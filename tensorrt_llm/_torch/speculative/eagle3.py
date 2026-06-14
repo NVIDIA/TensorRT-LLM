@@ -1213,6 +1213,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             if self.is_mtp_eagle:
                 return self.draft_sampler(logits)
             return self._draft_sampler_greedy(logits, d2t)
+        # Non-greedy (advanced) draft sampling has the same TP hazard as the
+        # greedy path: when the draft LM head is plain tensor-parallel
+        # (tp_size>1 without attention DP), each rank only holds a vocab shard
+        # of the draft logits. Random per-rank sampling then draws different
+        # tokens on different ranks, desyncing the spec-decode control flow and
+        # deadlocking the next collective. All-gather the shards into the full
+        # vocab first so every rank samples from the same distribution with the
+        # shared seed. (Greedy uses draft_sampler()'s lighter max+index gather;
+        # random sampling needs the full distribution. The LM-head-TP-in-ADP
+        # case is handled upstream and must not be gathered again here.)
+        if (self.is_mtp_eagle and self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size > 1
+                and not self.model_config.mapping.enable_attention_dp):
+            logits = allgather(logits, self.model_config.mapping, dim=-1)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             return self._draft_sampler_advanced_for_rejection(
                 logits, spec_metadata, batch_size, d2t, draft_step)
