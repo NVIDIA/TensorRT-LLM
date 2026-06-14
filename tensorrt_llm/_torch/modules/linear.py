@@ -372,8 +372,9 @@ class LinearMethodBase(ABC):
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
         kargs = {}
-        if isinstance(self, (UnquantizedLinearMethod,
-                             FP8BlockScalesLinearMethod, NVFP4LinearMethod)):
+        if isinstance(self,
+                      (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
+                       NVFP4LinearMethod, W4A8NVFP4FP8LinearMethod)):
             kargs['allow_partial_loading'] = allow_partial_loading
         load_fn(module, weights, **kargs)
 
@@ -2012,129 +2013,282 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
             fp8_input, module.weight,
             module.weight_scale.view(dtype=torch.float8_e4m3fn), alpha,
             module.dtype)
+        # Probe: save FIRST call and LATEST call separately for the fused
+        # gate_up_proj module (out_features = 2 * intermediate_size = 24576).
+        # Skip during CUDA graph capture — .cpu() is illegal there.
         if bias is not None:
             output = output + bias
         return output
 
-    def load_weight_scales(
-        self,
-        weights: List[Dict],
-        tp_size: int = 1,
-        tp_rank: int = 0,
-        tp_mode: Optional[TensorParallelMode] = None,
-    ):
-        # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
-        input_scale = None
-        weight_scale_2 = None
-        weight_scale = []
+    def load_weight_scales(self,
+                           module: Linear,
+                           weights: List[Dict],
+                           shard_keys: Optional[List[str]] = None):
+        """Load W4A8 NVFP4 FP8 scales from weights into module tmp attributes.
 
+        Supports partial loading: per-tensor scales are accumulated across
+        multiple calls and finalized in _finalize_w4a8_scales (called by
+        process_weights_after_loading_*). The block weight_scale is applied
+        eagerly in the vanilla path (single tensor, no concat needed) and
+        stashed per-shard in the fused paths.
+
+        Args:
+            module: Target Linear module
+            weights: List of weight dicts (one per shard for fused, one for vanilla)
+            shard_keys: Shard keys for fused weights (e.g., ['q','k','v'] or
+                ['gate','up']). None for vanilla (single weight).
+        """
         device = torch.device("cuda")
 
-        for w in weights:
-            if "input_scale" in w:
-                if input_scale is None:
-                    input_scale = w["input_scale"][...]
-                else:
-                    assert input_scale == w["input_scale"][
-                        ...], "The input_scale should be same for all the weights"
+        if shard_keys is not None:
+            # Fused: stash per-shard weight_scales; concat + swizzle in
+            # process_weights_after_loading_*.
+            if not hasattr(module, "tmp_w4a8_weight_scales"):
+                module.tmp_w4a8_weight_scales = {}
+            for shard_key, w in zip(shard_keys, weights):
+                if "weight_scale" in w:
+                    ws = load_weight_shard(w["weight_scale"],
+                                           module.tp_size,
+                                           module.tp_rank,
+                                           module.tp_mode,
+                                           device=device).contiguous()
+                    assert ws.dtype == torch.float8_e4m3fn
+                    module.tmp_w4a8_weight_scales[shard_key] = ws.view(
+                        fp4_utils.float4_sf_dtype)
+        else:
+            # Vanilla: single weight_scale, swizzle and copy directly.
+            w = weights[0]
             if "weight_scale" in w:
                 ws = load_weight_shard(w["weight_scale"],
-                                       tp_size,
-                                       tp_rank,
-                                       tp_mode,
+                                       module.tp_size,
+                                       module.tp_rank,
+                                       module.tp_mode,
                                        device=device).contiguous()
                 assert ws.dtype == torch.float8_e4m3fn
-                weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
+                ws = ws.view(fp4_utils.float4_sf_dtype)
+                ws = fp4_utils.shuffle_matrix_sf_a(ws, module.epilogue_tile_m,
+                                                   module.scaling_vector_size)
+                copy_weight(module.weight_scale, ws)
+
+        # Accumulate per-tensor scales across partial loads.
+        if not hasattr(module, "tmp_w4a8_input_scales_list"):
+            module.tmp_w4a8_input_scales_list = []
+        if not hasattr(module, "tmp_w4a8_weight_scale_2_list"):
+            module.tmp_w4a8_weight_scale_2_list = []
+        for w in weights:
+            if "input_scale" in w:
+                module.tmp_w4a8_input_scales_list.append(
+                    w["input_scale"][...].reshape([]))
             if "weight_scale_2" in w:
-                if weight_scale_2 is None:
-                    weight_scale_2 = w["weight_scale_2"][...]
-                else:
-                    assert weight_scale_2 == w["weight_scale_2"][...], (
-                        f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}"
-                    )
+                module.tmp_w4a8_weight_scale_2_list.append(
+                    w["weight_scale_2"][...].reshape([]))
 
-        # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
-        input_scale = input_scale.to(torch.float32)
-        weight_scale_2 = weight_scale_2.to(torch.float32)
-        alpha = input_scale * weight_scale_2
-        return input_scale, weight_scale, weight_scale_2, alpha
+    def _finalize_w4a8_scales(self, module: Linear):
+        """Finalize accumulated W4A8 per-tensor scales after all partial loads.
 
-    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
-        # FIXME: this depends on the kernel internals
-        load_weights_vanilla_helper(
-            module, weights,
-            lambda w: fp4_utils.shuffle_matrix_a(w, module.epilogue_tile_m))
+        Verifies consistency of input_scale / weight_scale_2 across shards
+        and returns (input_scale, weight_scale_2, alpha, inv_input_scale)
+        in float32. Callers (process_weights_after_loading_*) copy these
+        into the module, skipping entries that are None.
 
-        input_scale, weight_scale, weight_scale_2, alpha = self.load_weight_scales(
-            weights,
-            tp_size=module.tp_size,
-            tp_rank=module.tp_rank,
-            tp_mode=module.tp_mode)
+        input_scale may be None when the checkpoint omits it (dynamic
+        activation quantization); in that case alpha and inv_input_scale
+        are also None and the kernel recomputes alpha at runtime from
+        weight_scale_2 and the per-call input amax.
+        """
+        input_scale_list = getattr(module, "tmp_w4a8_input_scales_list", [])
+        weight_scale_2_list = getattr(module, "tmp_w4a8_weight_scale_2_list",
+                                      [])
 
-        assert len(weights) == 1
-        weight_scale = weight_scale[0]
-        # Shuffle and Swizzle weight scale
-        weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
-                                                     module.epilogue_tile_m,
-                                                     module.scaling_vector_size)
-        copy_weight(module.input_scale, input_scale)
-        copy_weight(module.inv_input_scale, 1.0 / input_scale)
-        copy_weight(module.weight_scale, weight_scale)
-        copy_weight(module.weight_scale_2, weight_scale_2)
-        copy_weight(module.alpha, alpha)
+        input_scale = None
+        if input_scale_list:
+            for s in input_scale_list[1:]:
+                assert torch.allclose(input_scale_list[0], s), \
+                    f"input_scale mismatch across shards: {input_scale_list}"
+            input_scale = input_scale_list[0].to(torch.float32)
 
-    def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]) -> None:
+        weight_scale_2 = None
+        if weight_scale_2_list:
+            for s in weight_scale_2_list[1:]:
+                assert torch.allclose(weight_scale_2_list[0], s), \
+                    f"weight_scale_2 mismatch across shards: {weight_scale_2_list}"
+            weight_scale_2 = weight_scale_2_list[0].to(torch.float32)
+
+        if input_scale is not None and weight_scale_2 is not None:
+            alpha = input_scale * weight_scale_2
+            inv_input_scale = 1.0 / input_scale
+        else:
+            alpha = None
+            inv_input_scale = None
+        if input_scale is None:
+            # verl QAT W4A8 omits static input_scale (activations are quantized
+            # online per-token). apply() checks `module.input_scale is not None`,
+            # which is always True for the pre-allocated Parameter, so we must
+            # flip force_dynamic_quantization to route through the runtime
+            # quantize_e4m3_per_tensor branch and recompute alpha per call.
+            module.force_dynamic_quantization = True
+        return input_scale, weight_scale_2, alpha, inv_input_scale
+
+    def _cleanup_w4a8_tmp_attrs(self, module: Linear):
+        """Clean up temporary attributes after process_weights_after_loading."""
+        for attr in ("tmp_w4a8_weight_scales", "tmp_w4a8_input_scales_list",
+                     "tmp_w4a8_weight_scale_2_list"):
+            if hasattr(module, attr):
+                delattr(module, attr)
+
+    def load_weights_vanilla(self,
+                             module: Linear,
+                             weights: List[Dict],
+                             allow_partial_loading: bool = False) -> None:
+        # Load raw FP4 weight into module.weight without shuffling; the
+        # shuffle happens in process_weights_after_loading_vanilla so that
+        # partial-loaded buckets (one full weight per bucket) and full loads
+        # share the same finalize path.
+        load_weights_vanilla_helper(module,
+                                    weights,
+                                    allow_partial_loading=allow_partial_loading)
+
+        self.load_weight_scales(module, weights, shard_keys=None)
+
+    def process_weights_after_loading_vanilla(self, module: Linear):
+        if not hasattr(module, "tmp_w4a8_input_scales_list"):
+            return
+
+        # Shuffle weight on the fully-loaded tensor.
+        shuffled = fp4_utils.shuffle_matrix_a(module.weight,
+                                              module.epilogue_tile_m)
+        copy_weight(module.weight, shuffled)
+
+        # Finalize per-tensor scales. input_scale / alpha / inv_input_scale
+        # may be None for dynamic activation quantization.
+        input_scale, weight_scale_2, alpha, inv_input_scale = \
+            self._finalize_w4a8_scales(module)
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if inv_input_scale is not None:
+            copy_weight(module.inv_input_scale, inv_input_scale)
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+
+        self._cleanup_w4a8_tmp_attrs(module)
+
+    def load_weights_fused_qkv_linear(
+            self,
+            module: Linear,
+            weights: List[Dict],
+            allow_partial_loading: bool = False) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
-            module, weights)
+            module, weights, allow_partial_loading=allow_partial_loading)
 
-        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
-            weights,
-            tp_size=module.tp_size,
-            tp_rank=module.tp_rank,
-            tp_mode=module.tp_mode)
-        # Swizzle weight scales after concatenation
-        weight_scale = torch.cat(weight_scales, 0)
-        # Shuffle and Swizzle weight scale
+        # Copy each available shard into module.weight at its shard offset,
+        # without shuffling. Shuffle happens in
+        # process_weights_after_loading_fused_qkv_linear after all shards
+        # are assembled.
+        for shard_key, weight in zip(('q', 'k', 'v'),
+                                     (q_weight, k_weight, v_weight)):
+            if weight is not None:
+                shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                    shard_key]
+                copy_weight_shard(module.weight, weight, shard_offset,
+                                  shard_size)
+
+        weight_mode = module.weights_loading_config.weight_mode
+        self.load_weight_scales(module,
+                                weights[:3],
+                                shard_keys=weight_mode.shard_keys)
+
+    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
+        if not hasattr(module, "tmp_w4a8_weight_scales"):
+            return
+
+        # Shuffle the fully-assembled fused weight.
+        shuffled = fp4_utils.shuffle_matrix_a(module.weight,
+                                              module.epilogue_tile_m)
+        copy_weight(module.weight, shuffled)
+
+        # Concat per-shard weight_scales in canonical order, then swizzle.
+        weight_mode = module.weights_loading_config.weight_mode
+        ordered_scales = [
+            module.tmp_w4a8_weight_scales[key] for key in weight_mode.shard_keys
+        ]
+        weight_scale = torch.cat(ordered_scales, 0)
         weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
                                                      module.epilogue_tile_m,
                                                      module.scaling_vector_size)
-        copy_weight(module.input_scale, input_scale)
-        copy_weight(module.inv_input_scale, 1.0 / input_scale)
         copy_weight(module.weight_scale, weight_scale)
-        copy_weight(module.weight_scale_2, weight_scale_2)
-        copy_weight(module.alpha, alpha)
 
-        fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        fused_weight = fp4_utils.shuffle_matrix_a(fused_weight,
-                                                  module.epilogue_tile_m)
-        copy_weight(module.weight, fused_weight)
+        # Finalize per-tensor scales. input_scale / alpha / inv_input_scale
+        # may be None for dynamic activation quantization.
+        input_scale, weight_scale_2, alpha, inv_input_scale = \
+            self._finalize_w4a8_scales(module)
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if inv_input_scale is not None:
+            copy_weight(module.inv_input_scale, inv_input_scale)
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
 
-    def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]) -> None:
+        self._cleanup_w4a8_tmp_attrs(module)
+
+    def load_weights_fused_gate_up_linear(
+            self,
+            module: Linear,
+            weights: List[Dict],
+            allow_partial_loading: bool = False) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
-            module, weights)
-        fused_weight = torch.cat((gate_weight, up_weight))
-        fused_weight = fp4_utils.shuffle_matrix_a(fused_weight,
-                                                  module.epilogue_tile_m)
-        copy_weight(module.weight, fused_weight)
+            module, weights, allow_partial_loading=allow_partial_loading)
 
-        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
-            weights,
-            tp_size=module.tp_size,
-            tp_rank=module.tp_rank,
-            tp_mode=module.tp_mode)
-        # Swizzle weight scales after concatenation
-        weight_scale = torch.cat(weight_scales, 0)
-        # Shuffle and Swizzle weight scale
+        for shard_key, weight in zip(('gate', 'up'), (gate_weight, up_weight)):
+            if weight is not None:
+                shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
+                    shard_key]
+                copy_weight_shard(module.weight, weight, shard_offset,
+                                  shard_size)
+
+        weight_mode = module.weights_loading_config.weight_mode
+        self.load_weight_scales(module,
+                                weights[:2],
+                                shard_keys=weight_mode.shard_keys)
+
+    def process_weights_after_loading_fused_gate_up_linear(
+            self, module: Linear):
+        if not hasattr(module, "tmp_w4a8_weight_scales"):
+            return
+
+        # Shuffle the fully-assembled fused weight.
+        shuffled = fp4_utils.shuffle_matrix_a(module.weight,
+                                              module.epilogue_tile_m)
+        copy_weight(module.weight, shuffled)
+
+        # Concat per-shard weight_scales in canonical order, then swizzle.
+        weight_mode = module.weights_loading_config.weight_mode
+        ordered_scales = [
+            module.tmp_w4a8_weight_scales[key] for key in weight_mode.shard_keys
+        ]
+        weight_scale = torch.cat(ordered_scales, 0)
         weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
                                                      module.epilogue_tile_m,
                                                      module.scaling_vector_size)
-        copy_weight(module.input_scale, input_scale)
-        copy_weight(module.inv_input_scale, 1.0 / input_scale)
         copy_weight(module.weight_scale, weight_scale)
-        copy_weight(module.weight_scale_2, weight_scale_2)
-        copy_weight(module.alpha, alpha)
+
+        # Finalize per-tensor scales. input_scale / alpha / inv_input_scale
+        # may be None for dynamic activation quantization.
+        input_scale, weight_scale_2, alpha, inv_input_scale = \
+            self._finalize_w4a8_scales(module)
+        if input_scale is not None:
+            copy_weight(module.input_scale, input_scale)
+        if inv_input_scale is not None:
+            copy_weight(module.inv_input_scale, inv_input_scale)
+        if weight_scale_2 is not None:
+            copy_weight(module.weight_scale_2, weight_scale_2)
+        if alpha is not None:
+            copy_weight(module.alpha, alpha)
+
+        self._cleanup_w4a8_tmp_attrs(module)
 
 
 class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
@@ -3123,7 +3277,7 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method,
                           (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
-                           NVFP4LinearMethod)):
+                           NVFP4LinearMethod, W4A8NVFP4FP8LinearMethod)):
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")
