@@ -76,13 +76,15 @@ from ..models.automodel import AutoConfig
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
 from ..sampling_params import BatchedLogitsProcessor
-from ..usage.config import TelemetryConfig, UsageContext  # noqa: F401
+from ..usage.config import UsageContext  # noqa: F401
+from ..usage.config import TelemetryConfig, TelemetryField
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
+_TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.virtual_memory import \
@@ -94,8 +96,10 @@ else:
 def Field(default: Any = ...,
           *,
           status: Optional[Literal["prototype", "beta", "deprecated"]] = None,
+          telemetry: Optional[Union[bool, Dict[str, Any],
+                                    TelemetryField]] = None,
           **kwargs: Any) -> Any:
-    """Custom Field wrapper that adds status to json_schema_extra.
+    """Custom Field wrapper that adds status and telemetry metadata.
 
     Args:
         default: The default value for the field
@@ -103,22 +107,68 @@ def Field(default: Any = ...,
             - None: Stable.
             - "beta": Recommended for use per the latest documentation.
             - "prototype": Not yet stable and subject to breaking changes; intended for experimentation only.
+        telemetry: Optional field-local telemetry override for LLM API config
+            capture. Type-safe fields (categorical/numeric) auto-enroll; pass
+            telemetry=TelemetryField.categorical(...) to opt a free-form str/Any field
+            in via an allowlist, or telemetry=False to opt a type-safe field out.
         **kwargs: All other arguments passed to the original Pydantic Field
 
     Returns:
-        A Pydantic FieldInfo object with the status added to json_schema_extra if provided
+        A Pydantic FieldInfo object with extra metadata added to
+        json_schema_extra if provided.
     """
+    telemetry_explicit_exclude = telemetry is False
+    telemetry_requested = telemetry is not None and not telemetry_explicit_exclude
 
-    if status is not None:
+    if status is not None or telemetry_requested or telemetry_explicit_exclude:
+        trtllm_schema_extra: dict[str, Any] = {}
         json_schema_extra = kwargs.get('json_schema_extra', {})
+        if status is not None:
+            trtllm_schema_extra['status'] = status
+        if telemetry_explicit_exclude:
+            # Honored opt-out sentinel: excludes a type-safe-but-sensitive field
+            # from capture. Consumed by build_capture_manifest's selection rule.
+            trtllm_schema_extra['telemetry'] = {"exclude": True}
+        elif telemetry_requested:
+            if isinstance(telemetry, TelemetryField):
+                telemetry_metadata = telemetry.as_json_schema_extra()
+            elif telemetry is True:
+                telemetry_metadata = {"kind": "value"}
+            elif isinstance(telemetry, dict):
+                telemetry_metadata = dict(telemetry)
+            else:
+                raise TypeError(
+                    "telemetry must be bool, dict, or TelemetryField")
+            trtllm_schema_extra['telemetry'] = telemetry_metadata
         if isinstance(json_schema_extra, dict):
-            json_schema_extra['status'] = status
+            json_schema_extra = {**json_schema_extra, **trtllm_schema_extra}
+        elif callable(json_schema_extra):
+            original_json_schema_extra = json_schema_extra
+
+            def merged_json_schema_extra(schema: dict[str, Any]) -> None:
+                original_extra = original_json_schema_extra(schema)
+                if isinstance(original_extra, dict):
+                    schema.update(original_extra)
+                schema.update(trtllm_schema_extra)
+
+            setattr(merged_json_schema_extra, _TRTLLM_JSON_SCHEMA_EXTRA_ATTR,
+                    trtllm_schema_extra)
+            json_schema_extra = merged_json_schema_extra
         else:
-            # If json_schema_extra is not a dict, create a new dict with the status
-            json_schema_extra = {'status': status}
+            json_schema_extra = trtllm_schema_extra
         kwargs['json_schema_extra'] = json_schema_extra
 
     return PydanticField(default, **kwargs)
+
+
+def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
+    json_schema_extra = getattr(field_info, "json_schema_extra", None)
+    if callable(json_schema_extra):
+        json_schema_extra = getattr(json_schema_extra,
+                                    _TRTLLM_JSON_SCHEMA_EXTRA_ATTR, None)
+    if isinstance(json_schema_extra, dict):
+        return json_schema_extra
+    return {}
 
 
 class BaseCudaGraphConfig(StrictBaseModel):
@@ -460,7 +510,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
-    algorithm: Literal["rocket"] = "rocket"
+    algorithm: Literal["rocket"] = Field(default="rocket")
     window_size: Optional[int] = Field(
         default=32, description="The window size for RocketKV.")
     kernel_size: Optional[int] = Field(
@@ -470,11 +520,11 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     prompt_budget: Optional[int] = Field(default=2048,
                                          description="Prompt budget")
     page_size: Optional[int] = Field(default=4, description="Page size")
-    kt_cache_dtype: Optional[str] = Field(
-        default='float8_e5m2',
-        choices=['bfloat16', 'float8_e5m2'],
-        description="KT cache dtype",
-    )
+    kt_cache_dtype: Optional[str] = Field(default='float8_e5m2',
+                                          choices=['bfloat16', 'float8_e5m2'],
+                                          description="KT cache dtype",
+                                          telemetry=TelemetryField.categorical(
+                                              'bfloat16', 'float8_e5m2'))
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -485,7 +535,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for DeepSeek Sparse Attention."""
-    algorithm: Literal["dsa"] = "dsa"
+    algorithm: Literal["dsa"] = Field(default="dsa")
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
     index_head_dim: Optional[int] = Field(
@@ -530,8 +580,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
         "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
-        "per-token footprint from 132 B to 68 B.",
-    )
+        "per-token footprint from 132 B to 68 B.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -575,7 +624,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
-    algorithm: Literal["skip_softmax"] = "skip_softmax"
+    algorithm: Literal["skip_softmax"] = Field(default="skip_softmax")
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
@@ -1220,7 +1269,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
         None,
         description="Named connector preset (e.g. 'lmcache'). "
         "When set, connector_module/scheduler_class/worker_class are "
-        "auto-populated from the preset registry.")
+        "auto-populated from the preset registry.",
+        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm'))
     connector_module: Optional[str] = Field(
         None,
         description=
@@ -1290,7 +1340,7 @@ class LayerwiseBenchmarksConfig(StrictBaseModel):
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["Medusa"] = "Medusa"
+    decoding_type: Literal["Medusa"] = Field(default="Medusa")
     medusa_choices: Optional[List[List[int]]] = Field(
         default=None,
         description=
@@ -1313,7 +1363,7 @@ class MedusaDecodingConfig(DecodingBaseConfig):
 
 
 class EagleDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["Eagle"] = "Eagle"
+    decoding_type: Literal["Eagle"] = Field(default="Eagle")
     eagle_choices: Optional[List[List[int]]] = Field(
         default=None,
         description=
@@ -1525,7 +1575,7 @@ class SAEnhancerConfig(StrictBaseModel):
 
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
-    decoding_type: Literal["Eagle3"] = "Eagle3"
+    decoding_type: Literal["Eagle3"] = Field(default="Eagle3")
 
     # Backs the dynamic-tree worker's pre-allocated, batch-indexed CUDA buffers
     # (draft_tokens_buffer, history_*_buffer, tree_mask_buffer, etc. in
@@ -1546,7 +1596,7 @@ class Eagle3DecodingConfig(EagleDecodingConfig):
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["SaveState"] = "SaveState"
+    decoding_type: Literal["SaveState"] = Field(default="SaveState")
     output_directory: str = Field(
         description=
         "Directory path where hidden states data files will be saved. The directory is created if it does not exist."
@@ -1622,7 +1672,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["User_Provided"] = "User_Provided"
+    decoding_type: Literal["User_Provided"] = Field(default="User_Provided")
     # Cannot use real type annotations due to circular imports
     drafter: object = Field(
         description=
@@ -1644,7 +1694,7 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 class NGramDecodingConfig(DecodingBaseConfig):
     """Configuration for NGram drafter speculative decoding."""
-    decoding_type: Literal["NGram"] = "NGram"
+    decoding_type: Literal["NGram"] = Field(default="NGram")
     max_matching_ngram_size: PositiveInt = Field(
         default=2,
         description=
@@ -1684,7 +1734,7 @@ class SADecodingConfig(DecodingBaseConfig):
     To combine SA with a neural drafter (Eagle3, MTP, PARD) instead of using
     it standalone, pass :class:`SAEnhancerConfig` via ``sa_config``.
     """
-    decoding_type: Literal["SA"] = "SA"
+    decoding_type: Literal["SA"] = Field(default="SA")
     max_matching_ngram_size: int = Field(
         default=-1,
         description="Positive value (e.g., 3): fixed-size ngram matching. "
@@ -1736,7 +1786,7 @@ class SADecodingConfig(DecodingBaseConfig):
 
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["Draft_Target"] = "Draft_Target"
+    decoding_type: Literal["Draft_Target"] = Field(default="Draft_Target")
     _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
@@ -1762,7 +1812,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
-    decoding_type: Literal["MTP"] = "MTP"
+    decoding_type: Literal["MTP"] = Field(default="MTP")
     use_relaxed_acceptance_for_thinking: bool = Field(
         default=False,
         description=
@@ -1903,7 +1953,7 @@ class PARDDecodingConfig(DecodingBaseConfig):
         "If None, it will be read from the draft model config (typically vocab_size)."
     )
 
-    decoding_type: Literal["PARD"] = "PARD"
+    decoding_type: Literal["PARD"] = Field(default="PARD")
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
@@ -1959,7 +2009,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
-    decoding_type: Literal["DFlash"] = "DFlash"
+    decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -1994,7 +2044,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
     Attributes that are inherited from the base class are ignored.
     """
 
-    decoding_type: Literal["AUTO"] = "AUTO"
+    decoding_type: Literal["AUTO"] = Field(default="AUTO")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -2597,7 +2647,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
 class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
     """Configuration for lookahead speculative decoding."""
 
-    decoding_type: Literal["Lookahead"] = "Lookahead"
+    decoding_type: Literal["Lookahead"] = Field(default="Lookahead")
     max_window_size: PositiveInt = Field(
         default=_LookaheadDecodingConfig.get_default_lookahead_decoding_window(
         ),
@@ -2793,8 +2843,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(
         default="auto",
         description=
-        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
-    )
+        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype.",
+        telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
+                                             "float32", "fp8", "nvfp4"))
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -3129,7 +3180,9 @@ class BaseLlmArgs(StrictBaseModel):
                                       description="The tensor parallel size.")
 
     dtype: str = Field(default="auto",
-                       description="The data type to use for the model.")
+                       description="The data type to use for the model.",
+                       telemetry=TelemetryField.categorical(
+                           "auto", "float16", "bfloat16", "float32"))
 
     revision: Optional[str] = Field(
         default=None, description="The revision to use for the model.")
@@ -3292,7 +3345,12 @@ class BaseLlmArgs(StrictBaseModel):
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.",
-        status="prototype")
+        status="prototype",
+        telemetry=TelemetryField.categorical('auto', 'deepseek-r1', 'laguna',
+                                             'qwen3', 'qwen3_5', 'minimax_m2',
+                                             'minimax_m2_append_think',
+                                             'nano-v3', 'gemma4', 'kimi_k2',
+                                             'kimi_k25'))
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -3324,7 +3382,8 @@ class BaseLlmArgs(StrictBaseModel):
         exclude_json_schema=True,  # hide from API references
         validate_default=True,
         status="deprecated",
-    )
+        telemetry=TelemetryField.categorical('pytorch', 'tensorrt',
+                                             '_autodeploy'))
 
     return_perf_metrics: bool = Field(default=False,
                                       description="Return perf metrics.",
@@ -3898,8 +3957,7 @@ class ModelExpressConfig(StrictBaseModel):
         "discovery. When unset, TRT-LLM first probes for existing sources: "
         "no source uses a short 30-second fallback cap, while an existing "
         "source uses modelexpress's default wait for long donor loads.",
-        status="prototype",
-    )
+        status="prototype")
 
     preshard_strategy: str = Field(
         default="per_module",
@@ -3907,7 +3965,7 @@ class ModelExpressConfig(StrictBaseModel):
         "TP-sharded for the local rank. Only 'per_module' is supported in "
         "this MX-only PR; 'global' requires LoadFormat.PRESHARDED.",
         status="prototype",
-    )
+        telemetry=TelemetryField.categorical('per_module'))
 
     @model_validator(mode="after")
     def validate_preshard_strategy(self) -> 'ModelExpressConfig':
@@ -3958,8 +4016,7 @@ class GmsConfig(StrictBaseModel):
         default="auto",
         description="GMS operating mode: 'auto' requests RW or RO, 'rw' "
         "requires writer mode, and 'ro' requires read-only mode.",
-        status="prototype",
-    )
+        status="prototype")
 
     tag: str = Field(
         default="weights",
@@ -4100,9 +4157,14 @@ class TorchLlmArgs(BaseLlmArgs):
         description="DWDP (Distributed Weight Data Parallelism) config.",
         status="prototype")
 
-    attn_backend: str = Field(default='TRTLLM',
-                              description="Attention backend to use.",
-                              status="beta")
+    attn_backend: str = Field(
+        default='TRTLLM',
+        description="Attention backend to use.",
+        status="beta",
+        # Recognized values mirror get_attention_backend dispatch in
+        # tensorrt_llm/_torch/attention_backend/utils.py.
+        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER",
+                                             "FLASHINFER_STAR_ATTENTION"))
 
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
@@ -4111,8 +4173,9 @@ class TorchLlmArgs(BaseLlmArgs):
         "TRTLLMSampler is deprecated and will be removed in release 1.4.",
         status="deprecated",
         deprecated=
-        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler."
-    )
+        "This parameter will be removed in release 1.4. TorchSampler will be the default sampler.",
+        telemetry=TelemetryField.categorical('TRTLLMSampler', 'TorchSampler',
+                                             'auto'))
 
     sampler_force_async_worker: bool = Field(
         default=False,
@@ -4194,29 +4257,28 @@ class TorchLlmArgs(BaseLlmArgs):
     load_format: Union[str, LoadFormat] = Field(
         default=LoadFormat.AUTO,
         description=
-        "How to load the model weights. By default, detect the weight type from the model checkpoint."
-    )
+        "How to load the model weights. By default, detect the weight type from the model checkpoint.",
+        telemetry=TelemetryField.categorical("auto", "dummy", "vision_only",
+                                             "gms"))
 
     enable_min_latency: bool = Field(
         default=False,
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
-        status="beta",
-    )
+        status="beta")
 
     # TODO: make this a per-request parameter
     stream_interval: PositiveInt = Field(
         default=1,
         description=
         "The iteration interval to create responses under the streaming mode. "
-        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead.",
+        "Set this to a larger value when the batch size is large, which helps reduce the streaming overhead."
     )
 
     force_dynamic_quantization: bool = Field(
         default=False,
         description="If true, force dynamic quantization. Defaults to False.",
-        status="prototype",
-    )
+        status="prototype")
 
     allreduce_strategy: Optional[Literal[
         'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
@@ -4274,8 +4336,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
-        status="prototype",
-    )
+        status="prototype")
 
     encode_only: bool = Field(
         default=False,
@@ -4286,8 +4347,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "models (BERT, RoBERTa, reward models) and decoder models used in "
         "single-prefill mode (e.g., extracting embeddings). When False "
         "(default), uses the standard generate() path.",
-        status="prototype",
-    )
+        status="prototype")
 
     ray_worker_extension_cls: Optional[str] = Field(
         default=None,
@@ -4326,33 +4386,28 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Enable the resource governor for runtime cache management "
         "operations such as KV cache truncation. This adds a per-iteration "
         "broadcast collective.",
-        status="prototype",
-    )
+        status="prototype")
 
     # fp8 cute dsl configs
     use_cute_dsl_blockscaling_mm: bool = Field(
         default=False,
         description="If true, use CuTe DSL fp8 blockscaling mm implementation.",
-        status="prototype",
-    )
+        status="prototype")
     use_cute_dsl_blockscaling_bmm: bool = Field(
         default=False,
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
-        status="prototype",
-    )
+        status="prototype")
     # bf16 cute dsl configs
     use_cute_dsl_bf16_bmm: bool = Field(
         default=False,
         description=
         "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
-        status="prototype",
-    )
+        status="prototype")
     use_cute_dsl_bf16_gemm: bool = Field(
         default=False,
         description=
         "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
-        status="prototype",
-    )
+        status="prototype")
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
@@ -4361,14 +4416,12 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
-        status="prototype",
-    )
+        status="prototype")
 
     max_stats_len: int = Field(
         default=1000,
         description="The max number of performance statistic entries.",
-        status="prototype",
-    )
+        status="prototype")
 
     layer_wise_benchmarks_config: LayerwiseBenchmarksConfig = Field(
         default_factory=LayerwiseBenchmarksConfig,
@@ -4762,10 +4815,11 @@ class TorchLlmArgs(BaseLlmArgs):
         for field_name in set_fields:
             field_info = self.model_fields.get(field_name)
 
-            if not field_info or not field_info.json_schema_extra:
+            if not field_info:
                 continue
 
-            status = field_info.json_schema_extra.get('status', None)
+            status = _get_trtllm_json_schema_extra(field_info).get(
+                'status', None)
 
             if status in ('beta', 'prototype'):
                 logger.warning(

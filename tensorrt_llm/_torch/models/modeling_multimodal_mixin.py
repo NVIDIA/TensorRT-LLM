@@ -46,6 +46,23 @@ class MultimodalModelMixin:
     mixin-owned forward can build on the same template method.
     """
 
+    @classmethod
+    def _cast_multimodal_encoder_dtype(
+        cls,
+        module: torch.nn.Module,
+        dtype: torch.dtype,
+    ) -> torch.nn.Module:
+        """Cast a multimodal encoder dtype without materializing meta tensors."""
+
+        def convert(tensor: torch.Tensor) -> torch.Tensor:
+            if not (tensor.is_floating_point() or tensor.is_complex()):
+                return tensor
+            if tensor.device == torch.device("meta"):
+                return torch.empty_like(tensor, dtype=dtype)
+            return tensor.to(dtype=dtype)
+
+        return module._apply(convert)
+
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
