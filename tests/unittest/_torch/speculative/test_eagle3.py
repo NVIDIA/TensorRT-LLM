@@ -696,15 +696,15 @@ def test_multi_eagle3(use_one_model: bool):
             load_format="dummy",
         )
 
-        spec_config = Eagle3DecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=eagle_model_dir,
-            # Llama 3 does not support one model eagle.
-            eagle3_one_model=use_one_model,
-            num_eagle_layers=2,
-            load_format="dummy")
+        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=use_one_model,
+                                           load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+        if use_one_model:
+            assert llm_spec.args.speculative_config._num_draft_hidden_layers == eagle_config[
+                "num_hidden_layers"]
 
         tok_ids = llm_spec.tokenizer.encode("The future of AI is")
 

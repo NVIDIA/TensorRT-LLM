@@ -347,9 +347,26 @@ def get_num_spec_layers(spec_config):
     if spec_config.spec_dec_mode.is_mtp_vanilla():
         return spec_config.num_nextn_predict_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
-        num_eagle_layers = spec_config.num_eagle_layers
-        return num_eagle_layers if num_eagle_layers is not None else 1
+        num_draft_hidden_layers = spec_config._num_draft_hidden_layers
+        return num_draft_hidden_layers if num_draft_hidden_layers is not None else 1
     return 0
+
+
+def update_spec_config_from_draft_model_config(spec_config,
+                                               draft_pretrained_config) -> None:
+    """Populate Eagle draft-layer fields from the loaded draft model config."""
+    from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
+
+    if not isinstance(spec_config, EagleDecodingConfig):
+        return
+
+    num_layers = getattr(draft_pretrained_config, "num_hidden_layers", None)
+    if num_layers is None:
+        logger.warning(
+            "Draft model pretrained config is missing num_hidden_layers; "
+            "defaulting _num_draft_hidden_layers to 1.")
+        num_layers = 1
+    spec_config._num_draft_hidden_layers = num_layers
 
 
 def get_spec_worker(spec_config,
@@ -446,6 +463,15 @@ def update_spec_config_from_model_config(spec_config, model_config):
         spec_config.max_draft_len = effective_draft_len
 
     spec_config.max_total_draft_tokens = spec_config.max_draft_len
+
+
+def update_spec_config_from_loaded_model(spec_config, model) -> None:
+    """Populate spec config fields from loaded target and draft model configs."""
+    update_spec_config_from_model_config(spec_config, model.config)
+    draft_config = getattr(model, 'draft_config', None)
+    if draft_config is not None:
+        update_spec_config_from_draft_model_config(
+            spec_config, draft_config.pretrained_config)
 
 
 @dataclass
