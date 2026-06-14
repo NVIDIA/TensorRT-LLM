@@ -633,7 +633,7 @@ def load_hf_tokenizer(model_dir: str,
 
     _ensure_gpt2_bytes_to_unicode_compat()
 
-    try:
+    def _load(**extra_kwargs):
         tokenizer = TransformersTokenizer.from_pretrained(
             model_dir,
             legacy=False,
@@ -641,39 +641,32 @@ def load_hf_tokenizer(model_dir: str,
             truncation_side='left',
             trust_remote_code=trust_remote_code,
             use_fast=use_fast,
-            **kwargs)
+            **{
+                **kwargs,
+                **extra_kwargs
+            })
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
         return tokenizer
-    except (OSError, ValueError) as e:
-        logger.warning(
-            f"Failed to load hf tokenizer from hub for {model_dir}: {e}. "
-            f"The model may be gated and the token is unavailable in this "
-            f"environment. Retrying with local cache...")
-    except Exception:
-        raise
 
-    # Same code block as before but with the specific usage of local_files_only to check if the tokenizer is available locally.
-    # Can come in handy in cases like when the model is in a gated repo, was correctly downloaded locally but the environment has no HF Auth Key present.
-    # See https://github.com/NVIDIA/TensorRT-LLM/issues/12805 for more details.
     try:
-        kwargs['local_files_only'] = True
-        tokenizer = TransformersTokenizer.from_pretrained(
-            model_dir,
-            legacy=False,
-            padding_side='left',
-            truncation_side='left',
-            trust_remote_code=trust_remote_code,
-            use_fast=use_fast,
-            **kwargs)
-        if trust_remote_code:
-            maybe_register_transformers_modules_by_value()
-        return tokenizer
-    except (OSError, ValueError) as e:
-        logger.warning(
-            f"Failed to load hf tokenizer from local cache for {model_dir}: {e}"
-        )
-    return None
+        return _load()
+    except Exception as e:
+        # Retry against the local HF cache only — the first attempt may have
+        # failed because the hub call was unauthorized (e.g. gated model with
+        # no HF token in the env) even though the weights are already cached.
+        if not kwargs.get("local_files_only", False):
+            logger.warning(
+                f"Failed to load hf tokenizer from {model_dir}: {e}. "
+                "Retrying with local_files_only=True.")
+            try:
+                return _load(local_files_only=True)
+            except Exception as e2:
+                logger.warning(
+                    f"Retry with local_files_only=True also failed: {e2}")
+        else:
+            logger.warning(f"Failed to load hf tokenizer from {model_dir}: {e}")
+        return None
 
 
 def load_custom_tokenizer(
