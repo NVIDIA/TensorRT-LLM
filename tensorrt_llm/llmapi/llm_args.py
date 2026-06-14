@@ -4111,6 +4111,16 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
+    enable_token_budget_fallback: bool = Field(
+        default=True,
+        description=
+        "Re-validate the per-step token budget at the prep boundary and "
+        "gracefully defer or re-chunk over-budget context requests instead of "
+        "letting a scheduler/materialization divergence trip the forward-pass "
+        "token assert and wedge the executor loop (GitHub issue #13318). "
+        "Disable to restore the pre-fallback behavior.",
+        status="beta")
+
     cuda_graph_config: Optional[CudaGraphConfigType] = Field(
         default_factory=CudaGraphConfig,
         description="CUDA graph config. If true, use CUDA graphs for decoding. \
