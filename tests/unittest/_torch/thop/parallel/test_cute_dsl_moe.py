@@ -53,6 +53,51 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
     )
 
 
+def test_ghost_token_zero_allocation():
+    """Experts with num_tokens_per_expert == 0 must not receive any tokens."""
+    num_experts = 256
+    top_k = 8
+    ep_size = 16
+    num_local_experts = num_experts // ep_size
+
+    helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, 128)
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(
+        1, approx_max_load=True)
+    result = helper.generate_token_selected_experts(1, num_tokens_per_expert)
+
+    assigned_experts = result[result >= 0].tolist()
+    for j, count in enumerate(num_tokens_per_expert):
+        if count == 0:
+            assert j not in assigned_experts, (
+                f"Expert {j} has 0 allocated tokens but was assigned to a token")
+
+
+def test_prioritization_uses_global_index():
+    """Bug 2: prioritization must use global expert index, not local."""
+    num_experts = 256
+    top_k = 8
+    ep_size = 16
+    num_local_experts = num_experts // ep_size
+    local_expert_offset = num_local_experts
+
+    helper = GroupedGemmInputsHelper(
+        num_experts, top_k, num_local_experts, local_expert_offset, 128)
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(
+        1, approx_max_load=True)
+    result = helper.generate_token_selected_experts(1, num_tokens_per_expert)
+
+    assigned = set(result[result >= 0].tolist())
+    expected = {
+        local_expert_offset + j
+        for j, count in enumerate(num_tokens_per_expert)
+        if int(count) > 0
+    }
+    assert assigned.issubset(expected), (
+        f"Assigned experts {sorted(assigned)} are not a subset of expected "
+        f"global experts {sorted(expected)}"
+    )
+
+
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("ep_size", [1, 8, 32])
 @pytest.mark.parametrize("top_k", [1, 2, 8])
