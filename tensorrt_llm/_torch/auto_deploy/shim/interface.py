@@ -363,7 +363,14 @@ class CachedSequenceInterface:
                 continue
             # Effective window: full-attention layers (sliding_window == 0) use
             # max_seq_len so the C++ side gets a single concrete window key.
-            effective_window = handler.sliding_window if handler.sliding_window > 0 else max_seq_len
+            # Clamp to max_seq_len so the pool key matches what
+            # _resolve_max_attention_window_vec produces (it applies the same
+            # clamp); otherwise _build_layer_to_pool_idx raises KeyError when
+            # sliding_window > max_seq_len.
+            effective_window = min(
+                handler.sliding_window if handler.sliding_window > 0 else max_seq_len,
+                max_seq_len,
+            )
 
             if attention_type is None:
                 attention_type = handler.attention_type
