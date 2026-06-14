@@ -16,7 +16,11 @@
 from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    KVCacheManagerV2,
+    ResourceManagerType,
+)
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -90,6 +94,11 @@ class _DummyKvCacheCreator:
         self._max_seq_len = kwargs["max_seq_len"]
         self._kv_cache_config = kwargs["kv_cache_config"]
         self._execution_stream = kwargs["execution_stream"]
+        self.kv_cache_manager_cls = (
+            lambda: KVCacheManagerV2
+            if "use_kv_cache_manager_v2" in kwargs and kwargs["use_kv_cache_manager_v2"]
+            else KVCacheManager
+        )
 
     def try_prepare_estimation(self):
         """Skip estimation phase (no-op)."""
