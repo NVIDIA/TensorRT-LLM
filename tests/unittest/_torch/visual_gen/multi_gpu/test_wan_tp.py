@@ -45,6 +45,8 @@ try:
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
+    from .tp_shard_utils import copy_tp_parameter
+
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
@@ -143,6 +145,11 @@ _WAN_I2V_TEST_CONFIG = dict(
     added_kv_proj_dim=256,  # add_k_proj input dim = hidden_size (image embeds projected to hidden_size before blocks)
 )
 
+# Existing WAN configs are already uneven with TP=3:
+# 4 attention heads split as 2+1+1, and ffn_dim=512 is not divisible by 3.
+_WAN_UNEVEN_TP3_CONFIG = dict(_WAN_T2V_TEST_CONFIG)
+_WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
+
 
 # =============================================================================
 # Model config + weight helpers
@@ -193,95 +200,32 @@ def _stabilize_model_weights(model):
 
 
 # =============================================================================
-# TP weight sharding helpers
+# TP weight sharding helpers (see tp_shard_utils.py)
 # =============================================================================
 
 
-def _shard_dim0(tensor, tp_rank, tp_size):
-    """Shard a tensor along dim 0."""
-    chunk = tensor.shape[0] // tp_size
-    return tensor[tp_rank * chunk : (tp_rank + 1) * chunk].contiguous()
-
-
-def _shard_dim1(tensor, tp_rank, tp_size):
-    """Shard a tensor along dim 1."""
-    chunk = tensor.shape[1] // tp_size
-    return tensor[:, tp_rank * chunk : (tp_rank + 1) * chunk].contiguous()
-
-
-def _shard_fused_qkv(tensor, tp_rank, tp_size, q_dim, kv_dim):
-    """Shard a fused QKV weight [q_dim + 2*kv_dim, ...] preserving Q/K/V structure."""
-    q, k, v = tensor.split([q_dim, kv_dim, kv_dim], dim=0)
-    return torch.cat(
-        [
-            _shard_dim0(q, tp_rank, tp_size),
-            _shard_dim0(k, tp_rank, tp_size),
-            _shard_dim0(v, tp_rank, tp_size),
-        ],
-        dim=0,
-    )
-
-
-def _shard_fused_gate_up(tensor, tp_rank, tp_size):
-    """Shard a fused gate_up weight [2*intermediate, ...] preserving gate/up structure."""
-    half = tensor.shape[0] // 2
-    gate, up = tensor.split([half, half], dim=0)
-    return torch.cat(
-        [
-            _shard_dim0(gate, tp_rank, tp_size),
-            _shard_dim0(up, tp_rank, tp_size),
-        ],
-        dim=0,
-    )
-
-
-def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
-    """Copy weights from a TP=1 reference model into a TP model with correct sharding.
-
-    Handles column-parallel (QKV, MLP up/gate), row-parallel (output projs),
-    fused QKV/gate_up weights, and replicated parameters (norms, embeddings).
-    """
+def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
+    """Copy weights from a TP=1 reference model into a TP model with correct sharding."""
     ref_params = dict(ref_model.named_parameters())
+    num_heads = config_dict["num_attention_heads"]
+    head_dim = config_dict["attention_head_dim"]
+    vgm = getattr(tp_model.model_config, "visual_gen_mapping", None)
+    ulysses_size = vgm.ulysses_size if vgm is not None else 1
 
     with torch.no_grad():
         for tp_name, tp_param in tp_model.named_parameters():
             if tp_name not in ref_params:
                 continue
-
-            ref_param = ref_params[tp_name]
-
-            if tp_param.shape == ref_param.shape:
-                # Replicated parameter (norms, embeddings, etc.)
-                tp_param.data.copy_(ref_param.data)
-            elif tp_param.ndim >= 2 and tp_param.shape[1] == ref_param.shape[1]:
-                # Column parallel: dim 0 is smaller (output dim sharded)
-                if "qkv_proj" in tp_name or "add_qkv_proj" in tp_name:
-                    q_dim = ref_param.shape[0] // 3
-                    tp_param.data.copy_(
-                        _shard_fused_qkv(ref_param.data, tp_rank, tp_size, q_dim, q_dim)
-                    )
-                elif "gate_up_proj" in tp_name:
-                    tp_param.data.copy_(_shard_fused_gate_up(ref_param.data, tp_rank, tp_size))
-                else:
-                    tp_param.data.copy_(_shard_dim0(ref_param.data, tp_rank, tp_size))
-            elif tp_param.ndim >= 2 and tp_param.shape[0] == ref_param.shape[0]:
-                # Row parallel: dim 1 is smaller (input dim sharded)
-                tp_param.data.copy_(_shard_dim1(ref_param.data, tp_rank, tp_size))
-            elif tp_param.ndim == 1 and tp_param.shape[0] < ref_param.shape[0]:
-                # 1D bias for column parallel
-                if "qkv_proj" in tp_name or "add_qkv_proj" in tp_name:
-                    q_dim = ref_param.shape[0] // 3
-                    tp_param.data.copy_(
-                        _shard_fused_qkv(ref_param.data, tp_rank, tp_size, q_dim, q_dim)
-                    )
-                elif "gate_up_proj" in tp_name:
-                    tp_param.data.copy_(_shard_fused_gate_up(ref_param.data, tp_rank, tp_size))
-                else:
-                    tp_param.data.copy_(_shard_dim0(ref_param.data, tp_rank, tp_size))
-            else:
-                raise ValueError(
-                    f"Cannot shard {tp_name}: ref={ref_param.shape}, tp={tp_param.shape}"
-                )
+            copy_tp_parameter(
+                tp_name,
+                ref_params[tp_name],
+                tp_param,
+                tp_rank,
+                tp_size,
+                num_heads,
+                head_dim,
+                ulysses_size=ulysses_size,
+            )
 
 
 # =============================================================================
@@ -330,6 +274,16 @@ def _logic_wan_t2v_tp_forward(rank, world_size):
 
 def _logic_wan_t2v_tp_vs_single_gpu(rank, world_size):
     """WAN T2V: TP 2-GPU output matches single-GPU reference."""
+    _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_T2V_TEST_CONFIG)
+
+
+def _logic_wan_t2v_tp3_uneven_vs_single_gpu(rank, world_size):
+    """WAN T2V: TP=3 with uneven head/FFN dims matches single-GPU reference."""
+    _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_UNEVEN_TP3_CONFIG)
+
+
+def _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
+    """WAN T2V: TP output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
     device = torch.device(f"cuda:{rank}")
@@ -342,15 +296,15 @@ def _logic_wan_t2v_tp_vs_single_gpu(rank, world_size):
 
     # Create single-GPU reference model
     torch.manual_seed(123)
-    ref_config = _make_model_config(_WAN_T2V_TEST_CONFIG, tp_size=1)
+    ref_config = _make_model_config(config_dict, tp_size=1)
     ref_model = WanTransformer3DModel(ref_config).to(device).to(compute_dtype)
     _stabilize_model_weights(ref_model)
 
     # Create TP model and copy sharded weights from ref
     torch.manual_seed(123)
-    tp_config = _make_model_config(_WAN_T2V_TEST_CONFIG, tp_size=world_size)
+    tp_config = _make_model_config(config_dict, tp_size=world_size)
     tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
-    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size)
+    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, config_dict)
 
     # Same inputs on all ranks
     torch.manual_seed(456)
@@ -410,7 +364,7 @@ def _logic_wan_t2v_tp_ulysses_vs_single_gpu(rank, world_size):
     )
     combined_model = WanTransformer3DModel(combined_config).to(device).to(compute_dtype)
     vgm = combined_config.visual_gen_mapping
-    _copy_ref_weights_to_tp(ref_model, combined_model, vgm.tp_rank, tp_size)
+    _copy_ref_weights_to_tp(ref_model, combined_model, vgm.tp_rank, tp_size, _WAN_T2V_TEST_CONFIG)
 
     # Same inputs on all ranks (Ulysses shards at runtime)
     torch.manual_seed(456)
@@ -494,6 +448,16 @@ def _logic_wan_i2v_tp_forward(rank, world_size):
 
 def _logic_wan_i2v_tp_vs_single_gpu(rank, world_size):
     """WAN I2V: TP 2-GPU output matches single-GPU reference."""
+    _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_I2V_TEST_CONFIG)
+
+
+def _logic_wan_i2v_tp3_uneven_vs_single_gpu(rank, world_size):
+    """WAN I2V: TP=3 with uneven head/FFN dims matches single-GPU reference."""
+    _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_I2V_UNEVEN_TP3_CONFIG)
+
+
+def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
+    """WAN I2V: TP output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
     device = torch.device(f"cuda:{rank}")
@@ -507,15 +471,15 @@ def _logic_wan_i2v_tp_vs_single_gpu(rank, world_size):
 
     # Create single-GPU reference model
     torch.manual_seed(123)
-    ref_config = _make_model_config(_WAN_I2V_TEST_CONFIG, tp_size=1)
+    ref_config = _make_model_config(config_dict, tp_size=1)
     ref_model = WanTransformer3DModel(ref_config).to(device).to(compute_dtype)
     _stabilize_model_weights(ref_model)
 
     # Create TP model and copy sharded weights from ref
     torch.manual_seed(123)
-    tp_config = _make_model_config(_WAN_I2V_TEST_CONFIG, tp_size=world_size)
+    tp_config = _make_model_config(config_dict, tp_size=world_size)
     tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
-    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size)
+    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size, config_dict)
 
     # Same inputs on all ranks
     torch.manual_seed(456)
@@ -526,7 +490,8 @@ def _logic_wan_i2v_tp_vs_single_gpu(rank, world_size):
         torch.randn(batch, txt_seq, 128, device=device, dtype=compute_dtype) * 0.1
     )
     encoder_hidden_states_image = (
-        torch.randn(batch, img_seq, 64, device=device, dtype=compute_dtype) * 0.1
+        torch.randn(batch, img_seq, config_dict["image_dim"], device=device, dtype=compute_dtype)
+        * 0.1
     )
     timestep = torch.tensor([0.5], device=device, dtype=compute_dtype)
 
@@ -588,6 +553,18 @@ class TestWanI2VTP:
     def test_wan_i2v_tp_vs_single_gpu(self):
         """WAN I2V TP 2-GPU output matches single-GPU reference."""
         run_test_in_distributed(world_size=2, test_fn=_logic_wan_i2v_tp_vs_single_gpu)
+
+
+class TestWanUnevenTP3:
+    """TP=3 tests where head count and FFN dims are not divisible by tp_size."""
+
+    def test_wan_t2v_tp3_uneven_vs_single_gpu(self):
+        """WAN T2V TP=3 (4 heads, uneven FFN) matches single-GPU reference."""
+        run_test_in_distributed(world_size=3, test_fn=_logic_wan_t2v_tp3_uneven_vs_single_gpu)
+
+    def test_wan_i2v_tp3_uneven_vs_single_gpu(self):
+        """WAN I2V TP=3 (4 heads, uneven FFN) matches single-GPU reference."""
+        run_test_in_distributed(world_size=3, test_fn=_logic_wan_i2v_tp3_uneven_vs_single_gpu)
 
 
 if __name__ == "__main__":

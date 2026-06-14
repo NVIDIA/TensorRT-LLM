@@ -466,21 +466,6 @@ class FluxSingleTransformerBlock(nn.Module):
         )
         self.act_mlp = _gelu_tanh_eager
 
-        kv_dim = num_attention_heads * attention_head_dim
-
-        # MLP + Attn Output projection, requires special handling for TP
-        self.proj_out = FluxJointAttnMLPProj(
-            attn_dim=kv_dim,
-            mlp_dim=self.mlp_hidden_dim,
-            out_dim=dim,
-            bias=True,
-            dtype=dtype,
-            quant_config=quant_config,
-            skip_create_weights_in_init=skip_create_weights,
-            force_dynamic_quantization=force_dynamic_quant,
-            config=config,
-        )
-
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
         self.attn = FluxJointAttention(
             hidden_size=dim,
@@ -491,6 +476,21 @@ class FluxSingleTransformerBlock(nn.Module):
             pre_only=True,  # No output projection in attention
             config=config,
             layer_idx=layer_idx,
+        )
+
+        # MLP + Attn Output projection, requires special handling for TP
+        self.proj_out = FluxJointAttnMLPProj(
+            attn_dim=self.attn.q_dim,
+            mlp_dim=self.mlp_hidden_dim,
+            out_dim=dim,
+            bias=True,
+            dtype=dtype,
+            quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights,
+            force_dynamic_quantization=force_dynamic_quant,
+            config=config,
+            # need explicit shard because we are aligned on head boundaries
+            attn_shard=(self.attn.local_q_dim_start, self.attn.local_q_dim_end),
         )
 
     def forward(
