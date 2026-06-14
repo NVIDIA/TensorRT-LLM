@@ -193,7 +193,6 @@ full:GH200/examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] 
 full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
 full:GH200/unittest/trt/model_api/test_model_quantization.py SKIP (https://nvbugs/4979955)
 full:H100/accuracy/test_llm_api_pytorch.py::TestQwen3_6_27B::test_fp8 SKIP (https://nvbugs/6255417)
-full:H100/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
 full:H100/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_eagle_triton_stress] SKIP (https://nvbugs/6250439)
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
