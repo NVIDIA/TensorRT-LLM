@@ -79,6 +79,9 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         tasks = [
             self._fetch_responses_loop_async,
         ]
+        # Drain partially-filled submit batches when batched submit is enabled.
+        if getattr(self, "_submit_batch_enabled", False):
+            tasks.append(self._submit_flush_loop_async)
         # Call mixin's setup_mainloop with custom tasks
         self.setup_mainloop(tasks=tasks, thread_name="rpc_proxy_main_loop")
 

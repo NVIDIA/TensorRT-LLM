@@ -55,6 +55,22 @@ class RpcWorkerMixin:
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 
+    def submit_batch(self, requests: "list[GenerationRequest]"):
+        """Submit a batch of requests received in a single RPC call.
+
+        rank 0 is the sole RPC ingress for the whole instance, so collapsing N
+        per-request ``submit`` calls into one amortizes the pickle/HMAC,
+        dispatch and GIL-acquisition overhead that otherwise scales with
+        concurrency and starves the executor loop (the co-located rank-0
+        worker). The C++ enqueue inside ``super().submit`` releases the GIL, so
+        the loop yields naturally between requests.
+        """
+        with nvtx_range_debug(f"RpcWorker.submit_batch[{len(requests)}]",
+                              color="blue",
+                              category="Worker"):
+            for request in requests:
+                super().submit(request)
+
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         """Fetch responses from the response queue (blocking)."""
         logger_debug(f"[worker] RpcWorker {self.rank} is fetching responses", color="yellow")
