@@ -48,6 +48,14 @@ else:
     Mapping = None
     torch_dtype_to_binding = None
 
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+)
+
 from ..custom_ops.attention_interface import (
     AttentionType,
     CausalConvResourceHandler,
@@ -56,11 +64,13 @@ from ..custom_ops.attention_interface import (
     IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     ReplayCacheBufIdxHandler,
+    ReplayNWritesHandler,
     ReplayOldBHandler,
     ReplayOldDAcumsumHandler,
     ReplayOldDtHandler,
     ReplayOldXHandler,
     ReplayPrevNumAcceptedHandler,
+    ReplayWorkItemsHandler,
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
@@ -160,6 +170,8 @@ class CachedSequenceInterface:
         self._kernel_handles_cyclic_swa: bool = False
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
+        self._replay_work_items: Optional[torch.Tensor] = None
+        self._replay_n_writes: Optional[torch.Tensor] = None
         self._spec_config = spec_config
         self._requires_uniform_kv_caches = requires_uniform_kv_caches
         self._reject_unmanaged_persistent_caches = reject_unmanaged_persistent_caches
@@ -524,6 +536,16 @@ class CachedSequenceInterface:
             for name, handler in self._resource_lookup.items()
             if isinstance(handler, ReplayPrevNumAcceptedHandler)
         ]
+        replay_work_items = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayWorkItemsHandler)
+        ]
+        replay_n_writes = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayNWritesHandler)
+        ]
 
         # When speculative decoding is enabled, the backend must supply matching spec buffers.
         # When it is not enabled, spec buffers may still be registered by the backend (e.g.
@@ -551,6 +573,14 @@ class CachedSequenceInterface:
                 f"Replay bundle mismatch: replay_prev_num_accepted has "
                 f"{len(replay_prev_num_accepted)} entries, expected {n} (== len(ssm_managed))"
             )
+            assert len(replay_work_items) == n, (
+                f"Replay bundle mismatch: replay_work_items has {len(replay_work_items)} "
+                f"entries, expected {n} (== len(ssm_managed))"
+            )
+            assert len(replay_n_writes) == n, (
+                f"Replay bundle mismatch: replay_n_writes has {len(replay_n_writes)} "
+                f"entries, expected {n} (== len(ssm_managed))"
+            )
         if self._spec_config is not None:
             if not use_replay:
                 assert len(ssm_spec) == len(ssm_managed), (
@@ -574,6 +604,8 @@ class CachedSequenceInterface:
             replay_old_dA_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
         )
 
     def _prepare_kv_cache_config(
@@ -767,6 +799,8 @@ class CachedSequenceInterface:
         replay_old_dA_cumsum: list = (),
         replay_cache_buf_idx: list = (),
         replay_prev_num_accepted: list = (),
+        replay_work_items: list = (),
+        replay_n_writes: list = (),
     ) -> Tuple[MambaHybridCacheManager, int]:
         """Create MambaHybridCacheManager and assign views for state resources.
 
@@ -784,12 +818,15 @@ class CachedSequenceInterface:
             conv_spec: List of speculative Conv resources.
             replay_old_x/B/dt/dA_cumsum: Per-layer replay cache resource lists.
             replay_cache_buf_idx/prev_num_accepted: Global replay resource lists.
+            replay_work_items/replay_n_writes: Per-forward replay metadata resources.
 
         Returns:
             Tuple of (manager, num_managed_mamba_layers).
         """
         # Detect replay mode from presence of ReplayOldXHandler resources.
         use_replay = len(replay_old_x) > 0
+        if use_replay and self._spec_config is None:
+            raise RuntimeError("Replay SSM state update requires speculative decoding config.")
 
         # Mamba state params can be derived from reference handlers and number of managed (non-speculative) resources.
         mamba_params = self._get_mamba_state_params(
@@ -867,7 +904,72 @@ class CachedSequenceInterface:
                 for buf_name, _ in buf_list:
                     self._caches[buf_name] = global_tensor
 
+            if replay_work_items:
+                self._replay_work_items = torch.empty(
+                    self.info.max_num_state_slots,
+                    REPLAY_WORK_ITEM_WIDTH,
+                    device=self.info.device,
+                    dtype=torch.int32,
+                )
+                for buf_name, _ in replay_work_items:
+                    self._caches[buf_name] = self._replay_work_items
+
+            if replay_n_writes:
+                self._replay_n_writes = torch.zeros(1, device=self.info.device, dtype=torch.int32)
+                for buf_name, _ in replay_n_writes:
+                    self._caches[buf_name] = self._replay_n_writes
+
         return manager, num_managed_mamba_layers
+
+    def prepare_replay_metadata(self) -> None:
+        """Populate replay work items for the current AD batch."""
+        if self._replay_work_items is None or self._replay_n_writes is None:
+            return
+        if not self.info.batch_info.is_use_replay():
+            return
+        if not hasattr(self._kv_cache_manager, "get_replay_state_update_metadata"):
+            return
+
+        replay_metadata = self._kv_cache_manager.get_replay_state_update_metadata()
+        self._replay_n_writes.zero_()
+        if replay_metadata is None:
+            return
+
+        num_prefill, num_extend, _ = self.info.batch_info.get_num_sequences()
+        if num_extend == 0:
+            return
+
+        slot_idx = self.info.get_arg("slot_idx", truncate=True)
+        cache_slot = slot_idx[num_prefill : num_prefill + num_extend].to(torch.int32)
+        cache_slot_idx = cache_slot.to(torch.long)
+        prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
+        cache_buf_idx = replay_metadata.cache_buf_idx
+
+        position_in_decode_batch = torch.arange(
+            num_extend, dtype=torch.int32, device=slot_idx.device
+        )
+        pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
+        active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
+
+        # Keep field order and write-first partitioning in sync with the
+        # PyTorch replay metadata path in mamba2_metadata.py.
+        writes = pnat + replay_metadata.replay_step_width > replay_metadata.replay_history_size
+        writes_i32 = writes.to(torch.int32)
+        write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
+        n_writes = torch.sum(writes_i32, dim=0, keepdim=True).to(torch.int32)
+        no_write_offsets = position_in_decode_batch - write_offsets
+        output_offsets = torch.where(writes, write_offsets, n_writes + no_write_offsets).to(
+            torch.long
+        )
+
+        work_items = self._replay_work_items[:num_extend]
+        work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH].scatter_(
+            0, output_offsets, position_in_decode_batch
+        )
+        work_items[:, REPLAY_WORK_CACHE_SLOT].scatter_(0, output_offsets, cache_slot)
+        work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
+        work_items[:, REPLAY_WORK_CACHE_BUF_IDX].scatter_(0, output_offsets, active_cache_buf_idx)
+        self._replay_n_writes.copy_(n_writes)
 
     def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.
@@ -923,6 +1025,8 @@ class CachedSequenceInterface:
         replay_old_dA_cumsum: list,
         replay_cache_buf_idx: list,
         replay_prev_num_accepted: list,
+        replay_work_items: list,
+        replay_n_writes: list,
     ) -> None:
         """Validate persistent cache resources are cache-manager backed.
 
@@ -948,6 +1052,8 @@ class CachedSequenceInterface:
                 replay_old_dA_cumsum,
                 replay_cache_buf_idx,
                 replay_prev_num_accepted,
+                replay_work_items,
+                replay_n_writes,
             ):
                 managed_names.update(name for name, _ in replay_resources)
 
@@ -1101,6 +1207,8 @@ class CachedSequenceInterface:
             replay_old_dA_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
         ) = self._identify_managed_state_resources()
 
         # Propagate replay mode into BatchInfo so SSM backends can branch on it
@@ -1142,6 +1250,8 @@ class CachedSequenceInterface:
                 replay_old_dA_cumsum=replay_old_dA_cumsum,
                 replay_cache_buf_idx=replay_cache_buf_idx,
                 replay_prev_num_accepted=replay_prev_num_accepted,
+                replay_work_items=replay_work_items,
+                replay_n_writes=replay_n_writes,
             )
         else:
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
@@ -1199,6 +1309,8 @@ class CachedSequenceInterface:
             replay_old_dA_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
         )
 
         # 8. Allocate remaining unmanaged resources
@@ -1445,6 +1557,8 @@ class CachedSequenceInterface:
         for k in self._caches:
             self._caches[k] = None
         self._unmanaged_resources.clear()
+        self._replay_work_items = None
+        self._replay_n_writes = None
 
     def shutdown(self) -> None:
         """Shutdown and release all resources."""
