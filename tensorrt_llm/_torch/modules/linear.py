@@ -380,8 +380,11 @@ class LinearMethodBase(ABC):
         if not allow_partial_loading:
             self.process_weights_after_loading(module)
 
-    def post_load_weights(self, module: Linear):
+    def transform_weights(self, module: Linear) -> None:
         pass
+
+    def post_load_weights(self, module: Linear) -> None:
+        self.transform_weights(module)
 
     def load_weight_scales(self, weights: List[Dict], *args, **kwargs):
         """
@@ -1241,8 +1244,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 copy_weight_shard(module.weight_scale, scale, shard_offset,
                                   shard_size)
 
-    def post_load_weights(self, module: Linear):
-        super().post_load_weights(module)
+    def transform_weights(self, module: Linear) -> None:
+        super().transform_weights(module)
         if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
                                  or module.disable_deep_gemm)) or \
            get_sm_version() == 120:
@@ -1821,9 +1824,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             torch.ops.trtllm.block_scale_interleave(ws_swapped),
             requires_grad=False)
 
-    def post_load_weights(self, module: Linear):
+    def transform_weights(self, module: Linear) -> None:
         """Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements."""
-        super().post_load_weights(module)
+        super().transform_weights(module)
         row_alignment, col_alignment = 32, 16
         row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
         col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
@@ -1873,10 +1876,10 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     its fused path is SM>=100-gated upstream.
     """
 
-    def post_load_weights(self, module: Linear):
+    def transform_weights(self, module: Linear) -> None:
         # Skip parent's 32x16 weight padding (apply() accepts [N, K/2] as-is)
         # and un-swizzle per-block scale once at load.
-        LinearMethodBase.post_load_weights(self, module)
+        LinearMethodBase.transform_weights(self, module)
         pad_rows = fp4_utils.pad_up(module.out_features, 128)
         pad_cols = fp4_utils.pad_up(
             module.in_features // module.scaling_vector_size, 4)
@@ -2914,6 +2917,7 @@ class Linear(nn.Module):
                                     dtype=self.dtype) if reduce_output else None
 
         self._weights_created = False
+        self._weights_transformed = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
@@ -2966,6 +2970,7 @@ class Linear(nn.Module):
                                          self.dtype)
 
         self._weights_created = True
+        self._weights_transformed = False
 
     @property
     def has_any_quant(self):
@@ -3127,6 +3132,7 @@ class Linear(nn.Module):
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")
+        self._weights_transformed = False
         self.quant_method.load_weights(
             self,
             weights,
@@ -3136,8 +3142,14 @@ class Linear(nn.Module):
     def process_weights_after_loading(self):
         self.quant_method.process_weights_after_loading(self)
 
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
+    def transform_weights(self) -> None:
+        if self._weights_transformed:
+            return
+        self.quant_method.transform_weights(self)
+        self._weights_transformed = True
+
+    def post_load_weights(self) -> None:
+        self.transform_weights()
 
     def pre_reload_weights(self):
         assert hasattr(

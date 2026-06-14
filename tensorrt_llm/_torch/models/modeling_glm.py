@@ -1074,7 +1074,7 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
         weight_loader = Glm4WeightLoader(self)
         weight_loader.load_weights(weights, allow_partial_loading=allow_partial_loading)
 
-    def post_load_weights(self):
+    def setup_aliases(self):
         for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm

@@ -725,7 +725,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoe
             allow_partial_loading=allow_partial_loading,
         )
 
-    def post_load_weights(self):
+    def setup_aliases(self):
         # For the cross-layer residual+LN fusion.
         for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
