@@ -47,6 +47,8 @@ CacheLevel = NewType("CacheLevel", int)
 
 
 GPU_LEVEL: Final[CacheLevel] = CacheLevel(0)
+HOST_LEVEL: Final[CacheLevel] = CacheLevel(1)
+DISK_LEVEL: Final[CacheLevel] = CacheLevel(2)
 
 # Normal token id that falls in the tokenizer vocabulary.
 TokenId = NewType("TokenId", int)
