@@ -88,10 +88,16 @@ BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "4"
 
-SLURM_CORES_REQUEST = "1"
-SLURM_CORES_LIMIT = "1"
-SLURM_MEMORY_REQUEST = "8Gi"
-SLURM_MEMORY_LIMIT = "12Gi"
+SLURM_BUILD_CORES_REQUEST = "1"
+SLURM_BUILD_CORES_LIMIT = "1"
+SLURM_BUILD_MEMORY_REQUEST = "8Gi"
+SLURM_BUILD_MEMORY_LIMIT = "12Gi"
+
+// Reduced requests for kubernetes SLURM test dispatcher pods only (not build work).
+SLURM_TEST_CORES_REQUEST = "0.5"
+SLURM_TEST_MEMORY_REQUEST = "1Gi"
+SLURM_TEST_JNLP_CORES_REQUEST = "0.5"
+SLURM_TEST_JNLP_MEMORY_REQUEST = "512Mi"
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
@@ -1937,7 +1943,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     }
 }
 
-def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false)
+def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false, slurmProxy = false)
 {
     def targetCloud = "kubernetes-cpu"
     def selectors = """
@@ -1973,6 +1979,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         nodeLabelPrefix = "cpu"
         break
     case "slurm":
+        def slurmCoresRequest = slurmProxy ? SLURM_TEST_CORES_REQUEST : SLURM_BUILD_CORES_REQUEST
+        def slurmMemoryRequest = slurmProxy ? SLURM_TEST_MEMORY_REQUEST : SLURM_BUILD_MEMORY_REQUEST
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
@@ -1980,12 +1988,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     tty: true
                     resources:
                       requests:
-                        cpu: ${SLURM_CORES_REQUEST}
-                        memory: ${SLURM_MEMORY_REQUEST}
+                        cpu: ${slurmCoresRequest}
+                        memory: ${slurmMemoryRequest}
                         ephemeral-storage: 100Gi
                       limits:
-                        cpu: ${SLURM_CORES_LIMIT}
-                        memory: ${SLURM_MEMORY_LIMIT}
+                        cpu: ${SLURM_BUILD_CORES_LIMIT}
+                        memory: ${SLURM_BUILD_MEMORY_LIMIT}
                         ephemeral-storage: 100Gi
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
@@ -2149,6 +2157,9 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         """
     }
 
+    def jnlpCpuRequest = slurmProxy ? SLURM_TEST_JNLP_CORES_REQUEST : "2"
+    def jnlpMemoryRequest = slurmProxy ? SLURM_TEST_JNLP_MEMORY_REQUEST : "10Gi"
+
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -2184,8 +2195,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '${jnlpCpuRequest}'
+                        memory: ${jnlpMemoryRequest}
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
@@ -4146,7 +4157,7 @@ def launchTestJobs(pipeline, testFilter)
     )
     fullSet += x86SlurmTestConfigs.keySet()
 
-    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64", 1, false, true), { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
         // dispatcher pod (when retry is enabled — see opts below) and is
         // threaded into runLLMTestlistOnSlurm so a future re-enable of outer
@@ -4415,7 +4426,7 @@ def launchTestJobs(pipeline, testFilter)
         // singleAttempt:true disables the outer K8s pod retry; see the x86
         // SLURM closure above for the full rationale (cap nested retry budget
         // so consistently-timing-out tests don't burn ~36h on retry cascades).
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64", 1, false, true), { attemptTag, isFinalAttempt, retryContext = null ->
             // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
             // dispatcher pod's tag so the inner SLURM retry's postTag can't
             // collide with a previous dispatcher pod's upload. See the x86
@@ -4433,7 +4444,7 @@ def launchTestJobs(pipeline, testFilter)
 
         // Add SBSA multi node Slurm jobs
         // singleAttempt:true disables the outer K8s pod retry; see above.
-        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64", 1, false, true), { attemptTag, isFinalAttempt, retryContext = null ->
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
