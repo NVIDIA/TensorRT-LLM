@@ -10,6 +10,7 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
                                        get_last_power_of_2_num_tokens_buckets,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
+from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
@@ -900,6 +901,14 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             num_tokens,
         )
+
+        # The tileN=16 dsFp8 Gemm2 cubin issues an illegal memory access on
+        # sm_103 (B300) for very small Gemm2 problem sizes (M = num_tokens,
+        # K = intermediate_size). Drop those candidates only for that narrow
+        # window so other shapes/SMs keep the full tactic set.
+        if (get_sm_version() == 103 and num_tokens <= 8
+                and self.intermediate_size <= 512):
+            tactics = [t for t in tactics if t[0] != 16]
 
         return tactics
 
