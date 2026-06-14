@@ -2268,19 +2268,22 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                              cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"],
+                         ids=["short_prompt", "long_prompt"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, prompt_file):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           prompt_file="long_prompts.json",
+                           prompt_file=prompt_file,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 

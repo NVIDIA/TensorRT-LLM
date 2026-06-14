@@ -98,6 +98,13 @@ template <typename T>
 std::list<std::vector<T>> chopVectorIntoBlocks(
     std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
 {
+    // No usable elements yields no blocks. Guard non-positive usableSize explicitly: callers may pass
+    // usableSize = inputLength - 1, which is -1 for a Helix CP "empty" rank with 0 input tokens. With a
+    // negative usableSize, downstream usage of "vec.begin() + usableSize" is undefined behavior.
+    if (usableSize <= 0)
+    {
+        return {};
+    }
     TLLM_CHECK_WITH_INFO(
         usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;
