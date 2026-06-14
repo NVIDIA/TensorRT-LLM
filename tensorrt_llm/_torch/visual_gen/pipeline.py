@@ -101,6 +101,16 @@ if TYPE_CHECKING:
     from .config import DiffusionPipelineConfig
 
 
+def _teacache_coefficients_are_explicit_user_override(teacache_cfg: Any) -> bool:
+    """Return True if teacache.coefficients should skip built-in variant table matching.
+
+    Only None means auto (use checkpoint path table). Any non-empty list, including
+    the identity polynomial [1.0, 0.0], is treated as an explicit user override.
+    """
+
+    return teacache_cfg.coefficients is not None
+
+
 class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
@@ -128,6 +138,8 @@ class BasePipeline(nn.Module):
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
+        # Wan 2.2 manual TeaCacheBackend pair; see WanPipeline.post_load_weights
+        self._teacache_backends: List[Any] = []
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -396,41 +408,83 @@ class BasePipeline(nn.Module):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
-    def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
-        """Pick TeaCache coefficients from checkpoint path; updates pipeline config in place."""
+    def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
+        """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
+
+        Precedence:
+
+        1. User-specified TeaCacheConfig.coefficients — any non-None list skips built-in
+           variant matching.
+
+        2. Pipeline table — if step 1 does not apply and coefficients is a non-empty dict
+           (model-specific tables from the pipeline subclass), match
+           pretrained_config._name_or_path against keys and set coefficients (and optional
+           default_thresh).
+
+        3. If coefficients are still unresolved after step 2, _setup_cache_acceleration
+           raises: TeaCache must not run without resolved coefficients.
+
+        Args:
+            coefficients: Optional mapping from variant key to coefficient list or nested
+                dict (ret_steps / standard), from the pipeline subclass.
+        """
+        teacache_cfg = self.pipeline_config.teacache
+        if teacache_cfg is None:
+            return
+        if _teacache_coefficients_are_explicit_user_override(teacache_cfg):
+            logger.info(
+                "TeaCache: Using user-configured coefficients "
+                "(skipping built-in checkpoint variant matching)"
+            )
+            return
+
+        teacache_explicit = teacache_cfg.model_dump(exclude_unset=True)
+
         if not coefficients:
             return
-        teacache_cfg = self.pipeline_config.teacache
-        checkpoint_path = getattr(
-            self.pipeline_config.primary_pretrained_config, "_name_or_path", ""
+
+        checkpoint_path = (
+            getattr(self.pipeline_config.primary_pretrained_config, "_name_or_path", "") or ""
         )
-        matched = False
+
         for model_size, coeff_data in coefficients.items():
-            if model_size.lower() in checkpoint_path.lower():
-                matched = True
-                if isinstance(coeff_data, dict):
-                    mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                    if mode in coeff_data:
-                        teacache_cfg.coefficients = coeff_data[mode]
-                        logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                    default_thresh = coeff_data.get("default_thresh")
-                    if (
-                        default_thresh is not None
-                        and "teacache_thresh" not in teacache_cfg.model_fields_set
-                    ):
-                        teacache_cfg.teacache_thresh = default_thresh
-                        logger.info(
-                            f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                        )
-                else:
-                    teacache_cfg.coefficients = coeff_data
-                    logger.info(f"TeaCache: Using {model_size} coefficients")
+            # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
+            path_l = checkpoint_path.lower()
+            key_l = model_size.lower()
+            if key_l not in path_l:
+                continue
+
+            if isinstance(coeff_data, dict):
+                # Select coefficient set based on warmup mode
+                mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                if mode not in coeff_data:
+                    logger.warning(
+                        "TeaCache: matched variant %r but table has no %r entry "
+                        "(available keys: %s). Trying other variants.",
+                        model_size,
+                        mode,
+                        list(coeff_data.keys()),
+                    )
+                    continue
+                teacache_cfg.coefficients = coeff_data[mode]
+                logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                # Apply model-specific default threshold if user didn't explicitly set one
+                default_thresh = coeff_data.get("default_thresh")
+                if default_thresh is not None and "teacache_thresh" not in teacache_explicit:
+                    teacache_cfg.teacache_thresh = default_thresh
+                    logger.info(f"TeaCache: Using {model_size} default threshold {default_thresh}")
                 break
-        if not matched:
+            else:
+                # Single coefficient list (no mode distinction)
+                teacache_cfg.coefficients = coeff_data
+                logger.info(f"TeaCache: Using {model_size} coefficients")
+                break
+        else:
             raise ValueError(
                 f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
                 f"Available variants: {list(coefficients.keys())}. "
-                f"TeaCache is not supported for this model variant."
+                f"Set teacache.coefficients explicitly in VisualGenArgs to use TeaCache anyway, "
+                f"or use a checkpoint path that contains one of the variant keys."
             )
 
     def _setup_cache_acceleration(
@@ -456,15 +510,28 @@ class BasePipeline(nn.Module):
         if not use_teacache:
             return
 
-        BasePipeline._apply_teacache_coefficients(self, coefficients)
+        self._apply_teacache_coefficients(coefficients)
+
+        teacache_cfg = cfg.teacache
+        if teacache_cfg is None or teacache_cfg.coefficients is None:
+            raise ValueError(
+                "TeaCache is enabled but no polynomial coefficients were resolved. "
+                "Set teacache.coefficients in VisualGenArgs, or use a pipeline and "
+                "checkpoint whose path matches a built-in coefficient table."
+            )
 
         if model is None:
             return
 
         acc = TeaCacheAccelerator(cfg.teacache)
         acc.wrap(model=model)
-        if acc.is_enabled():
-            self.cache_accelerator = acc
+        self.cache_accelerator = acc
+
+    def _refresh_teacache_backends(self, total_steps: int) -> None:
+        """Reset manual TeaCache backends (e.g. Wan 2.2 dual transformers)."""
+        for backend in self._teacache_backends:
+            if backend is not None and backend.is_enabled():
+                backend.refresh(total_steps)
 
     def setup_parallel_vae(self):
         """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
@@ -981,6 +1048,7 @@ class BasePipeline(nn.Module):
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
+        self._refresh_teacache_backends(total_steps)
 
         if self.rank == 0:
             if has_extra_streams:

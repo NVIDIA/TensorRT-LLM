@@ -13,6 +13,7 @@ from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT
 
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
+    TeaCacheBackend,
     register_extractor_from_config,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
@@ -95,13 +96,6 @@ class WanImageToVideoPipeline(BasePipeline):
             pipeline_config.primary_pretrained_config, "boundary_ratio", None
         )
         self.is_wan22_14b = self.boundary_ratio is not None
-
-        # Validate TeaCache compatibility before allocating GPU memory
-        if self.is_wan22_14b and pipeline_config.cache_backend == "teacache":
-            raise ValueError(
-                "TeaCache is not supported for Wan 2.2 models. "
-                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
-            )
 
         super().__init__(pipeline_config)
 
@@ -342,11 +336,38 @@ class WanImageToVideoPipeline(BasePipeline):
             else:
                 if self.pipeline_config.cache_backend == "cache_dit":
                     self._setup_cache_acceleration(self.transformer, coefficients=None)
-                self.transformer_cache_backend = self.cache_accelerator
+                    self.transformer_cache_backend = self.cache_accelerator
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
+
+        if (
+            self.transformer is not None
+            and self.transformer_2 is not None
+            and self.pipeline_config.cache_backend == "teacache"
+        ):
+            self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
+            tc = self.pipeline_config.teacache
+            if tc.coefficients is None or tc.coefficients_2 is None:
+                raise ValueError(
+                    "Wan 2.2 TeaCache requires explicit teacache.coefficients and "
+                    "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
+                    "There is no built-in coefficient table for Wan 2.2."
+                )
+            cfg_high = tc.model_copy()
+            cfg_low = tc.model_copy(update={"coefficients": tc.coefficients_2})
+            logger.info("TeaCache: Initializing (Wan 2.2 I2V high-noise transformer)...")
+            self.cache_backend = TeaCacheBackend(cfg_high)
+            self.cache_backend.enable(self.transformer)
+            self.transformer_cache_backend = self.cache_backend
+            logger.info("TeaCache: Initializing (Wan 2.2 I2V low-noise transformer_2)...")
+            self.transformer_2_cache_backend = TeaCacheBackend(cfg_low)
+            self.transformer_2_cache_backend.enable(self.transformer_2)
+            self._teacache_backends = [
+                self.cache_backend,
+                self.transformer_2_cache_backend,
+            ]
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         dummy_image = PIL.Image.new("RGB", (width, height))

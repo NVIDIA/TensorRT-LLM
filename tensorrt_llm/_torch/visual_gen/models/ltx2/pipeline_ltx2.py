@@ -16,7 +16,7 @@ import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
-from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -1012,13 +1012,18 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
-        # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
-        # To re-enable, uncomment the following lines and verify coefficients.
-        # register_extractor(
-        #     "LTXModel",
-        #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
-        # )
-        # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with explicit coefficients.
+        if self.transformer is not None and self.pipeline_config.cache_backend == "teacache":
+            if self.pipeline_config.teacache.coefficients is None:
+                raise ValueError(
+                    "TeaCache on LTX-2 requires explicit teacache.coefficients "
+                    "(no built-in coefficient table)."
+                )
+            register_extractor(
+                "LTXModel",
+                LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
+            )
+            self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Cache-DiT
         if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
