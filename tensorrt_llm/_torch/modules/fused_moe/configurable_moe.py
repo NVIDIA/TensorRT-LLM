@@ -629,6 +629,12 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "create_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement create_weights()"
         )
+        # Sync quant_config to backend before creating weights.
+        # apply_layerwise_quant_config() matches modules by name (e.g. "model.layers.X.mlp.experts"),
+        # but the backend's module name has a ".backend" suffix that prevents matching.
+        # Propagate the (possibly updated) quant_config from ConfigurableMoE to backend here
+        # so that backend._get_quant_method() uses the correct per-layer quantization config.
+        self.backend.quant_config = self.quant_config
         return self.backend.create_weights()
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
