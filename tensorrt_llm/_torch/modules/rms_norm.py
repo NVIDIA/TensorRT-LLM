@@ -25,6 +25,17 @@ from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import Fp4QuantizedTensor
 
+# Hidden-dim bounds of the warp-specialized fused_add_rms_norm_quant kernel
+# (cpp/tensorrt_llm/thop/fusedAddRMSNormQuant.cpp).
+_WS_MIN_N = 2048
+_WS_MAX_N = 16384
+# Row-count crossover for the layer-boundary add+RMSNorm+quant edge: below this
+# the one-CTA-per-row reduce_fusion kernel (fused_add_rmsnorm_fp4_quantize) is
+# faster; at/above it the warp-specialized kernel's DMA-ahead pipeline wins.
+# Measured at N=7168 on GB200 (ws first overtakes at M=4096, ~6% faster; M<=3072
+# favors reduce_fusion). See analysis/bench_rmsnorm_threshold_n7168.py.
+_WS_M_THRESHOLD = 4096
+
 
 class RMSNorm(nn.Module):
 
@@ -93,6 +104,8 @@ class RMSNorm(nn.Module):
         residual: Union[
             Optional[torch.Tensor],
             _ArgumentNotSpecifiedSentinelType] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
+        *,
+        return_norm_out: bool = False,
     ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
             torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]], Tuple[
                 Fp4QuantizedTensor, torch.Tensor, torch.Tensor]]:
@@ -100,63 +113,23 @@ class RMSNorm(nn.Module):
         if not has_residual:
             residual = None
 
-        if self.is_nvfp4 and has_residual and not self.use_gemma:
-            nvfp4_scale = getattr(self, "nvfp4_scale", None)
-            if nvfp4_scale is None:
-                raise ValueError(
-                    f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
-                    "but no `nvfp4_scale` is attached; ")
-
-            orig_shape = tuple(hidden_states.shape)
-            n = int(orig_shape[-1])
-            hs_2d = hidden_states.reshape(-1, n).contiguous()
-            res_2d = residual.reshape(-1, n)
-            gamma = self.weight
-
-            def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
-                if t.dtype != hs_2d.dtype:
-                    raise ValueError(
-                        f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}."
-                    )
-                return t.contiguous()
-
-            res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
-            gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
-
-            if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
-                raise RuntimeError(
-                    "RMSNorm NVFP4 fused path requires all tensors on the same device. "
-                    f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
-                )
-
-            sf_scale = nvfp4_scale.contiguous()
-
-            results = torch.ops.trtllm.fused_add_rms_norm_quant(
-                hs_2d,
-                res_2d,
-                gamma,
-                sf_scale,
-                True,
-                eps=self.variance_epsilon,
-                output_hp_norm=self.return_hp_output,
-            )
-            normed_fp4_i32, residual_out_2d, sf_fused = results[:3]
-            normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
-            if len(orig_shape) != 2:
-                normed_fp4_u8 = normed_fp4_u8.reshape(*orig_shape[:-1], n // 2)
-                residual_out = residual_out_2d.reshape(orig_shape)
-            else:
-                residual_out = residual_out_2d
-
-            hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
-
-            outputs = [hidden_states_fused]
-            if has_residual:
-                outputs.append(residual_out)
-            if self.return_hp_output:
-                high_precision_normed_output = results[3].reshape(orig_shape)
-                outputs.append(high_precision_normed_output)
-            return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        # Fused (add +) RMSNorm + NVFP4 input-quantize: when this norm feeds an
+        # NVFP4 Linear whose static input_scale is attached as self.nvfp4_scale,
+        # fold this norm and that Linear's input-quant into one kernel. With a
+        # residual this is the layer-boundary add+RMSNorm+quant; without, the
+        # residual-less variant (e.g. q_a_layernorm -> q_b_proj). The actual
+        # kernel is chosen by a size gate inside _fused_nvfp4_quant. The BF16
+        # post-RMSNorm value is also produced when return_norm_out (stashed on
+        # the Fp4QuantizedTensor for DSA consumers / returned for residual-less
+        # callers) or when self.return_hp_output (appended as an extra output
+        # for MoE-gate consumers). When is_nvfp4 but no scale is attached yet
+        # (e.g. a layer's first input_layernorm whose consumer has no static
+        # scale), fall through to the plain norm below.
+        nvfp4_scale = getattr(self, "nvfp4_scale",
+                              None) if self.is_nvfp4 else None
+        if nvfp4_scale is not None and not self.use_gemma:
+            return self._fused_nvfp4_quant(hidden_states, residual, nvfp4_scale,
+                                           return_norm_out)
 
         if self.return_hp_output:
             raise ValueError(
@@ -228,6 +201,145 @@ class RMSNorm(nn.Module):
             return hidden_states, cast(Optional[torch.Tensor], residual)
         else:
             return hidden_states
+
+    def _ws_kernel_eligible(self, hidden_states: torch.Tensor,
+                            residual: Optional[torch.Tensor]) -> bool:
+        """Whether the warp-specialized fused_add_rms_norm_quant kernel should
+        serve this call instead of the one-CTA-per-row reduce_fusion kernel.
+
+        ws only wins, and is only legal, for the contiguous rank-2 residual-add
+        edge with a large enough row count and an in-range hidden dim. The
+        residual-less and row-strided (column-slice) edges have no ws equivalent
+        and always use reduce_fusion. See _WS_M_THRESHOLD / _WS_MIN_N."""
+        if residual is None:
+            return False
+        n = hidden_states.shape[-1]
+        if not (_WS_MIN_N <= n <= _WS_MAX_N and n % 16 == 0):
+            return False
+        m = 1
+        for d in hidden_states.shape[:-1]:
+            m *= d
+        if m < _WS_M_THRESHOLD:
+            return False
+        # ws requires contiguous rank-2 input + residual (it cannot read a
+        # row-strided column slice and issues padded vectorized stores).
+        return hidden_states.is_contiguous() and residual.is_contiguous()
+
+    def _fused_nvfp4_quant(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        sf_scale: torch.Tensor,
+        return_norm_out: bool,
+    ):
+        """Fold this (add +) RMSNorm + the consuming NVFP4 Linear's input-quant
+        into one kernel. ``sf_scale`` is that Linear's static input_scale.
+
+        Picks the kernel by problem size (see _ws_kernel_eligible): the
+        warp-specialized ``fused_add_rms_norm_quant`` for the large contiguous
+        residual edge, else the one-CTA-per-row ``fused_add_rmsnorm_fp4_quantize``
+        / ``fused_rmsnorm_fp4_quantize`` (which also serve the residual-less and
+        row-strided column-slice edges ws cannot).
+
+        With a residual: returns ``(Fp4QuantizedTensor, residual_out)``. Without:
+        returns an ``Fp4QuantizedTensor`` (the residual-less q_a edge). When
+        ``return_norm_out`` the BF16 post-RMSNorm view is stashed on the
+        Fp4QuantizedTensor's ``bf16_hidden_states`` (and, residual-less, returned
+        alongside). When ``self.return_hp_output`` the BF16 normed value is
+        appended as a trailing output for MoE-gate consumers."""
+        # Either flag means "also produce the BF16 normed value".
+        want_norm = return_norm_out or self.return_hp_output
+
+        if self._ws_kernel_eligible(hidden_states, residual):
+            return self._fused_nvfp4_quant_ws(hidden_states, residual, sf_scale,
+                                              return_norm_out)
+
+        if residual is not None:
+            results = torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
+                hidden_states,
+                residual,
+                self.weight,
+                sf_scale,
+                float(self.variance_epsilon),
+                want_norm,
+            )
+            if want_norm:
+                bf16_hs, act_fp4, act_sf, residual_out = results
+            else:
+                act_fp4, act_sf, residual_out = results
+                bf16_hs = None
+            fp4 = Fp4QuantizedTensor(act_fp4,
+                                     act_sf,
+                                     bf16_hidden_states=bf16_hs)
+            outputs = [fp4, residual_out]
+            if self.return_hp_output:
+                outputs.append(bf16_hs)
+            return tuple(outputs)
+
+        orig_shape = tuple(hidden_states.shape)
+        n = orig_shape[-1]
+        hs_2d = hidden_states.reshape(-1, n)
+        results = torch.ops.trtllm.fused_rmsnorm_fp4_quantize(
+            hs_2d,
+            self.weight,
+            sf_scale,
+            float(self.variance_epsilon),
+            want_norm,
+        )
+        if want_norm:
+            norm_out, act_fp4, act_sf = results
+            norm_out = norm_out.reshape(orig_shape)
+        else:
+            act_fp4, act_sf = results
+            norm_out = None
+        if len(orig_shape) != 2:
+            act_fp4 = act_fp4.reshape(*orig_shape[:-1], n // 2)
+        fp4 = Fp4QuantizedTensor(act_fp4, act_sf, bf16_hidden_states=norm_out)
+        return (fp4, norm_out) if return_norm_out else fp4
+
+    def _fused_nvfp4_quant_ws(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        sf_scale: torch.Tensor,
+        return_norm_out: bool,
+    ):
+        """Warp-specialized fused add+RMSNorm+NVFP4-quant
+        (torch.ops.trtllm.fused_add_rms_norm_quant) for the large contiguous
+        residual edge. Returns the same shape as the reduce_fusion residual
+        branch of _fused_nvfp4_quant."""
+        want_norm = return_norm_out or self.return_hp_output
+        orig_shape = tuple(hidden_states.shape)
+        n = int(orig_shape[-1])
+        hs_2d = hidden_states.reshape(-1, n).contiguous()
+        res_2d = residual.reshape(-1, n).contiguous()
+        gamma = self.weight.contiguous()
+
+        results = torch.ops.trtllm.fused_add_rms_norm_quant(
+            hs_2d,
+            res_2d,
+            gamma,
+            sf_scale.contiguous(),
+            True,
+            eps=self.variance_epsilon,
+            output_hp_norm=want_norm,
+        )
+        normed_fp4_i32, residual_out_2d, sf_fused = results[:3]
+        normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
+        if len(orig_shape) != 2:
+            normed_fp4_u8 = normed_fp4_u8.reshape(*orig_shape[:-1], n // 2)
+            residual_out = residual_out_2d.reshape(orig_shape)
+        else:
+            residual_out = residual_out_2d
+
+        bf16_hs = results[3].reshape(orig_shape) if want_norm else None
+        fp4 = Fp4QuantizedTensor(normed_fp4_u8,
+                                 sf_fused,
+                                 bf16_hidden_states=bf16_hs)
+        outputs = [fp4, residual_out]
+        if self.return_hp_output:
+            outputs.append(bf16_hs)
+        return tuple(outputs)
 
     def skip_forward(
         self,
