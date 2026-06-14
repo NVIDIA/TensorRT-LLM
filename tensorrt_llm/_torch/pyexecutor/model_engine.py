@@ -2820,6 +2820,17 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
                 input_ids_start_offset=context_start_idx)
+            # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
+            # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
+            # not from the request.
+            # NOTE: the prefetch producer always writes the cached embedding into
+            # `py_multimodal_data` before stamping the event, so whenever the event is present,
+            # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
+            # it.
+            mm_encoder_event = request.py_mm_encoder_event
+            if mm_encoder_event is not None:
+                multimodal_params.encoder_event = mm_encoder_event
+                request.py_mm_encoder_event = None
             if multimodal_params.has_content():
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
