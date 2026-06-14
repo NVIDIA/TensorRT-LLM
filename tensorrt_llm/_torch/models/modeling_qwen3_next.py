@@ -293,6 +293,47 @@ class _DenseMlpAdapter(nn.Module):
         )
 
 
+def _layer_norm_is_nvfp4(model_config: ModelConfig[Qwen3NextConfig],
+                         layer_idx: int) -> bool:
+    """Whether this layer's *input* RMSNorm may fuse the NVFP4 quantization of
+    its downstream mixer (mirrors NemotronH's per-layer detection).
+
+    The fused `RMSNorm` path emits an `Fp4QuantizedTensor` that is consumed by
+    the layer's first mixer linear (GDN `in_proj_qkvz`/`in_proj_ba` -- which
+    share the same `input_scale` -- or attention `qkv_proj`).  Only enable it
+    when the checkpoint is NVFP4-quantized and the fused
+    `fused_add_rms_norm_quant` kernel constraints hold.
+    """
+    quant_config = getattr(model_config, "quant_config", None)
+    quant_mode = quant_config.quant_mode if quant_config is not None else None
+    is_nvfp4 = quant_mode is not None and quant_mode.has_nvfp4()
+    # MIXED_PRECISION checkpoints carry a global QuantMode(0); fall back to the
+    # per-layer quant_config_dict to detect NVFP4 layers.
+    quant_config_dict = getattr(model_config, "quant_config_dict", None)
+    if not is_nvfp4 and quant_config_dict is not None:
+        layer_prefix = f"model.layers.{layer_idx}."
+        for key, cfg in quant_config_dict.items():
+            if key.startswith(layer_prefix) and cfg.quant_mode.has_nvfp4():
+                is_nvfp4 = True
+                break
+
+    # Fused RMSNorm+NVFP4 kernel constraints (fusedAddRMSNormQuant.cpp).
+    hidden_size = model_config.pretrained_config.hidden_size
+    if is_nvfp4 and not (2048 <= hidden_size <= 16384
+                         and hidden_size % 16 == 0):
+        logger.warning_once(
+            f"Qwen3Next layer {layer_idx}: disabling fused NVFP4 RMSNorm for "
+            f"hidden_size={hidden_size} (requires 2048 <= hidden_size <= 16384 "
+            "and hidden_size % 16 == 0); using non-fused path.",
+            key="qwen3next_disable_nvfp4_rmsnorm_hidden_size",
+        )
+        is_nvfp4 = False
+    # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
+    if is_nvfp4 and getattr(model_config, "lora_config", None) is not None:
+        is_nvfp4 = False
+    return is_nvfp4
+
+
 def _create_mlp(model_config, aux_stream, layer_idx):
     """Create the appropriate MLP for this layer: MoE or dense GatedMLP."""
     config = model_config.pretrained_config
@@ -334,10 +375,20 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
 
         self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_gemma=True)
+        # Fuse the NVFP4 quantization of the downstream GDN in_proj into the
+        # input RMSNorm.  This norm also serves as the previous layer's
+        # next_layer_layernorm (wired in post_load_weights), so configuring it
+        # here covers every fused norm feeding this layer's mixer.  The actual
+        # `nvfp4_scale` is attached in post_load_weights once input scales are
+        # finalized; it is disabled there if the scale is unavailable.
+        self.is_nvfp4 = _layer_norm_is_nvfp4(model_config, layer_idx)
+
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+            quantize_type="nvfp4" if self.is_nvfp4 else None)
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
@@ -365,6 +416,12 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                                        or self.enable_attention_dp)
 
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+
+    def input_norm_scale_source(self) -> Optional[Linear]:
+        """First downstream linear consuming `input_layernorm`'s output; its
+        `input_scale` is fused into the norm for NVFP4 (GDN `in_proj_qkvz` and
+        `in_proj_ba` share the same input_scale)."""
+        return self.linear_attn.in_proj_qkvz
 
     def forward(
         self,
@@ -498,10 +555,16 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
 
         self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
 
-        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
-                                       eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype,
-                                       use_gemma=True)
+        # See Qwen3NextLinearDecoderLayer: fuse the downstream attention
+        # qkv_proj NVFP4 quantization into the input RMSNorm.
+        self.is_nvfp4 = _layer_norm_is_nvfp4(model_config, layer_idx)
+
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+            quantize_type="nvfp4" if self.is_nvfp4 else None)
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
@@ -528,6 +591,11 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.disable_attn_allreduce = (self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
         self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+
+    def input_norm_scale_source(self) -> Optional[Linear]:
+        """First downstream linear consuming `input_layernorm`'s output; its
+        `input_scale` is fused into the norm for NVFP4."""
+        return self.self_attn.qkv_proj
 
     def forward(
         self,
@@ -988,3 +1056,23 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+        # Attach the downstream mixer linear's NVFP4 input_scale to each layer's
+        # input RMSNorm so the fused norm+quant path can run.  Input scales are
+        # finalized during process_weights_after_loading, so this must happen
+        # here.  `input_layernorm` doubles as the previous layer's
+        # next_layer_layernorm, so configuring it covers every fused norm that
+        # feeds a mixer.  Iterate all layers (incl. the MTP layer, if present);
+        # fall back to the non-fused path when the downstream linear is not
+        # NVFP4 (e.g. an excluded/unquantized layer).
+        for layer in self.model.layers:
+            norm = getattr(layer, "input_layernorm", None)
+            if norm is None or not getattr(norm, "is_nvfp4", False):
+                continue
+            scale_source = layer.input_norm_scale_source()
+            input_scale = getattr(scale_source, "input_scale", None)
+            if input_scale is not None:
+                norm.nvfp4_scale = input_scale
+            else:
+                norm.is_nvfp4 = False
+                norm.return_hp_output = False
