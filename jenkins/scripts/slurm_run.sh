@@ -7,28 +7,6 @@ trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAN
 cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
-set_value_in_command() {
-    # Parameters
-    local key="$1"
-    local value="$2"
-    local command="$3"
-
-    # Transform the key
-    local placeholder="__PLACEHOLDER_${key}__"
-
-    # Check if placeholder exists
-    if [[ "$command" != *"$placeholder"* ]]; then
-        echo "Error: placeholder '$placeholder' not found in the command" >&2
-        return 1
-    fi
-
-    # Replace all occurrences
-    local result="${command//${placeholder}/${value}}"
-
-    # Return the result
-    echo "$result"
-}
-
 # Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
     # Update HOME/.gitconfig
@@ -54,18 +32,14 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
-# get trtllm wheel path and add to pytest command
+# Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-# In disaggregated mode, we only set coverage config file in benchmark pytest.
-if [[ -z "${DISAGG_SERVING_TYPE:-}" || "${DISAGG_SERVING_TYPE}" == "BENCHMARK" ]]; then
-    pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
-fi
 
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then
-    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+    sed -i "s|@TRTLLM_WHEEL_PATH@|$trtllmWhlPath|g" "$coverageConfigFile"
 else
     # Sleep 30 seconds to wait for the coverage config file to be saved
     sleep 30
@@ -120,6 +94,15 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+
+# CBTS coverage liveness signal: log case count vs cases with coverage data, gated on the sysmon rcfile (CBTS stages only).
+if [ $SLURM_PROCID -eq 0 ] && grep -q 'core = sysmon' "$coverageConfigFile" 2>/dev/null; then
+    jobWorkspace=$(dirname "$coverageConfigFile")
+    python3 $llmSrcNode/jenkins/scripts/cbts/coverage_utils/coverage_summary.py \
+        --cov-glob "$jobWorkspace/.coverage.$stageName*" \
+        --junit-glob "$jobWorkspace/results*.xml" \
+        --stage "$stageName" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
