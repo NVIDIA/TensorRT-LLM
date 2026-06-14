@@ -61,16 +61,19 @@ public:
         std::string const& directory = "");
 
     //! \brief Synchronize internal streams with bufferManager stream.
-    //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the
-    //! internal kernels used for offloading and onboarding will wait for prefill and decode kernels before performing
-    //! any block copies. This method must be called before the first call to
-    //! KVCacheManager::addSequenceBatch in every step.
+    //! \details This method ensures that the internal kernels used for offloading and onboarding will wait for work
+    //! previously scheduled on the buffer manager stream before performing any block copies. This method must be called
+    //! before the first call to KVCacheManager::addSequenceBatch in every step when the buffer manager stream
+    //! represents the work that block transfers depend on.
     void syncWithBufferManager();
 
     //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
     //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
     //! must be called after the last call to KVCacheManager::addSequenceBatch in every step.
     void syncTransfers();
+
+    //! \brief Whether any host-to-device or device-to-host transfer has been scheduled and not yet synchronized.
+    [[nodiscard]] bool hasPendingHostTransfers() const;
 
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
@@ -111,6 +114,7 @@ private:
     // identifies the raw memory blocks involved in I/O, not the block Id.
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
+    bool mHasPendingHostTransfers{false};
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;

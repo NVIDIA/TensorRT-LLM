@@ -666,7 +666,10 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(
+            self,
+            scheduled_batch: ScheduledRequests,
+            forward_done_event: Optional[torch.cuda.Event] = None):
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
@@ -737,6 +740,9 @@ class KVCacheManager(BaseResourceManager):
                     self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
+            if (forward_done_event is not None
+                    and self.impl.has_pending_host_transfers()):
+                forward_done_event.synchronize()
             self.impl.refresh_blocks()
 
         # A request may change from `context_requests_chunking` to
@@ -2167,10 +2173,17 @@ class ResourceManager:
         return self.resource_managers.get(type)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(
+            self,
+            scheduled_batch: ScheduledRequests,
+            forward_done_event: Optional[torch.cuda.Event] = None):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
-                resource_manager.prepare_resources(scheduled_batch)
+                if isinstance(resource_manager, KVCacheManager):
+                    resource_manager.prepare_resources(scheduled_batch,
+                                                       forward_done_event)
+                else:
+                    resource_manager.prepare_resources(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(

@@ -1183,6 +1183,9 @@ public:
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
 
+    //! \brief Whether any host-to-device or device-to-host transfer has been scheduled and not yet synchronized
+    [[nodiscard]] bool hasPendingHostTransfers() const;
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -1825,6 +1828,9 @@ public:
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
 
+    //! \brief Whether any host-to-device or device-to-host transfer has been scheduled and not yet synchronized
+    [[nodiscard]] bool hasPendingHostTransfers() const;
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -2091,6 +2097,7 @@ public:
     [[nodiscard]] virtual bool isPoolLayerFirst(SizeType32 layer_idx) const = 0;
 
     virtual void syncTransferManagerWithBufferManager() = 0;
+    [[nodiscard]] virtual bool hasPendingHostTransfers() const = 0;
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
     virtual void resetReuseState() = 0;
@@ -2577,6 +2584,11 @@ public:
     void syncTransferManagerWithBufferManager() override
     {
         mBlockManager.syncTransferManagerWithBufferManager();
+    }
+
+    [[nodiscard]] bool hasPendingHostTransfers() const override
+    {
+        return mBlockManager.hasPendingHostTransfers();
     }
 
     //! \brief Perform per-iteration bookkeeping

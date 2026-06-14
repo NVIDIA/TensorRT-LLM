@@ -2129,6 +2129,23 @@ void WindowBlockManager::syncTransferManagerWithBufferManager()
     mTransferManager->syncWithBufferManager();
 }
 
+bool BlockManager::hasPendingHostTransfers() const
+{
+    for (auto const& [_, manager] : mWindowBlockManagers)
+    {
+        if (manager.hasPendingHostTransfers())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WindowBlockManager::hasPendingHostTransfers() const
+{
+    return mTransferManager->hasPendingHostTransfers();
+}
+
 void BlockManager::refreshBlocks()
 {
     for (auto& [_, manager] : mWindowBlockManagers)
