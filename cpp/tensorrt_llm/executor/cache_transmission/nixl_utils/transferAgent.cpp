@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -592,6 +592,13 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     mDRamDstBuffer.resize(16);
     MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
     registerMemory(descs);
+
+    // P2P fast-path agent. Constructed after the NIXL agent so that it queries the CUDA
+    // device context already set up by NIXL. Disabled via TRTLLM_KV_TRANSFER_P2P_DISABLE.
+    if (!common::getEnvKvTransferP2pDisable())
+    {
+        mP2pAgent = std::make_unique<P2pTransferAgent>();
+    }
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -616,6 +623,13 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
     TLLM_CHECK(status == NIXL_SUCCESS);
+
+    // Export P2P handles for VRAM. This runs its own cuMemGetAddressRange-based scan
+    // independent of VmmDescSplitter — the two paths record different information.
+    if (descs.getType() == MemoryType::kVRAM && mP2pAgent)
+    {
+        mP2pAgent->exporter().exportHandles(descs);
+    }
 }
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
@@ -637,6 +651,10 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
         for (auto const& desc : descs.getDescs())
         {
             mLocalVramRegionInfo.erase(desc.getAddr());
+        }
+        if (mP2pAgent)
+        {
+            mP2pAgent->exporter().removeHandles(descs);
         }
     }
 }
@@ -662,6 +680,16 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
             remoteMap[r.baseAddr] = {r.totalLen, r.chunkSize};
         }
     }
+
+    // Import P2P memory from the peer (fabric / POSIX FD / CUDA IPC handles).
+    if (mP2pAgent && !agentDesc.getP2pBlob().empty())
+    {
+        auto info = P2pMemInfo::deserialize(agentDesc.getP2pBlob());
+        if (info.has_value() && info->supported)
+        {
+            mP2pAgent->registry().importAndMap(name, *info);
+        }
+    }
 }
 
 AgentDesc NixlTransferAgent::getLocalAgentDesc()
@@ -680,68 +708,240 @@ AgentDesc NixlTransferAgent::getLocalAgentDesc()
         }
     }
 
-    return AgentDesc{nixlBlob, std::move(regions)};
+    // Single locked call inside the exporter — atomic supported-check + serialize.
+    // The previous "isSupported() then getLocalInfo().serialize()" pair raced with
+    // concurrent registerMemory, which could mutate mLocalInfo between the two reads.
+    std::string p2pBlob = mP2pAgent ? mP2pAgent->serializeLocalInfoIfSupported() : std::string{};
+
+    return AgentDesc{nixlBlob, std::move(regions), std::move(p2pBlob)};
 }
 
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     // Clean up remote VMM region info before invalidating the remote agent.
     mRemoteVramRegionInfo.erase(name);
+    if (mP2pAgent)
+    {
+        mP2pAgent->registry().cleanup(name);
+    }
     mRawAgent->invalidateRemoteMD(name);
 }
 
-[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
+// Build and post a NIXL xfer request. Shared by the pure-NIXL path (all segments or no
+// P2P mapping available) and the mixed path (only the segments that failed P2P translate
+// are forwarded here). Ownership of the returned handle moves into NixlTransferStatus.
+[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitNixlTransferInternal(TransferOp op,
+    MemoryDescs const& srcDescs, MemoryDescs const& dstDescs, std::string const& remoteName,
+    std::optional<SyncMessage> const& syncMessage)
 {
     nixl_status_t status;
     nixlXferReqH* handle;
 
-    if (request.getSyncMessage().has_value())
+    // Use a local copy of mExtraParams so two concurrent submitters don't race on hasNotif/notifMsg.
+    nixl_opt_args_t localParams = mExtraParams;
+    if (syncMessage.has_value())
     {
-        mExtraParams.hasNotif = true;
-
-        mExtraParams.notifMsg = request.getSyncMessage().value();
+        localParams.hasNotif = true;
+        localParams.notifMsg = syncMessage.value();
     }
     else
     {
-        mExtraParams.hasNotif = false;
+        localParams.hasNotif = false;
     }
-    // Split transfer descriptors at VMM chunk boundaries to match registered memory.
-    // Both src and dst are split at chunk boundaries to ensure each descriptor
-    // falls within a single registered memory region on both local and remote sides.
-    // Find remote agent's VMM region map (empty map if not found).
+
     static VramRegionMap const kEmptyMap;
-    auto remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
+    auto remoteIt = mRemoteVramRegionInfo.find(remoteName);
     auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
 
-    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
-        request.getSrcDescs(), request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap);
+    auto [splitSrc, splitDst]
+        = VmmDescSplitter::splitTransferDescsWithRegionMaps(srcDescs, dstDescs, mLocalVramRegionInfo, remoteRegionMap);
 
-    // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
-    // This matches the coalescing done during registerMemory()
-    // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
     if (common::getEnvNixlEnableCoalesce())
     {
         NVTX3_SCOPED_RANGE(coalesceTransferDescs_CreateXferReq);
         auto [coalescedSrc, coalescedDst] = NixlHelper::coalesceTransferDescs(splitSrc, splitDst);
-        status
-            = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
-                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
+        status = mRawAgent->createXferReq(NixlHelper::convert(op), NixlHelper::convertXferDist(coalescedSrc),
+            NixlHelper::convertXferDist(coalescedDst), remoteName, handle, &localParams);
     }
     else
     {
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(splitSrc),
-            NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &mExtraParams);
+        status = mRawAgent->createXferReq(NixlHelper::convert(op), NixlHelper::convertXferDist(splitSrc),
+            NixlHelper::convertXferDist(splitDst), remoteName, handle, &localParams);
     }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
         " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
-        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(),
-        request.getRemoteName().c_str());
+        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(), remoteName.c_str());
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, &mExtraParams);
+        status = mRawAgent->postXferReq(handle, &localParams);
     }
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+}
+
+[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
+{
+    NVTX3_SCOPED_RANGE(NixlTransferAgent_submitTransferRequests);
+
+    // ---- P2P eligibility ----
+    // P2P is skipped entirely when:
+    // - No P2P agent configured
+    // - Either endpoint is not VRAM
+    // - Request carries a sync message (NIXL's notification channel is required)
+    // - No remote mapping exists for this peer (import never ran or was cleaned up)
+    // - Mixed mode is disabled via env and the mapping is partial (old all-or-nothing behavior)
+    //
+    // Cache the shared_ptr once so translate() in the per-segment loop is lock-free.
+    std::shared_ptr<RemoteP2pMapping const> remoteMapping
+        = (mP2pAgent && !request.getSyncMessage().has_value() && request.getSrcDescs().getType() == MemoryType::kVRAM
+              && request.getDstDescs().getType() == MemoryType::kVRAM)
+        ? mP2pAgent->registry().get(request.getRemoteName())
+        : nullptr;
+
+    if (remoteMapping == nullptr)
+    {
+        // ---- Pure NIXL path ----
+        mPureNixlCount.fetch_add(1, std::memory_order_relaxed);
+        return submitNixlTransferInternal(request.getOp(), request.getSrcDescs(), request.getDstDescs(),
+            request.getRemoteName(), request.getSyncMessage());
+    }
+
+    auto const& srcDescs = request.getSrcDescs().getDescs();
+    auto const& dstDescs = request.getDstDescs().getDescs();
+    size_t const numSegments = srcDescs.size();
+    TLLM_CHECK_WITH_INFO(numSegments == dstDescs.size(), "Transfer: srcDescs.size(%zu) != dstDescs.size(%zu)",
+        numSegments, dstDescs.size());
+
+    bool const isWrite = (request.getOp() == TransferOp::kWRITE);
+
+    // Bucket each segment into either P2P (translate returned a local mapped ptr) or NIXL
+    // (translate returned nullptr — unmapped pool). A single for-loop visits every segment;
+    // there is no early-break like the old all-or-nothing logic.
+    std::vector<void*> p2pSrcPtrs;
+    std::vector<void*> p2pDstPtrs;
+    std::vector<size_t> p2pSizes;
+    p2pSrcPtrs.reserve(numSegments);
+    p2pDstPtrs.reserve(numSegments);
+    p2pSizes.reserve(numSegments);
+
+    std::vector<MemoryDesc> nixlSrcVec;
+    std::vector<MemoryDesc> nixlDstVec;
+    nixlSrcVec.reserve(numSegments);
+    nixlDstVec.reserve(numSegments);
+
+    size_t p2pBytes = 0;
+
+    for (size_t i = 0; i < numSegments; ++i)
+    {
+        size_t const segSize = srcDescs[i].getLen();
+        // NIXL convention: dstDescs carry REMOTE addresses on the peer.
+        void* mappedRemotePtr = P2pRemoteMappingRegistry::translate(*remoteMapping, dstDescs[i].getAddr(), segSize);
+        if (mappedRemotePtr == nullptr)
+        {
+            nixlSrcVec.push_back(srcDescs[i]);
+            nixlDstVec.push_back(dstDescs[i]);
+            continue;
+        }
+        void* localPtr = reinterpret_cast<void*>(srcDescs[i].getAddr());
+        p2pBytes += segSize;
+        p2pSrcPtrs.push_back(isWrite ? localPtr : mappedRemotePtr);
+        p2pDstPtrs.push_back(isWrite ? mappedRemotePtr : localPtr);
+        p2pSizes.push_back(segSize);
+    }
+
+    bool const havePartialFallback = !nixlSrcVec.empty();
+    bool const mixedDisabled = common::getEnvKvTransferP2pMixedDisable();
+    if (havePartialFallback && mixedDisabled)
+    {
+        // Safety valve: user has asked to preserve the pre-mixed all-or-nothing behavior.
+        // If any segment missed, push the ENTIRE request through NIXL.
+        TLLM_LOG_WARNING("P2pTransfer: mapping incomplete for '%s' and mixed-mode disabled -> full NIXL fallback",
+            request.getRemoteName().c_str());
+        mPureNixlCount.fetch_add(1, std::memory_order_relaxed);
+        return submitNixlTransferInternal(request.getOp(), request.getSrcDescs(), request.getDstDescs(),
+            request.getRemoteName(), request.getSyncMessage());
+    }
+
+    // Helper to submit the P2P half via the appropriate path (cub vs memcpyBatch).
+    auto submitP2pHalf = [&]() -> std::unique_ptr<TransferStatus>
+    {
+        if (p2pSrcPtrs.empty())
+        {
+            return nullptr;
+        }
+        size_t const avgSegmentSize = p2pBytes / p2pSrcPtrs.size();
+        size_t const thresholdBytes = common::getEnvKvTransferP2pBatchThresholdKB() * 1024;
+        auto& ctx = mP2pAgent->contextForCurrentThread();
+        if (avgSegmentSize < thresholdBytes)
+        {
+            mCubSubmitCount.fetch_add(1, std::memory_order_relaxed);
+            TLLM_LOG_DEBUG("P2pTransfer: cub path %zu/%zu segs avgSize=%zuB total=%zuB to %s (op=%s)",
+                p2pSrcPtrs.size(), numSegments, avgSegmentSize, p2pBytes, request.getRemoteName().c_str(),
+                isWrite ? "WRITE" : "READ");
+            return ctx.submitWithCubBatched(p2pSrcPtrs, p2pDstPtrs, p2pSizes);
+        }
+        mMemcpyBatchSubmitCount.fetch_add(1, std::memory_order_relaxed);
+        TLLM_LOG_DEBUG("P2pTransfer: memcpyBatch path %zu/%zu segs avgSize=%zuB total=%zuB to %s (op=%s)",
+            p2pSrcPtrs.size(), numSegments, avgSegmentSize, p2pBytes, request.getRemoteName().c_str(),
+            isWrite ? "WRITE" : "READ");
+        return ctx.submitWithMemcpyBatch(p2pSrcPtrs, p2pDstPtrs, p2pSizes);
+    };
+
+    // ---- Case A: every segment mapped -> P2P only (same as old fast path). ----
+    if (!havePartialFallback)
+    {
+        mPureP2pCount.fetch_add(1, std::memory_order_relaxed);
+        return submitP2pHalf();
+    }
+
+    // ---- Case B: no segment mapped -> NIXL only.
+    // translate() returned nullptr for every segment, which is unusual but possible
+    // (e.g. remote agent was just cleaned up mid-request, or all pools happen to be
+    // on the unmapped side). Equivalent to the pre-mixed fallback branch.
+    if (p2pSrcPtrs.empty())
+    {
+        mPureNixlCount.fetch_add(1, std::memory_order_relaxed);
+        return submitNixlTransferInternal(request.getOp(), request.getSrcDescs(), request.getDstDescs(),
+            request.getRemoteName(), request.getSyncMessage());
+    }
+
+    // ---- Case C: mixed -> submit both halves, return a composite status. ----
+    // NIXL side uses only the unmapped subset. Submit P2P FIRST so its CUDA stream is
+    // launched ASAP (any host-side overhead of createXferReq runs while the GPU works).
+    mMixedCount.fetch_add(1, std::memory_order_relaxed);
+    TLLM_LOG_DEBUG("P2pTransfer: mixed path for '%s' — P2P %zu segs, NIXL %zu segs", request.getRemoteName().c_str(),
+        p2pSrcPtrs.size(), nixlSrcVec.size());
+
+    auto p2pStatus = submitP2pHalf();
+
+    MemoryDescs nixlSrcDescs{request.getSrcDescs().getType(), std::move(nixlSrcVec)};
+    MemoryDescs nixlDstDescs{request.getDstDescs().getType(), std::move(nixlDstVec)};
+    auto nixlStatus = submitNixlTransferInternal(
+        request.getOp(), nixlSrcDescs, nixlDstDescs, request.getRemoteName(), request.getSyncMessage());
+
+    return std::make_unique<MixedTransferStatus>(std::move(p2pStatus), std::move(nixlStatus));
+}
+
+PathCounterSnapshot NixlTransferAgent::getPathCounters() const noexcept
+{
+    PathCounterSnapshot snap{};
+    snap.pureP2p = mPureP2pCount.load(std::memory_order_relaxed);
+    snap.mixed = mMixedCount.load(std::memory_order_relaxed);
+    snap.pureNixl = mPureNixlCount.load(std::memory_order_relaxed);
+    snap.cubSubmit = mCubSubmitCount.load(std::memory_order_relaxed);
+    snap.memcpyBatchSubmit = mMemcpyBatchSubmitCount.load(std::memory_order_relaxed);
+    if (mP2pAgent)
+    {
+        auto p2pSnap = mP2pAgent->getCountersSnapshot();
+        snap.memcpyBatchSingleThread = p2pSnap.memcpyBatchSingleThread;
+        snap.memcpyBatchMultiThread = p2pSnap.memcpyBatchMultiThread;
+    }
+    else
+    {
+        snap.memcpyBatchSingleThread = 0;
+        snap.memcpyBatchMultiThread = 0;
+    }
+    return snap;
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
