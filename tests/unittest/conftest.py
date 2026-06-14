@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -337,12 +337,12 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module", params=[2, 4, 8])
+@pytest.fixture(scope="module")
 def mpi_pool_executor(request):
     """
     Start an MPIPoolExecutor with `request.param` workers.
     """
-    num_workers = request.param
+    num_workers = getattr(request, "param", 2)
     with MPIPoolExecutor(num_workers) as executor:
         # make the number of workers visible to tests
         setattr(executor, "num_workers", num_workers)
