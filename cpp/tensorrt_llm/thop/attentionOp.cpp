@@ -376,7 +376,8 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr) const
+        std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
+        std::optional<torch::Tensor> relative_attention_bias) const
         = 0;
 };
 
@@ -444,7 +445,8 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
+        std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
+        std::optional<torch::Tensor> relative_attention_bias) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -677,6 +679,20 @@ public:
                 attention_sinks.value().dtype() == torch::kFloat32, "Expected attention_sinks to have float dtype");
             attention_sinks_ptr = attention_sinks.value().data_ptr<float>();
         }
+        T const* relative_attention_bias_ptr = nullptr;
+        int relative_attention_bias_stride = 0;
+        if (relative_attention_bias.has_value())
+        {
+            auto const& relative_attention_bias_tensor = relative_attention_bias.value();
+            TORCH_CHECK(relative_attention_bias_tensor.dim() == 2 || relative_attention_bias_tensor.dim() == 3,
+                "relative_attention_bias must be [num_heads, num_buckets] for implicit mode or "
+                "[num_heads, max_seq_len, max_seq_len] for explicit mode");
+            TORCH_CHECK(relative_attention_bias_tensor.is_contiguous(), "relative_attention_bias must be contiguous");
+            TORCH_CHECK(relative_attention_bias_tensor.scalar_type() == qkv_or_q.scalar_type(),
+                "relative_attention_bias dtype must match attention input dtype");
+            relative_attention_bias_ptr = static_cast<T const*>(relative_attention_bias_tensor.data_ptr());
+            relative_attention_bias_stride = static_cast<int>(relative_attention_bias_tensor.size(1));
+        }
 
         // Prepare sparse attention parameters
         op.mRuntimeSparseAttentionParams.sparse_kv_indices
@@ -723,6 +739,8 @@ public:
         common_enqueue_params.attention_sinks = attention_sinks_ptr;
         common_enqueue_params.rotary_inv_freq = rotary_inv_freq_ptr;
         common_enqueue_params.rotary_cos_sin = rotary_cos_sin_ptr;
+        common_enqueue_params.relative_attention_bias = relative_attention_bias_ptr;
+        common_enqueue_params.relative_attention_bias_stride = relative_attention_bias_stride;
         common_enqueue_params.max_past_kv_length = max_past_kv_length;
         common_enqueue_params.max_attention_window_size = max_attention_window_size;
         common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
@@ -747,6 +765,13 @@ public:
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
         common_enqueue_params.trtllm_gen_jit_warmup = trtllm_gen_jit_warmup;
+        if (is_cross)
+        {
+            // For cross attention, the KV (encoder) sequence lengths are passed in via
+            // `sequence_length` (already sliced into `sequence_lengths_ptr`), so reuse
+            // it directly instead of a redundant `encoder_input_lengths` tensor.
+            common_enqueue_params.encoder_input_lengths = sequence_lengths_ptr;
+        }
         if (softmax_stats_tensor.has_value())
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
@@ -806,6 +831,14 @@ public:
             if (v_ptr != nullptr && v.has_value())
             {
                 enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
+            }
+            if (is_cross && cross_kv.has_value())
+            {
+                auto const& cross_kv_tensor = cross_kv.value();
+                enqueue_params.cross_kv = static_cast<T const*>(cross_kv_tensor.data_ptr());
+                enqueue_params.num_encoder_tokens = static_cast<int32_t>(cross_kv_tensor.size(0));
+                enqueue_params.cross_kv_length
+                    = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
             }
 
             if (op.isMLAEnabled())
@@ -993,7 +1026,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr, std::optional<int64_t> spec_decoding_target_max_draft_tokens)
+    std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
+    std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
+    std::optional<int64_t> spec_decoding_target_max_draft_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1002,16 +1037,17 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     bool const use_sage_attn
         = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0 || sage_attn_num_elts_per_blk_v > 0;
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn,
-        "Context attention only allows these non-MLA cases: fused QKV; separate QKV with SageAttention");
-    TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn || is_cross,
+        "For non-MLA, non-cross, non-SageAttention attention, only fused QKV is supported now.");
+    TLLM_CHECK_WITH_INFO(
+        update_kv_cache || is_cross, "KV cache update cannot be disabled now (except for cross attention).");
     auto qkv_or_q = q;
     if (is_fused_qkv)
     {
         TLLM_CHECK_WITH_INFO(!k.has_value(), "The k tensor should be null if using fused QKV");
         TLLM_CHECK_WITH_INFO(!v.has_value(), "The v tensor should be null if using fused QKV");
     }
-    if (!is_fused_qkv && update_kv_cache)
+    if (!is_fused_qkv && update_kv_cache && !is_cross)
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
@@ -1094,6 +1130,20 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
+    if (relative_attention_bias.has_value())
+    {
+        auto const relative_attention_bias_dim = relative_attention_bias.value().dim();
+        TORCH_CHECK(relative_attention_bias_dim == 2 || relative_attention_bias_dim == 3,
+            "relative_attention_bias must be [num_heads, num_buckets] for implicit mode or "
+            "[num_heads, max_seq_len, max_seq_len] for explicit mode");
+        TORCH_CHECK(relative_attention_bias_dim != 2 || relative_attention_max_distance > 0,
+            "relative_attention_max_distance must be positive when relative_attention_bias is a bucket table");
+        TORCH_CHECK(relative_attention_bias_dim != 3 || relative_attention_max_distance == 0,
+            "relative_attention_max_distance must be 0 when relative_attention_bias is precomputed");
+        TLLM_CHECK_WITH_INFO(op->mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE,
+            "relative_attention_bias requires position_embedding_type to be relative.");
+        op->mMaxDistance = static_cast<int>(relative_attention_max_distance);
+    }
     op->mRotaryEmbeddingDim = rope_dim;
     op->mRotaryEmbeddingBase = rope_base;
     op->mRotaryEmbeddingScaleType = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rope_scale_type));
@@ -1111,6 +1161,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mSageAttnQkInt8 = sage_attn_qk_int8;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mCrossAttention = is_cross;
 
     op->mAttentionChunkSize = attention_chunk_size;
     op->mSkipSoftmaxThresholdScaleFactorPrefill
@@ -1275,7 +1326,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1297,7 +1348,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr);
+            trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
