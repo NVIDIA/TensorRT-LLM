@@ -6,32 +6,34 @@ verl_config:
   test_dir: "tests"
 
   install_commands:
-    # Install gdrcopy
+    # Install gdrcopy (skip if already installed; build as user, install with sudo
+    # so the install step works under both root and non-root LOCAL_USER setups)
     - >-
+      if [ ! -f /usr/local/lib/libgdrapi.so ]; then
+      rm -rf gdrcopy &&
       git clone -b v2.5.1 https://github.com/NVIDIA/gdrcopy.git &&
-      (cd gdrcopy && make prefix=/usr/local lib_install) &&
-      rm -rf gdrcopy
+      (cd gdrcopy && make lib && sudo make prefix=/usr/local lib_install) &&
+      rm -rf gdrcopy;
+      fi
     # Install nvshmem
-    - "pip install nvidia-nvshmem-cu13==3.3.20"
+    - "sudo -H pip install nvidia-nvshmem-cu13==3.3.20"
     # Create nvshmem symlink (needed before DeepEP build)
-    - >-
-      (cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib &&
-      ln -s libnvshmem_host.so.3 libnvshmem_host.so)
+    - "sudo ln -sf libnvshmem_host.so.3 /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib/libnvshmem_host.so"
     # Install DeepEP
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
       (cd DeepEP &&
       export CPATH=/usr/local/cuda/targets/$(uname -m | sed 's/aarch64/sbsa-linux/;s/x86_64/x86_64-linux/')/include/cccl:$CPATH &&
-      TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" python setup.py install) &&
+      TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" python setup.py install --user) &&
       rm -rf DeepEP
     # Install Python dependencies
-    - "pip3 install --no-cache-dir --no-deps trl==0.27.0"
-    - "pip3 install --no-cache-dir nvtx matplotlib liger_kernel cachetools"
-    - "pip3 install --no-cache-dir cupy-cuda12x==14.0.1"
-    - "pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git@641a5a0"
-    - "pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0"
-    - "pip3 install pytest-asyncio"
-    - "pip3 install --no-cache-dir 'ray[default]==2.54.1'"
+    - "sudo -H pip3 install --no-cache-dir --no-deps trl==0.27.0"
+    - "sudo -H pip3 install --no-cache-dir nvtx matplotlib liger_kernel cachetools"
+    - "sudo -H pip3 install --no-cache-dir cupy-cuda12x==14.0.1"
+    - "sudo -H pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git@641a5a0"
+    - "sudo -H pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0"
+    - "sudo -H pip3 install pytest-asyncio"
+    - "sudo -H pip3 install --no-cache-dir 'ray[default]==2.54.1'"
 
 
   # The environment variables to expose in the container before setting up
@@ -41,6 +43,7 @@ verl_config:
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
     - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"
     - "TORCH_CUDA_ARCH_LIST="
+    - "RAY_enable_open_telemetry_on_core_worker=0"
 
   # Read-only CI model cache (flat layout: /scratch.../ModelName)
   ci_model_cache: "/scratch.trt_llm_data/llm-models"
