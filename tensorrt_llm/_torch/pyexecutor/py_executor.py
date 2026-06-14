@@ -858,8 +858,9 @@ class PyExecutor:
     def is_warmup(self, value: bool):
         self._is_warmup = value
         # Set warmup flag in model engine to trigger torch compile and avoid moe load balancer statistics update
-        self.model_engine.is_warmup = value
-        if self.draft_model_engine is not None:
+        if hasattr(self, 'model_engine'):
+            self.model_engine.is_warmup = value
+        if getattr(self, 'draft_model_engine', None) is not None:
             self.draft_model_engine.is_warmup = value
 
     def start_worker(self):
@@ -1891,19 +1892,34 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
-        for i in range(self.num_micro_batches):
-            try:
-                self.wait_on_pp_send_handles(self.send_handles, i)
-                self.wait_on_pp_send_handles(self.send_schedule_handles, i)
-                self.wait_on_pp_send_handles(
-                    self.send_expected_batch_num_handles, i)
-            except Exception:
-                # PP send handles may be in a broken state after an
-                # event-loop crash. Log and continue; the waiters have
-                # already been notified above.
-                logger.error(
-                    f"Error waiting on PP send handles during cleanup: "
-                    f"{traceback.format_exc()}")
+        if self.is_warmup:
+            # During warmup (memory profiling), ranks shut down independently
+            # after their dummy request completes.  Because the PP ring
+            # broadcast uses non-blocking MPI sends between ranks, a sender's
+            # isend handle may never complete if the receiver has already
+            # exited its broadcast-sample-state loop and freed the duplicated
+            # MPI communicator.  Waiting indefinitely on those handles
+            # therefore deadlocks the shutdown sequence.
+            #
+            # Cancel (best-effort) any outstanding send handles instead of
+            # blocking.  The subsequent collective allreduce in
+            # calculate_max_num_blocks guarantees that all ranks synchronize
+            # before normal operation begins, so no data is lost.
+            self._cancel_pp_send_handles()
+        else:
+            for i in range(self.num_micro_batches):
+                try:
+                    self.wait_on_pp_send_handles(self.send_handles, i)
+                    self.wait_on_pp_send_handles(self.send_schedule_handles, i)
+                    self.wait_on_pp_send_handles(
+                        self.send_expected_batch_num_handles, i)
+                except Exception:
+                    # PP send handles may be in a broken state after an
+                    # event-loop crash. Log and continue; the waiters have
+                    # already been notified above.
+                    logger.error(
+                        f"Error waiting on PP send handles during cleanup: "
+                        f"{traceback.format_exc()}")
 
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
@@ -2451,6 +2467,18 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _cancel_pp_send_handles(self):
+        """Best-effort cancel of all outstanding PP MPI isend handles.
+
+        Used during warmup shutdown to avoid blocking indefinitely on
+        sends whose receivers have already exited.
+        """
+        for handles in (self.send_handles, self.send_schedule_handles,
+                        self.send_expected_batch_num_handles):
+            for i in range(self.num_micro_batches):
+                if handles[i] is not None:
+                    handles[i] = None
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
