@@ -18,6 +18,7 @@ l0_a100:
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_llm_encode.py
+    - unittest/llmapi/test_llm_encode_multi_item.py
     - unittest/llmapi/test_mpi_session.py ISOLATION
     - unittest/llmapi/test_memory_profiling.py::test_profile_kvcache # profile kvcache for vision encoder
     - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
