@@ -452,6 +452,12 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
         if trace_result is None:
+            if already_gptj:
+                raise RuntimeError(
+                    "GPTJ-layout MLA model requires RoPE fused into trtllm_mla, but the RoPE "
+                    "pattern could not be traced from torch_mla. The eager rotation on "
+                    "native-layout weights is incorrect; do not disable this fusion."
+                )
             ad_logger.debug("Could not trace RoPE node from torch_mla; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rope pattern")
 
@@ -460,6 +466,12 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         # Build the rotary_cos_sin tensor from the model's RoPE buffers.
         rotary_cos_sin = _build_rotary_cos_sin_from_buffers(gm, rope_node, factory)
         if rotary_cos_sin is None:
+            if already_gptj:
+                raise RuntimeError(
+                    "GPTJ-layout MLA model requires RoPE fused into trtllm_mla, but "
+                    "rotary_cos_sin could not be constructed. The eager rotation on "
+                    "native-layout weights is incorrect; do not disable this fusion."
+                )
             ad_logger.debug("Could not construct rotary_cos_sin; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rotary_cos_sin")
 
@@ -483,6 +495,13 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
 
             rewired_mla_nodes.append(mla_node)
             replaced += 1
+
+        if already_gptj and replaced != len(mla_nodes):
+            raise RuntimeError(
+                f"GPTJ-layout MLA model: RoPE fused into only {replaced}/{len(mla_nodes)} "
+                "MLA node(s); the rest would run eager rotation on native-layout weights "
+                "(incorrect). Do not disable fuse_rope_into_trtllm_mla for this model."
+            )
 
         # Stash rope metadata on rewired MLA nodes for cache_init.
         for mla_node in rewired_mla_nodes:
