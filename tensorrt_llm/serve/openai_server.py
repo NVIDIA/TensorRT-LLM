@@ -453,7 +453,7 @@ class OpenAIServer(_VideoRoutesMixin):
             vocab_size = getattr(config, "vocab_size", None)
             if vocab_size is not None:
                 return int(vocab_size)
-        return int(self.tokenizer.tokenizer.vocab_size)
+        return int(self._vocab_size)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
@@ -564,9 +564,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @property
     def _vocab_size(self) -> Optional[int]:
-        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
-            return self.tokenizer.tokenizer.vocab_size
-        return None
+        if self.tokenizer is None:
+            return None
+        underlying = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        return getattr(underlying, "vocab_size", None)
 
     @staticmethod
     def create_error_response(
@@ -1187,11 +1188,6 @@ class OpenAIServer(_VideoRoutesMixin):
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            # Pass the model vocabulary size so ``logit_bias`` can be
-            # expanded into an embedding bias tensor in the sampler.
-            vocab_size = getattr(self.tokenizer.tokenizer,
-                                 "vocab_size", None) or getattr(
-                                     self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
                 vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
