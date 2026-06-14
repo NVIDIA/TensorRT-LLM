@@ -1572,6 +1572,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         max_batch_size: int,
         kv_cache_config: KvCacheConfig,
         num_layers: Optional[int] = None,
+        is_draft: bool = False,
         **kwargs,
     ):
         """Affine memory model for the unified hybrid KV pool.
@@ -1594,6 +1595,14 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # Attention slope from the parent's existing formula.
         attention_slope = KVCacheManager.get_cache_size_per_token(
             model_config, mapping, num_layers=num_layers, **kwargs)
+
+        if is_draft:
+            # One-model spec dec (MTP/EAGLE3) draft layers are attention-only
+            # and carry no Mamba state. When the draft falls back to the
+            # target's pretrained_config (MTP), counting target Mamba layers
+            # here would double-count the target's Mamba intercept and can
+            # exhaust the KV cache budget on tight-memory configs.
+            return attention_slope, 0
 
         params = extract_mamba_kv_cache_params(
             model_config.pretrained_config,

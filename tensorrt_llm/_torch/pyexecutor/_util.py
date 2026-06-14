@@ -335,11 +335,12 @@ class KvCacheCreator:
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config)
             elif self._mapping.is_last_pp_rank():
-                # EAGLE3/MTP: draft layers only on last PP rank
+                # EAGLE3/MTP: draft layers only on last PP rank.
                 total += self._per_manager_cache_cost(
                     self._kv_cache_manager_cls,
                     effective_draft_config,
-                    num_layers=self._get_num_draft_layers())
+                    num_layers=self._get_num_draft_layers(),
+                    is_draft=True)
         return total
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
