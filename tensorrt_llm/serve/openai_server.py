@@ -12,6 +12,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
@@ -666,6 +667,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
+        self.app.add_api_route("/reset_prefix_cache",
+                               self.reset_prefix_cache,
+                               methods=["POST"])
         resource_governor_queue = self.generator._executor.resource_governor_queue
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
@@ -1026,6 +1030,27 @@ class OpenAIServer(_VideoRoutesMixin):
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
+
+    async def reset_prefix_cache(self) -> Response:
+        """Reset local PyTorch KV prefix-cache reuse state."""
+        reset_fn = getattr(self.generator, "reset_prefix_cache", None)
+        if reset_fn is None:
+            return self._create_not_supported_error(
+                "reset_prefix_cache() is only supported by the PyTorch backend."
+            )
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, reset_fn)
+        except NotImplementedError as e:
+            return self._create_not_supported_error(str(e))
+        except (RuntimeError, ValueError) as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.CONFLICT,
+            )
+
+        return JSONResponse(content={"status": "success"})
 
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
@@ -1952,26 +1977,55 @@ class OpenAIServer(_VideoRoutesMixin):
             "deleted": True
         })
 
-    async def release_memory(self,
-                             request: MemoryUpdateRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/release_memory endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('sleep', args=(request.tags, ))
+    async def _run_worker_control_rpc(self, method: str,
+                                      args: tuple[Any, ...]) -> None:
+        """Dispatch a worker control method through direct or collective RPC."""
+        executor = getattr(self.generator, "_executor", None)
+        direct_method = getattr(executor, method, None)
+        if direct_method is not None:
+            await asyncio.get_running_loop().run_in_executor(
+                None, partial(direct_method, *args))
+            return
+
+        if isinstance(self.generator, AsyncLLM):
+            await self.generator.collective_rpc(method, args=args)
+            return
+
+        collective_rpc = getattr(self.generator, "_collective_rpc", None)
+        if collective_rpc is not None:
+            await asyncio.get_running_loop().run_in_executor(
+                None, partial(collective_rpc, method, args))
+            return
+
+        raise NotImplementedError(
+            f"{method}() is only supported by the PyTorch backend.")
+
+    async def _handle_worker_control_rpc(self, method: str,
+                                         args: tuple[Any, ...]) -> Response:
+        """Run a worker control method and map failures to HTTP responses."""
+        try:
+            await self._run_worker_control_rpc(method, args)
+        except NotImplementedError as e:
+            return self._create_not_supported_error(str(e))
+        except (RuntimeError, ValueError) as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.CONFLICT,
+            )
+
         return JSONResponse(content={"status": "success"})
 
-    async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/resume_memory endpoint is only supported with AsyncLLM()"
-        await self.generator.collective_rpc('wakeup', args=(request.tags, ))
-        return JSONResponse(content={"status": "success"})
+    async def release_memory(self, request: MemoryUpdateRequest) -> Response:
+        return await self._handle_worker_control_rpc('sleep', (request.tags, ))
 
-    async def update_weights(self,
-                             request: UpdateWeightsRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/update_weights endpoint is only supported with AsyncLLM()"
+    async def resume_memory(self, request: MemoryUpdateRequest) -> Response:
+        return await self._handle_worker_control_rpc('wakeup', (request.tags, ))
+
+    async def update_weights(self, request: UpdateWeightsRequest) -> Response:
+        if not isinstance(self.generator, AsyncLLM):
+            return self._create_not_supported_error(
+                "/update_weights endpoint is only supported with AsyncLLM()")
         await self.generator.collective_rpc('update_weights',
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})
