@@ -267,8 +267,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // for offload/onboard/partial copy is dangerous. We have an asynchronous decoder
 // that may not synchronize or synchronize at a later point in the execution stream.
 // To avoid synchronization issues caused by changes to decoder design we rely on
-// KVCacheTransferManager::syncWithBufferManager() that ensures that internal copy streams
-// will wait for prefill and decode kernels that have already been scheduled.
+// KVCacheTransferManager::syncWithBufferManager() to ensure that internal copy streams
+// wait for the work that block transfers depend on.
 //
 // Earlier versions of this code did not account for all possible cases where a new block copy
 // needed to wait for a previously scheduled copy to finish. For instance, it is possible
@@ -312,6 +312,7 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     }
 
     copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
+    mHasPendingHostTransfers |= !offloadedBlock->isPrimary();
 
     // Update transfer statistics — distinguish host→GPU onboard from GPU→GPU intra-device copy
     {
@@ -364,6 +365,7 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
     }
 
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
+    mHasPendingHostTransfers |= !offloadBlock->isPrimary();
 
     // Update transfer statistics
     {
@@ -393,6 +395,7 @@ void KVCacheTransferManager::syncWithBufferManager()
     // Once we synchronize, clear our list of pending thransfers.
     mPendingReads.clear();
     mPendingWrites.clear();
+    mHasPendingHostTransfers = false;
 }
 
 void KVCacheTransferManager::syncTransfers()
@@ -408,6 +411,12 @@ void KVCacheTransferManager::syncTransfers()
     // Once we synchronize, clear our list of pending thransfers.
     mPendingReads.clear();
     mPendingWrites.clear();
+    mHasPendingHostTransfers = false;
+}
+
+bool KVCacheTransferManager::hasPendingHostTransfers() const
+{
+    return mHasPendingHostTransfers;
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()

@@ -1168,9 +1168,13 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             pool_configurations=pool_configurations,
         )
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(
+            self,
+            scheduled_batch: ScheduledRequests,
+            forward_done_event: Optional[torch.cuda.Event] = None):
         MambaCacheManager.prepare_resources(self, scheduled_batch)
-        KVCacheManager.prepare_resources(self, scheduled_batch)
+        KVCacheManager.prepare_resources(self, scheduled_batch,
+                                         forward_done_event)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         MambaCacheManager.free_resources(self, request)
@@ -1749,8 +1753,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 )
                 self.mamba_ssm_rand_seed[ctx_slots] = seed_tensor
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        super().prepare_resources(scheduled_batch)
+    def prepare_resources(
+            self,
+            scheduled_batch: ScheduledRequests,
+            forward_done_event: Optional[torch.cuda.Event] = None):
+        super().prepare_resources(scheduled_batch, forward_done_event)
         if self.local_num_mamba_layers == 0:
             return
         self._prepare_resources(scheduled_batch)
