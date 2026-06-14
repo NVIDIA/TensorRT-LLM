@@ -66,6 +66,17 @@ def test_super_mtp_smoke():
         mtp_eagle_one_model=True,
         speculative_model=model_path,
     )
+    experiment_config["args"]["model_kwargs"].update(
+        {
+            "hidden_size": 256,
+            "intermediate_size": 256,
+            "mamba_head_dim": 64,
+            "ssm_state_size": 64,
+            "moe_intermediate_size": 128,
+            "moe_shared_expert_intermediate_size": 128,
+            "moe_latent_size": 64,
+        }
+    )
     # Shrink the Eagle/MTP drafter model to match the target's reduced dimensions.
     experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
         "model_kwargs"
@@ -78,6 +89,8 @@ def test_super_mtp_smoke():
         "piecewise_enabled"
     ] = False
     experiment_config["args"]["max_num_tokens"] = 256
+    experiment_config["args"]["enable_chunked_prefill"] = True
+    experiment_config["args"]["kv_cache_config"]["tokens_per_block"] = 16
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_prompt
 
