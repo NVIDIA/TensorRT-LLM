@@ -1210,7 +1210,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # before argmax (and falls back to a plain argmax when no TP gather is
         # needed). Eagle3 (non-MTP) keeps its d2t-aware argmax.
         if spec_metadata.is_all_greedy_sample:
-            if self.is_mtp_eagle:
+            # Only plain tensor parallelism (tp_size>1 without attention DP)
+            # shards the draft logits over the vocab dim and thus needs
+            # draft_sampler()'s all-gather argmax. The LM-head-TP-in-ADP case
+            # already produces full-vocab logits per rank (gathered upstream),
+            # and the no-TP / Eagle3 cases need nothing, so they take the plain
+            # d2t-aware argmax. (Routing ADP/LM-head-TP through draft_sampler
+            # without its mapping_lm_head_tp arg hits the None-mapping branch
+            # and crashes with 'NoneType has no attribute tp_group'.)
+            if (self.is_mtp_eagle and self.model_config is not None
+                    and hasattr(self.model_config, 'mapping')
+                    and self.model_config.mapping.tp_size > 1
+                    and not self.model_config.mapping.enable_attention_dp):
                 return self.draft_sampler(logits)
             return self._draft_sampler_greedy(logits, d2t)
         # Non-greedy (advanced) draft sampling has the same TP hazard as the
