@@ -748,7 +748,7 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
 }
 
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
-    int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
+    int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -828,15 +828,21 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         }
         else
         {
-            fp8_k_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-            fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+            // enqueueContext lays out and invokeMLAContextFp8Quantize writes these buffers for
+            // total_kv_len rows (which includes cached tokens under KV-cache reuse), so the
+            // estimate must cover the larger of the chunk-prefill bound and the actual rows.
+            auto const kv_rows = std::max(
+                mChunkPrefillBufferBatchSize * static_cast<size_t>(max_num_tokens), static_cast<size_t>(total_kv_len));
+            fp8_k_buf_size = kv_rows * static_cast<size_t>(total_k_dim_all_heads);
+            fp8_v_buf_size = kv_rows * static_cast<size_t>(total_v_dim_all_heads);
         }
     }
     else if (useSageAttnSeparateQkv)
     {
+        auto const kv_rows = std::max(static_cast<size_t>(max_num_tokens), static_cast<size_t>(total_kv_len));
         fp8_q_buf_size = max_num_tokens * static_cast<size_t>(local_hidden_units_qo);
-        fp8_k_buf_size = max_num_tokens * static_cast<size_t>(local_hidden_units_kv);
-        fp8_v_buf_size = max_num_tokens * static_cast<size_t>(local_hidden_units_kv);
+        fp8_k_buf_size = kv_rows * static_cast<size_t>(local_hidden_units_kv);
+        fp8_v_buf_size = kv_rows * static_cast<size_t>(local_hidden_units_kv);
     }
 
     int32_t const q_max_n_blk = mSageAttnNumEltsPerBlkQ > 0 ? tc::divUp(input_seq_length, mSageAttnNumEltsPerBlkQ) : 0;
