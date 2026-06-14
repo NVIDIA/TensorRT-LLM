@@ -2048,30 +2048,39 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    # [disagg-ctx-deadlock-fix] Mirror of the OR-gated entry in
-                    # _executor_loop: ensure every TP rank either calls
-                    # _check_disagg_ctx_cache_transfer_status together or skips
-                    # it together, so the internal allgather in
-                    # CacheTransceiver::checkContextTransferStatus always has
-                    # full quorum. The C++ syncComm inside that helper is at
-                    # most TP-wide (mGroupTensorParaComm; mGroupTPInDPComm
-                    # with attention_dp), so a TP-scoped OR vote is sufficient.
-                    # Using WORLD allreduce here serialized the disagg prefill
-                    # host loop on every iter (nvbug/6280060).
-                    local_need_check = (num_fitting_reqs == 0 and
-                                        not fitting_disagg_gen_init_requests)
-                    if self.dist.tp_size > 1:
-                        any_need_check = self.dist.tp_allreduce(
-                            int(local_need_check), op=ReduceOp.MAX)
-                    else:
-                        any_need_check = int(local_need_check)
-                    if any_need_check > 0:
-                        if local_need_check and not all_gen_first:
+                    # [disagg-ctx-deadlock-fix] In _executor_loop_pp,
+                    # _pp_schedule_and_propagate broadcasts num_fitting_reqs
+                    # and fitting_disagg_gen_init_requests rank-uniformly
+                    # (rank 0 schedules and broadcasts the result down the PP
+                    # chain, with tp_broadcast / cp_broadcast inside the first
+                    # PP rank). local_need_check is therefore already
+                    # rank-uniform, and PR #14020's tp_allreduce is redundant
+                    # on this code path. Restoring the pre-PR
+                    # has_any_inflight_requests() guard on the non-blocking
+                    # branch elides the multi-node MPI_Allgather inside
+                    # CacheTransceiver::checkContextTransferStatus when no
+                    # transfers are pending — the dominant per-iter cost on
+                    # TP=8 / 8 GB200 nodes for disagg prefill (nvbug/6311000).
+                    # _requests_in_transfer is rank-uniform under the
+                    # kv_cache_transceiver path: adds happen via the broadcast
+                    # schedule's context_requests_last_chunk and removes via
+                    # the helper's rank-uniform output (it only completes
+                    # requests that all ranks agreed finished).
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        if not all_gen_first:
                             logger.warning(
                                 "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                             )
                             self._check_disagg_ctx_cache_transfer_status(1)
-                        else:
+                        elif self.async_transfer_manager.has_any_inflight_requests(
+                        ):
+                            # Non-blocking cleanup of completed transfers to
+                            # free KV blocks. Skip the helper (and its
+                            # multi-node MPI_Allgather) when nothing is
+                            # in-flight — this matches the existing
+                            # has_any_inflight_requests() guards on
+                            # _check_kv_transfer_timeout at lines 2434, 3013,
+                            # 3457.
                             self._check_disagg_ctx_cache_transfer_status(0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
