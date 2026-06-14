@@ -2,6 +2,19 @@
 
 The AutoDeploy model registry provides a comprehensive, maintainable list of supported models for testing and coverage tracking.
 
+## Layout
+
+Configs are split into two layers, both listed in a model's `yaml_extra`:
+
+- **In-package:** `models.yaml` and AD-internal `<model>_ad.yaml` (transforms,
+  compile_backend, ...) live under
+  `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/`; they ship in
+  the wheel for runtime resolution and are hidden from users.
+- **Here (`configs/`):** user-facing `<model>.yaml` common knobs (max_batch_size,
+  kv_cache_config, ...).
+
+AutoDeploy loads `<model>_ad.yaml` then `<model>.yaml`.
+
 ## Format
 
 **Version: 2.0** (Flat format with composable configurations)
@@ -131,7 +144,7 @@ python3 scripts/prepare_model_coverage_v2.py \
     --output /tmp/model_coverage.yaml
 
 # View summary
-grep -E "^- name:|yaml_extra:" /path/to/TensorRT-LLM/examples/auto_deploy/model_registry/models.yaml | wc -l
+grep -E "^- name:|yaml_extra:" /path/to/TensorRT-LLM/tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml | wc -l
 ```
 
 When adding or removing models, use `prepare_model_coverage_v2.py` to validate the registry structure and coverage.

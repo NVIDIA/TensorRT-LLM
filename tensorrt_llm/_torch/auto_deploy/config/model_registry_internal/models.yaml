@@ -149,10 +149,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-8B-Instruct-FP8
   config_id: llama3_1_8b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b_ad.yaml', 'llama3_1_8b.yaml']
 - name: nvidia/Llama-3.1-8B-Instruct-NVFP4
   config_id: llama3_1_8b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'llama3_1_8b_ad.yaml', 'llama3_1_8b.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
@@ -191,7 +191,7 @@ models:
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-V2.5
 #   config_id: deepseek_v2_ep
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep_ad.yaml']
 # AttributeError: 'NoneType' object has no attribute 'shape'
 # - name: meta-llama/Llama-3.2-11B-Vision-Instruct
 #   config_id: multimodal
@@ -206,7 +206,7 @@ models:
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
   config_id: llama3_3_70b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b_ad.yaml', 'llama3_3_70b.yaml']
 - name: meta-llama/CodeLlama-34b-Instruct-hf
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -242,7 +242,7 @@ models:
 # torch.AcceleratorError: CUDA error: device-side assert triggered
 # - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
 #   config_id: nano_v3
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3_ad.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
 - name: Qwen/QwQ-32B-Preview
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -305,14 +305,14 @@ models:
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: deepseek_r1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1_ad.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
 - name: deepseek-ai/DeepSeek-R1-0528
   config_id: deepseek_r1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1_ad.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
 #   config_id: deepseek_v2_ep
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep_ad.yaml']
 # Timed out after AutoDeploy compile in multimodal run.
 # - name: Qwen/Qwen3-VL-8B-Instruct
 #   config_id: multimodal__qwen3_vl
@@ -351,7 +351,7 @@ models:
 #     'enable_sharder_ir.yaml']
 - name: zai-org/GLM-4.7-Flash
   config_id: glm_4_7_flash
-  yaml_extra: ['glm-4.7-flash.yaml']
+  yaml_extra: ['glm-4.7-flash_ad.yaml', 'glm-4.7-flash.yaml']
 - name: Nanbeige/Nanbeige4.1-3B
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -370,10 +370,10 @@ models:
 # --- Qwen3.5 MoE (Feb 2026) ---
 - name: Qwen/Qwen3.5-35B-A3B
   config_id: qwen3_5_moe_35b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b_ad.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
 - name: Qwen/Qwen3.5-397B-A17B
   config_id: qwen3_5_moe_400b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b_ad.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
 # --- GLM-5 (Feb 2026) ---
 - name: zai-org/GLM-5
   config_id: glm_5
@@ -401,13 +401,13 @@ models:
 # 288 routed experts top-8 + shared expert, mixed full/sliding GQA, head-wise attn gate.
 - name: stepfun-ai/Step-3.7-Flash
   config_id: step_3_7_flash
-  yaml_extra: ['step-3.7-flash.yaml']
+  yaml_extra: ['step-3.7-flash_ad.yaml', 'step-3.7-flash.yaml']
 - name: stepfun-ai/Step-3.7-Flash-FP8
   config_id: step_3_7_flash
-  yaml_extra: ['step-3.7-flash.yaml']
+  yaml_extra: ['step-3.7-flash_ad.yaml', 'step-3.7-flash.yaml']
 - name: stepfun-ai/Step-3.7-Flash-NVFP4
   config_id: step_3_7_flash
-  yaml_extra: ['step-3.7-flash.yaml']
+  yaml_extra: ['step-3.7-flash_ad.yaml', 'step-3.7-flash.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 # TypeError: 'NoneType' object is not subscriptable
 # - name: moonshotai/Kimi-K2.5
@@ -416,7 +416,7 @@ models:
 # --- GLM-4.7 (Dec 2025) ---
 - name: zai-org/GLM-4.7
   config_id: glm4_moe
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe_ad.yaml']
 # --- DeepSeek V3.2 (Dec 2025) ---
 # RuntimeError: NVRTC compilation failed. See https://github.com/NVIDIA/TensorRT-LLM/issues/14676
 # - name: deepseek-ai/DeepSeek-V3.2
@@ -432,7 +432,7 @@ models:
 # --- GLM-4.6 (Sep 2025) ---
 - name: zai-org/GLM-4.6
   config_id: glm4_moe
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe_ad.yaml']
 # --- Qwen3-Next (Sep 2025) ---
 # OOM during AutoDeploy run.
 # - name: Qwen/Qwen3-Next-80B-A3B-Instruct
@@ -465,7 +465,7 @@ models:
 # --- Tencent Hunyuan (2025) ---
 - name: tencent/Hunyuan-A13B-Instruct
   config_id: hunyuan_a13b_ep
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'hunyuan_a13b_ep.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'hunyuan_a13b_ep_ad.yaml', 'hunyuan_a13b_ep.yaml']
 - name: tencent/Hunyuan-7B-Instruct
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
@@ -479,10 +479,10 @@ models:
 # --- Granite 4.0 (2025) - hybrid Mamba/Transformer ---
 - name: ibm-granite/granite-4.0-micro
   config_id: granite_4_0_micro
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'granite_4.0_micro.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'granite_4.0_micro_ad.yaml', 'granite_4.0_micro.yaml']
 - name: ibm-granite/granite-4.0-h-small
   config_id: granite_4_0_h_small
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'granite_4.0_h_small.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'granite_4.0_h_small_ad.yaml', 'granite_4.0_h_small.yaml']
 # --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
 # TypeError: UserError.__init__() missing 1 required positional argument: 'msg'
 # - name: ai21labs/AI21-Jamba-Large-1.7
@@ -523,7 +523,7 @@ models:
 # --- Gemma 3n (Jun 2025) - on-device VLM ---
 - name: google/gemma-3n-E2B-it
   config_id: gemma3n_e2b_it
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3n_e2b_it.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3n_e2b_it_ad.yaml', 'gemma3n_e2b_it.yaml']
 # TimmWrapperModel requires the timm library but it was not found in your environment. You can install it with pip:
 # - name: google/gemma-3n-E4B-it
 #   config_id: multimodal
@@ -716,7 +716,7 @@ models:
 # --- Nvidia Nemotron 3 Nano (2025) ---
 - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   config_id: nano_v3
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3_ad.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -736,7 +736,7 @@ models:
 # --- Granite 4.0 tiny (2025) ---
 - name: ibm-granite/granite-4.0-tiny-preview
   config_id: granite_4_0_tiny_preview
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'granite_4.0_tiny_preview.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'granite_4.0_tiny_preview_ad.yaml', 'granite_4.0_tiny_preview.yaml']
 # --- OLMo 3 Think 7B (2025) ---
 - name: allenai/Olmo-3-7B-Think
   config_id: default_ws_1
@@ -753,7 +753,7 @@ models:
 # --- DeepSeek Coder V2 Lite (2025) ---
 - name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
   config_id: deepseek_v2_ep
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'deepseek_v2_ep.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'deepseek_v2_ep_ad.yaml']
 # --- Seed-Coder reasoning (2025) ---
 - name: ByteDance-Seed/Seed-Coder-8B-Reasoning
   config_id: default_ws_2
@@ -826,7 +826,7 @@ models:
 # tensorrt_llm.executor.utils.RequestError: Triton Error [CUDA]: device-side assert triggered
 # - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
 #   config_id: nano_v3__enable_sharder_ir
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3_ad.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: num_hidden_layers_5__enable_sharder_ir
