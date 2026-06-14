@@ -341,6 +341,7 @@ triton_server/test_triton.py::test_triton_extensive[triton-extensive] SKIP
 triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-tensorrt_llm] SKIP (https://nvbugs/5701480)
 triton_server/test_triton_llm.py::test_mistral_v1_multi_models[False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble] SKIP
 triton_server/test_triton_rcca.py::test_rcca_bug_4934893[Temperature:0.5-TOP_P:0.95-TOP_K:10-False-1---False-True-False-0-2048-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization---1-1-1-False-ensemble] SKIP (https://nvbugs/5619369)
+unittest/_torch/modeling -k "modeling_out_of_tree" SKIP (https://nvbugs/6319877)
 unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=IGNORE-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_DEEPGEMM-quant=W4A8_MXFP4_MXFP8-routing=DeepSeekV3] SKIP (https://nvbugs/6175060)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "MEGAMOE_DEEPGEMM" SKIP (https://nvbugs/6175060)
