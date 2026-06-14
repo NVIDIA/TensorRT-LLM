@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -160,6 +160,27 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if run_ray:
         command += ["--run-ray"]
 
+    s3_secret_key = None
+    s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
+    if s3_upload_path:
+        inner_output_dir = os.path.join(output_dir, "inner-s3", case_fn)
+        inner_upload_path = os.path.join(s3_upload_path, "inner", case_fn)
+        command += [
+            "-s",
+            f"--output-dir={inner_output_dir}",
+            f"--s3-upload-path={inner_upload_path}",
+            "--s3-capture-mode=direct",
+            "--s3-upload-mode=deferred",
+        ]
+        for option in ("--s3-endpoint", "--s3-username", "--s3-bucket"):
+            value = request.config.getoption(option, default=None)
+            if value:
+                command += [f"{option}={value}"]
+        if request.config.getoption("--s3-skip-upload", default=False):
+            command += ["--s3-skip-upload"]
+        s3_secret_key = request.config.getoption("--s3-secret-key",
+                                                 default=None)
+
     command += arg_list
 
     print(f"Running unit test:\"python {' '.join(command)}\"")
@@ -168,6 +189,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         try:
             pythonpath = os.environ.get("PYTHONPATH", "")
             env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            if s3_secret_key:
+                env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
                 env['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
             llm_venv.run_cmd(

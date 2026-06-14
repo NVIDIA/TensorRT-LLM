@@ -10,7 +10,8 @@ import tempfile
 import textwrap as tw
 
 from defs.runner_interface import PythonRunnerInterface
-from defs.trt_test_alternative import check_call, check_output, exists, makedirs
+from defs.trt_test_alternative import (check_call, check_output, exists,
+                                       makedirs, redact_args, redact_env)
 
 
 class PythonVenvRunnerImpl(PythonRunnerInterface):
@@ -129,7 +130,8 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
                                    f"Stdout: {e.stdout.decode()}\n"
                                    f"Stderr: {e.stderr.decode()}\n")
         else:
-            print(f"Start subprocess with {caller}({call_args}, env={new_env})")
+            print(f"Start subprocess with {caller}({redact_args(call_args)}, "
+                  f"env={redact_env(new_env)})")
             return caller(call_args, env=new_env, **kwargs)
 
     def install_packages(self, packages):
