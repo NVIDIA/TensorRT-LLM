@@ -248,6 +248,12 @@ class TRTLLMGenFusedMoE(MoE):
         backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
         self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
+        # Comm-side FlashInfer choice is decoupled from the op-backend choice:
+        # NVLinkTwoSidedFlashinfer requires 16B-aligned alltoall rows. When any
+        # payload would need padding, fall back to NVLinkTwoSided to avoid the
+        # extra pad/un-pad allocation in dispatch.
+        self.use_flashinfer_comm = self._check_flashinfer_comm_support()
+
         # Note: Load balancer initialization is handled by base class _init_load_balancer()
         # If no load balancer is available, the base class will set:
         # - self.num_slots = self.num_experts
@@ -355,7 +361,9 @@ class TRTLLMGenFusedMoE(MoE):
             if self.activation_type not in self._BF16_SUPPORTED_ACTIVATIONS:
                 return False
             return True
-
+        if self.activation_type == ActivationType.Silu:
+            return False
+        return True
         use_flashinfer = os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER",
                                         "0")
         if use_flashinfer != "1":
@@ -390,6 +398,38 @@ class TRTLLMGenFusedMoE(MoE):
             if self.hidden_size % quant_method.input_hidden_alignment != 0:
                 return False
 
+        return True
+
+    def _check_flashinfer_comm_support(self) -> bool:
+        """Whether the FlashInfer mnnvl alltoall comm path can be used without padding.
+
+        NVLinkTwoSidedFlashinfer requires each alltoall row to be 16B-aligned.
+        Returns False if any predictable payload (hidden_states / token_selected_slots
+        / token_final_scales) would need _align_payload padding.
+        """
+        if os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER_COMM",
+                          "0") != "1":
+            return False
+
+        # Tie comm choice to the op-backend opt-out.
+        if not self.use_flashinfer:
+            return False
+
+        act_dtype = self.dtype or torch.bfloat16
+        if (self.hidden_size * act_dtype.itemsize) % 16 != 0:
+            return False
+
+        # ConfigurableMoE dispatches token_selected_slots as int32 and, for
+        # TRTLLMGen, token_final_scales as bf16.
+        top_k = self.routing_method.experts_per_token
+        if (top_k * torch.int32.itemsize) % 16 != 0:
+            return False
+        if (top_k * torch.bfloat16.itemsize) % 16 != 0:
+            return False
+
+        # Note: hidden_states_sf alignment is not checked statically because its
+        # row width / dtype depends on quant-method internals. _align_payload
+        # remains as a safety net for that case.
         return True
 
     def _get_data_or_none(self, attr_name: str) -> Optional[torch.Tensor]:
@@ -682,12 +722,12 @@ class TRTLLMGenFusedMoE(MoE):
             # for cases like deepep low latency where fake top_k=1 might be used
             top_k = token_selected_experts.shape[-1]
 
-        # Ensure x_sf is 2D before flattening
         if x_sf is not None:
             assert len(
                 x_sf.shape
             ) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
-            x_sf = x_sf.flatten()
+            if not self.use_flashinfer:
+                x_sf = x_sf.flatten()
 
         if not self.has_any_quant:
             result = self.op_backend.run_bf16_moe(

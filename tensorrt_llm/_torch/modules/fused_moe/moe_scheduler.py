@@ -51,8 +51,13 @@ from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
-from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
+from .communication import (
+    DeepEP,
+    DeepEPLowLatency,
+    NVLinkOneSided,
+    NVLinkTwoSided,
+    NVLinkTwoSidedFlashinfer,
+)
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE

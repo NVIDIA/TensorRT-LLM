@@ -136,6 +136,7 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
         reduce_results=False,
         model_config=model_config,
     ).cuda()
+    moe_backend = moe.backend if isinstance(moe, ConfigurableMoE) else moe
 
     # Set fc31_act_scale directly (simulating AWQ pre_quant_scale)
     if has_scale:
@@ -152,7 +153,8 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
     x = torch.ones(seq_len, hidden_size, dtype=torch.bfloat16, device="cuda")
     router_logits = torch.randn(seq_len, num_experts, dtype=torch.bfloat16, device="cuda")
 
-    # Mock torch.ops.trtllm.fp4_quantize to capture the input after scaling
+    # Mock the unified op backend to capture the input after scaling. This
+    # keeps the test valid for both native TRTLLM and FlashInfer op backends.
     captured_input = None
 
     def mock_fp4_quantize(input_tensor, *args, **kwargs):
@@ -171,14 +173,14 @@ def test_fused_moe_trtllm_gen_input_scaling(has_scale):
             ),
         )
 
-    # Also mock the MoE runner to avoid execution errors
+    # Also mock the MoE runner to avoid execution errors.
     # just return a dummy output since we are capturing the input before input quantization
     def mock_moe_runner(*args, **kwargs):
-        return [torch.zeros(seq_len, hidden_size, dtype=torch.bfloat16, device="cuda")]
+        return torch.zeros(seq_len, hidden_size, dtype=torch.bfloat16, device="cuda")
 
-    with patch("torch.ops.trtllm.fp4_quantize", side_effect=mock_fp4_quantize, create=True):
-        with patch(
-            "torch.ops.trtllm.fp4_block_scale_moe_runner", side_effect=mock_moe_runner, create=True
+    with patch.object(moe_backend.op_backend, "fp4_quantize", side_effect=mock_fp4_quantize):
+        with patch.object(
+            moe_backend.op_backend, "run_fp4_block_scale_moe", side_effect=mock_moe_runner
         ):
             with torch.inference_mode():
                 moe.forward(x, router_logits)

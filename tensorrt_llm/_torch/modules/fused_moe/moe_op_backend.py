@@ -556,13 +556,13 @@ class FlashinferOpBackend(MoEOpBackend):
         enable_pdl: Optional[bool] = None,
     ):
         return self._fp4_quantize(
-            input,
-            global_scale,
-            sf_vec_size,
-            sf_use_ue8m0,
-            is_sf_swizzled_layout,
-            is_sf_8x4_layout,
-            enable_pdl,
+            input=input,
+            global_scale=global_scale,
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=sf_use_ue8m0,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+            enable_pdl=enable_pdl,
         )
 
     def mxfp8_quantize(
@@ -631,8 +631,11 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
-            # Run with pre-computed routing (packed format)
+            # FlashInfer nightly exposes unpacked precomputed routing for the FP4
+            # routed API only. The FP8 routed API still takes packed top-k input.
+            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
+                torch.bfloat16
+            ).view(torch.int16).to(torch.int32)
             return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
                 topk_ids=packed_topk_ids,
                 routing_bias=routing_bias,
@@ -648,7 +651,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 topk_group=topk_group,
                 intermediate_size=intermediate_size,
                 local_expert_offset=local_expert_offset,
-                local_num_experts=num_experts,
+                local_num_experts=local_num_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 routing_method_type=self.cvt_routing_method_type(routing_method_type),
                 use_shuffled_weight=use_shuffled_weight,
@@ -696,6 +699,29 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        fi_hidden_size = hidden_states.shape[1]
+        if hidden_states.dtype == torch.uint8:
+            fi_hidden_size *= 2
+
+        if gemm2_weights.shape[1] != fi_hidden_size:
+            raise ValueError(
+                "FlashInfer FP4 MoE GEMM2 expects gemm2_weights dim 1 "
+                f"to match hidden_states hidden size {fi_hidden_size}, "
+                f"got {gemm2_weights.shape[1]}."
+            )
+        if gemm2_weights_scale.shape[1] != fi_hidden_size:
+            raise ValueError(
+                "FlashInfer FP4 MoE GEMM2 expects gemm2_weights_scale dim 1 "
+                f"to match hidden_states hidden size {fi_hidden_size}, "
+                f"got {gemm2_weights_scale.shape[1]}."
+            )
+        if gemm2_bias is not None and gemm2_bias.shape[1] != fi_hidden_size:
+            raise ValueError(
+                "FlashInfer FP4 MoE GEMM2 expects gemm2_bias dim 1 "
+                f"to match hidden_states hidden size {fi_hidden_size}, "
+                f"got {gemm2_bias.shape[1]}."
+            )
+
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,
@@ -732,11 +758,12 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         else:
-            packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
-                torch.int16
+            routing_input = (
+                topk_ids.to(torch.int32),
+                topk_weights.to(torch.bfloat16),
             )
             outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
-                packed_tensor,
+                routing_input,
                 routing_bias,
                 hidden_states,
                 hidden_states_scale.view(torch.float8_e4m3fn)
@@ -772,6 +799,14 @@ class FlashinferOpBackend(MoEOpBackend):
         if not do_finalize:
             if outputs[2].dim() != 2:
                 outputs[2] = outputs[2].view(-1, top_k)
+            # WAR: flashinfer FP4 wrapper allocates expert_weights with
+            # routing_logits.dtype (float32 for DSV3) but the routing kernel
+            # always writes bf16 (mDtypeExpW = Bfloat16). Reinterpret bytes to
+            # bf16 so downstream consumers (e.g. moe_finalize_allreduce dispatch)
+            # see the right scalar_type. Underlying bytes/data_ptr are unchanged
+            # and downstream kernels use flat (token*top_k+k) indexing.
+            if outputs[1].dtype != torch.bfloat16:
+                outputs[1] = outputs[1].view(torch.bfloat16)
             return outputs
         else:
             final_hidden_states = outputs[0]
