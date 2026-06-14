@@ -191,6 +191,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return min(self.max_seq_len, self.max_num_tokens)
 
     @property
+    def effective_beam_width(self) -> int:
+        """Beam width visible to the kernel.
+
+        Cross-attention metadata is already expanded to one row per decoder
+        beam, and all beams read the same encoder K/V cache. Keep kernel beam
+        indirection disabled for that path.
+        """
+        return 1 if self.is_cross else self.beam_width
+
+    @property
     def max_seq_len(self) -> int:
         """
         Returns the max sequence length.
@@ -1439,6 +1449,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> None:
+        if metadata.is_cross:
+            if k is not None and v is not None:
+                k_flat = k.contiguous().view(k.shape[0], -1)
+                v_flat = v.contiguous().view(v.shape[0], -1)
+                forward_args.cross_kv = torch.cat([k_flat, v_flat],
+                                                  dim=1).contiguous()
+
+            q_hidden_size = self.num_heads * self.head_dim
+            kv_hidden_size = self.num_kv_heads * self.head_dim
+            qkv_hidden_size = q_hidden_size + 2 * kv_hidden_size
+            if q.shape[1] == q_hidden_size:
+                fused_q = q.new_zeros((q.shape[0], qkv_hidden_size))
+                fused_q[:, :q_hidden_size].copy_(q)
+                q = fused_q
+            else:
+                assert q.shape[1] == qkv_hidden_size
+            k = None
+            v = None
+            forward_args.is_fused_qkv = True
+
         attention_input_type = forward_args.attention_input_type
         if not self.is_mla_enable:
             if forward_args.is_fused_qkv:
@@ -1453,7 +1483,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     assert k.shape[1] == kv_hidden_size
                     assert v.shape[1] == kv_hidden_size
             num_tokens = q.shape[0]
-            if k is not None:
+            if k is not None and not metadata.is_cross:
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
@@ -1586,7 +1616,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 block_ids_per_seq=metadata.block_ids_per_seq,
                 tokens_per_block=metadata.tokens_per_block,
                 max_num_requests=metadata.max_num_requests,
-                beam_width=metadata.beam_width,
+                beam_width=metadata.effective_beam_width,
                 use_paged_context_fmha=metadata.use_paged_context_fmha,
                 helix_position_offsets=metadata.helix_position_offsets,
                 helix_is_inactive_rank=metadata.helix_is_inactive_rank,
@@ -1612,6 +1642,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_context_length=metadata.max_context_length,
                 max_seq_len=metadata.max_seq_len,
                 trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
+                is_cross=metadata.is_cross,
 
                 # --- Per-call (AttentionForwardArgs) ---
                 out_scale=forward_args.out_scale,
@@ -1643,6 +1674,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sage_attn_qk_int8=forward_args.sage_attn_qk_int8,
                 is_fused_qkv=forward_args.is_fused_qkv,
                 update_kv_cache=forward_args.update_kv_cache,
+                cross_kv=forward_args.cross_kv,
+                relative_attention_bias=forward_args.relative_attention_bias,
+                relative_attention_max_distance=forward_args.
+                relative_attention_max_distance,
+                position_embedding_type=self.position_embedding_type,
 
                 # --- Module config (TrtllmAttention) ---
                 rotary_inv_freq=self.rotary_inv_freq,
@@ -1654,7 +1690,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 head_size=self.head_dim,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=self.position_embedding_type,
                 rope_dim=self.rope_dim,
                 rope_base=self.rope_base,
                 rope_scale_type=self.rope_scale_type,
@@ -1716,7 +1751,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
-        assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
+        # Cross-attention uses the THOP path; the trtllm-gen backend API does
+        # not carry encoder K/V tensors yet.
 
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
@@ -1750,9 +1786,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         forward_args.is_fused_qkv = not metadata.is_cross and k is None
         forward_args.update_kv_cache = not metadata.is_cross or k is not None
-        assert (forward_args.is_fused_qkv and k is None
-                and v is None) or (not forward_args.is_fused_qkv
-                                   and k is not None and v is not None)
+        has_fused_qkv = forward_args.is_fused_qkv and k is None and v is None
+        has_unfused_kv = (not forward_args.is_fused_qkv and k is not None
+                          and v is not None)
+        uses_cached_cross_kv = (metadata.is_cross
+                                and not forward_args.update_kv_cache
+                                and k is None and v is None)
+        assert has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
         if forward_args.cu_q_seqlens is None:
             forward_args.cu_q_seqlens = metadata.cu_q_seqlens
         if forward_args.cu_kv_seqlens is None:

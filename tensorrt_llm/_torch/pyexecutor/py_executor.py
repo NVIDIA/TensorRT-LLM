@@ -8,7 +8,8 @@ import traceback
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
+                    Tuple, Union)
 
 import torch
 
@@ -81,6 +82,9 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
+
+if TYPE_CHECKING:
+    from ray.actor import ActorHandle
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -337,15 +341,20 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
-        # Store the execution stream for model forward operations.
-        # This stream is used for proper synchronization with KVCacheTransferManager.
-        # execution_stream can be provided by create_py_executor
-        # Create a new stream if none provided
+        # Store the execution stream for decoder/model forward operations.
+        # This stream is used for proper synchronization with
+        # KVCacheTransferManager. execution_stream can be provided by
+        # create_py_executor. Create a new stream if none provided.
         self.execution_stream = execution_stream if execution_stream is not None else torch.cuda.Stream(
         )
+        # Encoder-decoder requests use a dedicated encoder stream so the
+        # encoder forward does not serialize the decoder forward when the
+        # two operate on disjoint request sets. Per-request CUDA events
+        # carry the encoder->decoder dependency to the eventual consumer.
+        self.encoder_stream = torch.cuda.Stream()
         logger.info(
-            f"[PyExecutor] execution_stream initialized: {self.execution_stream}. "
-        )
+            f"[PyExecutor] execution_stream initialized: {self.execution_stream}; "
+            f"encoder_stream initialized: {self.encoder_stream}.")
 
         self.peft_cache_config = peft_cache_config
 
@@ -666,6 +675,31 @@ class PyExecutor:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
                 self.dist, self._do_terminate_request)
 
+        # Encoder-decoder models execute the encoder and decoder in separate
+        # iterations. The encoder branch lives in ``_executor_loop`` only;
+        # ``_executor_loop_overlap`` has not been threaded yet. Reject
+        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
+        # is intentionally out of scope for this port).
+        is_encoder_decoder = bool(
+            getattr(getattr(self.model_engine.model, "model_config", None),
+                    "is_encoder_decoder", False))
+        if is_encoder_decoder:
+            if self.dist.pp_size > 1:
+                raise NotImplementedError(
+                    "pp_size > 1 is not supported for encoder-decoder models "
+                    "in the PyTorch flow; encoder send/recv hooks are out of "
+                    "scope. Set pp_size=1 to run T5/BART/mBART.")
+            if not self.disable_overlap_scheduler:
+                raise NotImplementedError(
+                    "Overlap scheduler is not yet wired for encoder-decoder "
+                    "models. Set disable_overlap_scheduler=True for "
+                    "encoder-decoder runs.")
+            if getattr(self.model_engine, "cuda_graph_config",
+                       None) is not None:
+                raise NotImplementedError(
+                    "CUDA graph is not supported for encoder-decoder models. "
+                    "Disable cuda_graph_config for encoder-decoder runs.")
+
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
             # `TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE` controls whether to broadcast the sample state asynchronously.
@@ -925,10 +959,9 @@ class PyExecutor:
         self.shutdown()
 
     def enqueue_requests(
-        self,
-        requests: List[ExecutorRequest],
-        result_wait_queue: "Optional[ray.actor.ActorHandle]" = None
-    ) -> List[int]:
+            self,
+            requests: List[ExecutorRequest],
+            result_wait_queue: "Optional[ActorHandle]" = None) -> List[int]:
         """
         Enqueue new requests
         """
@@ -1069,7 +1102,7 @@ class PyExecutor:
             self,
             request: ExecutorRequest,
             query: Optional[List] = None,
-            result_wait_queue: "Optional[ray.actor.ActorHandle]" = None) -> int:
+            result_wait_queue: "Optional[ActorHandle]" = None) -> int:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
@@ -1368,7 +1401,10 @@ class PyExecutor:
             req_stat.reused_blocks_per_request = req.reused_blocks
             req_stat.missed_blocks_per_request = req.missed_blocks
             req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
-            req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
+            req_stat.scheduled = (req in scheduled_requests.encoder_requests
+                                  or req in scheduled_requests.context_requests
+                                  or req
+                                  in scheduled_requests.generation_requests)
             if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 req_stat.dis_serving_stats = DisServingRequestStats()
                 req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
@@ -2079,7 +2115,8 @@ class PyExecutor:
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
-                    f'scheduled {scheduled_batch.num_context_requests} context requests and '
+                    f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
+                    f'{scheduled_batch.num_context_requests} context requests and '
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
@@ -2695,7 +2732,8 @@ class PyExecutor:
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
-            f'scheduled {scheduled_batch.num_context_requests} context requests and '
+            f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
+            f'{scheduled_batch.num_context_requests} context requests and '
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
 
@@ -2872,6 +2910,15 @@ class PyExecutor:
                 gpu_forward_start = None
                 gpu_forward_end = None
                 gpu_forward_events_from_perf_pool = False
+
+                # Run the encoder iteration first.  After scatter the
+                # encoder requests transition to ``CONTEXT_INIT`` and are
+                # picked up by the next scheduler iteration as decoder
+                # context. The encoder pass is independent of the decoder
+                # ``can_queue`` gate, so an iteration with only encoder-init
+                # requests still makes forward progress.
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
 
@@ -4018,11 +4065,153 @@ class PyExecutor:
             self._revert_ctx_alloc(dropped)
 
         scheduled_requests = ScheduledRequests()
+        scheduled_requests.encoder_requests = scheduler_output.encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
+
+    # ---------------------------------------------------------------
+    # Encoder-decoder support: encoder iteration in the executor loop.
+    #
+    # At a scheduling pass, the scheduler may admit encoder-init requests
+    # alongside decoder-context and generation requests.  It returns them in
+    # disjoint buckets:
+    #
+    #   * encoder requests (``LlmRequestState.ENCODER_INIT``), which run
+    #     through ``ModelEngine.forward_encoder`` on this iteration.
+    #     After scatter, they transition to ``CONTEXT_INIT`` and are
+    #     re-admitted by the *next* iteration's scheduler pass for the
+    #     decoder context step.
+    #
+    #   * decoder-context requests (``CONTEXT_INIT`` and disagg-gen-init),
+    #     which flow through the normal decoder IFB step.
+    #
+    # The invariant is that encoder and decoder context never share one
+    # micro-batch; this preserves the cross-KV lifecycle and the
+    # dual-pool budget.
+    # ---------------------------------------------------------------
+    @nvtx_range("_run_encoder_step")
+    def _run_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
+        """Drive one encoder iteration for ``encoder_requests``.
+
+        Runs the encoder stack on the dedicated encoder stream, then
+        scatters the packed hidden states back onto the per-request
+        ``py_encoder_output`` field and transitions request state to
+        ``CONTEXT_INIT`` so the next scheduler pass picks them up as
+        decoder-context requests. A separate CUDA event is recorded for
+        each request on the encoder stream; the scheduler queries that
+        event before admitting the request to a decoder context step.
+        """
+        if not encoder_requests:
+            return
+
+        try:
+            self.encoder_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.encoder_stream):
+                encoder_hidden_states, encoder_seq_lens = (
+                    self.model_engine.forward_encoder(
+                        encoder_requests,
+                        resource_manager=self.resource_manager,
+                    ))
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(
+                f"Encountered an error in encoder forward: {error_msg}")
+            self._handle_errors(error_msg, requests=encoder_requests)
+            return
+
+        self._scatter_encoder_output(encoder_requests, encoder_hidden_states,
+                                     encoder_seq_lens)
+        for req in encoder_requests:
+            req.py_encoder_output_ready_event = torch.cuda.Event()
+            req.py_encoder_output_ready_event.record(self.encoder_stream)
+            # TODO(TRTLLM-12339): Honor return_encoder_output once the public
+            # LLM API shape for returned encoder hidden states is finalized.
+
+    @nvtx_range("_scatter_encoder_output")
+    def _scatter_encoder_output(
+        self,
+        encoder_requests: List[LlmRequest],
+        encoder_hidden_states: torch.Tensor,
+        encoder_seq_lens: List[int],
+    ) -> None:
+        """Slice packed encoder hidden states into per-request tensors.
+
+        Stores the slice for each request in ``req.py_encoder_output``
+        as a temporary GPU buffer (consumed by the first decoder
+        context step), and transitions the request from
+        ``ENCODER_INIT`` to ``CONTEXT_INIT`` so the next scheduler
+        iteration admits it on the decoder side.
+
+        ``py_skip_cross_kv_projection`` is initialized to ``False`` so
+        the *first* decoder context step projects K/V from
+        ``encoder_output`` and writes the cross-KV pool; the decoder
+        step flips it to ``True`` for later steps and chunks.
+        """
+        if encoder_hidden_states is None:
+            raise RuntimeError(
+                "Encoder forward returned None hidden states; cannot "
+                "scatter encoder output to requests.")
+
+        assert len(encoder_seq_lens) == len(encoder_requests), (
+            "Encoder packed sequence lengths must match the number of "
+            "encoder requests")
+        assert encoder_hidden_states.shape[0] == sum(encoder_seq_lens), (
+            "Encoder packed hidden states first dim must equal "
+            "sum(encoder_seq_lens)")
+
+        offset = 0
+        for req, seq_len in zip(encoder_requests, encoder_seq_lens):
+            req.py_encoder_output = encoder_hidden_states[offset:offset +
+                                                          seq_len]
+            req.py_skip_cross_kv_projection = False
+            req.state = LlmRequestState.CONTEXT_INIT
+            offset += seq_len
+
+    @nvtx_range("_attach_encoder_output_to_execution_stream")
+    def _attach_encoder_output_to_execution_stream(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """Hand encoder-produced tensors over to the execution stream.
+
+        Per-request encoder output tensors are produced on the dedicated
+        ``encoder_stream`` and consumed by the decoder forward on
+        ``execution_stream``. Cross-stream correctness is guaranteed by
+        the scheduler:
+        ``drop_decoder_context_requests_waiting_for_encoder_output`` excludes
+        any ``CONTEXT_INIT`` request whose ``py_encoder_output_ready_event``
+        has not completed, so by the time a request reaches this point the
+        encoder kernels for that request are already done. No
+        ``wait_event`` is therefore needed on the execution stream.
+
+        Two pieces of bookkeeping remain that this helper performs:
+
+        * ``record_stream`` is called on the encoder-output tensor so the
+          PyTorch caching allocator knows the storage is still in use on
+          the execution stream and must not be reused until the decoder
+          forward releases it.
+        * The spent ``py_encoder_output_ready_event`` is cleared so it
+          cannot be queried again on a later iteration.
+        """
+        for req in scheduled_requests.context_requests:
+            ready_event = getattr(req, "py_encoder_output_ready_event", None)
+            if ready_event is None:
+                continue
+
+            if req.py_encoder_output is not None:
+                req.py_encoder_output.record_stream(self.execution_stream)
+            req.py_encoder_output_ready_event = None
+
+    def _mark_cross_kv_projection_consumed(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """Release temporary encoder outputs after decoder context consumes them."""
+        for req in scheduled_requests.context_requests:
+            if getattr(req, "py_encoder_output", None) is None:
+                continue
+            req.py_encoder_output = None
+            req.py_skip_cross_kv_projection = True
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
@@ -4536,11 +4725,13 @@ class PyExecutor:
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
             self.execution_stream.wait_stream(torch.cuda.current_stream())
+            self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
                                   num_accepted_tokens_device)
+                self._mark_cross_kv_projection_consumed(scheduled_requests)
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.

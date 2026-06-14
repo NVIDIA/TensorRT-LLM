@@ -2796,7 +2796,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
-        "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Default is 50%. Should only be set when using encoder-decoder model."
+        "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise."
     )
     secondary_offload_min_priority: Optional[int] = Field(
         default=None,
@@ -2932,6 +2932,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
+    @field_validator('cross_kv_cache_fraction')
+    @classmethod
+    def validate_cross_kv_cache_fraction(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.cross_kv_cache_fraction must be a float between 0 and 1"
             )
         return v
 
