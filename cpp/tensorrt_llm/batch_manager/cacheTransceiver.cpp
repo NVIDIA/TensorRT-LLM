@@ -603,36 +603,6 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
-std::vector<LlmRequest::RequestIdType> gatherRequestIds(
-    std::shared_ptr<CacheTransceiverComm> const& mComm, std::vector<LlmRequest::RequestIdType> const& requestIds)
-{
-    int localSize = static_cast<int>(requestIds.size());
-    std::vector<int> sizes(mComm->getSize());
-    std::vector<LlmRequest::RequestIdType> retData;
-    if (useMPI())
-    {
-        mComm->allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
-        std::vector<int> displs(mComm->getSize());
-        size_t totalSize = 0;
-        for (int i = 0; i < mComm->getSize(); i++)
-        {
-            displs[i] = totalSize;
-            totalSize += sizes[i];
-        }
-        retData.resize(totalSize);
-        mComm->allgatherv(requestIds.data(), static_cast<int>(requestIds.size()), mpi::MpiType::kUINT64, retData.data(),
-            sizes, displs, mpi::MpiType::kUINT64);
-    }
-    else
-    {
-        mComm->allgather(&localSize, std::ref(sizes), {});
-        size_t totalSize = std::accumulate(sizes.begin(), sizes.end(), 0);
-        retData.resize(totalSize);
-        mComm->allgatherv(std::ref(requestIds), std::ref(retData), std::cref(sizes), {});
-    }
-    return retData;
-}
-
 void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm, LlmRequest* request)
 {
     namespace su = executor::serialize_utils;
@@ -716,42 +686,12 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
-    std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
+    std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
     for (auto&& [request, future] : mSenderFutures)
     {
         if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
-            contextCompleteRequestIds.push_back(request->mRequestId);
-        }
-    }
-
-    std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
-    if ((syncComm) && syncComm->getSize() > 1)
-    {
-        auto gatherRequestIdVec = gatherRequestIds(syncComm, contextCompleteRequestIds);
-        for (auto&& requestId : gatherRequestIdVec)
-        {
-            frequencyMap[requestId]++;
-        }
-    }
-    else
-    {
-        for (auto&& requestId : contextCompleteRequestIds)
-        {
-            frequencyMap[requestId]++;
-        }
-    }
-    std::vector<std::pair<LlmRequest::RequestIdType, int>> freqVec(frequencyMap.begin(), frequencyMap.end());
-
-    std::sort(freqVec.begin(), freqVec.end(),
-        [](std::pair<LlmRequest::RequestIdType, int> const& left,
-            std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
-    std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
-    for (auto&& [requestId, freq] : freqVec)
-    {
-        if (freq == ((syncComm) ? syncComm->getSize() : 1))
-        {
-            toCompleteIdSet.insert(requestId);
+            toCompleteIdSet.insert(request->mRequestId);
         }
     }
 
@@ -867,63 +807,18 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
-    std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+    std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
     for (auto&& [request, future] : mRequesterFutures)
     {
         if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
-            genTransferReadyRequestIds.push_back(request->mRequestId);
+            toCompleteIdSet.insert(request->mRequestId);
         }
     }
-    std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
-
-    std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-    if ((syncComm) && syncComm->getSize() > 1)
-    {
-        auto gatherRequestIdVec = gatherRequestIds(syncComm, genTransferReadyRequestIds);
-        for (auto&& requestId : gatherRequestIdVec)
-        {
-            frequencyMap[requestId]++;
-        }
-    }
-    else
-    {
-        for (auto&& requestId : genTransferReadyRequestIds)
-        {
-            frequencyMap[requestId]++;
-        }
-    }
-
-    std::vector<std::pair<LlmRequest::RequestIdType, int>> freqVec(frequencyMap.begin(), frequencyMap.end());
-
-    std::sort(freqVec.begin(), freqVec.end(),
-        [](std::pair<LlmRequest::RequestIdType, int> const& left,
-            std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
-    std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
-    size_t idx = 0;
-    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
-    {
-        if (idx >= freqVec.size())
-        {
-            break;
-        }
-        toCompleteIdSet.insert(freqVec.at(idx).first);
-        if (useMPI())
-        {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
-        }
-        else
-        {
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
-        }
-        idx++;
-    }
-    idx = 0;
 
     // insert order
+    size_t idx = 0;
     while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
     {
         if (idx >= mRequesterFutures.size())
@@ -947,23 +842,6 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             }
         }
         idx++;
-    }
-    for (auto&& [requestId, freq] : freqVec)
-    {
-        if (freq == ((syncComm != nullptr) ? syncComm->getSize() : 1))
-        {
-            toCompleteIdSet.insert(requestId);
-        }
-        if (useMPI())
-        {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
-                requestId, freq);
-        }
-        else
-        {
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
-        }
     }
     if (useMPI())
     {
