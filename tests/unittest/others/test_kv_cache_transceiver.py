@@ -26,6 +26,10 @@ from tensorrt_llm.sampling_params import SamplingParams
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 DataType = tensorrt_llm.bindings.DataType
+DEFAULT_KV_TRANSFER_TIMEOUT_S = (
+    CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default /
+    1000.0)
+KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
 
 
 def create_kv_cache_manager(mapping, dtype):
@@ -52,6 +56,41 @@ def fill_kv_cache_buffer(kv_cache_manager):
                                    dtype=torch.float32,
                                    device=buffer.device)
         buffer.copy_(random_values)
+
+
+def wait_for_transfer_completion(poll_fn,
+                                 is_done_fn,
+                                 timeout_s=DEFAULT_KV_TRANSFER_TIMEOUT_S +
+                                 KV_TRANSFER_COMPLETION_MARGIN_S):
+    """Poll until KV cache transfer completes or timeout expires.
+
+    Args:
+        poll_fn: Callable invoked each loop to drive transfer progress.
+        is_done_fn: Callable returning True when transfer is complete.
+        timeout_s: Seconds to wait before asserting failure.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        poll_fn()
+        if is_done_fn():
+            return
+        time.sleep(0.01)
+    poll_fn()
+    assert is_done_fn(), "Timed out waiting for KV cache transfer completion"
+
+
+def shutdown_transceivers(*transceivers):
+    for transceiver in transceivers:
+        transceiver.shutdown()
+
+
+def get_context_completed_request_id(request, transceiver_runtime):
+    if transceiver_runtime == "PYTHON":
+        assert request.py_disaggregated_params is not None
+        disagg_request_id = request.py_disaggregated_params.disagg_request_id
+        assert disagg_request_id is not None
+        return disagg_request_id
+    return request.py_request_id
 
 
 @pytest.fixture(scope="function")
@@ -101,66 +140,88 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
         mapping, dist, kv_cache_manager_gen, attention_type,
         cache_transceiver_config)
 
-    fill_kv_cache_buffer(kv_cache_manager_ctx)
+    try:
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
 
-    # init ctx request
-    sampling_params = SamplingParams()
-    ctx_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+        # init ctx request
+        sampling_params = SamplingParams()
+        ctx_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    if transceiver_runtime == "PYTHON":
-        disaggregated_params = tensorrt_llm.DisaggregatedParams(
-            request_type="context_only",
-            disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
-        ctx_request.py_disaggregated_params = disaggregated_params
+        if transceiver_runtime == "PYTHON":
+            disaggregated_params = tensorrt_llm.DisaggregatedParams(
+                request_type="context_only",
+                disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
+            ctx_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_ctx.impl.add_sequence_batch(
-        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
-    # send ctx request
-    kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, ctx_request.prompt_len, 1)],
+            [ctx_request])
+        # send ctx request
+        kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
-    # init gen request
-    gen_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        context_phase_params=ctx_request.context_phase_params)
+        # init gen request
+        gen_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=ctx_request.context_phase_params)
 
-    if transceiver_runtime == "PYTHON":
-        disaggregated_params = tensorrt_llm.DisaggregatedParams(
-            request_type="generation_only",
-            disagg_request_id=ctx_request.py_disaggregated_params.
-            disagg_request_id,
-            ctx_request_id=ctx_request.request_id,
-            ctx_dp_rank=ctx_request.context_phase_params.ctx_dp_rank,
-            ctx_info_endpoint=ctx_request.context_phase_params.
-            disagg_info_endpoint,
-            first_gen_tokens=ctx_request.context_phase_params.first_gen_tokens,
-            draft_tokens=ctx_request.context_phase_params.draft_tokens)
+        if transceiver_runtime == "PYTHON":
+            disaggregated_params = tensorrt_llm.DisaggregatedParams(
+                request_type="generation_only",
+                disagg_request_id=ctx_request.py_disaggregated_params.
+                disagg_request_id,
+                ctx_request_id=ctx_request.request_id,
+                ctx_dp_rank=ctx_request.context_phase_params.ctx_dp_rank,
+                ctx_info_endpoint=ctx_request.context_phase_params.
+                disagg_info_endpoint,
+                first_gen_tokens=ctx_request.context_phase_params.
+                first_gen_tokens,
+                draft_tokens=ctx_request.context_phase_params.draft_tokens)
 
-        gen_request.py_disaggregated_params = disaggregated_params
+            gen_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_gen.impl.add_sequence_batch(
-        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
-    # send gen request
-    kv_cache_transceiver_gen.request_and_receive_async(gen_request)
+        kv_cache_manager_gen.impl.add_sequence_batch(
+            [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+            [gen_request])
+        # send gen request
+        kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
-    kv_cache_transceiver_ctx.check_context_transfer_status(1)
-    kv_cache_transceiver_gen.check_gen_transfer_status(1)
+        completed_ctx_ids = set()
 
-    assert torch.equal(
-        kv_cache_manager_gen.get_buffers(0),
-        kv_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
+        def poll_transfers():
+            completed, failed = (
+                kv_cache_transceiver_ctx.check_context_transfer_status(1))
+            assert failed == []
+            completed_ctx_ids.update(completed)
+            kv_cache_transceiver_gen.check_gen_transfer_status(1)
+
+        expected_ctx_id = get_context_completed_request_id(
+            ctx_request, transceiver_runtime)
+
+        def transfers_done():
+            return (expected_ctx_id in completed_ctx_ids and gen_request.state
+                    == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
+
+        wait_for_transfer_completion(poll_transfers, transfers_done)
+
+        assert torch.equal(
+            kv_cache_manager_gen.get_buffers(0),
+            kv_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
+    finally:
+        shutdown_transceivers(kv_cache_transceiver_gen,
+                              kv_cache_transceiver_ctx)
 
 
 @pytest.mark.timeout(120)
@@ -322,9 +383,29 @@ def test_async_transfer_keeps_llm_request_alive():
         "request_and_receive_async must hold a strong shared_ptr while "
         "the requester future is in flight")
 
+    # Re-acquire temporary strong refs for cleanup after proving the in-flight
+    # futures owned the requests. Once a future is erased, the weakref may
+    # legitimately clear.
+    ctx_request = ctx_ref()
+    gen_request = gen_ref()
+    assert ctx_request is not None
+    assert gen_request is not None
+
     # Drive the transfer to completion so the harness tears down cleanly.
-    transceiver_ctx.check_context_transfer_status(1)
-    transceiver_gen.check_gen_transfer_status(1)
+    completed_ctx_ids = set()
+
+    def poll_transfers():
+        completed, failed = transceiver_ctx.check_context_transfer_status(1)
+        assert failed == []
+        completed_ctx_ids.update(completed)
+        transceiver_gen.check_gen_transfer_status(1)
+
+    def transfers_done():
+        return (ctx_request.py_request_id in completed_ctx_ids
+                and gen_request.state
+                == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
+
+    wait_for_transfer_completion(poll_transfers, transfers_done)
 
 
 def _build_ctx_request_for_timeout_test(request_id: int) -> LlmRequest:
@@ -426,6 +507,84 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
         f"unset; stdout:\n{out.out}")
 
     transceiver_ctx.cancel_request(ctx_request)
+
+
+@pytest.mark.timeout(120)
+def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
+    """A bounded transfer poll must not make a non-ready request terminal."""
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+    transceiver_gen = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_gen,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    ctx_request = _build_ctx_request_for_timeout_test(request_id=100)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    transceiver_ctx.respond_and_send_async(ctx_request)
+
+    start = time.monotonic()
+    completed_request_ids, error_request_ids = (
+        transceiver_ctx.check_context_transfer_status(1))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, (
+        f"Bounded poll should yield back to the executor quickly; "
+        f"elapsed={elapsed:.3f}s")
+    assert completed_request_ids == []
+    assert error_request_ids == []
+    assert ctx_request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+    sampling_params = SamplingParams()
+    gen_request = LlmRequest(
+        request_id=100,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=ctx_request.context_phase_params)
+
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
+
+    capfd.readouterr()
+    transceiver_gen.request_and_receive_async(gen_request)
+    transceiver_gen.check_gen_transfer_status(0)
+    out = capfd.readouterr()
+    marker = "Generation KV cache transfer for request 100 exceeded configured timeout"
+    assert marker not in out.out, (
+        f"Generation transfer timeout WARN fired before the request had "
+        f"actually timed out; stdout:\n{out.out}")
+
+    completed_ctx_ids = set()
+
+    def poll_transfers():
+        completed, failed = transceiver_ctx.check_context_transfer_status(1)
+        assert failed == []
+        completed_ctx_ids.update(completed)
+        transceiver_gen.check_gen_transfer_status(1)
+
+    def transfers_done():
+        return (ctx_request.py_request_id in completed_ctx_ids
+                and gen_request.state
+                == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
+
+    wait_for_transfer_completion(poll_transfers, transfers_done)
 
 
 def create_hybrid_cache_manager(mapping,
@@ -629,8 +788,21 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
     cache_transceiver_gen.request_and_receive_async(gen_request)
 
-    cache_transceiver_ctx.check_context_transfer_status(1)
-    cache_transceiver_gen.check_gen_transfer_status(1)
+    completed_ctx_ids = set()
+
+    def poll_transfers():
+        completed, failed = cache_transceiver_ctx.check_context_transfer_status(
+            1)
+        assert failed == []
+        completed_ctx_ids.update(completed)
+        cache_transceiver_gen.check_gen_transfer_status(1)
+
+    def transfers_done():
+        return (ctx_request.py_request_id in completed_ctx_ids
+                and gen_request.state
+                == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
+
+    wait_for_transfer_completion(poll_transfers, transfers_done)
 
     assert torch.equal(
         hybrid_cache_manager_gen.get_buffers(0),
