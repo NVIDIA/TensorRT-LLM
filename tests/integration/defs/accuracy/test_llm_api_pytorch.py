@@ -1218,6 +1218,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_ada
     @parametrize_with_ids("torch_compile", [False, True])
     def test_fp8_prequantized(self, torch_compile):
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
