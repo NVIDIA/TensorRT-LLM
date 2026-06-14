@@ -17,8 +17,10 @@ from typing import Iterable, Optional, Set
 
 from tensorrt_llm.lora_helper import LoraConfig
 
-# TRTLLM module names that map to routed-expert MoE projections.
-MOE_LORA_MODULE_NAMES: Set[str] = {"moe_h_to_4h", "moe_4h_to_h", "moe_gate"}
+# Canonical routed-expert MoE LoRA module names (single source of truth).
+from .layer import MOE_LORA_MODULE_NAMES
+
+_MOE_LORA_MODULE_NAME_SET: Set[str] = set(MOE_LORA_MODULE_NAMES)
 
 
 def _normalize_targets(lora_target_modules: Iterable[str]) -> Set[str]:
@@ -30,7 +32,7 @@ def has_moe_lora_targets(lora_config: Optional[LoraConfig]) -> bool:
     if lora_config is None:
         return False
     return bool(
-        MOE_LORA_MODULE_NAMES
+        _MOE_LORA_MODULE_NAME_SET
         & _normalize_targets(getattr(lora_config, "lora_target_modules", []) or [])
     )
 
