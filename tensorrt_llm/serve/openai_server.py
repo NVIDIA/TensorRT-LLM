@@ -403,6 +403,19 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
+        # The harmony (gpt-oss) path rebuilds the client-visible output from raw
+        # output token ids rather than the detokenized text, so the
+        # post-processing hook (TRTLLM-12622), which operates on detok text,
+        # cannot act there. Fail fast rather than silently bypassing a guardrail.
+        if self.use_harmony and getattr(self.generator.args, "post_processor",
+                                        None):
+            raise ValueError(
+                "--post_processor is not supported with harmony/gpt-oss models "
+                "in this version: the harmony output path is reconstructed from "
+                "raw token ids and would bypass the text-based hook. Disable the "
+                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
+                "not needed.")
+
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
             # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
