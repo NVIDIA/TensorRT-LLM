@@ -67,10 +67,20 @@ macro(_tensorrt_find_dll VAR)
     PATH_SUFFIXES bin)
 endmacro(_tensorrt_find_dll)
 
+set(libpostfix "")
+message(DEBUG "TRT_DYNAMIC_LINKING=${TRT_DYNAMIC_LINKING}")
+if(NOT ${TRT_DYNAMIC_LINKING})
+  if(WIN32)
+    message(FATAL_ERROR "Static linking with TRT not supported on Windows")
+  endif()
+  set(libpostfix "_static")
+endif()
+
 find_library(
   TensorRT_LIBRARY
-  NAMES "nvinfer_${TensorRT_VERSION_MAJOR}" nvinfer
+  NAMES "nvinfer_${TensorRT_VERSION_MAJOR}${libpostfix}" "nvinfer${libpostfix}"
   PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib)
+message(STATUS "TensorRT_LIBRARY = ${TensorRT_LIBRARY}")
 
 if(WIN32)
   _tensorrt_find_dll(TensorRT_DLL "nvinfer_${TensorRT_VERSION_MAJOR}.dll"
@@ -81,6 +91,16 @@ if(TensorRT_LIBRARY)
   set(TensorRT_LIBRARIES ${TensorRT_LIBRARIES} ${TensorRT_LIBRARY})
 endif(TensorRT_LIBRARY)
 
+if(NOT ${TRT_DYNAMIC_LINKING})
+  # Linking statically with TRT requires to also link with nvJitLink_static
+  find_library(
+    NVJITLINK_LIBRARY
+    NAMES "nvJitLink_static"
+    PATHS ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
+  message(DEBUG "NVJITLINK_LIBRARY=${NVJITLINK_LIBRARY}")
+  set(TensorRT_LIBRARIES ${TensorRT_LIBRARIES} ${NVJITLINK_LIBRARY})
+endif()
+
 if(TensorRT_FIND_COMPONENTS)
   list(REMOVE_ITEM TensorRT_FIND_COMPONENTS "nvinfer")
 
@@ -89,11 +109,15 @@ if(TensorRT_FIND_COMPONENTS)
       TensorRT_OnnxParser_INCLUDE_DIR
       NAMES NvOnnxParser.h
       PATHS ${TensorRT_WELL_KNOWN_ROOT}/include)
-
+    message(
+      DEBUG
+      "TensorRT_OnnxParser_INCLUDE_DIR=${TensorRT_OnnxParser_INCLUDE_DIR}")
     find_library(
       TensorRT_OnnxParser_LIBRARY
-      NAMES "nvonnxparser_${TensorRT_VERSION_MAJOR}" nvonnxparser
+      NAMES "nvonnxparser_${TensorRT_VERSION_MAJOR}${libpostfix}"
+            "nvonnxparser${libpostfix}"
       PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib)
+    message(DEBUG "TensorRT_OnnxParser_LIBRARY=${TensorRT_OnnxParser_LIBRARY}")
     if(TensorRT_OnnxParser_LIBRARY AND TensorRT_LIBRARIES)
       set(TensorRT_LIBRARIES ${TensorRT_LIBRARIES}
                              ${TensorRT_OnnxParser_LIBRARY})
@@ -115,7 +139,8 @@ if(TensorRT_FIND_COMPONENTS)
 
     find_library(
       TensorRT_Plugin_LIBRARY
-      NAMES "nvinfer_plugin_${TensorRT_VERSION_MAJOR}" nvinfer_plugin
+      NAMES "nvinfer_plugin_${TensorRT_VERSION_MAJOR}${libpostfix}"
+            nvinfer_plugin${libpostfix}
       PATHS ${TensorRT_WELL_KNOWN_ROOT}/lib)
 
     if(TensorRT_Plugin_LIBRARY AND TensorRT_LIBRARIES)
