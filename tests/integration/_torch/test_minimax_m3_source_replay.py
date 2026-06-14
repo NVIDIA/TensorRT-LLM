@@ -2003,9 +2003,7 @@ def _build_synthetic_m3_moe_bundle(
         AuxStreamType.MoeShared: aux,
         AuxStreamType.MoeChunkingOverlap: aux,
     }
-    moe = MiniMaxM3MoE(
-        model_config=mc, aux_stream_dict=aux_stream_dict, layer_idx=3
-    ).cuda()
+    moe = MiniMaxM3MoE(model_config=mc, aux_stream_dict=aux_stream_dict, layer_idx=3).cuda()
 
     # Synthetic per-expert weights (gate/up/down) at low magnitude.
     torch.manual_seed(7)

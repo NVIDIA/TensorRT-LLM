@@ -856,17 +856,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # extra buffer's role must be unique within the layer (asserted by
         # AttentionLayerConfig.__post_init__) and its size must be in bytes
         # per block (= bytes_per_token * tokens_per_block).
-        extra_buffers_per_layer = self._extra_buffers_per_layer(
-            tokens_per_block=tokens_per_block) or {}
+        extra_buffers_per_layer = (
+            self._extra_buffers_per_layer(tokens_per_block=tokens_per_block) or {}
+        )
 
         layer_configs: List[AttentionLayerConfig] = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
             buffers = [
                 BufferConfig(
                     role=role,
-                    size=self.get_layer_bytes_per_token(
-                        local_layer_idx=layer_id, data_role=role
-                    )
+                    size=self.get_layer_bytes_per_token(local_layer_idx=layer_id, data_role=role)
                     * tokens_per_block,
                 )
                 for role in buffer_type

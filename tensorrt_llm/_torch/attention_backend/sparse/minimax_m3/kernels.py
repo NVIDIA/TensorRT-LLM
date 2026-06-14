@@ -126,10 +126,7 @@ def _sparse_softmax_kernel(
         off_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = off_k < max_k
         qk_off = (
-            pid_q * stride_qk_q
-            + pid_h * stride_qk_h
-            + pid_g * stride_qk_g
-            + off_k * stride_qk_k
+            pid_q * stride_qk_q + pid_h * stride_qk_h + pid_g * stride_qk_g + off_k * stride_qk_k
         )
         att_off = pid_q * stride_att_q + pid_h * stride_att_h + off_k * stride_att_k
         qk = tl.load(qk_ptr + qk_off, mask=k_mask, other=float("-inf")).to(tl.float32)
@@ -147,10 +144,7 @@ def _sparse_softmax_kernel(
         off_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = off_k < max_k
         qk_off = (
-            pid_q * stride_qk_q
-            + pid_h * stride_qk_h
-            + pid_g * stride_qk_g
-            + off_k * stride_qk_k
+            pid_q * stride_qk_q + pid_h * stride_qk_h + pid_g * stride_qk_g + off_k * stride_qk_k
         )
         att_off = pid_q * stride_att_q + pid_h * stride_att_h + off_k * stride_att_k
         qk = tl.load(qk_ptr + qk_off, mask=k_mask, other=float("-inf")).to(tl.float32)
@@ -166,15 +160,10 @@ def _sparse_softmax_kernel(
         off_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = off_k < max_k
         qk_off = (
-            pid_q * stride_qk_q
-            + pid_h * stride_qk_h
-            + pid_g * stride_qk_g
-            + off_k * stride_qk_k
+            pid_q * stride_qk_q + pid_h * stride_qk_h + pid_g * stride_qk_g + off_k * stride_qk_k
         )
         att_off = pid_q * stride_att_q + pid_h * stride_att_h + off_k * stride_att_k
-        o_off = (
-            pid_q * stride_o_q + pid_h * stride_o_h + pid_g * stride_o_g + off_k * stride_o_k
-        )
+        o_off = pid_q * stride_o_q + pid_h * stride_o_h + pid_g * stride_o_g + off_k * stride_o_k
         qk = tl.load(qk_ptr + qk_off, mask=k_mask, other=float("-inf")).to(tl.float32)
         att = tl.load(attended_ptr + att_off, mask=k_mask, other=0).to(tl.int1)
         qk = tl.where(att, qk, float("-inf"))

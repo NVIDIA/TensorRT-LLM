@@ -29,28 +29,23 @@ importers (the model code, ``sparse.utils``, focused tests) keep
 working unchanged.
 """
 
-from .backend import (
-    MiniMaxM3SparseAttention,
-    get_minimax_m3_attention_backend_cls,
-    minimax_m3_sparse_decode,
-    minimax_m3_sparse_prefill,
-)
 # Re-export the algorithm-internal helpers focused unit tests reach
 # into so the package preserves the surface the monolithic module
 # exposed. These are not part of ``__all__`` (still package-private)
 # but stay importable as ``from ...minimax_m3 import _write_main_kv_slots``.
 from .backend import (  # noqa: F401
+    MiniMaxM3SparseAttention,
     _compute_index_attn_chunk_q,
     _compute_sparse_gqa_chunk_q,
     _gather_paged_batched,
     _index_attention_and_select,
     _write_main_kv_slots,
     _write_main_kv_slots_to_pool,
+    get_minimax_m3_attention_backend_cls,
+    minimax_m3_sparse_decode,
+    minimax_m3_sparse_prefill,
 )
-from .cache_manager import (
-    MiniMaxM3SparseIndexCache,
-    get_minimax_m3_kv_cache_manager_cls,
-)
+from .cache_manager import MiniMaxM3SparseIndexCache, get_minimax_m3_kv_cache_manager_cls
 from .metadata import (
     MiniMaxM3SparseAttentionMetadata,
     MiniMaxM3SparseConfig,

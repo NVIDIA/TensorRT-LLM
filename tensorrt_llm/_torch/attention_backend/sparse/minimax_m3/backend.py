@@ -59,7 +59,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -70,6 +70,9 @@ from .metadata import (
     ensure_metadata_on_device,
     get_minimax_m3_attention_metadata_cls,
 )
+
+if TYPE_CHECKING:
+    from .cache_manager import MiniMaxM3SparseIndexCache
 
 # Sentinel block score for blocks that init / local priority forces into
 # the top-k regardless of their numerical score.

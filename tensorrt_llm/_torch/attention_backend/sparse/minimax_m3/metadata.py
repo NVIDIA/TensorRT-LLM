@@ -23,9 +23,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 @dataclass(frozen=True)

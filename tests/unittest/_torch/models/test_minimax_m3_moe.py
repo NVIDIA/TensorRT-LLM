@@ -410,10 +410,7 @@ def test_decoder_layer_layer_frequency_dense_vs_moe():
     if not _has_cuda():
         pytest.skip("MiniMaxM3MoE create_moe needs CUDA buffers")
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        MiniMaxM3DecoderLayer,
-        MiniMaxM3MoE,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3DecoderLayer, MiniMaxM3MoE
     from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
     from tensorrt_llm._torch.utils import AuxStreamType
     from tensorrt_llm.mapping import Mapping
@@ -465,9 +462,7 @@ def test_minimax_m3_moe_block_constructs_shared_expert_when_enabled():
         AuxStreamType.MoeShared: aux_stream,
         AuxStreamType.MoeChunkingOverlap: aux_stream,
     }
-    moe = MiniMaxM3MoE(
-        model_config=model_config, aux_stream_dict=aux_stream_dict, layer_idx=3
-    )
+    moe = MiniMaxM3MoE(model_config=model_config, aux_stream_dict=aux_stream_dict, layer_idx=3)
     assert isinstance(moe.shared_experts, GatedMLP)
     # Shared expert intermediate is ``shared_intermediate_size * n_shared_experts``.
     expected_shared = cfg.shared_intermediate_size * cfg.n_shared_experts
@@ -499,9 +494,7 @@ def test_minimax_m3_moe_block_drops_shared_when_disabled():
         AuxStreamType.MoeShared: aux_stream,
         AuxStreamType.MoeChunkingOverlap: aux_stream,
     }
-    moe = MiniMaxM3MoE(
-        model_config=model_config, aux_stream_dict=aux_stream_dict, layer_idx=3
-    )
+    moe = MiniMaxM3MoE(model_config=model_config, aux_stream_dict=aux_stream_dict, layer_idx=3)
     assert moe.shared_experts is None
 
 
@@ -779,9 +772,7 @@ def _build_m3_moe_and_weights(
         AuxStreamType.MoeChunkingOverlap: aux,
     }
     if activation_type_override is None:
-        moe = MiniMaxM3MoE(
-            model_config=mc, aux_stream_dict=aux_stream_dict, layer_idx=3
-        ).cuda()
+        moe = MiniMaxM3MoE(model_config=mc, aux_stream_dict=aux_stream_dict, layer_idx=3).cuda()
     else:
         # Construct with the production wiring, then rebuild the
         # backend with the alternate activation_type. We do this via
@@ -790,9 +781,7 @@ def _build_m3_moe_and_weights(
         # weights, only with the activation flipped.
         from tensorrt_llm._torch.modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 
-        moe = MiniMaxM3MoE(
-            model_config=mc, aux_stream_dict=aux_stream_dict, layer_idx=3
-        ).cuda()
+        moe = MiniMaxM3MoE(model_config=mc, aux_stream_dict=aux_stream_dict, layer_idx=3).cuda()
         # Rebuild ``moe.experts`` with the overridden activation_type.
         # The other constructor args mirror the production call inside
         # ``MiniMaxM3MoE.__init__`` so this stays a faithful "swap one
@@ -807,9 +796,7 @@ def _build_m3_moe_and_weights(
             routing_method=MiniMaxM3MoeRoutingMethod(
                 top_k=moe.top_k,
                 num_experts=moe.num_experts,
-                callable_e_score_correction_bias=lambda: (
-                    moe.gate.e_score_correction_bias
-                ),
+                callable_e_score_correction_bias=lambda: (moe.gate.e_score_correction_bias),
                 routed_scaling_factor=moe.routed_scaling_factor,
             ),
             num_experts=moe.num_experts,

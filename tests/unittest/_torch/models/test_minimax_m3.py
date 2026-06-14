@@ -1391,8 +1391,7 @@ def test_minimax_m3_swiglu_oai_dense_mlp_adp_negative_control_mpi(mpi_pool_execu
 
     tp_size = mpi_pool_executor.num_workers
     assert tp_size == 2, (
-        "ADP negative-control test parametrize fixture must be "
-        f"[2]; got num_workers={tp_size}"
+        f"ADP negative-control test parametrize fixture must be [2]; got num_workers={tp_size}"
     )
 
     # Dispatch the worker function across ranks 0..tp_size-1. The

@@ -27,9 +27,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 _CHECKPOINT_PATH_ENV = "MINIMAX_M3_CHECKPOINT_PATH"
-_DEFAULT_CHECKPOINT_PATH = (
-    "/home/scratch.fredw_sw/workspace/hidden_trail/minimax-m3-preview_vv1"
-)
+_DEFAULT_CHECKPOINT_PATH = "/home/scratch.fredw_sw/workspace/hidden_trail/minimax-m3-preview_vv1"
 
 
 def _checkpoint_path() -> str:
@@ -146,23 +144,29 @@ def test_minimax_vl_vision_model_state_dict_keys_match_checkpoint_pattern():
 
     # Patch embedding + pre-LN (the typo "pre_layrnorm" must match the
     # checkpoint).
-    assert (
-        "vision_model.embeddings.patch_embedding.weight" in state_dict
-    ), state_dict.keys()
+    assert "vision_model.embeddings.patch_embedding.weight" in state_dict, state_dict.keys()
     assert "vision_model.pre_layrnorm.weight" in state_dict
     assert "vision_model.pre_layrnorm.bias" in state_dict
 
     # Each encoder layer must carry the canonical 16 weights (q/k/v/out *
     # weight+bias, layer_norm1/2 * weight+bias, mlp.fc1/2 * weight+bias).
     expected_per_layer = {
-        "self_attn.q_proj.weight", "self_attn.q_proj.bias",
-        "self_attn.k_proj.weight", "self_attn.k_proj.bias",
-        "self_attn.v_proj.weight", "self_attn.v_proj.bias",
-        "self_attn.out_proj.weight", "self_attn.out_proj.bias",
-        "layer_norm1.weight", "layer_norm1.bias",
-        "layer_norm2.weight", "layer_norm2.bias",
-        "mlp.fc1.weight", "mlp.fc1.bias",
-        "mlp.fc2.weight", "mlp.fc2.bias",
+        "self_attn.q_proj.weight",
+        "self_attn.q_proj.bias",
+        "self_attn.k_proj.weight",
+        "self_attn.k_proj.bias",
+        "self_attn.v_proj.weight",
+        "self_attn.v_proj.bias",
+        "self_attn.out_proj.weight",
+        "self_attn.out_proj.bias",
+        "layer_norm1.weight",
+        "layer_norm1.bias",
+        "layer_norm2.weight",
+        "layer_norm2.bias",
+        "mlp.fc1.weight",
+        "mlp.fc1.bias",
+        "mlp.fc2.weight",
+        "mlp.fc2.bias",
     }
     for i in range(cfg.num_hidden_layers):
         for suffix in expected_per_layer:
@@ -232,9 +236,7 @@ def test_minimax_vl_vision_model_param_shapes_match_checkpoint():
 
 
 def test_reanchor_multimodal_checkpoint_keys_maps_vision_branches():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        reanchor_multimodal_checkpoint_keys,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import reanchor_multimodal_checkpoint_keys
 
     keys = [
         "vision_tower.vision_model.embeddings.patch_embedding.weight",
@@ -253,10 +255,7 @@ def test_reanchor_multimodal_checkpoint_keys_maps_vision_branches():
         plan["multi_modal_projector.linear_1.weight"]
         == "vision_tower.multi_modal_projector.linear_1.weight"
     )
-    assert (
-        plan["patch_merge_mlp.linear_2.bias"]
-        == "vision_tower.patch_merge_mlp.linear_2.bias"
-    )
+    assert plan["patch_merge_mlp.linear_2.bias"] == "vision_tower.patch_merge_mlp.linear_2.bias"
     # Language-model keys are not in the mapping.
     assert "language_model.model.norm.weight" not in plan
     assert "language_model.lm_head.weight" not in plan
@@ -265,9 +264,7 @@ def test_reanchor_multimodal_checkpoint_keys_maps_vision_branches():
 def test_split_multimodal_weights_partitions_text_and_vision():
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        split_multimodal_weights,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import split_multimodal_weights
 
     weights = {
         "language_model.model.norm.weight": torch.zeros(2),
@@ -290,9 +287,7 @@ def test_split_multimodal_weights_partitions_text_and_vision():
 def test_split_multimodal_weights_preserves_unknown_top_level_keys():
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        split_multimodal_weights,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import split_multimodal_weights
 
     weights = {
         "language_model.model.norm.weight": torch.zeros(2),
@@ -389,9 +384,7 @@ def test_load_minimax_m3_vl_state_dict_strict_rejects_missing_keys():
             },
         }
     )
-    model = MiniMaxVLVisionModel(
-        config=cfg, text_hidden_size=32, dtype=torch.float32
-    )
+    model = MiniMaxVLVisionModel(config=cfg, text_hidden_size=32, dtype=torch.float32)
     # Provide only one weight; strict load must fail.
     raw_weights = {
         "vision_tower.vision_model.pre_layrnorm.weight": torch.zeros(16),
@@ -427,9 +420,7 @@ def test_load_minimax_m3_vl_state_dict_rejects_shape_mismatch():
             },
         }
     )
-    model = MiniMaxVLVisionModel(
-        config=cfg, text_hidden_size=32, dtype=torch.float32
-    )
+    model = MiniMaxVLVisionModel(config=cfg, text_hidden_size=32, dtype=torch.float32)
     # Wrong shape for pre_layrnorm.weight (expected [16], provided [8]).
     raw_weights = {
         "vision_tower.vision_model.pre_layrnorm.weight": torch.zeros(8),
@@ -512,7 +503,7 @@ def test_real_checkpoint_vision_state_dict_accounting():
     # Every target maps to a real module parameter slot.
     missing_targets: List[str] = []
     for source, target in plan.items():
-        relative = target[len("vision_tower."):]
+        relative = target[len("vision_tower.") :]
         if relative not in target_keys:
             missing_targets.append(target)
 
@@ -523,7 +514,7 @@ def test_real_checkpoint_vision_state_dict_accounting():
 
     # And every parameter slot is covered by a checkpoint key (no orphan
     # parameters in the module).
-    target_relative = {plan[k][len("vision_tower."):] for k in plan}
+    target_relative = {plan[k][len("vision_tower.") :] for k in plan}
     orphan_params = sorted(target_keys - target_relative)
     assert not orphan_params, (
         f"{len(orphan_params)} MiniMaxVLVisionModel parameters have no "
@@ -614,7 +605,7 @@ def test_real_checkpoint_vision_weight_load_smoke():
     expected_loaded = set()
     for k in targets:
         if k.startswith("vision_tower."):
-            expected_loaded.add(k[len("vision_tower."):])
+            expected_loaded.add(k[len("vision_tower.") :])
         else:
             expected_loaded.add(k)  # already in module-relative form
     assert expected_loaded.issubset(set(loaded)), (
@@ -643,9 +634,7 @@ def test_real_checkpoint_vision_weight_load_smoke():
 
 
 def test_compute_visual_token_count_matches_sglang_formula():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        compute_visual_token_count,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import compute_visual_token_count
 
     # Single image, grid (1, 48, 48) with spatial_merge_size 2 -> 1 * 24 * 24 = 576.
     assert compute_visual_token_count(1, 48, 48, 2) == 576
@@ -656,9 +645,7 @@ def test_compute_visual_token_count_matches_sglang_formula():
 
 
 def test_compute_visual_token_counts_batched():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        compute_visual_token_counts,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import compute_visual_token_counts
 
     # [1, 4, 4] merge=2 -> 1 * 2 * 2 = 4
     # [1, 8, 8] merge=2 -> 1 * 4 * 4 = 16
@@ -668,9 +655,7 @@ def test_compute_visual_token_counts_batched():
 
 
 def test_compute_visual_token_count_rejects_non_divisible_grid():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        compute_visual_token_count,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import compute_visual_token_count
 
     with pytest.raises(ValueError, match="multiple of spatial_merge_size"):
         compute_visual_token_count(1, 5, 4, 2)
@@ -679,9 +664,7 @@ def test_compute_visual_token_count_rejects_non_divisible_grid():
 
 
 def test_expand_multimodal_placeholders_image_only():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        expand_multimodal_placeholders,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import expand_multimodal_placeholders
 
     # Two image placeholders with different repeat counts.
     input_ids = [1, 2, 200025, 3, 200025, 4]
@@ -694,9 +677,7 @@ def test_expand_multimodal_placeholders_image_only():
 
 
 def test_expand_multimodal_placeholders_image_and_video():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        expand_multimodal_placeholders,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import expand_multimodal_placeholders
 
     input_ids = [10, 200025, 20, 200026, 30]
     expanded, image_spans, video_spans = expand_multimodal_placeholders(
@@ -712,24 +693,16 @@ def test_expand_multimodal_placeholders_image_and_video():
 
 
 def test_expand_multimodal_placeholders_count_mismatch_raises():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        expand_multimodal_placeholders,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import expand_multimodal_placeholders
 
     with pytest.raises(ValueError, match="more image tokens"):
-        expand_multimodal_placeholders(
-            [200025, 200025], image_token_id=200025, image_repeats=[2]
-        )
+        expand_multimodal_placeholders([200025, 200025], image_token_id=200025, image_repeats=[2])
     with pytest.raises(ValueError, match="consumed 0 image"):
-        expand_multimodal_placeholders(
-            [1, 2, 3], image_token_id=200025, image_repeats=[2]
-        )
+        expand_multimodal_placeholders([1, 2, 3], image_token_id=200025, image_repeats=[2])
 
 
 def test_apply_multimodal_pad_values_rewrites_only_spans():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        apply_multimodal_pad_values,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import apply_multimodal_pad_values
 
     input_ids = [1, 2, 200025, 200025, 200025, 4, 200026, 200026, 6]
     out = apply_multimodal_pad_values(
@@ -745,9 +718,7 @@ def test_apply_multimodal_pad_values_rewrites_only_spans():
 def test_merge_multimodal_embeddings_image_only_replaces_correct_positions():
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        merge_multimodal_embeddings,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import merge_multimodal_embeddings
 
     text_seq = 8
     hidden = 4
@@ -756,9 +727,7 @@ def test_merge_multimodal_embeddings_image_only_replaces_correct_positions():
     input_embeds[:] = torch.arange(text_seq, dtype=torch.float32).unsqueeze(-1) * 0.1
     image_embeds = torch.ones((5, hidden), dtype=torch.float32) * 9.0
     spans = [(2, 5), (6, 8)]
-    out = merge_multimodal_embeddings(
-        input_embeds, image_embeds=image_embeds, image_spans=spans
-    )
+    out = merge_multimodal_embeddings(input_embeds, image_embeds=image_embeds, image_spans=spans)
 
     # Positions inside spans replaced by 9.0.
     for start, end in spans:
@@ -771,9 +740,7 @@ def test_merge_multimodal_embeddings_image_only_replaces_correct_positions():
 def test_merge_multimodal_embeddings_rejects_mismatched_counts():
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        merge_multimodal_embeddings,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import merge_multimodal_embeddings
 
     input_embeds = torch.zeros((8, 4))
     image_embeds = torch.ones((4, 4))
@@ -794,9 +761,7 @@ def test_merge_multimodal_embeddings_negative_control_wrong_span():
     """
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        merge_multimodal_embeddings,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import merge_multimodal_embeddings
 
     input_embeds = torch.zeros((8, 4))
     image_embeds = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4) + 1.0
@@ -868,7 +833,9 @@ def test_vision_tower_forward_shape_and_dtype_cpu():
     pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.float32)
 
     out = model(pixel_values=pixel_values, grid_thw=grid_thw)
-    expected_tokens = compute_visual_token_count(1, 4, 4, cfg.img_token_compression_config["spatial_merge_size"])
+    expected_tokens = compute_visual_token_count(
+        1, 4, 4, cfg.img_token_compression_config["spatial_merge_size"]
+    )
     assert out.shape == (expected_tokens, text_hidden_size)
     assert out.dtype == torch.float32
     # The forward must not silently zero everything out under random init.
@@ -893,8 +860,7 @@ def test_vision_tower_forward_multi_image_concat():
     grid_thws = [[1, 4, 4], [1, 4, 6]]
     spatial_merge = cfg.img_token_compression_config["spatial_merge_size"]
     expected_per_image = [
-        compute_visual_token_count(*g, spatial_merge_size=spatial_merge)
-        for g in grid_thws
+        compute_visual_token_count(*g, spatial_merge_size=spatial_merge) for g in grid_thws
     ]
     n_patches = sum(g[0] * g[1] * g[2] for g in grid_thws)
     pixel_cols = (
@@ -924,7 +890,12 @@ def test_patch_embedding_shape_matches_conv3d_semantics():
     emb = MiniMaxVLPatchEmbedding(cfg, dtype=torch.float32)
 
     n = 16
-    pixel_cols = cfg.num_channels * cfg.img_token_compression_config["temporal_patch_size"] * cfg.patch_size * cfg.patch_size
+    pixel_cols = (
+        cfg.num_channels
+        * cfg.img_token_compression_config["temporal_patch_size"]
+        * cfg.patch_size
+        * cfg.patch_size
+    )
     pixel_values = torch.randn((n, pixel_cols), dtype=torch.float32)
     out = emb(pixel_values)
     assert out.shape == (n, cfg.hidden_size)
@@ -1059,9 +1030,7 @@ def test_real_checkpoint_vision_tower_forward_smoke():
             "mlp.fc2.weight",
             "mlp.fc2.bias",
         ):
-            targets.append(
-                f"vision_tower.vision_model.encoder.layers.{i}.{suffix}"
-            )
+            targets.append(f"vision_tower.vision_model.encoder.layers.{i}.{suffix}")
     targets += [
         "multi_modal_projector.linear_1.weight",
         "multi_modal_projector.linear_1.bias",
@@ -1102,9 +1071,7 @@ def test_real_checkpoint_vision_tower_forward_smoke():
     )
 
     torch.manual_seed(20260604)
-    pixel_values = torch.randn(
-        (n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda"
-    )
+    pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda")
     with torch.no_grad():
         out = model(pixel_values=pixel_values, grid_thw=grid_thw)
 
@@ -1211,9 +1178,7 @@ def test_real_checkpoint_multimodal_embedding_merge_smoke():
             "mlp.fc2.weight",
             "mlp.fc2.bias",
         ):
-            targets.append(
-                f"vision_tower.vision_model.encoder.layers.{i}.{suffix}"
-            )
+            targets.append(f"vision_tower.vision_model.encoder.layers.{i}.{suffix}")
     targets += [
         "multi_modal_projector.linear_1.weight",
         "multi_modal_projector.linear_1.bias",
@@ -1278,9 +1243,7 @@ def test_real_checkpoint_multimodal_embedding_merge_smoke():
         * vision_config.patch_size
     )
     torch.manual_seed(20260604)
-    pixel_values = torch.randn(
-        (n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda"
-    )
+    pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda")
     with torch.no_grad():
         visual_embeds = model(pixel_values=pixel_values, grid_thw=[grid_thw])
     assert visual_embeds.shape == (repeat, text_hidden_size)
@@ -1288,9 +1251,11 @@ def test_real_checkpoint_multimodal_embedding_merge_smoke():
 
     # Build a synthetic text-embedding tensor at the same hidden size and
     # mark each row with a unique sentinel for later equality checks.
-    text_embeds = torch.arange(
-        len(expanded_ids) * text_hidden_size, dtype=torch.bfloat16, device="cuda"
-    ).reshape(len(expanded_ids), text_hidden_size).contiguous()
+    text_embeds = (
+        torch.arange(len(expanded_ids) * text_hidden_size, dtype=torch.bfloat16, device="cuda")
+        .reshape(len(expanded_ids), text_hidden_size)
+        .contiguous()
+    )
 
     merged = merge_multimodal_embeddings(
         text_embeds, image_embeds=visual_embeds, image_spans=image_spans
@@ -1303,9 +1268,7 @@ def test_real_checkpoint_multimodal_embedding_merge_smoke():
     # Outside the span, merged carries the original text embeds.
     for i in range(len(expanded_ids)):
         if i < image_spans[0][0] or i >= image_spans[0][1]:
-            assert torch.equal(merged[i], text_embeds[i]), (
-                f"merge mutated text-only position {i}"
-            )
+            assert torch.equal(merged[i], text_embeds[i]), f"merge mutated text-only position {i}"
 
     # Negative control: shift the span by 1 and confirm the merge differs.
     shifted_spans = [(image_spans[0][0] + 1, image_spans[0][1] + 1)]
@@ -1442,9 +1405,7 @@ def test_build_multimodal_input_ids_image_start_end_matches_sglang_oracle():
 
 def test_build_multimodal_input_ids_video_uses_image_start_end_markers():
     """Videos use the IMAGE start/end markers (processing_minimax.py:54-62)."""
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        build_multimodal_input_ids,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import build_multimodal_input_ids
 
     # Video frame grid (2, 4, 6) merge=2 -> 2*2*3 = 12 placeholders.
     prompt = [10, _VS_TOK, _VID_TOK, _VE_TOK, 20]
@@ -1468,9 +1429,7 @@ def test_build_multimodal_input_ids_video_uses_image_start_end_markers():
 
 def test_build_multimodal_input_ids_image_and_video_interleaved():
     """Interleaved image + video preserves order in modality_list and offsets."""
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        build_multimodal_input_ids,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import build_multimodal_input_ids
 
     # image (1,4,4)=4 placeholders, then video (1,4,6)=6 placeholders.
     prompt = [1, _VS_TOK, _IMG_TOK, _VE_TOK, 2, _VS_TOK, _VID_TOK, _VE_TOK, 3]
@@ -1498,9 +1457,7 @@ def test_build_multimodal_input_ids_image_and_video_interleaved():
 
 
 def test_build_multimodal_input_ids_rejects_count_mismatch():
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        build_multimodal_input_ids,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import build_multimodal_input_ids
 
     # Two placeholders but only one grid -> ValueError.
     prompt = [_VS_TOK, _IMG_TOK, _VE_TOK, _VS_TOK, _IMG_TOK, _VE_TOK]
@@ -1682,9 +1639,7 @@ def test_negative_control_wrong_grid_order_breaks_parity():
     must produce a different expansion than the SGLang oracle so the parity
     assertion has a real failure path.
     """
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        build_multimodal_input_ids,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import build_multimodal_input_ids
 
     prompt = [1, _VS_TOK, _IMG_TOK, _VE_TOK, 2, _VS_TOK, _IMG_TOK, _VE_TOK, 3]
     correct_ids, correct_off, _, _ = build_multimodal_input_ids(
@@ -1777,7 +1732,7 @@ def _hand_rolled_processor_input_ids(
     vs_token = "]<]start of image[>["
     ve_token = "]<]end of image[>["
     placeholder = "]<]placeholder[>["
-    merge_length = spatial_merge_size ** 2
+    merge_length = spatial_merge_size**2
 
     out = text
     for grid in image_grid_thws:
@@ -1925,9 +1880,7 @@ def test_real_checkpoint_processor_input_ids_match_trt_build_helper():
     start, end = trt_img_off[0]
     assert end - start + 1 == expected_repeat
     for j in range(start, end + 1):
-        assert oracle_input_ids[j] == image_token_id, (
-            j, oracle_input_ids[j], image_token_id
-        )
+        assert oracle_input_ids[j] == image_token_id, (j, oracle_input_ids[j], image_token_id)
     assert oracle_input_ids[start - 1] == MINIMAX_M3_VL_VISION_START_TOKEN_ID
     assert oracle_input_ids[end + 1] == MINIMAX_M3_VL_VISION_END_TOKEN_ID
 
@@ -1972,8 +1925,7 @@ def test_real_checkpoint_processor_video_input_ids_match_trt_build_helper():
     text_prompt = "Watch: ]<]video[>[ then summarize."
     grid_t, grid_h, grid_w = 1, 4, 6
     spatial_merge = 2
-    n_per_frame = (grid_h * grid_w) // (spatial_merge ** 2)
-    image_token = "]<]image[>["
+    n_per_frame = (grid_h * grid_w) // (spatial_merge**2)
     vs_token = "]<]start of image[>["
     ve_token = "]<]end of image[>["
     video_token = "]<]video[>["
@@ -2070,11 +2022,9 @@ def test_real_checkpoint_processor_full_pipeline_merge_and_pad_parity():
 
     from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        CLIPVisionConfig,
         MINIMAX_M3_VL_IMAGE_TOKEN_ID,
         MINIMAX_M3_VL_VIDEO_TOKEN_ID,
-        MINIMAX_M3_VL_VISION_END_TOKEN_ID,
-        MINIMAX_M3_VL_VISION_START_TOKEN_ID,
+        CLIPVisionConfig,
         MiniMaxVLVisionModel,
         build_multimodal_input_ids,
         expand_multimodal_placeholders,
@@ -2138,10 +2088,7 @@ def test_real_checkpoint_processor_full_pipeline_merge_and_pad_parity():
         tok = processor_input_ids[i]
         if tok == image_token_id:
             pre_expand.append(image_token_id)
-            while (
-                i < len(processor_input_ids)
-                and processor_input_ids[i] == image_token_id
-            ):
+            while i < len(processor_input_ids) and processor_input_ids[i] == image_token_id:
                 i += 1
             continue
         pre_expand.append(tok)
@@ -2267,15 +2214,11 @@ def test_real_checkpoint_processor_full_pipeline_merge_and_pad_parity():
             * vision_config.patch_size
         )
         torch.manual_seed(20260604)
-        pixel_values = torch.randn(
-            (n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda"
-        )
+        pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda")
     else:
         pixel_values = pixel_values.to("cuda", dtype=torch.bfloat16)
         if pixel_values.dim() == 3:
-            pixel_values = pixel_values.reshape(
-                pixel_values.shape[0] * pixel_values.shape[1], -1
-            )
+            pixel_values = pixel_values.reshape(pixel_values.shape[0] * pixel_values.shape[1], -1)
 
     with torch.no_grad():
         visual_embeds = model(
@@ -2303,9 +2246,7 @@ def test_real_checkpoint_processor_full_pipeline_merge_and_pad_parity():
     # Outside the span, merged matches the original text embeddings.
     for j in range(len(processor_input_ids)):
         if j < start or j > end:
-            assert torch.equal(merged[j], text_embeds[j]), (
-                f"merge mutated text-only position {j}"
-            )
+            assert torch.equal(merged[j], text_embeds[j]), f"merge mutated text-only position {j}"
 
     # Negative control 2: shift the merge offset by 1 and confirm the merge
     # produces a different tensor — proves the merge is offset-sensitive.
@@ -2358,9 +2299,7 @@ def _compute_diff_metrics(a, b):
     import torch
 
     if tuple(a.shape) != tuple(b.shape):
-        raise ValueError(
-            f"shape mismatch: a.shape={tuple(a.shape)} b.shape={tuple(b.shape)}"
-        )
+        raise ValueError(f"shape mismatch: a.shape={tuple(a.shape)} b.shape={tuple(b.shape)}")
     af = a.detach().to(torch.float32)
     bf = b.detach().to(torch.float32)
     diff = (af - bf).abs()
@@ -2415,9 +2354,9 @@ def _sglang_oracle_compute_cu_seqlens(grid_thws, device):
     seqlens = [0]
     for grid_t, grid_h, grid_w in grid_thws:
         seqlens.append(int(grid_t) * int(grid_h) * int(grid_w))
-    return torch.cumsum(
-        torch.tensor(seqlens, dtype=torch.int32, device=device), dim=0
-    ).to(torch.int32)
+    return torch.cumsum(torch.tensor(seqlens, dtype=torch.int32, device=device), dim=0).to(
+        torch.int32
+    )
 
 
 def _sglang_oracle_rope_freqs(grid_thws, *, t_dim, h_dim, w_dim, rope_theta, device):
@@ -2448,10 +2387,7 @@ def _sglang_oracle_rope_freqs(grid_thws, *, t_dim, h_dim, w_dim, rope_theta, dev
         grid_t, grid_h, grid_w = int(grid_t), int(grid_h), int(grid_w)
         tokens_per_frame = grid_h * grid_w
         tpos_ids = (
-            torch.arange(grid_t, device=device)
-            .unsqueeze(1)
-            .expand(-1, tokens_per_frame)
-            .flatten()
+            torch.arange(grid_t, device=device).unsqueeze(1).expand(-1, tokens_per_frame).flatten()
         )
 
         hpos_ids = torch.arange(grid_h, device=device).unsqueeze(1).expand(-1, grid_w)
@@ -2557,7 +2493,11 @@ def _sglang_oracle_vision_tower_forward(
         # Negative control: feed the freqs from a *different* axis order
         # so the rotate-half kernel sees mismatched per-axis positions.
         dims = (t_dim, h_dim, w_dim)
-        t_dim, h_dim, w_dim = (dims[oracle_rope_axis_perm[0]], dims[oracle_rope_axis_perm[1]], dims[oracle_rope_axis_perm[2]])
+        t_dim, h_dim, w_dim = (
+            dims[oracle_rope_axis_perm[0]],
+            dims[oracle_rope_axis_perm[1]],
+            dims[oracle_rope_axis_perm[2]],
+        )
 
     # Step 1: patch embed via Conv3d using the TRT-loaded weights but
     # called inline (no module call).
@@ -2570,7 +2510,8 @@ def _sglang_oracle_vision_tower_forward(
     if pe_w.dtype != x.dtype:
         pe_w = pe_w.to(x.dtype)
     x = F.conv3d(
-        x, pe_w,
+        x,
+        pe_w,
         bias=None,
         stride=(temporal_patch_size, patch_size, patch_size),
     )
@@ -2637,7 +2578,6 @@ def _sglang_oracle_full_pipeline(pixel_values, grid_thws, *, model, vision_confi
     The patch-merger compresses by ``spatial_merge_size ** 2`` so the
     output count matches ``compute_visual_token_count`` per item.
     """
-    import torch
     import torch.nn.functional as F
 
     # Vision tower up through the encoder.
@@ -2654,7 +2594,7 @@ def _sglang_oracle_full_pipeline(pixel_values, grid_thws, *, model, vision_confi
 
     # Patch merger: reshape by spatial_merge_size**2 then linear -> gelu -> linear.
     pm = model.patch_merge_mlp
-    merge_factor = pm.spatial_merge_size ** 2
+    merge_factor = pm.spatial_merge_size**2
     n, hidden = x.shape
     assert n % merge_factor == 0, (n, merge_factor)
     x = x.reshape(n // merge_factor, merge_factor * hidden)
@@ -2860,9 +2800,7 @@ def test_goal_22_3_vision_tower_activation_parity_full_32_layers():
 
         # TRT forward: end-to-end + intermediate capture.
         with torch.no_grad():
-            trt_tower = model.vision_model(
-                pixel_values=pixel_values, grid_thw=[list(grid_thw)]
-            )
+            trt_tower = model.vision_model(pixel_values=pixel_values, grid_thw=[list(grid_thw)])
             trt_proj = model.multi_modal_projector(trt_tower)
             trt_merger = model.patch_merge_mlp(trt_proj)
 
@@ -2893,16 +2831,13 @@ def test_goal_22_3_vision_tower_activation_parity_full_32_layers():
                 metrics["max_abs"] > THRESH_MAX_ABS
                 or metrics["mean_abs"] > THRESH_MEAN_ABS
                 or (
-                    metrics["cosine"] == metrics["cosine"]
-                    and metrics["cosine"] < THRESH_MIN_COSINE
+                    metrics["cosine"] == metrics["cosine"] and metrics["cosine"] < THRESH_MIN_COSINE
                 )
             ):
                 failures.append(line)
 
     if failures:
-        raise AssertionError(
-            "Goal 22.3 vision-tower parity failed:\n" + "\n".join(failures)
-        )
+        raise AssertionError("Goal 22.3 vision-tower parity failed:\n" + "\n".join(failures))
 
 
 @pytest.mark.gpu
@@ -2998,9 +2933,7 @@ def test_goal_22_3_negative_control_wrong_grid_order_breaks_parity():
         * vision_config.patch_size
         * vision_config.patch_size
     )
-    pixel_values = torch.randn(
-        (n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda"
-    )
+    pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda")
 
     with torch.no_grad():
         correct = _sglang_oracle_full_pipeline(
@@ -3074,9 +3007,7 @@ def test_goal_22_3_negative_control_swapped_rope_axes_breaks_parity():
         * vision_config.patch_size
         * vision_config.patch_size
     )
-    pixel_values = torch.randn(
-        (n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda"
-    )
+    pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda")
 
     # Canonical SGLang vision-tower forward.
     with torch.no_grad():
@@ -3108,7 +3039,10 @@ def test_goal_22_3_negative_control_swapped_rope_axes_breaks_parity():
     # that confuses the H/W axes would produce.
     with torch.no_grad():
         wrong = _sglang_oracle_vision_tower_forward(
-            pixel_values, [list(g) for g in swapped_grid_thws], model=model, vision_config=vision_config
+            pixel_values,
+            [list(g) for g in swapped_grid_thws],
+            model=model,
+            vision_config=vision_config,
         )
 
     metrics = _compute_diff_metrics(canonical, wrong)
@@ -3119,7 +3053,10 @@ def test_goal_22_3_negative_control_swapped_rope_axes_breaks_parity():
             tensor_name="vision_tower_out_swapped_h_w_axes",
             metrics=metrics,
             prompt_id="neg_swap_hw_axes",
-            extra={"grid_thws_correct": [list(g) for g in grid_thws], "grid_thws_swapped": [list(g) for g in swapped_grid_thws]},
+            extra={
+                "grid_thws_correct": [list(g) for g in grid_thws],
+                "grid_thws_swapped": [list(g) for g in swapped_grid_thws],
+            },
         )
     )
     assert metrics["max_abs"] > 1e-2, (
@@ -3168,9 +3105,7 @@ def test_goal_22_3_negative_control_swapped_patch_merge_reshape_breaks_parity():
         * vision_config.patch_size
         * vision_config.patch_size
     )
-    pixel_values = torch.randn(
-        (n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda"
-    )
+    pixel_values = torch.randn((n_patches, pixel_cols), dtype=torch.bfloat16, device="cuda")
 
     # Canonical: vision tower -> projector -> patch merger (correct reshape).
     with torch.no_grad():
@@ -3184,7 +3119,7 @@ def test_goal_22_3_negative_control_swapped_patch_merge_reshape_breaks_parity():
     # contiguous merge for a column-major one.
     proj_out = canonical["proj_out"]
     pm = model.patch_merge_mlp
-    merge_factor = pm.spatial_merge_size ** 2
+    merge_factor = pm.spatial_merge_size**2
     n, hidden = proj_out.shape
     assert n % merge_factor == 0
 
@@ -3248,9 +3183,7 @@ def test_goal_22_3_negative_control_swapped_patch_merge_reshape_breaks_parity():
 # ---------------------------------------------------------------------------
 
 
-def _build_visual_features_for_prompt(
-    *, model, vision_config, prompt, dtype
-):
+def _build_visual_features_for_prompt(*, model, vision_config, prompt, dtype):
     """Run the TRT vision tower on a fixed prompt's pixel batch."""
     import torch
 
@@ -3338,9 +3271,7 @@ def test_goal_22_3_multimodal_inputs_embeds_wiring():
     # embedding table.
     torch.manual_seed(20260604)
     vocab_size = 200064  # M3 vocab; arbitrary tokens are within range
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     for prompt in _GOAL_22_3_FIXED_PROMPTS:
@@ -3348,9 +3279,7 @@ def test_goal_22_3_multimodal_inputs_embeds_wiring():
             model=model, vision_config=vision_config, prompt=prompt, dtype=dtype
         )
         n_visual = feats.shape[0]
-        input_ids, placeholder_id = _make_text_input_ids_for_prompt(
-            prompt, n_visual=n_visual
-        )
+        input_ids, placeholder_id = _make_text_input_ids_for_prompt(prompt, n_visual=n_visual)
         input_ids = input_ids.to(device=device)
 
         if prompt["modality"] == "image":
@@ -3404,9 +3333,7 @@ def test_goal_22_3_multimodal_inputs_embeds_wiring():
         assert text_diff["mean_abs"] == 0.0, text_diff
 
         # Visual run: byte-equal to the vision tower's output.
-        visual_diff = _compute_diff_metrics(
-            fused[run_start : run_end + 1], feats
-        )
+        visual_diff = _compute_diff_metrics(fused[run_start : run_end + 1], feats)
         print(
             _format_parity_report(
                 layer_id=-1,
@@ -3452,8 +3379,6 @@ def test_goal_22_3_multimodal_source_logit_replay_invariant():
     import torch
 
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
-        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
         merge_multimodal_embeddings_inclusive,
         prepare_multimodal_inputs_embeds,
     )
@@ -3469,9 +3394,7 @@ def test_goal_22_3_multimodal_source_logit_replay_invariant():
 
     torch.manual_seed(20260605)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     for prompt in _GOAL_22_3_FIXED_PROMPTS:
@@ -3479,9 +3402,7 @@ def test_goal_22_3_multimodal_source_logit_replay_invariant():
             model=model, vision_config=vision_config, prompt=prompt, dtype=dtype
         )
         n_visual = feats.shape[0]
-        input_ids, placeholder_id = _make_text_input_ids_for_prompt(
-            prompt, n_visual=n_visual
-        )
+        input_ids, placeholder_id = _make_text_input_ids_for_prompt(prompt, n_visual=n_visual)
         input_ids = input_ids.to(device=device)
 
         # Path A: forward-style helper that runs the vision tower itself.
@@ -3562,9 +3483,7 @@ def test_goal_22_3_multimodal_generation_determinism():
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -3577,9 +3496,7 @@ def test_goal_22_3_multimodal_generation_determinism():
 
     torch.manual_seed(20260606)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     n_steps = 32
@@ -3588,9 +3505,7 @@ def test_goal_22_3_multimodal_generation_determinism():
             model=model, vision_config=vision_config, prompt=prompt, dtype=dtype
         )
         n_visual = feats.shape[0]
-        input_ids, _placeholder_id = _make_text_input_ids_for_prompt(
-            prompt, n_visual=n_visual
-        )
+        input_ids, _placeholder_id = _make_text_input_ids_for_prompt(prompt, n_visual=n_visual)
         input_ids = input_ids.to(device=device)
 
         baseline = None
@@ -3622,12 +3537,8 @@ def test_goal_22_3_multimodal_generation_determinism():
                 # used by ``test_goal_22_3_vision_tower_two_call_determinism``.
                 # The key invariant is that the splice is deterministic
                 # (no random ordering) and the noise is bounded.
-                assert step_diff["cosine"] >= 0.999, (
-                    prompt["prompt_id"], step, step_diff
-                )
-                assert step_diff["max_abs"] <= 16.0, (
-                    prompt["prompt_id"], step, step_diff
-                )
+                assert step_diff["cosine"] >= 0.999, (prompt["prompt_id"], step, step_diff)
+                assert step_diff["max_abs"] <= 16.0, (prompt["prompt_id"], step, step_diff)
                 max_step_diff = max(max_step_diff, step_diff["max_abs"])
 
         print(
@@ -3667,9 +3578,7 @@ def test_goal_22_3_multimodal_forward_negative_control_grid_mismatch():
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -3682,9 +3591,7 @@ def test_goal_22_3_multimodal_forward_negative_control_grid_mismatch():
 
     torch.manual_seed(20260607)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     prompt = _GOAL_22_3_FIXED_PROMPTS[0]
@@ -3729,9 +3636,7 @@ def test_goal_22_3_multimodal_forward_negative_control_no_placeholder_runs():
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -3744,9 +3649,7 @@ def test_goal_22_3_multimodal_forward_negative_control_no_placeholder_runs():
 
     torch.manual_seed(20260608)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     prompt = _GOAL_22_3_FIXED_PROMPTS[0]
@@ -3788,12 +3691,11 @@ def test_goal_22_3_multimodal_params_extraction_round_trip():
     - video data flows through the same way
     - empty / missing modalities return ``None``
     """
-    import torch
     from types import SimpleNamespace as _SN
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        extract_multimodal_data_from_params,
-    )
+    import torch
+
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import extract_multimodal_data_from_params
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -3807,15 +3709,9 @@ def test_goal_22_3_multimodal_params_extraction_round_trip():
     vid_gthw = torch.tensor([[1, 3, 2]], dtype=torch.int32, device=device)
 
     params = [
-        _SN(multimodal_data={
-            "image": {"pixel_values": img_pv_1, "image_grid_thw": img_gthw_1}
-        }),
-        _SN(multimodal_data={
-            "image": {"pixel_values": img_pv_2, "image_grid_thw": img_gthw_2}
-        }),
-        _SN(multimodal_data={
-            "video": {"pixel_values_videos": vid_pv, "video_grid_thw": vid_gthw}
-        }),
+        _SN(multimodal_data={"image": {"pixel_values": img_pv_1, "image_grid_thw": img_gthw_1}}),
+        _SN(multimodal_data={"image": {"pixel_values": img_pv_2, "image_grid_thw": img_gthw_2}}),
+        _SN(multimodal_data={"video": {"pixel_values_videos": vid_pv, "video_grid_thw": vid_gthw}}),
         _SN(multimodal_data={}),  # pure text
     ]
     out = extract_multimodal_data_from_params(params)
@@ -3901,9 +3797,7 @@ def test_goal_22_3_vl_runtime_contracts_visible_in_module_graph():
     import torch
 
     from tensorrt_llm._torch.models import modeling_minimaxm3 as mod_text
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MiniMaxVLVisionModel,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import MiniMaxVLVisionModel
 
     # 1. The VL class is exported and inherits text causal LM.
     vl_cls = mod_text.MiniMaxM3VLForConditionalGeneration
@@ -3958,9 +3852,7 @@ def test_goal_22_3_vl_runtime_contracts_visible_in_module_graph():
 
     # 4. The text-only registration (sparse for-causal-lm) is unchanged.
     text_arch = "MiniMaxM3SparseForCausalLM"
-    assert text_arch in MODEL_CLASS_MAPPING, (
-        f"{text_arch} must be in the auto-model registry"
-    )
+    assert text_arch in MODEL_CLASS_MAPPING, f"{text_arch} must be in the auto-model registry"
     registered_text = MODEL_CLASS_MAPPING[text_arch]
     assert registered_text is mod_text.MiniMaxM3ForCausalLM
 
@@ -4026,9 +3918,7 @@ def test_goal_22_3_multimodal_inputs_embeds_with_explicit_mm_token_indices():
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -4041,9 +3931,7 @@ def test_goal_22_3_multimodal_inputs_embeds_with_explicit_mm_token_indices():
 
     torch.manual_seed(20260609)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     for prompt in _GOAL_22_3_FIXED_PROMPTS:
@@ -4071,9 +3959,7 @@ def test_goal_22_3_multimodal_inputs_embeds_with_explicit_mm_token_indices():
         # Locate placeholder positions explicitly — what the LLM API
         # runtime would do via ``MultimodalParams.multimodal_input``.
         mm_start = prefix_len + 1  # after VISION_START
-        mm_indices = torch.arange(
-            mm_start, mm_start + n_visual, dtype=torch.int64, device=device
-        )
+        mm_indices = torch.arange(mm_start, mm_start + n_visual, dtype=torch.int64, device=device)
 
         if prompt["modality"] == "image":
             fused = prepare_multimodal_inputs_embeds(
@@ -4095,9 +3981,7 @@ def test_goal_22_3_multimodal_inputs_embeds_with_explicit_mm_token_indices():
             )
 
         # Visual positions: byte-equal to vision tower output.
-        visual_diff = _compute_diff_metrics(
-            fused[mm_start : mm_start + n_visual], feats
-        )
+        visual_diff = _compute_diff_metrics(fused[mm_start : mm_start + n_visual], feats)
         print(
             _format_parity_report(
                 layer_id=-1,
@@ -4143,9 +4027,7 @@ def test_goal_22_3_multimodal_inputs_embeds_pad_value_token_search_fails_as_expe
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -4158,9 +4040,7 @@ def test_goal_22_3_multimodal_inputs_embeds_pad_value_token_search_fails_as_expe
 
     torch.manual_seed(20260610)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     prompt = _GOAL_22_3_FIXED_PROMPTS[0]
@@ -4236,10 +4116,6 @@ def test_goal_22_3_vl_runtime_contracts_attention_backend_and_cache_manager():
     because it uses the same ``MiniMaxM3ForCausalLM.forward`` super
     invocation after merging embeddings.
     """
-    import torch
-
-    from tensorrt_llm._torch.models import modeling_minimaxm3 as mod_text
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 
     # The M3 sparse runtime backend and V2 cache manager classes are
     # built inside factory functions so they only force the
@@ -4250,6 +4126,8 @@ def test_goal_22_3_vl_runtime_contracts_attention_backend_and_cache_manager():
         get_minimax_m3_attention_backend_cls,
         get_minimax_m3_kv_cache_manager_cls,
     )
+    from tensorrt_llm._torch.models import modeling_minimaxm3 as mod_text
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 
     # 1. Sparse attention runtime backend factory.
     sparse_backend_cls = get_minimax_m3_attention_backend_cls()
@@ -4259,14 +4137,11 @@ def test_goal_22_3_vl_runtime_contracts_attention_backend_and_cache_manager():
 
     # 2. V2 cache manager subclass factory.
     kv_cache_cls = get_minimax_m3_kv_cache_manager_cls()
-    assert kv_cache_cls.__name__ == "MiniMaxM3KVCacheManagerV2", (
-        f"kv_cache_cls={kv_cache_cls}"
-    )
+    assert kv_cache_cls.__name__ == "MiniMaxM3KVCacheManagerV2", f"kv_cache_cls={kv_cache_cls}"
     # Check the V2 lineage by class name introspection.
     mro_names = [c.__name__ for c in kv_cache_cls.__mro__]
     assert any("KVCacheManagerV2" in n for n in mro_names), (
-        f"MiniMaxM3KVCacheManagerV2 should inherit from KVCacheManagerV2; "
-        f"mro={mro_names}"
+        f"MiniMaxM3KVCacheManagerV2 should inherit from KVCacheManagerV2; mro={mro_names}"
     )
 
     # 3. Sparse attention config class.
@@ -4277,26 +4152,20 @@ def test_goal_22_3_vl_runtime_contracts_attention_backend_and_cache_manager():
 
     # 4. Auto-model registration.
     vl_arch = "MiniMaxM3SparseForConditionalGeneration"
-    assert vl_arch in MODEL_CLASS_MAPPING, (
-        f"{vl_arch} must be in the auto-model registry"
-    )
+    assert vl_arch in MODEL_CLASS_MAPPING, f"{vl_arch} must be in the auto-model registry"
     assert MODEL_CLASS_MAPPING[vl_arch] is mod_text.MiniMaxM3VLForConditionalGeneration
 
     # 5. The visual-input forward path uses ``fuse_input_embeds``, the
     #    standard TRT-LLM multimodal fusion contract that other VL
     #    models (Qwen2VL, Qwen3VL, Gemma3VL) rely on.
-    from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-        fuse_input_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_multimodal_utils import fuse_input_embeds
 
     assert callable(fuse_input_embeds)
 
     # 6. The sparse-attention dispatcher routes the VL config (since
     #    the VL class subclasses MiniMaxM3ForCausalLM and the runtime
     #    uses the same sparse_attention_config-based dispatch).
-    from tensorrt_llm._torch.attention_backend.sparse.utils import (
-        get_sparse_attn_kv_cache_manager,
-    )
+    from tensorrt_llm._torch.attention_backend.sparse.utils import get_sparse_attn_kv_cache_manager
 
     assert callable(get_sparse_attn_kv_cache_manager)
 
@@ -4334,9 +4203,7 @@ def test_goal_22_3_forward_handles_tensor_grid_thws_from_multimodal_params():
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -4349,9 +4216,7 @@ def test_goal_22_3_forward_handles_tensor_grid_thws_from_multimodal_params():
 
     torch.manual_seed(20260611)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     prompt = _GOAL_22_3_FIXED_PROMPTS[0]
@@ -4364,9 +4229,7 @@ def test_goal_22_3_forward_handles_tensor_grid_thws_from_multimodal_params():
 
     # Pass grid_thws as a torch.Tensor (the format
     # ``extract_multimodal_data_from_params`` returns).
-    grid_thws_tensor = torch.tensor(
-        grid_thws_list, dtype=torch.int32, device=device
-    )
+    grid_thws_tensor = torch.tensor(grid_thws_list, dtype=torch.int32, device=device)
     fused = prepare_multimodal_inputs_embeds(
         input_ids=input_ids,
         embed_tokens=embed_tokens,
@@ -4382,9 +4245,7 @@ def test_goal_22_3_forward_handles_tensor_grid_thws_from_multimodal_params():
     # populated with vision-tower output.
     ids_list = input_ids.tolist()
     run_start = ids_list.index(200025)  # image placeholder
-    visual_diff = _compute_diff_metrics(
-        fused[run_start : run_start + n_visual], feats
-    )
+    visual_diff = _compute_diff_metrics(fused[run_start : run_start + n_visual], feats)
     print(
         _format_parity_report(
             layer_id=-1,
@@ -4417,9 +4278,7 @@ def test_goal_22_3_model_forward_signature_accepts_multimodal_params_kwarg():
 
     from tensorrt_llm._torch.models import modeling_minimaxm3 as mod_text
 
-    forward_src = inspect.getsource(
-        mod_text.MiniMaxM3VLForConditionalGeneration.forward
-    )
+    forward_src = inspect.getsource(mod_text.MiniMaxM3VLForConditionalGeneration.forward)
     # The forward must pop multimodal_params (so it does not leak to
     # super()) and filter to params with actual vision data.
     assert 'kwargs.pop("multimodal_params"' in forward_src, (
@@ -4427,8 +4286,7 @@ def test_goal_22_3_model_forward_signature_accepts_multimodal_params_kwarg():
     )
     # Must filter for vision data before invoking the vision tower.
     assert "has_image_pv" in forward_src or "pixel_values" in forward_src, (
-        "forward() must check for image/video pixel_values before "
-        "invoking the vision tower"
+        "forward() must check for image/video pixel_values before invoking the vision tower"
     )
     # Text-only fallthrough: super().forward must be called with the
     # same kwargs (modulo multimodal_params).
@@ -4436,8 +4294,8 @@ def test_goal_22_3_model_forward_signature_accepts_multimodal_params_kwarg():
         "forward() must fall through to super for text-only requests"
     )
     print(
-        f"[M3-PARITY] forward_signature pops_multimodal_params=True "
-        f"filters_vision_data=True text_fallthrough=True"
+        "[M3-PARITY] forward_signature pops_multimodal_params=True "
+        "filters_vision_data=True text_fallthrough=True"
     )
 
 
@@ -4468,13 +4326,12 @@ def test_goal_22_3_iter189_mm_token_ids_buffer_registered_in_init_source():
     """
     import inspect
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        MiniMaxM3VLForConditionalGeneration)
+    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
 
     init_src = inspect.getsource(MiniMaxM3VLForConditionalGeneration.__init__)
     # The buffer is registered with a non-persistent flag so it does not
     # serialise into the state_dict but still follows model.to(device).
-    assert 'register_buffer(' in init_src and '"mm_token_ids"' in init_src, (
+    assert "register_buffer(" in init_src and '"mm_token_ids"' in init_src, (
         "MiniMaxM3VLForConditionalGeneration.__init__ must register "
         '"mm_token_ids" as a buffer; current source:\n' + init_src
     )
@@ -4490,8 +4347,8 @@ def test_goal_22_3_iter189_mm_token_ids_buffer_registered_in_init_source():
         "parameter)"
     )
     print(
-        f"[M3-PARITY] iter189_mm_token_ids_init_source register_buffer=True "
-        f"persistent=False uses_canonical_ids=True"
+        "[M3-PARITY] iter189_mm_token_ids_init_source register_buffer=True "
+        "persistent=False uses_canonical_ids=True"
     )
 
 
@@ -4514,9 +4371,10 @@ def test_goal_22_3_iter189_model_engine_filter_pattern_with_mm_token_ids():
         pytest.skip(f"torch unavailable: {e}")
 
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID)
-    from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-        filter_mm_token_from_input_ids)
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
+    )
+    from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 
     # Construct the canonical mm_token_ids tensor (matches the buffer
     # MiniMaxM3VLForConditionalGeneration.__init__ registers).
@@ -4609,15 +4467,14 @@ def test_goal_22_3_iter189_full_checkpoint_model_exposes_mm_token_ids():
     from transformers import AutoConfig
 
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        MiniMaxM3VLForConditionalGeneration)
+    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID)
+        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
+        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
+    )
 
     checkpoint = _checkpoint_path()
-    pretrained = AutoConfig.from_pretrained(
-        checkpoint, trust_remote_code=True
-    )
+    pretrained = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
     model_config = ModelConfig(pretrained_config=pretrained)
 
     model = MiniMaxM3VLForConditionalGeneration(model_config)
@@ -4634,9 +4491,7 @@ def test_goal_22_3_iter189_full_checkpoint_model_exposes_mm_token_ids():
     )
     # 3. It contains both IMAGE and VIDEO token IDs.
     ids = sorted(int(x) for x in mm_ids.tolist())
-    assert ids == sorted(
-        [MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID]
-    ), (
+    assert ids == sorted([MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID]), (
         f"model.mm_token_ids must contain IMAGE+VIDEO ids; got {ids}"
     )
     # 4. It is registered as a buffer (so it follows model.to(device)).
@@ -4653,9 +4508,7 @@ def test_goal_22_3_iter189_full_checkpoint_model_exposes_mm_token_ids():
 
 
 @pytest.mark.gpu
-@pytest.mark.skipif(
-    not _has_cuda(), reason="Iter189 mixed modality ordering needs CUDA"
-)
+@pytest.mark.skipif(not _has_cuda(), reason="Iter189 mixed modality ordering needs CUDA")
 @pytest.mark.skipif(
     not os.path.exists(_checkpoint_path()),
     reason=(
@@ -4684,8 +4537,7 @@ def test_goal_22_3_iter189_mixed_image_video_left_to_right_ordering():
 
     import torch
 
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        prepare_multimodal_inputs_embeds)
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import prepare_multimodal_inputs_embeds
 
     checkpoint = _checkpoint_path()
     device = torch.device("cuda")
@@ -4698,9 +4550,7 @@ def test_goal_22_3_iter189_mixed_image_video_left_to_right_ordering():
 
     torch.manual_seed(20260612)
     vocab_size = 200064
-    embed_table = torch.randn(
-        vocab_size, text_hidden_size, dtype=dtype, device=device
-    )
+    embed_table = torch.randn(vocab_size, text_hidden_size, dtype=dtype, device=device)
     embed_tokens = lambda ids: embed_table[ids]  # noqa: E731
 
     # Build the image and video features using existing helpers.
@@ -4738,9 +4588,8 @@ def test_goal_22_3_iter189_mixed_image_video_left_to_right_ordering():
 
     video_start = len(text_a) + 1
     image_start = video_start + n_vid + 1 + len(text_b) + 1
-    mm_indices_list = (
-        list(range(video_start, video_start + n_vid))
-        + list(range(image_start, image_start + n_img))
+    mm_indices_list = list(range(video_start, video_start + n_vid)) + list(
+        range(image_start, image_start + n_img)
     )
     mm_indices = torch.tensor(mm_indices_list, dtype=torch.int64, device=device)
 
@@ -4817,7 +4666,8 @@ def test_goal_22_3_iter189_extract_items_in_request_order():
         pytest.skip(f"torch unavailable: {e}")
 
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        extract_multimodal_items_in_request_order)
+        extract_multimodal_items_in_request_order,
+    )
 
     # Build three fake MultimodalParams (we use SimpleNamespace because
     # the real MultimodalParams pydantic class is overkill for this test).
@@ -4829,9 +4679,7 @@ def test_goal_22_3_iter189_extract_items_in_request_order():
     img_grid_3 = torch.tensor([[1, 6, 6]], dtype=torch.int32)
 
     req_1 = SimpleNamespace(
-        multimodal_data={
-            "image": {"pixel_values": img_pv_1, "image_grid_thw": img_grid_1}
-        }
+        multimodal_data={"image": {"pixel_values": img_pv_1, "image_grid_thw": img_grid_1}}
     )
     req_2 = SimpleNamespace(
         multimodal_data={
@@ -4842,9 +4690,7 @@ def test_goal_22_3_iter189_extract_items_in_request_order():
         }
     )
     req_3 = SimpleNamespace(
-        multimodal_data={
-            "image": {"pixel_values": img_pv_3, "image_grid_thw": img_grid_3}
-        }
+        multimodal_data={"image": {"pixel_values": img_pv_3, "image_grid_thw": img_grid_3}}
     )
 
     items = extract_multimodal_items_in_request_order([req_1, req_2, req_3])
@@ -4922,7 +4768,8 @@ def test_goal_22_3_iter189_input_processor_class_attributes():
     in CPU-only environments.
     """
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        get_minimax_m3_vl_input_processor_cls)
+        get_minimax_m3_vl_input_processor_cls,
+    )
     from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
     cls = get_minimax_m3_vl_input_processor_cls()
@@ -4930,16 +4777,11 @@ def test_goal_22_3_iter189_input_processor_class_attributes():
         f"{cls} must subclass BaseMultimodalInputProcessor"
     )
     # Methods required by the InputProcessor contract.
-    for name in ("__call__", "processor", "tokenizer", "config", "dtype",
-                 "model_path"):
+    for name in ("__call__", "processor", "tokenizer", "config", "dtype", "model_path"):
         assert hasattr(cls, name), (
-            f"{cls.__name__} must define {name}; "
-            f"available={sorted(dir(cls))[:20]}"
+            f"{cls.__name__} must define {name}; available={sorted(dir(cls))[:20]}"
         )
-    print(
-        f"[M3-PARITY] iter189_input_processor_class "
-        f"name={cls.__name__} subclass_of_base=True"
-    )
+    print(f"[M3-PARITY] iter189_input_processor_class name={cls.__name__} subclass_of_base=True")
 
 
 def test_goal_22_3_iter189_modality_order_validation():
@@ -4956,7 +4798,9 @@ def test_goal_22_3_iter189_modality_order_validation():
         pytest.skip(f"torch unavailable: {e}")
 
     from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        compute_visual_token_count, prepare_multimodal_inputs_embeds)
+        compute_visual_token_count,
+        prepare_multimodal_inputs_embeds,
+    )
 
     device = torch.device("cpu")
     fake_dtype = torch.float32
@@ -4983,9 +4827,7 @@ def test_goal_22_3_iter189_modality_order_validation():
                 total += compute_visual_token_count(
                     int(g[0]), int(g[1]), int(g[2]), self.spatial_merge_size
                 )
-            return torch.zeros(
-                total, fake_hidden_ref, dtype=fake_dtype_ref, device=device
-            )
+            return torch.zeros(total, fake_hidden_ref, dtype=fake_dtype_ref, device=device)
 
     tower = _FakeTower()
 
@@ -5024,9 +4866,7 @@ def test_goal_22_3_iter189_modality_order_validation():
             mm_modality_order=["image"],  # missing the video item
         )
 
-    print(
-        f"[M3-PARITY] iter189_modality_order_validation negative_controls=2 passed"
-    )
+    print("[M3-PARITY] iter189_modality_order_validation negative_controls=2 passed")
 
 
 # ---------------------------------------------------------------------------
@@ -5140,9 +4980,7 @@ def test_fast_path_expand_multi_image_per_item_counts():
     """Two images with different per-item token counts must be expanded
     with their respective ``num_mm_tokens_per_placeholder`` entries.
     """
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import MINIMAX_M3_VL_IMAGE_TOKEN_ID
 
     proc = _make_minimax_m3_vl_fast_path_processor()
     img = MINIMAX_M3_VL_IMAGE_TOKEN_ID
@@ -5163,9 +5001,7 @@ def test_fast_path_expand_video_placeholders_use_video_token_id():
     """Video-only requests must expand ``VIDEO_TOKEN_ID`` placeholders,
     not ``IMAGE_TOKEN_ID`` ones.
     """
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MINIMAX_M3_VL_VIDEO_TOKEN_ID,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import MINIMAX_M3_VL_VIDEO_TOKEN_ID
 
     proc = _make_minimax_m3_vl_fast_path_processor()
     vid = MINIMAX_M3_VL_VIDEO_TOKEN_ID
@@ -5200,9 +5036,7 @@ def test_fast_path_expand_rejects_placeholder_count_mismatch():
     producing a malformed prompt that fuse_input_embeds would reject
     deep inside the model.
     """
-    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
-        MINIMAX_M3_VL_IMAGE_TOKEN_ID,
-    )
+    from tensorrt_llm._torch.models.modeling_minimaxm3_vl import MINIMAX_M3_VL_IMAGE_TOKEN_ID
 
     proc = _make_minimax_m3_vl_fast_path_processor()
     img = MINIMAX_M3_VL_IMAGE_TOKEN_ID
@@ -5248,4 +5082,3 @@ def test_fast_path_hooks_are_registered_on_processor_class():
     assert hasattr(cls, "expand_prompt_token_ids_for_mm")
     assert hasattr(cls, "get_num_tokens_per_image")
     assert hasattr(cls, "get_num_tokens_per_video")
-

@@ -20,7 +20,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-
 # ---------------------------------------------------------------------------
 # MiniMax-M3 VL canonical special-token ids (from the checkpoint's
 # ``added_tokens.json`` + tokenizer).
@@ -87,13 +86,9 @@ def compute_visual_token_counts(
     counts: List[int] = []
     for grid_thw in grid_thws:
         if len(grid_thw) != 3:
-            raise ValueError(
-                f"grid_thw must be a (t, h, w) triple; got {tuple(grid_thw)}"
-            )
+            raise ValueError(f"grid_thw must be a (t, h, w) triple; got {tuple(grid_thw)}")
         counts.append(
-            compute_visual_token_count(
-                grid_thw[0], grid_thw[1], grid_thw[2], spatial_merge_size
-            )
+            compute_visual_token_count(grid_thw[0], grid_thw[1], grid_thw[2], spatial_merge_size)
         )
     return counts
 
@@ -150,9 +145,7 @@ def expand_multimodal_placeholders(
                 )
             repeat = int(image_repeats[image_idx])
             if repeat <= 0:
-                raise ValueError(
-                    f"image_repeats[{image_idx}] must be positive; got {repeat}"
-                )
+                raise ValueError(f"image_repeats[{image_idx}] must be positive; got {repeat}")
             start = len(expanded)
             expanded.extend([image_token_id] * repeat)
             image_spans.append((start, start + repeat))
@@ -167,9 +160,7 @@ def expand_multimodal_placeholders(
                 )
             repeat = int(video_repeats[video_idx])
             if repeat <= 0:
-                raise ValueError(
-                    f"video_repeats[{video_idx}] must be positive; got {repeat}"
-                )
+                raise ValueError(f"video_repeats[{video_idx}] must be positive; got {repeat}")
             start = len(expanded)
             expanded.extend([video_token_id] * repeat)
             video_spans.append((start, start + repeat))
@@ -235,9 +226,7 @@ def merge_multimodal_embeddings(
                 )
             return
         if embeds is None:
-            raise ValueError(
-                f"merge_multimodal_embeddings has {label}_spans but no {label}_embeds"
-            )
+            raise ValueError(f"merge_multimodal_embeddings has {label}_spans but no {label}_embeds")
         if embeds.dim() != 2:
             raise ValueError(
                 f"{label}_embeds must be [num_visual_tokens, hidden]; got shape "
@@ -258,7 +247,7 @@ def merge_multimodal_embeddings(
         for span_idx, (start, end) in enumerate(spans):
             if start < 0 or end > out.shape[0] or end <= start:
                 raise ValueError(
-                    f"{label}_spans[{span_idx}]={span!r} out of bounds for seq={out.shape[0]}"
+                    f"{label}_spans[{span_idx}]={(start, end)!r} out of bounds for seq={out.shape[0]}"
                 )
             chunk_len = end - start
             out[start:end] = embeds[cursor : cursor + chunk_len].to(
@@ -342,9 +331,7 @@ def build_multimodal_input_ids(
     dims (delegating divisibility to :func:`compute_visual_token_count`).
     """
     if spatial_merge_size <= 0:
-        raise ValueError(
-            f"spatial_merge_size must be positive; got {spatial_merge_size}"
-        )
+        raise ValueError(f"spatial_merge_size must be positive; got {spatial_merge_size}")
 
     prompt_list = list(prompt)
     image_grid_thws = list(image_grid_thws)
@@ -384,16 +371,12 @@ def build_multimodal_input_ids(
     for mm_start_idx, modality in vision_start_indices:
         if modality == _IMAGE_MODALITY:
             grid_t, grid_h, grid_w = image_grid_thws[img_idx]
-            mm_token_num = compute_visual_token_count(
-                grid_t, grid_h, grid_w, spatial_merge_size
-            )
+            mm_token_num = compute_visual_token_count(grid_t, grid_h, grid_w, spatial_merge_size)
             mm_token_id = image_token_id
             img_idx += 1
         else:  # video
             grid_t, grid_h, grid_w = video_grid_thws[video_idx]
-            mm_token_num = compute_visual_token_count(
-                grid_t, grid_h, grid_w, spatial_merge_size
-            )
+            mm_token_num = compute_visual_token_count(grid_t, grid_h, grid_w, spatial_merge_size)
             mm_token_id = video_token_id
             video_idx += 1
 
@@ -532,8 +515,7 @@ def _flatten_grids(grid_thws: Sequence[Sequence[int]]) -> List[Tuple[int, int, i
         if grid_thws.dim() == 1 and grid_thws.numel() == 3:
             return [(int(grid_thws[0]), int(grid_thws[1]), int(grid_thws[2]))]
         raise ValueError(
-            f"grid_thws tensor must be [N, 3] or [3]; got shape "
-            f"{tuple(grid_thws.shape)}"
+            f"grid_thws tensor must be [N, 3] or [3]; got shape {tuple(grid_thws.shape)}"
         )
     for g in grid_thws:
         if isinstance(g, torch.Tensor):
@@ -542,9 +524,7 @@ def _flatten_grids(grid_thws: Sequence[Sequence[int]]) -> List[Tuple[int, int, i
     return out
 
 
-def _find_placeholder_runs(
-    input_ids: torch.Tensor, token_id: int
-) -> List[Tuple[int, int]]:
+def _find_placeholder_runs(input_ids: torch.Tensor, token_id: int) -> List[Tuple[int, int]]:
     """Return ``[(start_inclusive, end_inclusive), ...]`` runs of ``token_id`` in ``input_ids``.
 
     Runs are returned in left-to-right order. Each run is a maximal
@@ -553,8 +533,7 @@ def _find_placeholder_runs(
     """
     if input_ids.dim() != 1:
         raise ValueError(
-            f"_find_placeholder_runs expects a 1-D tensor; got shape "
-            f"{tuple(input_ids.shape)}"
+            f"_find_placeholder_runs expects a 1-D tensor; got shape {tuple(input_ids.shape)}"
         )
     runs: List[Tuple[int, int]] = []
     seq = input_ids.tolist()
@@ -663,8 +642,7 @@ def prepare_multimodal_inputs_embeds(
         # the slice is assumed to be contiguous in input_ids order.
         if mm_token_indices.dim() != 1:
             raise ValueError(
-                f"mm_token_indices must be a 1-D tensor; got shape "
-                f"{tuple(mm_token_indices.shape)}"
+                f"mm_token_indices must be a 1-D tensor; got shape {tuple(mm_token_indices.shape)}"
             )
         idx_list = [int(i) for i in mm_token_indices.tolist()]
         # Verify all indices are within range and strictly increasing.
@@ -704,8 +682,7 @@ def prepare_multimodal_inputs_embeds(
                     vid_idx += 1
                 else:
                     raise ValueError(
-                        f"mm_modality_order entries must be 'image' or 'video'; "
-                        f"got {modality!r}"
+                        f"mm_modality_order entries must be 'image' or 'video'; got {modality!r}"
                     )
                 n = compute_visual_token_count(g[0], g[1], g[2], merge)
                 chunk = idx_list[cursor : cursor + n]
@@ -758,12 +735,8 @@ def prepare_multimodal_inputs_embeds(
     else:
         # Token-id run search; works only when input_ids still carry the
         # canonical placeholder token ids.
-        image_runs = (
-            _find_placeholder_runs(input_ids, image_token_id) if has_image else []
-        )
-        video_runs = (
-            _find_placeholder_runs(input_ids, video_token_id) if has_video else []
-        )
+        image_runs = _find_placeholder_runs(input_ids, image_token_id) if has_image else []
+        video_runs = _find_placeholder_runs(input_ids, video_token_id) if has_video else []
 
         if has_image and len(image_runs) != len(image_grid_list):
             raise ValueError(
@@ -813,9 +786,7 @@ def prepare_multimodal_inputs_embeds(
     # Splice into inputs_embeds (non-aliased; clone first).
     out = inputs_embeds.clone()
 
-    def _splice(
-        feats: Optional[torch.Tensor], runs: List[Tuple[int, int]]
-    ) -> None:
+    def _splice(feats: Optional[torch.Tensor], runs: List[Tuple[int, int]]) -> None:
         if feats is None or not runs:
             return
         cursor = 0
@@ -923,9 +894,7 @@ def extract_multimodal_items_in_request_order(
             pv = img.get("pixel_values")
             gthw = img.get("image_grid_thw")
             if pv is not None and gthw is not None:
-                items.append(
-                    {"modality": "image", "pixel_values": pv, "grid_thw": gthw}
-                )
+                items.append({"modality": "image", "pixel_values": pv, "grid_thw": gthw})
         vid = data.get("video") if isinstance(data, Mapping) else None
         if isinstance(vid, Mapping):
             pv = vid.get("pixel_values_videos")
@@ -933,9 +902,7 @@ def extract_multimodal_items_in_request_order(
                 pv = vid.get("pixel_values")
             gthw = vid.get("video_grid_thw")
             if pv is not None and gthw is not None:
-                items.append(
-                    {"modality": "video", "pixel_values": pv, "grid_thw": gthw}
-                )
+                items.append({"modality": "video", "pixel_values": pv, "grid_thw": gthw})
     return items
 
 
@@ -982,7 +949,9 @@ class CLIPVisionConfig:
             data = dict(source)
         else:
             data = {
-                k: getattr(source, k) for k in dir(source) if not k.startswith("_") and not callable(getattr(source, k))
+                k: getattr(source, k)
+                for k in dir(source)
+                if not k.startswith("_") and not callable(getattr(source, k))
             }
         valid = {f for f in cls.__dataclass_fields__.keys()}
         filtered = {k: v for k, v in data.items() if k in valid}
@@ -1013,9 +982,7 @@ class MiniMaxVLPatchEmbedding(nn.Module):
         self.embed_dim = config.hidden_size
         self.patch_size = config.patch_size
         self.input_num_channels = config.num_channels
-        self.temporal_patch_size = config.img_token_compression_config.get(
-            "temporal_patch_size", 2
-        )
+        self.temporal_patch_size = config.img_token_compression_config.get("temporal_patch_size", 2)
 
         self.patch_embedding = nn.Conv3d(
             in_channels=self.input_num_channels,
@@ -1040,10 +1007,7 @@ class MiniMaxVLPatchEmbedding(nn.Module):
             )
         n = pixel_values.shape[0]
         expected_cols = (
-            self.input_num_channels
-            * self.temporal_patch_size
-            * self.patch_size
-            * self.patch_size
+            self.input_num_channels * self.temporal_patch_size * self.patch_size * self.patch_size
         )
         if pixel_values.shape[1] != expected_cols:
             raise ValueError(
@@ -1165,9 +1129,7 @@ class MiniMaxVLEncoderSelfAttention(nn.Module):
         """
         seq, embed_dim = hidden_states.shape
         if embed_dim != self.embed_dim:
-            raise ValueError(
-                f"hidden_states dim {embed_dim} != module embed_dim {self.embed_dim}"
-            )
+            raise ValueError(f"hidden_states dim {embed_dim} != module embed_dim {self.embed_dim}")
 
         q = self.q_proj(hidden_states).reshape(seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(seq, self.num_heads, self.head_dim)
@@ -1294,12 +1256,8 @@ class MiniMaxVLVisionTransformer(nn.Module):
         self.config = config
         embed_dim = config.hidden_size
 
-        self.temporal_patch_size = config.img_token_compression_config.get(
-            "temporal_patch_size", 2
-        )
-        self.spatial_merge_size = config.img_token_compression_config.get(
-            "spatial_merge_size", 2
-        )
+        self.temporal_patch_size = config.img_token_compression_config.get("temporal_patch_size", 2)
+        self.spatial_merge_size = config.img_token_compression_config.get("spatial_merge_size", 2)
 
         self.embeddings = MiniMaxVLPatchEmbedding(config, dtype)
         # NOTE: the typo "layrnorm" matches the published checkpoint key.
@@ -1335,7 +1293,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
         self.register_buffer("inv_freq_h", inv_freq_h, persistent=False)
         self.register_buffer("inv_freq_w", inv_freq_w, persistent=False)
 
-    def _compute_cu_seqlens(self, grid_thw: Sequence[Sequence[int]], device: torch.device) -> torch.Tensor:
+    def _compute_cu_seqlens(
+        self, grid_thw: Sequence[Sequence[int]], device: torch.device
+    ) -> torch.Tensor:
         """Cumulative per-image token boundary tensor for SDPA segmentation.
 
         For each image we add ``grid_t * grid_h * grid_w`` tokens to the
@@ -1345,9 +1305,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
         seqlens = [0]
         for grid_t, grid_h, grid_w in grid_thw:
             seqlens.append(grid_t * grid_h * grid_w)
-        return torch.cumsum(
-            torch.tensor(seqlens, dtype=torch.int32, device=device), dim=0
-        ).to(torch.int32)
+        return torch.cumsum(torch.tensor(seqlens, dtype=torch.int32, device=device), dim=0).to(
+            torch.int32
+        )
 
     def _get_3d_rope_freqs(
         self,
@@ -1379,11 +1339,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         spatial_merge_size = self.spatial_merge_size
 
-        hpos_ids = (
-            torch.arange(grid_h, device=device_h)
-            .unsqueeze(1)
-            .expand(-1, grid_w)
-        )
+        hpos_ids = torch.arange(grid_h, device=device_h).unsqueeze(1).expand(-1, grid_w)
         hpos_ids = hpos_ids.reshape(
             grid_h // spatial_merge_size,
             spatial_merge_size,
@@ -1393,11 +1349,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
         hpos_ids = hpos_ids.permute(0, 2, 1, 3)
         hpos_ids = hpos_ids.unsqueeze(0).expand(grid_t, -1, -1, -1, -1).flatten()
 
-        wpos_ids = (
-            torch.arange(grid_w, device=device_w)
-            .unsqueeze(0)
-            .expand(grid_h, -1)
-        )
+        wpos_ids = torch.arange(grid_w, device=device_w).unsqueeze(0).expand(grid_h, -1)
         wpos_ids = wpos_ids.reshape(
             grid_h // spatial_merge_size,
             spatial_merge_size,
@@ -1425,10 +1377,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
     def _get_rope_freqs(self, grid_thw: Sequence[Sequence[int]]) -> torch.Tensor:
         """Concatenated per-image RoPE frequency tensor."""
-        chunks = [
-            self._get_3d_rope_freqs(int(t), int(h), int(w))
-            for t, h, w in grid_thw
-        ]
+        chunks = [self._get_3d_rope_freqs(int(t), int(h), int(w)) for t, h, w in grid_thw]
         return torch.cat(chunks, dim=0)
 
     def forward(
@@ -1534,9 +1483,7 @@ class MiniMaxVLPatchMerger(nn.Module):
             bias=patch_merge_bias,
             dtype=dtype,
         )
-        self.linear_2 = nn.Linear(
-            mid_size, text_hidden_size, bias=patch_merge_bias, dtype=dtype
-        )
+        self.linear_2 = nn.Linear(mid_size, text_hidden_size, bias=patch_merge_bias, dtype=dtype)
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         """Reshape by ``spatial_merge_size**2`` then 2-layer MLP.
@@ -1711,7 +1658,7 @@ def load_minimax_m3_vl_state_dict(
         if not target_key.startswith("vision_tower."):
             unconsumed.append(source_key)
             continue
-        relative_key = target_key[len("vision_tower."):]
+        relative_key = target_key[len("vision_tower.") :]
         if relative_key not in target_keys:
             unconsumed.append(source_key)
             continue
@@ -1785,8 +1732,10 @@ class MiniMaxM3VLInputProcessor:
 
         from transformers import AutoProcessor, AutoTokenizer
 
-        self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code
+        self._tokenizer = (
+            tokenizer
+            if tokenizer is not None
+            else AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         )
         self._model_path = model_path
         self._config = config
@@ -1803,9 +1752,7 @@ class MiniMaxM3VLInputProcessor:
                 text_cfg, "torch_dtype", getattr(config, "torch_dtype", torch.bfloat16)
             )
         if not isinstance(self._dtype, torch.dtype):
-            self._dtype = getattr(
-                torch, str(self._dtype).split(".")[-1], torch.bfloat16
-            )
+            self._dtype = getattr(torch, str(self._dtype).split(".")[-1], torch.bfloat16)
 
     # ----- registry contract properties -----------------------------------
     @property
@@ -1853,14 +1800,13 @@ class MiniMaxM3VLInputProcessor:
         # the real LM vocab lives on ``text_config`` (200064 incl. image
         # / video / vision-start / vision-end tokens).
         text_cfg = getattr(self._config, "text_config", None)
-        vocab = getattr(text_cfg, "vocab_size", None) or getattr(
-            self._config, "vocab_size", None)
+        vocab = getattr(text_cfg, "vocab_size", None) or getattr(self._config, "vocab_size", None)
         return int(vocab) if vocab is not None else None
 
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor(
-            [MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID],
-            dtype=torch.int32)
+            [MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID], dtype=torch.int32
+        )
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         # VISION_START / VISION_END frame each MM span; declared as
@@ -1868,7 +1814,8 @@ class MiniMaxM3VLInputProcessor:
         # but excluded from the embed-mask.
         return torch.tensor(
             [MINIMAX_M3_VL_VISION_START_TOKEN_ID, MINIMAX_M3_VL_VISION_END_TOKEN_ID],
-            dtype=torch.int32)
+            dtype=torch.int32,
+        )
 
     @staticmethod
     def _hw(media: Any) -> Tuple[int, int]:
@@ -1899,9 +1846,11 @@ class MiniMaxM3VLInputProcessor:
         if video_grid_thw is None:
             raise RuntimeError(
                 "MiniMaxM3VL fast path: get_num_tokens_per_video requires "
-                "precomputed video_grid_thw from the dummy-text pass.")
-        grid = (video_grid_thw.tolist()
-                if isinstance(video_grid_thw, torch.Tensor) else video_grid_thw)
+                "precomputed video_grid_thw from the dummy-text pass."
+            )
+        grid = (
+            video_grid_thw.tolist() if isinstance(video_grid_thw, torch.Tensor) else video_grid_thw
+        )
         merge = int(self._processor.image_processor.merge_size)
         grid_t, grid_h, grid_w = int(grid[0]), int(grid[1]), int(grid[2])
         return grid_t * (grid_h // merge) * (grid_w // merge) + 2
@@ -1933,12 +1882,11 @@ class MiniMaxM3VLInputProcessor:
         has_video = bool(mm_data.get("video"))
         if has_image and has_video:
             raise ValueError(
-                "MiniMaxM3VL fast path: mixed image + video in a single "
-                "request is not supported.")
+                "MiniMaxM3VL fast path: mixed image + video in a single request is not supported."
+            )
         if not (has_image or has_video):
             return list(prompt_token_ids), None
-        placeholder_id = (MINIMAX_M3_VL_IMAGE_TOKEN_ID
-                          if has_image else MINIMAX_M3_VL_VIDEO_TOKEN_ID)
+        placeholder_id = MINIMAX_M3_VL_IMAGE_TOKEN_ID if has_image else MINIMAX_M3_VL_VIDEO_TOKEN_ID
         expected = len(num_mm_tokens_per_placeholder)
         expanded: List[int] = []
         consumed = 0
@@ -1949,12 +1897,14 @@ class MiniMaxM3VLInputProcessor:
             if consumed >= expected:
                 raise ValueError(
                     "MiniMaxM3VL fast path: prompt has more placeholders than "
-                    f"num_mm_tokens entries ({expected}).")
+                    f"num_mm_tokens entries ({expected})."
+                )
             inner = int(num_mm_tokens_per_placeholder[consumed]) - 2
             if inner < 1:
                 raise ValueError(
                     f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={inner + 2} "
-                    "must be >= 3 (VISION_START + >=1 placeholder + VISION_END).")
+                    "must be >= 3 (VISION_START + >=1 placeholder + VISION_END)."
+                )
             expanded.append(MINIMAX_M3_VL_VISION_START_TOKEN_ID)
             expanded.extend([placeholder_id] * inner)
             expanded.append(MINIMAX_M3_VL_VISION_END_TOKEN_ID)
@@ -1962,7 +1912,8 @@ class MiniMaxM3VLInputProcessor:
         if consumed != expected:
             raise ValueError(
                 f"MiniMaxM3VL fast path: prompt has {consumed} placeholders "
-                f"but num_mm_tokens has {expected} entries.")
+                f"but num_mm_tokens has {expected} entries."
+            )
         return expanded, None
 
     # ----- main entry point -----------------------------------------------
@@ -1989,9 +1940,7 @@ class MiniMaxM3VLInputProcessor:
            shape TRT-LLM's runtime expects.
         """
         text_prompt = inputs.get("prompt") if isinstance(inputs, Mapping) else None
-        mm_data = (
-            inputs.get("multi_modal_data") if isinstance(inputs, Mapping) else None
-        ) or {}
+        mm_data = (inputs.get("multi_modal_data") if isinstance(inputs, Mapping) else None) or {}
 
         images = self._coerce_to_list(mm_data.get("image"))
         video_inputs = self._coerce_to_list(mm_data.get("video"))
