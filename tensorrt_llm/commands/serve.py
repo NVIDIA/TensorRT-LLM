@@ -994,11 +994,89 @@ def serve(
 
     def _serve_llm():
         nonlocal server_role
+
+        # Auto-detect models that only support the AutoDeploy backend and supply
+        # the AD defaults from examples/auto_deploy/model_registry/configs/.
+        #
+        # The gemma4 recipe mirrors gemma4_dense.yaml but with a single-GPU
+        # batch/memory budget: the registry maps gemma-4-31B to world_size_2
+        # (TP=2), which splits the ~58GB weights across two GPUs. trtllm-serve
+        # auto-routing here defaults to a single GPU, so the canonical
+        # max_batch_size=512 would size the resize_kv_cache warmup batch larger
+        # than the estimation-mode page table can back after weights are loaded,
+        # producing an out-of-bounds write in the paged-KV-cache update kernel.
+        # max_batch_size=64 + free_gpu_memory_fraction=0.5 keeps the warmup batch
+        # within the page table the single GPU can allocate.
+        _AUTODEPLOY_ONLY_DEFAULTS = {
+            "gemma4": {
+                "model_factory": "Gemma4ForConditionalGeneration",
+                "attn_backend": "triton",
+                "compile_backend": "torch-cudagraph",
+                "cuda_graph_config": {
+                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64],
+                },
+                "max_seq_len": 8192,
+                "max_batch_size": 64,
+                "max_num_tokens": 8192,
+                "enable_chunked_prefill": True,
+                # free_gpu_memory_fraction must be high enough that the smaller
+                # VSWA window pool has at least as many blocks as the
+                # resize_kv_cache warmup allocates (max_num_tokens/tokens_per_block
+                # pages); otherwise the warmup page table indexes past the window
+                # pool, producing an out-of-bounds write in the paged-KV update.
+                "kv_cache_config": {
+                    "enable_block_reuse": False,
+                    "free_gpu_memory_fraction": 0.7,
+                },
+                "transforms": {
+                    "compile_model": {
+                        # Gemma4's inner text graph has 8 leading
+                        # request-dependent inputs; if fewer are marked batched,
+                        # CUDA graph capture treats the dynamic metadata tensors
+                        # (page table / positions feeding the paged-KV update) as
+                        # static, producing an out-of-bounds write during warmup.
+                        "num_batched_inputs": 8,
+                        # Piecewise CUDA graph currently sizes per-request buffers
+                        # from a text-only warmup; disable it for the non-E2B
+                        # dense path (matches the validated gemma4_moe config).
+                        "piecewise_enabled": False,
+                    },
+                    "mlir_elementwise_fusion": {
+                        "enabled": True,
+                    },
+                    "gather_logits_before_lm_head": {
+                        "enabled": True,
+                    },
+                    "fuse_gemms": {
+                        "enabled": True,
+                    },
+                },
+            },
+        }
+
+        effective_backend = backend
+        autodeploy_extra = {}
+        if backend == "pytorch":
+            import transformers
+            try:
+                config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+                    model)
+                model_type = config_dict.get("model_type")
+                if model_type in _AUTODEPLOY_ONLY_DEFAULTS:
+                    logger.info(
+                        f"Model type '{model_type}' requires the AutoDeploy "
+                        f"backend. Switching from 'pytorch' to '_autodeploy'.")
+                    effective_backend = "_autodeploy"
+                    autodeploy_extra = _AUTODEPLOY_ONLY_DEFAULTS[model_type]
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not read model config for backend "
+                             f"auto-detection: {e}")
+
         llm_args, _ = get_llm_args(
             model=model,
             tokenizer=tokenizer,
             custom_tokenizer=custom_tokenizer,
-            backend=backend,
+            backend=effective_backend,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1030,6 +1108,9 @@ def serve(
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
                 llm_args_extra_dict = yaml.safe_load(f)
+        # Inject auto-detected AD defaults; user-provided options take priority
+        if autodeploy_extra:
+            llm_args_extra_dict = {**autodeploy_extra, **llm_args_extra_dict}
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 

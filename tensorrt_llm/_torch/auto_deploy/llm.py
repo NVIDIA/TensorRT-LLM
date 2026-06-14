@@ -197,8 +197,10 @@ class LLM(_TorchLLM):
         # _autodeploy backend.
         super()._build_model()
 
-        # Parent build normalizes tokenizer state, but AD owns the final processor;
-        # registered PyTorch processors (e.g. Gemma4) are expected to be replaced.
+        # now correct input processor. Parent build normalizes tokenizer state, but the base
+        # _TorchLLM._build_model may have selected a model-specific InputProcessor via
+        # @register_input_processor (e.g. Gemma4InputProcessor for Gemma4); AutoDeploy owns the
+        # final processor and always overrides that with its own AD input processor.
         assert self.tokenizer is None or isinstance(self.tokenizer, TransformersTokenizer)
         self.input_processor = self._create_input_processor()
 

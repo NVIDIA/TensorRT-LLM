@@ -1,4 +1,5 @@
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
+from tensorrt_llm._torch.configs.gemma4 import Gemma4Config
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 
 
@@ -30,4 +31,4 @@ def _register_custom_configs_with_transformers() -> None:
 _register_custom_configs_with_transformers()
 del _register_custom_configs_with_transformers
 
-__all__ = ["DeepseekV3Config", "LagunaConfig"]
+__all__ = ["DeepseekV3Config", "Gemma4Config", "LagunaConfig"]
