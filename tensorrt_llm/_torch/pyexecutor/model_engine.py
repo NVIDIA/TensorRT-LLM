@@ -497,7 +497,6 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attn_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
-            self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
@@ -551,6 +550,7 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
+        self.spec_metadata = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1343,33 +1343,70 @@ class PyTorchModelEngine(ModelEngine):
         else:
             max_seq_len_list = [effective_max_seq_len]
 
-        for bs, draft_len in graphs_to_capture:
-            if bs > self.batch_size:
-                continue
-
-            for max_seq_len in max_seq_len_list:
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len, max_seq_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        # No KV cache space, cannot continue capturing graphs
+        def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
+            spec_metadata = self.spec_metadata
+            if force_non_greedy and spec_metadata is not None:
+                spec_metadata._force_non_greedy_for_capture = True
+                # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
+                # to build the graph cache key BEFORE populate runs inside
+                # _prepare_inputs. Pre-flip it here so the very first capture
+                # in this pass uses the non-greedy key; populate's override
+                # below will keep it False on every subsequent iteration.
+                spec_metadata.is_all_greedy_sample = False
+            try:
+                for bs, draft_len in graphs_to_capture:
+                    if bs > self.batch_size:
                         continue
-                    logger.info(
-                        f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
-                    )
-                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
-                        self.spec_config is not None
-                        and self.spec_config.spec_dec_mode.use_one_engine())
-                    self._update_draft_inference_state_for_warmup(
-                        batch, draft_len > 0, resource_manager)
-                    self.runtime_draft_len = draft_len
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+
+                    for max_seq_len in max_seq_len_list:
+                        warmup_request = self._create_cuda_graph_warmup_request(
+                            resource_manager, bs, draft_len, max_seq_len)
+                        with self._release_batch_context(
+                                warmup_request, resource_manager) as batch:
+                            if batch is None:
+                                # No KV cache space, cannot continue capturing graphs
+                                continue
+                            logger.info(
+                                f"Run generation-only CUDA graph warmup ({label}) "
+                                f"for batch size={bs}, draft_len={draft_len}, "
+                                f"max_seq_len={max_seq_len}")
+                            self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
+                                self.spec_config is not None and
+                                self.spec_config.spec_dec_mode.use_one_engine())
+                            self._update_draft_inference_state_for_warmup(
+                                batch, draft_len > 0, resource_manager)
+                            self.runtime_draft_len = draft_len
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+            finally:
+                if force_non_greedy and spec_metadata is not None:
+                    spec_metadata._force_non_greedy_for_capture = False
+
+        # Pass 1: greedy fast-path (dummy requests carry no sampling params,
+        # so is_all_greedy_sample is naturally True).
+        _run_capture_pass(force_non_greedy=False, label="greedy")
+        # Pass 2: advanced sampling variant. Required because on-the-fly capture
+        # is disabled outside warmup, so any inference batch that contains a
+        # non-greedy request would otherwise fall back to eager. Only meaningful
+        # for one-engine spec dec (where is_all_greedy_sample participates in
+        # the graph key); other paths default to True and would never key into
+        # this variant.
+        needs_non_greedy_capture = (
+            self.spec_config is not None
+            and self.spec_config.spec_dec_mode.use_one_engine())
+        if needs_non_greedy_capture:
+            _run_capture_pass(force_non_greedy=True, label="advanced sampling")
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
+        # The advanced-sampling capture pass above leaves is_all_greedy_sample
+        # set to False on spec_metadata. Reset it to the default so the first
+        # real iteration's graph-key selection is not seeded with this
+        # capture-only value. (update_is_all_greedy_sample refreshes it every
+        # iteration; this is a defensive guard.)
+        if self.spec_metadata is not None:
+            self.spec_metadata.is_all_greedy_sample = True
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -4680,6 +4717,17 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
             self._pad_batch_seed_mrope_delta_cache(padded_requests)
+
+            # Refresh is_all_greedy_sample for the *current* batch BEFORE the
+            # CUDA graph key is built below. The key includes this flag to pick
+            # the argmax vs advanced-sampling graph variant; populate (inside
+            # _prepare_inputs) runs later and fills the matching GPU buffers.
+            # Without this pre-scan the key would use the previous iteration's
+            # stale value and could replay the advanced graph against
+            # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
+            if spec_metadata is not None:
+                spec_metadata.update_is_all_greedy_sample(
+                    padded_requests.all_requests())
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
