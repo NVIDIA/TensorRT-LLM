@@ -448,10 +448,53 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 
+def _relax_llama_validate_architecture() -> None:
+    """Honor explicit `head_dim` in transformers 5.x LlamaConfig validation.
+
+    transformers 5.5.x LlamaConfig.validate_architecture rejects any config
+    where `hidden_size % num_attention_heads != 0`, ignoring an explicit
+    `head_dim` that decouples q/k/v projection size from `hidden_size`
+    (e.g. kakaocorp/kanana-1.5-2.1b: hidden_size=1792, num_attention_heads=24,
+    head_dim=128). The check is too strict; downstream TRT-LLM code already
+    honors `head_dim`. Idempotent.
+
+    The huggingface_hub @strict decorator captures validators into
+    ``cls.__class_validators__`` at class-definition time, so we must replace
+    the entry in that list — overwriting ``LlamaConfig.validate_architecture``
+    alone is not enough.
+    """
+    try:
+        from transformers.models.llama.configuration_llama import LlamaConfig
+    except ImportError:
+        return
+
+    if getattr(LlamaConfig.validate_architecture, "_trtllm_patched", False):
+        return
+
+    def validate_architecture(self):
+        head_dim = getattr(self, "head_dim", None)
+        if isinstance(head_dim, int) and head_dim > 0:
+            return
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"The hidden size ({self.hidden_size}) is not a multiple of "
+                f"the number of attention heads ({self.num_attention_heads}).")
+
+    validate_architecture._trtllm_patched = True
+    LlamaConfig.validate_architecture = validate_architecture
+
+    validators = getattr(LlamaConfig, "__class_validators__", None) or []
+    for i, v in enumerate(validators):
+        if getattr(v, "__name__", None) == "validate_architecture":
+            validators[i] = validate_architecture
+            break
+
+
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: Optional[str] = None,
                            **kwargs) -> transformers.PretrainedConfig:
+    _relax_llama_validate_architecture()
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
