@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/ATen.h>
+#include <cstdint>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/operators.h>
@@ -68,7 +69,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 39);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 40);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -260,6 +261,11 @@ public:
     void syncTransferManagerWithBufferManager() override
     {
         NB_OVERRIDE_PURE(syncTransferManagerWithBufferManager);
+    }
+
+    bool hasPendingHostTransfers() const override
+    {
+        NB_OVERRIDE_PURE(hasPendingHostTransfers);
     }
 
     void refreshBlocks() override
@@ -623,6 +629,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())
         .def("sync_transfer_manager_with_buffer_manager", &BaseKVCacheManager::syncTransferManagerWithBufferManager,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("has_pending_host_transfers", &BaseKVCacheManager::hasPendingHostTransfers,
             nb::call_guard<nb::gil_scoped_release>())
         .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())

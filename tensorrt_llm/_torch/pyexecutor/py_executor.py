@@ -3277,7 +3277,10 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    forward_done_event = self._record_execution_stream_tail_event(
+                    )
+                    self.resource_manager.prepare_resources(
+                        scheduled_batch, forward_done_event)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -4476,6 +4479,17 @@ class PyExecutor:
                 f"Encountered an error in forward function: {error_msg}")
             self._handle_errors(error_msg)
             return None
+
+    def _record_execution_stream_tail_event(self) -> Optional[torch.cuda.Event]:
+        if self.execution_stream is None:
+            return None
+
+        # In overlap mode the next prepare_resources call can start while the
+        # previous forward is still queued on execution_stream. Record at the
+        # stream tail so KVCM transfer streams wait for that in-flight work.
+        forward_done_event = torch.cuda.Event()
+        forward_done_event.record(self.execution_stream)
+        return forward_done_event
 
     def _update_generation_requests_that_will_complete_next_iteration(
             self, generation_requests: list[LlmRequest]):
