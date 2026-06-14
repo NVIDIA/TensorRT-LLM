@@ -2328,18 +2328,25 @@ class Indexer(nn.Module):
         return q_pe, q_nope, k_pe, k_nope
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate and quantize for Q or K.
+        """Concatenate, rotate, and quantize for Q or K.
 
-        FP8 mode: fused cat + FP8 quantize via CUDA kernel.
-        FP4 mode: fused cat + per-block-32 FP4 E2M1 quantize via CUDA kernel.
-        The returned packed bytes are int8 (two FP4 codes per byte) and the
-        scale is int32 (four UE8M0 exponents packed little-endian).
+        Applies Hadamard rotation (rotate_activation) between concatenation
+        and quantization — required for DSA sparse attention correctness.
+
+        FP8 mode: cat → rotate → FP8 quantize (unfused to allow rotation).
+        FP4 mode: fused cat + FP4 quantize (TODO: add rotation).
         """
         if self.use_fp4:
             return torch.ops.trtllm.fused_cat_fp4(qk_pe, qk_nope)
-        fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
-            qk_pe, qk_nope, self.scale_fmt == "ue8m0")
-        return fp8_out, scale
+        from tensorrt_llm.quantization.utils.fp8_utils import (
+            fp8_quantize_1x128_sf_transpose,
+        )
+        combined = torch.cat([qk_pe, qk_nope], dim=-1)
+        combined = rotate_activation(combined)
+        combined_2d = combined.view(-1, combined.shape[-1])
+        return fp8_quantize_1x128_sf_transpose(
+            combined_2d, use_ue8m0=self.scale_fmt == "ue8m0"
+        )
 
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
