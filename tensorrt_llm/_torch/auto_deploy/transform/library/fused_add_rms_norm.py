@@ -18,6 +18,9 @@ from typing import List, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.normalization import (
+    triton_rms_norm,  # noqa: F401  (registers triton_fused_add_rms_norm)
+)
 from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -63,8 +66,11 @@ class FuseAddRMSNorm(BaseTransform):
         matches: List[Tuple[Node, Optional[Node], Node]] = []
 
         for node in graph.nodes:
-            # Match flashinfer_rms_norm (handles both overload packet and .default)
-            if not is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm):
+            # Match flashinfer_rms_norm or triton_rms_norm (fuse the preceding residual add).
+            if not (
+                is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm)
+                or is_op(node, torch.ops.auto_deploy.triton_rms_norm)
+            ):
                 continue
 
             input_to_norm = node.args[0]
@@ -101,13 +107,19 @@ class FuseAddRMSNorm(BaseTransform):
             # Insert the fused call right before the norm node. Using
             # inserting_before(norm_node) ensures correct topological order:
             # fused_node → norm_out → add_out all appear before norm_node.
+            # Pick the matching fused op (both return (norm, add)). Triton path uses the
+            # OpOverload as target since the CustomOpDef object lacks __name__ for FX.
+            is_triton = is_op(norm_node, torch.ops.auto_deploy.triton_rms_norm)
+            fused_target = (
+                torch.ops.auto_deploy.triton_fused_add_rms_norm.default
+                if is_triton
+                else flashinfer_fused_add_rms_norm
+            )
+
             with graph.inserting_before(norm_node):
-                # flashinfer_fused_add_rms_norm(x, residual, weight, eps):
-                #   residual += x        →  residual becomes add result
-                #   x = rms_norm(residual) →  x becomes norm result
-                # returns (x, residual) = (norm_result, add_result)
+                # fused(x, residual, weight, eps) returns (norm_result, add_result).
                 fused_node = graph.call_function(
-                    flashinfer_fused_add_rms_norm,
+                    fused_target,
                     args=(add_rhs, add_lhs, weight, eps),
                 )
                 norm_out = graph.call_function(operator.getitem, args=(fused_node, 0))

@@ -37,9 +37,10 @@ Sharding strategy:
   verbatim from the non-IR base (no sharding hints; AD has no fusion that
   recovers these kernels from a vanilla rewrite). ``torch_moe`` carries
   ``layer_type="moe"``. The shared expert MLP is constructed with
-  ``add_all_reduce=False, layer_type="moe"`` so its closing all_reduce is
-  deferred. A single ``all_reduce(layer_type="moe")`` is emitted after the
-  routed + shared partial sums.
+  ``add_all_reduce=False, layer_type="shared_expert"`` so it stays REPLICATED
+  (excluded from ``shard_layers``; NVFP4 TP-sharding corrupts its deswizzled
+  weight scales). The routed (EP) output is ``all_reduce(layer_type="moe")``-d
+  first, then the replicated shared output is added.
 * **MLP** (``DeepSeekV3MLP``): SwiGLU gate/up are colwise, down is rowwise +
   ``all_reduce(layer_type="mlp")``.
 
@@ -263,7 +264,9 @@ class DeepSeekV3MoEGate(nn.Module):
     ``torch.ops.trtllm.dsv3_router_gemm_op`` and
     ``torch.ops.trtllm.noaux_tc_op`` calls are kept verbatim from the non-IR
     base -- AD has no transform that recovers these kernels from a vanilla
-    PyTorch rewrite.
+    PyTorch rewrite. The gate weight is left at the model's bf16 default (see
+    ``__init__``) so forward() exports the bf16 ``dsv3_router_gemm_op`` path
+    directly; no dedicated lowering transform is needed.
     """
 
     def __init__(self, config):
@@ -275,9 +278,13 @@ class DeepSeekV3MoEGate(nn.Module):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
 
-        self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
-        )
+        # Do NOT set dtype=torch.float32 here. The model is built under HF's
+        # set_default_dtype(bfloat16) context; an explicit float32 keeps the gate
+        # weight in fp32, forcing the slow F.linear branch in forward() and a
+        # dedicated lowering transform. Inheriting the bf16 default lets forward
+        # export the trtllm.dsv3_router_gemm_op path directly (register_fake makes
+        # it meta-safe), so the values are byte-identical to the bf16 checkpoint.
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.n_routed_experts, dtype=torch.float32),
@@ -347,7 +354,7 @@ class DeepSeekV3MoE(nn.Module):
                 config,
                 intermediate_size=intermediate_size,
                 add_all_reduce=False,
-                layer_type="moe",
+                layer_type="shared_expert",
             )
         else:
             self.shared_experts = None
@@ -379,13 +386,16 @@ class DeepSeekV3MoE(nn.Module):
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
 
-        if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + shared_expert_output
-
-        # Single merge-point all_reduce for routed + shared partial sums.
+        # All-reduce the (EP-sharded) routed-expert output first, then add the
+        # replicated shared-expert output. The shared expert is excluded from TP
+        # sharding (NVFP4 TP-sharding corrupts its deswizzled weight scales), so
+        # adding it before the all-reduce would scale it by the TP world size.
         final_hidden_states = torch.ops.auto_deploy.all_reduce(
             final_hidden_states, layer_type="moe"
         )
+
+        if self.shared_experts is not None:
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         return final_hidden_states.to(hidden_states.dtype)
 
@@ -521,6 +531,28 @@ class DeepSeekV3Attention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
+        # KV projection FIRST (before Q) so the KV-cone precedes the Q-cone in
+        # graph order. This is the invariant multi_stream_mla_attn pattern 2
+        # relies on to overlap the (light) KV-cone on the aux stream with the
+        # (heavy) q_b_proj on the main stream. Q and KV are independent (both
+        # from hidden_states / the fused a-proj), so the reorder is numerically
+        # identical. Keep compressed form; latent compression is replicated.
+        kv_a_output = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.kv_a_proj_with_mqa.weight,
+            self.kv_a_proj_with_mqa.bias,
+            tp_mode="none",
+            layer_type="mla",
+        )
+        compressed_kv, k_pe = torch.split(
+            kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        # Apply layernorm to compressed_kv
+        compressed_kv = self.kv_a_layernorm(compressed_kv)
+        # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
+        # dim 2 is fixed at 1 and never scales with TP, so plain `.view` is correct.
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
+
         # Q projection: latent projections replicated, q_b_proj colwise.
         if self.q_lora_rank is None:
             q = torch.ops.auto_deploy.torch_linear_simple(
@@ -556,32 +588,18 @@ class DeepSeekV3Attention(nn.Module):
         )
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # KV projection - keep compressed form. Latent compression is replicated.
-        kv_a_output = torch.ops.auto_deploy.torch_linear_simple(
-            hidden_states,
-            self.kv_a_proj_with_mqa.weight,
-            self.kv_a_proj_with_mqa.bias,
-            tp_mode="none",
-            layer_type="mla",
-        )
-        compressed_kv, k_pe = torch.split(
-            kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-
-        # Apply layernorm to compressed_kv
-        compressed_kv = self.kv_a_layernorm(compressed_kv)
-
-        # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
-        # dim 2 is fixed at 1 and never scales with TP, so plain `.view` is correct.
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
-
         kv_seq_len = q_len
 
         cos, sin = self.rotary_emb(hidden_states, seq_len=kv_seq_len)
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
-        # Apply RoPE using custom op (weights pre-permuted to NeoX format at load time)
+        # Use torch_rope_with_explicit_cos_sin: this is the op fuse_rope_into_trtllm_mla
+        # matches and for which it builds the rotary_cos_sin table that pairs correctly
+        # with the fused kernel's is_neox=True rotation.  (The eager rotation output is
+        # discarded once RoPE is fused into trtllm_mla; only the op identity + cos/sin
+        # args matter.  The interleaving-aware op mis-pairs with is_neox=True and costs
+        # ~0.7 GSM8K, so do NOT use it here.)
         q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q_pe,
             k_pe,
@@ -778,18 +796,11 @@ class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Pre-permute RoPE weight rows from interleaved to NeoX format at load time
-        # so the forward can use torch_rope_with_explicit_cos_sin (→ flashinfer_rope).
-        self._register_load_state_dict_pre_hook(
-            partial(
-                mla_rope_utils._rope_deinterleave_load_hook,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-                qk_nope_head_dim=config.qk_nope_head_dim,
-                num_heads=config.num_attention_heads,
-                kv_lora_rank=config.kv_lora_rank,
-                num_layers=config.num_hidden_layers,
-            )
-        )
+        # No _rope_deinterleave_load_hook: weights stay in native GPTJ layout.
+        # The fused trtllm_mla path applies the correct rotation directly, so the
+        # load-time de-interleave + fusion-time undo round-trip is omitted.
+        # fuse_rope_into_trtllm_mla skips the undo for this model_type
+        # (mla_rope_utils.is_gptj_layout / _GPTJ_LAYOUT_MODEL_TYPES).
 
         # Dequantize kv_b_proj FP8 weights at load time.
         # kv_b_proj.weight is passed directly to torch_mla (not via a quantized linear op)

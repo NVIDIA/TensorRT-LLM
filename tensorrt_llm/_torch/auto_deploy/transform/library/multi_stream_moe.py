@@ -26,6 +26,7 @@ from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import (
     begin_aux_stream_passthrough,
     cuda_stream_manager,
+    dsv3_moe_shared_mlp_in_aux_wrapped,
     end_aux_stream_passthrough,
     wait_aux_stream_passthrough,
 )
@@ -230,6 +231,62 @@ def _execute_shared_expert_in_aux_stream(
             )
             continue
 
+        # ---- V19: Try the single-fx-node wrap pattern first. ----
+        # If shared subgraph is exactly one fused_nvfp4_swiglu_mlp call that
+        # directly consumes fork_point, collapse begin_aux + mlp + end_aux into
+        # a single @torch._dynamo.disable wrapper fx node.  This avoids the
+        # cuda-graph-capture-time per-fork dedicated stream allocation triggered
+        # when set_stream() appears as a separate fx graph node.
+        # DISABLED 2026-05-28: revert V19 to original 3-fx-node pattern (V8 baseline)
+        # to cleanly isolate V21.  Set _V19_ENABLE_WRAP = True to restore.
+        _V19_ENABLE_WRAP = False
+        v19_target = torch.ops.auto_deploy.fused_nvfp4_swiglu_mlp.default
+        if _V19_ENABLE_WRAP and (
+            len(shared_nodes) == 1
+            and shared_nodes[0] is shared_output
+            and getattr(shared_output, "target", None) is v19_target
+            and fork_point in shared_output.all_input_nodes
+        ):
+            ad_logger.info(
+                f"[V19] Wrapping shared MLP {shared_output.name} (MoE={moe_node.name}) "
+                f"into single dynamo-disabled fx node"
+            )
+            # Build wrapper call BEFORE shared_output, with same args.
+            mlp_args = tuple(shared_output.args)
+            with graph.inserting_before(shared_output):
+                wrap_call = graph.call_function(
+                    dsv3_moe_shared_mlp_in_aux_wrapped,
+                    args=mlp_args,
+                )
+
+            # Replace merge_node's reference to shared_output with wrap_call.
+            merge_node.args = tuple(
+                wrap_call if arg is shared_output else arg for arg in merge_node.args
+            )
+
+            # Erase old fused_mlp node (wrap_call replaces its single use).
+            if len(shared_output.users) == 0:
+                graph.erase_node(shared_output)
+            else:
+                # Some other use — fall back to replace_all_uses.
+                shared_output.replace_all_uses_with(wrap_call)
+                graph.erase_node(shared_output)
+
+            # wait_aux remains separate (does not call set_stream, so it does
+            # not split capture).
+            with graph.inserting_before(merge_node):
+                wait_aux_node = graph.call_function(
+                    wait_aux_stream_passthrough,
+                    args=(routed_output,),
+                )
+            merge_node.args = tuple(
+                wait_aux_node if arg is routed_output else arg for arg in merge_node.args
+            )
+
+            num_replaced += 1
+            continue
+
+        # ---- Fall back to original 3-fx-node pattern. ----
         # ---- Step 4: Insert begin_aux before the first shared-expert op. ----
         # NOTE: do NOT bake ``torch.cuda.current_device()`` into the graph —
         # that would hard-code device 0 and break on other ranks in a

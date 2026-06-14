@@ -123,6 +123,19 @@ _LINEAR_OPS: List[Callable] = [
 # allgather on workspace_id=0 cannot clobber its buffer.
 _AUX_WORKSPACE_ID = 1
 
+# DSv3 MLA fused a-projection split sizes: q_a_lora (1536) and kv_a_with_mqa (576).
+_DSV3_Q_A_OUT = 1536
+_DSV3_KV_A_OUT = 576
+
+
+def _is_narrow_op(n: Node) -> bool:
+    """True for either narrow representation: aten.narrow.default or the
+    torch.narrow built-in (emitted by the generic fuse_gemms split)."""
+    return n.op == "call_function" and n.target in (
+        torch.narrow,
+        torch.ops.aten.narrow.default,
+    )
+
 
 def _is_linear(node: Node) -> bool:
     """Return ``True`` if *node* is any kind of linear op (regular or quantized)."""
@@ -334,6 +347,106 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
 
 
 # ===========================================================================
+# Pattern 3 (V12): Full KV path on aux WITHOUT AllGather (sharding-excluded case)
+# ===========================================================================
+
+
+def _execute_kv_path_in_aux_stream_no_allgather(
+    gm: GraphModule, world_size: int
+) -> Tuple[GraphModule, int]:
+    """V12 pattern: full KV path on aux when KV linear has no AllGather downstream.
+
+    Triggers when:
+      - Unfused Q/KV GEMMs (two linears share fork point), AND
+      - KV linear has NO AllGather downstream (e.g., yaml ``exclude_shard_node_filter``
+        excludes ``kv_a_proj_with_mqa`` from tensor-parallel sharding).
+
+    This is the PT-pattern equivalent for AD: KV path (kv_linear + split +
+    kv_a_layernorm + view) all on aux stream, in parallel with Q path on main.
+
+    Pattern 2 (post fuse_dsv3) wraps only the small KV-cone after the fused
+    GEMM narrow. Pattern 3 wraps the larger KV chain starting from kv_linear,
+    which is closer to what PT does in attention.py:1696 and avoids the CUDA
+    driver folding small aux chunks back into main.
+    """
+    triples = _find_mla_qkv_pairs(gm)
+    if not triples:
+        return gm, 0
+
+    graph = gm.graph
+    node_order = {n: i for i, n in enumerate(graph.nodes)}
+    num_matches = 0
+
+    for fork_point, q_linear, kv_linear in triples:
+        # Skip if kv_linear has an AllGather downstream — that's pattern 0's job.
+        kv_ag = _find_downstream_node(kv_linear, lambda n: is_op(n, all_gather_ops()), max_depth=2)
+        if kv_ag is not None:
+            continue
+
+        # BFS forward from kv_linear to find the mla_op and the KV chain nodes.
+        mla_op: Optional[Node] = None
+        kv_chain_set = {kv_linear}
+        queue: deque[Node] = deque([kv_linear])
+        while queue:
+            n = queue.popleft()
+            tgt_str = str(getattr(n, "target", ""))
+            if "trtllm_mla" in tgt_str or "torch_mla" in tgt_str:
+                mla_op = n
+                continue
+            for u in n.users:
+                if u not in kv_chain_set:
+                    kv_chain_set.add(u)
+                    queue.append(u)
+        if mla_op is None:
+            continue
+
+        kv_chain = [n for n in kv_chain_set if n is not kv_linear and n is not mla_op]
+        kv_outputs = [n for n in kv_chain if mla_op in n.users]
+        if not kv_outputs:
+            continue
+
+        last_kv_op = max(kv_outputs, key=lambda n: node_order.get(n, 0))
+
+        ad_logger.info(
+            "Multi-stream MLA pattern 3 (no-AG full KV path): "
+            f"Q={q_linear.name}, KV={kv_linear.name}, mla_op={mla_op.name}, last_kv={last_kv_op.name}"
+        )
+
+        # Step 1: begin_aux before kv_linear, wrapping fork_point as input.
+        with graph.inserting_before(kv_linear):
+            begin_node = graph.call_function(begin_aux_stream_passthrough, args=(fork_point,))
+            begin_node.meta["val"] = fork_point.meta.get("val")
+        kv_linear.args = tuple(begin_node if a is fork_point else a for a in kv_linear.args)
+
+        # Step 2: end_aux right after last_kv_op (rewire mla_op).
+        with graph.inserting_after(last_kv_op):
+            end_node = graph.call_function(end_aux_stream_passthrough, args=(last_kv_op,))
+            end_node.meta["val"] = last_kv_op.meta.get("val")
+        mla_op.args = tuple(end_node if a is last_kv_op else a for a in mla_op.args)
+
+        # Step 3: wait_aux before mla_op on a Q-side input.
+        q_inputs_to_mla = [
+            u
+            for u in mla_op.all_input_nodes
+            if u not in kv_outputs and u.op != "get_attr" and u is not end_node
+        ]
+        if not q_inputs_to_mla:
+            continue
+        q_input_for_wait = sorted(q_inputs_to_mla, key=lambda x: node_order.get(x, 0))[-1]
+        with graph.inserting_before(mla_op):
+            wait_node = graph.call_function(wait_aux_stream_passthrough, args=(q_input_for_wait,))
+            wait_node.meta["val"] = q_input_for_wait.meta.get("val")
+        mla_op.args = tuple(wait_node if a is q_input_for_wait else a for a in mla_op.args)
+
+        num_matches += 1
+
+    if num_matches > 0:
+        eliminate_dead_code(gm)
+
+    return gm, num_matches
+
+
+# ===========================================================================
 # Pattern 1: Projection overlap (fallback)
 # ===========================================================================
 
@@ -443,6 +556,157 @@ def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
 
 
 # ===========================================================================
+# Pattern 2: Fused-graph KV-cone overlap (post a-projection fusion)
+# ===========================================================================
+
+
+def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, int]:
+    """V8 — wrap KV-cone with begin/end/wait_aux (assumes KV-cone is in graph
+    order BEFORE Q-cone, achieved by modeling_deepseek.py forward reorder).
+
+    Layout AFTER user-code reorder (modeling_deepseek.py calls KV path first)::
+
+        dsv3, narrow_kv, narrow_q  (main, views = free)
+        split_with_sizes_1   ┐
+        getitem×2            │  KV-cone (already in graph order before Q)
+        kv_a_layernorm       │
+        aten.to.dtype        │
+        view_1               ┘
+        q_a_layernorm  ┐
+        q_b_proj       │  Q-cone
+        view → split   │
+        getitem×2      ┘
+        trtllm_mla_with_cache
+
+    This transform wraps the KV-cone segment with begin_aux/end_aux markers,
+    and inserts wait_aux before the MLA op.  No node reordering is needed.
+    Same pattern as multi_stream_moe.
+
+    On the piecewise CG path begin/end/wait_aux are no-ops (disable_multi_stream
+    from commit c38f0d24); monolithic CG (decode) has multi_stream enabled
+    so the stream switch yields actual Q/KV overlap.
+    """
+    from collections import deque
+
+    graph = gm.graph
+    node_order = {n: i for i, n in enumerate(graph.nodes)}
+    num_wrapped = 0
+
+    # Anchor structurally: the fused DSv3 a-projection is any node feeding two
+    # narrows of length 1536 (q_a) and 576 (kv_a).  This is producer-agnostic --
+    # matches both the dedicated dsv3_fused_a_gemm op and the generic fuse_gemms
+    # torch_linear_simple -- and identifies q/kv by LENGTH (args[3]) rather than
+    # start offset, so it is robust to the [q;kv] vs [kv;q] cat order.
+    fused_nodes = []
+    for n in graph.nodes:
+        nws = [u for u in n.users if _is_narrow_op(u) and len(u.args) >= 4]
+        lens = {int(u.args[3]) for u in nws}
+        if _DSV3_Q_A_OUT in lens and _DSV3_KV_A_OUT in lens:
+            fused_nodes.append(n)
+    if not fused_nodes:
+        return gm, 0
+
+    for dsv3 in fused_nodes:
+        narrows = [u for u in dsv3.users if _is_narrow_op(u) and len(u.args) >= 4]
+        narrow_kv = next((n for n in narrows if int(n.args[3]) == _DSV3_KV_A_OUT), None)
+        narrow_q = next((n for n in narrows if int(n.args[3]) == _DSV3_Q_A_OUT), None)
+        if narrow_kv is None or narrow_q is None:
+            continue
+
+        # BFS forward from narrow_kv: collect KV cone, find trtllm_mla join.
+        mla_op = None
+        kv_cone: List[Node] = []
+        visited = {narrow_kv}
+        queue = deque([narrow_kv])
+        while queue:
+            n = queue.popleft()
+            if "trtllm_mla" in str(getattr(n, "target", "")):
+                mla_op = n
+                continue
+            if n is not narrow_kv:
+                kv_cone.append(n)
+            for u in n.users:
+                if u not in visited:
+                    visited.add(u)
+                    queue.append(u)
+        if mla_op is None or not kv_cone:
+            continue
+
+        kv_cone.sort(key=lambda x: node_order.get(x, 0))
+        kv_outputs = [n for n in kv_cone if mla_op in n.users]
+        if not kv_outputs:
+            continue
+        first_kv_compute = kv_cone[0]
+        last_kv_op = kv_cone[-1]
+
+        # Sanity: KV cone must come BEFORE Q-cone in graph order (= user code
+        # has already been reordered to call KV first).  If Q comes first,
+        # this V8 path is not applicable — would need V7-style reorder.
+        q_users = sorted(
+            (u for u in narrow_q.users if u is not mla_op),
+            key=lambda x: node_order.get(x, float("inf")),
+        )
+        if q_users and node_order.get(q_users[0], 0) < node_order.get(first_kv_compute, 0):
+            ad_logger.debug(
+                f"KV cone {first_kv_compute.name} is AFTER Q anchor {q_users[0].name} "
+                "in graph order — V8 layout invariant violated. Skipping."
+            )
+            continue
+
+        # Pick an MLA-op Q-side input to wrap with wait_aux (stream-level sync;
+        # one call gates the entire aux stream).  Use last input that isn't
+        # in kv_outputs / a buffer.
+        q_inputs_to_mla = [
+            u for u in mla_op.all_input_nodes if u not in kv_outputs and u.op != "get_attr"
+        ]
+        if not q_inputs_to_mla:
+            continue
+        wait_input_for_wait = sorted(q_inputs_to_mla, key=lambda x: node_order.get(x, 0))[-1]
+
+        ad_logger.info(
+            f"Multi-stream MLA pattern 2 (V8, KV-first user code): dsv3={dsv3.name}, "
+            f"narrow_kv={narrow_kv.name}, kv_cone=[{','.join(n.name for n in kv_cone)}], "
+            f"last_kv={last_kv_op.name}, q_for_wait={wait_input_for_wait.name}, "
+            f"mla_op={mla_op.name}"
+        )
+
+        # Step 1: Insert begin_aux just before first_kv_compute, with narrow_kv
+        # as input (semantics: aux waits for main's narrow_kv = dsv3, i.e. only
+        # dsv3 must complete before KV-cone starts on aux).
+        # V8: shared CUDA event (default event_id=-1) — matches the wait_aux below.
+        with graph.inserting_before(first_kv_compute):
+            begin_node = graph.call_function(begin_aux_stream_passthrough, args=(narrow_kv,))
+            begin_node.meta["val"] = narrow_kv.meta.get("val")
+        first_kv_compute.args = tuple(
+            begin_node if a is narrow_kv else a for a in first_kv_compute.args
+        )
+
+        # Step 2: Insert end_aux right after last_kv_op (switch back to main
+        # so Q-cone enqueues on main).
+        with graph.inserting_after(last_kv_op):
+            end_node = graph.call_function(end_aux_stream_passthrough, args=(last_kv_op,))
+            end_node.meta["val"] = last_kv_op.meta.get("val")
+        # Rewire mla_op's reference to last_kv_op → end_node.
+        mla_op.args = tuple(end_node if a is last_kv_op else a for a in mla_op.args)
+
+        # Step 3: Insert wait_aux just before mla_op on the chosen input (single
+        # event wait — gates entire aux stream).
+        with graph.inserting_before(mla_op):
+            wait_node = graph.call_function(
+                wait_aux_stream_passthrough, args=(wait_input_for_wait,)
+            )
+            wait_node.meta["val"] = wait_input_for_wait.meta.get("val")
+        mla_op.args = tuple(wait_node if a is wait_input_for_wait else a for a in mla_op.args)
+
+        num_wrapped += 1
+
+    if num_wrapped > 0:
+        eliminate_dead_code(gm)
+
+    return gm, num_wrapped
+
+
+# ===========================================================================
 # Transform class
 # ===========================================================================
 
@@ -453,9 +717,10 @@ class MultiStreamMLAAttn(BaseTransform):
 
     Pattern 0: Full KV path overlap for unfused Q/KV GEMMs (begin/end aux).
     Pattern 1: Overlaps KV projection linear with Q projection chain (fallback).
+    Pattern 2: Fused-graph (post a-projection fusion) KV-cone overlap.
 
-    Pattern 0 is tried first; if it matches (unfused graph), pattern 1 is skipped.
-    If pattern 0 finds nothing (fused graph), pattern 1 runs as fallback.
+    Pattern 0 is tried first.  If it finds nothing, pattern 2 is tried (handles
+    the post-V4 fused graph).  Pattern 1 is the legacy fallback.
     """
 
     def _apply(
@@ -467,18 +732,28 @@ class MultiStreamMLAAttn(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         cuda_stream_manager.add_device(torch.cuda.current_device())
 
-        # Pattern 0: full KV path on aux (unfused GEMMs)
+        n_unfused = 0
+        n_fused = 0
+        n_proj = 0
+        n_no_ag = 0
+        # Pattern 0: full KV path on aux (unfused GEMMs with AllGather)
         gm, n_unfused = _execute_kv_path_in_aux_stream(gm, shared_config.world_size)
         ad_logger.info(f"Multi-stream MLA pattern 0 (unfused KV path): {n_unfused} matches")
 
-        if n_unfused > 0:
-            total = n_unfused
-        else:
-            # Fallback: Pattern 1 (projection overlap)
-            gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
-            ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
-            total = n_proj
+        if n_unfused == 0:
+            # Pattern 3 (V12): full KV path on aux for unfused GEMMs WITHOUT AllGather
+            gm, n_no_ag = _execute_kv_path_in_aux_stream_no_allgather(gm, shared_config.world_size)
+            ad_logger.info(f"Multi-stream MLA pattern 3 (no-AG full KV path): {n_no_ag} matches")
+            if n_no_ag == 0:
+                # Pattern 2: fused-graph KV-cone overlap (fuse_gemms + op-level dsv3 select).
+                gm, n_fused = _execute_kv_cone_in_aux_stream_fused(gm)
+                ad_logger.info(f"Multi-stream MLA pattern 2 (fused KV cone): {n_fused} matches")
+                if n_fused == 0:
+                    # Pattern 1: legacy projection overlap fallback
+                    gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
+                    ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
 
+        total = n_unfused + n_no_ag + n_fused + n_proj
         info = TransformInfo(
             skipped=False,
             num_matches=total,

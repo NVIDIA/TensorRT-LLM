@@ -328,6 +328,9 @@ transforms:
   cleanup_identity_dtype_cast:
     stage: compile
     enabled: false
+  fuse_moe_allreduce_residual_rmsnorm:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     expect_mem_change: true

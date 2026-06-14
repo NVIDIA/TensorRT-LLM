@@ -36,6 +36,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.mla.rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
+from ...models.custom.mla_rope_utils import is_gptj_layout
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -122,14 +123,12 @@ def _build_rotary_cos_sin_from_buffers(
     if construction fails.
     """
     if is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
-        # torch_rope(q, k, cos, sin, unsqueeze_dim)
+        # NeoX-doubled cos/sin [max_pos, qk_rope_head_dim].
         cos_node = rope_node.args[2]
         sin_node = rope_node.args[3]
         cos_buf = _trace_to_buffer(gm, cos_node)
         sin_buf = _trace_to_buffer(gm, sin_node)
         if cos_buf is not None and sin_buf is not None:
-            # cos_buf/sin_buf are already in NeoX-doubled format
-            # [max_pos, head_dim] where head_dim = qk_rope_head_dim.
             # Stack interleaved [cos_0, sin_0, cos_1, sin_1, ...] as expected
             # by mla_rope_generation.
             result = torch.stack([cos_buf.float(), sin_buf.float()], dim=-1)
@@ -442,6 +441,14 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             ad_logger.info("No torch_mla nodes found; skipping.")
             return gm, TransformInfo(skipped=True, detail="no MLA nodes")
 
+        # Whether MLA RoPE weights are in native GPTJ layout (model skipped the
+        # de-interleave load hook) — if so, _undo_rope_deinterleave must NOT run.
+        try:
+            _model_config, _ = factory._get_model_config()
+            already_gptj = is_gptj_layout(_model_config)
+        except Exception:
+            already_gptj = False
+
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
         if trace_result is None:
@@ -489,9 +496,12 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
 
         # Reverse the NeoX weight de-interleave so projected data arrives in
         # GPTJ layout — matching what mla_rope_generation expects.
-        # The is_neox flag is always True when matching torch_rope_with_explicit_cos_sin
-        # (which uses the NeoX/split-half rotation style).
-        n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        # Skip when the graph was already in GPTJ layout (detected above before
+        # the rope nodes were consumed): those models never de-interleaved.
+        if not already_gptj:
+            n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        else:
+            n_fixed = 0
         ad_logger.info(
             f"Reversed RoPE weight de-interleave on {n_fixed} tensors "
             "(NeoX→GPTJ) for fused decode kernel."
