@@ -2,20 +2,20 @@
 
 set -ex
 
-TRT_VER="10.15.1.29"
+TRT_VER="10.16.1.11"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-02.html#rel-26-02
-CUDA_VER="13.1" # 13.1.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
+CUDA_VER="13.2" # 13.2.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.19.0.56-1"
-NCCL_VER="2.29.2-1+cuda13.1"
-CUBLAS_VER="13.2.1.1-1"
+CUDNN_VER="9.22.0.52-1"
+NCCL_VER="2.30.4-1+cuda13.2"
+CUBLAS_VER="13.4.1.2-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.1.115-1"
-CUDA_RUNTIME="13.1.80-1"
-CUDA_DRIVER_VERSION="590.48.01-1.el8"
+NVRTC_VER="13.2.78-1"
+CUDA_RUNTIME="13.2.75-1"
+CUDA_DRIVER_VERSION="595.58.03-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -63,7 +63,8 @@ install_ubuntu_requirements() {
       apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
     fi
 
-    CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
+    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
     apt-get install -y --no-install-recommends \
@@ -72,16 +73,40 @@ install_ubuntu_requirements() {
         libcudnn9-headers-cuda-13=${CUDNN_VER} \
         libnccl2=${NCCL_VER} \
         libnccl-dev=${NCCL_VER} \
-        libcublas-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
-        libcublas-dev-${CUBLAS_CUDA_VERSION}=${CUBLAS_VER} \
+        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
+        libcublas${CUBLAS_MAJOR_VER}-dev-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
         cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
 
     apt-get clean
     rm -rf /var/lib/apt/lists/*
+
+    # cublas >= 13.4.1.2 installs headers to /usr/include/libcublas/<major>/
+    # instead of /usr/local/cuda/include/. Symlink them back for build compatibility.
+    CUBLAS_HDR_DIR="/usr/include/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_HDR_DIR}" ]; then
+        for hdr in "${CUBLAS_HDR_DIR}"/*.h; do
+            ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
+        done
+    fi
+
+    # cublas >= 13.4.1.2 installs .so files to /usr/lib/<arch>-linux-gnu/libcublas/<major>/
+    # instead of /usr/local/cuda/lib64/. Symlink them so LD_LIBRARY_PATH=/usr/local/cuda/lib64 finds them.
+    ARCH=$(uname -m)
+    CUBLAS_LIB_DIR="/usr/lib/${ARCH}-linux-gnu/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_LIB_DIR}" ]; then
+        for lib in "${CUBLAS_LIB_DIR}"/libcublas*.so*; do
+            [ -e "${lib}" ] || continue
+            target="/usr/local/cuda/lib64/$(basename ${lib})"
+            [ -e "${target}" ] || ln -sf "${lib}" "${target}"
+        done
+    fi
+    ldconfig
 }
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
+    CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
@@ -95,8 +120,8 @@ install_rockylinux_requirements() {
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
-        "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
-        "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
+        "libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}" \
+        "libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}"; do
         wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
@@ -111,13 +136,34 @@ install_rockylinux_requirements() {
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
-        libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
-        libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
+        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm \
+        libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm
 
     # Clean up
     rm -f *.rpm
     dnf clean all
     nvcc --version
+
+    # cublas >= 13.4.1.2 installs headers to /usr/include/libcublas/<major>/
+    # instead of /usr/local/cuda/include/. Symlink them back for build compatibility.
+    CUBLAS_HDR_DIR="/usr/include/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_HDR_DIR}" ]; then
+        for hdr in "${CUBLAS_HDR_DIR}"/*.h; do
+            ln -sf "${hdr}" "/usr/local/cuda/include/$(basename ${hdr})"
+        done
+    fi
+
+    # cublas >= 13.4.1.2 installs .so files to /usr/lib64/libcublas/<major>/
+    # instead of /usr/local/cuda/lib64/. Symlink them so LD_LIBRARY_PATH=/usr/local/cuda/lib64 finds them.
+    CUBLAS_LIB_DIR="/usr/lib64/libcublas/${CUBLAS_MAJOR_VER}"
+    if [ -d "${CUBLAS_LIB_DIR}" ]; then
+        for lib in "${CUBLAS_LIB_DIR}"/libcublas*.so*; do
+            [ -e "${lib}" ] || continue
+            target="/usr/local/cuda/lib64/$(basename ${lib})"
+            [ -e "${target}" ] || ln -sf "${lib}" "${target}"
+        done
+    fi
+    ldconfig
 }
 
 install_tensorrt() {
