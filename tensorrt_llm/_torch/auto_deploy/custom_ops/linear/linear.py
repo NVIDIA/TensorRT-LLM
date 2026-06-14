@@ -87,6 +87,7 @@ def simple(
     # num_tokens > 16, handled inside the op).  Strictly shape+dtype gated.
     if (
         bias is None
+        and input.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and weight.shape[0] == _DSV3_A_FUSED_OUT
         and weight.shape[1] == _DSV3_A_IN
