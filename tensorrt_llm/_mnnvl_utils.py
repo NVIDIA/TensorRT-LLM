@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -182,6 +182,121 @@ class MnnvlMemory:
         cls.current_mem_offset = 0
 
     @classmethod
+    def _dup_remote_fds(cls, comm, all_handles_data, pidfds, remote_fds):
+        """Duplicate POSIX file-descriptor handles from peer processes.
+
+        Tries pidfd_getfd first; falls back to Unix-socket SCM_RIGHTS when
+        the syscall is blocked (e.g. by a container seccomp profile).
+        """
+        import socket
+        import struct
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.syscall
+        syscall.restype = ctypes.c_long
+        SYS_pidfd_open = 434
+        SYS_pidfd_getfd = 438
+
+        # Probe whether pidfd_getfd is usable (may be blocked by seccomp).
+        self_pidfd = syscall(SYS_pidfd_open, os.getpid(), 0)
+        use_pidfd = False
+        if self_pidfd >= 0:
+            probe = syscall(SYS_pidfd_getfd, self_pidfd, self_pidfd, 0)
+            if probe >= 0:
+                os.close(probe)
+                use_pidfd = True
+            os.close(self_pidfd)
+
+        if use_pidfd:
+            # ---- fast path: pidfd_getfd available ----
+            all_pids = comm.allgather(os.getpid())
+            for pid in all_pids:
+                pidfd = syscall(SYS_pidfd_open, pid, 0)
+                if pidfd < 0:
+                    err = ctypes.get_errno()
+                    raise RuntimeError(
+                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                    )
+                pidfds.append(pidfd)
+
+            for pidfd, fd in zip(pidfds, all_handles_data):
+                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                if remote_fd < 0:
+                    err = ctypes.get_errno()
+                    raise RuntimeError(
+                        f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: "
+                        f"{os.strerror(err)}"
+                    )
+                remote_fds.append(remote_fd)
+            return remote_fds
+
+        # ---- fallback: exchange fds via Unix-socket SCM_RIGHTS ----
+        logger.info("pidfd_getfd unavailable; using Unix-socket SCM_RIGHTS for fd exchange")
+        comm_rank = comm.Get_rank()
+        comm_size = comm.Get_size()
+        local_fd = all_handles_data[comm_rank]
+
+        fds = [None] * comm_size
+        fds[comm_rank] = local_fd
+
+        def _send_fd(sock, rank, fd):
+            sock.sendmsg(
+                [struct.pack("i", rank)],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
+            )
+
+        def _recv_fd(sock):
+            cmsg_space = socket.CMSG_SPACE(struct.calcsize("i"))
+            msg, anc, _, _ = sock.recvmsg(4, cmsg_space)
+            peer_rank = struct.unpack("i", msg[:4])[0]
+            for lvl, tp, data in anc:
+                if lvl == socket.SOL_SOCKET and tp == socket.SCM_RIGHTS:
+                    return peer_rank, struct.unpack("i", data[:4])[0]
+            raise RuntimeError("No SCM_RIGHTS ancillary data received")
+
+        sock_path = f"/tmp/.mnnvl_fd_{os.getpid()}"
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(sock_path)
+        server.listen(comm_size)
+        # allgather paths acts as a barrier: all servers are listening before
+        # any rank starts connecting.
+        all_paths = comm.allgather(sock_path)
+
+        try:
+            # Connect to all lower-ranked peers (they are the servers).
+            for r in range(comm_rank):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.connect(all_paths[r])
+                try:
+                    _send_fd(client, comm_rank, local_fd)
+                    _, fds[r] = _recv_fd(client)
+                finally:
+                    client.close()
+
+            # Accept from all higher-ranked peers.
+            for _ in range(comm_size - 1 - comm_rank):
+                conn, _ = server.accept()
+                try:
+                    peer_rank, peer_fd = _recv_fd(conn)
+                    fds[peer_rank] = peer_fd
+                    _send_fd(conn, comm_rank, local_fd)
+                finally:
+                    conn.close()
+        finally:
+            server.close()
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
+        return fds
+
+    @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
         # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
         MnnvlMemory.initialize()
@@ -226,36 +341,12 @@ class MnnvlMemory:
                 all_handles_data = comm.allgather(exported_fabric_handle.data)
             else:
                 all_handles_data = comm.allgather(exported_fabric_handle)
-                all_pids = comm.allgather(os.getpid())
-                libc = ctypes.CDLL(None, use_errno=True)
-                syscall = libc.syscall
-                SYS_pidfd_open = 434
-                SYS_pidfd_getfd = 438
-                for i, pid in enumerate(all_pids):
-                    pidfd = syscall(SYS_pidfd_open, pid, 0)
-                    if pidfd < 0:
-                        err = ctypes.get_errno()
-                        raise RuntimeError(
-                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                        )
-                    pidfds.append(pidfd)
-
-                for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
-                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                        if err == 1:  # EPERM
-                            error_msg += (
-                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                                "to your docker run command."
-                            )
-                        else:
-                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-
-                all_handles_data = remote_fds
+                all_handles_data = cls._dup_remote_fds(
+                    comm,
+                    all_handles_data,
+                    pidfds,
+                    remote_fds,
+                )
         except Exception:
             # Release resources on failure path to avoid leaks; then re-raise.
             if isinstance(exported_fabric_handle, int):
