@@ -662,6 +662,21 @@ class InsertCachedAttention(_InsertCachedOperator):
     """A transform to insert cached attention into the graph module."""
 
 
+@TransformRegistry.register("insert_cached_deepseek_v4_sparse_attention")
+class InsertCachedDeepSeekV4SparseAttention(_InsertCachedOperator):
+    """Opt-in transform for the DeepSeek V4 sparse cached reference backend."""
+
+    def _apply(self, *args, **kwargs):
+        if self.config.backend is None:
+            self.config.backend = "deepseek_v4_sparse"
+        elif self.config.backend != "deepseek_v4_sparse":
+            raise ValueError(
+                "insert_cached_deepseek_v4_sparse_attention only supports "
+                f"backend='deepseek_v4_sparse', got {self.config.backend!r}."
+            )
+        return super()._apply(*args, **kwargs)
+
+
 @TransformRegistry.register("insert_cached_mla_attention")
 class InsertCachedMLAAttention(_InsertCachedOperator):
     """A transform to insert cached MLA attention into the graph module."""

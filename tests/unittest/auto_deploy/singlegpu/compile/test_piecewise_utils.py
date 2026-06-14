@@ -163,6 +163,11 @@ class TestIsDynamicCachedOp:
         assert is_dynamic_cached_op(node) is True
         assert _get_dynamic_op_policy(node) == DynamicOpPolicy.OUT_BUFFER
 
+    def test_known_sparse_attention_op_returns_true(self):
+        target = _FakeOpOverload("auto_deploy::torch_deepseek_v4_sparse_attention_with_cache")
+        node = _make_mock_node("call_function", target=target)
+        assert is_dynamic_cached_op(node) is True
+
     def test_known_ssm_op_returns_true(self):
         target = _FakeOpOverload("auto_deploy::triton_cached_ssm")
         node = _make_mock_node("call_function", target=target)
@@ -387,6 +392,16 @@ class TestStreamSwitchBehavior:
         graph = Graph()
         x = graph.placeholder("x")
         attn_target = _FakeOpOverload("auto_deploy::flashinfer_attention_mha_with_cache")
+        attn = graph.create_node("call_function", attn_target, args=(x,), name="attn")
+        graph.output(attn)
+        gm = GraphModule(nn.Module(), graph)
+        assert needs_out_buffer(gm) is True
+
+    def test_needs_out_buffer_for_sparse_attention(self):
+        """Sparse cached attention follows the dynamic op output-buffer ABI."""
+        graph = Graph()
+        x = graph.placeholder("x")
+        attn_target = _FakeOpOverload("auto_deploy::torch_deepseek_v4_sparse_attention_with_cache")
         attn = graph.create_node("call_function", attn_target, args=(x,), name="attn")
         graph.output(attn)
         gm = GraphModule(nn.Module(), graph)

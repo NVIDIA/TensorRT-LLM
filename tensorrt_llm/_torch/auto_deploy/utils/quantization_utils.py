@@ -115,6 +115,64 @@ def fp8_scale(input: torch.Tensor) -> torch.Tensor:
     return torch.max(torch.abs(input).to(torch.float)) / FP8_MAX
 
 
+def ceil_pow2_scale(amax: torch.Tensor, max_value: float, min_value: float) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(amax.clamp_min(min_value) / max_value)))
+
+
+def fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(-1, dim // block_size, block_size)
+    scale = ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
+    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(-1, dim // block_size, block_size)
+    scale = ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
+    normalized = torch.clamp(grouped / scale, -6.0, 6.0)
+    abs_normalized = normalized.abs()
+    quant_abs = torch.zeros_like(abs_normalized)
+    quant_abs = torch.where(abs_normalized > 0.25, torch.full_like(quant_abs, 0.5), quant_abs)
+    quant_abs = torch.where(abs_normalized > 0.75, torch.full_like(quant_abs, 1.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 1.25, torch.full_like(quant_abs, 1.5), quant_abs)
+    quant_abs = torch.where(abs_normalized > 1.75, torch.full_like(quant_abs, 2.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 2.5, torch.full_like(quant_abs, 3.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 3.5, torch.full_like(quant_abs, 4.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 5.0, torch.full_like(quant_abs, 6.0), quant_abs)
+    quant = quant_abs * normalized.sign()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    dim = x.shape[-1]
+    if dim <= 1:
+        return x
+    if dim & (dim - 1):
+        raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
+
+    out = x.reshape(-1, dim).float()
+    width = 1
+    while width < dim:
+        out = out.reshape(-1, dim // (2 * width), 2, width)
+        left = out[..., 0, :]
+        right = out[..., 1, :]
+        out = torch.cat((left + right, left - right), dim=-1).flatten(-2)
+        width *= 2
+    return (out * (dim**-0.5)).reshape_as(x).to(x.dtype)
+
+
 def is_quantized_graph(gm: GraphModule):
     """Check if the graph is quantized by modelopt."""
     for n in gm.graph.nodes:
