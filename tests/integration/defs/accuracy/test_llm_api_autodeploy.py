@@ -1493,6 +1493,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         "nvidia/Llama-3.1-8B-Instruct-FP8": "meta-llama/Llama-3.1-8B-Instruct",
         "nvidia/Llama-3.1-8B-Instruct-NVFP4":
         "meta-llama/Llama-3.1-8B-Instruct",
+        "nvidia/DeepSeek-R1-0528-NVFP4-v2": "deepseek-ai/DeepSeek-R1-0528",
     }
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
@@ -1541,6 +1542,17 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                 pytest.mark.skip_less_device_memory(120000),
             ),
             id="deepseek-ai_DeepSeek-R1-0528",
+        ),
+        pytest.param(
+            "nvidia/DeepSeek-R1-0528-NVFP4-v2",
+            {},
+            [GSM8K],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="nvidia_DeepSeek-R1-0528-NVFP4-v2",
         ),
     ]
 
