@@ -117,11 +117,24 @@ class A2AController(Controller):
         # 4. Dispatch each requested delegation to the remote agents.
         send_tasks = []
         for tool_call in chat_task.tool_calls:
-            args = json.loads(tool_call.function.arguments)
+            # Models occasionally emit malformed JSON (or a non-object payload)
+            # in the tool-call arguments. Degrade gracefully instead of aborting
+            # the whole controller flow with an unhandled exception.
+            raw_args = tool_call.function.arguments
+            try:
+                parsed_args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                parsed_args = None
+
+            if isinstance(parsed_args, dict):
+                message = parsed_args.get("message", "")
+            else:
+                # Forward the raw text so the remote agent still gets something
+                # actionable rather than an empty request.
+                message = raw_args if isinstance(raw_args, str) else ""
+
             send_tasks.append(
-                A2ASendTask.create_a2a_task(
-                    tool_call.function.name, args.get("message", ""), self.WorkerTag.A2A
-                )
+                A2ASendTask.create_a2a_task(tool_call.function.name, message, self.WorkerTag.A2A)
             )
         yield send_tasks
 
