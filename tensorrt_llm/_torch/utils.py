@@ -453,6 +453,15 @@ def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
 
 
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    """Sentinel activation: GELU with tanh approximation.
+
+    Identity-comparable so MLP can detect this activation and enable the
+    fused gelu_tanh + NVFP4 quant fast path.
+    """
+    return F.gelu(x, approximate="tanh")
+
+
 def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
     # Pass num_elements=-1 will print the whole tensor
     if num_elements < 0:

@@ -1166,6 +1166,51 @@ def _register_fake():
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
 
+    @torch.library.register_fake("trtllm::fused_gelu_tanh_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the FP4 output and SF tensor shapes for ``trtllm::fused_gelu_tanh_quantize``.
+
+        Reports the FP4-packed output shape ``[M, N/2]`` (two FP4 values per
+        uint8 byte) and the swizzled scale-factor tensor shape so that
+        ``torch.compile`` / shape inference can trace through this op
+        without invoking the CUDA kernel.
+        """
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf
+
+    @torch.library.register_fake("trtllm::fused_layernorm_quantize")
+    def _(
+        input: torch.Tensor,
+        ln_weight: Optional[torch.Tensor],
+        ln_bias: Optional[torch.Tensor],
+        scale_msa: Optional[torch.Tensor],
+        shift_msa: Optional[torch.Tensor],
+        sf_scale: torch.Tensor,
+        seq_len_per_batch: int = 1,
+        eps: float = 1e-6,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the FP4 output and SF tensor shapes for ``trtllm::fused_layernorm_quantize``.
+
+        Same output-shape contract as ``fused_gelu_tanh_quantize``: a
+        ``[M, N/2]`` uint8 FP4-packed tensor plus the swizzled scale-factor
+        tensor. The optional ``ln_weight``/``ln_bias`` and
+        ``scale_msa``/``shift_msa`` arguments select between plain LN, affine
+        LN, and AdaLN (modulation) variants of the underlying kernel.
+        """
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf
+
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,

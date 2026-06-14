@@ -74,6 +74,7 @@ add_library(
   ulyssesPermuteScatterOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
+  fusedLayerNormQuant.cpp
   fusedGatedRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp

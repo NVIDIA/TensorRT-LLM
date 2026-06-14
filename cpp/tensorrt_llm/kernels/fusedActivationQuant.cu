@@ -31,21 +31,48 @@ namespace kernels
 
 constexpr int kEltsPerThread = 8;
 
-__device__ __forceinline__ float relu2_f32(float x)
-{
-    float r = fmaxf(0.0f, x);
-    return r * r;
-}
-
-// Fused relu2 + NVFP4 quantization kernel.
+// --- Activation functors -----------------------------------------------------
 //
-// To match the unfused path (PyTorch relu2 -> cvt_warp_fp16_to_fp4), relu2 is
-// computed in f32 then rounded back to native precision (bf16/fp16) before
-// quantization. Absmax and scale-factor math follow cvt_warp_fp16_to_fp4 exactly.
-// Column padding to a multiple of (4 * kSfVecSize) matches quantize_with_block_size
-// for the swizzled SF layout.
-template <typename T>
-__global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float const* __restrict__ sfScale,
+// Each functor must define `static __device__ __forceinline__ float apply(float)`
+// so it can be instantiated into the templated fusedActQuantizeKernel below.
+// Adding a new fused activation = define one functor here + add one explicit
+// instantiation of fusedActQuantizeKernel at the bottom of the file.
+struct Relu2Activation
+{
+    static __device__ __forceinline__ float apply(float x)
+    {
+        float const r = fmaxf(0.0f, x);
+        return r * r;
+    }
+};
+
+// Numerically equivalent to PyTorch's F.gelu(x, approximate="tanh"):
+//   inner = sqrt(2/pi) * (x + 0.044715 * x^3)
+//   out   = 0.5 * x * (1 + tanh(inner))
+struct GeluTanhActivation
+{
+    static __device__ __forceinline__ float apply(float x)
+    {
+        constexpr float kBeta = 0.7978845608028654f;
+        constexpr float kKappa = 0.044715f;
+        float const inner = kBeta * (x + kKappa * x * x * x);
+        return 0.5f * x * (1.0f + tanhf(inner));
+    }
+};
+
+// Fused activation + NVFP4 quantization kernel.
+//
+// To match the unfused path (PyTorch ${Act} -> cvt_warp_fp16_to_fp4), the
+// activation is computed in f32 then rounded back to native precision
+// (bf16/fp16) before quantization. Absmax and scale-factor math follow
+// cvt_warp_fp16_to_fp4 exactly. Column padding to a multiple of
+// (4 * kSfVecSize) matches quantize_with_block_size for the swizzled SF
+// layout. The activation is selected at compile time via the Act template
+// parameter, so the entire NVFP4 epilogue (absmax / shfl / SF swizzle /
+// FP4 packing / padded-column handling) lives in exactly one place; future
+// SF-layout or absmax fixes only need to be applied once.
+template <typename T, typename Act>
+__global__ void fusedActQuantizeKernel(T const* __restrict__ input, float const* __restrict__ sfScale,
     uint32_t* __restrict__ outputFp4, uint32_t* __restrict__ outputSf, int m, int n)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -75,8 +102,8 @@ __global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float cons
 #pragma unroll
             for (int i = 0; i < kPackedPerThread; i++)
             {
-                float f0 = relu2_f32(static_cast<float>(input[inputOffset + i * 2]));
-                float f1 = relu2_f32(static_cast<float>(input[inputOffset + i * 2 + 1]));
+                float f0 = Act::apply(static_cast<float>(input[inputOffset + i * 2]));
+                float f1 = Act::apply(static_cast<float>(input[inputOffset + i * 2 + 1]));
                 if constexpr (std::is_same_v<T, half>)
                 {
                     packedVals[i] = __floats2half2_rn(f0, f1);
@@ -161,17 +188,28 @@ __global__ void fusedRelu2QuantizeKernel(T const* __restrict__ input, float cons
 #endif
 }
 
-template <typename T>
-void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
-    int m, int n, int sfVecSize, cudaStream_t stream)
+// Shared launcher: compute the same threads-per-block as before and dispatch
+// the templated kernel for the requested activation functor. Both relu2 and
+// gelu_tanh launches funnel through here, so the launch geometry stays in
+// lock-step automatically.
+template <typename T, typename Act>
+static void invokeFusedActQuantize(T const* input, float const* sfScale, std::uint8_t* outputFp4,
+    std::uint8_t* outputSf, int m, int n, cudaStream_t stream)
 {
     constexpr int kSfVecSize = 16;
     int const numColThreadsPadded = ((n + 4 * kSfVecSize - 1) / (4 * kSfVecSize)) * (4 * kSfVecSize) / kEltsPerThread;
     int threadsPerBlock = min(512, numColThreadsPadded);
     threadsPerBlock = max(32, ((threadsPerBlock + 31) / 32) * 32);
 
-    fusedRelu2QuantizeKernel<T><<<m, threadsPerBlock, 0, stream>>>(
+    fusedActQuantizeKernel<T, Act><<<m, threadsPerBlock, 0, stream>>>(
         input, sfScale, reinterpret_cast<uint32_t*>(outputFp4), reinterpret_cast<uint32_t*>(outputSf), m, n);
+}
+
+template <typename T>
+void invokeFusedRelu2Quantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int /*sfVecSize*/, cudaStream_t stream)
+{
+    invokeFusedActQuantize<T, Relu2Activation>(input, sfScale, outputFp4, outputSf, m, n, stream);
 }
 
 template void invokeFusedRelu2Quantize<half>(
@@ -179,6 +217,21 @@ template void invokeFusedRelu2Quantize<half>(
 
 #ifdef ENABLE_BF16
 template void invokeFusedRelu2Quantize<__nv_bfloat16>(
+    __nv_bfloat16 const*, float const*, std::uint8_t*, std::uint8_t*, int, int, int, cudaStream_t);
+#endif
+
+template <typename T>
+void invokeFusedGeluTanhQuantize(T const* input, float const* sfScale, std::uint8_t* outputFp4, std::uint8_t* outputSf,
+    int m, int n, int /*sfVecSize*/, cudaStream_t stream)
+{
+    invokeFusedActQuantize<T, GeluTanhActivation>(input, sfScale, outputFp4, outputSf, m, n, stream);
+}
+
+template void invokeFusedGeluTanhQuantize<half>(
+    half const*, float const*, std::uint8_t*, std::uint8_t*, int, int, int, cudaStream_t);
+
+#ifdef ENABLE_BF16
+template void invokeFusedGeluTanhQuantize<__nv_bfloat16>(
     __nv_bfloat16 const*, float const*, std::uint8_t*, std::uint8_t*, int, int, int, cudaStream_t);
 #endif
 
