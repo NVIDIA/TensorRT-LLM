@@ -160,10 +160,13 @@ def _withhold_token_channel(output, streaming: bool) -> None:
     * **streaming** emits per-chunk *diffs* (``token_ids_diff`` /
       ``logprobs_diff``); advancing the diff watermark empties this chunk.
     * **non-streaming** emits the *full* ``token_ids`` / ``logprobs``; these are
-      truncated back to the already-presented prefix, mirroring exactly how the
-      text channel is blanked to ``output.text[:_last_text_len]``. (Outputs
-      accumulate via ``list.extend`` in the hook's single-output scope, so the
-      truncation stays consistent across chunks.)
+      truncated back to the already-*emitted* prefix (the content the hook chose
+      to emit on prior chunks), mirroring exactly how the text channel is blanked
+      to ``output.text[:_last_text_len]``. Outputs accumulate via ``list.extend``
+      in the hook's single-output scope, so the truncation stays consistent
+      across chunks: the result holds exactly the content a streaming client
+      would have received before this ``suppress``/``terminate`` — withholding
+      this chunk, not retroactively the prior ones.
     """
     if streaming:
         output._last_token_ids_len = len(output.token_ids)
