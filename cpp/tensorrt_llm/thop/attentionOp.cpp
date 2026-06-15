@@ -782,6 +782,24 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+            if (cu_q_seqlens.has_value())
+            {
+                TORCH_CHECK(cu_q_seqlens->dim() == 1, "cu_q_seqlens must be a 1-D tensor.");
+                TORCH_CHECK(cu_q_seqlens->is_cuda(), "cu_q_seqlens must be a CUDA tensor.");
+                TORCH_CHECK(cu_q_seqlens->scalar_type() == at::ScalarType::Int, "cu_q_seqlens must be int32.");
+                TORCH_CHECK(
+                    cu_q_seqlens->size(0) >= num_seqs + 1, "cu_q_seqlens must have at least num_seqs + 1 elements.");
+                enqueue_params.cu_q_seqlens = cu_q_seqlens->data_ptr<int32_t>();
+            }
+            if (cu_kv_seqlens.has_value())
+            {
+                TORCH_CHECK(cu_kv_seqlens->dim() == 1, "cu_kv_seqlens must be a 1-D tensor.");
+                TORCH_CHECK(cu_kv_seqlens->is_cuda(), "cu_kv_seqlens must be a CUDA tensor.");
+                TORCH_CHECK(cu_kv_seqlens->scalar_type() == at::ScalarType::Int, "cu_kv_seqlens must be int32.");
+                TORCH_CHECK(
+                    cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
+                enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
+            }
             // Pass V's actual token stride so the FMHA runner handles both
             // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
             // kv.split() view) correctly.
@@ -859,7 +877,17 @@ public:
                 enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask->data_ptr<int32_t>();
                 enqueue_params.spec_decoding_is_generation_length_variable = true;
                 TLLM_CHECK(spec_decoding_position_offsets_for_cpp->dim() == 2); // [batch_size, max_draft_len + 1]
-                enqueue_params.spec_decoding_max_generation_length = spec_decoding_position_offsets_for_cpp->sizes()[1];
+                if (useTllmGen)
+                {
+                    // Blackwell uses the padded packed-mask row dim as the mask stride.
+                    TLLM_CHECK(spec_decoding_packed_mask->dim() == 3);
+                    enqueue_params.spec_decoding_max_generation_length = spec_decoding_packed_mask->sizes()[1];
+                }
+                else
+                {
+                    enqueue_params.spec_decoding_max_generation_length
+                        = spec_decoding_position_offsets_for_cpp->sizes()[1];
+                }
             }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
@@ -965,7 +993,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr)
+    std::optional<int64_t> compressed_kv_cache_pool_ptr, std::optional<int64_t> spec_decoding_target_max_draft_tokens)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1096,6 +1124,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
+    // Include static tree length in the AttentionOp cache key.
+    if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
+    {
+        op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
+    }
 
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttentionPaged = false;

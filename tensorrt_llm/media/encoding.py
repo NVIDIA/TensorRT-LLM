@@ -472,8 +472,10 @@ def save_image(
     """Encode and save an image tensor to disk.
 
     Args:
-        image: Image as ``torch.Tensor`` ``(H, W, C)`` or ``(B, H, W, C)``,
-            dtype ``uint8``. If batched, the first image is saved.
+        image: Image as ``torch.Tensor`` ``(H, W, C)`` or ``(B, H, W, C)``
+            with ``B == 1``, dtype ``uint8``. Batched inputs with
+            ``B > 1`` are rejected — pass a single tensor or use
+            :func:`save_images` with one path per batch item.
         output_path: Output file path (``str`` or :class:`pathlib.Path`).
         format: Image format (``'png'``/``'jpg'``/``'webp'``). If ``None``,
             inferred from the path extension; defaults to PNG when unknown.
@@ -481,11 +483,20 @@ def save_image(
 
     Returns:
         Path string where the image was actually saved.
+
+    Raises:
+        ValueError: When ``image`` is a 4-D tensor with ``B > 1``.
     """
     if isinstance(output_path, Path):
         output_path = str(output_path)
 
     if hasattr(image, "dim") and image.dim() == 4:
+        if image.shape[0] > 1:
+            raise ValueError(
+                f"save_image received a batched tensor of size {image.shape[0]}; "
+                "pass a single (H, W, C) tensor, or use save_images(images, paths) "
+                "with one path per batch item."
+            )
         image = image[0]
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -530,8 +541,10 @@ def save_video(
     """Encode and save a video tensor (with optional audio) to disk.
 
     Args:
-        video: Video as ``torch.Tensor`` ``(T, H, W, C)`` or ``(B, T, H, W, C)``,
-            dtype ``uint8``. If batched, the first video is saved.
+        video: Video as ``torch.Tensor`` ``(T, H, W, C)`` or ``(B, T, H, W, C)``
+            with ``B == 1``, dtype ``uint8``. Batched inputs with
+            ``B > 1`` are rejected — pass a single tensor or use
+            :func:`save_videos` with one path per batch item.
         output_path: Output file path (``str`` or :class:`pathlib.Path`).
         audio: Optional audio tensor; ignored by the pure-Python AVI fallback.
         frame_rate: Frames per second.
@@ -542,10 +555,19 @@ def save_video(
 
     Returns:
         Path string where the video was actually saved.
+
+    Raises:
+        ValueError: When ``video`` is a 5-D tensor with ``B > 1``.
     """
     if isinstance(output_path, Path):
         output_path = str(output_path)
     if hasattr(video, "dim") and video.dim() == 5:
+        if video.shape[0] > 1:
+            raise ValueError(
+                f"save_video received a batched tensor of size {video.shape[0]}; "
+                "pass a single (T, H, W, C) tensor, or use save_videos(videos, paths) "
+                "with one path per batch item."
+            )
         video = video[0]
 
     output_dir = os.path.dirname(output_path)

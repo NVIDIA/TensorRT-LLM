@@ -153,6 +153,12 @@ public:
         int32_t const* helix_position_offsets = nullptr;
         bool const* helix_is_inactive_rank = nullptr;
 
+        // Optional packed-varlen boundaries for context attention. When set,
+        // these describe attention sequences/segments and are used directly by
+        // FMHA instead of the workspace boundaries rebuilt from context_lengths.
+        int32_t const* cu_q_seqlens = nullptr;
+        int32_t const* cu_kv_seqlens = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -211,6 +217,8 @@ public:
             ss << "softmaxStatsPtr: " << this->softmax_stats << std::endl;
             ss << "k_ptr: " << this->k_ptr << std::endl;
             ss << "v_ptr: " << this->v_ptr << std::endl;
+            ss << "cu_q_seqlens: " << this->cu_q_seqlens << std::endl;
+            ss << "cu_kv_seqlens: " << this->cu_kv_seqlens << std::endl;
             return ss.str();
         }
     };
@@ -491,6 +499,8 @@ public:
     bool mIsSpecDecTree = true;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
+    // Static spec-dec tree length used by FMHA autotuning.
+    int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
@@ -559,13 +569,14 @@ public:
             mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
             mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention,
-            mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
-            mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank,
-            mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
-            mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1),
-            mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ,
-            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mIsMLAEnabled, mIsGenerationMLA,
+            mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention,
+            mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
+            mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
+            mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
+            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
+            mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
+            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:

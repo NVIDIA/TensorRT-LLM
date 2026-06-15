@@ -54,6 +54,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm.usage import schema
+from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
+from tensorrt_llm.usage.llmapi_config import (
+    collect_llm_api_config_payloads as _collect_llm_api_config_payloads,
+)
 
 logger = logging.getLogger("tensorrt_llm")
 
@@ -356,6 +360,10 @@ def _extract_trtllm_config(llm_args: Any) -> Dict[str, Any]:
     Returns:
         Dict of config values, with None for unavailable fields.
     """
+    # TODO: Consolidate with llmApiConfigJson, which now captures a near-superset
+    # of these columns (backend, quant_config.quant_algo, MoE parallel sizes).
+    # Blocker is downstream SMS/dashboard migration: dropping them is a breaking
+    # wire-schema change, not a code-only refactor.
     if llm_args is None:
         return {}
 
@@ -460,6 +468,8 @@ def _collect_features(llm_args: Any) -> str:
         Compact JSON string, e.g. '{"lora":false,"speculative_decoding":false,...}'
     """
     features = dict(_FEATURES_DEFAULTS)
+    # TODO: Deduplicate featuresJson with llmApiConfigJson once remaining
+    # derived-only flags have explicit safe fields in LLM API config telemetry.
 
     if llm_args is None:
         return json.dumps(features, separators=(",", ":"))
@@ -590,6 +600,20 @@ def _background_reporter(
         arch_class_name = _extract_architecture_class_name(pretrained_config)
         trtllm_config = _extract_trtllm_config(llm_args)
         features_json = _collect_features(llm_args)
+        try:
+            llm_api_config_json, llm_api_config_meta_json = _collect_llm_api_config_payloads(
+                llm_args
+            )
+        except Exception:
+            # Double net: reporter must not die if collector call breaks.
+            # Intentionally broad -- this is the daemon-thread fail-silent guard;
+            # telemetry must never crash user inference, so anything the narrowed
+            # collector net lets propagate is contained here. Shared failure
+            # payload keeps metadata shape in one place.
+            args_class = type(llm_args).__name__ if llm_args is not None else ""
+            llm_api_config_json, llm_api_config_meta_json = _failure_llm_api_config_payloads(
+                args_class=args_class
+            )
 
         # Disaggregated serving metadata (set by serve.py orchestrator)
         disagg_role = os.environ.get(_DISAGG_ROLE_ENV, "")
@@ -631,6 +655,8 @@ def _background_reporter(
             ingressPoint=_clamp_str(usage_context or "", _S),
             # Feature flags
             featuresJson=features_json,
+            llmApiConfigJson=llm_api_config_json,
+            llmApiConfigMetaJson=llm_api_config_meta_json,
             # Disaggregated serving
             disaggRole=_clamp_str(disagg_role, _S),
             deploymentId=_clamp_str(deployment_id, _S),

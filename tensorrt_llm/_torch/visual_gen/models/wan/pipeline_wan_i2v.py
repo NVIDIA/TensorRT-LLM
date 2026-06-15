@@ -370,7 +370,6 @@ class WanImageToVideoPipeline(BasePipeline):
             is_wan22_14b=self.is_wan22_14b,
             name_or_path=getattr(self.config, "_name_or_path", ""),
             num_heads=getattr(self.config, "num_attention_heads", 40),
-            include_i2v=True,
         )
 
     @property
@@ -417,6 +416,7 @@ class WanImageToVideoPipeline(BasePipeline):
         self,
         image: Union[PIL.Image.Image, torch.Tensor, str],
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         height: int = 480,
         width: int = 832,
@@ -425,7 +425,6 @@ class WanImageToVideoPipeline(BasePipeline):
         guidance_scale: Optional[float] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
-        seed: int = 42,
         max_sequence_length: int = 512,
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
