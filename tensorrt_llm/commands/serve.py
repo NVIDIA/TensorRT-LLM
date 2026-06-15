@@ -563,23 +563,40 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
-    logger.info(f"Initializing VisualGen ({model})")
+    # Reserve the listening (host, port) by binding the socket *before*
+    # constructing the VisualGen pipeline, then hand the bound socket to
+    # uvicorn. VisualGen initialization can take many minutes; if we deferred
+    # the bind until uvicorn started, anything else on the host could grab the
+    # port in that window and trtllm-serve would die at bind() time.
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all(
+        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-    visual_gen_model = VisualGen(model=model, args=visual_gen_args)
+        logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = visual_gen_model.args.parallel_config.n_workers
-    logger.info(f"World size: {n_workers}")
-    logger.info(f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
-    logger.info(
-        f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}")
+        visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-    server = OpenAIServer(generator=visual_gen_model,
-                          model=model,
-                          server_role=ServerRole.VISUAL_GEN,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None)
-    _apply_fastapi_middlewares(server.app, middleware)
-    asyncio.run(server(host, port))
+        n_workers = visual_gen_model.args.parallel_config.n_workers
+        logger.info(f"World size: {n_workers}")
+        logger.info(
+            f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
+        logger.info(
+            f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}"
+        )
+
+        server = OpenAIServer(generator=visual_gen_model,
+                              model=model,
+                              server_role=ServerRole.VISUAL_GEN,
+                              metadata_server_cfg=metadata_server_cfg,
+                              tool_parser=None)
+        _apply_fastapi_middlewares(server.app, middleware)
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 class ChoiceWithAlias(click.Choice):

@@ -226,7 +226,7 @@ def _replay_precompute_kernel(
         other=0.0,
     )
 
-    # Compute raw CB once — shared across all heads in this block
+    # Compute raw CB once, shared across all heads in this block.
     raw_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
     # Store B to cache (once per group, only if this block covers the first heads)
@@ -458,17 +458,18 @@ def _replay_state_update_kernel(
     # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
     # replay leaves `state` unchanged — cache contents don't matter on step 0.
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
-    coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
+    accepted_mask = t_mask & (offs_t < prev_num_accepted_tokens)
+    coeff = tl.where(accepted_mask, coeff, 0.0)
 
-    # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
+    # Zero stale rows beyond PNAT to prevent Inf/NaN from reaching tl.dot.
     old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
     old_x_all = tl.load(
         old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
-        mask=t_mask[:, None] & m_mask[None, :],
+        mask=accepted_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
 
-    # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
+    # Apply the same accepted-row mask to old_B.
     old_B_base = (
         old_B_ptr
         + cache_batch_idx * stride_old_B_cache
@@ -477,7 +478,7 @@ def _replay_state_update_kernel(
     )
     old_B_all = tl.load(
         old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
-        mask=t_mask[:, None] & n_mask[None, :],
+        mask=accepted_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -488,7 +489,7 @@ def _replay_state_update_kernel(
     total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0)
     state *= total_decay
 
-    # tl.dot fast-forward: old_x^T @ dB_scaled → (M, dstate)
+    # tl.dot fast-forward: old_x^T @ dB_scaled -> (M, dstate)
     state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
     # Write post-replay state
@@ -771,7 +772,7 @@ def replay_selective_state_update(
     device = x.device
     BLOCK_SIZE_T = max(triton.next_power_of_2(T), 16)
 
-    # Allocate precomputed intermediates (per-call, not cached)
+    # Allocate precomputed intermediates (per-call, not cached).
     cb_scaled = torch.empty(
         batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_T, device=device, dtype=torch.float32
     )

@@ -748,7 +748,7 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
 }
 
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
-    int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
+    int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -828,8 +828,12 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         }
         else
         {
-            fp8_k_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-            fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+            // Use total_kv_len when available (KV cache reuse causes total_kv_len >> max_num_tokens).
+            // enqueueContext sizes these buffers by total_kv_len, so workspace must match.
+            size_t const kv_buf_tokens = std::max(
+                static_cast<size_t>(total_kv_len), static_cast<size_t>(mChunkPrefillBufferBatchSize) * max_num_tokens);
+            fp8_k_buf_size = kv_buf_tokens * static_cast<size_t>(total_k_dim_all_heads);
+            fp8_v_buf_size = kv_buf_tokens * static_cast<size_t>(total_v_dim_all_heads);
         }
     }
     else if (useSageAttnSeparateQkv)
@@ -1584,8 +1588,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
     // moreover, attn mask for cross attn should be set separately (see below)
     BuildDecoderInfoParams<T> decoder_params{};
+    int32_t const* precomputedCuQSeqlens = params.cu_q_seqlens;
+    int32_t const* precomputedCuKvSeqlens = params.cu_kv_seqlens != nullptr ? params.cu_kv_seqlens
+        : params.cu_q_seqlens != nullptr                                    ? params.cu_q_seqlens
+                                                                            : nullptr;
     decoder_params.seqQOffsets = workspaceViews.cuQSeqlens;
     decoder_params.seqKVOffsets = workspaceViews.cuKvSeqlens;
+    decoder_params.precomputedSeqQOffsets = precomputedCuQSeqlens;
+    decoder_params.precomputedSeqKVOffsets = precomputedCuKvSeqlens;
     decoder_params.seqCpPartialOffsets = workspaceViews.cuCpPartialSeqlens;
     decoder_params.cpSize = mCpSize;
     decoder_params.packedMaskRowOffsets = workspaceViews.cuMaskRows;
@@ -1628,6 +1638,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
     invokeBuildDecoderInfo(decoder_params, stream);
     sync_check_cuda_error(stream);
+
+    int32_t const* contextCuQSeqlens
+        = precomputedCuQSeqlens != nullptr ? precomputedCuQSeqlens : workspaceViews.cuQSeqlens;
+    int32_t const* contextCuKvSeqlens
+        = precomputedCuKvSeqlens != nullptr ? precomputedCuKvSeqlens : workspaceViews.cuKvSeqlens;
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // Override the attention mask produced by invokeBuildDecoderInfo().
@@ -1693,8 +1708,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPreprocess<T>(attention_input, workspaceViews.gatherInBuffer,
-                workspaceViews.gatherOutBuffer, params, workspaceViews.cuQSeqlens, workspaceViews.cuCpPartialSeqlens,
-                stream);
+                workspaceViews.gatherOutBuffer, params, contextCuQSeqlens, workspaceViews.cuCpPartialSeqlens, stream);
             attention_input = workspaceViews.gatherInBuffer;
             sync_check_cuda_error(stream);
         }
@@ -1724,9 +1738,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Indicate if chunked-context is used (i.e. q_seqlen > kv_seqlen).
         preprocessingParams.cache_seq_lens = params.sequence_lengths;
         preprocessingParams.encoder_seq_lens = params.encoder_input_lengths;
-        preprocessingParams.cu_seq_lens = workspaceViews.cuQSeqlens;
+        preprocessingParams.cu_seq_lens = contextCuQSeqlens;
         // Cross-attention only.
-        preprocessingParams.cu_kv_seq_lens = workspaceViews.cuKvSeqlens;
+        preprocessingParams.cu_kv_seq_lens = contextCuKvSeqlens;
         preprocessingParams.rotary_embedding_inv_freq = workspaceViews.rotaryInvFreq;
         preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
@@ -1785,7 +1799,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
             params.mla_param->cache_type = cache_type;
-            params.mla_param->cu_q_seqlens = workspaceViews.cuQSeqlens;
+            params.mla_param->cu_q_seqlens = const_cast<int*>(contextCuQSeqlens);
+            params.mla_param->cu_kv_seqlens = const_cast<int*>(contextCuKvSeqlens);
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
             // Set BMM scales for FP8 context computation
             params.mla_param->bmm1_scale = workspaceViews.fmhaBmm1Scale;
@@ -1973,9 +1988,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fmhaParams.pagedKvCache = kv_cache_buffer;
             fmhaParams.pagedKvSfCache = kv_scale_cache_buffer;
         }
-        fmhaParams.cuQSeqLenPtr = workspaceViews.cuQSeqlens;
+        fmhaParams.cuQSeqLenPtr = contextCuQSeqlens;
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
-        fmhaParams.cuKvSeqLenPtr = workspaceViews.cuKvSeqlens;
+        fmhaParams.cuKvSeqLenPtr = contextCuKvSeqlens;
         fmhaParams.cuMaskRowsPtr = workspaceViews.cuMaskRows;
         fmhaParams.tileCounterPtr = workspaceViews.fmhaTileCounter;
         fmhaParams.scaleBmm1Ptr = workspaceViews.fmhaBmm1Scale;
@@ -2023,8 +2038,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPostprocess<T>(workspaceViews.gatherOutBuffer,
-                reinterpret_cast<T*>(params.context_buf), workspaceViews.gatherInBuffer, params,
-                workspaceViews.cuQSeqlens, workspaceViews.cuCpPartialSeqlens, stream);
+                reinterpret_cast<T*>(params.context_buf), workspaceViews.gatherInBuffer, params, contextCuQSeqlens,
+                workspaceViews.cuCpPartialSeqlens, stream);
             sync_check_cuda_error(stream);
         }
 
@@ -3157,6 +3172,7 @@ int AttentionOp::initialize() noexcept
         fixedParams.isSpecDecoding = mIsSpecDecodingEnabled;
         fixedParams.hasAlibi = isALiBi();
         fixedParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
+        fixedParams.specDecodingTargetMaxGenLen = mSpecDecodingTargetMaxGenLen;
 
         mXqaDispatcher.reset(new XqaDispatcher(fixedParams));
 

@@ -533,9 +533,12 @@ class GenerationResultBase:
             # can prepend them.
             if (context_phase_params is not None
                     and self._disaggregated_params is not None):
-                first_gen_lp = [
-                    out.logprobs[0] for out in self._outputs if out.logprobs
-                ]
+                first_gen_lp = getattr(response_result, "first_gen_log_probs",
+                                       None)
+                if first_gen_lp is None:
+                    first_gen_lp = [
+                        out.logprobs[0] for out in self._outputs if out.logprobs
+                    ]
                 if first_gen_lp:
                     self._disaggregated_params.first_gen_log_probs = \
                         first_gen_lp

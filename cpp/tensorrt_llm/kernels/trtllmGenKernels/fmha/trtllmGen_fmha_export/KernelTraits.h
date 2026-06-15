@@ -262,11 +262,6 @@ struct KernelConfig : public KernelConfigBase {
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
         TLLM_CHECK_ERROR(options.mSeparateSmemKv, "Not supported");
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
-#ifdef TLLM_RUBIN_FEATURES
-        if (tg::isArchRubin(options.mCudaArch)) {
-          mNumStagesKv = int32_t{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
-        }
-#endif // TLLM_RUBIN_FEATURES
       } else if (keepsMmaAbForDsMlaGen) {
         // For DS MLA-generation kernels with keepsMmaAb, allocate at most 112 KiB shared memory for
         // 2-CTA mode and 128 KiB shared memory for 1-CTA mode. This preserves the previous stage
@@ -1051,7 +1046,7 @@ inline KernelTraits getKernelTraitsFromOptions(FmhaOptions_ const& options) {
 // [...................................FullTmem.....................................................]
 // [.......TmemS0........][.......TmemS1........][TmemP0][TmemP1][.....TmemO0.....][.....TmemO1.....]
 // [TmemStat0]            [TmemStat1]
-// 
+//
 // If mSeparateTmemColsForSAndP and mSeparateTmemColsForSAndStats are both true:
 // [...................................FullTmem.....................................................]
 // [..TmemS0..][..TmemS1..][TmemStat0][TmemStat1][..TmemP0..][..TmemP1..][...TmemO0...][...TmemO1...]
@@ -1216,9 +1211,9 @@ inline int32_t getTmemAllocationTransformedKv(KernelTraits traits) {
 // different rows (across the rows is only supported when tileSizeQ = 64).
 // clang-format off
 // Layout example:
-// stage0: [row0,  col0-127] 
-// stage1: [row0,  col128-255] 
-// stage2: [row16, col0-127] 
+// stage0: [row0,  col0-127]
+// stage1: [row0,  col128-255]
+// stage2: [row16, col0-127]
 // stage3: [row16, col128-255]
 // clang-format on
 
