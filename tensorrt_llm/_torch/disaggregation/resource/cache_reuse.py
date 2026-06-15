@@ -144,10 +144,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
             return
-        kv_cache = self._mgr.kv_cache_map.get(req.py_request_id)
-        if kv_cache is None:
-            return
-        self._mgr.try_commit_blocks_for_reuse(req, kv_cache)
+        self._mgr.try_commit_blocks(req)
 
 
 def create_cache_reuse_adapter(
