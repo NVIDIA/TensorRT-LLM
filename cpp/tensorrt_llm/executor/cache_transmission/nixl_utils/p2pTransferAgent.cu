@@ -339,10 +339,22 @@ std::optional<P2pMemInfo> P2pMemInfo::deserialize(std::string_view data)
 
     uint8_t handleTypeVal;
     iss.read(reinterpret_cast<char*>(&handleTypeVal), sizeof(handleTypeVal));
-    info.handleType = static_cast<VmmHandleType>(handleTypeVal);
+    switch (static_cast<VmmHandleType>(handleTypeVal))
+    {
+    case VmmHandleType::kNone:
+    case VmmHandleType::kFabric:
+    case VmmHandleType::kPosixFd:
+    case VmmHandleType::kCudaIpc: info.handleType = static_cast<VmmHandleType>(handleTypeVal); break;
+    default: return std::nullopt;
+    }
 
     uint32_t udsPathLen;
     iss.read(reinterpret_cast<char*>(&udsPathLen), sizeof(udsPathLen));
+    constexpr uint32_t kMaxUdsPathLen = sizeof(sockaddr_un::sun_path) - 1;
+    if (udsPathLen > kMaxUdsPathLen)
+    {
+        return std::nullopt;
+    }
     if (udsPathLen > 0)
     {
         info.udsPath.resize(udsPathLen);
@@ -1160,6 +1172,9 @@ void P2pHandleExporter::removeHandles(RegisterDescs const& descs)
         if (noPoolsLeft)
         {
             mLocalInfo.supported = false;
+            mLocalInfo.handleType = VmmHandleType::kNone;
+            mLocalInfo.udsPath.clear();
+            mDetectedHandleType = VmmHandleType::kNone;
             TLLM_LOG_INFO("P2pTransfer: all pools removed, disabled");
         }
         else
@@ -2030,7 +2045,9 @@ P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
     // Context when the calling thread terminates. weak_from_this() is safe here because
     // the public factory `create()` always wraps the object in a shared_ptr.
     auto& guardSlot = tlsExitGuards[this];
-    if (!guardSlot)
+    // Recreate the guard if missing or if its weakPool is expired (the previous pool that
+    // lived at this address has been destroyed and a new one reused the slot).
+    if (!guardSlot || guardSlot->weakPool.expired())
     {
         auto guard = std::make_unique<PoolThreadExitGuard>();
         guard->weakPool = weak_from_this();

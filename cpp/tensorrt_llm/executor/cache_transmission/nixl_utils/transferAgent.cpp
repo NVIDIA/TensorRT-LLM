@@ -776,6 +776,9 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         NVTX3_SCOPED_RANGE(postXferReq);
         status = mRawAgent->postXferReq(handle, &localParams);
     }
+    TLLM_CHECK_WITH_INFO(status == NIXL_IN_PROG || status == NIXL_SUCCESS,
+        " rank: %d postXferReq failed with status: %s selfname: %s remoteAgent name: %s",
+        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(), remoteName.c_str());
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
 }
 

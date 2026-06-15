@@ -49,9 +49,11 @@ endif()
 if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
   add_gtest(agentCommTest agentCommTest.cpp)
   add_gtest(transferAgentTest transferAgentTest.cpp)
-  add_gtest(p2pMemInfoTest p2pMemInfoTest.cu)
-  add_gtest(p2pTransferAgentTest p2pTransferAgentTest.cu)
   if(NIXL_ROOT)
+    # The P2P-specific tests rely on the NIXL wrapper, so they are gated on
+    # NIXL_ROOT and live inside this branch alongside their link configuration.
+    add_gtest(p2pMemInfoTest p2pMemInfoTest.cu)
+    add_gtest(p2pTransferAgentTest p2pTransferAgentTest.cu)
     target_link_libraries(p2pMemInfoTest PRIVATE tensorrt_llm_nixl_wrapper)
     target_link_libraries(p2pTransferAgentTest PRIVATE tensorrt_llm_nixl_wrapper
                                                        CUDA::cudart)
