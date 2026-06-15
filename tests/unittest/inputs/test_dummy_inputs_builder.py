@@ -2,10 +2,12 @@
 
 Verifies the default behaviors that subclasses inherit:
 
-* ``get_size_with_most_features`` raises ``NotImplementedError`` so
-  subclasses must opt into deterministic dummy sizing explicitly.
-* ``get_dummy_prompt`` catches that ``NotImplementedError`` and returns
-  ``None`` so ``_create_dummy_mm_context_request`` falls back to text-only.
+* ``get_mm_max_tokens_per_item`` returns ``{}`` and
+  ``get_dummy_mm_data_for_tokens`` raises ``NotImplementedError`` — the two
+  modality-agnostic profiler hooks default to "no direct profiling for this
+  model" (text-only dummy fallback) until a subclass opts in. Modality-specific
+  helpers (e.g. vision's ``get_size_for_max_tokens`` /
+  ``get_dummy_mm_data_for_size``) live on the concrete processor, not this base.
 
 Note: ``get_num_mm_tokens`` and ``spatial_merge_unit`` live on
 :class:`BaseMultimodalInputProcessor` — see
@@ -39,23 +41,11 @@ class _StubBuilder(BaseMultimodalDummyInputsBuilder):
         return ""
 
 
-def test_get_size_with_most_features_default_raises_not_implemented():
+def test_get_mm_max_tokens_per_item_default_empty():
+    assert _StubBuilder().get_mm_max_tokens_per_item() == {}
+
+
+def test_get_dummy_mm_data_for_tokens_default_raises_not_implemented():
     builder = _StubBuilder()
     with pytest.raises(NotImplementedError):
-        builder.get_size_with_most_features(max_tokens=1024)
-
-
-def test_get_dummy_prompt_returns_none_when_subclass_did_not_implement():
-    """``get_dummy_prompt`` returns ``None`` for non-migrated subclasses.
-
-    Caller falls back to a text-only dummy rather than seeing an unhandled
-    exception or an iterative halving probe.
-    """
-    builder = _StubBuilder()
-    assert builder.get_dummy_prompt(input_seq_len=512) is None
-
-
-def test_get_dummy_prompt_returns_none_for_non_positive_seq_len():
-    builder = _StubBuilder()
-    assert builder.get_dummy_prompt(input_seq_len=0) is None
-    assert builder.get_dummy_prompt(input_seq_len=-1) is None
+        builder.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"image": 1024})

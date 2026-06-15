@@ -1,5 +1,4 @@
 import enum
-import random
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -11,8 +10,6 @@ from PIL import Image
 from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
-
-import tensorrt_llm
 
 from .._utils import nvtx_range_debug
 from ..logger import logger
@@ -494,9 +491,10 @@ class BaseMultimodalInputProcessor(ABC):
     # ``get_num_mm_tokens`` is the single source of truth for the
     # input-size → token-count mapping. Two consumer paths share it:
     #
-    #   * Dummy sizing (BaseMultimodalDummyInputsBuilder.get_dummy_prompt):
-    #       uses pre-merger tokens directly to size the encoder workspace
-    #       against ``encoder_max_num_tokens``.
+    #   * Vision dummy sizing (the size trio on the concrete processor, e.g.
+    #       Qwen-VL's ``get_size_for_max_tokens`` / ``get_dummy_mm_data_for_size``
+    #       behind ``get_dummy_mm_data_for_tokens``): uses pre-merger tokens
+    #       directly to size the encoder workspace against ``encoder_max_num_tokens``.
     #   * Prompt-side hashing (get_num_tokens_per_image / _video):
     #       divides by ``spatial_merge_unit`` to get the placeholder count
     #       the prompt will carry.
@@ -632,23 +630,27 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """Build deterministic dummy multimodal inputs for profiling.
+    """Build deterministic dummy multimodal inputs for KV-cache profiling.
 
-    Subclasses provide the model-specific math relating image/video size to
-    encoder attention tokens (via :meth:`BaseMultimodalInputProcessor.get_num_mm_tokens`,
-    which concrete classes inherit alongside this mixin), and this base
-    class composes that math into a dummy prompt sized exactly to the
-    caller's budget. Token unit is **encoder attention** (pre-merger),
-    matching ``encoder_max_num_tokens`` and
-    ``AttentionMetadata.max_num_tokens``. Callers expressing budgets in
-    LLM-visible (post-merger) units convert via ``spatial_merge_unit`` at
-    the boundary.
+    Modality-agnostic: a model declares the per-item token demand of each
+    modality it encodes via :meth:`get_mm_max_tokens_per_item`, and materializes
+    the worst-case dummy for a per-modality token budget via
+    :meth:`get_dummy_mm_data_for_tokens`. The profiler splits the shared
+    ``encoder_max_num_tokens`` budget across modalities in proportion to that
+    demand, so they share one encoder microbatch cap rather than each claiming
+    the whole budget. Every modality-specific decision (size inversion, item
+    count, tensor layout) lives in the concrete implementation, so vision
+    (size-based), audio (duration/frame-based), and mixed image+video+audio
+    processors all satisfy the same contract without leaking ``width``/``height``
+    into this base.
+
+    Token unit is **encoder attention** (pre-merger), matching
+    ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
 
     Note: ``get_num_mm_tokens`` and ``spatial_merge_unit`` live on
-    :class:`BaseMultimodalInputProcessor` so the hashing path
-    (``get_num_tokens_per_image``) and the dummy path can share a single
-    source of truth — all concrete multimodal processors inherit from both
-    mixins.
+    :class:`BaseMultimodalInputProcessor` (shared with the hashing path
+    ``get_num_tokens_per_image`` / ``..._video`` / ``..._audio``); a concrete
+    multimodal processor inherits from both mixins.
     """
 
     def __init__(self, **kwargs):
@@ -669,80 +671,50 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     def model_path(self) -> str:
         ...
 
-    def get_size_with_most_features(
+    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
+        """Per-modality encoder-attention tokens of the single worst-case item.
+
+        Keyed by modality — e.g. ``{"image": 16384}`` for a vision-only model or
+        ``{"image": 16384, "audio": 1500}`` for a mixed one. The keys enumerate
+        the modalities this model runs through its encoder(s); the values weight
+        how the profiler splits the shared encoder budget across them. (Qwen-VL
+        declares only ``"image"``: image and video share one ViT, so the image
+        worst case already covers the vision encoder.)
+
+        Default ``{}`` → no direct encoder profiling (text-only dummy fallback);
+        a model opts in by overriding this together with
+        :meth:`get_dummy_mm_data_for_tokens`.
+        """
+        return {}
+
+    def get_dummy_mm_data_for_tokens(
         self,
         *,
-        max_tokens: int,
-    ) -> Dict[str, int]:
-        """Inverse of :meth:`get_num_mm_tokens`.
+        max_tokens_per_modality: Dict[str, int],
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, Any]:
+        """Build the worst-case dummy ``multimodal_data`` per modality budget.
 
-        Returns ``{'width', 'height', 'num_frames'}`` selecting the largest
-        media size whose attention-token count is ``<= max_tokens`` while
-        keeping the aspect ratio bounded. ``max_tokens`` is in pre-merger
-        units (same as ``get_num_mm_tokens``).
+        The modality-agnostic entry the KV-cache encoder profiler calls, sizing
+        each modality to saturate its share of the token budget.
 
-        Default raises ``NotImplementedError`` matching
-        :meth:`get_num_mm_tokens`.
+        ``max_tokens_per_modality`` maps each modality from
+        :meth:`get_mm_max_tokens_per_item` to its share of the (shared)
+        ``encoder_max_num_tokens`` budget. The implementation owns every
+        modality-specific choice: a vision processor inverts the budget to a
+        media size and materializes ``pixel_values`` / ``grid_thw``; an audio
+        processor sizes mel frames from its own duration math. Each modality's
+        tensors are built directly (no PIL image / HF-processor round-trip — only
+        their *shape* matters for memory profiling) and **merged into one**
+        ``multimodal_data`` dict so a single ``encode_multimodal_inputs`` forward
+        profiles the combined peak.
+
+        Returns the ``multimodal_data`` dict the model's encoder consumes (e.g.
+        ``{"image": {"pixel_values": ..., "image_grid_thw": ...}}`` for Qwen-VL).
+        Default raises ``NotImplementedError``; the profiler treats that as "no
+        direct profiling for this model" and falls back to a text-only dummy.
         """
         raise NotImplementedError
-
-    def get_dummy_image(self, *, width: int, height: int) -> Image.Image:
-        return Image.new("RGB", (width, height), color=random.randint(0, 256))
-
-    def get_dummy_prompt(self, input_seq_len: int):
-        """Build a multimodal prompt that fits ``input_seq_len`` LLM tokens.
-
-        ``input_seq_len`` is in LLM-visible (post-merger) units. The encoder
-        budget that produces this many LLM tokens is
-        ``input_seq_len * spatial_merge_unit``; that's the value handed to
-        :meth:`get_size_with_most_features`, which deterministically picks
-        the dummy image dimensions in one shot — no iterative halving.
-        """
-        if input_seq_len <= 0:
-            return None
-
-        # ``spatial_merge_unit`` lives on BaseMultimodalInputProcessor; all
-        # concrete classes inherit from both mixins so the attribute is always
-        # available in production. ``getattr`` with default 1 keeps standalone
-        # uses (e.g. unit tests) from crashing on no-merger setups.
-        spatial_merge_unit = getattr(self, "spatial_merge_unit", 1)
-        encoder_budget = input_seq_len * spatial_merge_unit
-        try:
-            size = self.get_size_with_most_features(max_tokens=encoder_budget)
-        except NotImplementedError:
-            # Model hasn't opted into deterministic dummy sizing yet.
-            # Returning None makes the caller (_create_dummy_mm_context_request)
-            # fall back to a text-only dummy with a warning. Migrating the model
-            # by implementing `get_num_mm_tokens` / `get_size_with_most_features`
-            # re-enables encoder workspace pre-allocation in KV cache profiling.
-            logger.debug(
-                f"[get_dummy_prompt] {type(self).__name__} has not implemented "
-                f"deterministic dummy sizing; falling back to text-only dummy.")
-            return None
-
-        image = self.get_dummy_image(width=size["width"], height=size["height"])
-
-        # Use the registered model_type from the decorator if available,
-        # otherwise fall back to HuggingFace config's model_type.
-        # This ensures consistency between placeholder registration and lookup.
-        registered_model_type = getattr(self.__class__,
-                                        '_registered_model_type', None)
-        config_model_type = self.config.model_type
-        model_type = registered_model_type or config_model_type
-
-        logger.debug(
-            f"[get_dummy_prompt] registered_model_type={registered_model_type}, "
-            f"config.model_type={config_model_type}, using model_type={model_type}"
-        )
-
-        return tensorrt_llm.inputs.utils.default_multimodal_input_loader(
-            tokenizer=self.tokenizer,
-            model_dir=self.model_path,
-            model_type=model_type,
-            modality="image",
-            prompts=[""],
-            media=[[image]],
-            image_data_format="pt")[0]
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
@@ -945,6 +917,7 @@ def register_input_processor(
         placeholder_metadata: MultimodalPlaceholderMetadata = None):
     """
     Register an input processor to a model class.
+
     NOTE:
         1. Since this API is only used for multimodal models, we are checking
            the model type only for that.
@@ -963,7 +936,8 @@ def register_input_processor(
         MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
             model_type, placeholder_metadata)
 
-        # Store model_type on processor class for use in get_dummy_prompt
+        # Expose the registered model_type on the processor class so callers
+        # can look it up without re-deriving it from the HF config.
         processor_cls._registered_model_type = model_type
 
         return model_cls

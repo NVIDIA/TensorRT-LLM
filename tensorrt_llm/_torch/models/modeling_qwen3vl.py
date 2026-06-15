@@ -2,7 +2,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import math
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -45,7 +44,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import MultimodalEncoderOutput, MultimodalModelMixin
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
@@ -204,105 +203,10 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # ``tokens_per_second`` scaling).
         return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
 
-    # ------------------------------------------------------------------
-    # Deterministic dummy-input sizing for multimodal profiling.
-    #
-    # `get_num_mm_tokens` / `get_size_with_most_features` are the encoder-
-    # side counterpart to the LLM's `max_num_tokens`: they report (and
-    # invert) the exact number of attention tokens the vision encoder will
-    # process for a given input size. The unit is **pre-merger patches** so
-    # that values are directly comparable with ``encoder_max_num_tokens``
-    # and ``AttentionMetadata.max_num_tokens``. Callers working in
-    # LLM-visible (post-merger) units multiply/divide by
-    # ``spatial_merge_unit`` at the boundary.
-    # ------------------------------------------------------------------
-    @property
-    def spatial_merge_unit(self) -> int:
-        """Encoder→LLM token ratio. Qwen3-VL applies a ``merge_size`` × ``merge_size`` spatial merger."""
-        merge_size = self.config.vision_config.spatial_merge_size
-        return merge_size * merge_size
-
-    def get_num_mm_tokens(
-        self,
-        *,
-        width: int,
-        height: int,
-        num_frames: int = 1,
-    ) -> int:
-        """Return the encoder attention tokens (pre-merger) that result from
-        an image/video of the given pixel dimensions.
-
-        Mirrors HF Qwen3-VL's ``smart_resize`` + patchify: ``(width, height)``
-        is rounded to a multiple of ``patch_size * spatial_merge_size`` and
-        then divided into ``patch_size``-sized patches. The result equals
-        the number of tokens the encoder will run attention over for one
-        atomic forward.
-        """
-        cfg = self.config.vision_config
-        patch_size = cfg.patch_size
-        merge_size = cfg.spatial_merge_size
-        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
-        factor = patch_size * merge_size
-
-        # Round half-up to the nearest multiple of ``factor`` (matches the
-        # smart_resize grid the HF Qwen-VL processor uses).
-        resized_w = max(((width + factor // 2) // factor) * factor, factor)
-        resized_h = max(((height + factor // 2) // factor) * factor, factor)
-        grid_h = resized_h // patch_size
-        grid_w = resized_w // patch_size
-
-        padded_frames = (
-            (num_frames + temporal_patch_size - 1) // temporal_patch_size
-        ) * temporal_patch_size
-        grid_t = max(padded_frames // temporal_patch_size, 1)
-
-        return grid_t * grid_h * grid_w
-
-    def get_size_with_most_features(
-        self,
-        *,
-        max_tokens: int,
-    ) -> Dict[str, int]:
-        """Invert ``get_num_mm_tokens``: pick the ``(width, height)`` whose
-        attention-token count is the largest value ≤ ``max_tokens`` while
-        keeping the aspect ratio bounded.
-
-        ``max_tokens`` is in the same unit as ``get_num_mm_tokens`` /
-        ``encoder_max_num_tokens`` (pre-merger). Single image (``num_frames=1``)
-        for now; callers needing video can compose with the temporal dim.
-        """
-        if max_tokens <= 0:
-            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
-
-        def closest_factor_pair(n: int) -> Tuple[int, int]:
-            """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
-            for d in range(math.isqrt(n), 0, -1):
-                if n % d == 0:
-                    return d, n // d
-            return 1, n
-
-        cfg = self.config.vision_config
-        patch_size = cfg.patch_size
-        merge_size = cfg.spatial_merge_size
-        unit = patch_size * merge_size
-
-        # Pre-merger tokens factor into (grid_h * grid_w) and each grid
-        # dimension is ``merge_size`` × the post-merger factor. Searching in
-        # post-merger units bounds the inner loop and lets us reuse the
-        # familiar near-square factor pair for aspect ratio bounds.
-        post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
-        h_factor, w_factor = closest_factor_pair(post_merger_budget)
-        for seq_len in range(post_merger_budget, 0, -1):
-            h_f, w_f = closest_factor_pair(seq_len)
-            if w_f / max(h_f, 1) <= 200:
-                h_factor, w_factor = h_f, w_f
-                break
-
-        return {
-            "width": unit * w_factor,
-            "height": unit * h_factor,
-            "num_frames": 1,
-        }
+    # Deterministic dummy-input sizing (`spatial_merge_unit`,
+    # `get_num_mm_tokens`, `get_size_for_max_tokens`) is inherited
+    # unchanged from `Qwen2VLInputProcessorBase` -- the grid math and the HF
+    # `smart_resize` it defers to are identical for Qwen3-VL.
 
     @classmethod
     def get_rope_index(
@@ -805,22 +709,39 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
         self.attn_metadata: Optional[AttentionMetadata] = None
 
-        # Pre-allocated `arange` for the vision block's
-        # `rope_position_ids`; per-call code just slices `[:seq_len]`
-        # instead of allocating a fresh `(seq_len,) int32` + H->D copy.
-        # TODO: Make capacity dynamic with the encoder's `max_num_tokens`.
-        self.register_buffer(
-            "_rope_position_ids_buffer",
-            torch.arange(32768, dtype=torch.int32, device="cuda"),
-            persistent=False,
-        )
+        # Pre-allocated `arange` for the vision block's `rope_position_ids`;
+        # per-call code just slices `[:seq_len]` instead of allocating a fresh
+        # `(seq_len,) int32` + H->D copy. Sized by `setup_attn_metadata` to the
+        # encoder's `max_num_tokens` (engine-driven); `forward` grows it on the
+        # rare miss above the budget.
+        self.register_buffer("_rope_position_ids_buffer", None, persistent=False)
 
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        merge_size = self.spatial_merge_size
+    def setup_attn_metadata(self, max_num_requests: int, max_num_tokens: int) -> None:
+        # Override the mixin default: each image / video frame is its own
+        # attention segment (``seq_lens.extend([h * w] * t)`` in ``forward``),
+        # so a single multi-image or video request can produce many more
+        # segments than ``max_batch_size``. The number of segments in one
+        # encoder forward is bounded by the token budget (every segment holds
+        # at least one token), NOT by the request count -- so floor the
+        # metadata's request capacity at ``max_num_tokens`` to keep the
+        # per-request buffers (prompt_lens / host_request_types / kv_lens) from
+        # overflowing when ``num_contexts`` is set to the segment count.
+        max_num_requests = max(max_num_requests, max_num_tokens)
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+        # Size the vision-block ``rope_position_ids`` scratch to the encoder
+        # token budget; ``forward`` still grows it on the rare miss (e.g. packed
+        # multi-video batches above the budget).
+        self._rope_position_ids_buffer = torch.arange(
+            max_num_tokens, dtype=torch.int32, device=self.device
+        )
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -942,10 +863,12 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         attn_metadata: Optional[AttentionMetadata] = None,
     ):
         if attn_metadata is None:
-            attn_metadata = self.metadata_cls(
-                max_num_requests=8192,  # TODO: Make this dynamic
-                max_num_tokens=8192,  # TODO: Make this dynamic
-                kv_cache_manager=None,
+            raise RuntimeError(
+                "Vision encoder AttentionMetadata is not initialized. "
+                "`setup_attn_metadata` (engine-driven via "
+                "`_set_up_multimodal_encoder_attn_metadata`, or called "
+                "explicitly in standalone tests) must run before the encoder "
+                "forward."
             )
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
@@ -978,7 +901,10 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         # the gate clears when `head_dim % 64 == 0`. Keep the pre-allocated
         # buffer large enough for packed multi-video batches.
         seq_len = hidden_states.shape[0]
-        if seq_len > self._rope_position_ids_buffer.numel():
+        if (
+            self._rope_position_ids_buffer is None
+            or seq_len > self._rope_position_ids_buffer.numel()
+        ):
             self._rope_position_ids_buffer = torch.arange(
                 seq_len, dtype=torch.int32, device=self.device
             )
@@ -1140,7 +1066,23 @@ class Qwen3VisionModelBase(nn.Module):
         return embeds
 
 
-class Qwen3VLModelBase(PreTrainedModel):
+class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    def encode_multimodal_inputs(
+        self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
+    ) -> MultimodalEncoderOutput:
+        """Uniform encoder entry (``MultimodalModelMixin`` contract).
+
+        Runs the vision encoder over ``multimodal_params`` and returns the
+        embeddings as a single tensor (Qwen3-VL folds deepstack streams into
+        the hidden dim, so the single-tensor contract holds). Used by the
+        startup memory profiler to invoke the encoder directly; the model's
+        own ``forward`` keeps its custom deepstack fusion path.
+        """
+        mm_embeds = get_multimodal_embeddings(
+            encoder_forward_fn=self.mm_encoder.forward, multimodal_params=list(multimodal_params)
+        )
+        return MultimodalEncoderOutput(embeddings=mm_embeds[0])
+
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.
 
@@ -1241,7 +1183,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         if self.use_deepstack:
             # Pre-allocated `(L, max_num_tokens, hidden)` scratch buffer for
             # per-layer deepstack embeddings; replaces `L` fresh
-            # `torch.zeros` + `L` scatters per prefill (vLLM-style).
+            # `torch.zeros` + `L` scatters per prefill.
             # `persistent=False` keeps it out of `state_dict`.
             self.register_buffer(
                 "deepstack_input_embeds",
