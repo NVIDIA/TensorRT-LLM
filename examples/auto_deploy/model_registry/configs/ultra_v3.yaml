@@ -23,7 +23,7 @@ kv_cache_config:
 transforms:
   detect_sharding:
     enable_attention_dp: false
-    allreduce_strategy: SYMM_MEM
+    allreduce_strategy: NCCL
     sharding_dims: [ep, bmm, tp]
     sharding_source: [manual]
     manual_config:
@@ -37,8 +37,6 @@ transforms:
         o_proj: rowwise
         up_proj: colwise
         down_proj: rowwise
-        fc1_latent_proj: gather
-        fc2_latent_proj: gather
   gather_logits_before_lm_head:
     enabled: true
   multi_stream_moe:
