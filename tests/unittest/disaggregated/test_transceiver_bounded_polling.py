@@ -200,6 +200,16 @@ def test_tx_session_wait_complete_nonblocking_returns_none_without_waiting() -> 
     assert task.wait_calls == []
 
 
+def test_tx_session_wait_complete_nonblocking_reports_later_task_error() -> None:
+    pending_task = _FakeTask(TaskStatus.TRANSFERRING)
+    failed_task = _FakeTask(TaskStatus.ERROR)
+    session = _make_tx_session([pending_task, failed_task])
+
+    assert session.wait_complete(blocking=False) == WaitResult.FAILED
+    assert pending_task.wait_calls == []
+    assert failed_task.wait_calls == []
+
+
 def test_tx_session_has_failed_reports_task_error() -> None:
     task = _FakeTask(TaskStatus.ERROR)
     session = _make_tx_session([task])

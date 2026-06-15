@@ -1241,11 +1241,13 @@ class TxSession(TxSessionBase):
         if not self.kv_tasks:
             return None
         if not blocking:
+            has_pending = False
             for task in self.kv_tasks:
-                if task.status == TaskStatus.TRANSFERRED:
-                    continue
                 if task.status == TaskStatus.ERROR:
                     return WaitResult.FAILED
+                if task.status != TaskStatus.TRANSFERRED:
+                    has_pending = True
+            if has_pending:
                 return None
             if self._need_aux:
                 if self.aux_task is None:
