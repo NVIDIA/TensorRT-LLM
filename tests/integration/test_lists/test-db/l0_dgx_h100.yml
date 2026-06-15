@@ -18,6 +18,7 @@ l0_dgx_h100:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
+  - unittest/_torch/distributed
   - unittest/_torch/modeling/test_modeling_pixtral.py::test_tensor_parallelism
   # ------------- Disaggregated serving tests ---------------
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
@@ -376,6 +377,7 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
+  - unittest/auto_deploy/multigpu/compile
   - unittest/auto_deploy/multigpu/custom_ops
   - unittest/auto_deploy/multigpu/smoke
   - unittest/auto_deploy/multigpu/transformations
