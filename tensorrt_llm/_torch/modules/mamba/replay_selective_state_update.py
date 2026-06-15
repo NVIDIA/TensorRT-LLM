@@ -2819,7 +2819,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
         ),  # raw_batch=1024, score=149.25us (B200 PDL-hoist default 5x200)
     ],
     ("fp8", "SR"): [
-        # --- ALL UNCHANGED (not retuned this round) ---
+        # --- ALL UNCHANGED (not tuned this round) ---
         (
             16,
             "persistent_dynamic",
