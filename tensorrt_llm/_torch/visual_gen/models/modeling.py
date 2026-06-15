@@ -16,6 +16,7 @@
 
 from typing import TYPE_CHECKING
 
+import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxScheduler
@@ -35,8 +36,43 @@ class BaseDiffusionModel(nn.Module):
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config
 
+    def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
+        """Run the diffusion transformer.
+
+        Concrete VisualGen models own their full forward signatures. This base
+        method defines the common arguments that every forward should accept.
+
+        Args:
+            timestep: Normalized denoising-time coordinate in ``[0, 1]``.
+                Larger values correspond to earlier, noisier denoising steps.
+                It may be ``None`` only for model paths that do not need a
+                timestep-dependent model-forward decision.
+                Model definers must pass the normalized value required by this
+                contract and perform any conversion needed inside modules that
+                reference this value. This TRT-LLM VisualGen contract
+                intentionally differs from Diffusers' ``ModelMixin`` subclasses,
+                where transformer ``timestep`` is model-specific. For example,
+                WAN forwards raw integer scheduler timesteps in ``[0, 999]``,
+                while FLUX forwards ``t / 1000``.
+        """
+        raise NotImplementedError("Diffusion model subclasses must implement forward().")
+
     def register_cuda_graph_extra_key_fns(self, runner: "CUDAGraphRunner") -> None:
-        """Register non-shape CUDA graph key contributors for this model."""
+        """Register CUDA graph key contributors that are not tensor shapes.
+
+        Override this hook when a model.forward input changes captured
+        execution without changing tensor shapes. Implementations should call
+        ``runner.register_extra_key_fn(name, fn)``, where ``fn`` is the
+        callback.
+
+        The callback receives the wrapped model.forward ``*args`` and
+        ``**kwargs`` and returns either a hashable key value or ``None``.
+        If the callback returns ``None``, the runner omits that key part for
+        the current call.
+
+        Subclasses should call ``super()`` unless they intentionally replace
+        the shared registrations.
+        """
         sparse_config = self.model_config.attention.sparse_attention_config
         if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
             return
@@ -45,6 +81,10 @@ class BaseDiffusionModel(nn.Module):
         if disabled_until_timestep is None:
             return
 
+        # Skip Softmax switches graph-visible attention behavior at the
+        # timestep boundary while tensor shapes stay unchanged. Key the dense
+        # and sparse phases separately; if timestep is absent or None, the
+        # scheduler returns None and the runner omits this key part.
         runner.register_extra_key_fn(
             "skip_softmax_phase",
             lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(

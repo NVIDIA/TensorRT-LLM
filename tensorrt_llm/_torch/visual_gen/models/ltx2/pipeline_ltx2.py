@@ -1650,6 +1650,7 @@ class LTX2Pipeline(BasePipeline):
         audio_scheduler = copy.deepcopy(self.scheduler)
         audio_scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         timesteps = self.scheduler.timesteps
+        num_steps = len(timesteps)
 
         # ---- 7. Build perturbation config for STG -----------------------
         stg_perturbation: PerturbationConfig | None = None
@@ -1777,6 +1778,7 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=text_cache,
+                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
                 step_index=step_index,
             )
 

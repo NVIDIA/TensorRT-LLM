@@ -58,9 +58,13 @@ This separation matters because tensor shapes alone are not always enough. If tw
 
 ## Extra Keys
 
-An extra key function is registered on `CUDAGraphRunner` with a stable name. During key construction, the runner calls each registered function with the same `*args` and `**kwargs` passed to the wrapped `model.forward`. If the function returns a non-`None` hashable value, the runner appends `(name, value)` to the graph key.
+Models add non-shape graph-key contributors through `BaseDiffusionModel.register_cuda_graph_extra_key_fns()`. The hook receives the model's `CUDAGraphRunner`; implementations call `runner.register_extra_key_fn(name, fn)` to register a named callback.
 
-Extra key functions should be used for forward inputs that affect captured kernels or control flow but are not already represented by tensor shapes. Skip Softmax Attention is one example. When `disabled_until_timestep` is configured, `BaseDiffusionModel` registers `skip_softmax_phase`; the callback reads the normalized forward `timestep` and maps it to the disabled or enabled phase. As a result, the disabled phase and enabled phase use separate CUDA graphs even if all tensor shapes are identical.
+During key construction, the runner calls each registered callback with the same `*args` and `**kwargs` passed to the wrapped `model.forward`. If the callback returns a non-`None` hashable value, the runner appends `(name, value)` to the graph key. If it returns `None`, that key part is omitted for the current call.
+
+Use an extra key when a forward input affects captured kernels or control flow but is not already represented by tensor shapes. For example, [Skip Softmax Attention](sparse-attention.md) can require separate CUDA graphs across its dense and sparse phases even when tensor shapes are identical. The base `BaseDiffusionModel` implementation registers a callback through `runner.register_extra_key_fn(...)` for this case.
+
+Subclasses can override `register_cuda_graph_extra_key_fns()` to add model-specific contributors. They should call `super()` unless they intentionally replace the shared registrations. This changes graph capture partitioning without exposing internal CUDA graph keys as public model-forward arguments.
 
 ## Capture and Replay
 
@@ -76,7 +80,7 @@ When a pipeline has multiple transformer components that do not execute concurre
 
 ## Implementation Notes
 
-The base runner is implemented in `tensorrt_llm/_torch/visual_gen/cuda_graph_runner.py`. Model components can participate by overriding or extending `BaseDiffusionModel.register_cuda_graph_extra_key_fns()`.
+The base runner is implemented in `tensorrt_llm/_torch/visual_gen/cuda_graph_runner.py`. Model components can participate by overriding or extending `BaseDiffusionModel.register_cuda_graph_extra_key_fns()` when they need model-specific graph-key behavior.
 
 Most VisualGen models use the base runner, which understands flat tensor arguments. LTX-2 uses a model-specific runner because its transformer forward accepts `Modality` dataclasses and other structured inputs that need custom keying, cloning, and replay copying.
 

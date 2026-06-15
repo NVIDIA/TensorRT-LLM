@@ -1751,6 +1751,7 @@ class LTXModel(BaseDiffusionModel):
         perturbations=None,
         *,
         text_cache: TextCache,
+        timestep: torch.Tensor | None = None,
         step_index=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
@@ -1761,6 +1762,13 @@ class LTXModel(BaseDiffusionModel):
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
             text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
                 Always required — callers must invoke ``prepare_text_cache()`` first.
+            timestep: Normalized denoising-time coordinate in ``[0, 1]``.
+                May be ``None`` for LTX-2 paths that rely only on per-modality
+                timestep values and do not need timestep-based CUDA graph
+                partitioning.
+                LTX-2 also carries per-modality timestep values in
+                ``video.timesteps`` / ``audio.timesteps`` for the reference
+                time-embedding path.
             step_index: Ordinal denoising-loop index.
 
         Returns:
