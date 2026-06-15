@@ -51,7 +51,8 @@ class KVSlice:
         total_blocks    = ceil(token_range.end / tpb)
         token_start_i   = (total_blocks - len(block_ids_per_layer_groups[i])) * tpb
     Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
-    block list.
+    block list. Beam search keeps this field 1-D: beam 0's blocks first,
+    followed by the final unshared block from each remaining beam.
 
     SWA stale_end uses the request prompt_len (on the session), not
     token_range.end — they differ for non-final slices.
@@ -104,6 +105,7 @@ class SessionArgsBase:
     params: DisaggregatedParams
     # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
     prompt_len: Optional[int] = None
+    beam_width: int = 1
 
 
 def get_unique_rid(request: LlmRequest) -> Optional[int]:

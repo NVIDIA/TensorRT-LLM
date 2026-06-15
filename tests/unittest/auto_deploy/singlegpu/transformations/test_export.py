@@ -27,6 +27,11 @@ from torch.fx import GraphModule
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
+class AddOne(nn.Module):
+    def forward(self, input_ids):
+        return input_ids + 1
+
+
 def _torch_export_non_strict(model, *args, **kwargs):
     kwargs["strict"] = False
     return export(model, *args, **kwargs)
@@ -47,6 +52,12 @@ class ModuleForExport(ABC, nn.Module):
     @abstractmethod
     def get_dynamic_shapes(self):
         pass
+
+
+def test_torch_export_to_gm_strips_input_constraint_pre_hook():
+    gm = torch_export_to_gm(AddOne(), args=(torch.ones(2, 4),))
+
+    assert torch.equal(gm(torch.ones(1, 4)), torch.full((1, 4), 2.0))
 
 
 class MLPForExport(ModuleForExport):

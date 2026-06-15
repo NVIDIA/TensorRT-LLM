@@ -11,7 +11,7 @@ llm_perf_core:
 # 6: B200, GB200, B300, GB300 test cases
 # 7: B200, B300 test cases
 # 8: H100, H20, H200, B200, B300, RTX6000D, RTX6000-Server test cases
-# 9: H20, H200, B200, B300, RTX6000D, RTX6000-Server test cases
+# 9: H20, H200, B200, B300, RTX6000-Server test cases
 # 10: RTX-6000D, RTX-6000 Server test cases
 # ===============================================================================
 
@@ -22,7 +22,7 @@ llm_perf_core:
       supports_fp8: true
     ranges:
       system_gpu_count:
-        gte: 2
+        gte: 4
   tests:
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[qwen3.5_9b-bench-pytorch-bfloat16-input_output_len:128,128]
@@ -36,6 +36,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-maxnt:5000-input_output_len:5000,500-reqs:8-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-input_output_len:500,2000-reqs:8-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_nano_8b_fp8-bench-pytorch-float8-input_output_len:1000,1000-reqs:8-con:1]
+   # test overlap scheduler
+   # con:1 paired with a small model is an intentional design choice—it amplifies host-side overhead and simplifies execution timelines to the maximum extent.
+  - perf/test_perf.py::test_perf[qwen3_0.6b-bench-pytorch-bfloat16-maxnt:2048-input_output_len:8000,1000-reqs:256-con:1-pp:4-gpus:4]
+  - perf/test_perf.py::test_perf[qwen3_30b_a3b-bench-pytorch-bfloat16-maxnt:2048-input_output_len:8000,1000-reqs:256-con:1-pp:4-gpus:4]
 
 
 # 2: L40S, H100, H20, H200
@@ -48,24 +52,8 @@ llm_perf_core:
   tests:
   #nemotron_nano_12b_v2
   - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-con:1] #min_latency
-  - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-input_output_len:500,2000-con:250] #max_throughput
-  - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-input_output_len:128,128]  #qwen3.5_9b (dense BF16 19G, 1-GPU)
   #qwen3.5_27b (dense BF16 52G, 2-GPU)
-  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,1000-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,2000-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-tp:2-gpus:2] #min_latency
-  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250-tp:2-gpus:2] #max_throughput
-  #llama_v3.3_nemotron_super_49b (nemotron-nas BF16 94G, 2-GPU)
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:1000,1000-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:1000,2000-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-tp:2-gpus:2] #min_latency
-  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250-tp:2-gpus:2] #max_throughput
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-streaming-bfloat16-input_output_len:128,128-gpus:4]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-bfloat16-input_output_len:128,128-gpus:4]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-streaming-float8-input_output_len:2000,200-gpus:8]
@@ -95,6 +83,23 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-maxnt:8192-input_output_len:2000,200-con:64]
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-maxnt:8192-input_output_len:128,128]
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-float4-maxbs:512-maxnt:8192-input_output_len:2000,200-con:256]
+  - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-input_output_len:500,2000-con:250] #max_throughput
+  - perf/test_perf.py::test_perf[nemotron_nano_12b_v2-bench-pytorch-bfloat16-input_output_len:128,128]
+  #qwen3.5_27b (dense BF16 52G, 2-GPU)
+  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,1000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,2000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250-tp:2-gpus:2] #max_throughput
+  #llama_v3.3_nemotron_super_49b (nemotron-nas BF16 94G, 2-GPU)
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:1000,1000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:1000,2000-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-tp:2-gpus:2] #min_latency
+  - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250-tp:2-gpus:2] #max_throughput
 
 
 # 4: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
@@ -138,7 +143,6 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-tp:2-gpus:2] #min_latency
   - perf/test_perf.py::test_perf[llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8-input_output_len:1000,1000-con:250-tp:2-gpus:2] #max_throughput
     #qwen3.5_122b_a10b (MoE BF16 234G, 4-GPU)
-  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:128,128-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:500,2000-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:2000,500-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:1000,1000-ep:4-tp:4-gpus:4]
@@ -210,9 +214,15 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:4-tp:4-gpus:4] #min_latency
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:1000,1000-con:512-ep:4-tp:4-gpus:4] #max_throughput
   #nemotron_3_super_120b_nvfp4 (Hybrid MoE+SSM+Attn FP4 76G, 4-GPU ep=4 tp=4, throughput config)
+  #these test config come from docs/source/deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.md
   - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] #min_latency
   - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4] #max_throughput
+  #nemotron_3_ultra_550b_nvfp4 (Hybrid MoE FP4 ~275G, 4-GPU ep=4 tp=4, throughput config, HF download)
+  #these test config come from docs/source/deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.md
+  - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] #min_latency
+  - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4]
+  - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4] #max_throughput
 
 
 # 7: B200, B300 test cases
@@ -280,15 +290,6 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-gpus:8]
   - perf/test_perf.py::test_perf[minimax_m2.5_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:8-gpus:8] #min_latency
   - perf/test_perf.py::test_perf[minimax_m2.5_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-con:512-ep:8-gpus:8] #max_throughput
-# 9: H20, H200, B200, B300 test cases
-  #llama_v3.1_nemotron_ultra_253b (nemotron-nas BF16 474G, 8-GPU)
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:128,128-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:1000,1000-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:1000,2000-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-tp:8-gpus:8] #min_latency
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250-tp:8-gpus:8] #max_throughput
   #llama_v3.1_nemotron_ultra_253b_fp8 (nemotron-nas FP8 241G, 8-GPU)
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-input_output_len:128,128-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-input_output_len:500,2000-tp:8-gpus:8]
@@ -305,8 +306,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:1000,1000-con:512-ep:8-tp:8-gpus:8] #max_throughput
+  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:128,128-ep:4-tp:4-gpus:4]
 
-# 9: H20, H200, B200, B300, RTX6000D, RTX6000-Server test cases
+
+# 9: H20, H200, B200, B300, RTX6000-Server test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -332,6 +335,14 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-input_output_len:1000,2000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:1000,1000-con:512-ep:8-tp:8-gpus:8] #max_throughput
+   #llama_v3.1_nemotron_ultra_253b (nemotron-nas BF16 474G, 8-GPU)
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:128,128-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:1000,1000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:1000,2000-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-maxbs:1-input_output_len:1000,1000-reqs:10-con:1-tp:8-gpus:8] #min_latency
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:1000,1000-con:250-tp:8-gpus:8] #max_throughput
 
 # 10: RTX-6000D, RTX-6000 Server test cases
 - condition:

@@ -179,6 +179,10 @@ class Distributed(ABC):
         pass
 
     @abstractmethod
+    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        pass
+
+    @abstractmethod
     def tp_broadcast(self, obj, root=0, **kwargs):
         pass
 
@@ -766,6 +770,10 @@ class MPIDist(Distributed):
         reduce_op = reduce_op_to_mpi(op)
         return mpi_comm().allreduce(obj, reduce_op)
 
+    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        reduce_op = reduce_op_to_mpi(op)
+        return self.tp_comm.allreduce(obj, reduce_op)
+
 
 class MultiHandleWrapper:
     """
@@ -993,6 +1001,25 @@ class TorchDist(Distributed):
             obj = torch.tensor(obj)
 
         dist.all_reduce(obj, op=reduce_op_to_torch(op))
+
+        if is_base_type:
+            obj = obj.item()
+
+        return obj
+
+    @log_op
+    def tp_allreduce(
+        self,
+        obj: int | float | torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+    ):
+        is_base_type = isinstance(obj, int) or isinstance(obj, float)
+        if is_base_type:
+            obj = torch.tensor(obj)
+
+        dist.all_reduce(obj,
+                        op=reduce_op_to_torch(op),
+                        group=self.mapping.tp_group_pg)
 
         if is_base_type:
             obj = obj.item()

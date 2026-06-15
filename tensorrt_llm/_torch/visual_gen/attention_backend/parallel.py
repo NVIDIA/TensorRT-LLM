@@ -20,7 +20,7 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -40,6 +40,25 @@ try:
 except (ImportError, OSError) as e:
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
+
+
+def post_permute_5d_to_4d(out_5d, P):
+    """5D [P, B, Sp, H/P, D] → 4D [B, P*Sp, H/P, D] (block-by-rank gather).
+    .contiguous() copies slot data out (layout-normalize for SDPA, decoupling
+    from IPC slot lifetime). Inductor fuses permute+contig with downstream
+    SDPA input prep."""
+    _P, Bt, Spt, HpP, Dt = out_5d.shape
+    return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
+
+
+def _ulysses_post_unscatter(q_5d, k_5d, v_5d, *, is_hnd):
+    """One-launch fused replacement for the post-A2A 5D -> 4D chain.
+
+    is_hnd=True  -> output [B, H, P*Sp, D] (VANILLA / torch SDPA)
+    is_hnd=False -> output [B, P*Sp, H, D] (TRTLLM / FA4)
+    """
+    layout = 0 if is_hnd else 1
+    return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d, layout)
 
 
 class UlyssesAttention(AttentionBackend):
@@ -65,10 +84,16 @@ class UlyssesAttention(AttentionBackend):
       + 1 for output (2 collectives total)
     """
 
+    # One side stream shared across all UlyssesAttention instances on the
+    # same device. Per-layer streams inflate the stream count and break
+    # cuda_graph capture.
+    _side_stream_by_device: ClassVar[Dict[int, "torch.cuda.Stream"]] = {}
+
     def __init__(
         self,
         inner_backend: AttentionBackend,
         process_group: torch.distributed.ProcessGroup,
+        async_ulysses: bool = False,
     ):
         self.inner_backend = inner_backend
         self.process_group = process_group
@@ -82,6 +107,24 @@ class UlyssesAttention(AttentionBackend):
 
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
+
+        # Async pipeline state. Eagerly populated when async_ulysses=True;
+        # forward_async assumes these are set. Non-async path doesn't touch
+        # them.
+        self._pg_boxed = None
+        self._async_side_stream: Optional[torch.cuda.Stream] = None
+        # Count of deferred pushes since the last `_join_async`. `_join_async`
+        # drains exactly this many `ulysses_a2a_async_barrier` calls on the
+        # side stream so V/Q/K pushes FIFO together without intermediate
+        # barrier kernels.
+        self._pending_barriers: int = 0
+        if async_ulysses:
+            device = torch.cuda.current_device()
+            if device not in UlyssesAttention._side_stream_by_device:
+                UlyssesAttention._side_stream_by_device[device] = torch.cuda.Stream(device=device)
+            self._async_side_stream = UlyssesAttention._side_stream_by_device[device]
+            if process_group is not None:
+                self._pg_boxed = process_group.boxed()
 
     def forward(
         self,
@@ -166,6 +209,120 @@ class UlyssesAttention(AttentionBackend):
 
         return self._output_a2a(output, batch_size, seq_len_full)
 
+    # ------------------------------------------------------------------
+    # Split-QKV async A2A pipeline. `_issue_async` and `_join_async` are
+    # the only stream-switch boundaries and are @torch.compiler.disable'd;
+    # the caller's compiled forward fuses each compute_{q,k,v} closure.
+    # ------------------------------------------------------------------
+
+    @torch.compiler.disable(recursive=False)
+    def _issue_async(self, perm_4d: torch.Tensor) -> torch.Tensor:
+        """Issue one V/Q/K async a2a (CE push only; barrier deferred to join).
+        Phase 1 (acquire slot + CUDA C permute+scatter) runs on the CURRENT
+        (default) stream. Phase 2a (cudaMemcpyBatchAsync peer push) is queued
+        on the comm side stream, gated by an event so it waits for Phase 1.
+        Phase 2b (symm-mem barrier) is NOT issued here — `_join_async` drains
+        all pending barriers in one shot so V/Q/K pushes FIFO through CE
+        without intermediate barrier kernels splitting them up. Returns the
+        5D recv-buf view.
+
+        Comm-stream FIFO serializes consecutive V/Q/K pushes in caller order;
+        no explicit chain event is needed between them. The default stream
+        is free to immediately begin the next V/Q/K compute — that's where
+        the V_push ∥ Q_compute ∥ K_compute overlap comes from."""
+        recv, send_h = torch.ops.trtllm.ulysses_a2a_async_prepare(perm_4d, self._pg_boxed)
+        ev = torch.cuda.Event()
+        ev.record()
+        with torch.cuda.stream(self._async_side_stream):
+            ev.wait()
+            torch.ops.trtllm.ulysses_a2a_async_push(send_h, self._pg_boxed)
+        self._pending_barriers += 1
+        return recv
+
+    @torch.compiler.disable(recursive=False)
+    def _join_async(self) -> None:
+        """Drain pending symm-mem barriers (one per deferred push) on the
+        side stream, then have the default stream wait on the tail event.
+        Comm-stream FIFO preserves [push V, push Q, push K, barrier, barrier,
+        barrier] order; all N barriers fire on channel=0 with identical
+        semantics, so the default stream sees a fully-synced recv buffer."""
+        with torch.cuda.stream(self._async_side_stream):
+            for _ in range(self._pending_barriers):
+                torch.ops.trtllm.ulysses_a2a_async_barrier(self._pg_boxed)
+            ev_done = torch.cuda.Event()
+            ev_done.record()
+        self._pending_barriers = 0
+        torch.cuda.current_stream().wait_event(ev_done)
+
+    def forward_async(
+        self,
+        compute_q: Callable[[], torch.Tensor],
+        compute_k: Callable[[], torch.Tensor],
+        compute_v: Callable[[], torch.Tensor],
+        **attn_kwargs,
+    ) -> torch.Tensor:
+        """Run the async ulysses attention path (V/Q/K rolling A2A).
+
+        Args:
+            compute_q / compute_k / compute_v : caller-provided closures that
+                each return a 4D tensor `[B, S_local, H, D]`. The closure
+                typically does `GEMM → (RMSNorm) → (RoPE) → view(4D)`; closures
+                live in the caller's compiled forward so inductor fuses each
+                into a single Triton kernel.
+            **attn_kwargs : forwarded to the wrapped inner attention backend
+                (mask, scale, etc.).
+
+        Returns:
+            output tensor in the caller's sharded layout `[B, S/P, H, D]`.
+
+        Pipeline: V/Q/K computed in V→Q→K order on the default stream; each
+        compute's output is fed to `_issue_async` which queues push+barrier on
+        the comm side stream. Default stream proceeds to the next compute
+        immediately, so V's push overlaps with Q's compute, Q's push overlaps
+        with K's compute. `_join_async` makes default wait on the last push.
+        Post-attention permute / SDPA / reverse A2A run in the caller's outer
+        compile region for additional inductor fusion."""
+        P = self.world_size
+
+        v_4d = compute_v()
+        v_5d = self._issue_async(v_4d)
+
+        q_4d = compute_q()
+        q_5d = self._issue_async(q_4d)
+
+        k_4d = compute_k()
+        k_5d = self._issue_async(k_4d)
+
+        self._join_async()
+
+        # Fast path: one fused kernel replaces the eager post-A2A chain
+        # (6 ops for HND target: permute+reshape+contig + transpose+contig
+        # per Q/K/V; 3 ops for NHD target). bf16-only because the kernel is
+        # only instantiated for __nv_bfloat16.
+        _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
+        is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
+        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
+        if use_fused_post_unscatter:
+            q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
+            B = B_q
+            seq_len_full = P * Sp_q
+        else:
+            v_out = post_permute_5d_to_4d(v_5d, P)
+            q_out = post_permute_5d_to_4d(q_5d, P)
+            k_out = post_permute_5d_to_4d(k_5d, P)
+
+            B = q_out.shape[0]
+            seq_len_full = q_out.shape[1]
+            if is_hnd:
+                q_out = q_out.transpose(1, 2).contiguous()
+                k_out = k_out.transpose(1, 2).contiguous()
+                v_out = v_out.transpose(1, 2).contiguous()
+
+        attn_kwargs["seq_len"] = seq_len_full
+        attn_kwargs["seq_len_kv"] = seq_len_full
+        output = self.inner_backend.forward(q=q_out, k=k_out, v=v_out, **attn_kwargs)
+        return self._output_a2a(output, B, seq_len_full)
+
     def _output_a2a(
         self,
         output: torch.Tensor,
@@ -230,7 +387,10 @@ class Attention2DAttention(AttentionBackend):
     -----------
     Ranks are arranged in a 2-D logical mesh of shape ``[row_size, col_size]``
     (total parallelism degree = ``P = row_size * col_size``).  Each rank holds a
-    ``[B, S/P, H, D]`` shard of Q, K, and V.
+    ``[B, S_q/P, H_q, D]`` shard of Q and ``[B, S_kv/P, H_kv, D]`` shards of K and V.
+    For self-attention ``S_q = S_kv`` and ``H_q = H_kv``; for GQA ``H_kv < H_q``; for
+    cross-attention ``S_kv`` may differ from ``S_q``.  K/V must be sequence-sharded
+    across the same mesh as Q (not replicated on every rank).
 
     Example for ``row_size=2, col_size=3`` (6 ranks total)::
 
@@ -244,19 +404,22 @@ class Attention2DAttention(AttentionBackend):
     Ranks in the same **column** share a ``col_process_group`` and all-gather K/V.
 
     Architecture:
-        Input:   [B, S/P, H, D]  (sequence sharded across P = row_size × col_size ranks)
-        Step 1:  Q all-gather within row group:        [B, S/P, H, D] → [B, S/col_size, H, D]
-        Step 2:  K/V fused all-gather within col group [B, S/P, H, D] → [B, S/row_size, H, D]
-                   (K and V packed into [2, B, S/P, H, D] before the gather,
+        Input:   Q [B, S_q/P, H_q, D], K/V [B, S_kv/P, H_kv, D]
+                 (sequence sharded across P = row_size × col_size ranks)
+        Step 1:  Q all-gather within row group:
+                   [B, S_q/P, H_q, D] → [B, S_q/row_size, H_q, D]
+        Step 2:  K/V fused all-gather within col group:
+                   [B, S_kv/P, H_kv, D] → [B, S_kv/col_size, H_kv, D]
+                   (K and V packed into [2, B, S_kv/P, H_kv, D] before the gather,
                     halving NCCL launch overhead vs. two separate collectives)
         Step 3:  Local attention with inner backend:
-                   Q [B, S/col_size, H, D] × K,V [B, S/row_size, H, D]
-                   → output [B, S/col_size, H, D] + LSE [B, H, S/col_size]
+                   Q [B, S_q/row_size, H_q, D] × K,V [B, S_kv/col_size, H_kv, D]
+                   → output [B, S_q/row_size, H_q, D] + LSE [B, H_q, S_q/row_size]
         Step 4:  Reduce-scatter output within row group, split into:
                    all_to_all_single to exchange partial outputs and LSEs, then
                    LSE-weighted combine via flash_attn_combine
-                   → [B, S/P, H, D]  (fully reduced, matching input layout)
-        Output:  [B, S/P, H, D]
+                   → [B, S_q/P, H_q, D]  (fully reduced, matching input Q layout)
+        Output:  [B, S_q/P, H_q, D]
 
     Supported inner backends
     ------------------------
@@ -275,6 +438,10 @@ class Attention2DAttention(AttentionBackend):
     Constraints
     -----------
     * Only ``PredefinedAttentionMask.FULL`` (or ``None``) is supported.
+    * Global ``S_q`` and ``S_kv`` must each be divisible by ``P = row_size × col_size``
+      so every rank holds an equal local shard.
+    * Cross-attention requires K/V to be sequence-sharded across the mesh (same as Q),
+      not replicated on every rank.
     * ``flash_attn_combine`` (JIT CUDA kernel) must be importable at
       construction time; the constructor raises ``ImportError`` otherwise.
     * The ``_combine`` step is wrapped in ``@torch.compiler.disable`` because
@@ -321,6 +488,7 @@ class Attention2DAttention(AttentionBackend):
                 )
         self.head_dim = inner_backend.head_dim
         self.num_heads = inner_backend.num_heads
+        self.num_kv_heads = getattr(inner_backend, "num_kv_heads", self.num_heads)
         self._inner_layout = inner_backend.preferred_layout
         if self._inner_layout not in (AttentionTensorLayout.NHD, AttentionTensorLayout.HND):
             raise NotImplementedError(
@@ -337,10 +505,30 @@ class Attention2DAttention(AttentionBackend):
         """
         Forward pass with Attention2D sequence parallelism.
 
-        q/k/v: [B, S/P, H, D] each.
+        q: [B, S_q/P, H_q, D].  k/v: [B, S_kv/P, H_kv, D].
         """
-        B, shard_seq, H, D = q.shape
+        B, shard_seq_q, H_q, D = q.shape
+        _, shard_seq_kv, H_kv, D_kv = k.shape
         attention_mask = kwargs.get("attention_mask", None)
+
+        if D_kv != D:
+            raise ValueError(
+                f"Attention2DAttention: q head_dim ({D}) must match k head_dim ({D_kv})."
+            )
+        if v.shape != k.shape:
+            raise ValueError(
+                f"Attention2DAttention: k and v shapes must match, got k={k.shape}, v={v.shape}."
+            )
+        if H_q != self.num_heads:
+            raise ValueError(
+                f"Attention2DAttention: q num_heads ({H_q}) must match "
+                f"inner backend num_heads ({self.num_heads})."
+            )
+        if H_kv != self.num_kv_heads:
+            raise ValueError(
+                f"Attention2DAttention: k num_kv_heads ({H_kv}) must match "
+                f"inner backend num_kv_heads ({self.num_kv_heads})."
+            )
 
         if attention_mask is not None and attention_mask != PredefinedAttentionMask.FULL:
             raise ValueError(
@@ -349,32 +537,34 @@ class Attention2DAttention(AttentionBackend):
 
         if self.row_group_size > 1:
             # All-gather q within row_process_group using a single flat buffer.
-            # [B, S/P, H, D] → [row_group_size, B, S/P, H, D] → [B, S/col_group_size, H, D]
-            q_recv = q.new_empty(self.row_group_size, B, shard_seq, H, D)
+            # [B, S_q/P, H_q, D] → [row_group_size, B, S_q/P, H_q, D]
+            # → [B, S_q/row_size, H_q, D]
+            q_recv = q.new_empty(self.row_group_size, B, shard_seq_q, H_q, D)
             torch.distributed.all_gather_into_tensor(
                 q_recv.view(-1), q.contiguous().view(-1), group=self.row_process_group
             )
-            q = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq, H, D)
+            q = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq_q, H_q, D)
 
         if self.col_group_size > 1:
             # Fuse K and V into a single all-gather to reduce NCCL launch overhead.
-            # [2, B, S/P, H, D] → [col_group_size, 2, B, S/P, H, D] → split back to K, V
-            kv_send = k.new_empty(2, B, shard_seq, H, D)
+            # [2, B, S_kv/P, H_kv, D] → [col_group_size, 2, B, S_kv/P, H_kv, D]
+            # → [B, S_kv/col_size, H_kv, D]
+            kv_send = k.new_empty(2, B, shard_seq_kv, H_kv, D)
             kv_send[0].copy_(k)
             kv_send[1].copy_(v)
-            kv_recv = k.new_empty(self.col_group_size, 2, B, shard_seq, H, D)
+            kv_recv = k.new_empty(self.col_group_size, 2, B, shard_seq_kv, H_kv, D)
             torch.distributed.all_gather_into_tensor(
                 kv_recv.view(-1), kv_send.view(-1), group=self.col_process_group
             )
             k = (
                 kv_recv[:, 0]
                 .permute(1, 0, 2, 3, 4)
-                .reshape(B, self.col_group_size * shard_seq, H, D)
+                .reshape(B, self.col_group_size * shard_seq_kv, H_kv, D)
             )
             v = (
                 kv_recv[:, 1]
                 .permute(1, 0, 2, 3, 4)
-                .reshape(B, self.col_group_size * shard_seq, H, D)
+                .reshape(B, self.col_group_size * shard_seq_kv, H_kv, D)
             )
 
         seq_len = q.shape[1]
@@ -622,6 +812,7 @@ def wrap_parallel_attention(
     *,
     visual_gen_mapping: Optional["VisualGenMapping"] = None,
     enable_sequence_parallel: bool = True,
+    async_ulysses: bool = False,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
 
@@ -650,5 +841,9 @@ def wrap_parallel_attention(
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
     if ulysses_size > 1:
-        attn = UlyssesAttention(attn, process_group=vgm.ulysses_group)
+        attn = UlyssesAttention(
+            attn,
+            process_group=vgm.ulysses_group,
+            async_ulysses=async_ulysses,
+        )
     return attn

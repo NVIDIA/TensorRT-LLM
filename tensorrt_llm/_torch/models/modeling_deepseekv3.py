@@ -340,7 +340,7 @@ class DeepseekV3WeightLoader:
         # preserved as `_ckpt_num_nextn_predict_layers`.
         ckpt_num_nextn_predict_layers = (
             getattr(self.config, '_ckpt_num_nextn_predict_layers', None)
-            or self.config.num_nextn_predict_layers)
+            or getattr(self.config, 'num_nextn_predict_layers', None))
 
         def detect_shared_mtp_weights() -> bool:
             # Detect if MTP layers share checkpoint weights (model has more MTP
@@ -348,7 +348,8 @@ class DeepseekV3WeightLoader:
             # multiple model MTP layers map to the same checkpoint layer via
             # modulo, and mark_consumed must be skipped to avoid deleting
             # weights that later MTP layers still need.
-            model_nextn = self.config.num_nextn_predict_layers or 0
+            model_nextn = getattr(self.config, 'num_nextn_predict_layers',
+                                  None) or 0
             return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()

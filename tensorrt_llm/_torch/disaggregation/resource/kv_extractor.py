@@ -296,7 +296,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     """
     from collections import defaultdict
 
-    from tensorrt_llm._torch.pyexecutor.resource_manager import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
     from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
     _ROLE_STR_TO_ENUM: dict[str, DataRole] = {

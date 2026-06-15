@@ -723,6 +723,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
     if (!triggeredFlags.isEmpty()) {
         pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
+        _cbtsReportDecision(pipeline, globalVars, "deferred",
+                            "user flags: ${triggeredFlags.join(', ')}", null)
         return null
     }
 
@@ -767,38 +769,74 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
+            _cbtsReportDecision(pipeline, globalVars, "fallback", "", output)
             return null
         }
-        // Piggyback input JSON on testFilter so each L0_Test stage agent can
-        // re-run main.py and regenerate cbts_test_db/ locally. The payload is
-        // base64-encoded because the raw JSON contains PR diffs and may include
-        // ${...} or {...} sequences that the Jenkins tokenmacro plugin would
-        // try to evaluate when the parent serializes globalVars for the
-        // Parameterized-Remote-Trigger plugin, raising MacroEvaluationException
-        // and blocking test dispatch. Capped at 256 KB (post-encoding, since
-        // that is what travels on the wire); oversize → drop piggyback,
-        // Layer 3 falls back to source.
-        final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
-        def inputJsonB64 = inputJson.bytes.encodeBase64().toString()
-        def inputJsonB64Size = inputJsonB64.length()
-        if (inputJsonB64Size <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
-            result.cbts_input_json_b64 = inputJsonB64
-            pipeline.echo("CBTS Layer 3: cbts_input_json_b64 piggyback enabled " +
-                          "(${inputJsonB64Size} bytes encoded, ${inputJson.length()} bytes raw)")
-        } else {
-            pipeline.echo("CBTS Layer 3: cbts_input_json_b64 is ${inputJsonB64Size} bytes, " +
-                          "exceeds ${CBTS_INPUT_PIGGYBACK_MAX_BYTES}-byte piggyback limit; " +
-                          "downstream stages will fall back to source test-db " +
-                          "(Layer 2 stage filtering still applies)")
+        // Upload the generated cbts_test_db/ to Artifactory so each L0_Test
+        // stage agent can download it directly instead of re-running main.py
+        // with the raw PR diff. This avoids passing large payloads as Jenkins
+        // parameters (env vars), which caused "Argument list too long" failures
+        // when diffs were large. Agents fall back to the source test-db if the
+        // download fails.
+        if (result.test_db_dir_override) {
+            try {
+                sh "tar czf /tmp/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
+                trtllm_utils.uploadArtifacts("/tmp/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
+                pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS Layer 3: artifact upload failed (${e.message}); " +
+                              "agents will fall back to source test-db")
+            }
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
+        def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output)
         return result
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
+    }
+}
+
+// Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
+// decisionJson null for deferred; reason used only then. Context/creds via env.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson)
+{
+    try {
+        def args = "--status ${status}"
+        if (decisionJson != null) {
+            pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
+            args += " --decision cbts_decision.json"
+        } else if (reason) {
+            args += " --reason '${reason.replace("'", "")}'"
+        }
+        // PR number for s_pr_number, mirroring perf_regression_utils: GitHub PR
+        // builds carry it in github_pr_api_url (.../pulls/<n>); GitLab MR builds
+        // expose env.gitlabMergeRequestIid. Empty for post-merge/branch builds.
+        def prNumber = ""
+        def prUrl = globalVars[GITHUB_PR_API_URL]
+        if (prUrl) {
+            def m = (prUrl =~ /\/pulls?\/(\d+)/)
+            if (m.find()) {
+                prNumber = m.group(1)
+            }
+        } else {
+            prNumber = env.gitlabMergeRequestIid ?: ""
+        }
+        if (prNumber) {
+            args += " --pr-number ${prNumber}"
+        }
+        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/report_cbts_decision.py ${args}"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: decision telemetry failed (non-fatal): ${e.message}")
     }
 }
 
@@ -982,10 +1020,12 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
@@ -1700,6 +1740,11 @@ pipeline {
         // to better analyze the time for each step/test
         timestamps()
         timeout(time: 24, unit: 'HOURS')
+    }
+    environment {
+        // CBTS decision telemetry; auto-exposes _USR/_PSW that open_search_db.py reads.
+        OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
+        OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
     }
     post {
         unsuccessful {

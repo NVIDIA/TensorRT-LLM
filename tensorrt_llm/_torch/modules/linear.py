@@ -1404,6 +1404,11 @@ class NVFP4LinearMethod(LinearMethodBase):
         group = (module.mapping.tp_group
                  if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                  and module.mapping is not None else None)
+        # Fuse bias inside the GEMM op when N is unpadded and the output is a
+        # plain buffer; otherwise fall back to post-op `out + bias` below.
+        fuse_bias_in_gemm = (bias is not None
+                             and output_buffer_kind == int(BufferKind.DEFAULT)
+                             and module.weight.shape[0] == module.out_features)
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
             module.weight,
@@ -1413,7 +1418,8 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.dtype,
             output_buffer_kind=output_buffer_kind,
             allowed_backends=allowed_backends_str,
-            group=group)
+            group=group,
+            bias=bias if fuse_bias_in_gemm else None)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -1421,7 +1427,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         if original_shape is not None:
             output = output.reshape(*original_shape[:-1], output.shape[-1])
 
-        if bias is not None:
+        if bias is not None and not fuse_bias_in_gemm:
             output = output + bias
         return output
 

@@ -79,7 +79,8 @@ inline cudaDataType_t getCudaDataType(at::ScalarType dtype)
 }
 
 void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
-    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha)
+    torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha,
+    c10::optional<torch::Tensor> const& bias = c10::nullopt)
 {
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[0];
@@ -144,11 +145,26 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     //   3. Passing dimensions as (n, m, k) instead of (m, n, k)
     //   4. Swapping scaling factors to match (b_sf_ptr, a_sf_ptr)
     // Note: beta is always 0 and is managed internally by BlockScaleGemm
+    void const* bias_ptr = nullptr;
+    if (bias.has_value() && bias->defined())
+    {
+        TLLM_CHECK_WITH_INFO(bias->is_cuda(), "bias must be a CUDA tensor for cuBLASLt epilogue");
+        TLLM_CHECK_WITH_INFO(
+            bias->device() == out.device(), "bias must reside on the same CUDA device as the GEMM output");
+        TLLM_CHECK_WITH_INFO(bias->is_contiguous(), "bias must be contiguous for cuBLASLt epilogue");
+        TLLM_CHECK_WITH_INFO(bias->dim() == 1 && bias->size(0) == n,
+            "bias must be a 1-D tensor of shape [N] matching the GEMM output dim");
+        TLLM_CHECK_WITH_INFO(
+            bias->scalar_type() == out.scalar_type(), "bias dtype must match output dtype for cuBLASLt epilogue");
+        bias_ptr = bias->data_ptr();
+    }
+
     cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr, k, // B matrix (swapped to first position)
         a_ptr, k,                                                              // A matrix (swapped to second position)
         out_ptr, n,                                                            // Output: C[m, n] in row-major
         b_sf_ptr, a_sf_ptr,                                                    // Scaling factors (also swapped)
-        alpha_ptr);                                                            // Uses default algorithm (nullptr)
+        alpha_ptr,                                                             // Uses default algorithm (nullptr)
+        bias_ptr);                                                             // Optional bias
 }
 
 } // namespace
@@ -176,10 +192,12 @@ public:
         return static_cast<int64_t>(num_algos);
     }
 
-    // Run GEMM with specified tactic (-1 for default/best)
+    // Run GEMM with specified tactic (-1 for default/best). Optional `bias`
+    // is fused via CUBLASLT_EPILOGUE_BIAS.
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1_scale,
         at::Tensor const& mat2_scale, at::Tensor const& alpha, int64_t output_buffer_kind, int64_t tactic,
-        c10::optional<torch::List<int64_t>> group = c10::nullopt) const
+        c10::optional<torch::List<int64_t>> group = c10::nullopt,
+        c10::optional<torch::Tensor> bias = c10::nullopt) const
     {
         int m = mat1.size(0);
         int k_compressed = mat1.size(1);
@@ -221,7 +239,8 @@ public:
         // Execute GEMM (beta is always 0 and is managed internally)
         if (has_algo)
         {
-            cublas_fp4_gemm_caller_with_algo(out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype);
+            cublas_fp4_gemm_caller_with_algo(
+                out, mat1, mat2, mat1_scale, mat2_scale, alpha, *algo_ptr, mOutputDtype, bias);
         }
         else
         {
@@ -230,7 +249,7 @@ public:
                 "CublasLtFP4GemmRunner: No valid algorithm found (tactic=%ld, available=%zu), falling back to default "
                 "for shape (m=%d, n=%d, k=%d)",
                 tactic, cache.heuristics.size(), m, n, k);
-            cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha);
+            cublas_fp4_gemm_caller(out, mat1, mat2, mat1_scale, mat2_scale, alpha, bias);
         }
 
         return out;
@@ -354,7 +373,8 @@ private:
     // Helper function to run GEMM with a specific algorithm
     static void cublas_fp4_gemm_caller_with_algo(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
         torch::Tensor const& scale_a, torch::Tensor const& scale_b, torch::Tensor const& alpha,
-        cublasLtMatmulAlgo_t const& algo, at::ScalarType output_dtype)
+        cublasLtMatmulAlgo_t const& algo, at::ScalarType output_dtype,
+        c10::optional<torch::Tensor> const& bias = c10::nullopt)
     {
         int32_t m = a.sizes()[0];
         int32_t n = b.sizes()[0];
@@ -409,6 +429,20 @@ private:
         //   3. Passing dimensions as (n, m, k) instead of (m, n, k)
         //   4. Swapping scaling factors to match matrices (b_sf_ptr, a_sf_ptr)
 
+        void const* bias_ptr = nullptr;
+        if (bias.has_value() && bias->defined())
+        {
+            TLLM_CHECK_WITH_INFO(bias->is_cuda(), "bias must be a CUDA tensor for cuBLASLt epilogue");
+            TLLM_CHECK_WITH_INFO(
+                bias->device() == out.device(), "bias must reside on the same CUDA device as the GEMM output");
+            TLLM_CHECK_WITH_INFO(bias->is_contiguous(), "bias must be contiguous for cuBLASLt epilogue");
+            TLLM_CHECK_WITH_INFO(bias->dim() == 1 && bias->size(0) == n,
+                "bias must be a 1-D tensor of shape [N] matching the GEMM output dim");
+            TLLM_CHECK_WITH_INFO(
+                bias->scalar_type() == out.scalar_type(), "bias dtype must match output dtype for cuBLASLt epilogue");
+            bias_ptr = bias->data_ptr();
+        }
+
         // Use BlockScaleGemm with specified algorithm for autotuning
         // Note: beta is always 0 and is managed internally by BlockScaleGemm
         cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr,
@@ -417,7 +451,8 @@ private:
             out_ptr, n,         // Output: C[m, n] in row-major
             b_sf_ptr, a_sf_ptr, // Scaling factors (also swapped)
             alpha_ptr,          // Alpha
-            &algo);             // Use specified algorithm
+            &algo,              // Use specified algorithm
+            bias_ptr);          // Optional bias for CUBLASLT_EPILOGUE_BIAS
     }
 };
 
