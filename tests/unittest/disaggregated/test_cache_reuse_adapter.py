@@ -21,13 +21,9 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
-from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
-    CacheReuseAdapter,
-    create_cache_reuse_adapter,
-)
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import CacheReuseAdapter
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 
 # ---------------------------------------------------------------------------
 # _align_kv_blocks: contract unchanged.
@@ -204,47 +200,6 @@ class TestCreateKvSliceTokenRange:
         kv_slice = transceiver._create_kv_slice(req, token_range=explicit)
 
         assert kv_slice.token_range is explicit
-
-
-class TestCacheReuseAdapterV2Commit:
-    class _FakeKVCache:
-        def __init__(self):
-            self.num_committed_tokens = 4
-            self.committed_tokens = None
-            self.stopped_committing = False
-
-        def commit(self, tokens):
-            self.committed_tokens = tokens
-            self.num_committed_tokens += len(tokens)
-
-        def stop_committing(self):
-            self.stopped_committing = True
-
-    def test_commit_blocks_for_reuse_uses_v2_manager_api(self):
-        req = SimpleNamespace(
-            py_request_id=1,
-            is_dummy_request=False,
-            context_current_position=8,
-            context_remaining_length=4,
-            is_disagg_generation_transmission_complete=True,
-            get_tokens=lambda beam_id: list(range(10)),
-        )
-        kv_cache = self._FakeKVCache()
-        manager = object.__new__(KVCacheManagerV2)
-        manager.enable_block_reuse = True
-        manager.is_draft = False
-        manager.tokens_per_block = 4
-        manager.kv_cache_map = {req.py_request_id: kv_cache}
-        manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[
-            start:end
-        ]
-
-        adapter = create_cache_reuse_adapter(manager)
-
-        adapter.commit_blocks_for_reuse(req)
-
-        assert kv_cache.committed_tokens == [4, 5, 6, 7]
-        assert kv_cache.stopped_committing
 
 
 # ---------------------------------------------------------------------------

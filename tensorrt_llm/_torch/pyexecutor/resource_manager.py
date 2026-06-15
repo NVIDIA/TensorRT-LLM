@@ -3730,34 +3730,23 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def try_commit_blocks(self, request: LlmRequest) -> None:
-        kv_cache = self.kv_cache_map.get(request.py_request_id)
-        if kv_cache is None:
-            return
-
         should_block_reuse = (self.enable_block_reuse and not self.is_draft
                               and not request.is_dummy_request)
         if not should_block_reuse:
             return
 
-        context_remaining_length = getattr(request, "context_remaining_length",
-                                           0)
-        is_context_complete = (context_remaining_length == 0 or getattr(
-            request, "is_disagg_generation_transmission_complete", False))
-        is_all_reusable = (
-            self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE)
-        should_commit = (
-            is_all_reusable or is_context_complete
-        ) and request.context_current_position > kv_cache.num_committed_tokens
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return
 
-        if should_commit:
+        if request.context_current_position > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 request.get_tokens(DEFAULT_BEAM_INDEX),
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=request.context_current_position)
             kv_cache.commit(tokens)
-
-        if is_context_complete:
+        if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
@@ -3977,11 +3966,12 @@ class KVCacheManagerV2(BaseResourceManager):
             if not kv_cache.is_active:
                 continue
 
-            should_block_reuse = (self.enable_block_reuse and not self.is_draft
-                                  and not req.is_dummy_request)
             is_all_reusable = (
                 self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE)
+            should_block_reuse = (self.enable_block_reuse and not self.is_draft
+                                  and not req.is_dummy_request)
             should_resize = not should_block_reuse or not is_all_reusable
+            should_commit = is_all_reusable or req.context_remaining_length == 0
 
             if should_resize:
                 success = kv_cache.resize(None, req.context_current_position)
@@ -3989,7 +3979,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise ValueError(
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
                     )
-            self.try_commit_blocks(req)
+            if should_commit:
+                self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV

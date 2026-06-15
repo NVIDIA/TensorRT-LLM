@@ -48,7 +48,10 @@ class CacheReuseAdapter(ABC):
     ) -> List[int]:
         """Per-layer-group cached prefix (block-aligned). SWA groups are
         clamped up to stale_end*tpb (blocks below it are evicted)."""
-        scalar = max(0, self._global_cached_token_count(req)) if self.enable_block_reuse else 0
+        if not self.enable_block_reuse:
+            return [0] * len(layer_groups)
+
+        scalar = max(0, self._global_cached_token_count(req))
         tpb = self.tokens_per_block
         out: List[int] = []
         for lg in layer_groups:
@@ -142,8 +145,6 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         )
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
-        if not self.enable_block_reuse:
-            return
         self._mgr.try_commit_blocks(req)
 
 
