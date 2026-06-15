@@ -2171,11 +2171,16 @@ class TestPydanticBestPractices:
                 annotation, _ALLOWED_CLASS_BASES):
             return False, f"class '{annotation.__name__}' is not a Pydantic model (convert to StrictBaseModel)"
 
-        # Require user-facing Pydantic models to inherit from StrictBaseModel
-        if isinstance(annotation, type) and issubclass(
-                annotation,
-                BaseModel) and not issubclass(annotation, StrictBaseModel):
-            return False, f"Pydantic model '{annotation.__name__}' is not a StrictBaseModel (convert to StrictBaseModel)"
+        # Require user-facing Pydantic models to forbid extra fields. StrictBaseModel
+        # enforces this; usage-local models (e.g. TelemetryConfig) may instead set
+        # model_config extra="forbid" directly so they stay importable without the
+        # heavy llmapi.utils dependency chain (which would otherwise pull torch/HF and
+        # create a circular import via llm_args).
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            is_strict = issubclass(annotation, StrictBaseModel)
+            forbids_extra = annotation.model_config.get("extra") == "forbid"
+            if not (is_strict or forbids_extra):
+                return False, f"Pydantic model '{annotation.__name__}' does not forbid extra fields (inherit StrictBaseModel or set model_config extra='forbid')"
 
         # Recursively check generic type arguments for disallowed types
         origin = get_origin(annotation)
