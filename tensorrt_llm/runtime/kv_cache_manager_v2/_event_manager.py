@@ -546,7 +546,15 @@ class KVCacheEventManager:
             return None
         return self._hash_from_radix_block(parent)
 
+    _hash_algo_logged = False
+
     def _hash_from_radix_block(self, block: Any) -> EventBlockHash:
+        if not KVCacheEventManager._hash_algo_logged:
+            KVCacheEventManager._hash_algo_logged = True
+            logger.info(
+                f"HASH_ALGO_TRACE: _hash_algo={self._hash_algo!r} "
+                f"V1={KV_CACHE_HASH_ALGO_V1!r} "
+                f"match={self._hash_algo == KV_CACHE_HASH_ALGO_V1}")
         if self._hash_algo == KV_CACHE_HASH_ALGO_V1:
             return self._v1_hash_from_radix_block(block)
         return self._normalize_block_hash(block.key)
@@ -576,18 +584,36 @@ class KVCacheEventManager:
             root_attrs = self._root_attrs_from_root_block(current)
 
         lora_task_id, cache_salt_id = root_attrs
+        _first_block_logged = getattr(self, "_first_block_logged", False)
         for current in reversed(chain):
             current_key = bytes(current.key)
             if parent_is_v1_compatible:
                 try:
+                    if not _first_block_logged:
+                        tokens_list = list(current.tokens)
+                        logger.info(
+                            f"V1_HASH_TRACE: tokens[:10]={tokens_list[:10]} "
+                            f"len={len(tokens_list)} parent_hash={parent_hash} "
+                            f"lora={lora_task_id} salt={cache_salt_id} "
+                            f"token_types={[type(t).__name__ for t in tokens_list[:3]]}")
                     parent_hash = self._hash_block_key(
                         current.tokens,
                         parent_hash,
                         lora_task_id,
                         cache_salt_id,
                     )
+                    if not _first_block_logged:
+                        logger.info(
+                            f"V1_HASH_TRACE: result={parent_hash}")
+                        self._first_block_logged = True
+                        _first_block_logged = True
                     self._v1_hash_compatible_keys.add(current_key)
                 except NonTextTokenHashError:
+                    if not _first_block_logged:
+                        logger.info(
+                            f"V1_HASH_TRACE: FALLBACK NonTextTokenHashError")
+                        self._first_block_logged = True
+                        _first_block_logged = True
                     parent_hash = self._fallback_v1_hash(current_key)
                     parent_is_v1_compatible = False
             else:

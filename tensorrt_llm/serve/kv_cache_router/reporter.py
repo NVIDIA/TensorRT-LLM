@@ -123,11 +123,31 @@ class WorkerReporter:
     # ----------------------------------------------------------------- loops
 
     def _run_event_loop(self) -> None:
+        total_events_sent = 0
+        total_reports_sent = 0
+        empty_polls = 0
+        last_log_time = time.monotonic()
         while not self._stop.is_set():
             try:
                 events = self._drain_events()
                 if events:
                     self._push_events(events)
+                    total_events_sent += len(events)
+                    total_reports_sent += 1
+                    empty_polls = 0
+                else:
+                    empty_polls += 1
+                # Log every 30s
+                now = time.monotonic()
+                if now - last_log_time >= 30.0:
+                    logger.info(
+                        f"WorkerReporter[{self._worker_id}] event_loop: "
+                        f"reports_sent={total_reports_sent} "
+                        f"events_sent={total_events_sent} "
+                        f"seq={self._event_seq} "
+                        f"empty_polls_since_last={empty_polls}")
+                    last_log_time = now
+                    empty_polls = 0
             except Exception as e:  # noqa: BLE001 - keep the daemon alive
                 logger.error(f"WorkerReporter event loop error: {e}")
             self._stop.wait(self._event_interval_s)

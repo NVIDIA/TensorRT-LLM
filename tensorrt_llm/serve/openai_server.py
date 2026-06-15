@@ -243,6 +243,11 @@ class OpenAIServer(_VideoRoutesMixin):
         self.disagg_cluster_worker = None
         self.resource_governor = None
 
+        # Centralized KV-cache router reporter
+        self._centralized_reporter = None
+        self._active_request_count = 0
+        self._active_request_count_lock = __import__('threading').Lock()
+
         # Skip loading AutoProcessor and model_config for VISUAL_GEN models
         # These are LLM-specific and can cause unnecessary memory usage
         if self._is_visual_gen:
@@ -298,8 +303,18 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
+            # Start centralized KV-cache router reporter if configured
+            router_address = os.environ.get("TLLM_CENTRALIZED_ROUTER_ADDRESS")
+            if router_address and not self._is_visual_gen:
+                self._start_centralized_reporter(router_address)
+
             # terminate rank0 worker
             yield
+
+            # Stop centralized router reporter
+            if self._centralized_reporter is not None:
+                self._centralized_reporter.stop()
+                logger.info("Stopped centralized KV-cache router reporter")
 
             # Stop background iteration stats collector
             if self._iteration_stats_collector_task is not None:
@@ -339,6 +354,21 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
+
+        # Track active /v1/ requests for centralized router load reporting
+        server_ref = self
+
+        @self.app.middleware("http")
+        async def _track_active_requests(request, call_next):
+            if request.url.path.startswith("/v1/"):
+                with server_ref._active_request_count_lock:
+                    server_ref._active_request_count += 1
+                try:
+                    return await call_next(request)
+                finally:
+                    with server_ref._active_request_count_lock:
+                        server_ref._active_request_count -= 1
+            return await call_next(request)
 
     def _get_iteration_stats_buffer_maxlen(self) -> Optional[int]:
         if isinstance(self.generator, VisualGen):
@@ -1891,6 +1921,68 @@ class OpenAIServer(_VideoRoutesMixin):
                     content[
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
         return JSONResponse(content=content)
+
+    def _start_centralized_reporter(self, router_address: str) -> None:
+        """Start the centralized KV-cache router reporter (ZMQ push)."""
+        import base64
+
+        from tensorrt_llm.serve.kv_cache_router import WorkerReporter
+
+        hmac_key_b64 = os.environ.get("TLLM_CENTRALIZED_ROUTER_HMAC_KEY")
+        hmac_key = (base64.b64decode(hmac_key_b64)
+                    if hmac_key_b64 else None)
+
+        worker_id = self.generator.llm_id
+        # Determine namespace: explicit env var > server_role > default "ctx".
+        # server_role is often None on standalone workers launched without
+        # --server_role, so allow env var override.
+        ns_env = os.environ.get("TLLM_CENTRALIZED_ROUTER_NAMESPACE")
+        if ns_env:
+            namespace = ns_env
+        elif self.server_role == ServerRole.GENERATION:
+            namespace = "gen"
+        else:
+            namespace = "ctx"
+        max_batch_size = getattr(self.generator.args, "max_batch_size",
+                                 64) or 64
+
+        executor = getattr(self.generator, "_executor", None)
+        logger.info(
+            f"CentralizedReporter: executor type={type(executor).__name__} "
+            f"has_get_kv_events={hasattr(executor, 'get_kv_events') if executor else False}")
+        if executor is None or not hasattr(executor, "get_kv_events"):
+            logger.warning(
+                "CentralizedReporter: executor does not support "
+                "get_kv_events; reporter not started")
+            return
+
+        def get_events(timeout_ms):
+            try:
+                events = executor.get_kv_events(timeout=timeout_ms / 1000.0)
+                return events
+            except Exception as e:
+                logger.error(f"CentralizedReporter get_events error: {e}")
+                return []
+
+        lock = self._active_request_count_lock
+
+        def get_load():
+            with lock:
+                return (self._active_request_count, 0)
+
+        self._centralized_reporter = WorkerReporter(
+            worker_id=worker_id,
+            namespace=namespace,
+            router_address=router_address,
+            hmac_key=hmac_key,
+            get_events=get_events,
+            get_load=get_load,
+            max_batch_size=max_batch_size,
+        )
+        self._centralized_reporter.start()
+        logger.info(
+            f"CentralizedReporter: started worker_id={worker_id} "
+            f"namespace={namespace} -> {router_address}")
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:

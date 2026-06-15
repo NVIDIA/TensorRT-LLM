@@ -100,8 +100,25 @@ class KVCacheRouterServer:
 
     def _dispatch(self, report) -> None:
         if isinstance(report, KvCacheEventReport):
+            self._event_count = getattr(self, "_event_count", 0) + 1
+            self._total_events_in_reports = (
+                getattr(self, "_total_events_in_reports", 0)
+                + len(report.events))
+            if self._event_count % 100 == 0:
+                logger.info(
+                    f"KVCacheRouterServer: ingested {self._event_count} "
+                    f"event reports ({self._total_events_in_reports} events) "
+                    f"from {report.worker_id} seq={report.seq} "
+                    f"snapshot={report.is_full_snapshot} "
+                    f"batch_size={len(report.events)}")
             self._router.apply_event_report(report)
         elif isinstance(report, WorkerLoadReport):
+            self._load_count = getattr(self, "_load_count", 0) + 1
+            if self._load_count % 500 == 0:
+                logger.info(
+                    f"KVCacheRouterServer: ingested {self._load_count} "
+                    f"load reports, latest from {report.worker_id} "
+                    f"active={report.num_active_requests}")
             self._router.apply_load_report(report)
         else:
             logger.warning(

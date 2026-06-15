@@ -55,7 +55,8 @@ class _NamespaceState:
     """All routing state for a single namespace."""
 
     __slots__ = ("trie", "loads", "last_event_seq", "last_load_seq",
-                 "last_load_ts", "last_seen_ts", "rr_counter")
+                 "last_load_ts", "last_seen_ts", "rr_counter",
+                 "layer_group_refcount")
 
     def __init__(self) -> None:
         self.trie = WorkerPrefixTrie()
@@ -67,6 +68,11 @@ class _NamespaceState:
         self.last_load_ts: Dict[str, float] = {}
         self.last_seen_ts: Dict[str, float] = {}
         self.rr_counter = 0
+        # Per-worker, per-hash: how many layer groups have "stored" this block.
+        # Only remove from trie when count drops to 0. This prevents premature
+        # trie removal when only one layer group evicts its page while others
+        # still hold the block (e.g. DSV4 MLA evicts but SWA retains).
+        self.layer_group_refcount: Dict[str, Dict[int, int]] = {}
 
 
 class CentralizedKVCacheRouter:
@@ -88,10 +94,12 @@ class CentralizedKVCacheRouter:
 
     def __init__(self,
                  tokens_per_block: int = 32,
+                 load_weight: float = 0.25,
                  load_suspend_s: float = 3.0,
                  stale_timeout_s: float = 30.0,
                  clock=time.monotonic) -> None:
         self._tokens_per_block = tokens_per_block
+        self._load_weight = load_weight
         self._load_suspend_s = load_suspend_s
         self._stale_timeout_s = stale_timeout_s
         self._clock = clock
@@ -172,7 +180,9 @@ class CentralizedKVCacheRouter:
             ns.last_seen_ts[report.worker_id] = self._clock()
             if report.is_full_snapshot:
                 ns.trie.remove_worker(report.worker_id)
-            self._apply_events(ns.trie, report.worker_id, report.events)
+                ns.layer_group_refcount.pop(report.worker_id, None)
+            self._apply_events(ns.trie, report.worker_id, report.events,
+                               ns.layer_group_refcount)
 
     def apply_load_report(self, report: WorkerLoadReport) -> None:
         """Apply a worker load report. Stale (``seq``) reports are dropped."""
@@ -231,7 +241,6 @@ class CentralizedKVCacheRouter:
                 return None
 
             matched = ns.trie.match(block_hashes) if block_hashes else {}
-            padded = max(len(block_hashes), 1) * self._tokens_per_block
 
             now = self._clock()
             best_score = None
@@ -242,10 +251,9 @@ class CentralizedKVCacheRouter:
                 if now - load_ts > self._load_suspend_s:
                     continue
                 load = ns.loads[w]
-                m_tokens = matched.get(w, 0) * self._tokens_per_block
+                matched_blocks = matched.get(w, 0)
                 workload = load.num_active_requests + load.num_queued_requests
-                max_bs = max(load.max_batch_size, 1)
-                score = m_tokens / padded - workload / max_bs
+                score = matched_blocks - self._load_weight * workload
                 if best_score is None or score > best_score:
                     best_score = score
                     best_workers = [w]
@@ -286,19 +294,66 @@ class CentralizedKVCacheRouter:
             t += tpb
         return hashes
 
-    @staticmethod
-    def _apply_events(trie: WorkerPrefixTrie, worker_id: str,
-                      events: List[dict]) -> None:
+    _event_debug_logged = False
+
+    @classmethod
+    def _apply_events(cls, trie: WorkerPrefixTrie, worker_id: str,
+                      events: List[dict],
+                      refcounts: Optional[Dict[str, Dict[int,
+                                                         int]]] = None
+                      ) -> None:
         for event_raw in events:
             data = event_raw.get("data", event_raw)
             etype = data.get("type")
+            layer_group_id = event_raw.get("layer_group_id")
             if etype == "stored":
                 block_hashes = [
                     b["block_hash"] for b in data.get("blocks", [])
                 ]
+                if not cls._event_debug_logged and block_hashes:
+                    cls._event_debug_logged = True
+                    hash_algo = event_raw.get(
+                        "hash_algo", data.get("hash_algo"))
+                    logger.info(
+                        f"KVCacheRouter EVENT_DEBUG: first stored event "
+                        f"worker={worker_id} "
+                        f"hash_algo={hash_algo} "
+                        f"hashes[:5]={block_hashes[:5]} "
+                        f"types={[type(h).__name__ for h in block_hashes[:3]]} "
+                        f"raw_blocks={data.get('blocks', [])[:2]}")
                 trie.add(worker_id, block_hashes)
+                if refcounts is not None and layer_group_id is not None:
+                    worker_rc = refcounts.setdefault(worker_id, {})
+                    for h in block_hashes:
+                        worker_rc[h] = worker_rc.get(h, 0) + 1
             elif etype == "removed":
-                trie.remove(worker_id, data.get("block_hashes", []))
+                removed_hashes = data.get("block_hashes", [])
+                if refcounts is not None and layer_group_id is not None:
+                    # Per-layer-group removal: only remove from trie when
+                    # ALL layer groups have evicted this hash.
+                    worker_rc = refcounts.get(worker_id)
+                    actually_removed = []
+                    for h in removed_hashes:
+                        if worker_rc is None:
+                            actually_removed.append(h)
+                            continue
+                        rc = worker_rc.get(h, 0)
+                        if rc <= 1:
+                            worker_rc.pop(h, None)
+                            actually_removed.append(h)
+                        else:
+                            worker_rc[h] = rc - 1
+                    if actually_removed:
+                        trie.remove(worker_id, actually_removed)
+                else:
+                    # No layer_group_id means full block removal or legacy
+                    # mode — honor immediately.
+                    trie.remove(worker_id, removed_hashes)
+                    if refcounts is not None:
+                        worker_rc = refcounts.get(worker_id)
+                        if worker_rc:
+                            for h in removed_hashes:
+                                worker_rc.pop(h, None)
             # "created" / "updated" carry no membership change for matching.
 
     @staticmethod
@@ -309,3 +364,4 @@ class CentralizedKVCacheRouter:
         ns.last_load_seq.pop(worker_id, None)
         ns.last_load_ts.pop(worker_id, None)
         ns.last_seen_ts.pop(worker_id, None)
+        ns.layer_group_refcount.pop(worker_id, None)

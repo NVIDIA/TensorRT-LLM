@@ -140,6 +140,7 @@ class KvCacheAwareServerState(ServerState):
         self._kv_cache_block_tables: dict[str, set[BlockHash]] = {
             KV_CACHE_HASH_ALGO_V1: self._kv_cache_block_table
         }
+        self._event_only_blocks: set[BlockHash] = set()
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
         self._poll_task: Optional[asyncio.Task] = None
@@ -197,11 +198,12 @@ class KvCacheAwareServerState(ServerState):
             if event["type"] == "created":
                 self.set_hash_algo(hash_algo)
             if event["type"] == "stored":
-                self.add_blocks(
-                    (block["block_hash"] for block in event["blocks"]),
-                    hash_algo=hash_algo)
+                block_hashes = [block["block_hash"] for block in event["blocks"]]
+                self.add_blocks(block_hashes, hash_algo=hash_algo)
+                self._event_only_blocks.update(block_hashes)
             elif event["type"] == "removed":
                 self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
+                self._event_only_blocks.difference_update(event["block_hashes"])
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
@@ -209,20 +211,32 @@ class KvCacheAwareServerState(ServerState):
             events_raw = await response.json()
         return events_raw
 
+    _event_match_log_counter = 0
+
     async def matched_tokens(
             self,
             block_hashes: list[list[BlockHash]],
             hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT) -> int:
         match_count = 0
+        event_match_count = 0
         async with self._lock:
             block_table = self._block_table(hash_algo)
             for hash_list in block_hashes:
                 for block_hash in hash_list:
-                    # TODO: 1) parent hash verification, 2) partial matching
                     if block_hash in block_table:
                         match_count += self._tokens_per_block
+                        if block_hash in self._event_only_blocks:
+                            event_match_count += self._tokens_per_block
                     else:
                         break
+            KvCacheAwareServerState._event_match_log_counter += 1
+            if KvCacheAwareServerState._event_match_log_counter <= 20 or KvCacheAwareServerState._event_match_log_counter % 100 == 0:
+                logger.info(
+                    f"EVENT_MATCH_DIAG server={self._server} "
+                    f"total_match={match_count} event_match={event_match_count} "
+                    f"event_blocks={len(self._event_only_blocks)} "
+                    f"total_blocks={len(block_table)} "
+                    f"query_hashes={[h for hl in block_hashes for h in hl][:3]}")
         return match_count
 
     async def decrement_load(self, request: OpenAIRequest):
@@ -804,7 +818,8 @@ class BlockHashMixin:
 
     def _init_block_hashing(self,
                             tokens_per_block: Optional[int] = None,
-                            custom_tokenizer: Optional[str] = None):
+                            custom_tokenizer: Optional[str] = None,
+                            tokenizer_dir: Optional[str] = None):
         env_tokens_per_block = os.environ.get(
             "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
@@ -814,26 +829,25 @@ class BlockHashMixin:
             else tokens_per_block
         self._tokenizers: dict = {}
         self._custom_tokenizer = custom_tokenizer
+        self._tokenizer_dir = tokenizer_dir
         logger.info(f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
                     f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
                     f", custom_tokenizer={self._custom_tokenizer}")
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
+            model_path = self._tokenizer_dir or model
             if self._custom_tokenizer:
                 from tensorrt_llm.tokenizer import load_custom_tokenizer
                 self._tokenizers[model] = load_custom_tokenizer(
-                    self._custom_tokenizer, model)
+                    self._custom_tokenizer, model_path)
             else:
                 from tensorrt_llm.tokenizer import \
                     maybe_fix_byte_level_tokenizer
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model, trust_remote_code=True)
-                # Work around Transformers 5.x LlamaTokenizer overriding
-                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
-                # which silently strips spaces from prompts (see tokenizer.py).
+                    model_path, trust_remote_code=True)
                 self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
-                    tokenizer, model, trust_remote_code=True)
+                    tokenizer, model_path, trust_remote_code=True)
         return self._tokenizers[model]
 
     def _encode_with_prefix_cache(self, rendered: str, key: int,
@@ -963,6 +977,15 @@ class BlockHashMixin:
         block_hashes = self._compute_block_hashes(token_lists)
         return token_lists, block_hashes
 
+    def _tokenize_and_compute_block_hashes_with_salt(
+            self, request: OpenAIRequest,
+            cache_salt_id: Optional[int] = None,
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        token_lists = self._tokenize(request)
+        block_hashes = self._compute_block_hashes(
+            token_lists, cache_salt_id=cache_salt_id)
+        return token_lists, block_hashes
+
     def _tokenize_and_compute_block_hashes_by_algo(
         self,
         request: OpenAIRequest,
@@ -1006,13 +1029,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  max_batch_size: int = 64,
                  tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
+                 tokenizer_dir: Optional[str] = None,
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer)
+        self._init_block_hashing(tokens_per_block, custom_tokenizer,
+                                 tokenizer_dir)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -1684,6 +1709,215 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                          f"content_loads={loads}")
 
 
+class CentralizedKvCacheAwareRouter(BlockHashMixin, Router):
+    """Router that delegates placement to the centralized KV-cache router.
+
+    Runs a KVCacheRouterServer (ZMQ PULL) in-process. Workers push events and
+    load reports to it via WorkerReporter. Query-side tokenizes + block-hashes
+    the request and calls select_worker on the centralized router core.
+    """
+
+    def __init__(self,
+                 server_role: ServerRole = None,
+                 servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
+                 tokens_per_block: Optional[int] = None,
+                 custom_tokenizer: Optional[str] = None,
+                 tokenizer_dir: Optional[str] = None,
+                 router_port: int = 5557,
+                 load_suspend_s: float = 100.0,
+                 stale_timeout_s: float = 30.0,
+                 **kwargs):
+        super().__init__(server_role, servers, metadata_server_cfg,
+                         metadata_server, **kwargs)
+        self._init_block_hashing(tokens_per_block, custom_tokenizer,
+                                 tokenizer_dir)
+
+        from tensorrt_llm.serve.kv_cache_router import (
+            CentralizedKVCacheRouter, KVCacheRouterServer)
+
+        import base64
+        import os
+        hmac_key_b64 = os.environ.get("TLLM_CENTRALIZED_ROUTER_HMAC_KEY")
+        hmac_key = (base64.b64decode(hmac_key_b64)
+                    if hmac_key_b64 else None)
+
+        tpb = self._tokens_per_block
+        self._core_router = CentralizedKVCacheRouter(
+            tokens_per_block=tpb,
+            load_suspend_s=load_suspend_s,
+            stale_timeout_s=stale_timeout_s)
+        self._zmq_server = KVCacheRouterServer(
+            self._core_router,
+            address=f"tcp://0.0.0.0:{router_port}",
+            hmac_key=hmac_key)
+        self._zmq_server.start()
+        endpoint, hmac_key = self._zmq_server.address
+        self._router_endpoint = endpoint
+        self._router_hmac_key = hmac_key
+        self._namespace = ("ctx" if server_role == ServerRole.CONTEXT
+                           else "gen")
+        self._rr_counter = 0
+        logger.info(
+            f"CentralizedKvCacheAwareRouter: ZMQ server started at "
+            f"{endpoint}, namespace={self._namespace}, tpb={tpb}")
+
+    @property
+    def router_endpoint(self) -> str:
+        return self._router_endpoint
+
+    @property
+    def router_hmac_key(self) -> Optional[bytes]:
+        return self._router_hmac_key
+
+    async def _prepare_server(self, server: str):
+        await super()._prepare_server(server)
+        if server not in self._prepared_ready_servers:
+            return
+        info = self._server_info.get(server, {})
+        worker_id = info.get("worker_id")
+        if worker_id:
+            self._core_router.register_worker_address(worker_id, server)
+            logger.info(
+                f"CentralizedKvCacheAwareRouter: registered "
+                f"worker_id={worker_id} -> {server}")
+        else:
+            logger.warning(
+                f"CentralizedKvCacheAwareRouter: {server} did not expose "
+                f"worker_id in /server_info; routing will degrade")
+
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        async with self._lock:
+            servers = [s for s in self._prepared_ready_servers
+                       if s != exclude_server]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
+
+        cache_salt_id = self._get_request_cache_salt_id(request)
+        token_lists, block_hashes = await asyncio.to_thread(
+            self._tokenize_and_compute_block_hashes_with_salt, request,
+            cache_salt_id)
+        flat_hashes = [h for hl in block_hashes for h in hl]
+
+        selection = self._core_router.select_worker(
+            self._namespace, flat_hashes)
+
+        fallback_reason = None
+        if selection is not None and selection.address in servers:
+            server = selection.address
+            matched = selection.matched_blocks
+        else:
+            server = servers[self._rr_counter % len(servers)]
+            matched = 0
+            if selection is None:
+                fallback_reason = "select_returned_None"
+            else:
+                fallback_reason = f"addr_not_in_servers({selection.address})"
+
+        self._rr_counter += 1
+
+        # Debug: log sample hashes to diagnose mismatch
+        if not getattr(self, "_hash_debug_done", False):
+            ns = self._core_router._namespaces.get(self._namespace)
+            trie_sample = []
+            if ns and ns.trie._owners:
+                for h in list(ns.trie._owners.keys())[:5]:
+                    trie_sample.append(h)
+            if trie_sample:
+                self._hash_debug_done = True
+                tl = token_lists[0] if token_lists else []
+                cache_salt = getattr(request, "cache_salt", None)
+                cache_salt_id = (self._get_request_cache_salt_id(request)
+                                 if hasattr(self, "_get_request_cache_salt_id")
+                                 else None)
+                logger.info(
+                    f"CentralizedRouter HASH_DEBUG rr={self._rr_counter}: "
+                    f"query_hashes[:5]={flat_hashes[:5]} "
+                    f"trie_sample={trie_sample} "
+                    f"router_tokens[:40]={tl[:40]} "
+                    f"tpb={self._tokens_per_block} "
+                    f"cache_salt={cache_salt!r} "
+                    f"cache_salt_id={cache_salt_id}")
+
+        # Track fallback vs matched routing stats
+        if not hasattr(self, "_diag_stats"):
+            self._diag_stats = {"total": 0, "fallback": 0,
+                                "matched_0": 0, "matched_partial": 0,
+                                "matched_full": 0, "total_hashes": 0,
+                                "total_matched": 0}
+        self._diag_stats["total"] += 1
+        self._diag_stats["total_hashes"] += len(flat_hashes)
+        self._diag_stats["total_matched"] += matched
+        if fallback_reason:
+            self._diag_stats["fallback"] += 1
+        elif matched == 0:
+            self._diag_stats["matched_0"] += 1
+        elif matched < len(flat_hashes):
+            self._diag_stats["matched_partial"] += 1
+        else:
+            self._diag_stats["matched_full"] += 1
+
+        # Periodic routing stats (every 50 requests)
+        if self._rr_counter % 50 == 0:
+            ns = self._core_router._namespaces.get(self._namespace)
+            trie_unique = len(ns.trie._owners) if ns else 0
+            worker_blocks = {
+                w: len(b) for w, b in ns.trie._worker_blocks.items()
+            } if ns else {}
+            num_loads = len(ns.loads) if ns else 0
+            last_seqs = dict(ns.last_event_seq) if ns else {}
+            ds = self._diag_stats
+            hit_rate = (ds["total_matched"] / max(ds["total_hashes"], 1)
+                        * 100)
+            logger.info(
+                f"CentralizedRouter DIAG rr={self._rr_counter}: "
+                f"trie_unique={trie_unique} worker_blocks={worker_blocks} "
+                f"loads={num_loads} seqs={last_seqs} | "
+                f"routing: total={ds['total']} fallback={ds['fallback']} "
+                f"match0={ds['matched_0']} partial={ds['matched_partial']} "
+                f"full={ds['matched_full']} "
+                f"hash_hit_rate={hit_rate:.1f}% | "
+                f"this: hashes={len(flat_hashes)} matched={matched} "
+                f"fb={fallback_reason} server={server}")
+
+        # Log first 10 fallbacks with detail for debugging
+        if fallback_reason and self._diag_stats["fallback"] <= 10:
+            ns = self._core_router._namespaces.get(self._namespace)
+            logger.warning(
+                f"CentralizedRouter FALLBACK #{self._diag_stats['fallback']}: "
+                f"reason={fallback_reason} "
+                f"ns_exists={ns is not None} "
+                f"ns_loads={len(ns.loads) if ns else 0} "
+                f"hashes={len(flat_hashes)}")
+
+        return server, {"matched_blocks": matched,
+                        "token_lists": token_lists}
+
+    def _address_worker_for(self, address: str) -> Optional[str]:
+        """Resolve server address to worker_id (reverse lookup)."""
+        return self._core_router._address_worker.get(address)
+
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
+        pass
+
+    def _on_servers_updated(self, old_servers, new_servers):
+        removed = set(old_servers) - set(new_servers)
+        for server in removed:
+            self._core_router.unregister_worker_address(address=server)
+
+    async def close(self):
+        self._zmq_server.stop()
+        await super().close()
+
+
 def create_router(
     router_config: Optional[RouterConfig],
     servers: Optional[List[str]],
@@ -1713,6 +1947,7 @@ def create_router(
         "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
         "conversation": ConversationRouter,
+        "centralized_kv_cache_aware": CentralizedKvCacheAwareRouter,
     }
     router_type = router_config.type if router_config else "round_robin"
     router_class = router_map.get(router_type.lower())
