@@ -383,28 +383,25 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
-            if len(ctx_response.choices) != 1:
-                raise ValueError(
-                    f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
-                )
-            choice = ctx_response.choices[0]
-            if choice.disaggregated_params is None:
-                raise ValueError(
-                    f"Context server did not return disaggregated params."
-                    f" finish_reason={choice.finish_reason!r}"
-                )
-            if choice.disaggregated_params.ctx_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: ctx_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
-                )
-            if choice.disaggregated_params.disagg_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: disagg_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
-                )
+            for idx, choice in enumerate(ctx_response.choices):
+                choice = ctx_response.choices[idx]
+                if choice.disaggregated_params is None:
+                    raise ValueError(
+                        f"Context server choice {idx} did not return disaggregated params."
+                        f" finish_reason={choice.finish_reason!r}"
+                    )
+                if choice.disaggregated_params.ctx_request_id is None:
+                    raise ValueError(
+                        f"Invalid disaggregated params: ctx_request_id is None for choice {idx}."
+                        f" finish_reason={choice.finish_reason!r},"
+                        f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                    )
+                if choice.disaggregated_params.disagg_request_id is None:
+                    raise ValueError(
+                        f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
+                        f" finish_reason={choice.finish_reason!r},"
+                        f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                    )
             return ctx_response
 
     async def _send_disagg_request_gen_first(
