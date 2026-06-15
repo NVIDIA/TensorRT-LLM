@@ -161,11 +161,19 @@ form — so keying state on `chunk.request_id` is sufficient to keep concurrent 
 
 ## Supported endpoints and limitations
 
-- **Endpoints**: `chat/completions` and `completions`, both streaming and non-streaming. The hook also
-  applies to the `responses` endpoint for non-harmony models.
+- **Endpoints**: `chat/completions` and `completions`, both streaming and non-streaming. The hook is
+  expected to apply to the `responses` endpoint for non-harmony models as well (shared detokenization
+  path), though that endpoint is not covered by the current end-to-end tests.
+- **Not client-bypassable**: the hook is a server-side guardrail, so it runs on every response even
+  when a `completions` request sets `detokenize=false`. The server detokenizes for the hook regardless;
+  the `detokenize` flag still controls only the returned channel (text vs. token ids), and a
+  `suppress`/`terminate` verdict withholds the token-id channel too.
 - **harmony / gpt-oss models**: not supported. Because the harmony output path is reconstructed from
   raw token ids, it would bypass the text-based hook, so the server fails fast at startup when
   `--post_processor` is combined with a harmony model.
+- **Disaggregated serving**: the context and generation servers are separate processes, each running
+  the hook on its own phase under a different `request_id`; per-request state cannot be correlated
+  across the two. A `terminate` on one phase does not propagate to the other.
 - **Text vs. token ids**: rewriting or suppressing text does not rewrite the underlying `token_ids` or
   `logprobs`. Clients that read both should expect them to diverge.
 - **Reasoning / tool parsing**: the hook runs before the reasoning and tool-call parsers. A hook that

@@ -105,6 +105,26 @@ def test_completions_non_streaming(client: openai.OpenAI, model_name: str, hook:
         assert completion.choices[0].finish_reason == "stop"
 
 
+def test_completions_detokenize_false_does_not_bypass_hook(
+    client: openai.OpenAI, model_name: str, hook: str
+):
+    """A server-side hook is a guardrail and must run even when the client sets
+    ``detokenize=false`` — that flag controls only the returned channel, not
+    whether the hook executes (TRTLLM-12622)."""
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is",
+        max_tokens=16,
+        temperature=0.0,
+        extra_body={"detokenize": False},
+    )
+    if hook == "terminate":
+        # The terminate hook fires on the first chunk regardless of the text
+        # channel, so the request stops early instead of running to max_tokens.
+        # If detokenize=false bypassed the hook, this would be "length".
+        assert completion.choices[0].finish_reason == "stop"
+
+
 @pytest.mark.asyncio(loop_scope="module")
 async def test_completions_streaming(async_client: openai.AsyncOpenAI, model_name: str, hook: str):
     stream = await async_client.completions.create(

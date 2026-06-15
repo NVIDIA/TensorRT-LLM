@@ -257,3 +257,20 @@ def test_apply_method_is_noop_when_instance_has_no_hook():
     DetokenizedGenerationResultBase._apply_post_processor_hook(result)
 
     assert out.text == "hello world"
+
+
+def test_harmony_model_rejects_post_processor():
+    """A harmony/gpt-oss model + post_processor must fail fast (TRTLLM-12622).
+
+    The harmony output path is rebuilt from raw token ids and would bypass the
+    text-based hook, so the server refuses the combination at startup.
+    """
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    guard = OpenAIServer._ensure_post_processor_supported
+    with pytest.raises(ValueError, match="not supported with harmony"):
+        guard(use_harmony=True, post_processor="my_pkg.guardrail.Hook")
+    # Every other combination is allowed.
+    guard(use_harmony=False, post_processor="my_pkg.guardrail.Hook")
+    guard(use_harmony=True, post_processor=None)
+    guard(use_harmony=False, post_processor=None)

@@ -327,12 +327,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            # The result may have already been finalized and removed — e.g. a
-            # post-processor hook (TRTLLM-12622) returned `terminate`, which
-            # marks the result done and pops it here, while the engine still has
-            # in-flight responses for the same client_id (abort is async, and the
-            # postproc worker recreates a record for any late response). Drop
-            # such late responses instead of crashing with a KeyError.
+            # The result may have already been finalized and removed — e.g. on
+            # the worker path a post-processor hook (TRTLLM-12622) returned
+            # `terminate`, so the worker sent a final Output that popped this
+            # client_id below, while the engine still has in-flight responses for
+            # it (abort is async, and the postproc worker recreates a record for
+            # any late response). Drop such late responses instead of crashing
+            # with a KeyError.
             result = self._results.get(client_id)
             if result is None:
                 return

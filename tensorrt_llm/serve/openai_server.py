@@ -403,18 +403,9 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
-        # The harmony (gpt-oss) path rebuilds the client-visible output from raw
-        # output token ids rather than the detokenized text, so the
-        # post-processing hook (TRTLLM-12622), which operates on detok text,
-        # cannot act there. Fail fast rather than silently bypassing a guardrail.
-        if self.use_harmony and getattr(self.generator.args, "post_processor",
-                                        None):
-            raise ValueError(
-                "--post_processor is not supported with harmony/gpt-oss models "
-                "in this version: the harmony output path is reconstructed from "
-                "raw token ids and would bypass the text-based hook. Disable the "
-                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
-                "not needed.")
+        self._ensure_post_processor_supported(
+            self.use_harmony,
+            getattr(self.generator.args, "post_processor", None))
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
@@ -459,6 +450,24 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    @staticmethod
+    def _ensure_post_processor_supported(use_harmony: bool,
+                                         post_processor: Optional[str]) -> None:
+        """Reject ``--post_processor`` combined with a harmony/gpt-oss model.
+
+        The harmony output path rebuilds the client-visible output from raw
+        output token ids rather than the detokenized text, so the text-based
+        post-processing hook (TRTLLM-12622) cannot act there. Fail fast at
+        startup rather than silently bypassing a guardrail.
+        """
+        if use_harmony and post_processor:
+            raise ValueError(
+                "--post_processor is not supported with harmony/gpt-oss models "
+                "in this version: the harmony output path is reconstructed from "
+                "raw token ids and would bypass the text-based hook. Disable the "
+                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
+                "not needed.")
 
     def _logit_bias_vocab_size(self) -> int:
         for config in (self.model_config,

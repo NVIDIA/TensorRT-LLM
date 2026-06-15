@@ -209,7 +209,8 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             # Cancel the engine request as well. On the in-proxy path this stops
             # wasted generation; on the worker path the record's abort() only
             # sets the flag and the engine is cancelled by the proxy via
-            # should_abort. Guarded for results that expose no abort().
+            # should_abort. The getattr guard is defensive (real results always
+            # define abort()).
             abort = getattr(result, "abort", None)
             if callable(abort):
                 try:

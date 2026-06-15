@@ -846,7 +846,14 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             'spaces_between_special_tokens':
             self.sampling_params.spaces_between_special_tokens
         }
-        if self.sampling_params.detokenize and self.tokenizer is not None:
+        # Detokenize when the client asked for text, OR whenever a post-processing
+        # hook (TRTLLM-12622) is configured: the hook is a server-side guardrail
+        # and must run on every response regardless of the client's
+        # ``detokenize`` flag (which only controls the returned channel, honored
+        # separately by the response formatter). Without this, a client could
+        # bypass the guardrail with ``detokenize=False``.
+        if (self.sampling_params.detokenize or self._post_processor_hook
+                is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
                 if hasattr(

@@ -247,7 +247,7 @@ class PostprocWorker:
                         num_generated_tokens=num_generated_tokens,
                     ))
                 if is_final:
-                    self._records.pop(client_id)
+                    self._records.pop(client_id, None)
             except Exception as e:
                 logger.error(
                     f"Postprocessing error for client {client_id}: {e}\n"
