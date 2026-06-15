@@ -133,6 +133,12 @@ SLURM_INFRA_RETRY_MAX = 1
 // to avoid nesting with the inner SLURM retry.
 K8S_INFRA_RETRY_MAX = 1
 
+// How often the background shell watcher snapshots the in-progress
+// ${stageName}/ directory (containing the PeriodicJUnitXML reporter's
+// results.xml) up to Artifactory. 5 minutes balances Artifactory traffic
+// against staleness for multi-hour test stages.
+PROGRESS_UPLOAD_INTERVAL_SEC = 300
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -997,6 +1003,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
     def stageIsInterrupted = false
+    // Tracks whether the Run Pytest stage's track step returned without
+    // throwing. Only on `true` do we sweep this stage's progress tar from
+    // Artifactory in the finally block (forensic tars from failed runs are
+    // kept). Set after the `node(...)` block; defaults to false so any
+    // earlier-thrown exception leaves the progress tar untouched.
+    def pytestSucceeded = false
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -1459,25 +1471,85 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptTrackPathNode
-                    ),
-                    numRetries: 3
-                )
+                // Track the Slurm job alongside a controller-side watcher
+                // that SSH-stats the remote results.xml and SCPs / uploads
+                // a progress tar whenever the file's mtime advances. Both
+                // run inside a single `sh` step (track in foreground, watcher
+                // as a background subshell) so Blue Ocean renders the stage
+                // as a single box instead of a nested parallel split.
+                def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                def progressTar = "results-${stageName}-progress.tar.gz"
+                def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/${progressTar}"
+                def remoteWorkspaceTrk = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+                def trackCmd = Utils.sshUserCmd(remote, scriptTrackPathNode)
+                def sshStatCmd = Utils.sshUserCmd(remote, "\"stat -c %Y ${remoteWorkspaceTrk}/results.xml 2>/dev/null || echo 0\"")
+                def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
+                sh "rm -f ${pytestDoneFile}"
+                withCredentials([usernamePassword(
+                        credentialsId: 'urm-artifactory-creds',
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS')]) {
+                    sh """
+                        set +e
+                        # ---- background watcher: SSH-stat remote XML, SCP, tar, upload ----
+                        (
+                            last=0
+                            while [ ! -f '${pytestDoneFile}' ]; do
+                                sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
+                                [ -f '${pytestDoneFile}' ] && break
+                                m=\$(${sshStatCmd} 2>/dev/null | tr -dc '0-9')
+                                [ -z "\$m" ] && m=0
+                                [ "\$m" -le "\$last" ] && continue
+                                last=\$m
+                                mkdir -p '${WORKSPACE}/${stageName}'
+                                if ! ${scpXmlCmd}; then
+                                    echo "[PROGRESS-UPLOAD] ${stageName}: scp failed; skipping this iteration"
+                                    continue
+                                fi
+                                ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) || continue
+                                if curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
+                                        -T '${WORKSPACE}/${progressTar}' '${progressUrl}'; then
+                                    echo "[PROGRESS-UPLOAD] ${stageName}: uploaded sbatch checkpoint (mtime=\$m)"
+                                else
+                                    echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal)"
+                                fi
+                            done
+                            echo "[PROGRESS-UPLOAD] ${stageName}: track done, watcher exiting"
+                        ) &
+                        WATCHER_PID=\$!
+
+                        # ---- foreground track: retry up to 3 times on failure ----
+                        attempt=0
+                        rc=1
+                        while [ \$attempt -lt 3 ]; do
+                            ${trackCmd}
+                            rc=\$?
+                            [ \$rc -eq 0 ] && break
+                            attempt=\$((attempt+1))
+                            [ \$attempt -lt 3 ] && echo "Track failed (rc=\$rc), retry \$attempt/3" && sleep 30
+                        done
+
+                        touch '${pytestDoneFile}'
+                        wait \$WATCHER_PID 2>/dev/null || true
+                        exit \$rc
+                    """
+                }
             }
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmSshCredentials
         }  // end withCredentials
+        // Reached only if no stage above (Initialize Test, Run Pytest) threw.
+        pytestSucceeded = true
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
     } finally {
         uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
+        if (pytestSucceeded) {
+            // pytest reached its natural end: drop the in-progress checkpoint
+            // tar; the final tar just uploaded by uploadResults supersedes it.
+            deleteProgressArtifact(stageName)
+        }
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -2982,6 +3054,37 @@ REUSED_TESTS_EOF
     }
 }
 
+// Removes the in-progress checkpoint tarball uploaded by the inline
+// shell watcher in runLLMTestlistOnPlatformImpl / runLLMTestlistWithSbatch.
+// Called only when the pytest+rerun execution
+// succeeded -- forensic checkpoints from failed runs are kept so the
+// orphan reflects "this attempt did not finish cleanly".
+//
+// Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
+// garbage-collected with the rest of the build's artifacts anyway.
+def deleteProgressArtifact(stageName) {
+    // UPLOAD_PATH points to the virtual repo `sw-tensorrt-generic`, which
+    // accepts GET/PUT but returns 404 on DELETE. Rewrite to the backing
+    // local repo so the delete actually lands.
+    def deletePath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+    def targetUrl = "https://urm.nvidia.com/artifactory/${deletePath}/test-results-progress/results-${stageName}-progress.tar.gz"
+    try {
+        withCredentials([usernamePassword(
+                credentialsId: 'urm-artifactory-creds',
+                usernameVariable: 'ART_USER',
+                passwordVariable: 'ART_PASS')]) {
+            sh """
+                curl -fsSL --retry 2 -X DELETE -u "\$ART_USER:\$ART_PASS" '${targetUrl}'
+            """
+        }
+        echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${targetUrl}"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "[PROGRESS-UPLOAD] ${stageName}: progress tar delete failed (non-fatal): ${e.message}"
+    }
+}
+
 /**
  * Decode a postTag into the postTags used by prior attempts of the same
  * stage in this build.
@@ -3303,13 +3406,60 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
+                // Sentinel that the watcher polls to know pytest has exited
+                // (success or failure). Lives outside ${stageName}/ so the
+                // `rm -rf ${stageName}/` at pytest startup doesn't wipe it.
+                def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
+                def progressTar = "results-${stageName}-progress.tar.gz"
+                def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/${progressTar}"
+                sh "rm -f ${pytestDoneFile}"
                 try {
                     if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
+                        // Run pytest in the foreground while a shell subshell
+                        // watcher periodically tars + uploads results.xml. The
+                        // watcher is a background subshell of the same `sh`
+                        // step (not a Groovy parallel branch) so Blue Ocean
+                        // renders the stage as a single box rather than a
+                        // nested parallel split.
+                        withCredentials([usernamePassword(
+                                credentialsId: 'urm-artifactory-creds',
+                                usernameVariable: 'ART_USER',
+                                passwordVariable: 'ART_PASS')]) {
+                            sh """
+                                set +e
+                                # ---- background watcher ----
+                                (
+                                    last=0
+                                    while [ ! -f '${pytestDoneFile}' ]; do
+                                        sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
+                                        [ -f '${pytestDoneFile}' ] && break
+                                        xml='${WORKSPACE}/${stageName}/results.xml'
+                                        m=\$(stat -c %Y "\$xml" 2>/dev/null || echo 0)
+                                        [ "\$m" -le "\$last" ] && continue
+                                        last=\$m
+                                        ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) || continue
+                                        if curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
+                                                -T '${WORKSPACE}/${progressTar}' '${progressUrl}'; then
+                                            echo "[PROGRESS-UPLOAD] ${stageName}: uploaded checkpoint (mtime=\$m)"
+                                        else
+                                            echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal)"
+                                        fi
+                                    done
+                                    echo "[PROGRESS-UPLOAD] ${stageName}: pytest done, watcher exiting"
+                                ) &
+                                WATCHER_PID=\$!
+
+                                # ---- foreground pytest ----
+                                rm -rf '${stageName}/'
+                                cd '${llmSrc}/tests/integration/defs'
+                                ${pytestCommand.join(" ")}
+                                rc=\$?
+
+                                touch '${pytestDoneFile}'
+                                wait \$WATCHER_PID 2>/dev/null || true
+                                exit \$rc
+                            """
+                        }
                     } else {
                         echo "No regular tests to run for stage ${stageName}"
                         noRegularTests = true
@@ -3322,6 +3472,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             echo '</testsuite>' >> ${stageName}/results.xml
                             echo '</testsuites>' >> ${stageName}/results.xml
                         """
+                        sh "touch ${pytestDoneFile}"
                     }
                 } catch (InterruptedException e) {
                     throw e
@@ -3362,6 +3513,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
         }
+
+        // pytest succeeded (possibly after rerun) -- the in-progress checkpoint
+        // tar is no longer needed; the stage's `finally` will upload the final
+        // results tar shortly. Drop the progress tar so consumers don't pick
+        // up a stale snapshot. Forensic tars from failed runs are intentionally
+        // left in place.
+        deleteProgressArtifact(stageName)
 
         if (perfMode) {
             basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
