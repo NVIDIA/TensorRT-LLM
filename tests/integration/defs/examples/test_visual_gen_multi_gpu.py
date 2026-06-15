@@ -57,6 +57,12 @@ WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("attn2d_2x2_ulysses2", {"attn2d_size": (2, 2), "ulysses_size": 2}),
 ]
 
+WAN22_LPIPS_TP_VARIANTS = [
+    ("tp2", {"tp_size": 2}),
+    ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
+    ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
+]
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
@@ -112,7 +118,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 
 def _skip_if_insufficient_gpus_for_parallel(parallel):
     parallel_cfg = ParallelConfig(**parallel)
-    required = parallel_cfg.total_parallel_size
+    required = parallel_cfg.n_workers
     available = torch.cuda.device_count()
     if available < required:
         pytest.skip(
@@ -152,13 +158,7 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
         dist.barrier()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize(
-    "variant_name,parallel",
-    WAN22_LPIPS_MULTI_GPU_VARIANTS,
-    ids=[name for name, _ in WAN22_LPIPS_MULTI_GPU_VARIANTS],
-)
-def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parallel):
+def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     _skip_if_insufficient_gpus_for_parallel(parallel)
     parallel_cfg = ParallelConfig(**parallel)
     generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
@@ -167,7 +167,7 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
     )
 
     run_test_in_distributed(
-        world_size=parallel_cfg.total_parallel_size,
+        world_size=parallel_cfg.n_workers,
         test_fn=_wan22_lpips_distributed_worker,
         model_path=_lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
         generated_path=str(generated_path),
@@ -193,3 +193,21 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
         generated_path,
     )
     _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
+
+
+@pytest.mark.parametrize(
+    "variant_name,parallel",
+    WAN22_LPIPS_MULTI_GPU_VARIANTS,
+    ids=[name for name, _ in WAN22_LPIPS_MULTI_GPU_VARIANTS],
+)
+def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parallel):
+    _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
+
+
+@pytest.mark.parametrize(
+    "variant_name,parallel",
+    WAN22_LPIPS_TP_VARIANTS,
+    ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
+)
+def test_wan22_t2v_lpips_against_golden_tp(tmp_path, variant_name, parallel):
+    _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
