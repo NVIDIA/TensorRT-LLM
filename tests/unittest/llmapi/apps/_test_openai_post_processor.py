@@ -118,11 +118,18 @@ def test_completions_detokenize_false_does_not_bypass_hook(
         temperature=0.0,
         extra_body={"detokenize": False},
     )
+    choice = completion.choices[0]
     if hook == "terminate":
         # The terminate hook fires on the first chunk regardless of the text
         # channel, so the request stops early instead of running to max_tokens.
         # If detokenize=false bypassed the hook, this would be "length".
-        assert completion.choices[0].finish_reason == "stop"
+        assert choice.finish_reason == "stop"
+        # The withheld content must not leak through the token-id channel that
+        # detokenize=false returns.
+        assert not choice.token_ids
+    elif hook == "suppress":
+        # detokenize=false returns token_ids; suppress must withhold them too.
+        assert not choice.token_ids
 
 
 @pytest.mark.asyncio(loop_scope="module")

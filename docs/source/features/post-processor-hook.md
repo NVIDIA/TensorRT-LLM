@@ -83,9 +83,9 @@ Return one of the following helpers from `__call__`:
 
 | Helper | Effect |
 |--------|--------|
-| `emit(text)` | Emit `text` for this chunk. Use it to pass output through unchanged (`emit(chunk.text_diff)`) or to rewrite/redact it. |
-| `suppress()` | Withhold this chunk entirely (no client-visible output for it). |
-| `terminate(reason)` | Stop the stream for this request. `reason` is surfaced as the response `stop_reason`, and the engine request is cancelled. |
+| `emit(text)` | Emit `text` for this chunk. Use it to pass output through unchanged (`emit(chunk.text_diff)`) or to rewrite/redact it. Affects the **text** channel only — it does not synthesize matching `token_ids` (see *Text vs. token ids* below). |
+| `suppress()` | Withhold this chunk entirely across **all** client-visible channels — text, `token_ids`, and `logprobs` (so `detokenize=false` token output is withheld too). |
+| `terminate(reason)` | Stop the stream for this request, withholding the terminating chunk on all channels. `reason` is surfaced as the response `stop_reason`, and the engine request is cancelled. |
 
 ## Usage examples
 
@@ -166,16 +166,21 @@ form — so keying state on `chunk.request_id` is sufficient to keep concurrent 
   path), though that endpoint is not covered by the current end-to-end tests.
 - **Not client-bypassable**: the hook is a server-side guardrail, so it runs on every response even
   when a `completions` request sets `detokenize=false`. The server detokenizes for the hook regardless;
-  the `detokenize` flag still controls only the returned channel (text vs. token ids), and a
-  `suppress`/`terminate` verdict withholds the token-id channel too.
+  the `detokenize` flag still controls only the returned channel (text vs. token ids). A
+  `suppress`/`terminate` verdict withholds **all** client-visible channels — text, `token_ids`, and
+  `logprobs` — on both the streaming and non-streaming paths, so a client cannot recover withheld
+  content through any channel.
+- **Requires a tokenizer**: the hook needs detokenized text to inspect, so `--post_processor` combined
+  with `skip_tokenizer_init` is rejected at startup rather than silently disabled.
 - **harmony / gpt-oss models**: not supported. Because the harmony output path is reconstructed from
   raw token ids, it would bypass the text-based hook, so the server fails fast at startup when
   `--post_processor` is combined with a harmony model.
 - **Disaggregated serving**: the context and generation servers are separate processes, each running
   the hook on its own phase under a different `request_id`; per-request state cannot be correlated
   across the two. A `terminate` on one phase does not propagate to the other.
-- **Text vs. token ids**: rewriting or suppressing text does not rewrite the underlying `token_ids` or
-  `logprobs`. Clients that read both should expect them to diverge.
+- **Text vs. token ids**: `emit` rewrites the **text** channel only — it does not rewrite the underlying
+  `token_ids`/`logprobs`, so a client reading both should expect them to diverge. (`suppress`/`terminate`
+  withhold all channels, so they do not diverge.)
 - **Reasoning / tool parsing**: the hook runs before the reasoning and tool-call parsers. A hook that
   rewrites or suppresses text may desync those parsers; prefer `terminate`, or apply such hooks to
   plain-text requests.

@@ -110,6 +110,28 @@ def test_suppress_blanks_token_and_logprob_diffs():
     assert out.logprobs_diff == []
 
 
+def test_suppress_blanks_full_token_and_logprob_channels_non_streaming():
+    """Non-streaming suppress must blank the full token/logprob channels (TRTLLM-12622).
+
+    Non-streaming emits the full token_ids/logprobs (not the diff), so suppress
+    must truncate the full channels — otherwise a detokenize=False completion
+    (token_ids) or any logprobs response leaks the withheld output.
+    """
+    out = _make_output("the full answer", last_text_len=0)
+    # Non-streaming single response: the diff watermark stays at 0.
+    assert out.token_ids == [1, 2, 3]
+    assert out.logprobs == [-0.1, -0.2, -0.3]
+    result = _FakeResult([out], done=True)
+
+    apply_post_processor_hook(lambda c: suppress(), result, streaming=False)
+
+    assert out.text == ""
+    # The full channels the non-streaming formatter reads are emptied, not just
+    # the diff view.
+    assert out.token_ids == []
+    assert out.logprobs == []
+
+
 def test_terminate_calls_abort_when_available_and_blanks_token_channel():
     out = _make_output("safe bad", last_text_len=len("safe "))
     out._last_token_ids_len = 1

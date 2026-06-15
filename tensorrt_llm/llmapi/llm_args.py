@@ -3535,6 +3535,16 @@ class BaseLlmArgs(StrictBaseModel):
     def validate_and_init_tokenizer(self):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
+            # The post-processing hook (TRTLLM-12622) is a text-based guardrail
+            # and needs detokenized text to inspect; without a tokenizer it could
+            # never run, so reject the combination rather than silently disabling
+            # the guardrail (mirrors the harmony fail-fast in OpenAIServer).
+            if self.post_processor is not None:
+                raise ValueError(
+                    "post_processor is not supported together with "
+                    "skip_tokenizer_init: the post-processing hook operates on "
+                    "detokenized text, which is unavailable when the tokenizer "
+                    "is skipped.")
             self.tokenizer = None
         elif self.custom_tokenizer:
             # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible

@@ -146,16 +146,33 @@ class PostProcessorHook(Protocol):
     def __call__(self, chunk: PostProcChunk) -> PostProcVerdict: ...
 
 
-def _withhold_token_channel(output) -> None:
-    """Withhold the raw token-id / logprob channel for this chunk too.
+def _withhold_token_channel(output, streaming: bool) -> None:
+    """Withhold the raw token-id / logprob channels alongside the blanked text.
 
-    Without this, a suppressed/terminated chunk would still leak
-    ``token_ids_diff`` (e.g. on ``/v1/completions`` with ``detokenize=False``)
-    and ``logprobs_diff`` even though the detokenized text was blanked.
+    ``suppress``/``terminate`` blank the text channel; the raw token-id and
+    logprob channels must be withheld too, or a suppressed/terminated output
+    leaks via them — ``token_ids`` on ``/v1/completions`` with
+    ``detokenize=False``, and ``logprobs`` on both chat and completions.
+
+    The two response shapes withhold differently, matching what each formatter
+    emits (verified by the channel audit):
+
+    * **streaming** emits per-chunk *diffs* (``token_ids_diff`` /
+      ``logprobs_diff``); advancing the diff watermark empties this chunk.
+    * **non-streaming** emits the *full* ``token_ids`` / ``logprobs``; these are
+      truncated back to the already-presented prefix, mirroring exactly how the
+      text channel is blanked to ``output.text[:_last_text_len]``. (Outputs
+      accumulate via ``list.extend`` in the hook's single-output scope, so the
+      truncation stays consistent across chunks.)
     """
-    output._last_token_ids_len = len(output.token_ids)
-    if getattr(output, "logprobs", None) is not None:
-        output._last_logprobs_len = len(output.logprobs)
+    if streaming:
+        output._last_token_ids_len = len(output.token_ids)
+        if getattr(output, "logprobs", None) is not None:
+            output._last_logprobs_len = len(output.logprobs)
+    else:
+        output.token_ids = output.token_ids[: output._last_token_ids_len]
+        if getattr(output, "logprobs", None) is not None:
+            output.logprobs = output.logprobs[: output._last_logprobs_len]
 
 
 def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) -> None:
@@ -198,10 +215,10 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             output.text = prefix + verdict.text
         elif verdict.action == "suppress":
             output.text = prefix
-            _withhold_token_channel(output)
+            _withhold_token_channel(output, streaming)
         elif verdict.action == "terminate":
             output.text = prefix + verdict.text
-            _withhold_token_channel(output)
+            _withhold_token_channel(output, streaming)
             output.finish_reason = "stop"
             output.stop_reason = verdict.reason
             result._aborted = True
