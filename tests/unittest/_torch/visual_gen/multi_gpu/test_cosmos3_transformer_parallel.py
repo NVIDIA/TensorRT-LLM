@@ -40,6 +40,22 @@ try:
 except ImportError:
     MODULES_AVAILABLE = False
 
+# Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
+# requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
+# LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
+# attn2d tests skip cleanly when the kernels are not built (e.g. non-Blackwell CI).
+try:
+    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+        _flash_attn_fwd as _fa4_fwd,
+    )
+    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+        _flash_attn_combine as _fa_combine,
+    )
+
+    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+except ImportError:
+    _ATTN2D_AVAILABLE = False
+
 pytestmark = pytest.mark.cosmos3
 
 # Small Cosmos3 config: 8 Q / 4 KV (GQA), hidden_size = 8 * 64 = 512.
@@ -63,6 +79,17 @@ _COSMOS3_TEST_CONFIG = dict(
     base_fps=24.0,
     unified_3d_mrope_temporal_modality_margin=100,
     enable_fps_modulation=True,
+)
+
+# attn2d needs an LSE-capable backend (FA4); FA4's CUTE kernels run with head_dim=128.
+# Same architecture as _COSMOS3_TEST_CONFIG otherwise (heads still divisible by
+# Ulysses=2 for the attn2d+ulysses case). mrope_section is unchanged: the interleave
+# slices clip to head_dim//2 (=64 here), so [16, 12, 12] stays valid.
+_COSMOS3_FA4_CONFIG = dict(
+    _COSMOS3_TEST_CONFIG,
+    head_dim=128,
+    hidden_size=8 * 128,
+    intermediate_size=1024,
 )
 
 # Video: [B, C, T, H, W]. patch_size=2 → seq_len = T * (H/2) * (W/2).
@@ -152,10 +179,12 @@ def _make_model_config(
     cfg_size=1,
     tp_size=1,
     ulysses_size=1,
+    attn2d_row_size=1,
+    attn2d_col_size=1,
     backend="VANILLA",
 ):
     pretrained_config = SimpleNamespace(**pretrained_dict)
-    ws = cfg_size * tp_size * ulysses_size
+    ws = cfg_size * tp_size * ulysses_size * attn2d_row_size * attn2d_col_size
     if ws > 1 and dist.is_initialized():
         ws = dist.get_world_size()
         rk = dist.get_rank()
@@ -167,6 +196,8 @@ def _make_model_config(
         cfg_size=cfg_size,
         tp_size=tp_size,
         ulysses_size=ulysses_size,
+        attn2d_row_size=attn2d_row_size,
+        attn2d_col_size=attn2d_col_size,
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
@@ -339,11 +370,17 @@ def _build_ref_and_parallel(
     tp_size: int = 1,
     ulysses_size: int = 1,
     cfg_size: int = 1,
+    attn2d_row_size: int = 1,
+    attn2d_col_size: int = 1,
+    backend: str = "VANILLA",
+    pretrained_dict: dict = _COSMOS3_TEST_CONFIG,
 ) -> Tuple[Cosmos3VFMTransformer, Cosmos3VFMTransformer, VisualGenMapping, torch.device]:
     device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
 
     torch.manual_seed(SEED_WEIGHTS)
-    ref_config = _make_model_config(_COSMOS3_TEST_CONFIG, tp_size=1, ulysses_size=1)
+    # Reference is the unsharded model on the same compute backend, so parity isolates
+    # the parallelism (e.g. FA4-full vs FA4+attn2d) rather than comparing backends.
+    ref_config = _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend=backend)
     # Do not .to(bfloat16) the whole module — RoPE inv_freq must stay fp32 (see
     # Qwen3VLTextRotaryEmbedding.forward). post_load_weights() sets Linear/MLP to bf16.
     ref_model = Cosmos3VFMTransformer(ref_config).to(device).eval()
@@ -352,10 +389,13 @@ def _build_ref_and_parallel(
 
     torch.manual_seed(SEED_WEIGHTS)
     parallel_config = _make_model_config(
-        _COSMOS3_TEST_CONFIG,
+        pretrained_dict,
         cfg_size=cfg_size,
         tp_size=tp_size,
         ulysses_size=ulysses_size,
+        attn2d_row_size=attn2d_row_size,
+        attn2d_col_size=attn2d_col_size,
+        backend=backend,
     )
     vgm = parallel_config.visual_gen_mapping
     parallel_model = Cosmos3VFMTransformer(parallel_config).to(device).eval()
@@ -483,6 +523,74 @@ def _logic_cosmos3_cfg_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_attn2d_vs_single_gpu(rank, world_size):
+    # 2x1 attn2d mesh (Q gathered across rows, K/V kept local). FA4 backend since
+    # Attention2DAttention requires an LSE-capable inner backend.
+    try:
+        ref_model, attn2d_model, _, device = _build_ref_and_parallel(
+            attn2d_row_size=2,
+            attn2d_col_size=1,
+            backend="FA4",
+            pretrained_dict=_COSMOS3_FA4_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=1, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    attn2d_out = _forward(attn2d_model, device, text_seed)
+
+    if rank == 0:
+        diff = (attn2d_out.float() - ref_out.float()).abs()
+        print(
+            f"[attn2d=2x1] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        attn2d_out,
+        ref_out,
+        msg=f"Rank {rank}: Attention2D (2x1) output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_attn2d_ulysses_vs_single_gpu(rank, world_size):
+    # 2x1 attn2d mesh composed with Ulysses=2 (seq_size = attn2d * ulysses = 4).
+    attn2d_row_size = 2
+    ulysses_size = 2
+    try:
+        ref_model, parallel_model, _, device = _build_ref_and_parallel(
+            ulysses_size=ulysses_size,
+            attn2d_row_size=attn2d_row_size,
+            attn2d_col_size=1,
+            backend="FA4",
+            pretrained_dict=_COSMOS3_FA4_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=ulysses_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    parallel_out = _forward(parallel_model, device, text_seed)
+
+    if rank == 0:
+        diff = (parallel_out.float() - ref_out.float()).abs()
+        print(
+            f"[attn2d=2x1,ulysses={ulysses_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        parallel_out,
+        ref_out,
+        msg=f"Rank {rank}: Attention2D+Ulysses output differs from single-GPU reference",
+    )
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -513,6 +621,19 @@ class TestCosmos3TransformerParallel:
     def test_cfg2_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_cfg_ulysses_vs_single_gpu)
+
+    def test_attn2d_2x1_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        if not _ATTN2D_AVAILABLE:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
+
+    @pytest.mark.gpu4
+    def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        if not _ATTN2D_AVAILABLE:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
 
 
 if __name__ == "__main__":

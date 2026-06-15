@@ -184,9 +184,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def max_context_length(self) -> int:
-        """``min(max_seq_len - 1, max_num_tokens)`` — upper bound for a single
-        context window."""
-        return min(self.max_seq_len - 1, self.max_num_tokens)
+        """
+        Upper bound for a single context window.
+        Required max_seq_len for context-only attention cases like visual gen
+        """
+        return min(self.max_seq_len, self.max_num_tokens)
 
     @property
     def max_seq_len(self) -> int:
@@ -498,7 +500,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets = None
             self.block_ids_per_seq = None
 
-        prompt_lens = torch.tensor(
+        prompt_lens = torch.as_tensor(
             self.prompt_lens,
             dtype=torch.int,
             device='cpu',
@@ -1751,6 +1753,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert (forward_args.is_fused_qkv and k is None
                 and v is None) or (not forward_args.is_fused_qkv
                                    and k is not None and v is not None)
+        if forward_args.cu_q_seqlens is None:
+            forward_args.cu_q_seqlens = metadata.cu_q_seqlens
+        if forward_args.cu_kv_seqlens is None:
+            forward_args.cu_kv_seqlens = metadata.cu_kv_seqlens
 
         # ``SkipSoftmax`` configs contribute nothing here — their thresholds
         # are read via the ``skip_softmax_threshold_scale_factor_*``
