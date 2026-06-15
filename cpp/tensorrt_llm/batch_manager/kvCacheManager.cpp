@@ -1101,6 +1101,7 @@ void BlockManager::startScheduling()
 
 void WindowBlockManager::startScheduling()
 {
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     mSchedulingNumFreeBlocks = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
     for (auto& [requestId, slotAllocatedBlocks] : mAllocatedBlocksPerSeq)
     {
@@ -1109,6 +1110,13 @@ void WindowBlockManager::startScheduling()
             allocatedBlock->startScheduling();
         }
     }
+}
+
+bool WindowBlockManager::schedulingHasFreeBlocks(SizeType32 numRequired) const
+{
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    auto const liveNumFreeBlocks = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
+    return std::min(mSchedulingNumFreeBlocks, liveNumFreeBlocks) >= numRequired;
 }
 
 void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
@@ -1131,6 +1139,13 @@ void WindowBlockManager::freeChildren(BlockPtr const& block)
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
+    std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
+    std::string const& directory, bool wantPlaceholder)
+{
+    return getFreeBlock(sequence.getRequestId(), priority, durationMs, mode, directory, wantPlaceholder);
+}
+
+BlockPtr WindowBlockManager::getFreeBlock(LlmRequest::RequestIdType requestId, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory, bool wantPlaceholder)
 {
@@ -1177,8 +1192,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     if (mBlockToSequence.count(block->getBlockId()) > 0)
     {
         auto const& originalOwnerSequenceId = mBlockToSequence[block->getBlockId()];
-        if (mIsValidStoreForReuseSequence.count(originalOwnerSequenceId) > 0
-            && sequence.getRequestId() != originalOwnerSequenceId)
+        if (mIsValidStoreForReuseSequence.count(originalOwnerSequenceId) > 0 && requestId != originalOwnerSequenceId)
         {
             TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d was originally held but released from sequence %d",
                 mLogPrefix.c_str(), block->getBlockId(), originalOwnerSequenceId);
@@ -1197,9 +1211,9 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     }
 
     // Record which sequence is using the block
-    mBlockToSequence[block->getBlockId()] = sequence.getRequestId();
+    mBlockToSequence[block->getBlockId()] = requestId;
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
-        block->getBlockId(), sequence.getRequestId());
+        block->getBlockId(), requestId);
 
     return block;
 }
@@ -1272,6 +1286,75 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         mEvictionPolicy->releaseBlock(block); // append block to offload queue
                                               // offloadBlock is now in primary memory pool
     }
+}
+
+std::vector<KVCacheBlock::IdType> WindowBlockManager::pinAndOnboardBlocksById(
+    std::vector<KVCacheBlock::IdType> const& blockIds, LlmRequest::RequestIdType requestId,
+    executor::KvCacheTransferMode mode, std::string const& directory)
+{
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::vector<KVCacheBlock::IdType> pinnedBlockIds;
+    pinnedBlockIds.reserve(blockIds.size());
+
+    try
+    {
+        for (auto const& blockId : blockIds)
+        {
+            TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
+                "Block id %d is out of range", blockId);
+            auto block = mAllBlocksById[blockId];
+            if (!block || block->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+            {
+                continue;
+            }
+
+            if (!block->hasRefs())
+            {
+                mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+            }
+            block->incRefCount();
+            pinnedBlockIds.push_back(block->getBlockId());
+            ++mTransferPinnedBlocks;
+
+            if (!block->isPlaceholder() && block->isPrimary())
+            {
+                ++mTransferAlreadyPrimaryBlocks;
+            }
+            else if (!block->isPlaceholder())
+            {
+                BlockPtr primaryBlock;
+                try
+                {
+                    primaryBlock
+                        = getFreeBlock(requestId, block->getPriority(), block->getDurationMs(), mode, directory);
+                }
+                catch (...)
+                {
+                    ++mTransferReservationFailures;
+                    throw;
+                }
+                ++mTransferPrimaryBlockReservations;
+                mTransferManager->onboard(block, primaryBlock, mPools, 0, mode, directory);
+                block->swapMemoryPoolBlockOffset(primaryBlock);
+                ++mTransferOnboardedBlocks;
+
+                if (mEventManager)
+                {
+                    mEventManager->enqueueUpdatedEvent(
+                        tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                        mWindowSize);
+                }
+                mEvictionPolicy->releaseBlock(primaryBlock);
+            }
+        }
+    }
+    catch (...)
+    {
+        unpinBlocksByIdNoLock(pinnedBlockIds);
+        throw;
+    }
+
+    return pinnedBlockIds;
 }
 
 void BlockManager::offloadBlock(
@@ -2119,6 +2202,21 @@ void WindowBlockManager::syncTransferManagerWithBufferManager()
     mTransferManager->syncWithBufferManager();
 }
 
+bool BlockManager::syncPendingTransfersToBufferManager()
+{
+    bool hasPendingTransfers = false;
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        hasPendingTransfers = manager.syncPendingTransfersToBufferManager() || hasPendingTransfers;
+    }
+    return hasPendingTransfers;
+}
+
+bool WindowBlockManager::syncPendingTransfersToBufferManager()
+{
+    return mTransferManager->syncTransfers();
+}
+
 void BlockManager::refreshBlocks()
 {
     for (auto& [_, manager] : mWindowBlockManagers)
@@ -2752,6 +2850,15 @@ KvCacheIterationStats WindowBlockManager::getAndResetIterationStats()
     // Generation phase
     stats.iterGenAllocBlocks = mGenAllocBlocks - mPrevGenAllocBlocks;
 
+    // Transfer-prep lease/reservation deltas
+    stats.iterTransferPinnedBlocks = mTransferPinnedBlocks - mPrevTransferPinnedBlocks;
+    stats.iterTransferAlreadyPrimaryBlocks = mTransferAlreadyPrimaryBlocks - mPrevTransferAlreadyPrimaryBlocks;
+    stats.iterTransferPrimaryBlockReservations
+        = mTransferPrimaryBlockReservations - mPrevTransferPrimaryBlockReservations;
+    stats.iterTransferOnboardedBlocks = mTransferOnboardedBlocks - mPrevTransferOnboardedBlocks;
+    stats.iterTransferReservationFailures = mTransferReservationFailures - mPrevTransferReservationFailures;
+    stats.iterTransferLeaseReleaseBlocks = mTransferLeaseReleaseBlocks - mPrevTransferLeaseReleaseBlocks;
+
     // Snapshot current values for next delta
     mPrevAllocTotalBlocks = mAllocTotalBlocks;
     mPrevAllocNewBlocks = mAllocNewBlocks;
@@ -2760,6 +2867,12 @@ KvCacheIterationStats WindowBlockManager::getAndResetIterationStats()
     mPrevPartialReusedBlocks = mPartialReusedBlocks;
     mPrevMissedBlocks = mMissedBlocks;
     mPrevGenAllocBlocks = mGenAllocBlocks;
+    mPrevTransferPinnedBlocks = mTransferPinnedBlocks;
+    mPrevTransferAlreadyPrimaryBlocks = mTransferAlreadyPrimaryBlocks;
+    mPrevTransferPrimaryBlockReservations = mTransferPrimaryBlockReservations;
+    mPrevTransferOnboardedBlocks = mTransferOnboardedBlocks;
+    mPrevTransferReservationFailures = mTransferReservationFailures;
+    mPrevTransferLeaseReleaseBlocks = mTransferLeaseReleaseBlocks;
 
     // Transfer stats (collected from transfer manager)
     if (mTransferManager)
@@ -2844,6 +2957,27 @@ void BlockManager::pinBlocks(GenerationRequest& sequence)
     }
 }
 
+std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> BlockManager::pinAndOnboardBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
+    LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode, std::string const& directory)
+{
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> pinnedBlockIdsPerWindow;
+    try
+    {
+        for (auto const& [windowSize, blockIds] : blockIdsPerWindow)
+        {
+            pinnedBlockIdsPerWindow[windowSize]
+                = mWindowBlockManagers.at(windowSize).pinAndOnboardBlocksById(blockIds, requestId, mode, directory);
+        }
+    }
+    catch (...)
+    {
+        unpinBlocksById(pinnedBlockIdsPerWindow);
+        throw;
+    }
+    return pinnedBlockIdsPerWindow;
+}
+
 void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     // Use the first window size
@@ -2853,6 +2987,15 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
     }
     auto& firstManager = mWindowBlockManagers.begin()->second;
     firstManager.unpinBlocksById(blockIds);
+}
+
+void BlockManager::unpinBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow)
+{
+    for (auto const& [windowSize, blockIds] : blockIdsPerWindow)
+    {
+        mWindowBlockManagers.at(windowSize).unpinBlocksById(blockIds);
+    }
 }
 
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
@@ -2867,6 +3010,12 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 
 void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    unpinBlocksByIdNoLock(blockIds);
+}
+
+void WindowBlockManager::unpinBlocksByIdNoLock(std::vector<KVCacheBlock::IdType> const& blockIds)
+{
     if (blockIds.empty())
     {
         return;
@@ -2880,6 +3029,7 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
             block->decRefCount();
+            ++mTransferLeaseReleaseBlocks;
             if (!block->hasRefs())
             {
                 mEvictionPolicy->releaseBlock(block);
@@ -3071,6 +3221,7 @@ void BlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 
 void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 {
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     for (auto& block : mAllocatedBlocksPerSeq.at(requestId))
     {
         // Decrease ref count
@@ -3908,9 +4059,22 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
     mBlockManager.pinBlocks(sequence);
 }
 
+std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> KVCacheManager::pinAndOnboardBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow, RequestIdType requestId,
+    executor::KvCacheTransferMode mode, std::string const& directory)
+{
+    return mBlockManager.pinAndOnboardBlocksById(blockIdsPerWindow, requestId, mode, directory);
+}
+
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     mBlockManager.unpinBlocksById(blockIds);
+}
+
+void KVCacheManager::unpinBlocksById(
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow)
+{
+    mBlockManager.unpinBlocksById(blockIdsPerWindow);
 }
 
 tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType blockId, SizeType32 windowSize) const

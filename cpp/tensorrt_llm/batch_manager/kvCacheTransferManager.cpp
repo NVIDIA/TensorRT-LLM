@@ -86,6 +86,11 @@ KVCacheTransferManager::KVCacheTransferManager(
     TLLM_CHECK(mDeviceId != -1);
 }
 
+void KVCacheTransferManager::setCudaDevice() const
+{
+    TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+}
+
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx)
 {
@@ -273,6 +278,9 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+    setCudaDevice();
+
     // Wait for any pending writes before reading from offloadedBlock
     auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlock->getMemoryPoolBlockIndex());
     if (offloadedBlockPendingWriteItr != mPendingWrites.end())
@@ -325,6 +333,9 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+    setCudaDevice();
+
     // Wait for any pending writes before reading from block
     auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
     if (blockPendingWriteItr != mPendingWrites.end())
@@ -366,6 +377,9 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
 
 void KVCacheTransferManager::syncWithBufferManager()
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+    setCudaDevice();
+
     tr::CudaEvent readyForOffloadEvent;
     mBufferManager.getStream().record(readyForOffloadEvent);
     mOffloadManager.getStream().wait(readyForOffloadEvent);
@@ -379,8 +393,16 @@ void KVCacheTransferManager::syncWithBufferManager()
     mPendingWrites.clear();
 }
 
-void KVCacheTransferManager::syncTransfers()
+bool KVCacheTransferManager::syncTransfers()
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+    setCudaDevice();
+
+    if (mPendingReads.empty() && mPendingWrites.empty())
+    {
+        return false;
+    }
+
     tr::CudaEvent offloadEvent;
     mOffloadManager.getStream().record(offloadEvent);
     mBufferManager.getStream().wait(offloadEvent);
@@ -392,6 +414,7 @@ void KVCacheTransferManager::syncTransfers()
     // Once we synchronize, clear our list of pending thransfers.
     mPendingReads.clear();
     mPendingWrites.clear();
+    return true;
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()

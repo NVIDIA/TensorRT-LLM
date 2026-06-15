@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -149,6 +149,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         return;
     }
 
+    bool const hasPendingTransferDependency = mCacheManager->syncPendingTransfersToBufferManager();
     bool hasIndexerKCache = mCacheManager->getIndexerKCachePool() != nullptr;
     std::vector<bool> transferringIndexerKCache;
     transferringIndexerKCache.push_back(false);
@@ -210,6 +211,10 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             TLLM_LOG_DEBUG("Try using zero-copy for the KV cache.");
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
+            if (hasPendingTransferDependency)
+            {
+                bufferManager.getStream().synchronize();
+            }
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (size_t i = 0; i < pickUpConnections.size(); i++)
             {

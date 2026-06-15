@@ -114,3 +114,9 @@ def test_metrics(client):
     assert "iterGenAllocBlocks" in ws_stats
     assert "iterOnboardBlocks" in ws_stats
     assert "iterOnboardBytes" in ws_stats
+    assert "iterTransferPinnedBlocks" in ws_stats
+    assert "iterTransferAlreadyPrimaryBlocks" in ws_stats
+    assert "iterTransferPrimaryBlockReservations" in ws_stats
+    assert "iterTransferOnboardedBlocks" in ws_stats
+    assert "iterTransferReservationFailures" in ws_stats
+    assert "iterTransferLeaseReleaseBlocks" in ws_stats

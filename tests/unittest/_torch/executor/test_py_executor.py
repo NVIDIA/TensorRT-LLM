@@ -248,6 +248,20 @@ class TestDisaggTerminationGuard:
         assert _classify_termination(req, True, False, 2) == "stats_only"
 
 
+def test_poll_disagg_ctx_cache_transfers_is_non_blocking() -> None:
+    ex = object.__new__(PyExecutor)
+    ex.kv_cache_transceiver = Mock()
+    ex.async_transfer_manager = Mock()
+    ex.async_transfer_manager.has_any_inflight_requests.return_value = True
+    ex._check_kv_transfer_timeout = Mock()
+    ex._check_disagg_ctx_cache_transfer_status = Mock()
+
+    ex._poll_disagg_ctx_cache_transfers()
+
+    ex._check_kv_transfer_timeout.assert_called_once_with()
+    ex._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+
+
 # ---------------------------------------------------------------------------
 # Tests for _compute_scheduled_tokens with KV cache reuse chunk-shift logic
 # ---------------------------------------------------------------------------

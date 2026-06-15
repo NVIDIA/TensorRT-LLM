@@ -68,7 +68,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 39);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 41);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -139,6 +139,14 @@ public:
         bool pinOnRelease = false) override
     {
         NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
+    }
+
+    std::unordered_map<SizeType32, std::vector<tbk::KVCacheBlock::IdType>> pinAndOnboardBlocksById(
+        std::unordered_map<SizeType32, std::vector<tbk::KVCacheBlock::IdType>> const& blockIdsPerWindow,
+        tb::LlmRequest::RequestIdType requestId, tensorrt_llm::executor::KvCacheTransferMode mode,
+        std::string const& directory) override
+    {
+        NB_OVERRIDE_PURE(pinAndOnboardBlocksById, blockIdsPerWindow, requestId, mode, directory);
     }
 
     std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
@@ -263,6 +271,11 @@ public:
         NB_OVERRIDE_PURE(syncTransferManagerWithBufferManager);
     }
 
+    bool syncPendingTransfersToBufferManager() override
+    {
+        NB_OVERRIDE_PURE(syncPendingTransfersToBufferManager);
+    }
+
     void refreshBlocks() override
     {
         NB_OVERRIDE_PURE(refreshBlocks);
@@ -271,6 +284,12 @@ public:
     void flushIterationEvents() override
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
+    }
+
+    void unpinBlocksById(
+        std::unordered_map<SizeType32, std::vector<tbk::KVCacheBlock::IdType>> const& blockIdsPerWindow) override
+    {
+        NB_OVERRIDE_PURE(unpinBlocksById, blockIdsPerWindow);
     }
 };
 
@@ -379,7 +398,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_offload_blocks", &tbk::KvCacheIterationStats::iterOffloadBlocks)
         .def_rw("iter_offload_bytes", &tbk::KvCacheIterationStats::iterOffloadBytes)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
-        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes);
+        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes)
+        .def_rw("iter_transfer_pinned_blocks", &tbk::KvCacheIterationStats::iterTransferPinnedBlocks)
+        .def_rw("iter_transfer_already_primary_blocks", &tbk::KvCacheIterationStats::iterTransferAlreadyPrimaryBlocks)
+        .def_rw("iter_transfer_primary_block_reservations",
+            &tbk::KvCacheIterationStats::iterTransferPrimaryBlockReservations)
+        .def_rw("iter_transfer_onboarded_blocks", &tbk::KvCacheIterationStats::iterTransferOnboardedBlocks)
+        .def_rw("iter_transfer_reservation_failures", &tbk::KvCacheIterationStats::iterTransferReservationFailures)
+        .def_rw("iter_transfer_lease_release_blocks", &tbk::KvCacheIterationStats::iterTransferLeaseReleaseBlocks);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(nb::init<>())
@@ -601,9 +627,13 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("sync_transfer_manager_with_buffer_manager", &BaseKVCacheManager::syncTransferManagerWithBufferManager,
             nb::call_guard<nb::gil_scoped_release>())
+        .def("sync_pending_transfers_to_buffer_manager", &BaseKVCacheManager::syncPendingTransfersToBufferManager,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("refresh_blocks", &BaseKVCacheManager::refreshBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("get_last_block_id", &BaseKVCacheManager::getLastBlockId, nb::call_guard<nb::gil_scoped_release>())
-        .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
+        .def("unpin_blocks_by_id",
+            nb::overload_cast<std::vector<tbk::KVCacheBlock::IdType> const&>(&BaseKVCacheManager::unpinBlocksById),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
         .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
             nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());

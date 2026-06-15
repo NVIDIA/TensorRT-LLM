@@ -35,6 +35,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
+from .stats_serialization import kv_cache_iteration_stats_to_dict
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
@@ -680,32 +681,9 @@ class BaseWorker(GenerationExecutor):
 
         # Inject per-iteration KV cache stats (keyed by window size)
         if kv_iter_stats is not None:
-            stats_dict["kvCacheIterationStats"] = {
-                str(window_size): {
-                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                    "iterReusedBlocks": s.iter_reused_blocks,
-                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                    "iterMissedBlocks": s.iter_missed_blocks,
-                    "iterCacheHitRate": s.iter_cache_hit_rate,
-                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                    "iterOnboardBlocks": s.iter_onboard_blocks,
-                    "iterOnboardBytes": s.iter_onboard_bytes,
-                    "iterOffloadBlocks": s.iter_offload_blocks,
-                    "iterOffloadBytes": s.iter_offload_bytes,
-                    "iterIntraDeviceCopyBlocks":
-                    s.iter_intra_device_copy_blocks,
-                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
-                }
-                for window_size, s in kv_iter_stats.items()
-            }
+            stats_dict[
+                "kvCacheIterationStats"] = kv_cache_iteration_stats_to_dict(
+                    kv_iter_stats)
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
