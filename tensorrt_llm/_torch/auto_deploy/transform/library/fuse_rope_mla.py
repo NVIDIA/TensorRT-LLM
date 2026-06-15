@@ -446,7 +446,7 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         try:
             _model_config, _ = factory._get_model_config()
             already_gptj = is_gptj_layout(_model_config)
-        except Exception:
+        except (AttributeError, AssertionError, KeyError, OSError, ValueError):
             already_gptj = False
 
         # Try to trace the RoPE pattern from the first MLA node.
