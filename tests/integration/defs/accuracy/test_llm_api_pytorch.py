@@ -48,6 +48,8 @@ from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)
 
+_NCCL_NVLS_DISABLED_ENV = {"NCCL_NVLS_ENABLE": "0"}
+
 
 # Keep helper definitions below imports so new imports do not need E402
 # suppressions in this legacy test file.
@@ -73,6 +75,11 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
     mocker.patch.object(MpiPoolSession, '_start_mpi_pool',
                         patched_start_mpi_pool)
+
+
+def disable_nccl_nvls_for_test(mocker):
+    mocker.patch.dict(os.environ, _NCCL_NVLS_DISABLED_ENV)
+    patch_mpi_pool_session_for_env(mocker, _NCCL_NVLS_DISABLED_ENV)
 
 
 def _get_default_torch_compile_config(torch_compile):
@@ -1698,7 +1705,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler,
-                            torch_compile):
+                            torch_compile, mocker):
+        if pp_size > 1:
+            disable_nccl_nvls_for_test(mocker)
+
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
             pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
@@ -1954,7 +1964,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile,
-                                    sampler_async_worker):
+                                    sampler_async_worker, mocker):
+        if pp_size > 1:
+            disable_nccl_nvls_for_test(mocker)
+
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -2390,12 +2403,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
-                         moe_backend):
+                         moe_backend, mocker):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
         if moe_backend == "CUTEDSL" and sm_version not in (100, 103):
             pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
+        if pp_size > 1:
+            disable_nccl_nvls_for_test(mocker)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
