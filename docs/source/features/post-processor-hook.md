@@ -155,11 +155,9 @@ shared across processes or across separate `LLM` instances; when the post-proces
 enabled, all chunks of a single request are still routed to the same worker, so per-request state
 remains consistent for that request.
 
-Engine-level batching is transparent to the hook: even when many requests are batched and run together
-in the engine, the hook is still invoked **once per request** (per output, per chunk), with
-`chunk.request_id` identifying which request the chunk belongs to. There is no batched-call form — the
-hook never receives more than one request's data in a single call, so keying state on `request_id` is
-sufficient to keep concurrent requests isolated.
+Engine-level batching is transparent to the hook: even when requests are batched together in the
+engine, the hook is invoked **once per request** (per output, per chunk) — there is no batched-call
+form — so keying state on `chunk.request_id` is sufficient to keep concurrent requests isolated.
 
 ## Supported endpoints and limitations
 

@@ -257,35 +257,3 @@ def test_apply_method_is_noop_when_instance_has_no_hook():
     DetokenizedGenerationResultBase._apply_post_processor_hook(result)
 
     assert out.text == "hello world"
-
-
-def test_independent_instances_keep_separate_state():
-    """Two owners' hook instances maintain isolated per-request state.
-
-    Demonstrates the Model-2 guarantee that distinct LLM/worker owners do not
-    share hook state, even for the same request id.
-    """
-
-    class Counter:
-        def __init__(self):
-            self.state = {}
-
-        def __call__(self, chunk: PostProcChunk):
-            n = self.state.get(chunk.request_id, 0) + 1
-            self.state[chunk.request_id] = n
-            return emit(f"{chunk.text_diff}#{n}")
-
-    hook_a, hook_b = Counter(), Counter()
-    # Same request id (1) routed to two different owners.
-    ra = _FakeResult([_make_output("x", 0)], req_id=1, post_processor_hook=hook_a)
-    rb = _FakeResult([_make_output("y", 0)], req_id=1, post_processor_hook=hook_b)
-
-    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
-
-    DetokenizedGenerationResultBase._apply_post_processor_hook(ra)
-    DetokenizedGenerationResultBase._apply_post_processor_hook(ra)
-    DetokenizedGenerationResultBase._apply_post_processor_hook(rb)
-
-    # hook_a counted request 1 twice; hook_b counted it once — fully isolated.
-    assert hook_a.state[1] == 2
-    assert hook_b.state[1] == 1

@@ -8,12 +8,9 @@ importable callable class via the ``--post_processor`` import path; trtllm
 builds one instance per owner (the ``LLM`` for the in-proxy detok path, and
 each post-processing worker process when enabled) and invokes it once per
 output, per streaming chunk (plus a final call), *after* detokenization and
-*before* the per-endpoint response formatter.
-
-Ownership is per-instance, not a process global: the hook instance is built by
-its owner and threaded onto each result alongside the tokenizer (see
-``DetokenizedGenerationResultBase``), so independent ``LLM`` instances in one
-process stay isolated.
+*before* the per-endpoint response formatter. Ownership is per-instance, not a
+process global: the instance is threaded onto each result alongside the
+tokenizer, so independent ``LLM`` instances in one process stay isolated.
 
 The hook owns its own per-request state (keyed by ``chunk.request_id``) exactly
 like Triton's model-managed ``self.sequences = {}`` pattern; trtllm passes only
@@ -141,12 +138,9 @@ def terminate(reason: str) -> PostProcVerdict:
 class PostProcessorHook(Protocol):
     """The interface a user post-processor implements.
 
-    The instance is built once per process (its ``__init__`` is the one-time
+    The instance is built once per owner (its ``__init__`` is the one-time
     setup) and called once per output, per chunk. It owns any per-request state
     and is responsible for releasing it on ``chunk.is_final``.
-
-    NOTE: rewriting/suppressing text does not rewrite the underlying token ids;
-    callers that read both text and token ids should expect them to diverge.
     """
 
     def __call__(self, chunk: PostProcChunk) -> PostProcVerdict: ...
@@ -176,12 +170,9 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     worker or crash the serving loop. This is consistent across the in-proxy and
     postproc-worker paths.
     """
-    # ``is_final`` is request-level (``result._done``), not per-output: a
-    # ``terminate`` verdict on one output marks the whole request done. Under the
-    # locked 1:1 single-output scope (TRTLLM-12622) this is exact; hooks key their
-    # per-request state on ``request_id`` and release it on ``is_final``, so
-    # request-level finality is the correct cleanup signal regardless of output
-    # count.
+    # ``is_final`` is request-level (``result._done``), not per-output; under the
+    # locked 1:1 single-output scope (TRTLLM-12622) this is the exact cleanup
+    # signal for hooks that release per-request state on ``is_final``.
     is_final = result._done
     for output in result.outputs:
         chunk = PostProcChunk(

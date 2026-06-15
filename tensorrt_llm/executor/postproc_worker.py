@@ -159,10 +159,9 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
-                # Thread this worker's owned hook onto the record (TRTLLM-12622),
-                # alongside the tokenizer the record_creator already received, so
-                # the detok chokepoint applies it. Set here (not in the
-                # record_creator signature) to keep custom record_creators working.
+                # Thread this worker's owned hook onto the record (TRTLLM-12622)
+                # for the detok chokepoint. Set here, not via the record_creator
+                # signature, so custom record_creators keep working.
                 self._records[
                     req_id]._post_processor_hook = self._post_processor_hook
                 if input.disaggregated_params is not None:
