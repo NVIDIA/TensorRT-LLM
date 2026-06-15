@@ -818,8 +818,7 @@ def _cbtsReportDecision(pipeline, globalVars, String status, String reason, Stri
         }
         // PR number for s_pr_number, mirroring perf_regression_utils: GitHub PR
         // builds carry it in github_pr_api_url (.../pulls/<n>); GitLab MR builds
-        // expose env.gitlabMergeRequestIid. Pass it explicitly since neither is
-        // in the shell env. Empty for post-merge/branch builds.
+        // expose env.gitlabMergeRequestIid. Empty for post-merge/branch builds.
         def prNumber = ""
         def prUrl = globalVars[GITHUB_PR_API_URL]
         if (prUrl) {
@@ -830,7 +829,10 @@ def _cbtsReportDecision(pipeline, globalVars, String status, String reason, Stri
         } else {
             prNumber = env.gitlabMergeRequestIid ?: ""
         }
-        sh "cd ${LLM_ROOT} && CBTS_PR_NUMBER='${prNumber}' python3 jenkins/scripts/cbts/tools/report_cbts_decision.py ${args}"
+        if (prNumber) {
+            args += " --pr-number ${prNumber}"
+        }
+        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/report_cbts_decision.py ${args}"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {

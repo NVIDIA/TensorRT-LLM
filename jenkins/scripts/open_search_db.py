@@ -177,6 +177,54 @@ class OpenSearchDB:
         data["_id"] = hashlib.md5(data_str).hexdigest()
 
     @staticmethod
+    def _postOnce(url, data, headers, use_poc_db):
+        """Send a single POST request and return (status_code, body_text).
+
+        Uses requests when available, otherwise falls back to urllib so
+        requests-free CI pods (e.g. the Setup Environment pod) can still post.
+        Connection-level failures propagate so the caller can retry.
+
+        :param url: Target URL.
+        :param data: Request body (str).
+        :param headers: Request headers (dict).
+        :param use_poc_db: Skip proxy auth when posting to the POC DB.
+        :return: tuple(int status_code, str body_text).
+        """
+        if requests is not None:
+            args = {
+                "url": url,
+                "data": data,
+                "headers": headers,
+                "timeout": POST_TIMEOUT_SECONDS,
+            }
+            if not use_poc_db:
+                args["auth"] = HTTPProxyAuth(OPEN_SEARCH_DB_USERNAME,
+                                             OPEN_SEARCH_DB_PASSWORD)
+            res = requests.post(**args)
+            return res.status_code, res.text
+
+        import base64
+        import urllib.error
+        import urllib.request
+
+        post_headers = dict(headers)
+        if not use_poc_db:
+            token = base64.b64encode(
+                f"{OPEN_SEARCH_DB_USERNAME}:{OPEN_SEARCH_DB_PASSWORD}".encode(
+                )).decode()
+            post_headers["Proxy-Authorization"] = f"Basic {token}"
+        req = urllib.request.Request(url,
+                                     data=data.encode("utf-8"),
+                                     headers=post_headers,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req,
+                                        timeout=POST_TIMEOUT_SECONDS) as resp:
+                return resp.status, ""
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+
+    @staticmethod
     def postToOpenSearchDB(json_data, project) -> bool:
         """
         Post data to OpenSearchDB.
@@ -218,34 +266,27 @@ class OpenSearchDB:
             "Accept-Charset": "UTF-8"
         }
 
+        last_text = "N/A"
         for attempt in range(DEFAULT_RETRY_COUNT):
             try:
-                args = {
-                    "url": url,
-                    "data": json_data_dump,
-                    "headers": headers,
-                    "timeout": POST_TIMEOUT_SECONDS,
-                }
-                if not use_poc_db:
-                    args["auth"] = HTTPProxyAuth(OPEN_SEARCH_DB_USERNAME,
-                                                 OPEN_SEARCH_DB_PASSWORD)
-                res = requests.post(**args)
-                if res.status_code in (200, 201, 202):
-                    if res.status_code != 200 and project == JOB_PROJECT_NAME:
+                status_code, last_text = OpenSearchDB._postOnce(
+                    url, json_data_dump, headers, use_poc_db)
+                if status_code in (200, 201, 202):
+                    if status_code != 200 and project == JOB_PROJECT_NAME:
                         OpenSearchDB.logger.info(
-                            f"OpenSearchDB post not 200, log:{res.status_code} {res.text}"
+                            f"OpenSearchDB post not 200, log:{status_code} {last_text}"
                         )
                     return True
                 else:
                     OpenSearchDB.logger.info(
-                        f"OpenSearchDB post failed, will retry, error:{res.status_code} {res.text}"
+                        f"OpenSearchDB post failed, will retry, error:{status_code} {last_text}"
                     )
             except Exception as e:
                 OpenSearchDB.logger.info(
                     f"OpenSearchDB post exception, attempt {attempt + 1} error: {e}"
                 )
         OpenSearchDB.logger.info(
-            f"Fail to postToOpenSearchDB after {DEFAULT_RETRY_COUNT} tries: {url}, json: {json_data_dump}, last error: {getattr(res, 'text', 'N/A') if 'res' in locals() else ''}"
+            f"Fail to postToOpenSearchDB after {DEFAULT_RETRY_COUNT} tries: {url}, json: {json_data_dump}, last error: {last_text}"
         )
         return False
 
