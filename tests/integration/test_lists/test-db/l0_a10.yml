@@ -35,16 +35,15 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_budget_split.py
   - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
-  - unittest/_torch/pyexecutor/test_kv_cache_compression_manager.py
-  - unittest/_torch/pyexecutor/test_error_classification.py
+  - unittest/_torch/executor/test_kv_cache_compression_manager.py
+  - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
   - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
   - unittest/_torch/modules/dwdp/test_dwdp_peer_ranges.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
-  - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
-  - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
+  - unittest/_torch/models/checkpoints
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
@@ -70,6 +69,8 @@ l0_a10:
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
   - unittest/disaggregated/test_mamba_transfer.py
+  - unittest/scaffolding
+  - unittest/tools
   - unittest/usage/test_collectors.py
   - unittest/usage/test_config.py
   - unittest/usage/test_opt_out.py
@@ -204,7 +205,7 @@ l0_a10:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - unittest/kv_cache_manager_v2_tests/ # 4 min
+  - unittest/kv_cache_manager_v2_tests # 4 min
   - unittest/dynamo
   - unittest/api_stability
   - unittest/bindings
@@ -247,6 +248,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - unittest/trt/quantization
+  - unittest/trt/python_plugin
   - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/test_model_runner_cpp.py

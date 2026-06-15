@@ -2298,9 +2298,6 @@
     "F403": 1,
     "F405": 13
   },
-  "tests/unittest/trt/model_api/profile_utils.py": {
-    "D415": 1
-  },
   "tests/unittest/trt/model_api/test_model_api_multi_gpu.py": {
     "D200": 1,
     "D300": 1,
