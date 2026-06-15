@@ -385,10 +385,10 @@ def validate_megamoe_tactic(tactic: Tuple) -> None:
     if (not isinstance(group_hint, int)) or isinstance(group_hint, bool) or group_hint <= 0:
         raise ValueError(f"group_hint must be a positive int, got {group_hint!r}.")
     if group_hint < 512:
-        logger.warning(
-            "[MegaMoE] group_hint=%d < 512; group_hint saturates around 512 "
-            "and smaller values are strictly worse.",
-            group_hint,
+        logger.warning_once(
+            f"[MegaMoE] group_hint={group_hint} < 512; group_hint saturates "
+            f"around 512 and smaller values are strictly worse.",
+            key="megamoe_group_hint_lt_512",
         )
 
     if load_balance_mode not in {"static", "atomic_counter"}:
@@ -760,7 +760,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 peer_ptr = int(self._handle.buffer_ptrs[r])
                 self.peer_offsets.append(peer_ptr - local_base)
 
-            logger.info(
+            logger.debug(
                 "[MegaMoeSymmMemProvider] group=%s rank=%d/%d total_bytes=%d "
                 "(activation=%d sf=%d topk_weights=%d combine=%d shared=%d)",
                 self.group_name,
@@ -1448,10 +1448,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
             compile_kwargs["max_active_clusters"] = hardware_info.get_max_active_clusters(
                 max(cluster_size, 1)
             )
-            # CuTe DSL compile is the dominant first-launch cost; log
-            # start/end at INFO so the long compile gap is visible through
-            # the standard TRT-LLM logger (honors TLLM_LOG_LEVEL).
-            logger.info(
+            # CuTe DSL compile is the dominant first-launch cost; log start/end
+            # at DEBUG only (the per-tactic compile-time stats must never appear
+            # at INFO on the normal serving path). Enable via TLLM_LOG_LEVEL=DEBUG
+            # when diagnosing the compile gap.
+            logger.debug(
                 f"[MegaMoECuteDsl] cute.compile START tactic="
                 f"(mma_tiler={mma_tiler}, cluster={cluster_shape}, "
                 f"group_hint={group_hint}, load_balance={load_balance_mode!r}, "
@@ -1462,7 +1463,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             t_compile_start = time.perf_counter()
             compiled = cute.compile(kernel, **compile_kwargs)
             t_compile_ms = (time.perf_counter() - t_compile_start) * 1000
-            logger.info(
+            logger.debug(
                 f"[MegaMoECuteDsl] cute.compile DONE in {t_compile_ms:.0f} ms "
                 f"(cache_keys_now={len(self.__class__.kernel_cache) + 1})"
             )
