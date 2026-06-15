@@ -245,3 +245,34 @@ def test_configured_hook_global_roundtrip():
     finally:
         set_configured_post_processor_hook(None)
     assert get_configured_post_processor_hook() is None
+
+
+def test_configured_hook_rejects_conflicting_registration():
+    """A conflicting in-process hook must fail fast (TRTLLM-12622).
+
+    A second, different hook in the same process is rejected rather than
+    silently clobbering the global and applying the wrong hook.
+    """
+    from tensorrt_llm.executor.postprocessor_hook import (
+        get_configured_post_processor_hook,
+        set_configured_post_processor_hook,
+    )
+
+    try:
+        set_configured_post_processor_hook("my_pkg.guardrail.A")
+        # Re-registering the same path is an idempotent no-op.
+        set_configured_post_processor_hook("my_pkg.guardrail.A")
+        assert get_configured_post_processor_hook() == "my_pkg.guardrail.A"
+
+        # A different non-None hook is rejected and the active one is unchanged.
+        with pytest.raises(RuntimeError, match="already registered"):
+            set_configured_post_processor_hook("my_pkg.guardrail.B")
+        assert get_configured_post_processor_hook() == "my_pkg.guardrail.A"
+
+        # Clearing to None is always allowed (e.g. on shutdown), after which a
+        # new hook can be registered.
+        set_configured_post_processor_hook(None)
+        set_configured_post_processor_hook("my_pkg.guardrail.B")
+        assert get_configured_post_processor_hook() == "my_pkg.guardrail.B"
+    finally:
+        set_configured_post_processor_hook(None)

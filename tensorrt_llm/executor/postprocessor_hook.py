@@ -52,8 +52,30 @@ _CONFIGURED_HOOK_PATH: Optional[str] = None
 
 
 def set_configured_post_processor_hook(import_path: Optional[str]) -> None:
-    """Record the configured hook import path for this process (or ``None``)."""
+    """Record the configured hook import path for this process (or ``None``).
+
+    The hook is process-global server configuration (one pipeline for all
+    requests in this process), so registering a *different* non-``None`` hook
+    while one is already active is rejected: a second ``LLM`` in the same
+    process with a conflicting ``--post_processor`` would otherwise silently
+    start applying the wrong hook to the already-running instance's responses.
+    Re-registering the same path is a no-op, and clearing to ``None`` (e.g. on
+    shutdown) is always allowed. In normal serving each server/rank process
+    hosts a single ``LLM``, so this only guards genuinely mixed-LLM processes.
+    """
     global _CONFIGURED_HOOK_PATH
+    if (
+        import_path is not None
+        and _CONFIGURED_HOOK_PATH is not None
+        and import_path != _CONFIGURED_HOOK_PATH
+    ):
+        raise RuntimeError(
+            "A different post-processor hook is already registered in this "
+            f"process ({_CONFIGURED_HOOK_PATH!r}); refusing to register "
+            f"{import_path!r}. The post-processing hook is process-global "
+            "configuration; running multiple LLMs with different "
+            "--post_processor values in one process is not supported."
+        )
     _CONFIGURED_HOOK_PATH = import_path
 
 
@@ -206,8 +228,8 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     """
     # ``is_final`` is request-level (``result._done``), not per-output: a
     # ``terminate`` verdict on one output marks the whole request done. Under the
-    # locked 1:1 single-output scope (TRTLLM-12622 §15.1) this is exact; hooks key
-    # their per-request state on ``request_id`` and release it on ``is_final``, so
+    # locked 1:1 single-output scope (TRTLLM-12622) this is exact; hooks key their
+    # per-request state on ``request_id`` and release it on ``is_final``, so
     # request-level finality is the correct cleanup signal regardless of output
     # count.
     is_final = result._done

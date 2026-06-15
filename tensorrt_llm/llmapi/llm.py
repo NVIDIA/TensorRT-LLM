@@ -237,12 +237,18 @@ class BaseLLM:
         from ..executor.postprocessor_hook import (
             get_post_processor_hook, set_configured_post_processor_hook)
         _post_processor_hook = getattr(self.args, "post_processor", None)
-        set_configured_post_processor_hook(_post_processor_hook)
         if _post_processor_hook:
             # Resolve eagerly so a bad import path fails fast at startup (and
             # primes the per-process build-once cache) rather than erroring on
-            # the first request.
+            # the first request. Validate BEFORE recording the process-global so
+            # a failed import leaves no stale hook registered for this process.
             get_post_processor_hook(_post_processor_hook)
+        # Record the configured hook for this process. Raises if a different
+        # hook is already registered in-process (mixed-LLM process), so a second
+        # instance can never silently apply the wrong hook to the first's
+        # responses.
+        set_configured_post_processor_hook(_post_processor_hook)
+        self._post_processor_hook = _post_processor_hook
 
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
@@ -1203,6 +1209,15 @@ class BaseLLM:
         if hasattr(self, 'mpi_session') and self.mpi_session is not None:
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+        # Release this process's post-processor hook registration so a
+        # subsequent LLM with a different --post_processor can be created in the
+        # same process (e.g. sequential use in tests or notebooks).
+        if getattr(self, "_post_processor_hook", None):
+            from ..executor.postprocessor_hook import \
+                set_configured_post_processor_hook
+            set_configured_post_processor_hook(None)
+            self._post_processor_hook = None
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.

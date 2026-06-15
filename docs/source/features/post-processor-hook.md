@@ -153,6 +153,12 @@ any per-request state must be keyed by `chunk.request_id` and released when `chu
 enabled, all chunks of a single request are still routed to the same worker, so per-request state
 remains consistent for that request.
 
+Engine-level batching is transparent to the hook: even when many requests are batched and run together
+in the engine, the hook is still invoked **once per request** (per output, per chunk), with
+`chunk.request_id` identifying which request the chunk belongs to. There is no batched-call form — the
+hook never receives more than one request's data in a single call, so keying state on `request_id` is
+sufficient to keep concurrent requests isolated.
+
 ## Supported endpoints and limitations
 
 - **Endpoints**: `chat/completions` and `completions`, both streaming and non-streaming. The hook also
