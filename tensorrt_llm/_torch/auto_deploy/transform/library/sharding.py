@@ -412,6 +412,11 @@ class ShardingTransformInfo(BaseModel, ABC):
 
     target_node: str
     config: ShardingTransformConfig
+    # Weight/param name (e.g. "...self_attn.q_a_proj.weight") resolved at from_node()
+    # time, where the FX node is available. exclude_shard_node_filter is documented in
+    # weight-name terms, so the central exclusion check matches against this (falling
+    # back to target_node). None when the node has no extractable weight.
+    weight_name: Optional[str] = None
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -440,16 +445,17 @@ class ShardingTransformInfo(BaseModel, ABC):
         return True
 
     def __hash__(self) -> int:
-        """Make the transform info hashable by excluding the config field.
+        """Make the transform info hashable by excluding non-identity fields.
 
-        The config field is excluded because:
-        1. It may not be hashable (ShardingTransformConfig is mutable)
-        2. Tests set config=None before comparison anyway
+        Excluded:
+        - config: may not be hashable (ShardingTransformConfig is mutable); tests
+          set config=None before comparison anyway.
+        - weight_name: derived from the node (hence from target_node), so it is
+          redundant for identity; tests construct expected transforms without it.
         """
-        # Get all fields except 'config' for hashing
         field_values = []
         for field_name, field_info in self.model_fields.items():
-            if field_name != "config":
+            if field_name not in ("config", "weight_name"):
                 value = getattr(self, field_name)
                 # Handle enums
                 if isinstance(value, (Enum, IntEnum)):
@@ -491,7 +497,12 @@ class WeightShardingInfo(ShardingTransformInfo):
         Create the correct TPShardingInfo subclass (FP8/FP4/base) based on `node`.
         """
         subcls = _resolve_tp_cls_from_node(node)
-        return subcls(target_node=node.name, **kwargs)
+        wname = extract_weight_name(node)
+        return subcls(
+            target_node=node.name,
+            weight_name=wname if isinstance(wname, str) else None,
+            **kwargs,
+        )
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -946,7 +957,12 @@ class EPShardingInfo(ShardingTransformInfo):
         Create the correct EPShardingInfo subclass (FP8/NVFP4/base) based on `node`.
         """
         subcls = _resolve_ep_cls_from_node(node)
-        return subcls(target_node=node.name, **kwargs)
+        wname = extract_weight_name(node)
+        return subcls(
+            target_node=node.name,
+            weight_name=wname if isinstance(wname, str) else None,
+            **kwargs,
+        )
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -1422,7 +1438,7 @@ class ShardingTransformContainer(BaseModel):
         # Global node-exclusion filter -- keeps matching nodes replicated
         # regardless of which sharding heuristic picked them up.
         if isinstance(transform, (WeightShardingInfo, EPShardingInfo)) and _is_node_excluded(
-            transform.target_node, self.config
+            transform.weight_name or transform.target_node, self.config
         ):
             ad_logger.info(
                 f"Skipping sharding for node {transform.target_node!r} "
