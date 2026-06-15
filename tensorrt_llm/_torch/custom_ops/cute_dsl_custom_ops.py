@@ -6005,6 +6005,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
                                   output_indices, order_row)
 
+    # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
+    # into this op to activate the kernel's ``seqlen_sorted=True`` LJF
+    # branch (longer rows land in earlier waves). argsort runs on device,
+    # graph-safe. Recommended gate:
+    #   num_rows > num_sms  AND  max_seq_len >= 64 * 1024
+    # Stricter (theoretically exact) form is
+    # ``num_rows > num_sms * occupancy``; ``> num_sms`` works in
+    # practice because some configs land at occupancy=1. Wave-2 must
+    # exist for sort to compress makespan; short rows show negligible
+    # win and can regress a few percent.
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
