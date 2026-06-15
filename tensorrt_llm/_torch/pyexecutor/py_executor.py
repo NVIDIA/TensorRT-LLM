@@ -4234,10 +4234,92 @@ class PyExecutor:
                     ] * self.model_engine.max_total_draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.py_beam_width
+                if not self._update_sampler_state_for_disagg_gen_request(
+                        req, beam_width, first_gen_tokens):
+                    continue
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+    def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
+                                                     first_gen_tokens) -> bool:
+        """Update beam sampler state with context-side first-token data."""
+        if beam_width <= 1:
+            return True
+
+        def fail_request(message: str) -> bool:
+            logger.error(message)
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            return False
+
+        seq_slot = req.py_seq_slot
+        if seq_slot is None:
+            return fail_request(
+                "Cannot update sampler state for disagg beam request "
+                f"{req.py_request_id}: seq slot is not assigned.")
+
+        sampler_store = getattr(self.sampler, 'store', None)
+        beam_search_store = getattr(sampler_store, 'beam_search_store', None)
+        if beam_search_store is None:
+            return fail_request(
+                "Cannot update sampler state for disagg beam request "
+                f"{req.py_request_id}: sampler has no beam search store.")
+        if len(first_gen_tokens) < beam_width:
+            return fail_request(
+                "Invalid first_gen_tokens length for disagg beam "
+                f"request {req.py_request_id}: "
+                f"{len(first_gen_tokens)} < {beam_width}")
+
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return fail_request(
+                "No disaggregated params available for disagg beam "
+                f"request {req.py_request_id}.")
+
+        first_gen_log_probs = getattr(disagg_params, 'first_gen_log_probs',
+                                      None)
+        if first_gen_log_probs is None:
+            return fail_request(
+                "No first_gen_log_probs available for disagg beam "
+                f"request {req.py_request_id}.")
+
+        if len(first_gen_log_probs) != beam_width:
+            return fail_request(
+                "Invalid first_gen_log_probs length for disagg beam "
+                f"request {req.py_request_id}: "
+                f"{len(first_gen_log_probs)} != {beam_width}")
+
+        first_gen_scores = []
+        for beam_idx, (token_id, token_log_probs) in enumerate(
+                zip(first_gen_tokens[:beam_width], first_gen_log_probs)):
+            token_log_prob = token_log_probs.get(token_id)
+            if token_log_prob is None:
+                return fail_request(
+                    "Missing first_gen_log_probs entry for disagg beam "
+                    f"request {req.py_request_id}: beam={beam_idx}, "
+                    f"token_id={token_id}")
+            first_gen_scores.append(token_log_prob.logprob)
+
+        original_tokens = beam_search_store.original_tokens
+        first_gen_token_values = torch.tensor(first_gen_tokens[:beam_width],
+                                              device=original_tokens.device,
+                                              dtype=original_tokens.dtype)
+        original_tokens[seq_slot, :beam_width,
+                        req.prompt_len].copy_(first_gen_token_values)
+        cache_indirection = beam_search_store.cache_indirection
+        beam_idx_arange = torch.arange(beam_width,
+                                       device=original_tokens.device,
+                                       dtype=cache_indirection.dtype)
+        cache_indirection[seq_slot, :beam_width,
+                          req.prompt_len].copy_(beam_idx_arange)
+
+        cum_log_probs = beam_search_store.cum_log_probs
+        values = torch.tensor(first_gen_scores,
+                              device=cum_log_probs.device,
+                              dtype=cum_log_probs.dtype)
+        cum_log_probs[seq_slot, :beam_width].copy_(values)
+        return True
 
     def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
         """Prepend logprobs and generation logits for first_gen_tokens
@@ -4248,10 +4330,7 @@ class PyExecutor:
 
         if getattr(disagg_params, 'first_gen_log_probs', None) is not None:
             if beam_width != 1:
-                logger.warning(
-                    "Skipping first_gen_log_probs prepend for "
-                    "request %s: beam_width=%s is not supported.",
-                    req.py_request_id, beam_width)
+                pass
             else:
                 req.py_result.append_log_probs(
                     [disagg_params.first_gen_log_probs])
@@ -5157,9 +5236,6 @@ class PyExecutor:
         return new_target_inputs, num_accepted_tokens_device
 
     def reset_prefix_cache(self):
-        if self.active_requests or self.waiting_queue:
-            raise RuntimeError(
-                "reset_prefix_cache() requires no active or queued requests.")
         self.kv_cache_manager.reset_reuse_state()
 
     def _handle_guided_decoder_errors(

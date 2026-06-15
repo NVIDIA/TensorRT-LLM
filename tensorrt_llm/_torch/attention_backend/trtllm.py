@@ -500,7 +500,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets = None
             self.block_ids_per_seq = None
 
-        prompt_lens = torch.tensor(
+        prompt_lens = torch.as_tensor(
             self.prompt_lens,
             dtype=torch.int,
             device='cpu',
@@ -1753,6 +1753,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert (forward_args.is_fused_qkv and k is None
                 and v is None) or (not forward_args.is_fused_qkv
                                    and k is not None and v is not None)
+        if forward_args.cu_q_seqlens is None:
+            forward_args.cu_q_seqlens = metadata.cu_q_seqlens
+        if forward_args.cu_kv_seqlens is None:
+            forward_args.cu_kv_seqlens = metadata.cu_kv_seqlens
 
         # ``SkipSoftmax`` configs contribute nothing here — their thresholds
         # are read via the ``skip_softmax_threshold_scale_factor_*``

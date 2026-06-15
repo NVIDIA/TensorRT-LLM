@@ -188,9 +188,8 @@ _MROPE_NUM_AXES = 3
 
 def _make_warmup_mrope_position_ids(token_num: int) -> torch.Tensor:
     """Build (_MROPE_NUM_AXES, 1, token_num) mrope_position_ids for warmup."""
-    return (torch.arange(0, token_num,
-                         dtype=torch.int32).expand(_MROPE_NUM_AXES, 1,
-                                                   -1).clone())
+    return (torch.arange(0, token_num, dtype=torch.int32,
+                         device="cuda").expand(_MROPE_NUM_AXES, 1, -1).clone())
 
 
 def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
@@ -209,7 +208,7 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
     }
     if is_gen:
         mrope_config["mrope_position_deltas"] = torch.zeros(
-            1, dtype=torch.int32).unsqueeze(0)
+            1, dtype=torch.int32, device="cuda").unsqueeze(0)
     if req.py_multimodal_data is None:
         req.py_multimodal_data = {}
     req.py_multimodal_data["mrope_config"] = mrope_config
@@ -1239,7 +1238,9 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
+        beam_width: Optional[int] = 1,
     ) -> List[List[int]]:
+        beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
                 if len(self.max_attention_window_vec) > 1:
@@ -1255,9 +1256,29 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
-            assert (len(result[i])) == 1
-            result[i] = result[i][0]
+            beams = [list(beam) for beam in result[i]]
+            assert len(beams) == beam_width, (
+                f"Expected {beam_width} index arrays per request, got {len(beams)}"
+            )
+            result[i] = beams[
+                0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
         return result
+
+    @staticmethod
+    def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:
+        """Pack beam-search blocks into a flat beam-0 layout.
+
+        The first beam owns the shared prompt blocks. For every other beam,
+        append only the final block when it differs from beam 0's final block.
+        """
+        if not beams:
+            return []
+        packed = list(beams[0])
+        beam0_last = beams[0][-1] if beams[0] else None
+        for beam in beams[1:]:
+            if beam and beam[-1] != beam0_last:
+                packed.append(beam[-1])
+        return packed
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:
