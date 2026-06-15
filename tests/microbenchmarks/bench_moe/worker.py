@@ -28,7 +28,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from mpi4py import MPI
@@ -70,6 +70,18 @@ _MPIPoolExecutor = _try_import("mpi4py.futures", "MPIPoolExecutor")
 POISON_HERE_PREFIX = "cuda_context_poisoned_after_success"
 POISON_UPSTREAM_PREFIX = "cuda_context_poisoned_upstream"
 WATCHDOG_UPSTREAM_PREFIX = "watchdog_timeout_upstream"
+# Terminal (status="failed") marker for a candidate the watchdog killed for
+# exceeding its wall-clock budget. NOT suffixed "_upstream": is_completed_for_resume
+# treats status="failed" as terminal, so --resume_from SKIPS it (does not re-attempt
+# and re-hang) while still surfacing the hang as a result row with a clear reason.
+WATCHDOG_TIMEOUT_PREFIX = "watchdog_timeout"
+# Terminal (status="failed") placeholder pre-written for the in-flight candidate
+# BEFORE it runs. If the process dies mid-candidate in a way nothing else can
+# record -- a CUDA device-side assert that aborts the MPI step, OOM-kill,
+# SIGSEGV, node loss -- this persisted row makes the candidate terminal so
+# --resume_from skips it and advances. Replaced with the real result on normal
+# completion. Like WATCHDOG_TIMEOUT_PREFIX, NOT suffixed "_upstream".
+INCOMPLETE_PREFIX = "incomplete"
 BENCH_MOE_POISON_EXIT_CODE = 75
 
 
@@ -182,11 +194,29 @@ def allreduce_poison_reason(local_reason: Optional[str]) -> Optional[str]:
 
 
 class CandidateWatchdog:
-    """Hard wall-clock guard around one candidate; SIGKILLs the process on timeout."""
+    """Hard wall-clock guard around one candidate; SIGKILLs the process on timeout.
 
-    def __init__(self, budget_s: float, label: str):
+    On timeout the guard first invokes ``on_timeout`` (used to record the hung
+    candidate as a terminal ``failed`` result + checkpoint so it is not silently
+    lost and is skipped on ``--resume_from`` rather than re-attempted), then
+    SIGKILLs to break the wedged CUDA/NCCL state. A genuine hang cannot be
+    recovered in-process, so the kill is unavoidable; ``on_timeout`` makes it a
+    recorded outcome instead of a vanished one.
+    """
+
+    def __init__(
+        self,
+        budget_s: float,
+        label: str,
+        on_timeout: Optional[Callable[[], None]] = None,
+        rank0_persist_grace_s: float = 8.0,
+    ):
         self._budget_s = float(budget_s)
         self._label = label
+        self._on_timeout = on_timeout
+        # Non-rank-0 ranks wait this long before SIGKILL so rank 0 can persist the
+        # checkpoint before the first task exit tears down the whole srun step.
+        self._rank0_persist_grace_s = float(rank0_persist_grace_s)
         self._cancelled = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -211,16 +241,35 @@ class CandidateWatchdog:
     def _guard(self) -> None:
         if self._cancelled.wait(self._budget_s):
             return
+        rank = mpi_rank()
         try:
             sys.stderr.write(
                 f"[bench_moe watchdog] candidate '{self._label}' exceeded "
                 f"{self._budget_s:.1f}s budget on pid={os.getpid()} "
-                f"rank={mpi_rank()}; sending SIGKILL to break suspected "
-                f"NCCL deadlock or CUDA hang.\n"
+                f"rank={rank}; recording it as a failed (timeout) result, then "
+                f"sending SIGKILL to break suspected NCCL deadlock or CUDA hang.\n"
             )
             sys.stderr.flush()
         except Exception:
             pass
+        # Record the hung candidate as a terminal failed row + checkpoint. Rank 0
+        # writes; other ranks no-op (see _emit_checkpoint_report). The main thread
+        # is blocked in a GIL-releasing CUDA call, so this watchdog thread can run.
+        if self._on_timeout is not None:
+            try:
+                self._on_timeout()
+            except Exception as exc:  # never let bookkeeping block the kill
+                try:
+                    sys.stderr.write(
+                        f"[bench_moe watchdog] on_timeout callback failed "
+                        f"({type(exc).__name__}: {exc}); killing anyway.\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+        # Let rank 0 flush its checkpoint before the first SIGKILL aborts the step.
+        if rank != 0 and self._rank0_persist_grace_s > 0:
+            time.sleep(self._rank0_persist_grace_s)
         os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -518,8 +567,52 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
         )
         _maybe_print_rank0(f"[bench_moe] running {case_label}")
 
+        # Pre-write a terminal "failed" placeholder for THIS candidate and
+        # checkpoint it BEFORE running. If the process then dies mid-candidate in
+        # a way nothing else can catch -- a CUDA device-side assert that aborts
+        # the MPI step, OOM-kill, SIGSEGV, node loss -- this persisted row keeps
+        # the candidate terminal, so --resume_from skips it and advances to the
+        # next one instead of re-attempting (and re-crashing on) the same
+        # candidate forever. On normal completion it is replaced with the real
+        # result below. Only the in-flight candidate gets a placeholder;
+        # not-yet-run candidates have no row and are still attempted on resume.
+        placeholder = _make_skipped_run_result(
+            model=ctx.model,
+            workload=workload,
+            config=cand,
+            world_size=world_size,
+            analysis=ctx.analysis,
+            reason=(
+                f"{INCOMPLETE_PREFIX}: process died before this candidate "
+                f"finished (crash/abort/OOM/kill) ({case_label})"
+            ),
+        )
+        placeholder.status = "failed"
+        placeholder.status_per_rank = {f"rank{i}": "incomplete" for i in range(world_size)}
+        accumulated_rows.append(_runresult_to_row(placeholder))
+        _emit_checkpoint_report(args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size)
+
+        # If the watchdog fires (suspected hang), overwrite the placeholder's
+        # reason with the precise timeout text and re-checkpoint before SIGKILL,
+        # so the hang is surfaced as a clear result (the row is already terminal).
+        def _record_watchdog_timeout(
+            _label: str = case_label,
+            _budget_s: float = watchdog_budget_s,
+        ) -> None:
+            if accumulated_rows:
+                accumulated_rows[-1]["skip_reason"] = (
+                    f"{WATCHDOG_TIMEOUT_PREFIX}: exceeded {_budget_s:.0f}s; "
+                    f"suspected NCCL/CUDA hang ({_label})"
+                )
+                accumulated_rows[-1]["status_per_rank"] = {
+                    f"rank{i}": "timeout" for i in range(world_size)
+                }
+            _emit_checkpoint_report(
+                args=args, ctx=ctx, rows=accumulated_rows, world_size=world_size
+            )
+
         # Hard wall-clock guard around the actual candidate execution.
-        with CandidateWatchdog(watchdog_budget_s, case_label):
+        with CandidateWatchdog(watchdog_budget_s, case_label, on_timeout=_record_watchdog_timeout):
             with torch.device(device):
                 r = _run_one_candidate(
                     model=ctx.model,
@@ -539,8 +632,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace, launcher: 
                     input_cache=input_cache,
                     enable_perfect_router_requested=bool(args.enable_perfect_router),
                 )
+        # Candidate finished normally: replace the pre-written placeholder (the
+        # last row) with the real result.
         row = _runresult_to_row(r)
-        accumulated_rows.append(row)
+        accumulated_rows[-1] = row
         if rank == 0:
             print(json.dumps(row, indent=2), flush=True)
 

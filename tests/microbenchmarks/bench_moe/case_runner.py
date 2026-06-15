@@ -561,6 +561,7 @@ def _resolve_layout_and_plan(
                 top_k=int(model.top_k),
                 num_experts=int(model.num_experts),
                 moe_ep_size=int(moe_ep_size),
+                enable_dp=bool(_enable_dp),
             )
         except Exception as exc:
             reason = f"routing plan error: {type(exc).__name__}: {exc}"
@@ -568,7 +569,7 @@ def _resolve_layout_and_plan(
             return _short_circuit(result, "skipped", reason)
         per_rank = list(routing_plan.per_rank_num_tokens)
     else:
-        per_rank = _per_rank_tokens(workload, world_size)
+        per_rank = _per_rank_tokens(workload, world_size, enable_dp=bool(_enable_dp))
 
     return int(moe_ep_size), per_rank, routing_plan
 
@@ -662,6 +663,11 @@ def _run_one_candidate(
     result.moe_ep_size = int(mapping.moe_ep_size)
     result.moe_tp_size = int(mapping.moe_tp_size)
     result.enable_attention_dp = bool(mapping.enable_attention_dp)
+
+    # TEP/TTP (no attention DP): no cross-rank dispatch; the scheduler fills
+    # all_rank_num_tokens from x.shape[0]. Pass None to follow that path.
+    if not mapping.enable_attention_dp:
+        all_rank_num_tokens = None
 
     AutoTuner.get().setup_distributed_state(mapping)
     AutoTuner.get().clear_cache()

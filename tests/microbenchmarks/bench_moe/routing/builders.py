@@ -115,23 +115,35 @@ def _build_per_rank_num_tokens(
     spec: RoutingControlSpec,
     num_tokens: int,
     world_size: int,
+    enable_dp: bool,
 ) -> List[int]:
     """Resolve ``per_rank_num_tokens`` for a workload.
 
-    Explicit ``spec.per_rank_num_tokens`` wins; otherwise tokens are split
-    evenly across ranks with any remainder on rank 0.
+    Explicit ``spec.per_rank_num_tokens`` wins; otherwise the token count per
+    rank depends on the attention-DP setting:
+
+    * ``enable_dp=True``  (DEP / DTP): tokens are DP-sharded across ranks, so
+      each rank holds ``num_tokens / world_size``.
+    * ``enable_dp=False`` (TEP / TTP): attention is tensor-parallel, so every
+      rank sees the complete batch and holds ``num_tokens``.
+
+    When an explicit list is provided its sum is validated against the expected
+    total (``num_tokens`` for DP modes, ``num_tokens * world_size`` for non-DP).
     """
     if spec.per_rank_num_tokens is None:
+        if not enable_dp:
+            return [int(num_tokens)] * world_size
         return _distribute_tokens(int(num_tokens), world_size)
+    expected_total = int(num_tokens) * (1 if enable_dp else world_size)
     return _validate_per_rank_token_list(
-        spec.per_rank_num_tokens, world_size=world_size, expected_total=int(num_tokens)
+        spec.per_rank_num_tokens, world_size=world_size, expected_total=expected_total
     )
 
 
-def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
+def _per_rank_tokens(workload: WorkloadSpec, world_size: int, enable_dp: bool) -> List[int]:
     """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
     return _build_per_rank_num_tokens(
-        workload.routing_control, int(workload.num_tokens), world_size
+        workload.routing_control, int(workload.num_tokens), world_size, enable_dp
     )
 
 
@@ -309,6 +321,7 @@ def _build_routing_plan(
     top_k: int,
     num_experts: int,
     moe_ep_size: int,
+    enable_dp: bool,
 ) -> RoutingPlan:
     """Translate a ``RoutingControlSpec`` into a canonical normalised plan."""
     if moe_ep_size <= 0 or num_experts % moe_ep_size != 0:
@@ -318,7 +331,7 @@ def _build_routing_plan(
     experts_per_rank = num_experts // moe_ep_size
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
-    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size)
+    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size, enable_dp)
     # The dispatch matrix is indexed by EP rank on both axes. The current
     # worker only calls routing-control planning when ``moe_ep_size`` equals
     # ``world_size`` so that this EP-axis matrix also matches the user-visible
