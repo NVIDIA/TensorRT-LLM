@@ -240,7 +240,7 @@ class TestWanVsaSparse:
     def test_sparse_vsa(self):
         pipeline = _load_vsa_pipeline(WAN21_VSA_PATH, vsa_sparsity=0.9)
         try:
-            attn_cfg = pipeline.model_config.attention
+            attn_cfg = pipeline.pipeline_config.primary_model_config.attention
             assert attn_cfg.backend == "CUTEDSL"
             assert attn_cfg.sparse_attention_config.vsa_sparsity == 0.9
 
