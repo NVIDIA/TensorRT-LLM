@@ -71,10 +71,12 @@ def inplace_info():
             2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
-            1: "output"
+            1: "output",
+            2: "output_sf"
         },
         torch.ops.trtllm.mla_dsa_attn_inplace.default: {
-            1: "output"
+            1: "output",
+            2: "output_sf"
         },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"

@@ -327,6 +327,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_swiglu_fusion import \
         Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
+    from ..cute_dsl_kernels.blackwell.dense_gemm_nvfp4_out import \
+        PersistentDenseGemmNVFP4OutKernel
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
@@ -6733,6 +6735,486 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL bf16 bmm output dtype must be bf16"
         assert output.shape == (
             batch_size, m, n), "CuTe DSL bf16 bmm output shape is incorrect"
+
+    # ======================================================================
+    # BF16-in / NVFP4-out Dense Persistent BMM (CuTe DSL) for Blackwell
+    #
+    # Fuses the standalone BF16->NVFP4 quantize into the BF16 V-up bmm
+    # epilogue (DeepSeek-V3.2 MLA decode, v_b_proj absorption). The bmm
+    # directly emits packed E2M1 + swizzled E4M3 block scale factors so the
+    # downstream o_proj NVFP4 GEMM can consume them without a separate
+    # quantize kernel.
+    #
+    # A      : BF16 [L, M, K]  (= attn_out_latent.transpose(0, 1),
+    #          L = num_heads, M = seq, K = kv_lora_rank). M may be a
+    #          non-contiguous (transposed) view -> explicit A strides.
+    # B      : BF16 [L, N, K]  (= v_b_proj, N = v_head_dim, K-major).
+    # C      : packed FP4 [M, L, N//2] uint8 (M-major: M outer, then head L,
+    #          then the head's N//2 packed bytes). This is byte-identical to
+    #          the monolithic [M, L*(N//2)] row-major activation the o_proj
+    #          NVFP4 GEMM consumes, so .reshape(M, L*(N//2)) is ZERO copy. The
+    #          kernel writes this byte order via a permuted-stride C cute
+    #          tensor (M stride = L*N, L stride = N, N stride = 1, in FP4
+    #          elements) -- TMA stores it directly, no post-kernel transpose.
+    # SFC    : ONE monolithic E4M3 swizzled SF over the logical [M, L*N]
+    #          activation: pad_up(M, 128) * pad_up((L*N) // sf_vec_size, 4)
+    #          elements -- exactly what fp4_quantize([M, L*N]) produces with
+    #          batchIdx=None. This is what the downstream o_proj NVFP4 GEMM
+    #          consumes.
+    # sf_scale: float32 device scalar (= o_proj.input_scale).
+    #
+    # Because N (= v_head_dim) is a multiple of sf_vec_size AND N // sf_vec_size
+    # is a multiple of the swizzle K-tile width (4), head boundaries fall on
+    # K-tile boundaries -- heads stay independent in the monolithic SF, with no
+    # cross-head reduction. A per-head SF stacked along L would be byte-
+    # identical only for M <= 128; for M > 128 (decode) it diverges, so the
+    # kernel emits the monolithic layout.
+    # ======================================================================
+
+    class CuteDSLNVFP4OutBlackwellBmmRunner(TunableRunner):
+        kernel_class = PersistentDenseGemmNVFP4OutKernel
+        kernel_cache = dict()
+        sf_vec_size = 16
+
+        tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 1, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ), )
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__()
+            self.use_tvm_ffi = use_tvm_ffi
+
+        # NOTE: the SF buffer is sized EXACTLY pad_up(M,128)*pad_up(K//16,4)
+        # (see bmm_nvfp4_out_sfc_numel) -- no CTA-tile overrun slack. Tactics
+        # whose CTA-M tile / cluster grouping would write SF rows past
+        # pad_up(M,128) are filtered out here by can_implement
+        # (PersistentDenseGemmNVFP4OutKernel.is_sf_write_in_bounds), so every
+        # selectable tactic is safe with the exact-size buffer.
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[int]:
+
+            if not is_sm_100f():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    f"CuteDSL NVFP4-out BMM only supports SM 100 family. "
+                    f"Skipping all tactics.")
+                return []
+            # [L, M, K]
+            batch_size, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[
+                0].shape[2]
+            # [L, N, K]
+            n = inputs[1].shape[1]
+            a_major = "k"
+            b_major = "k"
+            c_major = "n"
+
+            use_2cta_instrs_candi = [False, True]
+            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candi = [
+                (1, 1),
+                (1, 2),
+                (1, 4),
+                (2, 1),
+                (2, 2),
+                (2, 4),
+                (4, 1),
+                (4, 2),
+                (4, 4),
+            ]
+            return [
+                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
+                for use_2cta_instrs in use_2cta_instrs_candi
+                for mma_tiler_mn in mma_tiler_mn_candi
+                for cluster_shape_mn in cluster_shape_mn_candi
+                if self.__class__.kernel_class.can_implement(
+                    cutlass.BFloat16,  # ab_dtype
+                    cutlass.Float32,  # acc_dtype
+                    cutlass.Float4E2M1FN,  # c_dtype
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_major,
+                    b_major,
+                    c_major,
+                    self.__class__.sf_vec_size,
+                )
+            ]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            """
+            Performs bf16-in / nvfp4-out dense persistent batched gemm using
+            CuTe DSL, fusing the BF16->NVFP4 quantize into the epilogue.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: A tensor [L, M, K], dtype bf16 (M may be a
+                        non-contiguous transposed view).
+                    inputs[1]: B tensor [L, N, K], dtype bf16, K-major.
+                    inputs[2]: sf_scale, float32 scalar device tensor.
+                    inputs[3]: packed FP4 output C [M, L, N//2], uint8
+                        (M-major; reshapes zero-copy to monolithic
+                        [M, L*(N//2)] row-major).
+                    inputs[4]: E4M3 SFC output, 1D, dtype uint8.
+                tactic: (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn).
+            """
+            if isinstance(tactic, tuple):
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
+                    False,
+                    (128, 128),
+                    (1, 1),
+                ]
+
+            a_tensor, b_tensor, sf_scale_tensor, c_tensor, sfc_tensor = inputs
+
+            batch_size = a_tensor.shape[0]
+            m = a_tensor.shape[1]
+            k = a_tensor.shape[2]
+            n = b_tensor.shape[1]
+
+            sf_vec_size = self.__class__.sf_vec_size
+
+            # A strides (cute tensor is (M, K, L)):
+            #   M stride = a_tensor.stride(1)  (transposed view friendly)
+            #   K stride = 1                   (always innermost)
+            #   L stride = a_tensor.stride(0)
+            a_stride_m = a_tensor.stride(1)
+            a_stride_batch = a_tensor.stride(0)
+
+            # C strides for the (M, N, L) cute C tensor over the M-major
+            # [M, L, N//2] packed FP4 torch buffer. The downstream o_proj NVFP4
+            # GEMM reads the V-up output as a flat MONOLITHIC [M, L*N] row-major
+            # matrix whose row m is head-major: [head0's N cols, head1's N
+            # cols, ...]. To make the SAME buffer correct under a zero-copy
+            # reshape to [M, L*(N//2)] (no transpose), element (m, n, l) must
+            # land at linear FP4-element offset m*(L*N) + l*N + n. The C cute
+            # tensor's element type is Float4E2M1FN, so strides are in FP4
+            # ELEMENTS:
+            #   N stride = 1     (contiguous minor -> TMA box minor mode)
+            #   M stride = L * N (one full head-major row of FP4 elements)
+            #   L stride = N     (one head's FP4 elements)
+            # The TMA store only requires the box minor mode (N) to be unit-
+            # stride; M and L are outer/batch modes whose (16B-aligned) strides
+            # are encoded directly in the TMA tensor map, so this permuted
+            # layout stores fine -- no per-kernel control-flow change needed.
+            #
+            # These are passed as SCALAR args into the jit-compiled
+            # wrapper_strided (mirroring the A strides), which builds the C
+            # cute.make_tensor INSIDE the jit. cute.make_layout cannot run at
+            # the Python/runtime level here -- it needs an active MLIR context.
+            c_stride_m = batch_size * n
+            c_stride_n = 1
+            c_stride_l = n
+
+            def _make_a_ptr(t):
+                return make_ptr(cutlass.BFloat16,
+                                t.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+
+            def _make_b_ptr(t):
+                return make_ptr(cutlass.BFloat16,
+                                t.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+
+            def _make_c_ptr(t):
+                return make_ptr(cutlass.Float4E2M1FN,
+                                t.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=32)
+
+            def _make_sfc_ptr(t):
+                return make_ptr(cutlass.Float8E4M3FN,
+                                t.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+
+            if not self.use_tvm_ffi:
+                a_ptr = _make_a_ptr(a_tensor)
+                b_ptr = _make_b_ptr(b_tensor)
+                c_ptr = _make_c_ptr(c_tensor)
+                sfc_ptr = _make_sfc_ptr(sfc_tensor)
+                sf_scale_cute = cute.runtime.from_dlpack(sf_scale_tensor)
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = _make_a_ptr(a_tensor)
+                    b_ptr = _make_b_ptr(b_tensor)
+                    c_ptr = _make_c_ptr(c_tensor)
+                    sfc_ptr = _make_sfc_ptr(sfc_tensor)
+                    sf_scale_cute = cute.runtime.from_dlpack(sf_scale_tensor)
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    # STATIC per-head N (= v_head_dim) as a Python int. Threaded
+                    # into the kernel so sf_n_tiles_per_head = n // cta_tile_N is
+                    # a constexpr int readable inside the warp-specialized
+                    # epilogue region (NOT derived from the dynamic c.shape).
+                    n=n,
+                    sf_vec_size=sf_vec_size,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_strided,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    sfc_ptr,
+                    sf_scale_cute,
+                    a_stride_m,
+                    a_stride_batch,
+                    c_stride_m,
+                    c_stride_n,
+                    c_stride_l,
+                    max_active_clusters=max_active_clusters,
+                    stream=stream,
+                    options="--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # launch gemm kernel
+            if self.use_tvm_ffi:
+                # Args mirror the sibling bf16 BMM runner (wrapper_strided)
+                # and swiglu FP4-out runner: params compiled as cute.Pointer
+                # (a/b/c/sfc ptrs) are launched with raw .data_ptr() ints,
+                # while the param compiled as a cute.Tensor (sf_scale) is
+                # launched with the RAW torch tensor -- the TVM-FFI runtime
+                # converts the torch tensor itself; passing the plain
+                # from_dlpack cute tensor here is rejected ("not a TVM-FFI
+                # tensor"). See c_cute_tensor handling at ~6445.
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    c_tensor.data_ptr(),
+                    sfc_tensor.data_ptr(),
+                    sf_scale_tensor,
+                    a_stride_m,
+                    a_stride_batch,
+                    c_stride_m,
+                    c_stride_n,
+                    c_stride_l,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    sfc_ptr,
+                    sf_scale_cute,
+                    a_stride_m,
+                    a_stride_batch,
+                    c_stride_m,
+                    c_stride_n,
+                    c_stride_l,
+                    stream=stream,
+                )
+
+    # a/b: bf16, scale: fp32 scalar, output: packed FP4 (E2M1) + swizzled
+    # E4M3 scale factors.
+    @torch.library.custom_op("trtllm::bmm_nvfp4_out",
+                             mutates_args=(),
+                             device_types="cuda")
+    def bmm_nvfp4_out(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        sf_scale: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batched BF16 GEMM with a fused BF16->NVFP4 output epilogue.
+
+        Computes ``C = A @ B^T_k`` per batch (A [L, M, K], B [L, N, K],
+        both K-major) and quantizes the FP32 accumulator to NVFP4 in the
+        epilogue, emitting packed E2M1 values and E4M3 block scale factors
+        in TensorRT-LLM's swizzled SF layout.
+
+        Args:
+            input: A tensor [L, M, K], dtype bf16. M may be a non-contiguous
+                (transposed) view.
+            weight: B tensor [L, N, K], dtype bf16, K-major (contiguous).
+            sf_scale: per-tensor quantization scale, float32 device scalar
+                (= downstream NVFP4 GEMM input_scale).
+            use_tvm_ffi: use TVM-FFI to lower host launch overhead.
+
+        Returns:
+            (fp4_c, sfc):
+                fp4_c: packed E2M1 output [M, L, N // 2], uint8, M-major. The
+                    physical byte order is head-major within each M row, so
+                    ``fp4_c.reshape(M, L * (N // 2))`` (or ``.view``) yields the
+                    monolithic [M, L*N] packed activation the downstream o_proj
+                    NVFP4 GEMM consumes with ZERO copy (no transpose).
+                sfc: 1D E4M3 swizzled scale factors, uint8. ONE monolithic
+                    swizzled SF over the logical [M, L*N] activation, holding
+                    pad_up(M, 128) * pad_up((L*N) // 16, 4) elements -- exactly
+                    what fp4_quantize([M, L*N]) produces (batchIdx=None). This
+                    is the layout the downstream o_proj NVFP4 GEMM expects.
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL NVFP4-out BMM only supports SM 100 family.")
+
+        sf_vec_size = CuteDSLNVFP4OutBlackwellBmmRunner.sf_vec_size
+        batch_size, m, _ = input.shape
+        n = weight.shape[1]
+
+        # M-major packed FP4 output: physical buffer [M, L, N//2] uint8.
+        # The downstream o_proj NVFP4 GEMM reads this as a flat monolithic
+        # [M, L*N] row-major activation, head-major within each row. Allocating
+        # M-major (M outer, then L, then the N//2 packed bytes) means a plain
+        # .reshape(M, L*(N//2)) / .view(M, L*(N//2)) is ALREADY the correct
+        # row-major byte order with ZERO copy -- no transpose. The kernel writes
+        # into this exact byte order via a permuted-stride C cute tensor built
+        # inside wrapper_strided from the c_stride_m/n/l scalar args (see
+        # CuteDSLNVFP4OutBlackwellBmmRunner.forward).
+        fp4_c = input.new_empty((m, batch_size, n // 2), dtype=torch.uint8)
+
+        # MONOLITHIC SF allocation: the kernel derives its SF layout from the
+        # 2D shape (M, L*N) via tile_atom_to_shape_SF, producing ONE swizzled
+        # block of pad_up(M, 128) * pad_up((L*N) // sf_vec_size, 4) elements
+        # (not a per-batch-stacked buffer). For N a multiple of sf_vec_size,
+        # (L*N) // sf_vec_size = L * (N // sf_vec_size); since N // sf_vec_size
+        # (= 8 for N=128) is already a multiple of 4, no extra column padding
+        # is introduced by L.
+        #
+        # EXACT size, NO overrun slack: this is byte-for-byte what
+        # fp4_quantize([M, L*N]) produces and what the downstream o_proj NVFP4
+        # GEMM demands (it validates a_sf.numel() == pad_up(M,128)*pad_up(K//16,4)
+        # with no slack). Tactics whose CTA-M tile / cluster grouping would write
+        # past pad_up(M,128) rows are rejected by can_implement
+        # (is_sf_write_in_bounds), so an exact-size buffer is safe.
+        sfc = input.new_empty((bmm_nvfp4_out_sfc_numel(m, batch_size * n), ),
+                              dtype=torch.uint8)
+
+        _run_bmm_nvfp4_out(input, weight, sf_scale, fp4_c, sfc, use_tvm_ffi)
+        return fp4_c, sfc
+
+    @torch.library.register_fake("trtllm::bmm_nvfp4_out")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        sf_scale: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sf_vec_size = CuteDSLNVFP4OutBlackwellBmmRunner.sf_vec_size
+        batch_size, m, _ = input.shape
+        n = weight.shape[1]
+        # M-major [M, L, N//2] so it reshapes zero-copy to monolithic
+        # [M, L*(N//2)] row-major (see the eager impl for the rationale).
+        fp4_c = input.new_empty((m, batch_size, n // 2), dtype=torch.uint8)
+        sfc = input.new_empty((bmm_nvfp4_out_sfc_numel(m, batch_size * n), ),
+                              dtype=torch.uint8)
+        return fp4_c, sfc
+
+    def bmm_nvfp4_out_sfc_numel(m: int, total_n: int) -> int:
+        """Element count of the monolithic swizzled SF buffer for a [M, total_n]
+        (= [M, L*N]) activation.
+
+        EXACTLY pad_up(M, 128) * pad_up((L*N) // sf_vec_size, 4) -- byte-for-byte
+        what fp4_quantize([M, L*N]) produces and what the downstream o_proj NVFP4
+        GEMM demands (its act-SF validation rejects ANY slack). NO CTA-tile
+        overrun slack is added: tactics whose CTA-M tile / cluster grouping would
+        write past pad_up(M, 128) rows are rejected by
+        PersistentDenseGemmNVFP4OutKernel.can_implement (is_sf_write_in_bounds),
+        so every selectable tactic stays within this exact-size buffer. Callers
+        that pre-allocate the SF buffer (e.g. MLA.create_output) MUST size it
+        with this so the buffer is simultaneously kernel-safe and o_proj
+        consumable."""
+        sf_vec_size = CuteDSLNVFP4OutBlackwellBmmRunner.sf_vec_size
+        sfc_cols = pad_up(total_n // sf_vec_size, 4)
+        sfc_rows = pad_up(m, 128)
+        return sfc_rows * sfc_cols
+
+    def _run_bmm_nvfp4_out(input, weight, sf_scale, fp4_c, sfc, use_tvm_ffi):
+        """Autotune + launch the NVFP4-out BMM into the caller's fp4_c/sfc
+        buffers. Shared by the allocating op (bmm_nvfp4_out) and the in-place op
+        (bmm_nvfp4_out_inplace)."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL NVFP4-out BMM only supports SM 100 family.")
+        tuner = AutoTuner.get()
+        runner = CuteDSLNVFP4OutBlackwellBmmRunner(use_tvm_ffi=use_tvm_ffi)
+        inputs = [input, weight, sf_scale, fp4_c, sfc]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::bmm_nvfp4_out::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    # In-place variant: write into caller-provided fp4_c / sfc buffers (e.g. the
+    # MLA attention output buffers pre-allocated by create_output). Same kernel,
+    # no allocation, no copy -- matches the in-place custom-op contract used by
+    # mla_dsa_attn_inplace / mla_custom_op_inplace.
+    @torch.library.custom_op("trtllm::bmm_nvfp4_out_inplace",
+                             mutates_args=("fp4_c", "sfc"),
+                             device_types="cuda")
+    def bmm_nvfp4_out_inplace(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        sf_scale: torch.Tensor,
+        fp4_c: torch.Tensor,
+        sfc: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        _run_bmm_nvfp4_out(input, weight, sf_scale, fp4_c, sfc, use_tvm_ffi)
+
+    @torch.library.register_fake("trtllm::bmm_nvfp4_out_inplace")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        sf_scale: torch.Tensor,
+        fp4_c: torch.Tensor,
+        sfc: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        return None
 
     # ======================================================================
     # BF16 Dense Persistent GEMM (CuTe DSL) for Blackwell - Linear layers
