@@ -2004,10 +2004,12 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
     }
 }
 
+// State flows through the mutated placementContext map (read by the retry
+// loop); this records into it and returns nothing.
 def recordSlurmPlacementContext(Map placementContext, String slurmJobID, def nodeList, String stageName)
 {
     if (placementContext == null) {
-        return null
+        return
     }
 
     if (slurmJobID) {
@@ -2020,7 +2022,6 @@ def recordSlurmPlacementContext(Map placementContext, String slurmJobID, def nod
         def jobLabel = slurmJobID ? "job ${slurmJobID}" : "job"
         echo "[INFRA-RETRY] ${stageName}: SLURM ${jobLabel} ran on node list(s): ${placementContext.lastSlurmNodeList}"
     }
-    return placementContext.lastSlurmNodeList
 }
 
 def captureSlurmWorkspaceMetadata(def pipeline, Map remote, String jobWorkspace, Map placementContext, String stageName)
@@ -2046,7 +2047,7 @@ def captureSlurmWorkspaceMetadata(def pipeline, Map remote, String jobWorkspace,
 def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID, Map placementContext, String stageName, String jobWorkspace=null)
 {
     if (placementContext == null) {
-        return null
+        return
     }
 
     def capturedJobID = slurmJobID
@@ -2099,7 +2100,6 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
     }
 
     recordSlurmPlacementContext(placementContext, capturedJobID, nodeList, stageName)
-    return placementContext.lastSlurmNodeList
 }
 
 /**
