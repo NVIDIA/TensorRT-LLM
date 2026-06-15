@@ -703,6 +703,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        self.py_kv_transfer_cancelled = False
 
         # Performance timing info (step metrics, GPU events, context GPU timing)
         # Lazily created only when return_perf_metrics is enabled to avoid

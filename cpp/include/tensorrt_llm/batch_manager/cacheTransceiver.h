@@ -285,7 +285,6 @@ private:
     // request while a C++ status check still dereferences it.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
-    // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
     std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
@@ -294,6 +293,10 @@ private:
     std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
+    // checkGenTransferStatus bounded-poll metrics, logged on budget exhaustion.
+    size_t mGenPollWaitedCalls{0};
+    size_t mGenPollWaitedIterationsTotal{0};
+    size_t mGenPollBudgetExhaustedCount{0};
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;

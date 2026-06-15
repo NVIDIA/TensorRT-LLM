@@ -820,7 +820,7 @@ def main():
         if is_b200:
             ucx_tls_cmd = "export UCX_TLS=^ib &&"
         else:
-            ucx_tls_cmd = "unset UCX_TLS &&"
+            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',

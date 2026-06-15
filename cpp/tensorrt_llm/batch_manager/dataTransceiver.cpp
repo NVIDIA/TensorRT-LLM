@@ -361,7 +361,9 @@ public:
         auto const* connection = isAgent
             ? agentConnectionManager->recvConnectionAndRequestInfo(info, mTerminate)
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
-        if (connection == nullptr && !mManager->isRunning())
+        // A null connection only happens on shutdown paths (terminate flag or
+        // manager stopping); bail out before touching the empty RequestInfo.
+        if (connection == nullptr)
         {
             TLLM_LOG_WARNING(" recvRequestInfo connection is nullptr, maybe the server is terminating");
             return info;
@@ -673,6 +675,12 @@ private:
                             break;
                         }
                         it = getCurrentResponse();
+                    }
+                    // Terminating while waiting leaves it == end(); bail out
+                    // instead of dereferencing it inside sendResponse.
+                    if (mTerminate || it == mReadyResponses.end())
+                    {
+                        break;
                     }
                     sendResponse(it);
                 }
