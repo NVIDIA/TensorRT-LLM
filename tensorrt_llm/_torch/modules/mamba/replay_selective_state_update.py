@@ -2298,7 +2298,7 @@ _QUANT_MAX_BY_DTYPE = {
 # Source: emit_tuning_from_noise.py. Auto-generated from noise-cleaned per-cell search
 # winners (best of pd / pm by bucket_expected_renorm). Effective batch = raw_batch × 16.
 # The search predates a Triton PDL scheduling bug.
-# Most knobs are unchanged; large PDL-hoist regressions got spot retunes.
+# Most knobs are unchanged; large PDL-hoist/precompute regressions got spot retunes.
 # Missing dtype/SR combos fall back via the _resolve_tuning chain:
 # RN→SR for same dtype, then bf16/int16→fp16/SR and fp8→int8/SR.
 _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
@@ -2307,32 +2307,32 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             16,
             "persistent_dynamic",
             {
-                "_block_size_m": 8,
-                "_cta_per_sm": 6,
+                "_block_size_m": 4,
+                "_cta_per_sm": 4,
                 "_flatten": False,
-                "_heads_per_block": 1,
+                "_heads_per_block": 2,
                 "_num_loop_stages": 1,
                 "_num_stages": 4,
                 "_num_warps": 1,
-                "_precompute_num_warps": 4,
+                "_precompute_num_warps": 8,
                 "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": False,
-                "_use_tma_replay_write_store": True,
+                "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.83us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1, score=6.40us (B200 precompute-retune noise-cleaned 5x500)
         (
             32,
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 9,
+                "_cta_per_sm": 4,
                 "_flatten": False,
-                "_heads_per_block": 2,
+                "_heads_per_block": 1,
                 "_num_loop_stages": 1,
-                "_num_stages": 5,
+                "_num_stages": 3,
                 "_num_warps": 1,
                 "_precompute_num_warps": 4,
                 "_use_tma_rect_load": False,
@@ -2342,17 +2342,17 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=2, score=7.0us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=2, score=6.99us (B200 precompute-retune noise-cleaned 5x500)
         (
             64,
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 4,
+                "_cta_per_sm": 10,
                 "_flatten": False,
-                "_heads_per_block": 4,
+                "_heads_per_block": 2,
                 "_num_loop_stages": 1,
-                "_num_stages": 4,
+                "_num_stages": 2,
                 "_num_warps": 1,
                 "_precompute_num_warps": 4,
                 "_use_tma_rect_load": False,
@@ -2362,7 +2362,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=4, score=7.05us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=4, score=7.05us (B200 precompute-retune noise-cleaned 5x500)
         (
             128,
             "persistent_dynamic",
@@ -2408,27 +2408,27 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             "persistent_main",
             {
                 "_block_size_m_nowrite": 64,
-                "_block_size_m_write": 32,
-                "_cta_per_sm_nowrite": 5,
-                "_cta_per_sm_write": 9,
+                "_block_size_m_write": 16,
+                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_write": 7,
                 "_flatten": False,
                 "_heads_per_block": 8,
                 "_num_loop_stages_nowrite": 1,
                 "_num_loop_stages_write": 1,
                 "_num_stages_nowrite": 3,
-                "_num_stages_write": 3,
+                "_num_stages_write": 2,
                 "_num_warps_nowrite": 1,
-                "_num_warps_write": 2,
+                "_num_warps_write": 1,
                 "_precompute_num_warps": 8,
-                "_use_tma_rect_load": True,
+                "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
-                "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": True,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
-                "nowrite_first": True,
+                "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=32, score=12.66us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=32, score=13.08us (B200 precompute-retune noise-cleaned 5x500)
         (
             1024,
             "persistent_main",
@@ -2565,22 +2565,22 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             16,
             "persistent_dynamic",
             {
-                "_block_size_m": 8,
-                "_cta_per_sm": 9,
+                "_block_size_m": 4,
+                "_cta_per_sm": 7,
                 "_flatten": False,
-                "_heads_per_block": 4,
+                "_heads_per_block": 2,
                 "_num_loop_stages": 1,
-                "_num_stages": 3,
+                "_num_stages": 2,
                 "_num_warps": 1,
-                "_precompute_num_warps": 4,
+                "_precompute_num_warps": 8,
                 "_use_tma_rect_load": False,
-                "_use_tma_replay_nowrite_load": False,
-                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_nowrite_load": True,
+                "_use_tma_replay_write_load": True,
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.59us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1, score=6.54us (B200 precompute-retune noise-cleaned 5x500)
         (
             32,
             "persistent_dynamic",
@@ -2712,51 +2712,51 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=64, score=18.51us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=64, score=18.51us (B200 PDL-retune noise-cleaned 5x500)
         (
             2048,
             "persistent_main",
             {
                 "_block_size_m_nowrite": 64,
-                "_block_size_m_write": 16,
-                "_cta_per_sm_nowrite": 8,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 5,
                 "_cta_per_sm_write": 8,
                 "_flatten": False,
                 "_heads_per_block": 8,
                 "_num_loop_stages_nowrite": 1,
                 "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 4,
+                "_num_stages_nowrite": 2,
                 "_num_stages_write": 2,
                 "_num_warps_nowrite": 1,
                 "_num_warps_write": 1,
                 "_precompute_num_warps": 8,
-                "_use_tma_rect_load": False,
+                "_use_tma_rect_load": True,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": True,
+                "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=28.72us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=128, score=28.83us (B200 precompute-retune noise-cleaned 5x500)
         (
             4096,
             "persistent_main",
             {
                 "_block_size_m_nowrite": 64,
                 "_block_size_m_write": 64,
-                "_cta_per_sm_nowrite": 8,
+                "_cta_per_sm_nowrite": 6,
                 "_cta_per_sm_write": 3,
                 "_flatten": False,
-                "_heads_per_block": 2,
-                "_num_loop_stages_nowrite": 1,
+                "_heads_per_block": 8,
+                "_num_loop_stages_nowrite": 2,
                 "_num_loop_stages_write": 1,
-                "_num_stages_nowrite": 4,
-                "_num_stages_write": 1,
-                "_num_warps_nowrite": 1,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 4,
+                "_num_warps_nowrite": 2,
                 "_num_warps_write": 4,
-                "_precompute_num_warps": 1,
-                "_use_tma_rect_load": False,
+                "_precompute_num_warps": 8,
+                "_use_tma_rect_load": True,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": True,
                 "_use_tma_replay_write_store": True,
@@ -2764,7 +2764,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=256, score=47.98us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=256, score=46.60us (B200 precompute-retune noise-cleaned 5x500)
         (
             8192,
             "persistent_main",
@@ -2775,10 +2775,10 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_cta_per_sm_write": 6,
                 "_flatten": False,
                 "_heads_per_block": 16,
-                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_nowrite": 5,
                 "_num_loop_stages_write": 2,
-                "_num_stages_nowrite": 5,
-                "_num_stages_write": 4,
+                "_num_stages_nowrite": 2,
+                "_num_stages_write": 2,
                 "_num_warps_nowrite": 2,
                 "_num_warps_write": 4,
                 "_precompute_num_warps": 4,
@@ -2790,7 +2790,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=83.00us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=512, score=81.07us (B200 precompute-retune noise-cleaned 5x500)
         (
             16384,
             "persistent_main",
@@ -2819,6 +2819,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
         ),  # raw_batch=1024, score=149.25us (B200 PDL-hoist default 5x200)
     ],
     ("fp8", "SR"): [
+        # --- ALL UNCHANGED (not retuned this round) ---
         (
             16,
             "persistent_dynamic",
@@ -2838,7 +2839,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.46us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1, score=6.46us (B200 PDL-retune noise-cleaned 5x500)
         (
             32,
             "persistent_dynamic",
@@ -2858,7 +2859,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=2, score=6.72us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=2, score=6.72us (B200 precompute retune 5x100)
         (
             64,
             "persistent_dynamic",
@@ -2990,7 +2991,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=24.5us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=128, score=24.5us (B200 PDL-retune noise-cleaned 5x500)
         (
             4096,
             "persistent_main",
@@ -3016,7 +3017,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=256, score=40.04us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=256, score=40.04us (B200 PDL-retune noise-cleaned 5x500)
         (
             8192,
             "persistent_main",
@@ -3042,7 +3043,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=67.94us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=512, score=67.94us (B200 precompute retune 5x100)
         (
             16384,
             "persistent_main",
@@ -3068,7 +3069,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=1024, score=126.74us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1024, score=126.74us (B200 PDL-retune noise-cleaned 5x500)
     ],
     ("fp32", "RN"): [
         (
@@ -3078,19 +3079,19 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_block_size_m": 8,
                 "_cta_per_sm": 6,
                 "_flatten": False,
-                "_heads_per_block": 8,
+                "_heads_per_block": 2,
                 "_num_loop_stages": 1,
-                "_num_stages": 2,
+                "_num_stages": 1,
                 "_num_warps": 1,
-                "_precompute_num_warps": 4,
+                "_precompute_num_warps": 8,
                 "_use_tma_rect_load": False,
-                "_use_tma_replay_nowrite_load": True,
-                "_use_tma_replay_write_load": True,
-                "_use_tma_replay_write_store": False,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": False,
+                "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=1, score=6.64us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1, score=6.42us (B200 precompute-retune noise-cleaned 5x500)
         (
             32,
             "persistent_dynamic",
@@ -3116,13 +3117,13 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 9,
+                "_cta_per_sm": 7,
                 "_flatten": False,
                 "_heads_per_block": 2,
                 "_num_loop_stages": 1,
-                "_num_stages": 4,
+                "_num_stages": 1,
                 "_num_warps": 1,
-                "_precompute_num_warps": 4,
+                "_precompute_num_warps": 8,
                 "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": False,
@@ -3130,7 +3131,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=4, score=7.19us (B200 PDL-hoist default 5x200)
+        ),  # raw_batch=4, score=7.10us (B200 precompute-retune noise-cleaned 5x500)
         (
             128,
             "persistent_dynamic",
@@ -3216,7 +3217,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": False,
             },
-        ),  # raw_batch=64, score=20.05us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=64, score=20.05us (B200 PDL-retune noise-cleaned 5x500)
         (
             2048,
             "persistent_main",
@@ -3242,7 +3243,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=128, score=31.39us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=128, score=31.39us (B200 PDL-retune noise-cleaned 5x500)
         (
             4096,
             "persistent_main",
@@ -3268,7 +3269,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=256, score=51.27us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=256, score=51.27us (B200 PDL-retune noise-cleaned 5x500)
         (
             8192,
             "persistent_main",
@@ -3294,7 +3295,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=512, score=88.57us (B200 precompute retune 5x100)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=512, score=88.57us (B200 precompute retune 5x100)
         (
             16384,
             "persistent_main",
@@ -3320,7 +3321,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
             },
-        ),  # raw_batch=1024, score=170.51us (B200 PDL-retune noise-cleaned 5x500)  # << TUNED_AFTER_PDL_FIX
+        ),  # raw_batch=1024, score=170.51us (B200 PDL-retune noise-cleaned 5x500)
     ],
 }
 _PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob -> (pm_write_knob, pm_nowrite_knob)
