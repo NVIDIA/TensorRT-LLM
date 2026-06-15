@@ -29,6 +29,9 @@ l0_b200_multi_gpus_perf_sanity:
   # deepseek-v32-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_tep8_mtp3_8k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_blackwell-v32_fp4_dep8_mtp1_8k1k] TIMEOUT (90)
+  # glm-5-fp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_tep8_mtp3_8k1k]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_dep8_mtp1_8k1k] TIMEOUT (90)
   # gpt-oss-120b-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp2_mtp0_1k1k]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gpt_oss_120b_fp4_blackwell-gpt_oss_fp4_tp1_mtp0_1k1k]
