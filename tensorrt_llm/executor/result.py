@@ -30,9 +30,7 @@ from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
-from .postprocessor_hook import (apply_post_processor_hook,
-                                 get_configured_post_processor_hook,
-                                 get_post_processor_hook)
+from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
 if TYPE_CHECKING:
@@ -817,7 +815,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                  tokenizer: Optional[Callable] = None,
                  streaming: bool = False,
                  background_error_handler: Optional[Callable] = None,
-                 postproc_params: Optional["PostprocParams"] = None):
+                 postproc_params: Optional["PostprocParams"] = None,
+                 post_processor_hook: Optional[PostProcessorHook] = None):
         super().__init__(
             id,
             sampling_params,
@@ -826,6 +825,10 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         )
         self.tokenizer = tokenizer
         self._streaming = streaming
+        # User post-processing hook (TRTLLM-12622) owned by this result's
+        # creator (the LLM for the in-proxy path, the worker for the worker
+        # path) and threaded in alongside the tokenizer; None when unconfigured.
+        self._post_processor_hook = post_processor_hook
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
@@ -887,13 +890,13 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
         Runs after detok populated ``text``/``text_diff`` and before any
         per-endpoint formatter reads them. Shared by the postproc-worker path
-        and the in-proxy path; the hook is configured per-process and read from
-        the process-global set at startup.
+        and the in-proxy path; the hook instance is owned by this result's
+        creator and threaded in via ``post_processor_hook`` (``None`` when
+        unconfigured), so independent ``LLM`` instances stay isolated.
         """
-        import_path = get_configured_post_processor_hook()
-        if not import_path:
+        hook = self._post_processor_hook
+        if hook is None:
             return
-        hook = get_post_processor_hook(import_path)
         apply_post_processor_hook(hook, self, streaming=self._streaming)
 
 

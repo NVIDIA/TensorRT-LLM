@@ -8,8 +8,9 @@ lets a deployment rewrite, redact, suppress, or terminate model output — inclu
 spans the chunks of a streamed response — without modifying TensorRT LLM source.
 
 The hook is a plain Python callable class supplied by import path, mirroring `--custom_tokenizer`. It
-is built once per process and invoked once per output, per streaming chunk (plus a final call), so it
-can hold its own per-request state.
+is owned by the `LLM` instance (and built once in each post-processing worker process when those are
+enabled) and invoked once per output, per streaming chunk (plus a final call), so it can hold its own
+per-request state. Independent `LLM` instances in one process each own a separate hook instance.
 
 ```{note}
 This feature is a prototype and its interface may change in a future release.
@@ -147,9 +148,10 @@ class SuppressHook:
 
 ## Per-request state
 
-The hook instance is built once per process and shared across all requests handled by that process, so
-any per-request state must be keyed by `chunk.request_id` and released when `chunk.is_final` is seen
-(or after a `terminate`). State is not shared across processes; when the post-processing worker pool is
+The hook instance is owned by the `LLM` (built once in each post-processing worker process when the
+pool is enabled) and shared across all requests it handles, so any per-request state must be keyed by
+`chunk.request_id` and released when `chunk.is_final` is seen (or after a `terminate`). State is not
+shared across processes or across separate `LLM` instances; when the post-processing worker pool is
 enabled, all chunks of a single request are still routed to the same worker, so per-request state
 remains consistent for that request.
 

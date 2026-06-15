@@ -5,9 +5,15 @@
 This provides a native, per-request, stateful post-processing seam equivalent
 to a Triton python-backend post-processor. A user supplies a picklable,
 importable callable class via the ``--post_processor`` import path; trtllm
-builds one instance per process and invokes it once per output, per streaming
-chunk (plus a final call), *after* detokenization and *before* the per-endpoint
-response formatter.
+builds one instance per owner (the ``LLM`` for the in-proxy detok path, and
+each post-processing worker process when enabled) and invokes it once per
+output, per streaming chunk (plus a final call), *after* detokenization and
+*before* the per-endpoint response formatter.
+
+Ownership is per-instance, not a process global: the hook instance is built by
+its owner and threaded onto each result alongside the tokenizer (see
+``DetokenizedGenerationResultBase``), so independent ``LLM`` instances in one
+process stay isolated.
 
 The hook owns its own per-request state (keyed by ``chunk.request_id``) exactly
 like Triton's model-managed ``self.sequences = {}`` pattern; trtllm passes only
@@ -31,57 +37,9 @@ __all__ = [
     "terminate",
     "apply_post_processor_hook",
     "load_post_processor_hook",
-    "get_post_processor_hook",
-    "set_configured_post_processor_hook",
-    "get_configured_post_processor_hook",
 ]
 
 logger = logging.getLogger(__name__)
-
-# Process-level cache so the hook instance is built once per process (mirrors
-# the "build once in the worker" precedent of ``record_creator``). Keyed by
-# import path; the per-request state lives inside the instance.
-_HOOK_INSTANCE_CACHE: dict = {}
-
-# The post-processing hook is global server config (one pipeline for all
-# requests), and detokenization runs in different processes depending on
-# ``--num_postprocess_workers`` (the postproc worker process when enabled, the
-# proxy/serving process otherwise). Each such process records the configured
-# import path here at startup; the detok chokepoint reads it.
-_CONFIGURED_HOOK_PATH: Optional[str] = None
-
-
-def set_configured_post_processor_hook(import_path: Optional[str]) -> None:
-    """Record the configured hook import path for this process (or ``None``).
-
-    The hook is process-global server configuration (one pipeline for all
-    requests in this process), so registering a *different* non-``None`` hook
-    while one is already active is rejected: a second ``LLM`` in the same
-    process with a conflicting ``--post_processor`` would otherwise silently
-    start applying the wrong hook to the already-running instance's responses.
-    Re-registering the same path is a no-op, and clearing to ``None`` (e.g. on
-    shutdown) is always allowed. In normal serving each server/rank process
-    hosts a single ``LLM``, so this only guards genuinely mixed-LLM processes.
-    """
-    global _CONFIGURED_HOOK_PATH
-    if (
-        import_path is not None
-        and _CONFIGURED_HOOK_PATH is not None
-        and import_path != _CONFIGURED_HOOK_PATH
-    ):
-        raise RuntimeError(
-            "A different post-processor hook is already registered in this "
-            f"process ({_CONFIGURED_HOOK_PATH!r}); refusing to register "
-            f"{import_path!r}. The post-processing hook is process-global "
-            "configuration; running multiple LLMs with different "
-            "--post_processor values in one process is not supported."
-        )
-    _CONFIGURED_HOOK_PATH = import_path
-
-
-def get_configured_post_processor_hook() -> Optional[str]:
-    """Return the hook import path configured for this process, if any."""
-    return _CONFIGURED_HOOK_PATH
 
 
 def load_post_processor_hook(import_path: str) -> "PostProcessorHook":
@@ -91,6 +49,11 @@ def load_post_processor_hook(import_path: str) -> "PostProcessorHook":
     ``module.path.ClassName``, import the module, fetch the class, instantiate
     it with no arguments. The class must be importable and picklable so it can
     cross the post-processing worker process boundary.
+
+    Each owner (the ``LLM`` and each postproc worker) calls this once and holds
+    the returned instance for the lifetime of the owner; the instance is never
+    pickled across a process boundary (only ``import_path`` is), and per-request
+    state lives inside it.
 
     Args:
         import_path: Dotted path to the hook class, e.g.
@@ -113,19 +76,6 @@ def load_post_processor_hook(import_path: str) -> "PostProcessorHook":
             "Expected format: 'module.path.ClassName' resolving to a "
             "no-arg-constructible callable class."
         ) from e
-
-
-def get_post_processor_hook(import_path: str) -> "PostProcessorHook":
-    """Return the process-cached hook instance for ``import_path``.
-
-    Builds it on first use and reuses it thereafter so per-request state held by
-    the instance persists across chunks within this process.
-    """
-    hook = _HOOK_INSTANCE_CACHE.get(import_path)
-    if hook is None:
-        hook = load_post_processor_hook(import_path)
-        _HOOK_INSTANCE_CACHE[import_path] = hook
-    return hook
 
 
 @dataclasses.dataclass

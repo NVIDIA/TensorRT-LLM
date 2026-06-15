@@ -4,12 +4,10 @@
 
 import pytest
 
-from tensorrt_llm.executor import postprocessor_hook as _pph
 from tensorrt_llm.executor.postprocessor_hook import (
     PostProcChunk,
     apply_post_processor_hook,
     emit,
-    get_post_processor_hook,
     load_post_processor_hook,
     suppress,
     terminate,
@@ -17,29 +15,27 @@ from tensorrt_llm.executor.postprocessor_hook import (
 from tensorrt_llm.executor.result import CompletionOutput
 
 
-@pytest.fixture(autouse=True)
-def _reset_hook_process_globals():
-    """Isolate the module-level process globals between tests."""
-    saved_path = _pph.get_configured_post_processor_hook()
-    saved_cache = dict(_pph._HOOK_INSTANCE_CACHE)
-    _pph.set_configured_post_processor_hook(None)
-    _pph._HOOK_INSTANCE_CACHE.clear()
-    try:
-        yield
-    finally:
-        _pph.set_configured_post_processor_hook(saved_path)
-        _pph._HOOK_INSTANCE_CACHE.clear()
-        _pph._HOOK_INSTANCE_CACHE.update(saved_cache)
-
-
 class _FakeResult:
     """Minimal stand-in for a GenerationResult at the detok chokepoint."""
 
-    def __init__(self, outputs, req_id=1, done=False, aborted=False, has_abort=False):
+    def __init__(
+        self,
+        outputs,
+        req_id=1,
+        done=False,
+        aborted=False,
+        has_abort=False,
+        streaming=True,
+        post_processor_hook=None,
+    ):
         self.outputs = outputs
         self.id = req_id
         self._done = done
         self._aborted = aborted
+        self._streaming = streaming
+        # Per-instance hook ownership (TRTLLM-12622): the detok read site reads
+        # this attribute rather than a process global.
+        self._post_processor_hook = post_processor_hook
         self.abort_called = 0
         if has_abort:
             self.abort = self._abort
@@ -226,53 +222,70 @@ def test_loader_raises_on_bad_path():
         load_post_processor_hook("no.such.module.Nope")
 
 
-def test_get_hook_builds_once_per_process():
-    a = get_post_processor_hook("collections.OrderedDict")
-    b = get_post_processor_hook("collections.OrderedDict")
-    assert a is b
+def test_loader_builds_independent_instances():
+    """Each owner builds its own instance (no shared process-global cache).
 
-
-def test_configured_hook_global_roundtrip():
-    from tensorrt_llm.executor.postprocessor_hook import (
-        get_configured_post_processor_hook,
-        set_configured_post_processor_hook,
-    )
-
-    try:
-        assert get_configured_post_processor_hook() is None
-        set_configured_post_processor_hook("my_pkg.guardrail.G")
-        assert get_configured_post_processor_hook() == "my_pkg.guardrail.G"
-    finally:
-        set_configured_post_processor_hook(None)
-    assert get_configured_post_processor_hook() is None
-
-
-def test_configured_hook_rejects_conflicting_registration():
-    """A conflicting in-process hook must fail fast (TRTLLM-12622).
-
-    A second, different hook in the same process is rejected rather than
-    silently clobbering the global and applying the wrong hook.
+    This is the core of per-instance ownership (TRTLLM-12622): two owners
+    loading the same import path get distinct instances, so their per-request
+    state never collides.
     """
-    from tensorrt_llm.executor.postprocessor_hook import (
-        get_configured_post_processor_hook,
-        set_configured_post_processor_hook,
-    )
+    a = load_post_processor_hook("collections.OrderedDict")
+    b = load_post_processor_hook("collections.OrderedDict")
+    assert a is not b
 
-    try:
-        set_configured_post_processor_hook("my_pkg.guardrail.A")
-        # Re-registering the same path is an idempotent no-op.
-        set_configured_post_processor_hook("my_pkg.guardrail.A")
-        assert get_configured_post_processor_hook() == "my_pkg.guardrail.A"
 
-        # A different non-None hook is rejected and the active one is unchanged.
-        with pytest.raises(RuntimeError, match="already registered"):
-            set_configured_post_processor_hook("my_pkg.guardrail.B")
-        assert get_configured_post_processor_hook() == "my_pkg.guardrail.A"
+def test_apply_method_reads_hook_from_instance_attribute():
+    """The detok read site applies the hook owned by the result instance."""
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
 
-        # Clearing to None is always allowed (e.g. on shutdown), after which a
-        # new hook can be registered.
-        set_configured_post_processor_hook(None)
-        set_configured_post_processor_hook("my_pkg.guardrail.B")
-        assert get_configured_post_processor_hook() == "my_pkg.guardrail.B"
-    finally:
-        set_configured_post_processor_hook(None)
+    out = _make_output("hello world", last_text_len=len("hello"))
+    result = _FakeResult([out], post_processor_hook=lambda c: emit(c.text_diff.upper()))
+
+    # Call the real read site against the per-instance attribute.
+    DetokenizedGenerationResultBase._apply_post_processor_hook(result)
+
+    assert out.text == "hello WORLD"
+
+
+def test_apply_method_is_noop_when_instance_has_no_hook():
+    """With no hook on the instance, the chunk passes through untouched."""
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    out = _make_output("hello world", last_text_len=len("hello"))
+    result = _FakeResult([out], post_processor_hook=None)
+
+    DetokenizedGenerationResultBase._apply_post_processor_hook(result)
+
+    assert out.text == "hello world"
+
+
+def test_independent_instances_keep_separate_state():
+    """Two owners' hook instances maintain isolated per-request state.
+
+    Demonstrates the Model-2 guarantee that distinct LLM/worker owners do not
+    share hook state, even for the same request id.
+    """
+
+    class Counter:
+        def __init__(self):
+            self.state = {}
+
+        def __call__(self, chunk: PostProcChunk):
+            n = self.state.get(chunk.request_id, 0) + 1
+            self.state[chunk.request_id] = n
+            return emit(f"{chunk.text_diff}#{n}")
+
+    hook_a, hook_b = Counter(), Counter()
+    # Same request id (1) routed to two different owners.
+    ra = _FakeResult([_make_output("x", 0)], req_id=1, post_processor_hook=hook_a)
+    rb = _FakeResult([_make_output("y", 0)], req_id=1, post_processor_hook=hook_b)
+
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    DetokenizedGenerationResultBase._apply_post_processor_hook(ra)
+    DetokenizedGenerationResultBase._apply_post_processor_hook(ra)
+    DetokenizedGenerationResultBase._apply_post_processor_hook(rb)
+
+    # hook_a counted request 1 twice; hook_b counted it once — fully isolated.
+    assert hook_a.state[1] == 2
+    assert hook_b.state[1] == 1

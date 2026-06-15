@@ -32,6 +32,8 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
+from ..executor.postprocessor_hook import (PostProcessorHook,
+                                           load_post_processor_hook)
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
@@ -76,15 +78,21 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     @classmethod
     def _from_generation_result(
-            cls,
-            generation_result: GenerationResult,
-            prompt: Optional[str] = None,
-            tokenizer: Optional[TokenizerBase] = None) -> 'RequestOutput':
+        cls,
+        generation_result: GenerationResult,
+        prompt: Optional[str] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        post_processor_hook: Optional[PostProcessorHook] = None
+    ) -> 'RequestOutput':
         inst = cls.__new__(cls)
         inst.__dict__.update(generation_result.__dict__)
         inst.tokenizer = tokenizer
         inst._streaming = generation_result._streaming
         inst._prompt = prompt
+        # User post-processing hook (TRTLLM-12622) owned by the LLM instance;
+        # threaded onto the result the user holds (the object the in-proxy detok
+        # runs on) alongside the tokenizer. None when unconfigured.
+        inst._post_processor_hook = post_processor_hook
         return inst
 
     @property
@@ -230,25 +238,15 @@ class BaseLLM:
                      "yellow")
         self.mpi_session = self.args.mpi_session
 
-        # Record the configured post-processing hook (TRTLLM-12622) for this
-        # (LLM/proxy) process. When postproc workers are disabled, the detok
-        # chokepoint runs here on RequestOutput; when enabled, each worker
-        # process records it separately via postproc_worker_main.
-        from ..executor.postprocessor_hook import (
-            get_post_processor_hook, set_configured_post_processor_hook)
-        _post_processor_hook = getattr(self.args, "post_processor", None)
-        if _post_processor_hook:
-            # Resolve eagerly so a bad import path fails fast at startup (and
-            # primes the per-process build-once cache) rather than erroring on
-            # the first request. Validate BEFORE recording the process-global so
-            # a failed import leaves no stale hook registered for this process.
-            get_post_processor_hook(_post_processor_hook)
-        # Record the configured hook for this process. Raises if a different
-        # hook is already registered in-process (mixed-LLM process), so a second
-        # instance can never silently apply the wrong hook to the first's
-        # responses.
-        set_configured_post_processor_hook(_post_processor_hook)
-        self._post_processor_hook = _post_processor_hook
+        # Build this LLM's post-processing hook instance (TRTLLM-12622), if
+        # configured. Ownership is per-instance: this instance is threaded onto
+        # the results this LLM produces (in-proxy detok path), and each postproc
+        # worker builds its own from the same import path. Resolving here also
+        # fails fast on a bad import path at startup rather than per-request.
+        _post_processor_path = getattr(self.args, "post_processor", None)
+        self._post_processor_hook = (
+            load_post_processor_hook(_post_processor_path)
+            if _post_processor_path else None)
 
         if self.args.parallel_config.is_multi_gpu:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
@@ -547,8 +545,11 @@ class BaseLLM:
             result.metrics_dict.update(
                 {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
 
-        return RequestOutput._from_generation_result(result, prompt,
-                                                     self.tokenizer)
+        return RequestOutput._from_generation_result(
+            result,
+            prompt,
+            self.tokenizer,
+            post_processor_hook=self._post_processor_hook)
 
     def _preprocess(
         self,
@@ -1209,15 +1210,6 @@ class BaseLLM:
         if hasattr(self, 'mpi_session') and self.mpi_session is not None:
             self.mpi_session.shutdown()
             self.mpi_session = None
-
-        # Release this process's post-processor hook registration so a
-        # subsequent LLM with a different --post_processor can be created in the
-        # same process (e.g. sequential use in tests or notebooks).
-        if getattr(self, "_post_processor_hook", None):
-            from ..executor.postprocessor_hook import \
-                set_configured_post_processor_hook
-            set_configured_post_processor_hook(None)
-            self._post_processor_hook = None
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
