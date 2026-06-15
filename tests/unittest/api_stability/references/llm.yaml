@@ -380,6 +380,10 @@ methods:
         default: 2
     return_annotation: List[dict]
     status: beta
+  get_kv_cache_capacity:
+    parameters: {}
+    return_annotation: dict
+    status: beta
   get_kv_cache_events_async:
     parameters:
       timeout:

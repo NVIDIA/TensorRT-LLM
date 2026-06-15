@@ -1053,6 +1053,35 @@ class PyExecutor:
             self.stats = []
         return latest_stats
 
+    def get_kv_cache_capacity(self) -> dict:
+        kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is None:
+            return {}
+
+        kv_stats = kv_cache_manager.get_kv_cache_stats()
+        max_num_blocks = getattr(kv_stats, "max_num_blocks", 0)
+        tokens_per_block = getattr(kv_stats, "tokens_per_block", 0)
+
+        if not max_num_blocks:
+            max_num_blocks = getattr(kv_cache_manager, "blocks_in_primary_pool",
+                                     0)
+        if not max_num_blocks:
+            max_num_blocks = kv_cache_manager.get_max_resource_count()
+        if not tokens_per_block:
+            tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", 0)
+
+        if not max_num_blocks or not tokens_per_block:
+            return {}
+
+        max_num_blocks = int(max_num_blocks)
+        tokens_per_block = int(tokens_per_block)
+        return {
+            "maxNumBlocks": max_num_blocks,
+            "tokensPerBlock": tokens_per_block,
+            "maxNumTokens": max_num_blocks * tokens_per_block,
+        }
+
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
