@@ -73,6 +73,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -614,7 +615,7 @@ class EncoderLayer(nn.Module):
         return x
 
 
-class MoonViT3dEncoder(nn.Module):
+class MoonViT3dEncoder(nn.Module, MultimodalEncoderMixin):
     """Stack of MoonViT3d encoder layers + 2D RoPE + final LayerNorm."""
 
     def __init__(
@@ -649,12 +650,11 @@ class MoonViT3dEncoder(nn.Module):
             dtype=model_config.torch_dtype,
         )
 
+        # Context-only metadata (kv_cache_manager=None) built by the engine via
+        # ``MultimodalEncoderMixin.setup_attn_metadata`` at the encoder budget;
+        # filled per forward by ``prepare_attn_metadata``.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,
-            max_num_tokens=8192,
-            kv_cache_manager=None,
-        )
+        self.attn_metadata: Optional[AttentionMetadata] = None
 
     def prepare_attn_metadata(
         self,

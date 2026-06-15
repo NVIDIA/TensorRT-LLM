@@ -581,14 +581,33 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
 
+        # Encoder-only metadata never carries a KV cache. ``__post_init__``
+        # only initializes the block-offset / block-id attributes when a
+        # ``kv_cache_manager`` is present, and the full ``prepare()`` is what
+        # otherwise sets them to ``None`` (its no-cache branch). This fast path
+        # skips ``prepare()``, so mirror that no-cache setup here -- the FMHA
+        # ``_run`` reads ``kv_cache_block_offsets`` and ``block_ids_per_seq``
+        # unconditionally and would otherwise raise ``AttributeError``.
+        self.kv_cache_params = KVCacheParams(use_cache=False)
+        self.kv_cache_block_offsets = None
+        self.block_ids_per_seq = None
+
         # For encoder batches every request is a context request, so total
         # kv-tokens equals total q-tokens.
         self.host_total_kv_lens[0] = self._num_tokens
 
+        # ``host_request_types`` is allocated with ``torch.empty_like`` (not
+        # zeroed), and the full ``prepare()`` is what normally fills it. This
+        # fast path skips ``prepare()``, so explicitly mark every request as a
+        # context request (type 0) here -- otherwise the FMHA reads whatever
+        # garbage the buffer happened to hold and may treat a context segment
+        # as a generation step.
+        n = self.num_seqs
+        self.host_request_types[:n].fill_(0)
+
         # Graph metadata binds these views once per key; eager refreshes them
         # because batch shape can vary between calls.
         if not self.is_cuda_graph:
-            n = self.num_seqs
             self.kv_lens_cuda_runtime = self._seq_lens_cuda[:n]
             self.kv_lens_runtime = self._seq_lens[:n]
             self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:n]

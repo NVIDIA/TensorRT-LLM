@@ -7,6 +7,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
 from tensorrt_llm._torch.models.multimodal_encoder_graph import _MM_SIDE_STREAM_ENV
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
@@ -89,8 +90,13 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     vision tower, FlashInfer raises at forward time about it not being supported.
     """
     vision_model = RADIOVisionModel(_make_fp8_model_config(), disable_quantization=True)
-    # Engine normally calls this after model load; standalone tests must do it themselves.
-    vision_model.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
+    # Engine normally calls this after model load by walking `model.modules()`
+    # for `MultimodalEncoderMixin` instances (the mixin lives on the inner
+    # `VisionTransformer`, not the `RADIOVisionModel` wrapper); standalone tests
+    # must mirror that themselves.
+    for module in vision_model.modules():
+        if isinstance(module, MultimodalEncoderMixin):
+            module.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
 
     device = torch.device("cuda")
     dtype = torch.bfloat16

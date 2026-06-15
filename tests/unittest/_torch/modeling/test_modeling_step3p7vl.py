@@ -177,6 +177,22 @@ def _vision_attn_metadata(seq_lens):
     return md
 
 
+def _setup_encoder_attn_metadata(module, max_num_tokens: int = 8192):
+    """Mirror the engine's ``_set_up_multimodal_encoder_attn_metadata`` walk.
+
+    The encoder builds its ``AttentionMetadata`` via the engine-driven
+    ``MultimodalEncoderMixin.setup_attn_metadata`` after model load; standalone
+    tests that construct the encoder/tower directly must do the same before the
+    encoder forward. Returns ``module`` for chaining.
+    """
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+
+    for m in module.modules():
+        if isinstance(m, MultimodalEncoderMixin):
+            m.setup_attn_metadata(max_num_requests=max_num_tokens, max_num_tokens=max_num_tokens)
+    return module
+
+
 @torch.no_grad()
 def _init_finite_weights(module, std: float = 0.02):
     """Fill all parameters with small finite values.
@@ -428,7 +444,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
 
         width, patch, image = 64, 8, 64
         vision_cfg = _make_tiny_vision_config(width=width, patch_size=patch, image_size=image)
-        enc = (
+        enc = _setup_encoder_attn_metadata(
             Step3p7VisionEncoder(
                 _vision_attention_model_config(vision_cfg), vision_cfg, dtype=_GPU_DTYPE
             )
@@ -448,7 +464,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
 
         width, patch, image = 64, 8, 128  # base grid 16
         vision_cfg = _make_tiny_vision_config(width=width, patch_size=patch, image_size=image)
-        enc = (
+        enc = _setup_encoder_attn_metadata(
             Step3p7VisionEncoder(
                 _vision_attention_model_config(vision_cfg), vision_cfg, dtype=_GPU_DTYPE
             )
@@ -478,7 +494,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         """``_encode`` runs the encoder + projector to the text hidden size."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
 
-        tower = (
+        tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
                 _make_tiny_vision_model_config(
                     text_hidden_size=32, width=64, patch_size=8, image_size=64
@@ -502,7 +518,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
         from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-        tower = (
+        tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
                 _make_tiny_vision_model_config(
                     text_hidden_size=32, width=64, patch_size=8, image_size=64
@@ -548,7 +564,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
         from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-        tower = (
+        tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
                 _make_tiny_vision_model_config(
                     text_hidden_size=32, width=64, patch_size=8, image_size=64
