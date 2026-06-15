@@ -235,6 +235,25 @@ def test_eagle_one_model_factory_skips_sa_enhancer_without_sa_config(monkeypatch
     assert wrapper.sa_enhancer is None
 
 
+def test_eagle_one_model_factory_max_seq_len_uses_target_factory():
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+    )
+    factory = EagleOneModelFactory(
+        model="target-model",
+        speculative_config=spec_config,
+        skip_loading_weights=True,
+        max_seq_len=64,
+    )
+    factory.target_factory = SimpleNamespace(max_seq_len=128)
+    factory.draft_factory = SimpleNamespace(max_seq_len=32)
+
+    assert factory.max_seq_len == 128
+
+
 @pytest.fixture
 def register_mock_eagle_factory():
     """Register MockEagleDrafterFactory for the test and clean up afterwards.

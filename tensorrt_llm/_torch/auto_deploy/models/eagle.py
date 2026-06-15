@@ -316,7 +316,7 @@ class EagleOneModelFactory(ModelFactory):
 
     @property
     def max_seq_len(self) -> int:
-        return self.draft_factory.max_seq_len
+        return self.target_factory.max_seq_len
 
     @property
     def vocab_size_padded(self) -> Optional[int]:

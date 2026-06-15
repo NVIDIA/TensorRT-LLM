@@ -19,6 +19,7 @@ from typing import Any, Optional
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine, create_autodeploy_executor
@@ -75,36 +76,121 @@ class MockFactory:
 """Unit tests for create_autodeploy_executor function."""
 
 
-def test_inference_optimizer_sees_sa_manager():
+def test_build_from_config_creates_sa_manager_after_factory_resolution():
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
+
+    events = []
+    resolved_max_seq_len = 96
+    sa_config = SAEnhancerConfig(threshold=5)
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+        sa_config=sa_config,
+    )
     ad_config = LlmArgs(
         model="target-model",
         max_batch_size=2,
-        max_seq_len=64,
+        max_seq_len=None,
         max_num_tokens=128,
         max_input_len=32,
+        speculative_config=spec_config,
         backend="_autodeploy",
         device="cpu",
         cuda_graph_config={"max_batch_size": 2},
     )
     get_inference_model = Mock(return_value=Mock())
-    sa_manager = object()
+    sa_manager = Mock()
+
+    def _create_factory():
+        events.append("create_factory")
+        ad_config.max_seq_len = resolved_max_seq_len
+        return MockFactory(vocab_size_padded=1000)
+
+    def _create_sa_manager(*args):
+        events.append("create_sa_manager")
+        return sa_manager
+
+    def _ensure_workspace(max_draft_len):
+        events.append("ensure_workspace")
+
+    def _create_optimizer(*args, **kwargs):
+        events.append("create_optimizer")
+        return get_inference_model
+
+    sa_manager._ensure_workspace.side_effect = _ensure_workspace
 
     # InferenceOptimizer needs the SA manager during CUDA graph capture.
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            side_effect=_create_factory,
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
+            side_effect=_create_sa_manager,
+        ) as sa_manager_cls,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.InferenceOptimizer",
+            side_effect=_create_optimizer,
+        ) as optimizer_cls,
+    ):
+        engine = ADEngine.build_from_config(ad_config)
+
+    assert events == [
+        "create_factory",
+        "create_sa_manager",
+        "ensure_workspace",
+        "create_optimizer",
+    ]
+    sa_manager_cls.assert_called_once_with(
+        sa_config, ad_config.max_batch_size, resolved_max_seq_len
+    )
+    sa_manager._ensure_workspace.assert_called_once_with(spec_config.max_draft_len)
+    assert optimizer_cls.call_args.kwargs["sa_manager"] is sa_manager
+    assert engine.sa_manager is sa_manager
+    get_inference_model.assert_called_once_with(engine.cache_seq_interface)
+
+
+def test_build_from_config_cleans_up_sa_manager_when_workspace_allocation_fails():
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="draft-model",
+        sa_config=SAEnhancerConfig(threshold=5),
+    )
+    ad_config = LlmArgs(
+        model="target-model",
+        max_batch_size=2,
+        max_seq_len=96,
+        max_num_tokens=128,
+        max_input_len=32,
+        speculative_config=spec_config,
+        backend="_autodeploy",
+        device="cpu",
+        cuda_graph_config={"max_batch_size": 2},
+    )
+    sa_manager = Mock()
+    sa_manager._ensure_workspace.side_effect = torch.OutOfMemoryError("oom")
+
     with (
         patch(
             "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
             return_value=MockFactory(vocab_size_padded=1000),
         ),
         patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
+            return_value=sa_manager,
+        ),
+        patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.InferenceOptimizer",
-            return_value=get_inference_model,
         ) as optimizer_cls,
+        pytest.raises(RuntimeError, match="Could not allocate necessary memory for the SAManager"),
     ):
-        engine = ADEngine.build_from_config(ad_config, sa_manager=sa_manager)
+        ADEngine.build_from_config(ad_config)
 
-    assert optimizer_cls.call_args.kwargs["sa_manager"] is sa_manager
-    assert engine.sa_manager is sa_manager
-    get_inference_model.assert_called_once_with(engine.cache_seq_interface)
+    sa_manager.shutdown.assert_called_once()
+    optimizer_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])
@@ -141,6 +227,7 @@ def test_create_autodeploy_executor_with_guided_decoding(
     )
     mock_engine.cache_seq_interface.info.vocab_size_padded = vocab_size_padded
     mock_engine.cache_seq_interface.max_num_state_slots = max_batch_size
+    mock_engine.sa_manager = None
 
     # Mock the specific dependencies requested, plus minimal additional mocks to prevent errors
     with (
@@ -155,10 +242,6 @@ def test_create_autodeploy_executor_with_guided_decoding(
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
         ) as mock_ad_engine,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=vocab_size_padded),
-        ),
     ):
         mock_ad_engine.return_value = mock_engine
 
@@ -215,14 +298,7 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
     mock_engine.cache_seq_interface.kv_cache_manager.impl = Mock()
     mock_engine.cache_seq_interface.kv_cache_config_tuned = SimpleNamespace(tokens_per_block=64)
     mock_sa_manager = Mock()
-
-    def _assert_workspace_reserved_before_build(*args, **kwargs):
-        # Resize accounting depends on the SA workspace being reserved BEFORE the engine builds
-        # (the build runs the KV-cache resize). Asserting from build_from_config's side_effect pins
-        # the ordering: the eager workspace allocation must already have run by the time the engine
-        # is built. A plain assert_called_once after the call would not catch a reordering.
-        mock_sa_manager._ensure_workspace.assert_called_once_with(spec_config.max_draft_len)
-        return mock_engine
+    mock_engine.sa_manager = mock_sa_manager
 
     with (
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_world_size", return_value=1),
@@ -232,12 +308,8 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.torch.cuda.set_device"),
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
-            side_effect=_assert_workspace_reserved_before_build,
+            return_value=mock_engine,
         ) as build_from_config_mock,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
-            return_value=mock_sa_manager,
-        ) as sa_manager_cls,
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.instantiate_sampler",
             return_value=Mock(),
@@ -249,17 +321,11 @@ def test_create_autodeploy_executor_registers_sa_resource_manager():
     ):
         result = create_autodeploy_executor(ad_config)
 
-    sa_manager_cls.assert_called_once_with(
-        sa_config, ad_config.max_batch_size, ad_config.max_seq_len
-    )
     assert (
         result.resource_manager.get_resource_manager(ResourceManagerType.SPEC_RESOURCE_MANAGER)
         is mock_sa_manager
     )
-    # The SAManager is created up front and handed to the engine at build time (rather than
-    # lazily fetched from the resource managers during prepare_inputs). The eager workspace
-    # reservation and its before-build ordering are asserted in the side_effect above.
-    assert build_from_config_mock.call_args.kwargs["sa_manager"] is mock_sa_manager
+    assert "sa_manager" not in build_from_config_mock.call_args.kwargs
 
 
 def test_create_autodeploy_executor_skips_sa_resource_manager_without_sa_config():
@@ -287,6 +353,7 @@ def test_create_autodeploy_executor_skips_sa_resource_manager_without_sa_config(
     mock_engine.cache_seq_interface.kv_cache_manager = Mock()
     mock_engine.cache_seq_interface.kv_cache_manager.impl = Mock()
     mock_engine.cache_seq_interface.kv_cache_config_tuned = SimpleNamespace(tokens_per_block=64)
+    mock_engine.sa_manager = None
 
     with (
         patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.mpi_world_size", return_value=1),
@@ -299,9 +366,6 @@ def test_create_autodeploy_executor_skips_sa_resource_manager_without_sa_config(
             return_value=mock_engine,
         ) as build_from_config_mock,
         patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.SuffixAutomatonManager",
-        ) as sa_manager_cls,
-        patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.instantiate_sampler",
             return_value=Mock(),
         ),
@@ -312,8 +376,7 @@ def test_create_autodeploy_executor_skips_sa_resource_manager_without_sa_config(
     ):
         result = create_autodeploy_executor(ad_config)
 
-    sa_manager_cls.assert_not_called()
-    assert build_from_config_mock.call_args.kwargs["sa_manager"] is None
+    assert "sa_manager" not in build_from_config_mock.call_args.kwargs
     assert (
         result.resource_manager.get_resource_manager(ResourceManagerType.SPEC_RESOURCE_MANAGER)
         is None

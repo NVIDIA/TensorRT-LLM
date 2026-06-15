@@ -369,7 +369,6 @@ class ADEngine(ModelEngine):
         # deprecation: Mapping will soon be replaced entirely by DistConfig
         mapping: Optional[Mapping] = None,
         dist: Optional[Distributed] = None,
-        sa_manager: Optional[SuffixAutomatonManager] = None,
     ):
         """Build the ADEngine using the LlmArgs that gets passed through from the LLM."""
 
@@ -380,6 +379,28 @@ class ADEngine(ModelEngine):
         device = str(device)
 
         factory = ad_config.create_factory()
+        spec_config = ad_config.speculative_config
+        if dist_config is not None:
+            pp_size = dist_config.pp_size
+        elif mapping is not None:
+            pp_size = mapping.pp_size
+        else:
+            pp_size = 1
+        max_num_sequences = ad_config.max_batch_size * pp_size
+        sa_manager = None
+        if spec_config is not None and getattr(spec_config, "sa_config", None) is not None:
+            sa_manager = SuffixAutomatonManager(
+                spec_config.sa_config,
+                max_num_sequences,
+                ad_config.max_seq_len,
+            )
+            try:
+                sa_manager._ensure_workspace(spec_config.max_draft_len)
+            except Exception as err:
+                sa_manager.shutdown()
+                raise RuntimeError(
+                    "Could not allocate necessary memory for the SAManager."
+                ) from err
 
         # Initialize CachedSequenceInterface - it will create SequenceInfo internally
         # using tokens_per_block from kv_cache_config
@@ -1172,21 +1193,9 @@ def create_autodeploy_executor(
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
 
-    # Reserve SA workspace before engine build so resize_kv_cache sees less free GPU memory and
-    # sizes the KV cache with room for the SA pool. This is workspace allocation only; there is no
-    # scheduler batch to prepare at this point.
-    sa_manager = None
-    if spec_config is not None and getattr(spec_config, "sa_config", None) is not None:
-        sa_manager = SuffixAutomatonManager(
-            spec_config.sa_config,
-            max_num_sequences,
-            ad_config.max_seq_len,
-        )
-        sa_manager._ensure_workspace(spec_config.max_draft_len)
-
     # initialize model engine
     engine = ADEngine.build_from_config(
-        ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist, sa_manager=sa_manager
+        ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist
     )
 
     # resource managers
@@ -1200,8 +1209,8 @@ def create_autodeploy_executor(
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
         ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
     }
-    if sa_manager is not None:
-        resource_managers[ResourceManagerType.SPEC_RESOURCE_MANAGER] = sa_manager
+    if engine.sa_manager is not None:
+        resource_managers[ResourceManagerType.SPEC_RESOURCE_MANAGER] = engine.sa_manager
     resource_manager = ResourceManager(resource_managers)
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
