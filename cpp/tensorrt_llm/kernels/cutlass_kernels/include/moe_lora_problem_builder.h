@@ -29,8 +29,14 @@ namespace kernels::cutlass_kernels
 {
 
 // Caller-owned device-output bundle for one LoRA module. Each array is sized
-// for the maximum permuted-token count the FusedMoeRunner expects to see;
-// the builder fills the first num_permuted_tokens entries each call.
+// for the maximum permuted-token count the FusedMoeRunner expects to see
+// (P_max). The builder run-length-aggregates consecutive rows that share the
+// same (rank, A_ptr, B_ptr) into one M=run_length problem, so only the first
+// `num_groups` (<= num_permuted_tokens) slots hold live problems; the trailing
+// slots [num_groups, P_max) are filled as N=0 no-ops (zero grouped-GEMM tiles,
+// never dereferenced). The array length passed to the grouped-GEMM wrapper
+// stays fixed at num_permuted_tokens regardless of num_groups, which keeps the
+// host problem count constant across CUDA-graph replays.
 //
 // Layout convention (mirrors attention LoRA in cuda_graph_grouped_gemm.h):
 //   In-GEMM:  D = A @ B with C aliased to D when there's no bias.
@@ -82,6 +88,13 @@ struct MoeLoraGemmGroupArrays
 // input, workspace, and output base addresses, and writes every device-resident
 // input the cuda_graph_(split_k_)grouped_gemm wrappers need.
 //
+// It run-length-aggregates consecutive permuted rows that share the same
+// (rank, A_ptr, B_ptr) into a single M=run_length problem (the rows are already
+// contiguous in input/workspace/output, so this is a pure regroup with no
+// gather and identical math). Slots [0, num_groups) hold the merged problems
+// and [num_groups, P) are N=0 no-ops; the array length stays P so the
+// grouped-GEMM problem count is constant across CUDA-graph replays.
+//
 // Inputs:
 //   ranks_dev: int32 [P], per-permuted-row LoRA rank.
 //   ptrs_dev:  int64 [P*2], per-permuted-row (A_ptr + offset, B_ptr + offset),
@@ -106,8 +119,10 @@ struct MoeLoraGemmGroupArrays
 //   splitk_slices:   split-K factor for the in-GEMM; drives the per-problem
 //                    split-K scratch stride.
 //
-// The split-K stride is a worst-case fixed value (max_lora_rank * splitk_slices
-// per problem) so the offsets can be computed from i alone without a prefix-sum.
+// The split-K offsets are an exclusive prefix sum over per-run
+// M * max_lora_rank * splitk_slices; element [P] holds the total (sum of M = P,
+// so the total is unchanged from the un-aggregated layout) and the no-op tail
+// slots repeat that total.
 void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_dev, void const* input_base,
     void* lowrank_workspace, void* output_base, int64_t num_permuted_tokens, int64_t in_hidden_size,
     int64_t out_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,

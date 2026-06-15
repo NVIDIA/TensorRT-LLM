@@ -153,6 +153,24 @@ struct MoeLoraDevicePath
     // this consumer (for example, the TensorRT plugin).
     MoeLoraDeviceRunFn run = nullptr;
 
+    // "Adapter as secondary sort key" (lora_gemm_by_adapter.md, Piece B).
+    // When adapter_sort is true, the runner regroups the permuted rows within
+    // each expert block by adapter slot (launchMoeLoraAdapterRegroup) right
+    // after the expert sort, so same-adapter rows are contiguous and the
+    // builder-side aggregation (Piece A) merges them into fat-M problems.
+    //
+    // Slot-indexed mode only: token_to_slot_dev is the dense per-token adapter
+    // slot id (== the token_to_slot device mirror), num_slots its range, and
+    // num_tokens the un-expanded token count (regroup_scratch_dev is a
+    // [P_max]-sized int scratch used as a stable read copy of the forward map).
+    // All of these are nullptr/0 unless the slot-indexed device path is active
+    // and the feature is opted in.
+    bool adapter_sort = false;
+    int32_t const* token_to_slot_dev = nullptr;
+    int* regroup_scratch_dev = nullptr;
+    int num_slots = 0;
+    int64_t num_tokens = 0;
+
     MoeLoraDevicePathModule fc1;
     MoeLoraDevicePathModule fc2;
     MoeLoraDevicePathModule gated;

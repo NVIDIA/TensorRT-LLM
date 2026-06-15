@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import pathlib
 import random
 import time
@@ -12,7 +13,8 @@ from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
-from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig)
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
                                           SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -40,6 +42,7 @@ from utils.util import (force_ampere, similar, similarity_score,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.llmapi.llm_args import MoeConfig
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -1092,6 +1095,194 @@ def test_qwen_moe_shared_expert_lora():
             "logprobs) -- shared expert LoRA not applied")
     finally:
         llm.shutdown()
+
+
+def _write_routed_expert_lora_adapter(save_dir: str, *, moe_layers: list[int],
+                                      num_experts: int, hidden_size: int,
+                                      moe_intermediate_size: int, rank: int,
+                                      lora_alpha: float, seed: int) -> None:
+    """Fabricate a per-expert routed-expert HF LoRA adapter on disk.
+
+    Current transformers stores Qwen2-MoE routed experts as fused 3D parameters
+    (experts.gate_up_proj, experts.down_proj) rather than per-expert Linears, so
+    PEFT cannot emit the per-expert adapter keys the TRT-LLM loader expects.
+    This writes those keys directly: for every MoE layer and expert it creates
+    random lora_A/lora_B for gate_proj (moe_h_to_4h), up_proj (moe_gate) and
+    down_proj (moe_4h_to_h), keyed as .../mlp.experts.{e}.{proj}.lora_{A,B}.weight.
+    lora_B is non-zero so each adapter perturbs the routed-expert output.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def randn(rows, cols, std=0.02):
+        weight = torch.randn(rows,
+                             cols,
+                             generator=generator,
+                             dtype=torch.float32)
+        return (weight * std).to(torch.bfloat16)
+
+    # (projection name, in_features, out_features) for a single expert.
+    projections = (
+        ("gate_proj", hidden_size, moe_intermediate_size),
+        ("up_proj", hidden_size, moe_intermediate_size),
+        ("down_proj", moe_intermediate_size, hidden_size),
+    )
+
+    state_dict = {}
+    for layer_idx in moe_layers:
+        prefix = f"base_model.model.model.layers.{layer_idx}.mlp.experts"
+        for expert_idx in range(num_experts):
+            for proj, in_features, out_features in projections:
+                key = f"{prefix}.{expert_idx}.{proj}"
+                state_dict[f"{key}.lora_A.weight"] = randn(rank, in_features)
+                state_dict[f"{key}.lora_B.weight"] = randn(out_features, rank)
+
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(state_dict, os.path.join(save_dir, "adapter_model.bin"))
+    adapter_config = {
+        "peft_type": "LORA",
+        "r": int(rank),
+        "lora_alpha": float(lora_alpha),
+        "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        "bias": "none",
+        "task_type": "CAUSAL_LM",
+        "use_rslora": False,
+    }
+    with open(os.path.join(save_dir, "adapter_config.json"), "w") as f:
+        json.dump(adapter_config, f)
+
+
+@skip_gpu_memory_less_than_40gb
+@pytest.mark.part0
+@pytest.mark.parametrize("moe_lora_mode", [
+    "host_path",
+    "device_path_eager",
+    "device_path_cudagraph",
+])
+def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
+        moe_lora_mode: str, monkeypatch) -> None:
+    """Routed-expert MoE LoRA on Qwen1.5-MoE with the PyTorch CUTLASS backend.
+
+    Five dummy adapters of varying rank target the routed experts (moe_h_to_4h,
+    moe_gate, moe_4h_to_h). The same workload runs through each of the three
+    routed-expert LoRA execution paths, selected by moe_lora_mode:
+
+    - host_path: eager, legacy host path (per-request D2H pointer expand).
+    - device_path_eager: eager, capture-safe device path forced on via
+      TLLM_MOE_LORA_USE_DEVICE_PATH (per-request schema, no CUDA graph).
+    - device_path_cudagraph: CUDA graph decode, which always takes the
+      slot-indexed device path; all adapters share one captured graph,
+      exercising the slot-indexed device path and per-slot rank handling.
+
+    Current transformers stores the routed experts as fused 3D parameters, so
+    PEFT cannot produce per-expert adapter weights; the adapters are fabricated
+    directly in the per-expert key layout the TRT-LLM loader expects. An
+    explicit module mapping is supplied because the default map only knows
+    w1/w2/w3 for routed experts. lora_B is non-zero so each adapter perturbs the
+    routed-expert output, letting the test assert the LoRA is actually applied.
+    """
+    # Select the execution path. The eager device path is forced via env var
+    # (read once at FusedMoeRunner construction); the CUDA-graph path always
+    # takes the slot-indexed device path, so it needs no env opt-in.
+    cuda_graph_config = None
+    if moe_lora_mode == "device_path_eager":
+        monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    elif moe_lora_mode == "device_path_cudagraph":
+        cuda_graph_config = CudaGraphConfig(max_batch_size=10)
+
+    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
+
+    # Five adapters with varying ranks; max_lora_rank must cover the largest.
+    ranks = [8, 16, 32, 16, 64]
+    max_rank = max(ranks)
+
+    # HF expert-projection names -> routed-expert TRT-LLM module ids. The
+    # default map only carries w1/w2/w3, so the gate/up/down names need an
+    # explicit entry. (gate_proj->w1->moe_h_to_4h, up_proj->w3->moe_gate,
+    # down_proj->w2->moe_4h_to_h.)
+    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
+    trtllm_modules_to_hf_modules = {
+        "moe_h_to_4h": "gate_proj",
+        "moe_gate": "up_proj",
+        "moe_4h_to_h": "down_proj",
+    }
+
+    # Derive expert dims and the set of MoE layers from the model config so the
+    # fabricated adapter matches the served model.
+    with open(f"{model_dir}/config.json") as f:
+        cfg = json.load(f)
+    num_experts = cfg["num_experts"]
+    hidden_size = cfg["hidden_size"]
+    moe_intermediate_size = cfg["moe_intermediate_size"]
+    num_hidden_layers = cfg["num_hidden_layers"]
+    decoder_sparse_step = cfg.get("decoder_sparse_step", 1)
+    mlp_only_layers = cfg.get("mlp_only_layers") or []
+    moe_layers = [
+        layer_idx for layer_idx in range(num_hidden_layers)
+        if layer_idx not in mlp_only_layers and num_experts > 0 and
+        (layer_idx + 1) % decoder_sparse_step == 0
+    ]
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        lora_paths = []
+        for i, r in enumerate(ranks):
+            lora_path = f"{lora_dir}/lora_{i}"
+            _write_routed_expert_lora_adapter(
+                lora_path,
+                moe_layers=moe_layers,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                moe_intermediate_size=moe_intermediate_size,
+                rank=r,
+                lora_alpha=2 * r,
+                seed=1000 + i,
+            )
+            lora_paths.append(lora_path)
+
+        lora_config = LoraConfig(
+            lora_dir=lora_paths,
+            lora_target_modules=target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            max_lora_rank=max_rank,
+            max_loras=len(ranks),
+            max_cpu_loras=len(ranks),
+        )
+        llm = LLM(model=model_dir,
+                  lora_config=lora_config,
+                  moe_config=MoeConfig(backend="CUTLASS"),
+                  cuda_graph_config=cuda_graph_config)
+        try:
+            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+            prompt = "What is your name?"
+
+            base_tokens = list(
+                llm.generate([prompt], sampling_params,
+                             lora_request=None)[0].outputs[0].token_ids)
+
+            lora_requests = [
+                LoRARequest(f"moe-lora-{i}", i, path)
+                for i, path in enumerate(lora_paths)
+            ]
+
+            # One batch mixes a no-LoRA (rank-0) request with every adapter so
+            # the rank-0 skip path and all adapters run through a single
+            # (captured, when enabled) decode graph.
+            requests = [None] + lora_requests
+            outputs = llm.generate([prompt] * len(requests),
+                                   sampling_params,
+                                   lora_request=requests)
+            out_tokens = [list(o.outputs[0].token_ids) for o in outputs]
+
+            # The no-LoRA row (index 0) must run (rank-0 skip path) and produce
+            # output.
+            assert out_tokens[0], (
+                "No-LoRA row in the mixed batch produced no tokens.")
+            # Every adapter -- not just one -- must change the output vs base.
+            for i in range(len(lora_requests)):
+                assert out_tokens[i + 1] != base_tokens, (
+                    f"Routed-expert MoE LoRA adapter {i} produced output "
+                    "identical to the base model; it was not applied.")
+        finally:
+            llm.shutdown()
 
 
 class TestLlmError:
