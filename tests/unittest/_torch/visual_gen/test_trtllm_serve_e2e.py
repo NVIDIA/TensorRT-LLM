@@ -40,8 +40,6 @@ import pytest
 import requests
 import yaml
 
-from tensorrt_llm._utils import get_free_port
-
 # ---------------------------------------------------------------------------
 # Model paths
 # ---------------------------------------------------------------------------
@@ -69,6 +67,14 @@ _FLUX2_PATH = Path(_llm_models_root()) / "FLUX.2-dev"
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]  # repo root
 _REF_IMAGE_PATH = _PROJECT_ROOT / "examples" / "visual_gen" / "cat_piano.png"
 
+# Use the CI-aware port allocator from tests/integration/defs/common.py so
+# parallel pytest sessions on the same OCI node fall into disjoint port
+# sections (CONTAINER_PORT_START / CONTAINER_PORT_NUM). It transparently falls
+# back to the plain free-port scan when those env vars are not set.
+_INTEGRATION_TESTS_DIR = _PROJECT_ROOT / "tests" / "integration"
+if str(_INTEGRATION_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_INTEGRATION_TESTS_DIR))
+from defs.common import get_free_port_in_ci  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Remote server helper (follows RemoteOpenAIServer pattern)
@@ -94,7 +100,7 @@ class RemoteVisualGenServer:
         env: Optional[dict] = None,
     ) -> None:
         self.host = host
-        self.port = port if port is not None else get_free_port()
+        self.port = port if port is not None else get_free_port_in_ci()
         self._config_file: Optional[str] = None
         self.proc: Optional[subprocess.Popen] = None
 

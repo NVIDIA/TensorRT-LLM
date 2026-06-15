@@ -133,7 +133,9 @@ class QuantConfig(StrictBaseModel):
     """Serializable quantization configuration class, part of the PretrainedConfig."""
 
     quant_algo: Optional[QuantAlgo] = Field(
-        default=None, description="Quantization algorithm.")
+        default=None,
+        description="Quantization algorithm.",
+        json_schema_extra={"telemetry": True})
     kv_cache_quant_algo: Optional[QuantAlgo] = Field(
         default=None, description="KV cache quantization algorithm.")
     group_size: Optional[int] = Field(

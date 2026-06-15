@@ -90,6 +90,10 @@ def _normalize_qwen35_exclude_modules(model_config):
         name = re.sub(r"\.in_proj_(q|k|v|z|qkv)(\b|\*)", ".in_proj_qkvz*", name)
         normalized.add(name)
 
+    # gdn_mixer uses Linear module for weight management of depthwise conv1d
+    # but conv1d is not a proper linear module and should be excluded from quant
+    normalized.add("*linear_attn.conv1d")
+
     qc.exclude_modules = sorted(normalized)
 
 
