@@ -37,6 +37,17 @@ _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
 _MAX_MODEL_INIT_WORKERS = 3
+_MODEL_DIR_PARAMS = [
+    pytest.param(_LLAVA_DIR, id="llava_7b"),
+    pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
+    pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
+    pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
+                 id="qwen3_30b_a3b_fp8"),
+]
+_PD_DISAGG_PARAMS = [
+    pytest.param(False, id="no_pd_disagg"),
+    pytest.param(True, id="pd_disagg"),
+]
 
 
 def _instantiate_models(*initializers):
@@ -259,21 +270,13 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         f"got {num_duplicates}. Offsets: {mm_keys_offsets}")
 
 
-@pytest.fixture(
-    scope="module",
-    params=[
-        pytest.param(_LLAVA_DIR, id="llava_7b"),
-        pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
-        pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
-        pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
-                     id="qwen3_30b_a3b_fp8"),
-    ],
-)
+@pytest.fixture(scope="module")
 def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    if request.param == _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL:
+    model_dir_param = getattr(request, "param", _LLAVA_DIR)
+    if model_dir_param == _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL:
         return _create_fake_qwen3_vl_30b_a3b_fp8_dir(tmp_path_factory,
                                                      _QWEN_3_VL_DIR)
-    return request.param
+    return model_dir_param
 
 
 @pytest.mark.parametrize(
@@ -631,13 +634,9 @@ def test_kv_event_mm_keys_with_very_long_uuid():
             f"found {len(matching)} times in {mm_key_hashes}")
 
 
-@pytest.fixture(scope="module",
-                params=[
-                    pytest.param(False, id="no_pd_disagg"),
-                    pytest.param(True, id="pd_disagg"),
-                ])
+@pytest.fixture(scope="module")
 def pd_disagg(request) -> bool:
-    return request.param
+    return getattr(request, "param", False)
 
 
 @pytest.fixture(scope="module")
@@ -778,6 +777,8 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
         assert x[key] != y[key]
 
 
+@pytest.mark.parametrize("model_dir", _MODEL_DIR_PARAMS, indirect=True)
+@pytest.mark.parametrize("pd_disagg", _PD_DISAGG_PARAMS, indirect=True)
 @pytest.mark.threadleak(enabled=False)
 def test_single_request_chat_multiple_images(
     pd_disagg: bool,
