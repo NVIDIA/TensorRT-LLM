@@ -9,10 +9,7 @@ BF16, so attention backends can consult BF16 values for the tail tokens that
 do not yet fill a complete FP4 quant block of 16 elements along the sequence
 dimension.
 
-Used by both ``TrtllmAttention`` (via an internal C++ attention op that reads
-both pools) and ``FlashInferAttention`` (via either explicit Python-side
-dequant into a BF16 workspace before calling FlashInfer MLA wrappers, or an
-env-gated Triton attention path that reads packed FP4 Q, K, and V directly).
+Used by the TRTLLM attention backend FP4 MLA FMHA path.
 """
 
 import os
@@ -23,9 +20,6 @@ import triton
 import triton.language as tl
 
 from .fp4_mla_kernels import (
-    _fp4_mla_dequant_kernel,
-    _fp4_mla_overlay_hp_tail_kernel,
-    _fp4_mla_scatter_kernel,
     _fp4_mla_v_scale_store_context_tokens_kernel,
     _fp4_mla_v_scale_store_generation_tiles_kernel,
     _hp_kv_restore_rejected_from_pool_kernel,
@@ -44,22 +38,12 @@ FP4_MLA_P_GLOBAL_SCALE: float = 448.0 * 6.0
 # Max finite e4m3 magnitude for FP4 MLA block-scale clamping.
 FP4_MLA_E4M3_MAX: float = 448.0
 FP4_MLA_Q_RESIDUAL_DIM: int = 64
-FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
-FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION_BACKEND"
+FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
 _HPUpdatePhase = Literal["all", "context", "generation"]
 _FP4_MLA_MTP_HP_SNAPSHOTS = "_fp4_mla_mtp_hp_snapshots"
 
 
 # Environment helpers
-
-
-def _env_enabled(name: str) -> bool:
-    return os.getenv(name, "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def _env_enabled_default(name: str, default: bool) -> bool:
@@ -81,13 +65,12 @@ def _env_int(name: str) -> Optional[int]:
     return int(value)
 
 
-def is_flashinfer_fp4_mla_attention_enabled() -> bool:
-    """Return whether FlashInfer MLA should allocate no-dequant FP4 attention buffers."""
-    return _env_enabled(FLASHINFER_FP4_MLA_ATTENTION_ENV)
-
-
 def _fp4_mla_attention_backend() -> str:
-    return os.getenv(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, "triton").lower()
+    return os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton").lower()
+
+
+def _cutile_backend_available() -> bool:
+    return hasattr(tl, "ext")
 
 
 def _ceil_div(lhs: int, rhs: int) -> int:
@@ -105,6 +88,43 @@ def _get_sm_count(device: torch.device) -> int:
         count = torch.cuda.get_device_properties(index).multi_processor_count
         _SM_COUNT_CACHE[index] = count
     return count
+
+
+def apply_fp4_mla_rope(
+    target: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_cos_sin: torch.Tensor,
+    max_positions: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply TRTLLM MLA RoPE using adjacent GPT-J-style element pairs."""
+    if rope_dim % 2 != 0:
+        raise RuntimeError(f"MLA RoPE dimension must be even, got {rope_dim}.")
+    if target.shape[-1] != rope_dim:
+        raise RuntimeError(
+            f"MLA RoPE target last dimension must be {rope_dim}, got {target.shape[-1]}."
+        )
+
+    positions = positions[: target.shape[0]].to(torch.long)
+    cos_sin = rotary_cos_sin.view(max_positions, rope_dim, 2).index_select(0, positions)
+    pair_count = rope_dim // 2
+
+    math_dtype = target.dtype
+    if math_dtype == torch.float8_e4m3fn:
+        math_dtype = torch.bfloat16
+    target_math = target.to(math_dtype)
+    cos = cos_sin[:, :pair_count, 0].to(math_dtype)
+    sin = cos_sin[:, :pair_count, 1].to(math_dtype)
+    while cos.ndim < target_math.ndim:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+    target_even = target_math[..., 0::2]
+    target_odd = target_math[..., 1::2]
+    target_roped = torch.empty_like(target_math)
+    target_roped[..., 0::2] = target_even * cos - target_odd * sin
+    target_roped[..., 1::2] = target_odd * cos + target_even * sin
+    return target_roped.to(target.dtype)
 
 
 def _host_int_list_during_forward(value: Any, start: int, end: int) -> Optional[list[int]]:
@@ -136,10 +156,6 @@ def _get_fp4_mla_swizzled_scale_size(rows: int, cols: int) -> int:
     row_groups = _ceil_div(rows, FP4_MLA_SCALE_ROW_GROUP)
     col_groups = _ceil_div(scale_cols, FP4_MLA_SCALE_COL_GROUP)
     return row_groups * col_groups * 32 * 16
-
-
-def _use_fp4_mla_swizzled_sf() -> bool:
-    return is_flashinfer_fp4_mla_attention_enabled()
 
 
 def _get_fp4_mla_context_start_positions(metadata: Any, num_contexts: int) -> torch.Tensor:
@@ -438,65 +454,6 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     )
 
 
-def _scatter_fp4_mla_kv_cache_1d(
-    metadata: Any,
-    latent_cache: torch.Tensor,
-    kv_cache: torch.Tensor,
-    sf_cache: torch.Tensor,
-    global_scale: torch.Tensor,
-    *,
-    layer_idx: int,
-    token_offset: int,
-    num_tokens: int,
-    head_dim: int,
-    sf_per_token: int,
-    use_swizzled_sf: bool,
-) -> None:
-    q_fp4, q_sf = torch.ops.trtllm.fp4_quantize(
-        latent_cache, global_scale, FP4_BLOCK_SIZE, False, False
-    )
-    q_sf = q_sf.view(num_tokens, head_dim // FP4_BLOCK_SIZE)
-
-    packed_dim = head_dim // 2
-    block_packed_dim = triton.next_power_of_2(packed_dim)
-    block_sf = triton.next_power_of_2(sf_per_token)
-
-    _fp4_mla_scatter_kernel[(num_tokens,)](
-        kv_cache,
-        sf_cache,
-        q_fp4,
-        q_sf,
-        metadata.batch_indices,
-        metadata.positions,
-        metadata.paged_kv_indices,
-        metadata.paged_kv_indptr,
-        metadata.paged_kv_indices.shape[0],
-        metadata.paged_kv_indptr.shape[0],
-        kv_cache.shape[0],
-        token_offset,
-        metadata.page_size,
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
-        kv_cache.stride(3),
-        kv_cache.stride(4),
-        sf_cache.stride(0),
-        sf_cache.stride(1),
-        sf_cache.stride(2),
-        sf_cache.stride(3),
-        sf_cache.stride(4),
-        q_fp4.stride(0),
-        q_fp4.stride(1),
-        q_sf.stride(0),
-        q_sf.stride(1),
-        PACKED_D=packed_dim,
-        SF_PER_TOKEN=sf_per_token,
-        BLOCK_PACKED_D=block_packed_dim,
-        BLOCK_SF=block_sf,
-        USE_SWIZZLED_SF=use_swizzled_sf,
-    )
-
-
 # Public cache update and decode entry points
 
 
@@ -521,12 +478,11 @@ def scatter_fp4_mla_kv_cache(
     slices ``latent_cache[:num_ctx_tokens]`` for context and
     ``latent_cache[num_ctx_tokens:]`` for generation before dispatching.
 
-    When the no-dequant FP4 MLA attention path is enabled, callers should pass
-    ``phase``, ``local_layer``, and ``v_head_dim``.  Context scatter then writes
-    the final FP4 tile representation directly: dimensions below
+    Callers must pass ``phase``, ``local_layer``, and ``v_head_dim``. Context
+    scatter writes the final FP4 tile representation directly: dimensions below
     ``v_head_dim`` use one shared 16-token by 16-dim scale written into both
-    K's token-major scale layout and V's dim-major scale layout.  Tail K-only
-    dimensions use K's per-token 1D scales.  Generation scatter rewrites each
+    K's token-major scale layout and V's dim-major scale layout. Tail K-only
+    dimensions use K's per-token 1D scales. Generation scatter rewrites each
     touched 16-token tile by reading old tokens from the HP pool and new tokens
     from ``latent_cache``; callers then update the HP pool after scatter.
     """
@@ -552,175 +508,94 @@ def scatter_fp4_mla_kv_cache(
             "range (see MLA.forward_impl)."
         )
 
-    use_swizzled_sf = _use_fp4_mla_swizzled_sf()
-    if use_swizzled_sf:
-        _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
+    _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
 
     global_scale = _get_fp4_mla_global_scale(metadata, latent_cache.device)
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
     sf_per_token = head_dim // FP4_BLOCK_SIZE
 
-    use_2d_scatter = (
-        use_swizzled_sf
-        and phase in ("context", "generation")
-        and getattr(metadata, "fp4_mla_v_scale_pool", None) is not None
-    )
-    if use_2d_scatter:
-        assert phase is not None
-        if local_layer is None or v_head_dim is None:
-            raise ValueError("Real FP4 MLA scatter requires local_layer and v_head_dim.")
-        if metadata.page_size % HP_BLOCK_SIZE != 0:
-            raise ValueError(
-                f"FP4 MLA scatter requires page_size divisible by "
-                f"{HP_BLOCK_SIZE}, got {metadata.page_size}."
-            )
-        if v_head_dim > head_dim:
-            raise ValueError(f"FP4 MLA v_head_dim={v_head_dim} cannot exceed head_dim={head_dim}.")
-        if v_head_dim % FP4_BLOCK_SIZE != 0:
-            raise ValueError(
-                f"FP4 MLA v_head_dim must be divisible by {FP4_BLOCK_SIZE}, got {v_head_dim}."
-            )
-
-        sf_cache = sf_cache.view(torch.float8_e4m3fn)
-        v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
-        num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
-        sf_per_page = metadata.page_size // HP_BLOCK_SIZE
-
-        if phase == "context":
-            _scatter_fp4_mla_kv_cache_2d_context(
-                metadata,
-                latent_cache,
-                kv_cache,
-                sf_cache,
-                v_sf,
-                global_scale,
-                token_offset=token_offset,
-                local_layer=local_layer,
-                v_head_dim=v_head_dim,
-                head_dim=head_dim,
-                num_tokens=num_tokens,
-                num_dim_blocks=num_dim_blocks,
-                sf_per_token=sf_per_token,
-                sf_per_page=sf_per_page,
-            )
-        else:
-            _scatter_fp4_mla_kv_cache_2d_generation(
-                metadata,
-                latent_cache,
-                kv_cache,
-                sf_cache,
-                v_sf,
-                global_scale,
-                local_layer=local_layer,
-                v_head_dim=v_head_dim,
-                head_dim=head_dim,
-                num_tokens=num_tokens,
-                num_dim_blocks=num_dim_blocks,
-                sf_per_token=sf_per_token,
-                sf_per_page=sf_per_page,
-            )
-        if phase == "context":
-            v_pack_page_ids = metadata.paged_kv_indices
-        else:
-            num_gen_blocks = metadata.num_generation_blocks
-            v_pack_page_ids = metadata.paged_kv_indices[
-                metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
-            ]
-        _maybe_update_cutile_v_packed_cache(
-            metadata,
-            layer_idx,
-            kv_cache,
-            v_pack_page_ids,
-            v_head_dim=v_head_dim,
-            page_size=metadata.page_size,
-            local_layer=local_layer,
-            v_sf=v_sf[local_layer],
+    if phase not in ("context", "generation"):
+        raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
+    if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
+        raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
+    if local_layer is None or v_head_dim is None:
+        raise ValueError("FP4 MLA scatter requires local_layer and v_head_dim.")
+    if metadata.page_size % HP_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"FP4 MLA scatter requires page_size divisible by "
+            f"{HP_BLOCK_SIZE}, got {metadata.page_size}."
         )
-        _maybe_update_triton_v_packed_cache(
-            metadata,
-            layer_idx,
-            kv_cache,
-            v_pack_page_ids,
-            num_queries=num_tokens,
-            v_head_dim=v_head_dim,
-            page_size=metadata.page_size,
-            local_layer=local_layer,
-            v_sf=v_sf[local_layer],
+    if v_head_dim > head_dim:
+        raise ValueError(f"FP4 MLA v_head_dim={v_head_dim} cannot exceed head_dim={head_dim}.")
+    if v_head_dim % FP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"FP4 MLA v_head_dim must be divisible by {FP4_BLOCK_SIZE}, got {v_head_dim}."
         )
-        return
 
-    _scatter_fp4_mla_kv_cache_1d(
+    sf_cache = sf_cache.view(torch.float8_e4m3fn)
+    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
+    sf_per_page = metadata.page_size // HP_BLOCK_SIZE
+
+    if phase == "context":
+        _scatter_fp4_mla_kv_cache_2d_context(
+            metadata,
+            latent_cache,
+            kv_cache,
+            sf_cache,
+            v_sf,
+            global_scale,
+            token_offset=token_offset,
+            local_layer=local_layer,
+            v_head_dim=v_head_dim,
+            head_dim=head_dim,
+            num_tokens=num_tokens,
+            num_dim_blocks=num_dim_blocks,
+            sf_per_token=sf_per_token,
+            sf_per_page=sf_per_page,
+        )
+        v_pack_page_ids = metadata.paged_kv_indices
+    else:
+        _scatter_fp4_mla_kv_cache_2d_generation(
+            metadata,
+            latent_cache,
+            kv_cache,
+            sf_cache,
+            v_sf,
+            global_scale,
+            local_layer=local_layer,
+            v_head_dim=v_head_dim,
+            head_dim=head_dim,
+            num_tokens=num_tokens,
+            num_dim_blocks=num_dim_blocks,
+            sf_per_token=sf_per_token,
+            sf_per_page=sf_per_page,
+        )
+        num_gen_blocks = metadata.num_generation_blocks
+        v_pack_page_ids = metadata.paged_kv_indices[
+            metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
+        ]
+    _maybe_update_cutile_v_packed_cache(
         metadata,
-        latent_cache,
+        layer_idx,
         kv_cache,
-        sf_cache,
-        global_scale,
-        layer_idx=layer_idx,
-        token_offset=token_offset,
-        num_tokens=num_tokens,
-        head_dim=head_dim,
-        sf_per_token=sf_per_token,
-        use_swizzled_sf=use_swizzled_sf,
+        v_pack_page_ids,
+        v_head_dim=v_head_dim,
+        page_size=metadata.page_size,
+        local_layer=local_layer,
+        v_sf=v_sf[local_layer],
     )
-
-
-def _ensure_decode_workspace(
-    metadata: Any,
-    head_dim: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    num_blocks = _get_decode_workspace_num_blocks(metadata)
-    workspace = getattr(metadata, "_fp4_mla_decode_cache_buf", None)
-    needs_alloc = (
-        workspace is None
-        or workspace.shape[0] < max(num_blocks, 1)
-        or workspace.shape[1] != metadata.page_size
-        or workspace.shape[2] != head_dim
-        or workspace.dtype != dtype
+    _maybe_update_triton_v_packed_cache(
+        metadata,
+        layer_idx,
+        kv_cache,
+        v_pack_page_ids,
+        num_queries=num_tokens,
+        v_head_dim=v_head_dim,
+        page_size=metadata.page_size,
+        local_layer=local_layer,
+        v_sf=v_sf[local_layer],
     )
-    if needs_alloc:
-        if torch.cuda.is_current_stream_capturing():
-            raise ValueError(
-                "Cannot allocate FlashInfer FP4 MLA decode workspace while "
-                "capturing a CUDA graph. Run a warmup prepare/forward first."
-            )
-        workspace = torch.empty(
-            (max(num_blocks, 1), metadata.page_size, head_dim),
-            dtype=dtype,
-            device=metadata.paged_kv_indices.device,
-        )
-        metadata._fp4_mla_decode_cache_buf = workspace
-    return workspace[:num_blocks]
-
-
-def _get_decode_workspace_num_blocks(metadata: Any) -> int:
-    if metadata.is_cuda_graph:
-        max_blocks_per_seq = (
-            metadata.kv_cache_manager.max_seq_len + metadata.page_size - 1
-        ) // metadata.page_size
-        max_graph_blocks = metadata.max_num_requests * max_blocks_per_seq
-        return min(
-            metadata.kv_cache_manager.blocks_in_primary_pool,
-            max_graph_blocks,
-        )
-    return metadata.num_generation_blocks
-
-
-def _get_decode_src_page_ids(metadata: Any, num_blocks: int) -> torch.Tensor:
-    page_ids = (
-        metadata._paged_kv_indices
-        if metadata.is_cuda_graph and hasattr(metadata, "_paged_kv_indices")
-        else metadata.paged_kv_indices
-    )
-    src_page_ids = page_ids[metadata.num_context_blocks : metadata.num_context_blocks + num_blocks]
-    if src_page_ids.numel() != num_blocks:
-        raise RuntimeError(
-            f"FP4 MLA dequant needs {num_blocks} decode page ids from "
-            f"paged_kv_indices[{metadata.num_context_blocks}:"
-            f"{metadata.num_context_blocks + num_blocks}], got "
-            f"{src_page_ids.numel()}."
-        )
-    return src_page_ids
 
 
 def _validate_fp4_mla_cache_shape(page_size: int, head_dim: int) -> None:
@@ -759,85 +634,6 @@ def _validate_fp4_mla_attention_q_shape(head_dim: int, q_residual_dim: int) -> N
         )
 
 
-def get_fp4_mla_decode_cache(
-    metadata: Any,
-    layer_idx: int,
-    local_layer: int,
-    *,
-    head_dim: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Build a compact dequantized MLA cache for FlashInfer decode."""
-    # Must match scatter_fp4_mla_kv_cache: the env var picks the SF layout,
-    # not the page size. When the dequant fallback is the read path
-    # (env disabled), scatter wrote linear scales and we must read linear.
-    use_swizzled_sf = _use_fp4_mla_swizzled_sf()
-    if use_swizzled_sf:
-        _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
-    combined = _ensure_decode_workspace(metadata, head_dim, dtype)
-    num_blocks = combined.shape[0]
-    if num_blocks == 0:
-        return combined
-
-    kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
-    sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    global_scale = _get_fp4_mla_global_scale(metadata, combined.device)
-    src_page_ids = _get_decode_src_page_ids(metadata, num_blocks)
-    block_d = triton.next_power_of_2(head_dim)
-
-    _fp4_mla_dequant_kernel[(num_blocks, metadata.page_size)](
-        combined,
-        kv_cache,
-        sf_cache,
-        global_scale,
-        src_page_ids,
-        src_page_ids.shape[0],
-        kv_cache.shape[0],
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
-        kv_cache.stride(3),
-        kv_cache.stride(4),
-        sf_cache.stride(0),
-        sf_cache.stride(1),
-        sf_cache.stride(2),
-        sf_cache.stride(3),
-        sf_cache.stride(4),
-        combined.stride(0),
-        combined.stride(1),
-        combined.stride(2),
-        D=head_dim,
-        FP4_BLOCK=FP4_BLOCK_SIZE,
-        BLOCK_D=block_d,
-        USE_SWIZZLED_SF=use_swizzled_sf,
-    )
-
-    num_gen = metadata.num_seqs - metadata.num_contexts
-    if num_gen > 0 and metadata.high_precision_kv_pool is not None:
-        pool = metadata.high_precision_kv_pool
-        _fp4_mla_overlay_hp_tail_kernel[(num_gen, HP_BLOCK_SIZE)](
-            combined,
-            pool,
-            metadata.seq_slots[metadata.num_contexts : metadata.num_seqs],
-            metadata.kv_lens_cuda_runtime[metadata.num_contexts : metadata.num_seqs],
-            metadata.paged_kv_indptr_decode,
-            pool.shape[0],
-            pool.shape[1],
-            combined.shape[0],
-            local_layer,
-            metadata.page_size,
-            combined.stride(0),
-            combined.stride(1),
-            combined.stride(2),
-            pool.stride(0),
-            pool.stride(1),
-            D=head_dim,
-            BLOCK_D=block_d,
-            HP_BLOCK=HP_BLOCK_SIZE,
-        )
-    return combined
-
-
 def _ensure_workspace_tensor(
     metadata: Any,
     attr_name: str,
@@ -869,6 +665,8 @@ def _ensure_workspace_tensor(
 
 def _cutile_persistent_v_pack_enabled() -> bool:
     if _fp4_mla_attention_backend() != "cutile":
+        return False
+    if not _cutile_backend_available():
         return False
     return os.getenv("TRTLLM_FP4_MLA_PERSISTENT_V_PACK", "1").lower() not in (
         "0",
@@ -2334,11 +2132,6 @@ def run_fp4_mla_attention_decode(
     V-view scale pool.  No BF16 dequantized KV workspace is materialized on
     this path.
     """
-    if not is_flashinfer_fp4_mla_attention_enabled():
-        raise RuntimeError(
-            f"FP4 MLA attention decode requires {FLASHINFER_FP4_MLA_ATTENTION_ENV}=1."
-        )
-
     head_dim = kv_lora_rank + qk_rope_head_dim
     _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
     if metadata.page_size != FP4_MLA_TOKENS_PER_BLOCK:
@@ -2426,6 +2219,12 @@ def run_fp4_mla_attention_decode(
         return
 
     if backend == "cutile":
+        if not _cutile_backend_available():
+            raise RuntimeError(
+                "FP4 MLA cutile attention backend requires Triton tl.ext APIs, "
+                "which are unavailable in this runtime. Set "
+                f"{FP4_MLA_ATTENTION_BACKEND_ENV}=triton."
+            )
         from .fp4_mla_cutile import fp4_mla_paged_attention
 
         total_p_rows = num_queries * max_pages * num_heads
@@ -2635,41 +2434,38 @@ def run_fp4_mla_attention_decode(
     if backend != "triton":
         raise ValueError(
             f"Unsupported FP4 MLA attention backend '{backend}'. "
-            f"Set {FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV} to "
-            "'triton' or 'cutile'."
+            f"Set {FP4_MLA_ATTENTION_BACKEND_ENV} to 'triton' or 'cutile'."
         )
 
     # Self-contained public-Triton path: TMA-loaded QK + fused page-stats pack,
     # reduce-stats, prob-scale, and PV with an optional prepacked V cache.
-    if backend == "triton":
-        _run_triton_attention_decode(
-            metadata=metadata,
-            layer_idx=layer_idx,
-            local_layer=local_layer,
-            q_fp4=q_fp4,
-            q_sf=q_sf.contiguous().view(-1),
-            kv_cache=kv_cache,
-            sf_cache=sf_cache,
-            v_sf=v_sf,
-            global_scale=global_scale,
-            src_page_ids=src_page_ids,
-            kv_lens=kv_lens,
-            p_fp4=p_fp4,
-            p_sf=p_sf,
-            max_scores=max_scores,
-            denom=denom,
-            output=output,
-            num_queries=num_queries,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            kv_lora_rank=kv_lora_rank,
-            q_residual_dim=q_residual_dim,
-            query_len_per_seq=query_len_per_seq,
-            max_pages=max_pages,
-            sm_scale=float(sm_scale),
-            q_global_scale=q_global_scale,
-        )
-        return
+    _run_triton_attention_decode(
+        metadata=metadata,
+        layer_idx=layer_idx,
+        local_layer=local_layer,
+        q_fp4=q_fp4,
+        q_sf=q_sf.contiguous().view(-1),
+        kv_cache=kv_cache,
+        sf_cache=sf_cache,
+        v_sf=v_sf,
+        global_scale=global_scale,
+        src_page_ids=src_page_ids,
+        kv_lens=kv_lens,
+        p_fp4=p_fp4,
+        p_sf=p_sf,
+        max_scores=max_scores,
+        denom=denom,
+        output=output,
+        num_queries=num_queries,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        kv_lora_rank=kv_lora_rank,
+        q_residual_dim=q_residual_dim,
+        query_len_per_seq=query_len_per_seq,
+        max_pages=max_pages,
+        sm_scale=float(sm_scale),
+        q_global_scale=q_global_scale,
+    )
 
 
 def _hp_pool_layer_view(

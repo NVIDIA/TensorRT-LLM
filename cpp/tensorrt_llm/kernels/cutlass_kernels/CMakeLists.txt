@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -244,11 +244,13 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX
        ".*moe_gemm_kernels_(bf16|fp16)_fp4.*")
   set(MOE_GEMM_SRC_CU_FP4 ${MOE_GEMM_SRC_CU})
-  list(FILTER MOE_GEMM_SRC_CU_FP4 INCLUDE REGEX ".*fp4.*")
-  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp4.*")
+  list(FILTER MOE_GEMM_SRC_CU_FP4 INCLUDE REGEX
+       ".*/moe_gemm/[^/]*fp4[^/]*\\.cu$")
+  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*/moe_gemm/[^/]*fp4[^/]*\\.cu$")
   set(MOE_GEMM_SRC_CU_FP8 ${MOE_GEMM_SRC_CU})
-  list(FILTER MOE_GEMM_SRC_CU_FP8 INCLUDE REGEX ".*fp8.*")
-  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp8.*")
+  list(FILTER MOE_GEMM_SRC_CU_FP8 INCLUDE REGEX
+       ".*/moe_gemm/[^/]*fp8[^/]*\\.cu$")
+  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*/moe_gemm/[^/]*fp8[^/]*\\.cu$")
 
   add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP})
 

@@ -37,6 +37,8 @@ class FmhaParams:
     workspace: torch.Tensor
     attention_input: Optional[torch.Tensor] = None
     qkv_input: Optional[torch.Tensor] = None
+    k_input: Optional[torch.Tensor] = None
+    v_input: Optional[torch.Tensor] = None
     context_buf: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
@@ -203,6 +205,8 @@ class PhasedFmha(Fmha):
 
             params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
             params.qkv_input = params.attention_input
+            params.k_input = None if k is None else k[token_offset : token_offset + num_ctx_tokens]
+            params.v_input = None if v is None else v[token_offset : token_offset + num_ctx_tokens]
             params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
@@ -240,6 +244,8 @@ class PhasedFmha(Fmha):
 
             params.attention_input = q[token_offset : token_offset + num_gen_tokens]
             params.qkv_input = params.attention_input
+            params.k_input = None if k is None else k[token_offset : token_offset + num_gen_tokens]
+            params.v_input = None if v is None else v[token_offset : token_offset + num_gen_tokens]
             params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.max_past_kv_length = max_past_kv_len

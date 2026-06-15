@@ -672,12 +672,12 @@ class TestFlashInferFp4KvGuards(unittest.TestCase):
     """Guards that FlashInfer + NVFP4 KV cache rejects unsupported configs at
     init time with a clear NotImplementedError, rather than failing mid-forward.
 
-    Phase 1 of NVFP4 KV cache support on the FlashInfer backend only covers
-    MLA; non-MLA FP4 should error out early pointing users to attn_backend
+    NVFP4 KV cache is supported only by the TRTLLM attention backend, so
+    FlashInfer should error out early and point users to attn_backend
     ``TRTLLM`` or a BF16/FP8 KV cache.
     """
 
-    def test_non_mla_fp4_kv_raises_not_implemented(self):
+    def test_fp4_kv_raises_not_implemented(self):
         from tensorrt_llm.models.modeling_utils import QuantConfig
         from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -694,5 +694,4 @@ class TestFlashInferFp4KvGuards(unittest.TestCase):
         # self-serve without reading the backend source.
         msg = str(ctx.exception)
         self.assertIn("NVFP4 KV cache", msg)
-        self.assertIn("MLA", msg)
         self.assertIn("TRTLLM", msg)

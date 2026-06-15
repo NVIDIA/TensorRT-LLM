@@ -51,6 +51,19 @@ _THOP_LITERALS: dict = {}
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        attn = self.attn
+        if attn.is_mla_enable and attn.has_fp4_kv_cache:
+            return False
+        return True
+
     def forward(
         self,
         q: torch.Tensor,

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     FLASH_MLA_TOKENS_PER_BLOCK,
-    FLASHINFER_FP4_MLA_ATTENTION_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
     _select_mla_tokens_per_block,
 )
@@ -20,9 +19,11 @@ def _non_mla_config():
     return SimpleNamespace()
 
 
-def _model_config(kv_cache_quant_algo=None, enable_flash_mla=False):
+def _model_config(kv_cache_quant_algo=None, enable_flash_mla=False, attn_backend=None):
     quant_config = SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo)
-    return SimpleNamespace(quant_config=quant_config, enable_flash_mla=enable_flash_mla)
+    return SimpleNamespace(
+        quant_config=quant_config, enable_flash_mla=enable_flash_mla, attn_backend=attn_backend
+    )
 
 
 def _kv_cache_config(dtype="auto", tokens_per_block=32):
@@ -57,8 +58,7 @@ def test_flash_mla_non_fp4_uses_flash_mla_tokens_per_block():
     assert kv_cache_config.tokens_per_block == FLASH_MLA_TOKENS_PER_BLOCK
 
 
-def test_fp4_mla_dequant_flow_uses_flash_mla_tokens_per_block(monkeypatch):
-    monkeypatch.delenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, raising=False)
+def test_fp4_mla_dequant_flow_uses_flash_mla_tokens_per_block():
     kv_cache_config = _kv_cache_config(tokens_per_block=32)
 
     tokens_per_block = _select_mla_tokens_per_block(
@@ -72,13 +72,12 @@ def test_fp4_mla_dequant_flow_uses_flash_mla_tokens_per_block(monkeypatch):
     assert kv_cache_config.tokens_per_block == FLASH_MLA_TOKENS_PER_BLOCK
 
 
-def test_fp4_mla_attention_uses_128_tokens_per_block_from_quant_config(monkeypatch):
-    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "1")
+def test_fp4_mla_attention_uses_128_tokens_per_block_from_quant_config():
     kv_cache_config = _kv_cache_config(tokens_per_block=32)
 
     tokens_per_block = _select_mla_tokens_per_block(
         _mla_config(),
-        _model_config(kv_cache_quant_algo=QuantAlgo.NVFP4, enable_flash_mla=True),
+        _model_config(kv_cache_quant_algo=QuantAlgo.NVFP4, attn_backend="TRTLLM"),
         kv_cache_config,
         kv_cache_config.tokens_per_block,
     )
@@ -87,13 +86,12 @@ def test_fp4_mla_attention_uses_128_tokens_per_block_from_quant_config(monkeypat
     assert kv_cache_config.tokens_per_block == FP4_MLA_TOKENS_PER_BLOCK
 
 
-def test_fp4_mla_attention_uses_128_tokens_per_block_from_kv_cache_dtype(monkeypatch):
-    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "1")
+def test_fp4_mla_attention_uses_128_tokens_per_block_from_kv_cache_dtype():
     kv_cache_config = _kv_cache_config(dtype="nvfp4", tokens_per_block=32)
 
     tokens_per_block = _select_mla_tokens_per_block(
         _mla_config(),
-        _model_config(enable_flash_mla=True),
+        _model_config(enable_flash_mla=True, attn_backend="TRTLLM"),
         kv_cache_config,
         kv_cache_config.tokens_per_block,
     )

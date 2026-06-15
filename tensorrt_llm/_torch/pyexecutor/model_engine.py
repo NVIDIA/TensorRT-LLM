@@ -8,7 +8,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
+                    Union)
 
 import torch
 import torch._dynamo.config
@@ -80,6 +81,9 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 class ModelEngine(ABC):
@@ -2099,35 +2103,6 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
                     inputs['attn_metadata'].on_update_kv_lens()
-                elif getattr(inputs['attn_metadata'], 'kv_lens_cuda_runtime',
-                             None) is not None:
-                    # FlashInfer NVFP4 MLA does not expose kv_lens_cuda; it keeps
-                    # the per-sequence KV length in kv_lens_cuda_runtime and
-                    # precomputes the FP4 KV-cache write positions / batch indices
-                    # from it during prepare(). The overlap scheduler builds the
-                    # generation metadata from the all-draft-accepted estimate
-                    # (num_cached_tokens_per_seq = past_seen + runtime_draft_len +
-                    # 1), so without the same previous_kv_lens_offsets correction
-                    # the FP4 KV scatter and the BF16 HP-pool overlay would write
-                    # at over-estimated positions whenever the previous MTP step
-                    # rejected a draft token, corrupting the KV cache. Apply the
-                    # correction, then rebuild positions/batch indices from the
-                    # corrected lengths so the captured graph replays them.
-                    md = inputs['attn_metadata']
-                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
-                        md.kv_lens_cuda_runtime[
-                            num_ctx_requests -
-                            num_chunked_ctx_requests:num_ctx_requests] += (
-                                self.
-                                previous_kv_lens_offsets_cuda[:
-                                                              num_chunked_ctx_requests]
-                            )
-                    else:
-                        md.kv_lens_cuda_runtime[num_ctx_requests:num_seqs] += (
-                            self.
-                            previous_kv_lens_offsets_cuda[:num_gen_requests])
-                    md.on_update_kv_lens()
-                    md._populate_fp4_mla_batch_indices_positions()
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -2175,27 +2150,6 @@ class PyTorchModelEngine(ModelEngine):
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
-                elif getattr(inputs['attn_metadata'], 'kv_lens_cuda_runtime',
-                             None) is not None:
-                    # Undo the FlashInfer NVFP4 MLA kv_lens correction applied in
-                    # _preprocess_inputs so the captured graph re-applies it from
-                    # the original (over-estimated) lengths on the post-capture
-                    # replay. positions/batch indices are rebuilt by the captured
-                    # _populate_fp4_mla_batch_indices_positions on every replay, so
-                    # they do not need to be restored here.
-                    md = inputs['attn_metadata']
-                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
-                        md.kv_lens_cuda_runtime[
-                            num_ctx_requests -
-                            num_chunked_ctx_requests:num_ctx_requests] -= (
-                                self.
-                                previous_kv_lens_offsets_cuda[:
-                                                              num_chunked_ctx_requests]
-                            )
-                    else:
-                        md.kv_lens_cuda_runtime[num_ctx_requests:num_seqs] -= (
-                            self.
-                            previous_kv_lens_offsets_cuda[:num_gen_requests])
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -4291,7 +4245,6 @@ class PyTorchModelEngine(ModelEngine):
                     anchor_len)
                 all_cache_indices = all_cache_indices[
                     num_kvblocks_per_ctx_block:]
-            cache_indices = all_cache_indices[:num_kv_blocks]
             last_query_pos_id = request.ctx_position_blocks[-1][-1]
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])

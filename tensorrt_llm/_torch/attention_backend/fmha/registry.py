@@ -18,11 +18,13 @@ from typing import TypeAlias
 
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
 FMHA_LIBS: dict[str, FmhaCls] = {
+    "fp4_mla": Fp4MlaFmha,
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
 }

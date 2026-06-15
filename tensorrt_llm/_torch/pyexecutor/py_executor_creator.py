@@ -46,7 +46,6 @@ from .py_executor import PyExecutor
 
 FLASH_MLA_TOKENS_PER_BLOCK = 64
 FP4_MLA_TOKENS_PER_BLOCK = 128
-FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
 
 
 class _ExecutorMemoryMonitor:
@@ -201,20 +200,8 @@ def _has_fp4_kv_cache(model_config, kv_cache_config) -> bool:
             or kv_cache_quant_algo in fp4_quant_values)
 
 
-def _enable_fp4_mla_attention() -> bool:
-    return os.getenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _is_fp4_mla_flashinfer_attention_requested(llm_args: TorchLlmArgs,
-                                               kv_cache_config) -> bool:
-    return (llm_args.attn_backend == "FLASHINFER"
-            and _has_fp4_kv_cache(llm_args, kv_cache_config)
-            and _enable_fp4_mla_attention())
+def _enable_fp4_mla_attention(config=None) -> bool:
+    return getattr(config, "attn_backend", None) == "TRTLLM"
 
 
 def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
@@ -223,7 +210,7 @@ def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
         return tokens_per_block
 
     if (_has_fp4_kv_cache(model_config, kv_cache_config)
-            and _enable_fp4_mla_attention()):
+            and _enable_fp4_mla_attention(model_config)):
         tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
         logger.info(
             f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
@@ -479,23 +466,14 @@ def create_py_executor(
                 "token-match acceptance. This can change the sampled output "
                 "distribution; set use_rejection_sampling=True to use exact "
                 "one-model speculative sampling.")
-        # Regular FlashInfer decode expects one query token per sequence.  The
-        # FP4 MLA no-dequant path has its own linear-MTP handling, so allow that
-        # explicit configuration through.
-        fp4_mla_flashinfer = _is_fp4_mla_flashinfer_attention_requested(
-            llm_args, kv_cache_config)
-        if llm_args.attn_backend == "FLASHINFER" and not fp4_mla_flashinfer:
+        # Regular FlashInfer decode expects one query token per sequence.
+        if llm_args.attn_backend == "FLASHINFER":
             raise ValueError(
                 f"FLASHINFER attention backend is not supported with one-engine speculative "
                 f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
                 f"decode path expects exactly 1 token per sequence, but one-engine speculative "
                 f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
-        if fp4_mla_flashinfer:
-            # FlashInfer metadata prepares page tables against one KV manager.
-            # Keep one-model MTP draft layers in the main manager so global
-            # draft layer ids are present in layer_offsets.
-            spec_config._allow_separate_draft_kv_cache = False
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

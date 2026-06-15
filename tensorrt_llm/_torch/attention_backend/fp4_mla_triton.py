@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Triton FP4 MLA decode-path kernels.
 
-This file owns the no-dequant ``triton`` attention backend selected via
-``TRTLLM_FLASHINFER_FP4_MLA_ATTENTION_BACKEND=triton``. It is separate from
-``fp4_mla_kernels.py``, which holds shared KV-cache scatter/dequant and HP-pool
-helper kernels.
+This file owns the no-dequant Triton attention kernels used by the TRTLLM
+FP4 MLA FMHA path. It is separate from ``fp4_mla_kernels.py``, which holds
+shared KV-cache scatter and HP-pool helper kernels.
 
 Optimizations -- self-contained, public-Triton compatible (no ``tl.ext.*``
 or any private-Triton extension):

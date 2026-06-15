@@ -8,8 +8,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -17,15 +17,39 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
 from tensorrt_llm.bindings.internal.batch_manager import (
-    LinearAttentionMetadata, LinearCacheType)
+    KvCacheStats, LinearAttentionMetadata, LinearCacheType)
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+    IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+# yapf: disable
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
+                                                      AttentionLayerConfig,
+                                                      BufferConfig,
+                                                      CacheTierConfig,
+                                                      DiskCacheTierConfig,
+                                                      GpuCacheTierConfig,
+                                                      HostCacheTierConfig)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import \
+    KVCacheManager as KVCacheManagerPy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import \
+    KVCacheManagerConfig as KVCacheManagerConfigPy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, ReuseScope,
+                                                      TokenIdExt, _KVCache)
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
+                                                              GPU_LEVEL)
+from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
+                                                             typed_range)
+
+# yapf: enable
 
 # isort: off
 # isort: on
@@ -58,16 +82,15 @@ if TYPE_CHECKING:
 BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
-FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
 
 
-def _flashinfer_fp4_mla_attention_enabled() -> bool:
-    return os.getenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+class Role:
+    KEY = DataRole("key")
+    VALUE = DataRole("value")
+    KEY_BLOCK_SCALE = DataRole("key_block_scale")
+    VALUE_BLOCK_SCALE = DataRole("value_block_scale")
+    INDEX_KEY = DataRole("index_key")
+    ALL = DataRole("all")
 
 
 @dataclass
@@ -1161,8 +1184,7 @@ class KVCacheManager(BaseResourceManager):
 
     def _enable_mla_v_scale_pool(self) -> bool:
         return (self.dtype == DataType.NVFP4
-                and self.kv_cache_type == CacheTypeCpp.SELFKONLY
-                and _flashinfer_fp4_mla_attention_enabled())
+                and self.kv_cache_type == CacheTypeCpp.SELFKONLY)
 
     def _get_mla_v_scale_bytes_per_token(self, num_layers: int) -> int:
         if not self._enable_mla_v_scale_pool():
@@ -2238,6 +2260,7 @@ class KVCacheManager(BaseResourceManager):
         """Reset the reuse state of the KV cache manager."""
         self.impl.reset_reuse_state()
 
+
 class KVCacheManagerV2(BaseResourceManager):
 
     def __init__(
@@ -3154,6 +3177,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if (req.multimodal_hashes is None or req.multimodal_positions is None
                 or req.multimodal_lengths is None):
             return tokens[chunk_start:chunk_end] if is_sliced else tokens
+
+        from .kv_cache_manager_v2 import (
+            _augment_tokens_with_contiguous_mm_metadata,
+            _augment_tokens_with_mm_run_metadata,
+            _resolve_multimodal_run_metadata)
 
         result: list[TokenIdExt] = list(tokens[chunk_start:chunk_end])
         run_metadata = _resolve_multimodal_run_metadata(req)
