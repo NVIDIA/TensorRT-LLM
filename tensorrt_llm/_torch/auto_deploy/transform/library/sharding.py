@@ -2598,28 +2598,19 @@ def _process_mla_sharding(
     # extract o_proj node
     o_proj = layer_subgraph.terminating_node
 
-    # add the sharding strategies for the q_a_proj and kv_a_proj nodes.
-    # Nodes excluded via ShardingTransformConfig.exclude_shard_node_filter are
-    # intentionally kept replicated and must not abort MLA processing of the
-    # remaining linears (q_b/kv_b/o_proj). Count only the ones we actually
-    # attempted to shard when validating against the "already sharded" guard.
-    # exclude_shard_node_filter matches the WEIGHT name (e.g. "q_a_proj"), not the
-    # generic FX linear-node name (torch_linear_simple), so resolve the weight name.
+    # Simple-shard the q_a_proj/kv_a_proj opening linears (replicated output).
+    # Nodes excluded via exclude_shard_node_filter stay replicated. add() dedups
+    # nodes an earlier sharding source already touched, so we always continue to
+    # q_b/kv_b/o_proj instead of aborting the layer. The filter matches the WEIGHT
+    # name (e.g. "q_a_proj"), not the FX linear-node name, so resolve it.
     def _excl_name(n):
         w = extract_weight_name(n)
         return w if isinstance(w, str) else n.name
 
     a_proj_candidates = [q_a_proj, kv_a_proj]
     a_proj_to_shard = [n for n in a_proj_candidates if not _is_node_excluded(_excl_name(n), config)]
-    num_simple_shards = (
+    if a_proj_to_shard:
         _process_simple_shard(a_proj_to_shard, transform_container, layer_type=LayerType.MLA)
-        if a_proj_to_shard
-        else 0
-    )
-    if num_simple_shards < len(a_proj_to_shard):
-        # Genuine "someone else already sharded these" case (e.g. via MANUAL
-        # source). Abort to avoid double-processing.
-        return 0
 
     # extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj
     sub_subgraph = subgraph(
