@@ -136,6 +136,12 @@ class AttentionMetadata:
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
 
+    # Explicit query/KV sequence boundaries for attention kernels that operate
+    # on packed varlen context inputs. These are sequence/segment boundaries,
+    # not necessarily request boundaries.
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
+
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
     # are enabled.
@@ -741,6 +747,13 @@ class AttentionForwardArgs:
     attention_window_size: Optional[int] = None
     attention_mask_data: Optional[torch.Tensor] = None
     attention_sinks: Optional[torch.Tensor] = None
+
+    multi_item_part_lens: Optional[list[list[int]]] = None
+    """Additional token layout information for multi-item scoring.
+
+    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
+    see `TokensPrompt` for details.
+    """
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
