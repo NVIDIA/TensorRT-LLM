@@ -31,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
 from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS, COSMOS3_T2I_PARAMS
@@ -754,7 +755,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # 2. Prepare latents
         if image is not None:
             if isinstance(image, str):
-                image = PIL.Image.open(image).convert("RGB")
+                image = load_image(image, format="pil")
 
             if isinstance(image, PIL.Image.Image):
                 image = image.convert("RGB")
