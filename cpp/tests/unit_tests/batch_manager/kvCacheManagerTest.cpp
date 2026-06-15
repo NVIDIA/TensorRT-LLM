@@ -4815,7 +4815,8 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     transferManager.onboard(secondaryBlock, primaryBlock, {pool});
     bool firstSyncResult{false};
     bool secondSyncResult{false};
-    std::thread firstSyncThread([&transferManager, &firstSyncResult]() { firstSyncResult = transferManager.syncTransfers(); });
+    std::thread firstSyncThread(
+        [&transferManager, &firstSyncResult]() { firstSyncResult = transferManager.syncTransfers(); });
     std::thread secondSyncThread(
         [&transferManager, &secondSyncResult]() { secondSyncResult = transferManager.syncTransfers(); });
     firstSyncThread.join();

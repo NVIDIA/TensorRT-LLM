@@ -15,10 +15,8 @@
 
 from typing import Mapping, Protocol, TypeAlias
 
-
 KvCacheIterationStatValue: TypeAlias = int | float
-KvCacheIterationStatsDict: TypeAlias = dict[
-    str, dict[str, KvCacheIterationStatValue]]
+KvCacheIterationStatsDict: TypeAlias = dict[str, dict[str, KvCacheIterationStatValue]]
 
 
 class KvCacheIterationStatsLike(Protocol):
@@ -51,7 +49,7 @@ class KvCacheIterationStatsLike(Protocol):
 
 
 def kv_cache_iteration_stats_to_dict(
-        kv_iter_stats: Mapping[int, KvCacheIterationStatsLike]
+    kv_iter_stats: Mapping[int, KvCacheIterationStatsLike],
 ) -> KvCacheIterationStatsDict:
     return {
         str(window_size): {
@@ -76,15 +74,11 @@ def kv_cache_iteration_stats_to_dict(
             "iterIntraDeviceCopyBlocks": s.iter_intra_device_copy_blocks,
             "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
             "iterTransferPinnedBlocks": s.iter_transfer_pinned_blocks,
-            "iterTransferAlreadyPrimaryBlocks":
-            s.iter_transfer_already_primary_blocks,
-            "iterTransferPrimaryBlockReservations":
-            s.iter_transfer_primary_block_reservations,
+            "iterTransferAlreadyPrimaryBlocks": s.iter_transfer_already_primary_blocks,
+            "iterTransferPrimaryBlockReservations": s.iter_transfer_primary_block_reservations,
             "iterTransferOnboardedBlocks": s.iter_transfer_onboarded_blocks,
-            "iterTransferReservationFailures":
-            s.iter_transfer_reservation_failures,
-            "iterTransferLeaseReleaseBlocks":
-            s.iter_transfer_lease_release_blocks,
+            "iterTransferReservationFailures": s.iter_transfer_reservation_failures,
+            "iterTransferLeaseReleaseBlocks": s.iter_transfer_lease_release_blocks,
         }
         for window_size, s in kv_iter_stats.items()
     }

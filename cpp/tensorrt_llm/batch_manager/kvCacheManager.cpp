@@ -1192,8 +1192,7 @@ BlockPtr WindowBlockManager::getFreeBlock(LlmRequest::RequestIdType requestId, e
     if (mBlockToSequence.count(block->getBlockId()) > 0)
     {
         auto const& originalOwnerSequenceId = mBlockToSequence[block->getBlockId()];
-        if (mIsValidStoreForReuseSequence.count(originalOwnerSequenceId) > 0
-            && requestId != originalOwnerSequenceId)
+        if (mIsValidStoreForReuseSequence.count(originalOwnerSequenceId) > 0 && requestId != originalOwnerSequenceId)
         {
             TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d was originally held but released from sequence %d",
                 mLogPrefix.c_str(), block->getBlockId(), originalOwnerSequenceId);

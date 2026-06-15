@@ -400,15 +400,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
         .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes)
         .def_rw("iter_transfer_pinned_blocks", &tbk::KvCacheIterationStats::iterTransferPinnedBlocks)
-        .def_rw("iter_transfer_already_primary_blocks",
-            &tbk::KvCacheIterationStats::iterTransferAlreadyPrimaryBlocks)
+        .def_rw("iter_transfer_already_primary_blocks", &tbk::KvCacheIterationStats::iterTransferAlreadyPrimaryBlocks)
         .def_rw("iter_transfer_primary_block_reservations",
             &tbk::KvCacheIterationStats::iterTransferPrimaryBlockReservations)
         .def_rw("iter_transfer_onboarded_blocks", &tbk::KvCacheIterationStats::iterTransferOnboardedBlocks)
-        .def_rw("iter_transfer_reservation_failures",
-            &tbk::KvCacheIterationStats::iterTransferReservationFailures)
-        .def_rw("iter_transfer_lease_release_blocks",
-            &tbk::KvCacheIterationStats::iterTransferLeaseReleaseBlocks);
+        .def_rw("iter_transfer_reservation_failures", &tbk::KvCacheIterationStats::iterTransferReservationFailures)
+        .def_rw("iter_transfer_lease_release_blocks", &tbk::KvCacheIterationStats::iterTransferLeaseReleaseBlocks);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(nb::init<>())
