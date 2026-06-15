@@ -260,7 +260,7 @@ def _logic_ltx2_av_ulysses_vs_single_gpu(rank, world_size, backend, audio_seq_le
         .eval()
     )
     _init_all_weights(ref_model)
-    ref_model.configure_audio_ulysses(audio_seq_len)
+    ref_model.configure_audio_padding(audio_seq_len)
     ref_state = ref_model.state_dict()
 
     # ── Ulysses model: same weights ─────────────────────────────────────────
@@ -272,7 +272,7 @@ def _logic_ltx2_av_ulysses_vs_single_gpu(rank, world_size, backend, audio_seq_le
         .eval()
     )
     u_model.load_state_dict(ref_state)
-    u_model.configure_audio_ulysses(audio_seq_len)
+    u_model.configure_audio_padding(audio_seq_len)
 
     # ── Inputs (identical across ranks) ─────────────────────────────────────
     video, audio, v_ctx, a_ctx, v_pos, a_pos = _build_inputs(

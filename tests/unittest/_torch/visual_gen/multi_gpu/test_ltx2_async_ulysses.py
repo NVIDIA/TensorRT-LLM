@@ -289,7 +289,7 @@ def _build_av_model(
 ):
     """Build LTXModel (AudioVideo) with deterministic weights via shared seed.
 
-    ``configure_audio_ulysses(audio_seq_len)`` gates audio_attn1's Ulysses
+    ``configure_audio_padding(audio_seq_len)`` gates audio_attn1's Ulysses
     activity by divisibility: not divisible → ``set_ulysses_active(False)``
     swaps the audio backend to plain (no ``forward_async``), forcing async
     self-attn to fall through the ``hasattr`` guard in ``LTX2Attention.forward``.
@@ -308,7 +308,7 @@ def _build_av_model(
         .eval()
     )
     _init_all_weights(model)
-    model.configure_audio_ulysses(audio_seq_len)
+    model.configure_audio_padding(audio_seq_len)
     return model
 
 

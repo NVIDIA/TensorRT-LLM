@@ -879,7 +879,7 @@ class BasicAVTransformerBlock(nn.Module):
                 # (Q=video huge, K/V=audio small — AG of the small audio is
                 # far cheaper than full-video a2a collectives).
                 # key_padding_mask zeros attention on the audio pad slots that
-                # configure_audio_ulysses appended to make T_a divisible by U.
+                # configure_audio_padding appended to make T_a divisible by U.
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
                     ax_scaled, pe=audio.cross_positional_embeddings
                 )
@@ -1137,7 +1137,7 @@ class LTXModel(BaseDiffusionModel):
             raise ValueError("LTX2 does not currently support TP.")
 
         self._audio_is_sharded = False
-        self._audio_pad = 0  # set by configure_audio_ulysses
+        self._audio_pad = 0  # set by configure_audio_padding
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
         # Per-block text cross-attn KV lists, looked up by inner.idx in the
@@ -1466,7 +1466,7 @@ class LTXModel(BaseDiffusionModel):
         for the fused kernel or keeps 4D for the eager apply_rotary_emb path.
         LTX-2 SPLIT rope produces 4D PE; INTERLEAVED is not used in prod.
 
-        ``_audio_is_sharded`` (set in ``configure_audio_ulysses``) already
+        ``_audio_is_sharded`` (set in ``configure_audio_padding``) already
         encodes whether audio_seq_len is divisible by ulysses_size, so we
         gate sharding on that flag alone — no second divisibility check.
         """
@@ -1568,27 +1568,34 @@ class LTXModel(BaseDiffusionModel):
             timesteps = audio.timesteps
         return replace(audio, latent=latent, positions=positions, timesteps=timesteps)
 
-    def configure_audio_ulysses(self, audio_seq_len: int) -> None:
-        """Configure audio sharding + padding for Ulysses.
+    def configure_audio_padding(self, audio_seq_len: int) -> None:
+        """Pad audio + configure Ulysses sharding once, before the denoise loop.
 
-        Call once before the denoising loop when the audio token count is
-        known. The decision is cached — ``forward()`` uses it without
-        re-checking.
-
-        When sequence parallelism is active, audio is always padded to
-        ``(U - T_a % U) % U`` slots so ``T_a`` becomes divisible by ``U``
-        and a ``[B, T_a_padded]`` validity mask is attached so attention
-        zeros out pad positions. ``forward`` strips the pad tail on exit.
+        Pads audio to a length divisible by Ulysses size U. For the VANILLA
+        backend only, also bumps short audio (T_a <= 128) past 128 so its cuDNN
+        SDPA stays on the SM100 flash kernel instead of the ~3x slower SM80
+        fallback. Cached for forward(), which applies the pad + validity mask.
         """
-        if not self._sharder.is_active:
-            self._audio_is_sharded = False
-            self._audio_pad = 0
+        sp = self._sharder.is_active
+        U = self._sharder.size if sp else 1
+        # Divisible by U (no-op when U == 1).
+        padded_len = audio_seq_len + (U - audio_seq_len % U) % U
+        # cuDNN-only (VANILLA backend) bump above the SM100 min query seqlen
+        # (> 128), keeping the U-divisibility. Other backends don't hit the
+        # cuDNN SM80 fallback, so don't pad them past 128.
+        attn_cfg = (
+            getattr(self.model_config, "attention", None) if self.model_config is not None else None
+        )
+        is_vanilla = getattr(attn_cfg, "backend", "VANILLA") == "VANILLA"
+        if is_vanilla and padded_len <= 128:
+            padded_len = (128 // U + 1) * U  # smallest U-multiple strictly > 128
+        self._audio_pad = padded_len - audio_seq_len
+        self._audio_is_sharded = sp
+
+        # Per-block Ulysses toggle only matters under SP; without it the blocks
+        # keep their default (unsharded) state and just consume the padded audio.
+        if not sp:
             return
-
-        U = self._sharder.size
-        self._audio_pad = (U - audio_seq_len % U) % U
-        self._audio_is_sharded = True
-
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
             target._audio_is_sharded = self._audio_is_sharded
@@ -1606,7 +1613,7 @@ class LTXModel(BaseDiffusionModel):
         rank (e.g. Stage 2 of the two-stage pipeline where non-primary
         workers have already exited).  Call with ``True`` to restore
         multi-rank operation; audio sharding will be reconfigured by
-        the next :meth:`configure_audio_ulysses` call.
+        the next :meth:`configure_audio_padding` call.
         """
         if self._sharder.size <= 1:
             return
@@ -1746,7 +1753,7 @@ class LTXModel(BaseDiffusionModel):
             raise ValueError("Audio is not enabled for this model")
 
         # Audio padding for Ulysses: when self._audio_pad > 0 (set once by
-        # configure_audio_ulysses to make T_a divisible by ulysses_size), pad
+        # configure_audio_padding to make T_a divisible by ulysses_size), pad
         # audio on entry to make it shardable. Build a [B, T_a_padded] bool mask
         # (True=valid, False=pad) that travels through TransformerArgs to
         # audio_attn1 + a2v. Strip the padded tail on output below.
@@ -1795,7 +1802,7 @@ class LTXModel(BaseDiffusionModel):
 
         # Shard sequences for parallelism (Ulysses head-sharding, ring CP, or Attention2D).
         # Video is always sharded.  Audio sharding is decided once by
-        # configure_audio_ulysses() and cached in self._audio_is_sharded.
+        # configure_audio_padding() and cached in self._audio_is_sharded.
         if self._sharder.is_active:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
