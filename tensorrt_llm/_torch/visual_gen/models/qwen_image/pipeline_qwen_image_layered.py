@@ -80,7 +80,8 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating Qwen-Image-Layered transformer")
-        pretrained = getattr(self.model_config, "pretrained_config", None)
+        model_config = self.pipeline_config.model_configs["transformer"]
+        pretrained = getattr(model_config, "pretrained_config", None)
 
         def _cfg(name: str, default):
             if pretrained is None:
@@ -97,7 +98,7 @@ class QwenImageLayeredPipeline(QwenImagePipeline):
             raise NotImplementedError("Qwen-Image-Layered zero_cond_t is not supported yet.")
 
         self.transformer = QwenImageTransformer2DModel(
-            model_config=self.model_config,
+            model_config=model_config,
             patch_size=_cfg("patch_size", 2),
             in_channels=_cfg("in_channels", 64),
             out_channels=_cfg("out_channels", 16),

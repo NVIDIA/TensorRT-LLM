@@ -237,7 +237,7 @@ class QwenImagePipeline(BasePipeline):
     def post_load_weights(self) -> None:
         """Post-load setup: transformer hooks and optional Cache-DiT."""
         super().post_load_weights()
-        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
             self._setup_cache_acceleration(self.transformer, coefficients=None)
 
     def _refresh_cache_acceleration(self, num_inference_steps: int) -> None:
