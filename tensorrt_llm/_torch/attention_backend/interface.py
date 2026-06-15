@@ -733,6 +733,10 @@ class AttentionSparseArgs:
     sparse_attn_indices: Optional[torch.Tensor] = None
     sparse_attn_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices_block_size: int = 0
+    # DeepSeek-V4 sparse-MLA only: per-token compressed top-k lengths and the
+    # base pointer of the compressed KV cache pool (compress_ratio > 1).
+    sparse_mla_topk_lens: Optional[torch.Tensor] = None
+    compressed_kv_cache_pool_ptr: Optional[int] = None
 
 
 @dataclass(kw_only=True, slots=True)
