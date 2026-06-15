@@ -784,7 +784,7 @@ class AttentionDpConfig(StrictBaseModel):
         "Enable explicit conversation-affinity routing for attention DP. When "
         "True, the first request of each conversation is round-robined across "
         "ranks and every subsequent request carrying the same conversation_id "
-        "(read from disaggregated_params, populated from the X-Session-ID "
+        "(read from the top-level request field, populated from the X-Session-ID "
         "header) is pinned to that conversation's first-turn rank. This keeps a "
         "multi-turn conversation's KV-cache prefix on one rank (maximizing "
         "block reuse, minimizing cross-rank migration). Unlike "

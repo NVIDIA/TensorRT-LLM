@@ -20,11 +20,11 @@ from transformers import AutoTokenizer
 from tensorrt_llm import logger
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
+                                                ConversationParams,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
-                                       ConversationRouter,
-                                       KvCacheAwareRouter,
+                                       ConversationRouter, KvCacheAwareRouter,
                                        KvCacheAwareServerState, ServerRole,
                                        block_key_hasher, v2_sha256_block_hasher)
 
@@ -808,9 +808,10 @@ class ConversationRouterTester(BasicWorkerTester):
                     req = CompletionRequest(
                         model=self.model_name,
                         prompt=prompt,
+                        conversation_params=ConversationParams(
+                            conversation_id=conv_id),
                         disaggregated_params=DisaggregatedParams(
-                            request_type="context_only",
-                            conversation_id=conv_id))
+                            request_type="context_only"))
                     server, _ = await self.ctx_router.get_next_server(req)
                     if first_server is None:
                         first_server = server
@@ -840,8 +841,10 @@ class ConversationRouterTester(BasicWorkerTester):
                     req = CompletionRequest(
                         model=self.model_name,
                         prompt=f"Unique prompt number {i} for load balancing",
+                        conversation_params=ConversationParams(
+                            conversation_id=cid),
                         disaggregated_params=DisaggregatedParams(
-                            request_type="context_only", conversation_id=cid))
+                            request_type="context_only"))
                     server, _ = await self.ctx_router.get_next_server(req)
                     servers_seen.add(server)
                     response = await self._send_via_disagg(

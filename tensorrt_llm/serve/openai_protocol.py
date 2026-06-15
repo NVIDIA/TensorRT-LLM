@@ -38,6 +38,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
@@ -136,7 +137,11 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
-    conversation_id: Optional[str] = None
+
+
+class ConversationParams(OpenAIBaseModel):
+    conversation_id: str = Field(
+        description=("Stable multi-turn conversation id used for routing"), )
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -394,6 +399,10 @@ class CompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
     )
 
     # doc: end-completion-extra-params
@@ -763,6 +772,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
     )
 
     cache_salt: Optional[str] = Field(
@@ -1243,7 +1256,6 @@ def to_disaggregated_params(
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
-        conversation_id=tllm_disagg_params.conversation_id,
     )
 
 
@@ -1266,8 +1278,16 @@ def to_llm_disaggregated_params(
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
-        conversation_id=disaggregated_params.conversation_id,
     )
+
+
+def to_llm_conversation_params(
+    conversation_params: Optional[ConversationParams]
+) -> Optional[LlmConversationParams]:
+    if conversation_params is None:
+        return None
+    return LlmConversationParams(
+        conversation_id=conversation_params.conversation_id)
 
 
 # ============================================================================
