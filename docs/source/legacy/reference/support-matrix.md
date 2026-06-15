@@ -1,5 +1,9 @@
 # Support Matrix
 
+```{deprecated}
+This page is outdated and no longer maintained. Please refer to the up-to-date [Supported Models](../../models/supported-models.md) page instead.
+```
+
 TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA GPUs. The following sections provide a list of supported GPU architectures as well as important features implemented in TensorRT-LLM.
 
 ## Models (PyTorch Backend)
@@ -154,7 +158,7 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [25.12](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [26.02](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
   - [10.14](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision

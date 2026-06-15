@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 #include "xqaDispatcher.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunnerUtils.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <cstdint>
@@ -141,8 +141,8 @@ XqaDispatcher::XqaDispatcher(XqaFixedParams fixedParams)
         mQDataType = (mFixedParams.kvDataType == DATA_TYPE_E4M3 || mFixedParams.kvDataType == DATA_TYPE_E2M1)
             ? DATA_TYPE_E4M3
             : mFixedParams.inputDataType;
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mQDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+            mQDataType, mFixedParams.kvDataType, mFixedParams.kvDataType, mFixedParams.outputDataType));
     }
     else
     {
@@ -242,9 +242,9 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
             SHOULD_NOT_USE(
                 "Fallback to MMHA as variable attention_window_size is not supported by TRTLLM-GEN kernels.");
         }
-        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 16)
+        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 32)
         {
-            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 16 is not supported by TRTLLM-GEN kernels.");
+            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 32 is not supported by TRTLLM-GEN kernels.");
         }
 
         return true;
@@ -282,6 +282,7 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mMaskType
             = mFixedParams.isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mIsSpecDecTree = mFixedParams.isSpecDecoding;
+        tllmRunnerParams.mSpecDecodingTargetMaxGenLen = mFixedParams.specDecodingTargetMaxGenLen;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = true;
@@ -291,11 +292,26 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
+        // Align with ExportCubin: only PagedKv kernels are built with numTokensPerPage > 0.
+        // ContiguousKv must use 0 so hash matches registered cubins.
+        tllmRunnerParams.mNumTokensPerPage = mFixedParams.isPagedKv ? mFixedParams.numTokensPerBlock : 0;
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
         tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+        // Problem size fields used by FMHA kernel selection (computeNumCtas). Must be non-zero to avoid
+        // integer divide-by-zero when mMultiCtasKvMode is true. Actual launch uses real sizes from runImpl.
+        tllmRunnerParams.mBatchSize = 1;
+        tllmRunnerParams.mMaxSeqLenQ = 1;
+        tllmRunnerParams.mMaxSeqLenKv = 1;
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
+
+        // Sparse MQA/GQA uses trtllm-gen sparse kernel.
+        if (mFixedParams.useTllmGenSparseAttention)
+        {
+            tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
+            tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
+        }
 
         // Check if it is supported or not.
         auto [isSupported, info] = mTllmGenFMHARunner->isSupportedWithInfo(tllmRunnerParams);
@@ -335,19 +351,7 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type{KvCacheDataType::BASE};
-        if (params.kv_cache_quant_mode.hasInt8KvCache())
-        {
-            cache_type = KvCacheDataType::INT8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp8KvCache())
-        {
-            cache_type = KvCacheDataType::FP8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp4KvCache())
-        {
-            cache_type = KvCacheDataType::NVFP4;
-        }
+        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -431,8 +435,8 @@ void XqaDispatcher::runImpl(
             tllmRunnerParams.mMaxNumPagesPerSeqKv = kv_cache_buffer.mMaxBlocksPerSeq;
             tllmRunnerParams.mNumTokensPerPage = kv_cache_buffer.mTokensPerBlock;
 
-            // Gather kv page offsets for sparse attention.
-            if (params.use_sparse_attention)
+            // Gather kv page offsets for block sparse attention (with offsets).
+            if (params.use_sparse_attention_gen_paged)
             {
                 invokeGatherKvPageOffsets(reinterpret_cast<int32_t*>(launchParams.sparse_kv_block_offsets),
                     launchParams.sparse_seq_lengths, reinterpret_cast<int32_t const*>(kv_cache_buffer.data),
@@ -444,10 +448,19 @@ void XqaDispatcher::runImpl(
                     = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(launchParams.sparse_kv_block_offsets);
                 tllmRunnerParams.mUseBlockSparseAttention = true;
             }
+            // Sparse MQA/GQA attention: use trtllm-gen sparse kernel.
+            else if (mFixedParams.useTllmGenSparseAttention)
+            {
+                tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
+                tllmRunnerParams.mSparseTopK = params.sparse_params.num_sparse_topk;
+                tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(params.sparse_params.sparse_attn_indices);
+                tllmRunnerParams.kvPtr = params.sparse_params.sparse_kv_cache_pool;
+            }
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(!params.use_sparse_attention, "Sparse attention is not supported for KVLinearBuffer.");
+            TLLM_CHECK_WITH_INFO(!(params.use_sparse_attention_gen_paged || mFixedParams.useTllmGenSparseAttention),
+                "Sparse attention is not supported for KVLinearBuffer.");
             static_assert(std::is_same_v<KVCacheBuffer, KVLinearBuffer>);
             // Contiguous KV
             tllmRunnerParams.mQkvLayout = QkvLayout::ContiguousKv;
@@ -482,7 +495,23 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        bool const isSpecDecTree = params.is_spec_dec_tree && params.multi_query_tokens;
+        if (isSpecDecTree)
+        {
+            TLLM_CHECK_WITH_INFO(params.spec_decoding_max_generation_length > 0,
+                "spec_decoding_max_generation_length must be positive for spec-dec tree.");
+            tllmRunnerParams.mMaxSeqLenQ
+                = std::min(tllmRunnerParams.mMaxSeqLenQ, params.spec_decoding_max_generation_length);
+            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length + tllmRunnerParams.mMaxSeqLenQ;
+        }
+        else
+        {
+            tllmRunnerParams.mMaxSeqLenKv = params.max_past_kv_length;
+        }
+        tllmRunnerParams.mJITWarmup = params.trtllm_gen_jit_warmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = params.trtllm_gen_jit_warmup_max_num_requests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = params.trtllm_gen_jit_warmup_max_seq_len_q;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = params.trtllm_gen_jit_warmup_max_seq_len_kv;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
@@ -501,8 +530,10 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.mMaskType
             = tllmRunnerParams.mIsSpecDecTree ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mLayerIdx = params.layer_idx;
-        tllmRunnerParams.seqlensQPtr = params.spec_decoding_generation_lengths;
+        tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
         tllmRunnerParams.generalPackedCustoMaskPtr = params.spec_decoding_packed_mask;
+        tllmRunnerParams.mPackedMaskMaxSeqLenQ = params.spec_decoding_max_generation_length;
+        tllmRunnerParams.mSpecDecodingTargetMaxGenLen = mFixedParams.specDecodingTargetMaxGenLen;
         tllmRunnerParams.customMaskPtr = params.spec_decoding_bl_tree_mask;
         tllmRunnerParams.customMaskOffsetsPtr = params.spec_decoding_bl_tree_mask_offset;
         tllmRunnerParams.firstSparseMaskOffsetsKvPtr = params.spec_bl_tree_first_sparse_mask_offset_kv;

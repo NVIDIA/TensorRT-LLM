@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for basic graph quantization."""
 
 from typing import List
@@ -7,13 +21,18 @@ import torch
 import torch.nn as nn
 from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
-from _torch_test_utils import fp4_compatible, fp8_compatible
+from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
     ModelFactory,
     SubModuleExportInfo,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
+    FP8BMMQuantizationFromConfig,
+    FP8LinearQuantizationFromConfig,
+    Quantization,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -37,6 +56,15 @@ class DummyFactory(ModelFactory):
 
     def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
         return [FullModelExportInfo()]
+
+    @property
+    def max_seq_len(self) -> int:
+        return 512
+
+
+def test_quantization_base_does_not_register_noop_post_load_hook():
+    assert FP8LinearQuantizationFromConfig.post_load_hook is Quantization.post_load_hook
+    assert FP8BMMQuantizationFromConfig.post_load_hook is not Quantization.post_load_hook
 
 
 @pytest.mark.parametrize(
@@ -122,7 +150,10 @@ def test_finegrained_fp8_quantization():
     model = MLP(128, 256, 128).to(torch.float16).to("cuda")
     x = torch.randn(3, 128, dtype=torch.float16).to("cuda")
 
-    quant_config = {"quant_method": "fp8"}
+    quant_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
     QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
@@ -164,7 +195,10 @@ def test_finegrained_fp8_quantization():
             5e-1,
             lambda num_p_og: num_p_og,
             BMMModel,
-            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+            marks=pytest.mark.skipif(
+                not (fp8_compatible() and trtllm_ops_available()),
+                reason="Requires fp8 support and TRT-LLM ops",
+            ),
         ),
         pytest.param(
             {"quant_algo": "FP8"},
@@ -172,11 +206,15 @@ def test_finegrained_fp8_quantization():
             5e-1,
             lambda num_p_og: num_p_og,
             BMMDynamicModel,
-            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+            marks=pytest.mark.skipif(
+                not (fp8_compatible() and trtllm_ops_available()),
+                reason="Requires fp8 support and TRT-LLM ops",
+            ),
         ),
     ],
 )
 def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
+    torch.manual_seed(0)
     batch_size, seq_len, hidden_dim, num_experts = 2, 2, 16, 1
 
     # Create model based on class

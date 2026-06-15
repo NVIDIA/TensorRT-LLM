@@ -123,6 +123,36 @@ class TestQuant(unittest.TestCase):
         self.assertTrue(
             isinstance(quant_model.lm_head, WeightOnlyQuantColumnLinear))
 
+    def test_is_module_excluded_from_quantization_ancestor_match(self):
+        qc = QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=[
+                'model.layers.7.mixer',
+                'model.layers.7.mixer.o_proj',
+                'lm_head',
+                'backbone.layers.5.mixer.gate',
+                'model.layers.9.*',
+            ],
+        )
+
+        for name in (
+                'model.layers.7.mixer.q_proj',
+                'model.layers.7.mixer.k_proj',
+                'model.layers.7.mixer.v_proj',
+                'model.layers.7.mixer.o_proj',
+                'lm_head',
+                'lm_head.weight',
+                'model.layers.9.mixer.q_proj',
+        ):
+            self.assertTrue(qc.is_module_excluded_from_quantization(name), name)
+        for name in (
+                'model.layers.8.mixer.q_proj',
+                'model.embed_tokens',
+                'backbone.layers.5.mixer.something',
+        ):
+            self.assertFalse(qc.is_module_excluded_from_quantization(name),
+                             name)
+
     def test_convert_GPT_to_smooth_quant(self):
         config = {
             'architecture': 'GPTForCausalLM',

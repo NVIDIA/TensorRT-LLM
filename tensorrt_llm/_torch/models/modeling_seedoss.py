@@ -87,7 +87,7 @@ class SeedOssDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        mrope_config: Optional[dict] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -151,7 +151,7 @@ class SeedOssModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        mrope_config: Optional[dict] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:

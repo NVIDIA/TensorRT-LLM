@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import json
 import tempfile
 import threading
 from concurrent.futures import ProcessPoolExecutor
@@ -10,22 +9,18 @@ import pytest
 import torch
 import zmq
 
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
-                                   GenerationExecutor, GenerationRequest,
-                                   GenerationResult, GenerationResultBase,
-                                   PostprocWorker)
+                                   GenerationRequest, GenerationResult,
+                                   GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
-from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from utils.llm_data import llm_models_root
-from utils.util import similar
 # isort: on
 
 WORLD_SIZE = mpi_world_size()
@@ -36,132 +31,6 @@ def engine_path():
     return Path(tempfile.tempdir) / "llm_engine"
 
 
-@pytest.fixture(scope="module")
-def llama_7b_path(engine_path: Path) -> Path:
-    path = engine_path / "llama7b"
-
-    if not path.exists():
-        model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
-        llm = LLM(model_dir)
-        with llm:
-            llm.save(str(path))
-
-    return path
-
-
-@pytest.fixture(scope="module")
-def llama_7b_bs2_path(engine_path: Path) -> Path:
-    path = engine_path / "llama7b_bs2"
-
-    if not path.exists():
-        model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
-        build_config = BuildConfig()
-        build_config.max_beam_width = 2
-        # TODO[chunweiy]: switch to executor backend
-        llm = LLM(model_dir, build_config=build_config)
-        with llm:
-            llm.save(str(path))
-
-    return path
-
-
-@pytest.fixture(scope="module")
-def llama_7b_tp2_path(engine_path: Path) -> Path:
-    path = engine_path / "llama7b-tp2"
-
-    if not path.exists():
-        model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
-        llm = LLM(model_dir, tensor_parallel_size=2)
-        with llm:
-            llm.save(str(path))
-
-    return path
-
-
-@pytest.mark.skip(reason="https://nvbugs/5488280")
-@pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
-def test_generation_bs2(llama_7b_bs2_path: Path):
-    tokenizer = TransformersTokenizer.from_pretrained(llama_7b_bs2_path)
-    prompt = "A B C D"
-    prompt_token_ids = tokenizer.encode(prompt)
-    max_tokens = 8
-
-    with GenerationExecutor.create(
-            llama_7b_bs2_path,
-            executor_config=tllm.ExecutorConfig(max_beam_width=2)) as executor:
-        result = executor.generate(prompt_token_ids,
-                                   sampling_params=SamplingParams(
-                                       max_tokens=max_tokens,
-                                       n=2,
-                                       use_beam_search=True))
-        assert similar(tokenizer.decode(result.outputs[0].token_ids),
-                       'E F G H I J K L')
-        assert similar(tokenizer.decode(result.outputs[1].token_ids),
-                       'E F G H I K L M')
-
-
-@pytest.mark.skip(reason="https://nvbugs/5488280")
-@pytest.mark.skipif(WORLD_SIZE != 1, reason="Must run on single MPI rank")
-def test_sync_generation(llama_7b_path: Path):
-    tokenizer = TransformersTokenizer.from_pretrained(llama_7b_path)
-    prompt = "A B C D"
-    prompt_token_ids = tokenizer.encode(prompt)
-
-    expected_output = "E F G H"
-    expected_long_output = "E F G H I J K L"
-    sampling_params0 = SamplingParams(max_tokens=4)
-    sampling_params1 = SamplingParams(max_tokens=8)
-    with GenerationExecutor.create(llama_7b_path) as executor:
-        # Simple generations (synchronous)
-        result = executor.generate(prompt_token_ids,
-                                   sampling_params=sampling_params0)
-        assert tokenizer.decode(result.outputs[0].token_ids) == expected_output
-
-        results = executor.generate(
-            [prompt_token_ids, prompt_token_ids],
-            sampling_params=[sampling_params0, sampling_params1])
-        for result, expected in zip(results,
-                                    (expected_output, expected_long_output)):
-            print(f"result: {result}")
-            assert tokenizer.decode(result.outputs[0].token_ids) == expected
-
-        # Iterate the partial results when streaming
-        future = executor.generate_async(prompt_token_ids,
-                                         sampling_params=sampling_params0,
-                                         streaming=True)
-        for partial_result in future:
-            partial_text = tokenizer.decode(partial_result.outputs[0].token_ids)
-            print(f"partial_text: {partial_text}")
-            assert expected_output.startswith(partial_text)
-
-        # Iterate the partial results when streaming
-        # Streaming results in nested loop
-        for sampling_params in [sampling_params0, sampling_params1]:
-            future = executor.generate_async(prompt_token_ids,
-                                             sampling_params=sampling_params,
-                                             streaming=True)
-            for partial_result in future:
-                partial_text = tokenizer.decode(
-                    partial_result.outputs[0].token_ids)
-                print(f"partial_text: {partial_text}")
-                assert expected_long_output.startswith(partial_text)
-
-        # TODO: enable this when mass integration is done.
-        # Low-level api with .submit
-        # Submit a batch of requests
-        # futures = []
-        # for _ in range(5):
-        #     futures.append(
-        #         executor.submit(
-        #             GenerationRequest(prompt_token_ids,
-        #                               sampling_params=sampling_params0)))
-
-        # for future in executor.wait_first_completed(futures):
-        #     assert future.done
-        #     assert tokenizer.decode(
-        #         future.result().outputs[0].token_ids) == expected_output
-
-
 def test_invalid_sampling_params():
     with pytest.raises(ValueError):
         # n > 1 does not allow greedy decoding, which is deterministic.
@@ -170,77 +39,6 @@ def test_invalid_sampling_params():
         # n > beam_width is not possible because n exceeds the number of beam
         # search results
         SamplingParams(max_tokens=4, n=4, best_of=3, use_beam_search=True)
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 2,
-                    reason="Must run on 2 MPI ranks with at least 2 GPUs")
-def test_sync_generation_tp_main_node_only(llama_7b_tp2_path: Path):
-    tokenizer = TransformersTokenizer.from_pretrained(llama_7b_tp2_path)
-    prompt = "deep learning"
-    prompt_token_ids = tokenizer.encode(prompt)
-    sampling_params = SamplingParams(max_tokens=4)
-
-    with GenerationExecutor.create(llama_7b_tp2_path) as executor:
-
-        executor.block_subordinates()
-        # from now on, only rank0 lives in the with statement
-        # other nodes wait at the "end" of the with statement
-
-        result = executor.generate(prompt_token_ids,
-                                   sampling_params=sampling_params)
-        assert tokenizer.decode(
-            result.outputs[0].token_ids) == "<s> deep learning, neural network,"
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2 or WORLD_SIZE != 1,
-                    reason="Must run on 1 MPI rank with at least 2 GPUs")
-def _test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
-    tokenizer = TransformersTokenizer.from_pretrained(llama_7b_tp2_path)
-    prompt = "deep learning"
-    prompt_token_ids = tokenizer.encode(prompt)
-    tp_size = 2
-    sampling_params = SamplingParams(max_tokens=4)
-
-    executor = GenerationExecutor.create(llama_7b_tp2_path,
-                                         model_world_size=tp_size)
-
-    async def async_stats_task():
-        # asyncio event loop must be created before first generation in order to
-        # use async APIs.
-        result = executor.generate(prompt_token_ids,
-                                   sampling_params=sampling_params)
-        assert tokenizer.decode(
-            result.outputs[0].token_ids) == ", neural network,"
-
-        try:
-            stats_result = executor.aget_stats(timeout=2)
-            # aget_stats now returns IterationResult, iterate to get stats
-            async for stats_str in stats_result:
-                stats = json.loads(stats_str) if isinstance(stats_str,
-                                                            str) else stats_str
-                assert stats["iter"] >= 0
-                assert stats["cpuMemUsage"] > 0
-                assert stats["gpuMemUsage"] > 0
-                break  # Just check first result
-        except AsyncQueue.EventLoopShutdownError:
-            pass
-
-    asyncio.run(async_stats_task())
-
-    # Poll for stats since RPC calls return immediately
-    import time
-    stats_list = []
-    for _ in range(10):
-        stats_list = executor.get_stats(timeout=0.5)
-        if stats_list:
-            break
-        time.sleep(0.1)
-
-    assert len(stats_list) > 0
-    stats = json.loads(stats_list[0]) if isinstance(stats_list[0],
-                                                    str) else stats_list[0]
-    assert stats["iter"] == 1
-    executor.shutdown()
 
 
 def test_FusedIpcQueue():
@@ -319,7 +117,7 @@ def test_GenerationResult():
 
 def test_DetokenizedGenerationResultBase():
     sampling_params = SamplingParams(max_tokens=4)
-    model_path = llm_models_root() / "llama-models/llama-7b-hf"
+    model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     tokenizer = TransformersTokenizer.from_pretrained(model_path)
     result = DetokenizedGenerationResultBase(
         id=2,
@@ -344,8 +142,7 @@ def test_abort_on_GenerationResultBase():
 
 
 def test_abort_on_DetokenizedGenerationResultBase():
-    """DetokenizedGenerationResultBase inherits abort() so postprocess workers
-    can call it without AttributeError (NVBug 5955173)."""
+    """DetokenizedGenerationResultBase inherits abort() so postprocess workers can call it without AttributeError (NVBug 5955173)."""
     sampling_params = SamplingParams(max_tokens=4)
     result = DetokenizedGenerationResultBase(id=1,
                                              sampling_params=sampling_params)
@@ -358,8 +155,7 @@ def test_abort_on_DetokenizedGenerationResultBase():
 
 
 def test_PostprocWorker_Output_should_abort():
-    """PostprocWorker.Output carries should_abort flag for worker-to-main-thread
-    abort signal propagation."""
+    """PostprocWorker.Output carries should_abort flag for worker-to-main-thread abort signal propagation."""
     out_default = PostprocWorker.Output(client_id=0, res=None, is_final=False)
     assert out_default.should_abort is False
 
@@ -371,8 +167,7 @@ def test_PostprocWorker_Output_should_abort():
 
 
 def test_handle_response_propagates_should_abort():
-    """When a PostprocWorker.Output has should_abort=True, _handle_response
-    on the main-thread GenerationResult calls abort() (NVBug 5955173)."""
+    """When a PostprocWorker.Output has should_abort=True, _handle_response on the main-thread GenerationResult calls abort() (NVBug 5955173)."""
     sampling_params = SamplingParams(max_tokens=4)
     result = GenerationResultBase(id=1, sampling_params=sampling_params)
     assert not result.aborted()
@@ -384,6 +179,35 @@ def test_handle_response_propagates_should_abort():
     result._handle_response(output)
     assert result.aborted()
     assert result._outputs[0]._postprocess_result == "mock_sse_data"
+
+
+def test_PostprocWorker_Output_tracing_fields():
+    """PostprocWorker.Output carries finish_reason and num_generated_tokens for
+    tracing on the num_postprocess_workers > 0 path. Both fields are optional
+    and default to None when not populated by the worker."""
+    out = PostprocWorker.Output(client_id=0, res=None, is_final=False)
+    assert out.finish_reason is None
+    assert out.num_generated_tokens is None
+
+
+def test_handle_response_postproc_nonstreaming_propagates_metadata():
+    """On the non-streaming path (res is not CompletionOutput), finish_reason and
+    token_ids are set on _outputs[0] from the PostprocWorker.Output fields."""
+    sampling_params = SamplingParams(max_tokens=10)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+
+    output = PostprocWorker.Output(
+        client_id=1,
+        res="mock_sse_data",  # non-streaming: res is not a CompletionOutput
+        is_final=True,
+        finish_reason="stop",
+        num_generated_tokens=5,
+    )
+    result._handle_response(output)
+
+    assert result._done
+    assert result._outputs[0].finish_reason == "stop"
+    assert len(result._outputs[0].token_ids) == 5
 
 
 def _ZeroMqQueue_sync_sync_task(addr: str):
@@ -507,9 +331,10 @@ def test_ResponsePostprocessWorker():
 
     pool = ProcessPoolExecutor(max_workers=1)
     print("submit task")
-    fut = pool.submit(ResponsePostprocessWorker_worker_task, input_pipe.address,
-                      out_pipe.address,
-                      str(llm_models_root() / "llama-models/llama-7b-hf"))
+    fut = pool.submit(
+        ResponsePostprocessWorker_worker_task, input_pipe.address,
+        out_pipe.address,
+        str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"))
 
     inputs = [
         Input(rsp=create_rsp(123),
@@ -543,6 +368,104 @@ def test_ResponsePostprocessWorker():
     input_pipe.put(None)  # tell worker to shutdown
     fut.result()
 
+    pool.shutdown()
+    input_pipe.close()
+    out_pipe.close()
+
+
+def test_get_params_for_first_rsp_returns_disaggregated_params_once():
+    """Verify _get_params_for_first_rsp extracts disaggregated_params from the GenerationResult on the first call and returns None after.
+
+    Regression test for https://nvbugs/5991957.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.executor.base_worker import _get_params_for_first_rsp
+
+    disagg_params = DisaggregatedParams(
+        request_type="generation_only",
+        first_gen_tokens=[7],
+        ctx_request_id=12345,
+    )
+    request = GenerationRequest(
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4),
+        disaggregated_params=disagg_params,
+    )
+    request.set_id(42)
+    result = GenerationResult(request, disaggregated_params=disagg_params)
+
+    worker = SimpleNamespace(_results={42: result})
+
+    # First call: should return all three params
+    sp, pp, dp = _get_params_for_first_rsp(worker, 42)
+    assert sp is not None
+    assert pp is None  # no postproc_params on this request
+    assert dp is not None
+    assert dp.request_type == "generation_only"
+    assert dp.first_gen_tokens == [7]
+    assert dp.ctx_request_id == 12345
+    assert result._params_transmitted is True
+
+    # Second call: _params_transmitted is True, all should be None
+    sp2, pp2, dp2 = _get_params_for_first_rsp(worker, 42)
+    assert sp2 is None
+    assert pp2 is None
+    assert dp2 is None
+
+
+def test_PostprocWorker_disaggregated_params():
+    """GEN-side: disaggregated_params seeded on the record persists across
+    multiple responses (streaming pattern).
+
+    Regression test for https://nvbugs/5991957: PostprocWorker record was
+    created without disaggregated_params, causing /v1/chat/completions to
+    return 400 in disaggregated serving with num_postprocess_workers > 0.
+    """
+    input_pipe = ZeroMqQueue(is_server=True)
+    out_pipe = ZeroMqQueue(is_server=True, socket_type=zmq.PULL)
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    fut = pool.submit(
+        ResponsePostprocessWorker_worker_task, input_pipe.address,
+        out_pipe.address,
+        str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"))
+
+    disagg_params = DisaggregatedParams(
+        request_type="generation_only",
+        first_gen_tokens=[7],
+        ctx_request_id=12345,
+    )
+
+    # First response carries disaggregated_params (transmitted once)
+    input_pipe.put(
+        Input(rsp=create_rsp(42),
+              sampling_params=SamplingParams(max_tokens=4),
+              disaggregated_params=disagg_params,
+              streaming=True))
+
+    # Subsequent streaming response — no disaggregated_params in Input,
+    # but the record should still have it from the first response
+    input_pipe.put(
+        Input(rsp=create_rsp(43, finished=True),
+              sampling_params=None,
+              disaggregated_params=None,
+              streaming=None))
+
+    for _ in range(2):
+        out = out_pipe.get()
+        assert isinstance(out, list)
+        assert len(out) == 1
+        output = out[0]
+        assert isinstance(output, Output)
+        assert output.disaggregated_params is not None, \
+            "disaggregated_params was not propagated through PostprocWorker"
+        assert output.disaggregated_params.request_type == "generation_only"
+        assert output.disaggregated_params.first_gen_tokens == [7]
+        assert output.disaggregated_params.ctx_request_id == 12345
+
+    input_pipe.put(None)
+    fut.result()
     pool.shutdown()
     input_pipe.close()
     out_pipe.close()

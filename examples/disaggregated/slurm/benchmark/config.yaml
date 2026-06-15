@@ -26,6 +26,13 @@ hardware:
   gpus_per_node: 4  # Modify this with your hardware configuration
   num_ctx_servers: 1  # Number of context servers
   num_gen_servers: 1  # Number of generation servers
+  # compact_packing: false  # Opt-in: pack workers into the minimum number
+  # of nodes and let two workers share a physical node when their GPU counts
+  # straddle a node boundary (e.g. two TP=6 ctx workers in 3 four-GPU nodes
+  # via 4+2 / 2+4). Only recommended on full-mesh NVLink fabrics like
+  # GB200/GB300 NVL72 where cross-worker NVLink traffic on the shared node
+  # is free; on PCIe / partitioned-NVLink hosts the shared node will
+  # bottleneck and you should leave this off.
 
 # Environment Configuration
 environment:
@@ -107,7 +114,7 @@ worker_config:
     num_postprocess_workers: 4
     speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
   ctx:
     max_batch_size: 4
     max_num_tokens: 4608
@@ -130,4 +137,4 @@ worker_config:
       backend: DEFAULT
     speculative_config: # when mtp_size is 0, remove this section.
       decoding_type: MTP
-      num_nextn_predict_layers: 1
+      max_draft_len: 1

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import pathlib as _pl
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Generator, cast
 
 import pytest
@@ -27,7 +28,7 @@ from test_beam_search_util import (BeamSearchTestOutput, DummyConfigLoader,
 from utils.llm_data import llm_models_root
 from utils.util import assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
-from tensorrt_llm import LLM, SamplingParams, TorchLlmArgs
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams, TorchLlmArgs
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         SamplingConfig)
@@ -35,11 +36,13 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
-    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, FinishReason,
-    beam_search_sampling_batch)
+    BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, beam_search_sampling_batch)
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
-from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.executor.result import (CompletionOutput, GenerationResult,
+                                          Logprob)
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig)
 
 
 @pytest.fixture(scope="module")
@@ -75,12 +78,21 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
     )
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[False, True],
+                ids=["no_cuda_graph_and_overlap", "cuda_graph_and_overlap"])
 def with_cuda_graph_and_overlap(request):
     return request.param
 
 
-def _build_llm(fixed_params, input_prompts, llm_kwargs):
+def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
+    llm_kwargs = llm_kwargs.copy()
+    kv_cache_config = llm_kwargs.pop(
+        "kv_cache_config",
+        KvCacheConfig(
+            max_tokens=10000,  # pyright: ignore
+        ),
+    )
     if "max_batch_size" not in llm_kwargs:
         llm_kwargs = llm_kwargs | dict(
             max_batch_size=fixed_params["max_beam_width"] * len(
@@ -89,9 +101,7 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs):
         )
     return LLM(
         **llm_kwargs,
-        kv_cache_config=KvCacheConfig(
-            max_tokens=10000,  # type: ignore
-        ),
+        kv_cache_config=kv_cache_config,
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
     )
@@ -114,24 +124,32 @@ def _single_process_context():
 @pytest.fixture(scope="module")
 def llm(fixed_params, input_prompts, model_kwargs, single_process: bool,
         with_cuda_graph_and_overlap: bool):
+    check_no_sync = single_process  # single_process only used for sync check
+    if check_no_sync and model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip("Sync check only supported for TorchSampler")
+
     gc.collect(
         2)  # force destruction of any other LLM instances (cf. comment above)
     with _single_process_context() if single_process else nullcontext():
+        llm_kwargs: dict[
+            str,
+            Any] = deepcopy(  # LLM.shutdown resets checkpoint_loader.config_loader
+                model_kwargs)
+        if not with_cuda_graph_and_overlap:
+            llm_kwargs |= dict(
+                disable_overlap_scheduler=True,
+                cuda_graph_config=None,
+            )
+        else:
+            llm_kwargs |= dict(
+                disable_overlap_scheduler=False,
+                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                                  enable_padding=True),
+            )
         llm = _build_llm(
             fixed_params,
             input_prompts,
-            llm_kwargs=(
-                (dict(
-                    disable_overlap_scheduler=True,
-                    cuda_graph_config=None,
-                ) if not with_cuda_graph_and_overlap else dict(
-                    disable_overlap_scheduler=False,
-                    cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
-                                                      enable_padding=True),
-                ))
-                |
-                deepcopy(  # LLM.shutdown resets checkpoint_loader.config_loader
-                    model_kwargs)),
+            llm_kwargs=llm_kwargs,
         )
     with llm:
         yield llm
@@ -203,30 +221,33 @@ def check_cache_indirection(beam: CompletionOutput,
     ), f"expected {reference_cache_indirection[beam_idx, :num_valid_cache_indirection].tolist()} cache indirection, but got {valid_cache_indirection.tolist()}"
 
 
-def validate_output_beam(beam: CompletionOutput,
+def validate_output_beam(beam_output: CompletionOutput,
                          expected_outputs: BeamSearchTestOutput,
                          sampling_params: SamplingParams, prompt_length: int,
                          beam_idx: int) -> None:
     """Perform several checks on the output of a single beam"""
 
     valid_tokens = None
-    if sampling_params.stop_token_ids is not None:
-        if sampling_params.stop_token_ids[0] in expected_outputs.outputs[
-                beam_idx].tolist():
-            valid_tokens = expected_outputs.outputs[beam_idx].tolist().index(
-                sampling_params.stop_token_ids[0]) + 1
+    if sampling_params.stop_token_ids is not None and sampling_params.stop_token_ids[
+            0] in (expected_output_token_ids :=
+                   expected_outputs.outputs[beam_idx].tolist()):
+        assert beam_output.finish_reason == "stop"
+        valid_tokens = expected_output_token_ids.index(
+            sampling_params.stop_token_ids[0]) + 1
+    else:
+        assert beam_output.finish_reason == "length"
 
-    check_generation_logits(beam, sampling_params, valid_tokens)
-    check_logprobs(beam, sampling_params, valid_tokens)
-    check_cache_indirection(beam, sampling_params,
+    check_generation_logits(beam_output, sampling_params, valid_tokens)
+    check_logprobs(beam_output, sampling_params, valid_tokens)
+    check_cache_indirection(beam_output, sampling_params,
                             expected_outputs.cache_indirection, prompt_length,
                             beam_idx, valid_tokens)
     # Check output similarity
 
     assert valid_tokens is None or valid_tokens > 0
-    assert beam.token_ids == expected_outputs.outputs[
-        beam_idx, :valid_tokens].tolist(
-        ), f"expected {expected_outputs.outputs[beam_idx, :valid_tokens].tolist()} token ids, but got {beam.token_ids}"
+    expected_valid_token_ids = expected_outputs.outputs[
+        beam_idx, :valid_tokens].tolist()
+    assert beam_output.token_ids == expected_valid_token_ids, f"expected {expected_valid_token_ids} token ids, but got {beam_output.token_ids}"
 
 
 def check_context_logits(output: GenerationResult,
@@ -240,9 +261,11 @@ def check_context_logits(output: GenerationResult,
         assert output.context_logits is None, "context logits should be None"
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[False, True],
+                ids=["multi_process", "single_process"])
 def single_process(request) -> bool:
-    return request.param
+    return cast(bool, request.param)
 
 
 def validate_output(output: GenerationResult, input_prompt: list[int],
@@ -258,9 +281,35 @@ def validate_output(output: GenerationResult, input_prompt: list[int],
     # check each beam
     expected_outputs = get_expected_outputs(
         input_prompt[-1], num_iterations=sampling_params.max_tokens)
-    for beam_idx, beam in enumerate(output.outputs):
-        validate_output_beam(beam, expected_outputs, sampling_params,
+
+    for beam_idx, beam_output in enumerate(output.outputs):
+        validate_output_beam(beam_output, expected_outputs, sampling_params,
                              len(input_prompt), beam_idx)
+
+
+def validate_disagg_output(output: GenerationResult, input_prompt: list[int],
+                           sampling_params: SamplingParams) -> None:
+    """Validate disagg beam output without requiring full-run cache history."""
+    check_context_logits(output, sampling_params)
+    assert len(output.outputs) == sampling_params.n
+    expected_outputs = get_expected_outputs(
+        input_prompt[-1], num_iterations=sampling_params.max_tokens)
+
+    for beam_idx, beam_output in enumerate(output.outputs):
+        assert beam_output.finish_reason == "length"
+        check_generation_logits(beam_output, sampling_params, valid_tokens=None)
+        check_logprobs(beam_output, sampling_params, valid_tokens=None)
+        expected_token_ids = expected_outputs.outputs[beam_idx].tolist()
+        assert beam_output.token_ids == expected_token_ids, (
+            f"expected {expected_token_ids} token ids, "
+            f"got {beam_output.token_ids}")
+
+        assert beam_output.additional_generation_outputs is not None
+        cache_indirection = beam_output.additional_generation_outputs[
+            "cache_indirection"]
+        assert cache_indirection is not None
+        assert cache_indirection.shape[1] == sampling_params.best_of
+        assert cache_indirection.shape[0] == sampling_params.max_tokens - 1
 
 
 def validate_outputs(llm: LLM, input_prompts: list[list[int]],
@@ -328,6 +377,51 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
         validate_output(output, input_prompts[output_idx], sampling_params)
 
 
+def validate_disagg_outputs(ctx_llm: LLM,
+                            gen_llm: LLM,
+                            input_prompts: list[list[int]],
+                            sampling_params: SamplingParams,
+                            request_id_base: int = 0) -> None:
+    """Run context-only then generation-only beam search and validate outputs."""
+
+    ctx_disagg_params = [
+        DisaggregatedParams(request_type="context_only",
+                            disagg_request_id=1000 + request_id_base + idx)
+        for idx in range(len(input_prompts))
+    ]
+    ctx_outputs = ctx_llm.generate(
+        deepcopy(input_prompts),
+        sampling_params=deepcopy(sampling_params),
+        disaggregated_params=ctx_disagg_params,
+        use_tqdm=False,
+    )
+    assert isinstance(ctx_outputs, list)
+    assert len(ctx_outputs) == len(input_prompts)
+
+    gen_disagg_params = []
+    for ctx_output in ctx_outputs:
+        disagg_params = ctx_output.disaggregated_params
+        assert disagg_params is not None
+        assert disagg_params.first_gen_tokens is not None
+        assert disagg_params.first_gen_log_probs is not None
+        assert len(disagg_params.first_gen_tokens) == sampling_params.best_of
+        assert len(disagg_params.first_gen_log_probs) == sampling_params.best_of
+        disagg_params.request_type = "generation_only"
+        gen_disagg_params.append(disagg_params)
+
+    gen_outputs = gen_llm.generate(
+        deepcopy(input_prompts),
+        sampling_params=deepcopy(sampling_params),
+        disaggregated_params=gen_disagg_params,
+        use_tqdm=False,
+    )
+    assert isinstance(gen_outputs, list)
+    assert len(gen_outputs) == len(input_prompts)
+    for output_idx, output in enumerate(gen_outputs):
+        validate_disagg_output(output, input_prompts[output_idx],
+                               sampling_params)
+
+
 ###########################################################################
 # End to end tests
 ###########################################################################
@@ -337,7 +431,7 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("num_output_beams", [1, 2])
-@pytest.mark.parametrize("num_prompts", [1, 2, 3])
+@pytest.mark.parametrize("num_prompts", [1, 3])
 @pytest.mark.parametrize("stop_token_ids", [[15], None])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_e2e(
@@ -353,15 +447,7 @@ def test_beam_search_e2e(
     single_process: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    llm_args = cast(TorchLlmArgs, llm.args)
-    check_no_sync = single_process  # single_process only used for sync check
-    if check_no_sync and cast(TorchLlmArgs,
-                              llm.args).sampler_type != "TorchSampler":
-        pytest.skip("Sync check only supported for TorchSampler")
-    if check_no_sync and (cast(TorchLlmArgs, llm.args).sampler_type
-                          == "TorchSampler") and stop_token_ids is not None:
-        # FIXME: Fix TorchSampler._are_stop_words
-        pytest.skip("Stop word handling in TorchSampler syncs")
+    llm_args = cast(TorchLlmArgs, llm.args)  # type: ignore[redundant-cast]
 
     if return_log_probs and num_prompts > 1 and llm_args.sampler_type == "TRTLLMSampler":
         pytest.skip(
@@ -388,15 +474,73 @@ def test_beam_search_e2e(
         logprobs=return_log_probs,
         end_id=-1,
         stop_token_ids=stop_token_ids,
+        include_stop_str_in_output=True,
         additional_model_outputs=["cache_indirection"],
     )
     validate_outputs(
         llm,
         input_prompts[:num_prompts],
         sampling_params,
-        check_no_sync=check_no_sync,
+        check_no_sync=single_process,
         monkeypatch=monkeypatch,
     )
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_disagg_e2e(
+    fixed_params,
+    input_prompts,
+    model_kwargs: dict[str, Any],
+) -> None:
+    if model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip(
+            "Disaggregated beam score handoff is implemented for TorchSampler")
+
+    sampling_params = SamplingParams(
+        max_tokens=fixed_params["max_tokens"],
+        n=fixed_params["max_beam_width"],
+        best_of=fixed_params["max_beam_width"],
+        use_beam_search=True,
+        end_id=-1,
+        include_stop_str_in_output=True,
+        additional_model_outputs=["cache_indirection"],
+    )
+
+    disagg_kwargs = deepcopy(model_kwargs)
+    disagg_kwargs |= dict(
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(max_tokens=10000,
+                                      enable_block_reuse=True,
+                                      enable_partial_reuse=True,
+                                      use_kv_cache_manager_v2=True),
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            kv_transfer_timeout_ms=1000,
+            kv_transfer_sender_future_timeout_ms=1000,
+        ),
+    )
+
+    partial_reuse_prompts = [[1, 2, 3], [1, 5, 6]]
+
+    ctx_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
+    gen_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
+    try:
+        with ctx_llm, gen_llm:
+            validate_disagg_outputs(ctx_llm,
+                                    gen_llm,
+                                    partial_reuse_prompts[:1],
+                                    sampling_params,
+                                    request_id_base=0)
+            validate_disagg_outputs(ctx_llm,
+                                    gen_llm,
+                                    partial_reuse_prompts[1:],
+                                    sampling_params,
+                                    request_id_base=100)
+    finally:
+        ctx_llm.shutdown()
+        gen_llm.shutdown()
 
 
 ###########################################################################
@@ -479,6 +623,10 @@ def test_beam_search_sampling_batch_basic():
     new_log_probs_result = new_log_probs.clone()
     predecessor_beams_result = predecessor_beams.clone()
 
+    # Pre-computed per-step constants (matches production cache contract).
+    seq_offsets = torch.arange(max_batch_size, dtype=torch.int64) * beam_width
+    beam_idx_arange = torch.arange(beam_width, dtype=torch.int32)
+
     # Create BeamSearchMetadata
     beam_search_args = BeamSearchMetadata(
         cache_indirection=cache_indirection_result,
@@ -489,6 +637,8 @@ def test_beam_search_sampling_batch_basic():
         finished_beams=finished_beams_result,
         new_log_probs=new_log_probs_result,
         predecessor_beams=predecessor_beams_result,
+        seq_offsets=seq_offsets,
+        beam_idx_arange=beam_idx_arange,
     )
 
     # Run beam search sampling
@@ -592,6 +742,172 @@ def test_beam_search_sampling_batch_basic():
             torch.testing.assert_close(
                 predecessor_beams_result[seq_slot, beam_idx],
                 torch.tensor(predecessor_beam, dtype=torch.int32))
+
+
+def test_beam_search_sampling_batch_disagg_handoff():
+    """Test context-first disagg beam handoff seeds gen-side beam scores."""
+
+    test_params = GeneralTestParams()
+    batch_size = test_params.batch_size
+    beam_width = test_params.beam_width
+    vocab_size = test_params.vocab_size
+    max_batch_size = test_params.max_batch_size
+    prompt_len = test_params.prompt_len
+    temperature = 1.0
+
+    seq_slots = torch.arange(
+        batch_size, dtype=torch.int64) + (max_batch_size - batch_size) // 2
+    seq_offsets = torch.arange(max_batch_size, dtype=torch.int64) * beam_width
+    beam_idx_arange = torch.arange(beam_width, dtype=torch.int32)
+
+    def make_metadata(seq_len: int) -> BeamSearchMetadata:
+        return BeamSearchMetadata(
+            cache_indirection=torch.zeros(
+                (max_batch_size, beam_width, prompt_len + 2),
+                dtype=torch.int32),
+            cache_indirection_buffer=torch.full(
+                (max_batch_size, beam_width, prompt_len + 2),
+                -1,
+                dtype=torch.int32),
+            cum_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            seq_slots=seq_slots,
+            seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
+            finished_beams=torch.zeros((max_batch_size, beam_width),
+                                       dtype=torch.int32),
+            new_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            predecessor_beams=torch.zeros((max_batch_size, beam_width),
+                                          dtype=torch.int32),
+            seq_offsets=seq_offsets,
+            beam_idx_arange=beam_idx_arange,
+        )
+
+    torch.manual_seed(43)
+    context_logits = torch.randn((batch_size, vocab_size), dtype=torch.float32)
+    generation_logits = torch.randn((batch_size * beam_width, vocab_size),
+                                    dtype=torch.float32)
+    for req_idx in range(batch_size):
+        context_logits[req_idx, req_idx * beam_width:req_idx * beam_width +
+                       beam_width] += torch.tensor([8.0, 7.0, 1.0])
+        for beam_idx in range(beam_width):
+            row = req_idx * beam_width + beam_idx
+            generation_logits[row, 10 + beam_idx] += 4.0 + beam_idx
+
+    # Baseline: one continuous request. Context produces first beams, then
+    # generation continues with beam_width input beams.
+    continuous_metadata = make_metadata(prompt_len)
+    first_tokens, _ = beam_search_sampling_batch(
+        logits=context_logits,
+        beam_width_in=1,
+        beam_width_out=beam_width,
+        beam_search_args=continuous_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    first_gen_scores = continuous_metadata.cum_log_probs[
+        seq_slots, :beam_width].clone()
+    assert first_tokens.shape == (batch_size, beam_width)
+
+    continuous_metadata.seq_lens = torch.full((batch_size, ),
+                                              prompt_len + 1,
+                                              dtype=torch.int32)
+    continuous_next_tokens, _ = beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=continuous_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    continuous_cum_log_probs = continuous_metadata.cum_log_probs[
+        seq_slots, :beam_width].clone()
+    continuous_new_log_probs = continuous_metadata.new_log_probs[
+        seq_slots, :beam_width].clone()
+    continuous_predecessor_beams = continuous_metadata.predecessor_beams[
+        seq_slots, :beam_width].clone()
+    continuous_cache_indirection = continuous_metadata.cache_indirection[
+        seq_slots, :beam_width, :prompt_len + 2].clone()
+
+    # Disaggregated generation starts from reset sampler buffers, then seeds
+    # the first-token beam scores derived from context first_gen_log_probs.
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    disagg_metadata = make_metadata(prompt_len + 1)
+    original_tokens = torch.zeros((max_batch_size, beam_width, prompt_len + 2),
+                                  dtype=torch.int32)
+    fake_executor = cast(
+        PyExecutor,
+        SimpleNamespace(sampler=SimpleNamespace(store=SimpleNamespace(
+            beam_search_store=SimpleNamespace(
+                original_tokens=original_tokens,
+                cache_indirection=disagg_metadata.cache_indirection,
+                cum_log_probs=disagg_metadata.cum_log_probs,
+            )))))
+    for req_idx, seq_slot in enumerate(seq_slots.tolist()):
+        first_gen_tokens = first_tokens[req_idx, :beam_width].tolist()
+        first_gen_log_probs = [{
+            token_id:
+            Logprob(logprob=float(first_gen_scores[req_idx, beam_idx].item()))
+        } for beam_idx, token_id in enumerate(first_gen_tokens)]
+        req = SimpleNamespace(
+            py_seq_slot=seq_slot,
+            py_request_id=req_idx,
+            prompt_len=prompt_len,
+            py_disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_log_probs=first_gen_log_probs,
+            ),
+        )
+        PyExecutor._update_sampler_state_for_disagg_gen_request(
+            fake_executor, req, beam_width, first_gen_tokens)
+
+    expected_beam_indices = torch.arange(beam_width, dtype=torch.int32).expand(
+        batch_size, beam_width)
+    torch.testing.assert_close(
+        original_tokens[seq_slots, :beam_width, prompt_len], first_tokens)
+    torch.testing.assert_close(
+        disagg_metadata.cache_indirection[seq_slots, :beam_width, prompt_len],
+        expected_beam_indices)
+    torch.testing.assert_close(
+        disagg_metadata.cum_log_probs[seq_slots, :beam_width], first_gen_scores)
+    disagg_next_tokens, _ = beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=disagg_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+
+    torch.testing.assert_close(disagg_next_tokens, continuous_next_tokens)
+    torch.testing.assert_close(
+        disagg_metadata.cache_indirection[seq_slots, :beam_width, :prompt_len +
+                                          2], continuous_cache_indirection)
+    torch.testing.assert_close(
+        disagg_metadata.cum_log_probs[seq_slots, :beam_width],
+        continuous_cum_log_probs)
+    torch.testing.assert_close(
+        disagg_metadata.new_log_probs[seq_slots, :beam_width],
+        continuous_new_log_probs)
+    torch.testing.assert_close(
+        disagg_metadata.predecessor_beams[seq_slots, :beam_width],
+        continuous_predecessor_beams)
+
+    # This is the regression guard for disagg: if gen-side cum_log_probs remain
+    # reset after receiving first_gen_tokens, the next step is scored incorrectly.
+    unseeded_metadata = make_metadata(prompt_len + 1)
+    beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=unseeded_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    assert not torch.allclose(
+        unseeded_metadata.cum_log_probs[seq_slots, :beam_width],
+        continuous_cum_log_probs)
 
 
 def create_default_request(test_params: GeneralTestParams) -> LlmRequest:
@@ -761,6 +1077,7 @@ def test_create_beam_history():
                 beam_history_builder=sampler._prepare_beam_history(
                     request,
                     finish_reasons=torch.ones((beam_width, ), dtype=torch.int),
+                    d2h_copier=sampler._copy_to_host,
                 ), )
 
         yield _uut
@@ -910,12 +1227,12 @@ class TestParameterValidation:
     @pytest.fixture(scope="module", params=[1, 4])
     @staticmethod
     def batch_size(request) -> int:
-        return request.param
+        return cast(int, request.param)
 
     @pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
     @staticmethod
     def sampler_type(request) -> str:
-        return request.param
+        return cast(str, request.param)
 
     @pytest.fixture(scope="module")
     @staticmethod
@@ -941,7 +1258,7 @@ class TestParameterValidation:
         )
 
     def _check_engine_responds(self, llm: LLM, input_prompts: list[str],
-                               fixed_params: dict):
+                               fixed_params: dict[str, Any]):
         _ = llm.generate(input_prompts,
                          sampling_params=SamplingParams(
                              max_tokens=fixed_params["max_tokens"],
@@ -957,7 +1274,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -984,8 +1301,8 @@ class TestParameterValidation:
     @pytest.mark.timeout(120)
     @pytest.mark.threadleak(enabled=False)
     def test_use_beam_search_ommitted(self, llm: LLM, input_prompts: list[str],
-                                      fixed_params: dict, batch_size: int,
-                                      sampler_type: str):
+                                      fixed_params: dict[str, Any],
+                                      batch_size: int, sampler_type: str):
         if batch_size == 1:
             pytest.skip("Test does not depend on batch size")
         if sampler_type == "TorchSampler":
@@ -1011,7 +1328,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -1040,7 +1357,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):
@@ -1069,7 +1386,7 @@ class TestParameterValidation:
         self,
         llm: LLM,
         input_prompts: list[str],
-        fixed_params: dict,
+        fixed_params: dict[str, Any],
         batch_size: int,
         sampler_type: str,
     ):

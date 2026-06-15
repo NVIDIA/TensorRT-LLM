@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Test FlashInfer MLA backend operations.
 
 Tests the flashinfer_mla_with_cache cached op and compares it with the
@@ -17,6 +31,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.flashinfer_mla import (
     _GlobalFlashInferMLAPlanner,
 )
@@ -145,14 +160,14 @@ def _create_unpaged_cache_and_metadata(
     total_tokens = sum(seq_lengths)
     is_decode = all(s == 1 for s in seq_lengths)
 
+    _bi = BatchInfo()
     if is_decode:
         # Decode phase
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        _bi.update([0, 0, 0, 0, batch_size, batch_size])
     else:
         # Context/prefill phase
-        batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device=device
-        )
+        _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
 
     return {
         "mla_cache": mla_cache,
@@ -245,14 +260,14 @@ def _create_paged_cache_and_metadata(
     total_tokens = sum(seq_lengths)
     is_decode = all(s == 1 for s in seq_lengths)
 
+    _bi = BatchInfo()
     if is_decode:
         # Decode phase
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        _bi.update([0, 0, 0, 0, batch_size, batch_size])
     else:
         # Context/prefill phase
-        batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device=device
-        )
+        _bi.update([batch_size, total_tokens, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
 
     return {
         "ckv_cache": ckv_cache,

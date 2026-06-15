@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -543,7 +543,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // logitsPostProcessorName
             std::nullopt,    // logitsPostProcessor
             encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
-            std::nullopt);   // cacheSaltID
+            std::nullopt);   // cacheSalt
     request.setRequestType(tensorrt_llm::executor::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
     return request;
 }
@@ -610,7 +610,7 @@ public:
             texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse,
                 benchmarkParams.maxTokensInPagedKvCache, benchmarkParams.maxAttentionWindowVec,
                 benchmarkParams.sinkTokenLength, benchmarkParams.freeGpuMemoryFractions.at(in),
-                benchmarkParams.kvHostCacheSize, benchmarkParams.kvOnboardBlocks);
+                benchmarkParams.kvHostCacheSize);
             texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(benchmarkParams.multiBlockMode,
                 benchmarkParams.enableContextFMHAFP32Acc, benchmarkParams.cudaGraphMode,
                 benchmarkParams.cudaGraphCacheSize);
@@ -1213,8 +1213,6 @@ int main(int argc, char* argv[])
     options.add_options()("kv_host_cache_bytes",
         "Size of secondary memory pool used for offloading kv cache blocks (in bytes).",
         cxxopts::value<size_t>()->default_value("0"));
-    options.add_options()("kv_onboard_blocks", "If offloaded blocks should be onboarded to primary memory before reuse",
-        cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "max_prompt_len", "Truncate all prompts from dataset to the length specified.", cxxopts::value<SizeType32>());
     options.add_options()("gpu_weights_percent",
@@ -1482,10 +1480,6 @@ int main(int argc, char* argv[])
     TLLM_CHECK_WITH_INFO(
         benchmarkParams.kvHostCacheSize == false, "Currently disaggServer don't support kv_host_cache!");
 
-    // Argument: If offloaded blocks should be onboarded to primary memory before they are reused.
-    benchmarkParams.kvOnboardBlocks = result["kv_onboard_blocks"].as<bool>();
-    TLLM_CHECK_WITH_INFO(
-        benchmarkParams.kvOnboardBlocks == true, "Currently disaggServer don't support kv_onboard_blocks =false!");
     // Argument: Medusa choices for the Medusa speculative decoding.
     if (result.count("medusa_choices"))
     {

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -22,14 +24,17 @@ import tempfile
 import time
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
+import aiohttp
+import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import parse_gsm8k_output, wait_for_server
+from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell)
+                           skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -48,9 +53,28 @@ class TestConfig:
     test_desc: str
     request_count: int
     accuracy_threshold: float
+    speculative_model_path: Optional[str] = None
+    cancellation_rate: Optional[int] = None
+    cancellation_delay: Optional[float] = None
 
     def __str__(self):
         return self.test_desc
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    """
+    sm = get_sm_version()
+    """
+    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
+    """
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
 
 
 def cleanup_output_files():
@@ -60,6 +84,41 @@ def cleanup_output_files():
             os.remove(file)
         except FileNotFoundError:
             pass
+
+
+# Fatal patterns whose presence in worker/server logs after a stress run
+# indicates the cluster did not stay healthy and the test should be failed.
+_FATAL_LOG_PATTERNS = (
+    "Hang detected on rank",
+    "RuntimeError: Cluster is not ready",
+    "Internal server error",
+)
+
+
+def scan_logs_for_fatal_errors(processes):
+    """Scan saved process logs for fatal disagg/worker error patterns.
+
+    Returns a dict mapping log path -> {pattern: count} for any pattern that
+    appears at least once. Skips processes that did not save a log file.
+    """
+    findings: dict[str, dict[str, int]] = {}
+    for proc in processes:
+        log_path = getattr(proc, "log_path", None)
+        if not log_path or not os.path.exists(log_path):
+            continue
+        counts = {pat: 0 for pat in _FATAL_LOG_PATTERNS}
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                for line in f:
+                    for pat in _FATAL_LOG_PATTERNS:
+                        if pat in line:
+                            counts[pat] += 1
+        except OSError:
+            continue
+        hits = {pat: c for pat, c in counts.items() if c > 0}
+        if hits:
+            findings[log_path] = hits
+    return findings
 
 
 def get_default_disagg_cluster_config():
@@ -140,6 +199,16 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml",
         "gen_only_bs1":
         f"{test_configs_root}/disagg_config_gen_only_bs1.yaml",
+        "gen_only_insufficient_kv":
+        f"{test_configs_root}/disagg_config_gen_only_insufficient_kv.yaml",
+        "kv_cache_aware":
+        f"{test_configs_root}/disagg_config_gen_only_kv_cache_aware.yaml",
+        "round_robin":
+        f"{test_configs_root}/disagg_config_round_robin.yaml",
+        "load_balancing":
+        f"{test_configs_root}/disagg_config_load_balancing.yaml",
+        "conversation":
+        f"{test_configs_root}/disagg_config_conversation.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "4_ranks_trt_backend":
@@ -150,14 +219,16 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_mixed.yaml",
         "overlap":
         f"{test_configs_root}/disagg_config_overlap.yaml",
+        "overlap_gen_first":
+        f"{test_configs_root}/disagg_config_overlap_gen_first.yaml",
+        "overlap_gen_first_pp4":
+        f"{test_configs_root}/disagg_config_overlap_gen_first_pp4.yaml",
         "overlap_transceiver_runtime_python":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
         f"{test_configs_root}/disagg_config_metrics.yaml",
-        "trtllm_sampler":
-        f"{test_configs_root}/disagg_config_trtllm_sampler.yaml",
         "load_balance":
         f"{test_configs_root}/disagg_config_load_balance.yaml",
         "cache_aware_balance":
@@ -214,6 +285,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_two_mtp.yaml",
         "deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_ctxpp2_gentp2.yaml",
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse":
+        f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse.yaml",
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_chunked":
+        f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse_chunked.yaml",
         "deepseek_v3_lite_bf16_empty_batch":
         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml",
         "llama4_kv_cache_overflow":
@@ -222,14 +297,30 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
-        "gpt_oss_120b_stress":
+        "deepseek_r1_v2_fp4_mtp_stress":
+        f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm_mtp.yaml",
+        "gpt_oss_120b_trtllm_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
+        "gpt_oss_120b_eagle_triton_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_triton.yaml",
+        "gpt_oss_120b_eagle_trtllm_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_trtllm.yaml",
+        "gpt_oss_120b_triton_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
+        "qwen3_5_4b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
+        "qwen3_32b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
+        "llama31_8b_ucx":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "mamba_conc_greater_than_mbs":
+        f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
     }
 
     if test_desc not in config_map:
@@ -280,7 +371,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc in ("overlap", "trtllm_sampler"):
+    if test_desc.startswith("overlap"):
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,
@@ -404,6 +495,11 @@ def run_client_tests(example_dir,
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
                     ]
+                elif "qwen3_32b_fp8" in test_desc:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio in Python is a library"
+                    ]
                 else:
                     expected_strings = [
                         "The capital of Germany is Berlin",
@@ -421,6 +517,82 @@ def run_client_tests(example_dir,
                     assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
 
+def verify_usage_with_cache_reuse(server_url: str, model: str):
+    """Verify repeated requests report context-side usage after cache reuse."""
+    prompt = "Explain why a repeated disaggregated request should reuse cached KV blocks."
+    max_tokens = 4
+    timeout = aiohttp.ClientTimeout(total=120)
+
+    async def send_request(session: aiohttp.ClientSession, endpoint: str):
+        if endpoint == "completions":
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            }
+        else:
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                }],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            }
+
+        async with session.post(f"{server_url}/v1/{endpoint}",
+                                json=payload,
+                                timeout=timeout) as resp:
+            assert resp.status == 200, \
+                f"{endpoint} request failed with {resp.status}: {await resp.text()}"
+            return await resp.json()
+
+    def validate_usage(endpoint: str, first_response: dict[str, Any],
+                       second_response: dict[str, Any]):
+        first_usage = first_response.get("usage")
+        second_usage = second_response.get("usage")
+        print(f"[usage_check] {endpoint} first_usage={first_usage}")
+        print(f"[usage_check] {endpoint} second_usage={second_usage}")
+        assert first_usage is not None, f"{endpoint} first response missing usage"
+        assert second_usage is not None, f"{endpoint} second response missing usage"
+        assert second_usage["prompt_tokens"] == first_usage["prompt_tokens"], \
+            (f"{endpoint} prompt_tokens mismatch: second={second_usage['prompt_tokens']} "
+             f"!= first={first_usage['prompt_tokens']}")
+        assert second_usage["completion_tokens"] == max_tokens, \
+            (f"{endpoint} completion_tokens mismatch: "
+             f"got={second_usage['completion_tokens']} expected={max_tokens}")
+        assert second_usage["total_tokens"] == (
+            second_usage["prompt_tokens"] + second_usage["completion_tokens"]), \
+            (f"{endpoint} total_tokens mismatch: "
+             f"got={second_usage['total_tokens']} expected="
+             f"{second_usage['prompt_tokens'] + second_usage['completion_tokens']}")
+
+        prompt_tokens_details = second_usage.get("prompt_tokens_details")
+        assert prompt_tokens_details is not None, \
+            f"{endpoint} second response missing prompt_tokens_details"
+        print(
+            f"[usage_check] {endpoint} prompt_tokens_details={prompt_tokens_details}"
+        )
+        assert prompt_tokens_details["cached_tokens"] == (
+            second_usage["prompt_tokens"] - 1), \
+            (f"{endpoint} cached_tokens mismatch: "
+             f"got={prompt_tokens_details['cached_tokens']} "
+             f"expected={second_usage['prompt_tokens'] - 1}")
+
+    async def check_usage():
+        async with aiohttp.ClientSession() as session:
+            for endpoint in ("completions", "chat/completions"):
+                first_response = await send_request(session, endpoint)
+                second_response = await send_request(session, endpoint)
+                validate_usage(endpoint, first_response, second_response)
+
+    asyncio.run(check_usage())
+
+
 # TODO: add test for disaggregated server prometheus metrics
 def fetch_prometheus_metrics(server_url: str):
     import requests
@@ -435,6 +607,8 @@ def setup_disagg_cluster(
     env: dict[str, str] | None = None,
     cwd: str | None = None,
     server_start_timeout: int = 300,
+    schedule_style: str | None = None,
+    save_log: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -444,12 +618,20 @@ def setup_disagg_cluster(
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
+        schedule_style: Disagg schedule style ('context_first' or 'generation_first')
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+
+    speculative_config = config.get("speculative_config")
+    if isinstance(speculative_config, dict):
+        speculative_model = speculative_config.get("speculative_model")
+        if speculative_model:
+            speculative_config["speculative_model"] = resolve_llm_model_path(
+                speculative_model)
 
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
@@ -481,6 +663,8 @@ def setup_disagg_cluster(
 
     # Launch workers
     model = model_name or config.get("model")
+    if model:
+        model = resolve_llm_model_path(model)
     ctx_workers = []
     gen_workers = []
     disagg_server = None
@@ -500,7 +684,8 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=env))
+                               env=env,
+                               save_log=save_log))
             next_device += gpus_per_ctx
 
         for i in range(num_gen_instances):
@@ -513,7 +698,8 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=env))
+                               env=env,
+                               save_log=save_log))
             next_device += gpus_per_gen
 
         # Build minimal server config and launch
@@ -535,9 +721,12 @@ def setup_disagg_cluster(
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
         }
+        if schedule_style:
+            server_config["schedule_style"] = schedule_style
         disagg_server = run_disagg_server(server_config,
                                           work_dir,
                                           server_port,
+                                          save_log=save_log,
                                           env=env,
                                           cwd=cwd)
 
@@ -559,18 +748,23 @@ def run_disaggregated_test(example_dir,
                            prompt_file="prompts.json",
                            extra_endpoints_test=None,
                            model_path=None,
-                           cwd=None):
+                           cwd=None,
+                           disagg_schedule_style=None,
+                           post_client_test=None):
     """Run disaggregated test using service discovery instead of MPI."""
-
     if mpi_disabled():
         pytest.skip(
             "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
         )
 
+    run_env = env.copy() if env else os.environ.copy()
+    run_env["UCX_TLS"] = get_ucx_tls()
+
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd)
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
 
@@ -596,7 +790,7 @@ def run_disaggregated_test(example_dir,
             client_config_file,
             test_desc,
             num_iters,
-            env,
+            run_env,
             300,  # timeout
             prompt_file,
             extra_endpoints_test,
@@ -604,6 +798,8 @@ def run_disaggregated_test(example_dir,
             all_worker_procs,
             disagg_server.process,
             use_ray=True)
+        if post_client_test is not None:
+            post_client_test(server_url)
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -621,6 +817,7 @@ def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                            "2_ranks_diff_max_tokens",
                            env=llm_venv._new_env,
                            prompt_file="long_prompts.json",
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -637,6 +834,7 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -653,6 +851,7 @@ def test_disaggregated_single_gpu_trt_backend(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_trt_backend",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -669,6 +868,39 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("router_type",
+                         ["load_balancing", "kv_cache_aware", "conversation"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_router(disaggregated_test_root,
+                              disaggregated_example_root, llm_venv,
+                              llama_model_root, router_type, tmp_path):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    metrics_file = tmp_path / f"perf_metrics_{router_type}.json"
+
+    def fetch_perf_metrics(server_url: str):
+        import json
+
+        import requests as http_requests
+        resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
+        assert resp.status_code == 200, \
+            f"Failed to fetch perf_metrics: {resp.status_code}"
+        metrics = resp.json()
+        metrics_file.write_text(json.dumps(metrics, indent=2))
+        logger.info(f"Router={router_type}: saved {len(metrics)} perf metrics "
+                    f"to {metrics_file}")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           router_type,
+                           env=llm_venv._new_env,
+                           extra_endpoints_test=fetch_perf_metrics,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -685,7 +917,70 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_trt_backend",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_benchmark_gen_only_insufficient_kv(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        llama_model_root):
+    """Test that gen-only benchmark mode raises an error when KV cache is too
+    small to hold all benchmark requests, instead of hanging forever."""
+    import openai
+
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
+    env["UCX_TLS"] = get_ucx_tls()
+
+    config_file = get_test_config("gen_only_insufficient_kv",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+        setup_disagg_cluster(config_file,
+                             model_name=llama_model_root,
+                             env=env,
+                             cwd=llm_venv.get_working_directory())
+
+    try:
+        client = openai.OpenAI(api_key="tensorrt_llm",
+                               base_url=f"http://localhost:{server_port}/v1")
+
+        # Send 64 concurrent requests to trigger the benchmark fill loop
+        # and the insufficient KV cache error.
+        import concurrent.futures
+
+        def send_request():
+            try:
+                stream = client.completions.create(
+                    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                    prompt="What is the capital of Germany?",
+                    max_tokens=10,
+                    temperature=0.0,
+                    stream=True)
+                # Must iterate the stream to receive SSE error chunks
+                chunks = []
+                for chunk in stream:
+                    chunks.append(chunk.choices[0].text)
+                return "".join(chunks)
+            except Exception as e:
+                return e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+            futures = [pool.submit(send_request) for _ in range(64)]
+            results = [f.result(timeout=120) for f in futures]
+
+        errors = [r for r in results if isinstance(r, Exception)]
+        assert len(errors) > 0, \
+            "Expected at least one error due to insufficient KV cache"
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.skip_less_device(4)
@@ -702,6 +997,7 @@ def test_disaggregated_genbs1(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_bs1",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -717,6 +1013,7 @@ def test_disaggregated_multi_gpu(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -732,6 +1029,7 @@ def test_disaggregated_multi_gpu_trt_backend(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks_trt_backend",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -745,6 +1043,7 @@ def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "cuda_graph",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -758,6 +1057,7 @@ def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "mixed",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -768,10 +1068,47 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    def post_client_test(server_url: str):
+        verify_usage_with_cache_reuse(server_url,
+                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
+                           post_client_test=post_client_test,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+@pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
+def test_disaggregated_overlap_gen_first(disaggregated_test_root,
+                                         disaggregated_example_root, llm_venv,
+                                         llama_model_root, ctx_pp):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    def post_client_test(server_url: str):
+        verify_usage_with_cache_reuse(server_url,
+                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
+        env=llm_venv._new_env,
+        model_path=llama_model_root,
+        cwd=llm_venv.get_working_directory(),
+        disagg_schedule_style="generation_first",
+        post_client_test=post_client_test)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -782,9 +1119,12 @@ def test_disaggregated_overlap_transceiver_runtime_python(
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
-                           env=llm_venv._new_env,
+                           env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -805,6 +1145,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env,
                            extra_endpoints_test=extra_endpoints_test,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -822,6 +1163,7 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                            num_iters=1,
                            prompt_file="tool_call_prompts.json",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -838,6 +1180,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env
                            | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
     send_file = os.path.join(output_path, "rank_0_send.csv")
@@ -869,20 +1212,6 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
-                                      disaggregated_example_root,
-                                      llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "trtllm_sampler",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
                                     llama_model_root):
@@ -892,6 +1221,7 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -906,6 +1236,7 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -920,6 +1251,7 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "conditional",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -932,6 +1264,7 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -991,6 +1324,7 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1005,6 +1339,7 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1096,6 +1431,46 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(8)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse",
+        env=llm_venv._new_env,
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_long_prompt(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    # NVBug 5991576: repeated long prompts with PP+disagg+block_reuse
+    # trigger scheduler hang due to reusable token budget miscalculation.
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse_chunked",
+        num_iters=5,
+        prompt_file="long_prompts.json",
+        env=llm_venv._new_env,
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @skip_arm
 @pytest.mark.skip_less_device(4)
@@ -1110,7 +1485,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
@@ -1131,7 +1506,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -1150,7 +1525,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_transceiver_runtime_python",
                            env=env,
@@ -1169,7 +1544,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
@@ -1413,7 +1788,7 @@ def run_disaggregated_benchmark(example_dir,
                                 cwd=None):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -1519,6 +1894,8 @@ def run_disaggregated_aiperf(config_file,
                              server_start_timeout=1200,
                              input_tokens=128,
                              output_tokens=100,
+                             input_tokens_stddev=0,
+                             output_tokens_stddev=0,
                              concurrency=1,
                              endpoint_type='chat',
                              request_count=None,
@@ -1527,6 +1904,8 @@ def run_disaggregated_aiperf(config_file,
                              random_seed=100,
                              accuracy_test=False,
                              threshold=0.8,
+                             cancellation_rate=None,
+                             cancellation_delay=None,
                              env=None,
                              cwd=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
@@ -1548,15 +1927,15 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             server_start_timeout=server_start_timeout)
+                             server_start_timeout=server_start_timeout,
+                             save_log=True)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
@@ -1585,16 +1964,34 @@ def run_disaggregated_aiperf(config_file,
 
         # Add common parameters
         aiperf_cmd.extend([
-            '--url', f'{server_host}:{server_port}',
+            '--url',
+            f'{server_host}:{server_port}',
             '--synthetic-input-tokens-mean',
-            str(input_tokens), '--synthetic-input-tokens-stddev', '0',
+            str(input_tokens),
+            '--synthetic-input-tokens-stddev',
+            str(input_tokens_stddev),
             '--output-tokens-mean',
-            str(output_tokens), '--output-tokens-stddev', '0', '--extra-inputs',
-            f'max_tokens:{output_tokens}', '--extra-inputs',
-            f'min_tokens:{output_tokens}', '--extra-inputs', 'ignore_eos:true',
+            str(output_tokens),
+            '--output-tokens-stddev',
+            str(output_tokens_stddev),
+            '--extra-inputs',
+            'ignore_eos:true',
+        ])
+        # When output length is fixed (stddev == 0) pin max/min tokens so the
+        # server returns exactly output_tokens. When non-zero, let aiperf
+        # sample the per-request max_tokens from the mean/stddev distribution.
+        if output_tokens_stddev == 0:
+            aiperf_cmd.extend([
+                '--extra-inputs',
+                f'max_tokens:{output_tokens}',
+                '--extra-inputs',
+                f'min_tokens:{output_tokens}',
+            ])
+        aiperf_cmd.extend([
             '--concurrency',
-            str(concurrency), '--warmup-request-count',
-            str(warmup_request_count)
+            str(concurrency),
+            '--warmup-request-count',
+            str(warmup_request_count),
         ])
 
         # Use request-count or num-dataset-entries
@@ -1603,6 +2000,15 @@ def run_disaggregated_aiperf(config_file,
         else:
             # Default: use num-dataset-entries for compatibility
             aiperf_cmd.extend(['--num-dataset-entries', '64'])
+
+        if cancellation_rate is not None:
+            aiperf_cmd.extend(
+                ['--request-cancellation-rate',
+                 str(cancellation_rate)])
+        if cancellation_delay is not None:
+            aiperf_cmd.extend(
+                ['--request-cancellation-delay',
+                 str(cancellation_delay)])
 
         aiperf_cmd.extend(
             ['--random-seed',
@@ -1614,6 +2020,20 @@ def run_disaggregated_aiperf(config_file,
                    env=env,
                    poll_procs=all_worker_procs + [disagg_server.process])
 
+        # Catch cases where aiperf finished but the disagg cluster was unhealthy
+        # during the run (e.g. context-side hangs, KV transfer timeouts) which
+        # would otherwise be swallowed because aiperf records 500s as completed.
+        fatal_findings = scan_logs_for_fatal_errors(
+            [*ctx_workers, *gen_workers, disagg_server])
+        if fatal_findings:
+            summary = "\n".join(f"  {path}: " +
+                                ", ".join(f"{pat}={cnt}"
+                                          for pat, cnt in hits.items())
+                                for path, hits in fatal_findings.items())
+            raise AssertionError(
+                "Fatal error patterns detected in disaggregated worker/server "
+                f"logs:\n{summary}")
+
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
@@ -1624,33 +2044,46 @@ def run_disaggregated_aiperf(config_file,
                 max_gen_toks=256,
                 max_length=4096)
 
-            # only raise error if accuracy test passed and accuracy value is less than threshold
-            if accuracy_test_result and (accuracy_value < threshold):
+            if not accuracy_test_result:
+                raise AssertionError(
+                    "Accuracy test failed to complete (likely worker hang or "
+                    "crash); inspect saved logs under work_dir "
+                    f"({work_dir}): worker_ctx_*.log, worker_gen_*.log, "
+                    "disagg_server.log")
+            if accuracy_value < threshold:
                 raise AssertionError(
                     f"Accuracy test failed: accuracy value {accuracy_value} is less than test threshold {threshold}"
                 )
 
-    except Exception:
-        # Print outputs on error
-        logger.error("-------- Workers output (last 30 lines) --------")
-        try:
-            with open('output_workers.log', 'r') as f:
-                lines = f.read().split('\n')
-                for line in lines[-30:]:
-                    if line.strip():
-                        logger.error(line)
-        except FileNotFoundError:
-            pass
+            # Re-scan logs after the accuracy run to catch issues (e.g.
+            # cluster-not-ready, internal server errors) that only surfaced
+            # while lm_eval was driving the server.
+            fatal_findings = scan_logs_for_fatal_errors(
+                [*ctx_workers, *gen_workers, disagg_server])
+            if fatal_findings:
+                summary = "\n".join(f"  {path}: " +
+                                    ", ".join(f"{pat}={cnt}"
+                                              for pat, cnt in hits.items())
+                                    for path, hits in fatal_findings.items())
+                raise AssertionError(
+                    "Fatal error patterns detected in disaggregated "
+                    f"worker/server logs after accuracy run:\n{summary}")
 
-        logger.error("-------- Disagg server output (last 30 lines) --------")
-        try:
-            with open('output_disagg.log', 'r') as f:
-                lines = f.read().split('\n')
-                for line in lines[-30:]:
-                    if line.strip():
-                        logger.error(line)
-        except FileNotFoundError:
-            pass
+    except Exception:
+        # Print tail of each captured worker/server log to aid triage.
+        for proc in [*ctx_workers, *gen_workers, disagg_server]:
+            log_path = getattr(proc, "log_path", None)
+            if not log_path or not os.path.exists(log_path):
+                continue
+            logger.error(f"-------- {log_path} (last 30 lines) --------")
+            try:
+                from collections import deque
+                with open(log_path, "r", errors="replace") as f:
+                    for line in deque(f, maxlen=30):
+                        if line.strip():
+                            logger.error(line.rstrip())
+            except OSError:
+                pass
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -1728,6 +2161,19 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
 
         print_info(f"Accuracy test result is: {result}")
 
+        # lm_eval's async request retry path crashes on certain transport-level
+        # errors with "UnboundLocalError: cannot access local variable 'outputs'".
+        # When this happens individual requests are silently dropped but the
+        # process can still exit 0, so the score is computed against a partial
+        # set. Treat the presence of this trace as an inconclusive run.
+        combined_output = (result.stdout or "") + (result.stderr or "")
+        if ("UnboundLocalError" in combined_output
+                and "outputs" in combined_output):
+            logger.warning(
+                "lm_eval reported UnboundLocalError on 'outputs' "
+                "(request retry crashed); treating accuracy run as failed")
+            return False, accuracy_value
+
         # Check if process completed successfully
         if result.returncode == 0:
             test_end_time = time.time()
@@ -1756,53 +2202,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
-@pytest.mark.parametrize("benchmark_model_root", [
-    'DeepSeek-V3-Lite-fp8', 'DeepSeek-V3-Lite-bf16', 'llama-v3-8b-hf',
-    'llama-3.1-8b-instruct-hf-fp8'
-],
-                         indirect=True)
-def test_disaggregated_benchmark_on_diff_backends(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        benchmark_model_root, benchmark_root, shared_gpt_path):
-    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
-    ) != 90:
-        pytest.skip("The test should only run on Hopper")
-    nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
-    ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
-    temp_dir = tempfile.TemporaryDirectory()
-    nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
-    ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
-    with open(nixl_config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(nixl_config, f)
-    with open(ucx_config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(ucx_config, f)
-
-    env = llm_venv._new_env.copy()
-    nixl_e2el, nixl_ttft = run_disaggregated_benchmark(
-        disaggregated_example_root,
-        nixl_config_path,
-        benchmark_root,
-        benchmark_model_root,
-        shared_gpt_path,
-        env=env,
-        model_path=benchmark_model_root,
-        cwd=llm_venv.get_working_directory())
-    ucx_e2el, ucx_ttft = run_disaggregated_benchmark(
-        disaggregated_example_root,
-        ucx_config_path,
-        benchmark_root,
-        benchmark_model_root,
-        shared_gpt_path,
-        env=env,
-        model_path=benchmark_model_root,
-        cwd=llm_venv.get_working_directory())
-    print(f"Nixl E2EL: {nixl_e2el} ms, UCX E2EL: {ucx_e2el} ms")
-    print(f"Nixl TTFT: {nixl_ttft} ms, UCX TTFT: {ucx_ttft} ms")
-
-    assert ucx_e2el > 0 and nixl_e2el > 0 and nixl_e2el < 1.05 * ucx_e2el
-    assert ucx_ttft > 0 and nixl_ttft > 0 and nixl_ttft < 1.05 * ucx_ttft
-
-
+@skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
@@ -1892,8 +2292,30 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['Qwen3/Qwen3-32B-FP8'])
+def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
+                                     disaggregated_example_root, llm_venv,
+                                     model_path):
+    model_dir = resolve_llm_model_path(model_path)
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
@@ -1904,13 +2326,67 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
                             test_desc='deepseek_r1_v2_fp4_stress',
                             request_count=35000,
-                            accuracy_threshold=0.92),
+                            accuracy_threshold=0.92,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+    pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
+                            test_desc='deepseek_r1_v2_fp4_mtp_stress',
+                            request_count=35000,
+                            accuracy_threshold=0.90,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
-                            test_desc='gpt_oss_120b_stress',
+                            test_desc='gpt_oss_120b_trtllm_stress',
                             request_count=60000,
-                            accuracy_threshold=0.42),
+                            accuracy_threshold=0.42,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
+    pytest.param(
+        TestConfig(
+            model_path='gpt_oss/gpt-oss-120b',
+            test_desc='gpt_oss_120b_eagle_triton_stress',
+            request_count=60000,
+            accuracy_threshold=0.42,
+            speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
+            cancellation_rate=10,
+            cancellation_delay=0.5,
+        ),
+        marks=(pytest.mark.skip_less_device(8), skip_no_hopper),
+    ),
+    pytest.param(
+        TestConfig(
+            model_path='gpt_oss/gpt-oss-120b',
+            test_desc='gpt_oss_120b_eagle_trtllm_stress',
+            request_count=60000,
+            accuracy_threshold=0.42,
+            speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
+            cancellation_rate=10,
+            cancellation_delay=0.5,
+        ),
+        marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell),
+    ),
+    pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
+                            test_desc='gpt_oss_120b_triton_stress',
+                            request_count=30000,
+                            accuracy_threshold=0.42,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(4), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='Qwen3.5-4B-FP8',
+                            test_desc='qwen3_5_4b_fp8_stress',
+                            request_count=3000,
+                            accuracy_threshold=0.72,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='Qwen3/Qwen3-32B-FP8',
+                            test_desc='qwen3_32b_fp8_stress',
+                            request_count=10000,
+                            accuracy_threshold=0.42),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
 @pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
@@ -1925,17 +2401,42 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
-    model_dir = f"{llm_models_root()}/{model_path}"
+    model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
     config_file = get_test_config(test_desc, disaggregated_example_root,
                                   os.path.dirname(__file__))
+
+    # Resolve speculative_model to an absolute path for worker processes.
+    if test_config.speculative_model_path is not None:
+        spec_model_dir = f"{llm_models_root()}/{test_config.speculative_model_path}"
+        setup_model_symlink(llm_venv, spec_model_dir,
+                            test_config.speculative_model_path)
+        with open(config_file, 'r') as f:
+            patched_config = yaml.safe_load(f)
+        patched_sections = []
+        for section in ('context_servers', 'generation_servers'):
+            spec = patched_config.get(section, {}).get('speculative_config')
+            if spec is not None and 'speculative_model' in spec:
+                spec['speculative_model'] = spec_model_dir
+                patched_sections.append(section)
+        if not patched_sections:
+            raise AssertionError(
+                f"{test_desc} sets speculative_model_path, but no "
+                "speculative_config.speculative_model field was patched")
+        patched_path = os.path.join(llm_venv.get_working_directory(),
+                                    f"{test_desc}_patched.yaml")
+        with open(patched_path, 'w') as f:
+            yaml.safe_dump(patched_config, f)
+        config_file = patched_path
 
     run_disaggregated_aiperf(config_file=config_file,
                              model_path=model_dir,
                              server_start_timeout=7200,
                              input_tokens=input_tokens,
                              output_tokens=output_tokens,
+                             input_tokens_stddev=0,
+                             output_tokens_stddev=output_tokens // 10,
                              concurrency=concurrency,
                              endpoint_type='completions',
                              request_count=test_config.request_count,
@@ -1943,6 +2444,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              streaming=False,
                              accuracy_test=True,
                              threshold=test_config.accuracy_threshold,
+                             cancellation_rate=test_config.cancellation_rate,
+                             cancellation_delay=test_config.cancellation_delay,
                              env=llm_venv._new_env,
                              cwd=llm_venv.get_working_directory())
 
@@ -2025,7 +2528,7 @@ def run_disaggregated_cancel_test(example_dir,
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -2103,6 +2606,206 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
                                   cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
+                         indirect=True)
+def test_disaggregated_logprobs_serving(disaggregated_test_root,
+                                        disaggregated_example_root, llm_venv,
+                                        llama_model_root):
+    """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
+
+    Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
+    where the context worker returns prefill result (request_type=generation_only)
+    to the generation worker. Ensures LogProbStorage flows correctly across the
+    context/gen boundary without AttributeError on cum_log_probs.
+    """
+
+    async def iter_sse_chunks(resp):
+        """Yield parsed JSON chunks from an OpenAI SSE stream."""
+        async for line in resp.content:
+            decoded = line.decode("utf-8").strip()
+            if not decoded.startswith("data: "):
+                continue
+            data_str = decoded[len("data: "):]
+            if data_str == "[DONE]":
+                break
+            try:
+                yield json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+    async def collect_streaming_logprobs(resp, api_type):
+        """Parse SSE stream and return (tokens, logprobs) lists."""
+        tokens, logprobs = [], []
+        async for chunk in iter_sse_chunks(resp):
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            lp_data = choices[0].get("logprobs")
+            if not lp_data:
+                continue
+            if api_type == "completions":
+                tokens.extend(lp_data.get("tokens", []))
+                logprobs.extend(lp_data.get("token_logprobs", []))
+            else:
+                for item in lp_data.get("content", []):
+                    tokens.append(item.get("token"))
+                    logprobs.append(item.get("logprob"))
+        return tokens, logprobs
+
+    def extract_logprobs(result, api_type):
+        """Extract (tokens, logprobs) from non-streaming OpenAI response."""
+        choices = result.get("choices", [])
+        assert len(choices) > 0, "Response should have choices"
+        if api_type == "completions":
+            lp_data = choices[0].get("logprobs")
+            assert lp_data is not None, "Response should contain logprobs"
+            tokens = lp_data.get("tokens", [])
+            logprobs = lp_data.get("token_logprobs", [])
+            assert len(tokens) == len(logprobs), (
+                f"count mismatch: {len(logprobs)} logprobs "
+                f"for {len(tokens)} tokens")
+            return tokens, logprobs
+        lp_obj = choices[0].get("logprobs")
+        assert lp_obj is not None, "Response should contain logprobs"
+        content = lp_obj.get("content", [])
+        tokens = [item.get("token") for item in content]
+        logprobs = [item.get("logprob") for item in content]
+        return tokens, logprobs
+
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "llama-3.1-model/Llama-3.1-8B-Instruct")
+
+    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = get_ucx_tls()
+    ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
+    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+        setup_disagg_cluster(config_file, env=env,
+                             model_name=llama_model_root,
+                             cwd=llm_venv.get_working_directory(),
+                             server_start_timeout=600)
+
+    server_host = config.get("hostname", "localhost")
+    server_url = f"http://{server_host}:{server_port}"
+    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    max_tokens = 20
+    timeout = aiohttp.ClientTimeout(total=120)
+    # Use emoji prompt to also stress-test multi-byte tokenizer handling
+    prompt = "I love coding 🚀 and AI."
+
+    async def check_logprobs():
+        async with aiohttp.ClientSession() as session:
+            for api_type in ("completions", "chat"):
+                url = (f"{server_url}/v1/completions"
+                       if api_type == "completions" else
+                       f"{server_url}/v1/chat/completions")
+
+                def make_payload(prompt, stream, _api_type=api_type):
+                    base = {
+                        "max_tokens": max_tokens,
+                        "logprobs": 1 if _api_type == "completions" else True,
+                        "stream": stream,
+                        "temperature": 0
+                    }
+                    if _api_type == "completions":
+                        return {"model": model_name, "prompt": prompt, **base}
+                    return {
+                        "model": model_name,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        **base
+                    }
+
+                # 1) Streaming vs non-streaming consistency check
+                async with session.post(url,
+                                        json=make_payload(prompt, False),
+                                        timeout=timeout) as resp:
+                    assert resp.status == 200, \
+                        f"[{api_type}] non-streaming: {await resp.text()}"
+                    ns_tokens, ns_logprobs = extract_logprobs(
+                        await resp.json(), api_type)
+
+                async with session.post(url,
+                                        json=make_payload(prompt, True),
+                                        timeout=timeout) as resp:
+                    assert resp.status == 200, \
+                        f"[{api_type}] streaming: {await resp.text()}"
+                    st_tokens, st_logprobs = \
+                        await collect_streaming_logprobs(resp, api_type)
+
+                assert ns_tokens == st_tokens, (
+                    f"[{api_type}] streaming vs non-streaming tokens mismatch")
+                assert len(ns_logprobs) == len(st_logprobs), (
+                    f"[{api_type}] logprobs length: "
+                    f"{len(ns_logprobs)} vs {len(st_logprobs)}")
+                # Skip position 0: the first token logprob can diverge
+                # between streaming and non-streaming in disaggregated mode
+                # due to the context/generation handoff boundary.
+                comparable = 0
+                for i, (n, s) in enumerate(
+                        zip(ns_logprobs, st_logprobs, strict=True)):
+                    if i == 0 or n is None or s is None:
+                        continue
+                    comparable += 1
+                    rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4,
+                                                                          1e-5)
+                    assert np.isclose(n, s, rtol=rtol, atol=atol), \
+                        f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
+                assert comparable > 0, (
+                    f"[{api_type}] no comparable post-handoff logprobs found")
+
+                # 2) Chat API with top_logprobs (requires gather_generation_logits)
+                if api_type == "chat":
+                    top_lp_payload = {
+                        "model": model_name,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        "max_tokens": max_tokens,
+                        "logprobs": True,
+                        "top_logprobs": 3,
+                        "stream": False,
+                        "temperature": 0,
+                    }
+                    async with session.post(f"{server_url}/v1/chat/completions",
+                                            json=top_lp_payload,
+                                            timeout=timeout) as resp:
+                        assert resp.status == 200, (
+                            f"[chat/top_logprobs] {resp.status}: "
+                            f"{await resp.text()}")
+                        result = await resp.json()
+                    lp_obj = result["choices"][0].get("logprobs")
+                    assert lp_obj is not None, "top_logprobs response should have logprobs"
+                    content = lp_obj.get("content", [])
+                    assert len(
+                        content) > 0, "top_logprobs content should be non-empty"
+                    for item in content:
+                        top_lps = item.get("top_logprobs")
+                        assert top_lps is not None and len(top_lps) > 0, (
+                            f"top_logprobs should be non-empty when requested: {item}"
+                        )
+                        for tl in top_lps:
+                            assert "token" in tl and "logprob" in tl, (
+                                f"top_logprob entry missing token/logprob: {tl}"
+                            )
+                            assert tl["logprob"] <= 0.0, (
+                                f"top_logprob {tl['logprob']} should be <= 0")
+
+    try:
+        asyncio.run(check_logprobs())
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @pytest.mark.skip_less_device(8)
 @skip_pre_blackwell
 @pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
@@ -2124,3 +2827,39 @@ def test_disaggregated_cancel_large_context_requests_long(
                                   requests_per_burst=32,
                                   model_path=model_dir,
                                   cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path",
+                         ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
+def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
+                                                   llm_venv, model_path,
+                                                   benchmark_root,
+                                                   shared_gpt_path):
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config("mamba_conc_greater_than_mbs",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        model_dir,
+        shared_gpt_path,
+        env=env,
+        num_prompts=40,
+        max_concurrency=4,
+        random_input_len=1024,
+        random_output_len=1024,
+        skip_warmup=True,
+        model_path=model_dir,
+        cwd=llm_venv.get_working_directory())
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+    assert e2el > 0 and ttft > 0

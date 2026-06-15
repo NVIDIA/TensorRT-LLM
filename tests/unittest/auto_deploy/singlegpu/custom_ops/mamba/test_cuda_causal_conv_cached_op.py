@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for CUDA-backed cached causal conv1d custom ops.
 
 Covers:
@@ -10,6 +24,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 def _random_params_depthwise(device, dtype, batch, seq, channels, k):
@@ -59,9 +74,10 @@ def test_generate_only_with_slot_mapping_cuda(conv_env):
     # Metadata (not used in generate-only op entry, but required by the interface)
     cu_seqlen = torch.zeros(batch, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, batch, batch])
+    batch_info_host = _bi.serialize()
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     x_ref = x.clone()
@@ -123,9 +139,10 @@ def test_context_flattened_and_state_writeback_cuda(conv_env):
         dtype=dtype,
     )
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     num_prefill = len(lens)
-    batch_info_host = torch.tensor([num_prefill, total, 0], device=device, dtype=torch.int32)
+    _bi = BatchInfo()
+    _bi.update([num_prefill, total, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     cu_seqlen = torch.tensor([0, lens[0], total], device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(num_prefill, device=device, dtype=torch.bool)
 

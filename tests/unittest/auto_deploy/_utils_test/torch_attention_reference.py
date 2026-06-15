@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Torch attention reference implementations for testing.
 
 This module provides clean reference implementations using the torch backend
@@ -8,6 +22,7 @@ code duplication and ensure consistency.
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 class TorchAttentionReference:
@@ -40,15 +55,14 @@ class TorchAttentionReference:
             0, batch_size * seq_len, seq_len, device=q.device, dtype=torch.int32
         )
 
-        # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-        # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0]
-        # For generate phase (seq_len == 1): [0, 0, batch_size]
+        # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0, 0, 0, 0]
+        # For generate phase (seq_len == 1): [0, 0, 0, 0, batch_size, batch_size]
+        _bi = BatchInfo()
         if seq_len == 1:
-            batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
+            _bi.update([0, 0, 0, 0, batch_size, batch_size])
         else:
-            batch_info_host = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=q.device, dtype=torch.int32
-            )
+            _bi.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+        batch_info_host = _bi.serialize()
 
         # Flatten inputs to [1, total_seq_len, ...] format
         q_flat = q.reshape(1, batch_size * seq_len, -1)
@@ -68,6 +82,7 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             scale,
+            None,
         )
 
         # Reshape back to original format [batch, seq, n_heads, head_dim]
@@ -109,6 +124,7 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             scale,
+            None,
         )
 
     @staticmethod
@@ -144,8 +160,10 @@ class TorchAttentionReference:
         k_flat = k_new.view(1, batch_size, -1)
         v_flat = v_new.view(1, batch_size, -1)
 
-        # Create batch_info_host for decode phase: [num_prefill, num_prefill_tokens, num_decode]
-        batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
+        # Create batch_info_host for decode phase
+        _bi = BatchInfo()
+        _bi.update([0, 0, 0, 0, batch_size, batch_size])
+        batch_info_host = _bi.serialize()
 
         # Call torch backend via custom op registry
         output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
@@ -159,6 +177,7 @@ class TorchAttentionReference:
             seq_start,
             k_cache,
             v_cache,
+            None,
             None,
         )
 
@@ -200,6 +219,8 @@ class TorchAttentionReference:
             None,  # sinks
             sliding_window_size,
             logit_cap,
+            False,  # read_cache_only
+            None,  # custom_attn_mask
         )
 
     @staticmethod

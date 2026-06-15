@@ -12,6 +12,7 @@ l0_sanity_check:
         - '*h200*'
         - '*l40s*'
         - '*a10*'
+        - '*a100x*'
         - '*gb202*'
         - '*gb203*'
         - '*5080*'
@@ -33,6 +34,10 @@ l0_sanity_check:
     - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[UCX-mha-ctx_fp16_gen_fp16]
     - unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission[mha]
     - unittest/others/test_kv_cache_transceiver.py::test_cancel_request_in_transmission[mla]
+    - unittest/others/test_kv_cache_transceiver.py::test_async_transfer_keeps_llm_request_alive
+    - unittest/others/test_kv_cache_transceiver.py::test_kv_transfer_timeout_warns_once_per_request
+    - unittest/others/test_kv_cache_transceiver.py::test_kv_transfer_timeout_silent_when_unset
+    - unittest/_torch/pyexecutor/test_model_loader_mx.py
 - condition:
     ranges:
       system_gpu_count:
@@ -45,6 +50,7 @@ l0_sanity_check:
         - '*h200*'
         - '*l40s*'
         - '*a10*'
+        - '*a100x*'
         - '*gb202*'
         - '*gb203*'
         - '*5080*'

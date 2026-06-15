@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 from .llm_request import PerfTimingInfo
@@ -28,6 +29,7 @@ class PerfMetricsManager:
         self.enabled = enabled
         self._perf_events = None
         self._perf_event_idx = 0
+        self._forward_event_pool = []
 
     # ------------------------------------------------------------------
     # GPU event helpers
@@ -44,8 +46,8 @@ class PerfMetricsManager:
 
         Returns:
             Tuple of ``(gpu_forward_start, gpu_forward_end,
-            gpu_sample_end)`` or ``(None, None, None)`` if metrics are
-            disabled.
+            gpu_sample_end)`` or ``(None, None, None)`` if per-request perf
+            metrics are disabled.
         """
         if not self.enabled:
             return None, None, None
@@ -58,6 +60,16 @@ class PerfMetricsManager:
         events = self._perf_events[self._perf_event_idx % 2]
         self._perf_event_idx += 1
         return events
+
+    def borrow_forward_timing_events(self):
+        """Borrow a forward-only pair when the ping-pong perf events are unavailable."""
+        if self._forward_event_pool:
+            return self._forward_event_pool.pop()
+        return (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+
+    def release_forward_timing_events(self, start_event, end_event) -> None:
+        if start_event is not None and end_event is not None:
+            self._forward_event_pool.append((start_event, end_event))
 
     @contextmanager
     def record_perf_events(
@@ -103,6 +115,22 @@ class PerfMetricsManager:
     def get_timestamp(self) -> Optional[float]:
         """Return a CPU timestamp if metrics are enabled, else ``None``."""
         return get_steady_clock_now_in_seconds() if self.enabled else None
+
+    @staticmethod
+    def try_compute_gpu_elapsed_time_ms(
+        start_event: Optional[torch.cuda.Event],
+        end_event: Optional[torch.cuda.Event],
+    ) -> Optional[float]:
+        """Return CUDA-event elapsed time if ready, without synchronizing."""
+        if start_event is None or end_event is None:
+            return None
+        try:
+            if not end_event.query():
+                return None
+            return float(start_event.elapsed_time(end_event))
+        except RuntimeError as e:
+            logger.warning("Failed to compute GPU event elapsed_time: %s", e)
+            return None
 
     @staticmethod
     def save_timing_to_requests(
@@ -163,14 +191,31 @@ class PerfMetricsManager:
 
             # Compute once per batch, reuse for all requests
             if batch_gpu_forward_time is None:
-                batch_gpu_forward_time = perf.gpu_forward_start_event.elapsed_time(
-                    perf.gpu_forward_end_event
-                )
-                batch_gpu_sample_time = (
-                    perf.gpu_forward_end_event.elapsed_time(perf.gpu_sample_end_event)
-                    if perf.gpu_sample_end_event
-                    else 0.0
-                )
+                if not perf.gpu_forward_end_event.query():
+                    perf.gpu_forward_end_event.synchronize()
+                if perf.gpu_sample_end_event and not perf.gpu_sample_end_event.query():
+                    perf.gpu_sample_end_event.synchronize()
+                try:
+                    batch_gpu_forward_time = perf.gpu_forward_start_event.elapsed_time(
+                        perf.gpu_forward_end_event
+                    )
+                    batch_gpu_sample_time = (
+                        perf.gpu_forward_end_event.elapsed_time(perf.gpu_sample_end_event)
+                        if perf.gpu_sample_end_event
+                        else 0.0
+                    )
+                except RuntimeError as e:
+                    # CUDA event timing can fail if events were not recorded
+                    # on the current stream. Skip metrics for this batch rather
+                    # than crashing the executor thread.
+                    logger.warning(
+                        "Failed to compute GPU event elapsed_time: %s. "
+                        "Setting batch GPU times to 0.0. This may indicate "
+                        "an issue with the forward pass or stream synchronization.",
+                        e,
+                    )
+                    batch_gpu_forward_time = 0.0
+                    batch_gpu_sample_time = 0.0
 
             target["gpu_forward_time"] = batch_gpu_forward_time
             target["gpu_sample_time"] = batch_gpu_sample_time

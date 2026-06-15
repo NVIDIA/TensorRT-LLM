@@ -22,10 +22,11 @@ from torch.export import Dim
 from torch.fx import GraphModule
 
 # Import to register custom op
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
 
 class SimpleLMHeadModel(torch.nn.Module):
@@ -44,6 +45,47 @@ class SimpleLMHeadModel(torch.nn.Module):
         return logits
 
 
+class NoLmHeadModel(torch.nn.Module):
+    """Model without lm_head (like a VLM text backbone exported separately).
+
+    Simulates the Qwen3.5 MoE scenario where only the text backbone is exported
+    and the lm_head is applied externally.  The graph output is the final norm
+    output, preceded by a residual add (multi-input node that stops the backward walk).
+    """
+
+    def __init__(self, hidden_size: int = 128):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        self.linear2 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        self.norm = torch.nn.LayerNorm(hidden_size, device="cuda", dtype=torch.float16)
+
+    def forward(self, hidden_states, logit_gather_ids=None, seq_len=None):
+        residual = hidden_states
+        hidden_states = self.linear1(hidden_states)
+        # Residual add: multi-input node that should stop the backward walk
+        hidden_states = hidden_states + residual
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+class SoftcapLMHeadModel(torch.nn.Module):
+    """Model with LM head followed by softcapping (like Gemma4)."""
+
+    def __init__(self, hidden_size: int = 128, vocab_size: int = 1000, softcap: float = 30.0):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        self.lm_head = torch.nn.Linear(hidden_size, vocab_size, device="cuda", dtype=torch.float16)
+        self.softcap = softcap
+
+    def forward(self, hidden_states, logit_gather_ids=None, seq_len=None):
+        hidden_states = self.linear1(hidden_states)
+        logits = self.lm_head(hidden_states)
+        logits = logits / self.softcap
+        logits = torch.tanh(logits)
+        logits = logits * self.softcap
+        return logits
+
+
 class TestGatherTokensOp:
     """Test the custom op directly."""
 
@@ -55,10 +97,12 @@ class TestGatherTokensOp:
 
         # Create gather info: num_tokens_to_gather=batch_size, gather_required=0 (False)
         token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
 
         output = torch.ops.auto_deploy.gather_tokens.default(
-            hidden_states, token_gather_indices, tokens_gather_info_host
+            hidden_states, token_gather_indices, batch_info_host
         )
 
         # Should return [batch, 1, hidden] for generate format (3D shape preserved)
@@ -81,10 +125,12 @@ class TestGatherTokensOp:
         gather_indices = torch.arange(0, num_gather, dtype=torch.long, device="cuda")
 
         # Create gather info: num_tokens_to_gather=num_gather, gather_required=1 (True)
-        tokens_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(num_gather, True)
+        batch_info_host = batch_info.serialize()
 
         output = torch.ops.auto_deploy.gather_tokens.default(
-            hidden_states, gather_indices, tokens_gather_info_host
+            hidden_states, gather_indices, batch_info_host
         )
 
         # Should return [1, num_gather, hidden] for packed format (3D shape preserved)
@@ -101,10 +147,12 @@ class TestGatherTokensOp:
         hidden_size = 128
         hidden_states = torch.randn(1, 1, hidden_size, device="cuda", dtype=torch.float16)
         gather_indices = torch.tensor([0], dtype=torch.long, device="cuda")
-        logits_gather_info_host = torch.tensor([1, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(1, True)
+        batch_info_host = batch_info.serialize()
 
         output = torch.ops.auto_deploy.gather_tokens.default(
-            hidden_states, gather_indices, logits_gather_info_host
+            hidden_states, gather_indices, batch_info_host
         )
 
         # 2D input should stay 2D to preserve vocab axis after LM head.
@@ -119,15 +167,17 @@ class TestGatherTokensOp:
 
         # Create gather info
         token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
 
         # Use fake implementation directly
         with FakeTensorMode() as mode:
             hidden_states_fake = mode.from_tensor(hidden_states)
             token_gather_indices_fake = mode.from_tensor(token_gather_indices)
-            tokens_gather_info_host_fake = mode.from_tensor(tokens_gather_info_host)
+            batch_info_host_fake = mode.from_tensor(batch_info_host)
             output = torch.ops.auto_deploy.gather_tokens.default(
-                hidden_states_fake, token_gather_indices_fake, tokens_gather_info_host_fake
+                hidden_states_fake, token_gather_indices_fake, batch_info_host_fake
             )
 
         # Should return [batch, 1, hidden_size] (fake returns empty_like which preserves 3D shape)
@@ -146,15 +196,17 @@ class TestGatherTokensOp:
 
         # Create gather info
         token_gather_indices = torch.arange(num_gather, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(num_gather, True)
+        batch_info_host = batch_info.serialize()
 
         # Use fake implementation directly
         with FakeTensorMode() as mode:
             hidden_states_fake = mode.from_tensor(hidden_states)
             token_gather_indices_fake = mode.from_tensor(token_gather_indices)
-            tokens_gather_info_host_fake = mode.from_tensor(tokens_gather_info_host)
+            batch_info_host_fake = mode.from_tensor(batch_info_host)
             output = torch.ops.auto_deploy.gather_tokens.default(
-                hidden_states_fake, token_gather_indices_fake, tokens_gather_info_host_fake
+                hidden_states_fake, token_gather_indices_fake, batch_info_host_fake
             )
 
         # The fake implementation returns empty_like which preserves input shape [1, total_tokens, hidden]
@@ -227,13 +279,15 @@ class TestGatherLogitsBeforeLmHeadTransform:
 
         # Test forward pass
         token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
-        tokens_gather_info_host = torch.tensor([batch_size, 0], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
         output = gm_transformed(
             hidden_states,
             logit_gather_ids,
             seq_len,
             token_gather_indices=token_gather_indices,
-            tokens_gather_info_host=tokens_gather_info_host,
+            batch_info_host=batch_info_host,
         )
         # Output should be [batch_size, 1, vocab_size] since gather now returns 3D
         assert output.shape == (batch_size, 1, vocab_size)
@@ -287,13 +341,15 @@ class TestGatherLogitsBeforeLmHeadTransform:
         # Test forward pass
         num_gather = len(logit_gather_ids)
         token_gather_indices = logit_gather_ids
-        tokens_gather_info_host = torch.tensor([num_gather, 1], dtype=torch.int32, device="cpu")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(num_gather, True)
+        batch_info_host = batch_info.serialize()
         output = gm_transformed(
             hidden_states,
             logit_gather_ids_padded,
             seq_len,
             token_gather_indices=token_gather_indices,
-            tokens_gather_info_host=tokens_gather_info_host,
+            batch_info_host=batch_info_host,
         )
         # Output should be [1, num_gather, vocab_size] since gather now returns 3D
         assert output.shape == (1, num_gather, vocab_size)
@@ -333,3 +389,129 @@ class TestGatherLogitsBeforeLmHeadTransform:
         assert not self._check_gather_op_in_graph(gm_transformed), (
             "Gather op should not be in graph"
         )
+
+    def test_transform_no_lm_head_in_graph(self):
+        """Test that gather is placed at output when lm_head is not in the graph.
+
+        VLMs like Qwen3.5 MoE export only the text backbone; the lm_head is
+        applied externally by the executor.  The backward walk must NOT traverse
+        into the model body (e.g. to an attention o_proj linear) and instead
+        place the gather right before the output node so the external lm_head
+        receives gathered hidden states.
+        """
+        hidden_size = 128
+        batch_size = 4
+        max_batch_size = 8
+        model = NoLmHeadModel(hidden_size).cuda()
+
+        hidden_states = torch.randn(batch_size, 1, hidden_size, device="cuda", dtype=torch.float16)
+        logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        seq_len = torch.ones(batch_size, dtype=torch.long, device="cuda")
+
+        gm = torch_export_to_gm(
+            model,
+            args=(hidden_states, logit_gather_ids, seq_len),
+            dynamic_shapes=None,
+            clone=True,
+        )
+
+        # Apply transform
+        cm = self._create_cached_sequence_interface(max_batch_size)
+        transform_config = {
+            "gather_logits_before_lm_head": {
+                "stage": "post_load_fusion",
+                "max_batch_size": max_batch_size,
+            }
+        }
+        optimizer = InferenceOptimizer(None, transform_config)
+        gm_transformed = optimizer(cm, gm)
+
+        # Gather op should be inserted in the graph
+        assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
+
+        # Verify forward pass — the model outputs hidden_size (not vocab_size)
+        token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
+        output = gm_transformed(
+            hidden_states,
+            logit_gather_ids,
+            seq_len,
+            token_gather_indices=token_gather_indices,
+            batch_info_host=batch_info_host,
+        )
+        # Model has no lm_head, so output is [batch, 1, hidden_size]
+        assert output.shape == (batch_size, 1, hidden_size)
+
+    def test_transform_with_softcapping(self):
+        """Test that gather is placed BEFORE lm_head when softcapping follows it.
+
+        Models like Gemma4 apply softcapping (div, tanh, mul) after the lm_head.
+        The transform must walk backward through these ops to find the actual
+        linear and insert gather before it, not after the softcapping chain.
+        Otherwise the lm_head still runs on all tokens (no compute reduction)
+        and piecewise CUDA graph capture OOMs on the [num_tokens, vocab_size]
+        intermediate.
+        """
+        hidden_size = 128
+        vocab_size = 1000
+        batch_size = 4
+        max_batch_size = 8
+        model = SoftcapLMHeadModel(hidden_size, vocab_size).cuda()
+
+        hidden_states = torch.randn(batch_size, 1, hidden_size, device="cuda", dtype=torch.float16)
+        logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        seq_len = torch.ones(batch_size, dtype=torch.long, device="cuda")
+
+        gm = torch_export_to_gm(
+            model,
+            args=(hidden_states, logit_gather_ids, seq_len),
+            dynamic_shapes=None,
+            clone=True,
+        )
+
+        # Apply transform
+        cm = self._create_cached_sequence_interface(max_batch_size)
+        transform_config = {
+            "gather_logits_before_lm_head": {
+                "stage": "post_load_fusion",
+                "max_batch_size": max_batch_size,
+            }
+        }
+        optimizer = InferenceOptimizer(None, transform_config)
+        gm_transformed = optimizer(cm, gm)
+
+        assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
+
+        # Verify gather_tokens comes BEFORE the lm_head linear, not after softcapping.
+        # Walk the graph and record the order of gather_tokens vs aten.linear ops.
+        gather_idx = None
+        linear_indices = []
+        for i, node in enumerate(gm_transformed.graph.nodes):
+            if is_op(node, torch.ops.auto_deploy.gather_tokens):
+                gather_idx = i
+            if is_linear_op(node):
+                linear_indices.append(i)
+
+        assert gather_idx is not None, "gather_tokens not found"
+        # The lm_head linear is the last linear in the graph
+        lm_head_linear_idx = linear_indices[-1]
+        assert gather_idx < lm_head_linear_idx, (
+            f"gather_tokens (idx={gather_idx}) should come before "
+            f"lm_head linear (idx={lm_head_linear_idx})"
+        )
+
+        # Verify forward pass correctness
+        token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
+        output = gm_transformed(
+            hidden_states,
+            logit_gather_ids,
+            seq_len,
+            token_gather_indices=token_gather_indices,
+            batch_info_host=batch_info_host,
+        )
+        assert output.shape == (batch_size, 1, vocab_size)

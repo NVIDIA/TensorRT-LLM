@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import json
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime
 
 import yaml
@@ -246,15 +250,41 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
         }
 
 
-def get_env_config(config, runtime_mode):
-    """Get env config based on mode."""
+def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
+    """Get worker / server / benchmark env vars from the yaml.
+
+    Aggregated yaml stores env vars per server config under
+    `server_configs[i].server_env_var`. Disaggregated yaml stores them at the
+    top-level `environment.{worker,server,benchmark}_env_var`.
+
+    ctx_only is a hybrid: the launch path is aggregated, but the yaml is the
+    disagg one, so the agg launch's "server_env_var" comes from
+    `environment.worker_env_var`.
+
+    Returns: {worker_env_var, server_env_var, benchmark_env_var}.
+    """
+    env = config.get("environment", {}) or {}
     if runtime_mode == "aggregated":
-        return {}
-    env = config.get("environment", {})
+        if benchmark_mode == "ctx_only":
+            return {
+                "worker_env_var": env.get("worker_env_var", "") or "",
+                "server_env_var": env.get("worker_env_var", "") or "",
+                "benchmark_env_var": env.get("benchmark_env_var", "") or "",
+            }
+        agg_server_env_var = ""
+        for sc in config.get("server_configs", []) or []:
+            if sc.get("name") == server_name:
+                agg_server_env_var = sc.get("server_env_var", "") or ""
+                break
+        return {
+            "worker_env_var": "",
+            "server_env_var": agg_server_env_var,
+            "benchmark_env_var": "",
+        }
     return {
-        "worker_env_var": env.get("worker_env_var", ""),
-        "server_env_var": env.get("server_env_var", ""),
-        "benchmark_env_var": env.get("benchmark_env_var", ""),
+        "worker_env_var": env.get("worker_env_var", "") or "",
+        "server_env_var": env.get("server_env_var", "") or "",
+        "benchmark_env_var": env.get("benchmark_env_var", "") or "",
     }
 
 
@@ -272,6 +302,24 @@ def get_benchmark_config(config, benchmark_mode):
     }
 
 
+def partition_has_gpu_gres(partition):
+    """Return True if the Slurm partition reports GPU GRES (e.g. 'gpu:4'), False if null/absent."""
+    try:
+        gres = (
+            subprocess.check_output(
+                ["sinfo", "-p", partition, "-h", "-o", "%G"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            .strip()
+            .split("\n")[0]
+            .strip()
+        )
+        return gres.startswith("gpu:")
+    except Exception:
+        return False
+
+
 def generate_sbatch_params(args, hardware_config, work_dir):
     """Generate #SBATCH parameters."""
     total_nodes = hardware_config["total_nodes"]
@@ -283,8 +331,11 @@ def generate_sbatch_params(args, hardware_config, work_dir):
         f"#SBATCH --segment={total_nodes}",
         f"#SBATCH --ntasks={total_gpus}",
         f"#SBATCH --ntasks-per-node={gpus_per_node}",
-        f"#SBATCH --gpus-per-node={gpus_per_node}",
-        f"#SBATCH --gres=gpu:{gpus_per_node}",
+    ]
+    if partition_has_gpu_gres(args.partition):
+        lines.append(f"#SBATCH --gpus-per-node={gpus_per_node}")
+        lines.append(f"#SBATCH --gres=gpu:{gpus_per_node}")
+    lines += [
         f"#SBATCH --partition={args.partition}",
         f"#SBATCH --time={args.time}",
         f"#SBATCH --account={args.account}",
@@ -294,7 +345,7 @@ def generate_sbatch_params(args, hardware_config, work_dir):
     return lines
 
 
-def generate_srun_args(args, runtime_mode, timestamp):
+def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_config=None):
     """Generate srun arguments."""
     is_aggr = runtime_mode == "aggregated"
     container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
@@ -307,19 +358,37 @@ def generate_srun_args(args, runtime_mode, timestamp):
     if args.work_dir:
         lines.append(f"--container-workdir={args.work_dir}")
 
-    if args.mounts:
-        lines.append(f"--container-mounts={args.mounts}")
+    # Build mount list: always include llm_src for install
+    mounts = args.mounts if args.mounts else ""
+    if llm_src and llm_src not in mounts:
+        llm_src_mount = f"{llm_src}:{llm_src}"
+        mounts = f"{mounts},{llm_src_mount}" if mounts else llm_src_mount
+    if mounts:
+        lines.append(f"--container-mounts={mounts}")
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_aggr:
+    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmi2
+    is_single_gpu_aggr = (
+        is_aggr and hardware_config is not None and hardware_config.get("total_gpus") == 1
+    )
+
+    if args.mpi_type:
+        lines.append(f"--mpi={args.mpi_type}")
+    elif is_aggr and not is_single_gpu_aggr:
         lines.append("--mpi=pmi2")
 
     return lines
 
 
 def generate_pytest_command(
-    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+    test_prefix,
+    work_dir,
+    config_file_base_name,
+    select_pattern,
+    runtime_mode,
+    benchmark_mode,
+    waives_file="",
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -343,13 +412,69 @@ def generate_pytest_command(
 
     pytest_command = (
         f"pytest -v "
+        f"perf/test_perf_sanity.py "
         f"--test-prefix={test_prefix} "
         f"--test-list={test_list_path} "
         f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
     )
 
+    if waives_file:
+        pytest_command += f" --waives-file={waives_file}"
+
     return pytest_command, test_list_content, test_list_path
+
+
+def normalize_accuracy_config(acc_cfg: dict) -> dict:
+    """Normalize accuracy config to nested tasks format used by accuracy_runner.py.
+
+    Handles two input formats:
+
+    Flat (perf-sanity style):
+        {"enable_accuracy_test": bool, "model": str, "tasks": "gsm8k", "model_args_extra": str}
+
+    Nested (examples/disaggregated/slurm/benchmark/config.yaml style):
+        {"enable_accuracy_test": bool, "tasks": {"gsm8k": {"model": str, "model_args_extra": str, ...}}}
+
+    Always returns the nested format.
+    """
+    if not acc_cfg:
+        return acc_cfg
+    tasks = acc_cfg.get("tasks")
+    if isinstance(tasks, dict):
+        return acc_cfg  # already nested
+    # Flat format: tasks is a string like "gsm8k"
+    task_name = tasks or "gsm8k"
+    return {
+        "enable_accuracy_test": acc_cfg.get("enable_accuracy_test", False),
+        "tasks": {
+            task_name: {
+                "model": acc_cfg.get("model", "local-completions"),
+                "model_args_extra": acc_cfg.get("model_args_extra", ""),
+                "extra_kwargs": {},
+            }
+        },
+    }
+
+
+def replace_env_in_file(work_dir: str, file_path: str, env_vars: dict) -> str:
+    """Read a file, replace env var placeholders, write to work_dir/lm_eval_configs/.
+
+    Returns the lm_eval_configs directory path (for use as --include_path).
+    Also copies utils.py from the same directory if present (needed for GPQA task).
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    for key, value in env_vars.items():
+        content = content.replace(key, value)
+    tmp_dir = os.path.join(work_dir, "lm_eval_configs")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, os.path.basename(file_path)), "w", encoding="utf-8") as f:
+        f.write(content)
+    utils_py = os.path.join(os.path.dirname(file_path), "utils.py")
+    if os.path.exists(utils_py):
+        shutil.copy(utils_py, tmp_dir)
+    return tmp_dir
 
 
 def remove_whitespace_lines(lines):
@@ -405,6 +530,11 @@ def main():
         choices=["source", "wheel"],
         help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)",
     )
+    parser.add_argument(
+        "--wheel-path",
+        default="",
+        help="Path to a specific wheel file to install (used when INSTALL_MODE=wheel)",
+    )
     parser.add_argument("--capture-nsys", action="store_true", help="Capture nsys profile")
     parser.add_argument(
         "--nsys-start-stop",
@@ -422,6 +552,23 @@ def main():
         help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
     parser.add_argument("--test-prefix", default="", help="Test prefix")
+    parser.add_argument(
+        "--waives-file",
+        default="",
+        help="Path to waives file for pytest (optional)",
+    )
+    parser.add_argument(
+        "--mpi-type",
+        default="",
+        help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
+        " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
+    )
+    parser.add_argument(
+        "--disagg-server-port",
+        type=int,
+        default=8000,
+        help="Port the disagg server listens on (exported as DISAGG_SERVER_PORT)",
+    )
 
     args = parser.parse_args()
 
@@ -438,7 +585,7 @@ def main():
         )
         config_yaml = get_config_yaml_path(llm_src, config_file_base_name, benchmark_mode)
     elif args.config_file:
-        config_yaml = args.config_file
+        config_yaml = os.path.abspath(args.config_file)
         config_file_base_name = os.path.splitext(os.path.basename(config_yaml))[0]
 
         # Load config to detect type
@@ -465,10 +612,27 @@ def main():
     else:
         raise ValueError("Either --test-list or --config-file must be provided")
 
+    # Always rebuild test_case_name from parsed components so it matches the
+    # pytest test id written into test_list.txt by generate_pytest_command
+    # (which strips the `_upload` prefix). Without this, when --test-list is
+    # supplied with the long form (e.g. `disagg_upload-...`), test_output_dir
+    # would carry `_upload` while test_perf_sanity.py creates its working dir
+    # under the stripped form — producing two divergent folders.
+    if runtime_mode == "disaggregated":
+        test_case_name = f"disagg-{benchmark_mode}-{config_file_base_name}"
+    elif benchmark_mode == "ctx_only":
+        test_case_name = f"aggr-ctx_only-{config_file_base_name}"
+    else:
+        test_case_name = f"aggr-{config_file_base_name}-{select_pattern}"
+
     # Load config if not already loaded
     if not args.config_file:
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
+
+    # Detect GPU type from config metadata
+    supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
+    is_b200 = "B200" in supported_gpus
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -478,6 +642,10 @@ def main():
     if not work_dir:
         work_dir = os.path.join(llm_src, "jenkins", "scripts", "perf", "local", timestamp)
     os.makedirs(work_dir, exist_ok=True)
+
+    # Per-test output directory consumed by slurm_launch_draft.sh. Same shape
+    # as PerfSanityTestConfig.get_commands: <output_dir>/<test_case_name>.
+    test_output_dir = os.path.join(work_dir, test_case_name)
 
     test_prefix = args.test_prefix if args.test_prefix else f"{llm_src}/tests/integration/defs"
 
@@ -505,7 +673,7 @@ def main():
         )
 
     # Get configs based on mode
-    env_config = get_env_config(config, runtime_mode)
+    env_config = get_env_config(config, runtime_mode, benchmark_mode, select_pattern)
     bm_config = get_benchmark_config(config, benchmark_mode)
     hardware_config = get_hardware_config(
         config,
@@ -518,11 +686,17 @@ def main():
     sbatch_lines = generate_sbatch_params(args, hardware_config, work_dir)
 
     # Generate srun args
-    srun_args_lines = generate_srun_args(args, runtime_mode, timestamp)
+    srun_args_lines = generate_srun_args(args, runtime_mode, timestamp, llm_src, hardware_config)
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+        test_prefix,
+        work_dir,
+        config_file_base_name,
+        select_pattern,
+        runtime_mode,
+        benchmark_mode,
+        waives_file=args.waives_file,
     )
 
     # Write test list file
@@ -542,6 +716,7 @@ def main():
             f"export configYamlPath='{config_yaml}'",
             f"export BUILD_WHEEL={'true' if args.build_wheel else 'false'}",
             f"export INSTALL_MODE='{args.install_mode}'",
+            f"export WHEEL_PATH='{args.wheel_path}'",
         ]
     )
 
@@ -572,12 +747,27 @@ def main():
         ctx_tllm_profile_start_stop = args.ctx_nsys_start_stop
         gen_tllm_profile_start_stop = args.gen_nsys_start_stop
 
+    # When the user supplied --config-file, point the config-folder env vars at the
+    # directory that contains that file so pytest parametrisation discovers it directly
+    # instead of looking in the default tests/scripts/perf-sanity/ directories.
+    if args.config_file:
+        config_dir = os.path.dirname(os.path.abspath(args.config_file))
+        effective_agg_config_folder = (
+            config_dir if runtime_mode == "aggregated" else AGG_CONFIG_FOLDER
+        )
+        effective_disagg_config_folder = (
+            config_dir if runtime_mode == "disaggregated" else DISAGG_CONFIG_FOLDER
+        )
+    else:
+        effective_agg_config_folder = AGG_CONFIG_FOLDER
+        effective_disagg_config_folder = DISAGG_CONFIG_FOLDER
+
     pytest_common_vars = (
         f"LLM_ROOT='{llm_src}' "
         f"LLM_BACKEND_ROOT='{llm_src}/triton_backend' "
         f"LLM_MODELS_ROOT='{args.llm_models_root}' "
-        f"AGG_CONFIG_FOLDER='{AGG_CONFIG_FOLDER}' "
-        f"DISAGG_CONFIG_FOLDER='{DISAGG_CONFIG_FOLDER}' "
+        f"AGG_CONFIG_FOLDER='{effective_agg_config_folder}' "
+        f"DISAGG_CONFIG_FOLDER='{effective_disagg_config_folder}' "
     )
     llmapi_launch = f"{llm_src}/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 
@@ -627,6 +817,10 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
+        if is_b200:
+            ucx_tls_cmd = "export UCX_TLS=^ib &&"
+        else:
+            ucx_tls_cmd = "unset UCX_TLS &&"
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
@@ -634,20 +828,23 @@ def main():
                 f'export SERVER_ENV_VARS="{server_env_vars}"',
                 f'export BENCHMARK_ENV_VARS="{benchmark_env_var}"',
                 (
-                    'export pytestCommandCTXWorker="unset UCX_TLS &&'
+                    f'export pytestCommandCTXWorker="{ucx_tls_cmd}'
                     " $CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 (
-                    'export pytestCommandGENWorker="unset UCX_TLS &&'
+                    f'export pytestCommandGENWorker="{ucx_tls_cmd}'
                     " $GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
-                'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
                 (
-                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f'export pytestCommandDisaggServer="{ucx_tls_cmd}'
+                    ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"'
+                ),
+                (
+                    f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
@@ -661,6 +858,7 @@ def main():
                 f"export gpusPerNodePerGenServer={hardware_config.get('gpus_per_node_per_gen_server', '')}",
                 f"export totalNodes={hardware_config.get('total_nodes', '')}",
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
+                f"export testOutputDir={test_output_dir}",
             ]
         )
 
@@ -677,20 +875,74 @@ def main():
             f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
         )
+        # Aggregated mode (including ctx_only).
+        # For regular agg, server_env_var (from the matched server_configs entry)
+        # carries spec-decode flags like TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS;
+        # for ctx_only, get_env_config maps environment.worker_env_var into the
+        # server_env_var slot. Both reach all SLURM ranks via env-prefix on
+        # pytestCommand before trtllm-llmapi-launch dispatches.
+        agg_server_env_vars = env_config.get("server_env_var", "")
+        launcher_seg = "" if hardware_config.get("total_gpus") == 1 else " $LLM_API_LAUNCH"
         # Aggregated mode (including ctx_only)
         script_prefix_lines.extend(
             [
                 f'export WORKER_ENV_VARS="{worker_env_vars}"',
+                f'export SERVER_ENV_VARS="{agg_server_env_vars}"',
                 (
-                    'export pytestCommand="$WORKER_ENV_VARS $PYTEST_COMMON_VARS $NSYS_PREFIX $LLM_API_LAUNCH'
+                    'export pytestCommand="$SERVER_ENV_VARS $WORKER_ENV_VARS $PYTEST_COMMON_VARS'
+                    f"{launcher_seg}"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
                 f"export gpusPerNodePerServer={hardware_config.get('gpus_per_node_per_server', '')}",
                 f"export totalNodes={hardware_config.get('total_nodes', '')}",
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
+                f"export testOutputDir={test_output_dir}",
             ]
         )
+        # Forward pytestCommand into the pyxis container on every rank (matches the
+        # disagg branch's --container-env=pytestCommand). Without this, exports
+        # in the launch script don't survive the container boundary on multi-node.
+        srun_args_lines.append("--container-env=pytestCommand")
+
+    # Export accuracy config to BENCHMARK node (disagg only)
+    if runtime_mode == "disaggregated":
+        acc_cfg = normalize_accuracy_config(config.get("accuracy", {}))
+        if acc_cfg.get("enable_accuracy_test"):
+            env_sub = {"LLM_MODELS_ROOT": args.llm_models_root}
+            processed = copy.deepcopy(acc_cfg)
+            for task_cfg in processed.get("tasks", {}).values():
+                extra = task_cfg.get("extra_kwargs", {})
+                if "custom_config" in extra:
+                    cfg_path = extra.pop("custom_config")
+                    if not os.path.isabs(cfg_path):
+                        cfg_path = os.path.join(llm_src, cfg_path)
+                    extra["include_path"] = replace_env_in_file(work_dir, cfg_path, env_sub)
+            # Determine model_dir_name from config metadata (used by accuracy_runner.py to build model_path)
+            model_dir_name = config.get("metadata", {}).get("model_dir_name", "")
+            # Path to the accuracy runner script (co-located with this submit.py)
+            accuracy_runner = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "accuracy_runner.py"
+            )
+            script_prefix_lines.extend(
+                [
+                    f"export ACCURACY_CONFIG_JSON='{json.dumps(processed)}'",
+                    f"export DISAGG_SERVER_PORT={args.disagg_server_port}",
+                    f"export MODEL_DIR_NAME='{model_dir_name}'",
+                    # pytestCommandAccuracy is the command run by slurm_run.sh on the ACCURACY_TEST node.
+                    # DISAGG_SERVER_HOST is set at runtime by the draft launch script
+                    # (disagg: slurm_launch_disagg_draft.sh; aggregated: slurm_launch_draft.sh).
+                    f'export pytestCommandAccuracy="python3 {accuracy_runner}"',
+                ]
+            )
+            srun_args_lines.extend(
+                [
+                    "--container-env=ACCURACY_CONFIG_JSON",
+                    "--container-env=DISAGG_SERVER_PORT",
+                    "--container-env=MODEL_DIR_NAME",
+                    "--container-env=DISAGG_SERVER_HOST",
+                ]
+            )
 
     # Remove whitespace lines
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)

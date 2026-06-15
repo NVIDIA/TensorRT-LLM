@@ -1,111 +1,253 @@
-"""Utilities for piecewise CUDA graph: graph splitting at dynamic op boundaries.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Utilities for piecewise CUDA graph: dynamic op registry, classification, and graph splitting.
 
 This module provides the logic to:
-1. Identify dynamic (uncapturable) custom ops in the FX graph (attention, SSM, conv, delta).
-2. Split the FX GraphModule at those boundaries using torch.fx.passes.split_module.
-3. Return the split GraphModule and metadata about which submodules are dynamic vs static.
+1. Identify dynamic (uncapturable) custom ops in the FX graph.
+2. Classify dynamic submodules by their piecewise output handling policy.
+3. Split the FX GraphModule at dynamic op boundaries using torch.fx.passes.split_module.
+4. Return the split GraphModule and metadata about which submodules are dynamic vs static.
 """
 
+import operator
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from enum import Enum, auto
+from typing import Any, Dict, List, Optional, Set
 
+import torch.nn as nn
 from torch.fx import GraphModule, Node
 from torch.fx.passes.split_module import split_module
 
 from ..utils.logger import ad_logger
 
 # ---------------------------------------------------------------------------
-# Dynamic ops registry: these ops cannot be captured in CUDA graphs for
-# mixed/prefill batches because they have data-dependent control flow or
-# dynamic kernel configurations.
+# Dynamic op registry. Each registered op is a split boundary for piecewise CUDA
+# graph. The policy describes the output contract of the dynamic submodule after
+# it has been split out of the captured static graph.
+#
+# Keep this registry organized by policy rather than by op family. The piecewise
+# code does not care whether an op is "attention", "SSM", or "metadata" by name;
+# it cares whether the op's outputs need an out= buffer, a MetadataWrapper, or no
+# wrapper at all. When adding a new dynamic op, first decide which output contract
+# it has, then place it in this registry with the matching policy.
 # ---------------------------------------------------------------------------
 
-# Cached attention ops (grid depends on per-sequence lengths)
-_CACHED_ATTENTION_OPS = [
-    "auto_deploy::flashinfer_attention_mha_with_cache",
-    "auto_deploy::triton_attention_flattened_mha_with_cache",
-    "auto_deploy::torch_cached_attention_with_cache",
-    "auto_deploy::trtllm_attention_mha_with_cache",
-    # MLA attention variants
-    "auto_deploy::flashinfer_mla_with_cache",
-    "auto_deploy::torch_cached_mla_with_cache",
-]
 
-# Cached SSM ops (Python-level branching on batch_info_host)
-_CACHED_SSM_OPS = [
-    "auto_deploy::triton_cached_ssm",
-    "auto_deploy::torch_cached_ssm",
-    "auto_deploy::flashinfer_cached_ssm",
-]
+class DynamicOpPolicy(Enum):
+    """How piecewise CUDA graph should handle a dynamic custom op's output.
 
-# Cached causal conv ops (branching on prefill vs decode)
-_CACHED_CONV_OPS = [
-    "auto_deploy::triton_cached_causal_conv1d",
-    "auto_deploy::cuda_cached_causal_conv1d",
-]
+    Dynamic ops are always split out of static CUDA graph segments and run
+    eagerly. This enum only controls the additional output-address handling that
+    is needed so downstream static segments can still be captured and replayed
+    safely.
 
-# Cached delta rule ops (branching on prefill vs decode)
-_CACHED_DELTA_OPS = [
-    "auto_deploy::fla_cached_delta_rule",
-    "auto_deploy::fla_cached_gated_delta_rule",
-]
+    OUT_BUFFER:
+        The dynamic op returns a fresh tensor that is consumed by a captured
+        static segment. A fresh allocation would give CUDA graph replay a
+        different address from capture, so the op is wrapped with
+        DynamicOpWrapper and receives a pre-allocated out= buffer from the
+        preceding ADPiecewiseRunner graph pool. Use this for ops whose output
+        shape is bounded by the piecewise token bucket and can be safely copied
+        into that stable buffer.
 
-# Metadata preparation ops (branch on batch_info_host, do CPU math on CUDA tensors)
-_METADATA_PREP_OPS = [
-    "auto_deploy::flashinfer_attention_prepare_metadata",
-    "auto_deploy::flashinfer_mla_prepare_metadata",
-    "auto_deploy::mamba_ssm_prepare_metadata",
-]
+    METADATA_WRAPPER:
+        The dynamic op prepares metadata tensors eagerly, and those metadata
+        tensors are later consumed by captured static segments. The op itself
+        usually does not support an out= buffer, so MetadataWrapper owns stable
+        metadata buffers and copies request results into them. Use this only
+        when the metadata output shapes are bounded by the wrapper's padding
+        strategy.
 
-# Logits gather ops (CPU branching on host tensor + shape-dependent logic)
-_LOGITS_GATHER_OPS = [
-    "auto_deploy::gather_logits_before_lm_head",
-]
+    EAGER:
+        The dynamic op still needs to be a split boundary, but piecewise should
+        not add output stabilization. This covers inplace ops that return None,
+        ops that already return persistent/stable buffers, logits or host-driven
+        helpers whose outputs are not consumed by captured static segments, and
+        request-dependent outputs whose shapes are not safely bounded by the
+        piecewise token bucket.
+    """
+
+    # Wrap with DynamicOpWrapper and pass a stable out= buffer.
+    OUT_BUFFER = auto()
+
+    # Wrap with MetadataWrapper to keep metadata tensor addresses stable.
+    METADATA_WRAPPER = auto()
+
+    # Run eagerly as a split boundary with no output-address wrapper.
+    EAGER = auto()
+
+
+_DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {
+    # Dynamic kernels whose outputs feed captured static segments.
+    "auto_deploy::flashinfer_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::triton_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::torch_cached_attention_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::trtllm_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::flashinfer_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::flashinfer_trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::torch_cached_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::triton_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::torch_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::flashinfer_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::fla_cached_delta_rule": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::fla_cached_gated_delta_rule": DynamicOpPolicy.OUT_BUFFER,
+    # Metadata-prep outputs whose addresses must remain stable for captured segments.
+    "auto_deploy::flashinfer_attention_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
+    "auto_deploy::flashinfer_mla_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
+    "auto_deploy::triton_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
+    "auto_deploy::mamba_ssm_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
+    # Request-dependent metadata output shapes that are not safely bounded by
+    # the piecewise token bucket. They must split the graph, but padding them in
+    # MetadataWrapper would be the wrong address-stability strategy.
+    "auto_deploy::gemma4_prepare_multimodal_mask": DynamicOpPolicy.EAGER,
+    # Host-driven gather helper. It is dynamic for piecewise splitting, but its
+    # output is not stabilized through DynamicOpWrapper or MetadataWrapper.
+    "auto_deploy::gather_tokens": DynamicOpPolicy.EAGER,
+    # Persistent-buffer metadata prep ops. They run eagerly because they have
+    # dynamic host control flow, but their returned buffers are already stable,
+    # so piecewise must not add another output-address wrapper.
+    "auto_deploy::trtllm_attention_prepare_metadata": DynamicOpPolicy.EAGER,
+    "auto_deploy::trtllm_mla_prepare_metadata": DynamicOpPolicy.EAGER,
+    # Inplace dynamic ops. These mutate their input state and return None, so
+    # there is no produced tensor for DynamicOpWrapper or MetadataWrapper to own.
+    "auto_deploy::triton_cached_causal_conv1d": DynamicOpPolicy.EAGER,
+    "auto_deploy::cuda_cached_causal_conv1d": DynamicOpPolicy.EAGER,
+}
 
 
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
-    return set(
-        _CACHED_ATTENTION_OPS
-        + _CACHED_SSM_OPS
-        + _CACHED_CONV_OPS
-        + _CACHED_DELTA_OPS
-        + _METADATA_PREP_OPS
-        + _LOGITS_GATHER_OPS
-    )
+    return set(_DYNAMIC_OP_POLICIES)
+
+
+def _get_op_name(target: Any) -> str:
+    """Return a stable qualified name for FX call_function targets."""
+    if hasattr(target, "name"):
+        # torch._ops.OpOverload has .name() method
+        return target.name()
+    if hasattr(target, "__qualname__"):
+        return target.__qualname__
+    return str(target)
+
+
+def _matches_op_name(op_name: str, registered_name: str) -> bool:
+    """Match OpOverload names and wrapper-function names using existing semantics."""
+    if registered_name in op_name:
+        return True
+    base_name = registered_name.split("::")[-1] if "::" in registered_name else registered_name
+    return base_name in op_name
+
+
+def _get_dynamic_op_policy(node: Node) -> Optional[DynamicOpPolicy]:
+    """Return the piecewise policy for a dynamic custom op node, if any."""
+    if node.op != "call_function":
+        return None
+
+    op_name = _get_op_name(node.target)
+    for registered_name, policy in _DYNAMIC_OP_POLICIES.items():
+        if _matches_op_name(op_name, registered_name):
+            return policy
+    return None
 
 
 def is_dynamic_cached_op(node: Node) -> bool:
-    """Check if a node is a dynamic (uncapturable) cached op.
+    """Check if a node is a dynamic op that should split piecewise partitions."""
+    return _get_dynamic_op_policy(node) is not None
 
-    These are ops that cannot be captured inside a CUDA graph for mixed/prefill
-    batches due to data-dependent control flow or dynamic kernel grids.
-    """
-    if node.op != "call_function":
-        return False
 
-    target = node.target
-    # Handle OpOverload: get the qualified name
-    if hasattr(target, "name"):
-        # torch._ops.OpOverload has .name() method
-        op_name = target.name()
-    elif hasattr(target, "__qualname__"):
-        op_name = target.__qualname__
-    else:
-        op_name = str(target)
+# ---------------------------------------------------------------------------
+# Partition classification helpers for submodules produced by piecewise splitting.
+# ---------------------------------------------------------------------------
 
-    # Strip the ".default" suffix if present for matching
-    dynamic_ops = _get_all_dynamic_op_names()
-    # Check with namespace::name format AND base name (for wrapper functions
-    for dyn_op in dynamic_ops:
-        if dyn_op in op_name:
+# Trivial FX ops that are metadata-only or typically no-ops — used to identify
+# static partitions with no meaningful GPU compute (e.g., between adjacent dynamic ops).
+# NOTE: reshape, contiguous, and to *can* launch kernels in edge cases (non-contiguous
+# tensors, dtype/device casts), but in practice these appear only as lightweight
+# plumbing in empty partitions.
+_TRIVIAL_CALL_FUNCTIONS = {operator.getitem, getattr}
+_TRIVIAL_CALL_METHODS = {
+    "view",
+    "reshape",
+    "contiguous",
+    "permute",
+    "transpose",
+    "unsqueeze",
+    "squeeze",
+    "expand",
+    "size",
+    "dim",
+    "to",
+}
+
+
+def submod_has_cuda_ops(submod: nn.Module) -> bool:
+    """Check if a submodule has ops beyond trivial metadata/reshape operations."""
+    if not isinstance(submod, GraphModule):
+        return True  # Conservative: non-FX modules assumed to have GPU ops
+
+    for node in submod.graph.nodes:
+        if node.op == "call_module":
             return True
-        # Also check by base op name without namespace prefix
-        base_name = dyn_op.split("::")[-1] if "::" in dyn_op else dyn_op
-        if base_name in op_name:
+        if node.op == "call_function":
+            if node.target in _TRIVIAL_CALL_FUNCTIONS:
+                continue
+            return True
+        if node.op == "call_method":
+            if node.target in _TRIVIAL_CALL_METHODS:
+                continue
             return True
 
     return False
+
+
+def needs_out_buffer(submod: nn.Module) -> bool:
+    """Return True if this dynamic submodule produces a NEW output tensor.
+
+    Inplace ops (mutate input, return None) don't produce new tensors.
+    Metadata prep ops are handled by MetadataWrapper (stable output addresses).
+    All of these are skipped -- only OUT_BUFFER policy ops need out= buffers.
+    """
+    if not isinstance(submod, GraphModule):
+        return True
+
+    has_dynamic_op = False
+    for node in submod.graph.nodes:
+        policy = _get_dynamic_op_policy(node)
+        if policy is None:
+            continue
+        has_dynamic_op = True
+        if policy == DynamicOpPolicy.OUT_BUFFER:
+            return True
+    return not has_dynamic_op
+
+
+def needs_metadata_wrapper(submod: nn.Module) -> bool:
+    """Return True if metadata-prep outputs should be stabilized for captured runners."""
+    if not isinstance(submod, GraphModule):
+        return False
+
+    for node in submod.graph.nodes:
+        if _get_dynamic_op_policy(node) == DynamicOpPolicy.METADATA_WRAPPER:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Graph splitting
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -180,36 +322,28 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
         keep_original_order=True,
     )
 
-    # Analyze the split result to identify dynamic vs static submodules
+    # Analyze the split result to identify dynamic vs static submodules.
+    # split_module names submodules "submod_{partition_id}", so the name suffix
+    # IS the partition ID.  We classify each submodule directly by checking its
+    # partition ID against dynamic_partitions.  This avoids fragile alignment
+    # between partition_ids_in_order and submod_names (they can diverge when
+    # get_attr-only partitions exist in the original graph but split_module
+    # does not create submodules for them).
     submod_names = []
     for name, _ in split_gm.named_children():
         if name.startswith("submod_"):
             submod_names.append(name)
 
-    # Sort by index
     submod_names.sort(key=lambda n: int(n.split("_")[1]))
-
-    # Build a mapping from partition ID to submod index
-    # The split_module assigns submod_N names in order of first-seen partition IDs
-    partition_ids_in_order = []
-    seen = set()
-    for node in gm.graph.nodes:
-        if node.op in ("placeholder", "output"):
-            continue
-        pid = node_to_partition.get(node, 0)
-        if pid not in seen:
-            seen.add(pid)
-            partition_ids_in_order.append(pid)
 
     dynamic_indices = []
     static_indices = []
-    for idx, pid in enumerate(partition_ids_in_order):
-        if idx >= len(submod_names):
-            break
+    for name in submod_names:
+        pid = int(name.split("_")[1])
         if pid in dynamic_partitions:
-            dynamic_indices.append(idx)
+            dynamic_indices.append(pid)
         else:
-            static_indices.append(idx)
+            static_indices.append(pid)
 
     ad_logger.info(
         f"Piecewise split: {len(submod_names)} submodules "

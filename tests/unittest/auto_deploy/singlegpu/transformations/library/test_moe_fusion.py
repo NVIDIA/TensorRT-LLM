@@ -1,4 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
+import operator
 from pathlib import Path
 
 import pytest
@@ -12,11 +27,14 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import ActivationType
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
+    _extract_noaux_internal_routing,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
-from tensorrt_llm._torch.utils import ActivationType
 
 
 class BlockSparseTop2MLP(nn.Module):
@@ -835,6 +853,92 @@ def test_fp8_moe_different_input_scales(backend, allow_different_input_scales, s
             )
 
 
+@skip_pre_hopper
+@pytest.mark.skipif(
+    not fp8_compatible() or not trtllm_ops_available(),
+    reason="Requires fp8 and trtllm support",
+)
+def test_fp8_moe_fusion_accepts_scalar_input_scales():
+    """Regression test for checkpoints that materialize per-expert FP8 scales as scalars."""
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_fp8_moe_weights
+
+    torch.manual_seed(0)
+
+    batch_size, num_experts, top_k = 4, 2, 2
+    hidden_size, intermediate_size = 128, 128
+    act_fn = ActivationType.Silu
+
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.5
+    selected_experts = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]], device="cuda")
+    routing_weights = torch.ones((batch_size, top_k), device="cuda", dtype=torch.float32) / top_k
+
+    w1_weight, w2_weight, w3_weight = [], [], []
+    w1_input_scale, w2_input_scale, w3_input_scale = [], [], []
+    w1_weight_scale, w2_weight_scale, w3_weight_scale = [], [], []
+
+    for _ in range(num_experts):
+        w1_weight.append(
+            torch.randn(intermediate_size, hidden_size, device="cuda").to(torch.float8_e4m3fn)
+        )
+        w2_weight.append(
+            torch.randn(hidden_size, intermediate_size, device="cuda").to(torch.float8_e4m3fn)
+        )
+        w3_weight.append(
+            torch.randn(intermediate_size, hidden_size, device="cuda").to(torch.float8_e4m3fn)
+        )
+        w1_input_scale.append(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+        w2_input_scale.append(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+        w3_input_scale.append(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+        w1_weight_scale.append(torch.tensor(0.1, dtype=torch.float32, device="cuda"))
+        w2_weight_scale.append(torch.tensor(0.1, dtype=torch.float32, device="cuda"))
+        w3_weight_scale.append(torch.tensor(0.1, dtype=torch.float32, device="cuda"))
+
+    class ScalarScaleFP8GatedMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            for i in range(num_experts):
+                self.register_buffer(f"w1_{i}", w1_weight[i])
+                self.register_buffer(f"w2_{i}", w2_weight[i])
+                self.register_buffer(f"w3_{i}", w3_weight[i])
+                self.register_buffer(f"w1_iscale_{i}", w1_input_scale[i])
+                self.register_buffer(f"w2_iscale_{i}", w2_input_scale[i])
+                self.register_buffer(f"w3_iscale_{i}", w3_input_scale[i])
+                self.register_buffer(f"w1_wscale_{i}", w1_weight_scale[i])
+                self.register_buffer(f"w2_wscale_{i}", w2_weight_scale[i])
+                self.register_buffer(f"w3_wscale_{i}", w3_weight_scale[i])
+
+        def forward(self, hidden_states, chosen_experts, router_weights):
+            return torch.ops.auto_deploy.torch_quant_fp8_moe(
+                hidden_states,
+                chosen_experts,
+                router_weights,
+                [getattr(self, f"w1_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_{i}") for i in range(num_experts)],
+                [getattr(self, f"w1_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_iscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w1_wscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w2_wscale_{i}") for i in range(num_experts)],
+                [getattr(self, f"w3_wscale_{i}") for i in range(num_experts)],
+                is_gated_mlp=True,
+                act_fn=act_fn,
+            )
+
+    gm = fx.symbolic_trace(ScalarScaleFP8GatedMoE().cuda())
+    num_transformed = _stack_fp8_moe_weights(
+        gm, backend="trtllm", allow_different_input_scales=False
+    )
+    gm.recompile()
+
+    assert num_transformed == 1
+    assert getattr(gm, "quant_moe_fc1_act_scale_0").shape == torch.Size([])
+
+    with torch.inference_mode():
+        output = gm(x, selected_experts, routing_weights)
+    assert output.shape == x.shape
+
+
 class NVFP4MoEModuleForInputScaleTest(nn.Module):
     """Module wrapping torch_quant_nvfp4_moe for testing NVFP4 MoE input scale handling."""
 
@@ -1536,6 +1640,36 @@ def test_nvfp4_trtllm_gen_non_gated_empty_w3_lists():
         output = gm(x)
 
     assert torch.isfinite(output).all(), "TRTLLM-Gen non-gated output contains non-finite values."
+
+
+@pytest.mark.skipif(not trtllm_ops_available(), reason="Requires TRTLLM ops")
+@pytest.mark.parametrize("with_ep_mask", [False, True], ids=["no_ep_mask", "ep_mask"])
+def test_nvfp4_trtllm_gen_internal_routing(with_ep_mask):
+    """The TRTLLM-Gen internal-routing matcher must handle direct and EP-masked routing."""
+    graph = fx.Graph()
+    router_logits = graph.placeholder("router_logits")
+    routing_bias = graph.placeholder("routing_bias")
+    noaux = graph.call_function(
+        torch.ops.trtllm.noaux_tc_op.default,
+        args=(router_logits, routing_bias, 1, 1, 22, 5.0),
+    )
+    routing_weights = graph.call_function(operator.getitem, args=(noaux, 0))
+    selected_experts = graph.call_function(operator.getitem, args=(noaux, 1))
+    routing_weights_arg = routing_weights
+    selected_experts_arg = selected_experts
+
+    if with_ep_mask:
+        selected_experts_arg = graph.call_function(operator.sub, args=(selected_experts, 128))
+        expert_rank = graph.call_function(operator.floordiv, args=(selected_experts, 128))
+        rank_mask = graph.call_function(torch.eq, args=(expert_rank, 1))
+        routing_weights_arg = graph.call_function(operator.mul, args=(routing_weights, rank_mask))
+
+    result = _extract_noaux_internal_routing(selected_experts_arg, routing_weights_arg)
+
+    assert result is not None
+    assert result[0] is router_logits
+    assert result[1] is routing_bias
+    assert result[2:] == (22, 1, 1, 5.0)
 
 
 @pytest.mark.skipif(

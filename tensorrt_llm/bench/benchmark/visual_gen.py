@@ -18,11 +18,12 @@ r"""Offline benchmark for VisualGen (image/video generation) models.
 Usage:
     trtllm-bench --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
         --model_path /path/to/checkpoint \
-        visual-gen --extra_visual_gen_options config.yaml <benchmark_args>
+        visual-gen --visual_gen_args config.yaml <benchmark_args>
 """
 
 import json
 import os
+import tempfile
 import time
 from datetime import datetime
 from typing import Optional
@@ -55,11 +56,13 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 
 @click.command(name="visual-gen", context_settings={"show_default": True})
 @click.option(
+    "--visual_gen_args",
     "--extra_visual_gen_options",
+    "visual_gen_args",
     type=str,
     default=None,
-    help="Path to a YAML file with extra VisualGen model options "
-    "(same format as trtllm-serve --extra_visual_gen_options).",
+    help="Path to a YAML file with VisualGen engine args "
+    "(same format as trtllm-serve --visual_gen_args).",
 )
 @click.option(
     "--prompt",
@@ -173,7 +176,7 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 @click.pass_obj
 def visual_gen_command(
     bench_env: BenchmarkEnvironment,
-    extra_visual_gen_options: Optional[str],
+    visual_gen_args: Optional[str],
     prompt: Optional[str],
     prompt_file: Optional[str],
     num_prompts: int,
@@ -197,8 +200,7 @@ def visual_gen_command(
     import yaml
 
     from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
-    from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
-    from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
     if prompt is None and prompt_file is None:
         raise click.UsageError("Either --prompt or --prompt_file must be specified.")
@@ -210,18 +212,18 @@ def visual_gen_command(
 
     # Build VisualGenArgs (same pattern as trtllm-serve _serve_visual_gen)
     extra_args: dict = {}
-    if extra_visual_gen_options is not None:
-        with open(extra_visual_gen_options, "r") as f:
+    if visual_gen_args is not None:
+        with open(visual_gen_args, "r") as f:
             extra_args = yaml.safe_load(f) or {}
 
-    diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
+    visual_gen_args = VisualGenArgs(**extra_args) if extra_args else None
 
-    n_workers = get_visual_gen_num_gpus(extra_args)
-    parallel_config = extra_args.get("parallel", {})
+    n_workers = visual_gen_args.parallel_config.n_workers if visual_gen_args is not None else 1
+    parallel_config = extra_args.get("parallel_config", {})
     if parallel_config:
         logger.info(f"World size: {n_workers}")
-        logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
-        logger.info(f"Ulysses size: {parallel_config.get('dit_ulysses_size', 1)}")
+        logger.info(f"CFG size: {parallel_config.get('cfg_size', 1)}")
+        logger.info(f"Ulysses size: {parallel_config.get('ulysses_size', 1)}")
 
     # Parse generation parameters
     width, height = _parse_size(size)
@@ -240,6 +242,8 @@ def visual_gen_command(
         gen_params_kwargs["num_inference_steps"] = num_inference_steps
     if guidance_scale is not None:
         gen_params_kwargs["guidance_scale"] = guidance_scale
+    if negative_prompt is not None:
+        gen_params_kwargs["negative_prompt"] = negative_prompt
 
     gen_params = VisualGenParams(**gen_params_kwargs)
 
@@ -263,8 +267,8 @@ def visual_gen_command(
     # Initialize VisualGen
     logger.info(f"Initializing VisualGen ({model_path})")
     visual_gen = VisualGen(
-        model_path=model_path,
-        diffusion_args=diffusion_args,
+        model=model_path,
+        args=visual_gen_args,
     )
 
     try:
@@ -286,7 +290,6 @@ def visual_gen_command(
             visual_gen=visual_gen,
             input_requests=input_requests,
             gen_params=gen_params,
-            negative_prompt=negative_prompt,
             max_concurrency=max_concurrency,
         )
         benchmark_duration = time.perf_counter() - benchmark_start
@@ -329,50 +332,74 @@ def _run_benchmark(
     visual_gen,
     input_requests,
     gen_params,
-    negative_prompt: Optional[str],
     max_concurrency: int,
 ) -> list[VisualGenRequestOutput]:
-    """Run the benchmark loop, dispatching requests with concurrency control."""
+    """Run the benchmark loop, dispatching requests with concurrency control.
+
+    Each per-request ``latency`` window covers ``generate()`` plus a
+    ``save()`` to a per-run temp directory. The save mirrors what the
+    serving path (``openai_video_routes.py`` / ``openai_server.py``) does
+    inside its own ``latency`` window: encode and write to a persisted
+    location. The directory is cleaned up at the end of the run.
+    """
     import asyncio
 
-    outputs: list[VisualGenRequestOutput] = []
-
-    if max_concurrency <= 1:
-        outputs = _run_sequential(visual_gen, input_requests, gen_params, negative_prompt)
-    else:
-        outputs = asyncio.run(
+    with tempfile.TemporaryDirectory(prefix="trtllm-bench-vg-") as media_dir:
+        if max_concurrency <= 1:
+            return _run_sequential(visual_gen, input_requests, gen_params, media_dir)
+        return asyncio.run(
             _run_concurrent(
                 visual_gen,
                 input_requests,
                 gen_params,
-                negative_prompt,
                 max_concurrency,
+                media_dir,
             )
         )
 
-    return outputs
+
+def _save_for_timing(result, media_dir: str, idx: int) -> None:
+    """Persist ``result`` to ``media_dir`` so e2e timing covers encoding.
+
+    Mirrors the serving path: encodes and writes to a persisted location
+    (the file is left in place; the directory is wiped wholesale when the
+    enclosing :class:`tempfile.TemporaryDirectory` exits). Uses
+    ``resolve_video_format("auto")`` for video so the bench falls back to
+    ``.avi`` (pure-Python) on hosts without ffmpeg, matching the server's
+    default behavior instead of hard-failing.
+    """
+    if result.image is not None:
+        path = os.path.join(media_dir, f"img_{idx}.png")
+    elif result.video is not None:
+        from tensorrt_llm.media.encoding import resolve_video_format
+
+        _, ext = resolve_video_format("auto")
+        path = os.path.join(media_dir, f"vid_{idx}{ext}")
+    else:
+        return
+
+    result.save(path)
 
 
 def _run_sequential(
-    visual_gen, input_requests, gen_params, negative_prompt
+    visual_gen, input_requests, gen_params, media_dir: str
 ) -> list[VisualGenRequestOutput]:
     """Run requests one at a time, measuring per-request latency."""
     outputs = []
 
-    for req in input_requests:
+    for idx, req in enumerate(input_requests):
         output = VisualGenRequestOutput()
-        inputs = (
-            {"prompt": req.prompt, "negative_prompt": negative_prompt}
-            if negative_prompt
-            else req.prompt
-        )
         st = time.perf_counter()
         try:
-            visual_gen.generate(inputs=inputs, params=gen_params)
-            output.e2e_latency = time.perf_counter() - st
+            result = visual_gen.generate(inputs=req.prompt, params=gen_params)
+            _save_for_timing(result, media_dir, idx)
+            output.latency = time.perf_counter() - st
             output.success = True
+            if result.metrics is not None:
+                output.generation = result.metrics.generation
+                output.denoise = result.metrics.denoise
         except Exception as e:
-            output.e2e_latency = time.perf_counter() - st
+            output.latency = time.perf_counter() - st
             output.success = False
             output.error = str(e)
             output.exception_type = e.__class__.__name__
@@ -384,7 +411,7 @@ def _run_sequential(
 
 
 async def _run_concurrent(
-    visual_gen, input_requests, gen_params, negative_prompt, max_concurrency
+    visual_gen, input_requests, gen_params, max_concurrency, media_dir: str
 ) -> list[VisualGenRequestOutput]:
     """Run requests concurrently using generate_async with a semaphore."""
     import asyncio
@@ -393,21 +420,20 @@ async def _run_concurrent(
     outputs: list[VisualGenRequestOutput] = [VisualGenRequestOutput() for _ in input_requests]
 
     async def _generate_one(idx, req):
-        inputs = (
-            {"prompt": req.prompt, "negative_prompt": negative_prompt}
-            if negative_prompt
-            else req.prompt
-        )
         async with semaphore:
             output = outputs[idx]
             st = time.perf_counter()
             try:
-                future = visual_gen.generate_async(inputs=inputs, params=gen_params)
-                await future.result()
-                output.e2e_latency = time.perf_counter() - st
+                future = visual_gen.generate_async(inputs=req.prompt, params=gen_params)
+                result = await future
+                _save_for_timing(result, media_dir, idx)
+                output.latency = time.perf_counter() - st
                 output.success = True
+                if result.metrics is not None:
+                    output.generation = result.metrics.generation
+                    output.denoise = result.metrics.denoise
             except Exception as e:
-                output.e2e_latency = time.perf_counter() - st
+                output.latency = time.perf_counter() - st
                 output.success = False
                 output.error = str(e)
                 output.exception_type = e.__class__.__name__

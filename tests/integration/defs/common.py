@@ -56,6 +56,15 @@ def venv_check_output(venv, cmd, env=None, **kwargs):
     return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
+def resolve_llm_model_path(model_path: str) -> str:
+    """Resolve a model subpath relative to the test LLM model root."""
+    if os.path.isabs(model_path):
+        return model_path
+
+    from .conftest import llm_models_root
+    return os.path.join(llm_models_root(), model_path)
+
+
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd, **kwargs):
     """
     This function WAR check_call() to run python_cmd with mpi.
@@ -932,12 +941,16 @@ def test_llm_torch_multi_lora_support(
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
         tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        expected_outputs=None):
-    """Test multi-LoRA support with LLM-API Torch backend."""
+        pipeline_parallel_size=1):
+    """Test multi-LoRA support with LLM-API Torch backend.
 
-    # if expected_outputs is None:
-    #     raise ValueError("expected_outputs must be provided for exact validation")
+    When zero_lora_weights=True, validates that LoRA outputs match base model
+    outputs (since zero-weight LoRAs should not alter behavior).
+    """
+
+    assert zero_lora_weights, (
+        "This test compares LoRA outputs against base model outputs, "
+        "which is only valid when zero_lora_weights=True.")
 
     start_time = time.time()
     print("Creating dummy LoRAs...")
@@ -955,9 +968,6 @@ def test_llm_torch_multi_lora_support(
         f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
     )
 
-    print("Initializing LLM_torch with LoRA support...")
-    init_start = time.time()
-
     lora_config = LoraConfig(lora_dir=lora_paths,
                              max_lora_rank=lora_rank,
                              max_loras=num_loras,
@@ -966,17 +976,57 @@ def test_llm_torch_multi_lora_support(
 
     input_prompts = get_test_prompts_for_torch()
 
-    with LLM_torch(
-            model=hf_model_dir,
-            lora_config=lora_config,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
-            dtype="bfloat16",
-            max_batch_size=8,  # From original test
-            max_input_len=512,  # From original test
-            max_seq_len=562,  # From original test
-            max_beam_width=1  # From original test
-    ) as llm:
+    sampling_params = SamplingParams(max_tokens=30,
+                                     top_p=0.5,
+                                     top_k=0,
+                                     temperature=0.0)
+
+    # Step 1: Get base model outputs (no LoRA) as the ground truth.
+    print("Initializing LLM_torch without LoRA for base model outputs...")
+    init_start = time.time()
+
+    with LLM_torch(model=hf_model_dir,
+                   tensor_parallel_size=tensor_parallel_size,
+                   pipeline_parallel_size=pipeline_parallel_size,
+                   dtype="bfloat16",
+                   max_batch_size=8,
+                   max_input_len=512,
+                   max_seq_len=562,
+                   max_beam_width=1) as base_llm:
+
+        init_end = time.time()
+        print(
+            f"Base LLM_torch initialization completed in {(init_end - init_start):.2f} seconds."
+        )
+
+        print("Running base model inference (no LoRA)...")
+        base_inference_start = time.time()
+
+        base_outputs = base_llm.generate(input_prompts,
+                                         sampling_params=sampling_params)
+
+        base_inference_end = time.time()
+        print(
+            f"Base inference completed in {(base_inference_end - base_inference_start):.2f} seconds."
+        )
+
+    expected_outputs = [o.outputs[0].text for o in base_outputs]
+    for i, text in enumerate(expected_outputs):
+        print(f"Base output {i+1}: {text!r}")
+
+    # Step 2: Run with LoRA adapters and compare against base outputs.
+    print("Initializing LLM_torch with LoRA support...")
+    init_start = time.time()
+
+    with LLM_torch(model=hf_model_dir,
+                   lora_config=lora_config,
+                   tensor_parallel_size=tensor_parallel_size,
+                   pipeline_parallel_size=pipeline_parallel_size,
+                   dtype="bfloat16",
+                   max_batch_size=8,
+                   max_input_len=512,
+                   max_seq_len=562,
+                   max_beam_width=1) as llm:
 
         init_end = time.time()
         print(
@@ -986,20 +1036,18 @@ def test_llm_torch_multi_lora_support(
         print("Running inference with LLM-API Torch backend...")
         inference_start = time.time()
 
-        # Create LoRA requests for different adapters
+        # Create LoRA requests cycling through available adapters.
         lora_requests = []
+        lora_counter = 0
         for i in range(len(input_prompts)):
-            if i % 2 == 1:  # Add some requests without LoRA
+            if i % 2 == 1:
                 lora_requests.append(None)
-            else:  # With LoRA
+            else:
+                lora_idx = lora_counter % num_loras
+                lora_counter += 1
                 lora_requests.append(
-                    LoRARequest(f"lora-{i}", i,
-                                lora_paths[i % len(lora_paths)]))
-
-        sampling_params = SamplingParams(max_tokens=30,
-                                         top_p=0.5,
-                                         top_k=0,
-                                         temperature=0.0)
+                    LoRARequest(f"lora-{lora_idx}", lora_idx,
+                                lora_paths[lora_idx]))
 
         outputs = llm.generate(input_prompts,
                                sampling_params=sampling_params,
@@ -1010,8 +1058,8 @@ def test_llm_torch_multi_lora_support(
             f"Inference completed in {(inference_end - inference_start):.2f} seconds."
         )
 
-        # Validate exact outputs
-        print("Validating exact outputs...")
+        # Validate that LoRA outputs match base model outputs.
+        print("Validating outputs against base model...")
         assert len(outputs) == len(expected_outputs), \
             f"Expected {len(expected_outputs)} outputs, got {len(outputs)}"
 
@@ -1021,13 +1069,12 @@ def test_llm_torch_multi_lora_support(
             print(
                 f"LoRA: {lora_requests[i].lora_int_id if lora_requests[i] else 'None'}"
             )
-            print(f"Expected: {expected}")
-            print(f"Actual: {actual_text}")
+            print(f"Expected (base): {expected!r}")
+            print(f"Actual (LoRA):   {actual_text!r}")
             print("-" * 50)
 
-            # Exact string comparison
             assert actual_text == expected, \
-                f"Output {i+1} mismatch:\nExpected: {expected!r}\nActual: {actual_text!r}"
+                f"Output {i+1} mismatch:\nExpected (base): {expected!r}\nActual (LoRA):   {actual_text!r}"
 
     total_time = time.time() - start_time
     print(f"Total test execution time: {total_time:.2f} seconds")
@@ -1249,9 +1296,11 @@ def parse_gsm8k_output(output_text: str) -> float:
         float: The accuracy value (0.7582 in the example)
     """
 
-    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # Look for the specific pattern:
+    # |gsm8k|...|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # lm-eval pads table cells, so allow whitespace around the value.
     patterns = [
-        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
+        r'flexible-extract\s*\|\s*\d+\s*\|\s*exact_match\s*\|\s*↑\s*\|\s*(\d+(?:\.\d+)?)',
     ]
 
     for pattern in patterns:

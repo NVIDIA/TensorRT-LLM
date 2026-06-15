@@ -26,6 +26,8 @@
 #include <curand_kernel.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstring>
 #include <random>
 #include <unordered_set>
 
@@ -285,6 +287,190 @@ TEST_F(TestBeamHypothesesCopy, SingleBatchTest)
     checkAllEqual();
 }
 
+void runFinalizeKeepsPromptPrefixFromUnfinishedIds(SizeType32 beamWidth)
+{
+    SizeType32 constexpr batchSize{2};
+    SizeType32 constexpr maxSeqLen{9};
+    auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+    auto constexpr nvFloatType = TRTDataType<float>::value;
+    auto constexpr nvBoolType = TRTDataType<bool>::value;
+
+    auto stream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+    auto bufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(stream);
+
+    auto const idsShape = ITensor::makeShape({batchSize, beamWidth, maxSeqLen});
+    auto const cbaShape = ITensor::makeShape({batchSize, beamWidth * 2, maxSeqLen});
+    auto const beamShape = ITensor::makeShape({batchSize, beamWidth});
+    auto const cbaBeamShape = ITensor::makeShape({batchSize, beamWidth * 2});
+
+    auto outputIds = bufferManager->gpu(idsShape, nvTokenIdType);
+    auto outputIdsUnfinish = bufferManager->gpu(idsShape, nvTokenIdType);
+    auto parentIdsUnfinish = bufferManager->gpu(idsShape, nvSizeType);
+    auto outputIdsCBA = bufferManager->gpu(cbaShape, nvTokenIdType);
+    auto sequenceLengths = bufferManager->gpu(beamShape, nvSizeType);
+    auto inputLengths = bufferManager->gpu(beamShape, nvSizeType);
+    auto cumLogProbs = bufferManager->gpu(beamShape, nvFloatType);
+    auto sequenceLengthsCBA = bufferManager->gpu(cbaBeamShape, nvSizeType);
+    auto cumLogProbsCBA = bufferManager->gpu(cbaBeamShape, nvFloatType);
+    auto normedScoresCBA = bufferManager->gpu(cbaBeamShape, nvFloatType);
+    auto numBeamsCBA = bufferManager->gpu(ITensor::makeShape({batchSize}), nvSizeType);
+    auto batchDones = bufferManager->gpu(ITensor::makeShape({batchSize}), nvBoolType);
+    auto lengthPenalties = bufferManager->gpu(ITensor::makeShape({batchSize}), nvFloatType);
+
+    std::vector<TokenIdType> outputIdsHost(batchSize * beamWidth * maxSeqLen, 0);
+    std::vector<TokenIdType> outputIdsUnfinishHost(batchSize * beamWidth * maxSeqLen, -1);
+    std::vector<SizeType32> parentIdsUnfinishHost(batchSize * beamWidth * maxSeqLen, 0);
+    std::vector<TokenIdType> outputIdsCBAHost(batchSize * beamWidth * 2 * maxSeqLen, -777);
+    std::vector<SizeType32> sequenceLengthsHost(batchSize * beamWidth, 0);
+    std::vector<SizeType32> inputLengthsHost(batchSize * beamWidth, 0);
+    std::vector<float> cumLogProbsHost(batchSize * beamWidth, 0.0f);
+    std::vector<SizeType32> sequenceLengthsCBAHost(batchSize * beamWidth * 2, 0);
+    std::vector<float> cumLogProbsCBAHost(batchSize * beamWidth * 2, -100.0f);
+    std::vector<float> normedScoresCBAHost(batchSize * beamWidth * 2, -100.0f);
+    std::vector<SizeType32> numBeamsCBAHost(batchSize, beamWidth);
+    bool batchDonesHost[batchSize] = {false, false};
+    float lengthPenaltiesHost[batchSize] = {0.0f, 0.0f};
+
+    auto promptToken = [](SizeType32 batchIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>((batchIdx + 1) * 100 + pos); };
+    auto unfinishedToken = [](SizeType32 batchIdx, SizeType32 beamIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>(1000 + batchIdx * 100 + beamIdx * 10 + pos); };
+    auto cbaToken = [](SizeType32 batchIdx, SizeType32 cbaIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>(3000 + batchIdx * 100 + cbaIdx * 10 + pos); };
+    auto inputLengthForBatch = [](SizeType32 batchIdx) -> SizeType32 { return batchIdx == 0 ? 3 : 5; };
+    auto sequenceLengthForBatch = [](SizeType32 batchIdx) -> SizeType32 { return batchIdx == 0 ? 7 : 8; };
+
+    for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        SizeType32 const inputLength = inputLengthForBatch(batchIdx);
+        SizeType32 const sequenceLength = sequenceLengthForBatch(batchIdx);
+        SizeType32 const idsBatchOffset = batchIdx * beamWidth * maxSeqLen;
+        SizeType32 const cbaBatchOffset = batchIdx * beamWidth * 2 * maxSeqLen;
+        SizeType32 const cbaBeamOffset = batchIdx * beamWidth * 2;
+
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            SizeType32 const beamOffset = idsBatchOffset + beamIdx * maxSeqLen;
+            inputLengthsHost[batchIdx * beamWidth + beamIdx] = inputLength;
+            sequenceLengthsHost[batchIdx * beamWidth + beamIdx] = sequenceLength;
+            cumLogProbsHost[batchIdx * beamWidth + beamIdx]
+                = beamWidth == 1 ? 12.0f : (beamIdx == 1 ? 12.0f : 5.0f + beamIdx * 3.0f);
+
+            for (SizeType32 pos = 0; pos < sequenceLength; ++pos)
+            {
+                outputIdsUnfinishHost[beamOffset + pos]
+                    = pos < inputLength ? promptToken(batchIdx, pos) : unfinishedToken(batchIdx, beamIdx, pos);
+                parentIdsUnfinishHost[beamOffset + pos] = beamIdx;
+            }
+        }
+
+        for (SizeType32 cbaIdx = 0; cbaIdx < beamWidth; ++cbaIdx)
+        {
+            sequenceLengthsCBAHost[cbaBeamOffset + cbaIdx] = sequenceLength;
+            normedScoresCBAHost[cbaBeamOffset + cbaIdx]
+                = beamWidth == 1 ? 10.0f : (cbaIdx == 1 ? 10.0f : 1.0f - cbaIdx * 2.0f);
+            cumLogProbsCBAHost[cbaBeamOffset + cbaIdx] = normedScoresCBAHost[cbaBeamOffset + cbaIdx];
+            for (SizeType32 pos = inputLength; pos < sequenceLength; ++pos)
+            {
+                outputIdsCBAHost[cbaBatchOffset + cbaIdx * maxSeqLen + pos] = cbaToken(batchIdx, cbaIdx, pos);
+            }
+        }
+    }
+
+    bufferManager->copy(outputIdsHost.data(), *outputIds);
+    bufferManager->copy(outputIdsUnfinishHost.data(), *outputIdsUnfinish);
+    bufferManager->copy(parentIdsUnfinishHost.data(), *parentIdsUnfinish);
+    bufferManager->copy(outputIdsCBAHost.data(), *outputIdsCBA);
+    bufferManager->copy(sequenceLengthsHost.data(), *sequenceLengths);
+    bufferManager->copy(inputLengthsHost.data(), *inputLengths);
+    bufferManager->copy(cumLogProbsHost.data(), *cumLogProbs);
+    bufferManager->copy(sequenceLengthsCBAHost.data(), *sequenceLengthsCBA);
+    bufferManager->copy(cumLogProbsCBAHost.data(), *cumLogProbsCBA);
+    bufferManager->copy(normedScoresCBAHost.data(), *normedScoresCBA);
+    bufferManager->copy(numBeamsCBAHost.data(), *numBeamsCBA);
+    bufferManager->copy(batchDonesHost, *batchDones);
+    bufferManager->copy(lengthPenaltiesHost, *lengthPenalties);
+    stream->synchronize();
+
+    tk::BeamHypotheses bh;
+    bh.nMaxBatchSize = batchSize;
+    bh.nBatchSize = batchSize;
+    bh.nBeamWidth = beamWidth;
+    bh.nMaxSeqLen = maxSeqLen;
+    bh.lengthPenalties = bufferCast<float>(*lengthPenalties);
+    bh.inputLengths = bufferCast<SizeType32>(*inputLengths);
+    bh.outputIds = bufferCast<TokenIdType>(*outputIds);
+    bh.sequenceLengths = bufferCast<SizeType32>(*sequenceLengths);
+    bh.cumLogProbs = bufferCast<float>(*cumLogProbs);
+    bh.outputIdsCBA = bufferCast<TokenIdType>(*outputIdsCBA);
+    bh.sequenceLengthsCBA = bufferCast<SizeType32>(*sequenceLengthsCBA);
+    bh.cumLogProbsCBA = bufferCast<float>(*cumLogProbsCBA);
+    bh.normedScoresCBA = bufferCast<float>(*normedScoresCBA);
+    bh.numBeamsCBA = bufferCast<SizeType32>(*numBeamsCBA);
+    bh.batchDones = bufferCast<bool>(*batchDones);
+    bh.outputIdsUnfinish = bufferCast<TokenIdType>(*outputIdsUnfinish);
+    bh.parentIdsUnfinish = bufferCast<SizeType32>(*parentIdsUnfinish);
+
+    tk::invokeInsertUnfinishedPath(bh, stream->get());
+    tk::invokeFinalize(bh, stream->get());
+    stream->synchronize();
+
+    auto outputIdsResult = bufferManager->copyFrom(*outputIds, MemoryType::kCPU);
+    auto sequenceLengthsResult = bufferManager->copyFrom(*sequenceLengths, MemoryType::kCPU);
+    stream->synchronize();
+    auto const outputIdsPtr = bufferCast<TokenIdType>(*outputIdsResult);
+    auto const sequenceLengthsPtr = bufferCast<SizeType32>(*sequenceLengthsResult);
+
+    for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        SizeType32 const inputLength = inputLengthForBatch(batchIdx);
+        SizeType32 const sequenceLength = sequenceLengthForBatch(batchIdx);
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            EXPECT_EQ(sequenceLengthsPtr[batchIdx * beamWidth + beamIdx], sequenceLength);
+            SizeType32 selectedCbaIdx = 0;
+            if (beamWidth == 1)
+            {
+                selectedCbaIdx = 1;
+            }
+            else
+            {
+                selectedCbaIdx = beamIdx == 0 ? 4 : (beamIdx == 1 ? 5 : 1);
+            }
+
+            for (SizeType32 pos = 0; pos < sequenceLength; ++pos)
+            {
+                TokenIdType expected = promptToken(batchIdx, pos);
+                if (pos >= inputLength)
+                {
+                    if (selectedCbaIdx >= beamWidth)
+                    {
+                        expected = unfinishedToken(batchIdx, selectedCbaIdx - beamWidth, pos);
+                    }
+                    else
+                    {
+                        expected = cbaToken(batchIdx, selectedCbaIdx, pos);
+                    }
+                }
+                SizeType32 const dst = batchIdx * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
+                EXPECT_EQ(outputIdsPtr[dst], expected)
+                    << "batchIdx=" << batchIdx << ", beamIdx=" << beamIdx << ", pos=" << pos;
+            }
+        }
+    }
+}
+
+TEST(BeamHypothesesFinalizeTest, KeepsPromptPrefixFromUnfinishedIds)
+{
+    runFinalizeKeepsPromptPrefixFromUnfinishedIds(3);
+}
+
+TEST(BeamHypothesesFinalizeTest, KeepsPromptPrefixFromUnfinishedIdsBeamWidthOne)
+{
+    runFinalizeKeepsPromptPrefixFromUnfinishedIds(1);
+}
+
 /**
  * @brief Fills a slice of a tensor with data from a source array.
  *
@@ -317,6 +503,8 @@ void fillTensorAtIndex(ITensor::SharedPtr tensor, SizeType32 idx, std::vector<T>
     target = ITensor::slice(target, 0, insertLen);
     bufferManager->copy(src.data(), *target);
 }
+
+} // anonymous namespace
 
 class TestGatherTree : public ::testing::Test
 {
@@ -691,6 +879,182 @@ TEST_F(TestGatherTree, GatherTreeWithSwap)
 
     EXPECT_TRUE(checkResult());
 }
+
+// Test that generation logits are correctly reordered after gatherTree finalization.
+// Uses the same hardcoded beam search data as GatherTreeNoSwap, creates sentinel logits
+// where logits[slot][g][v] = slot (so we can verify which slot each beam's logits came from),
+// then runs the reorder algorithm and checks the result.
+TEST_F(TestGatherTree, GenerationLogitsReorder)
+{
+    // Compile-time proof that the fixture data causes beam reordering.
+    // hardcodeBuffersLen10: parentIds[slot=1][t=3] = 0 (row 1, col 3 of the parentIds table).
+    // Since 0 != 1, any beam trace through slot 1 at t=4 steps to slot 0 at t=3 — a concrete swap.
+    static constexpr SizeType32 kFixtureParentIds_slot1_t3 = 0;
+    static_assert(kFixtureParentIds_slot1_t3 != 1,
+        "parentIds[slot=1][t=3] must differ from slot 1 to guarantee a beam swap in this test");
+
+    createBuffers();
+    hardcodeBuffersLen10();
+    cudaDeviceSynchronize();
+    kernels::gatherTree(
+        mDecodingState->getJointDecodingOutput(), mDecodingState->getJointDecodingInput(), mSamplingConfig, *mStream);
+    cudaDeviceSynchronize();
+
+    // Verify gatherTree worked first
+    ASSERT_TRUE(checkResult());
+
+    // Now test the generation logits reordering algorithm.
+    // Copy ids, parentIds, gatheredIds, and seqLengths to host.
+    auto idsHost = mBufferManager->copyFrom(*mDecodingState->getIds(0), MemoryType::kCPU);
+    auto parentIdsHost = mBufferManager->copyFrom(*ITensor::at(mDecodingState->getParentIds(), {0}), MemoryType::kCPU);
+    auto gatheredIdsHost = mBufferManager->copyFrom(*mDecodingState->getGatheredIds(0), MemoryType::kCPU);
+    auto seqLengthsHost = mBufferManager->copyFrom(*mDecodingState->getSequenceLengths(0), MemoryType::kCPU);
+
+    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
+    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
+    auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
+    auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
+
+    SizeType32 constexpr promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
+    SizeType32 constexpr vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
+    SizeType32 const maxNewTokens = maxSeqLen - promptLen;
+
+    // Populate sentinel logits: for each (pre-reassignment slot, gen step), place a 1.0f
+    // at the selected token position. All other entries stay 0. After correct reordering,
+    // logits[beam][g][gatheredToken] should be positive (the sentinel landed at the right place).
+    std::vector<float> logits(static_cast<size_t>(beamWidth) * maxNewTokens * vocabSizePadded, 0.0f);
+    for (SizeType32 postSlot = 0; postSlot < beamWidth; ++postSlot)
+    {
+        auto const genLen = seqLengthsData[postSlot] - promptLen;
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            SizeType32 const t = promptLen + g;
+            SizeType32 const preSlot = parentIdsData[postSlot * maxSeqLen + t];
+            TokenIdType const token = idsData[postSlot * maxSeqLen + t];
+            logits[static_cast<size_t>(preSlot * maxNewTokens + g) * vocabSizePadded + token] = 1.0f;
+        }
+    }
+
+    // Build slot trace and reorder (same algorithm as reorderGenerationLogitsForBeamSearch)
+    std::vector<std::vector<SizeType32>> slotTrace(beamWidth, std::vector<SizeType32>(maxNewTokens, 0));
+
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const seqLen = seqLengthsData[beam];
+        auto const genLen = seqLen - promptLen;
+        if (genLen <= 0)
+        {
+            continue;
+        }
+
+        // Find starting slot by matching backtracked sequence
+        SizeType32 startSlot = -1;
+        for (SizeType32 s = 0; s < beamWidth; ++s)
+        {
+            SizeType32 slot = s;
+            bool matches = true;
+            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+            {
+                if (idsData[slot * maxSeqLen + t] != gatheredIdsData[beam * maxSeqLen + t])
+                {
+                    matches = false;
+                    break;
+                }
+                if (t > promptLen)
+                {
+                    slot = parentIdsData[slot * maxSeqLen + t];
+                }
+            }
+            if (matches)
+            {
+                startSlot = s;
+                break;
+            }
+        }
+        ASSERT_GE(startSlot, 0) << "Could not find starting slot for beam " << beam;
+
+        // Build pre-reassignment slot trace in a single pass
+        SizeType32 slot = startSlot;
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+        {
+            slot = parentIdsData[slot * maxSeqLen + t];
+            slotTrace[beam][t - promptLen] = slot;
+        }
+    }
+
+    // Reorder logits using a temp buffer (same approach as the production code)
+    auto const stepSize = static_cast<size_t>(vocabSizePadded) * sizeof(float);
+    std::vector<float> temp(beamWidth * vocabSizePadded);
+    auto* logitsPtr = reinterpret_cast<uint8_t*>(logits.data());
+    auto* tempPtr = reinterpret_cast<uint8_t*>(temp.data());
+
+    std::vector<SizeType32> genLens(beamWidth);
+    SizeType32 maxGenLen = 0;
+    for (SizeType32 b = 0; b < beamWidth; ++b)
+    {
+        genLens[b] = std::max(SizeType32{0}, seqLengthsData[b] - promptLen);
+        maxGenLen = std::max(maxGenLen, genLens[b]);
+    }
+
+    for (SizeType32 g = 0; g < maxGenLen; ++g)
+    {
+        bool stepNeedsReorder = false;
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g < genLens[b] && slotTrace[b][g] != b)
+            {
+                stepNeedsReorder = true;
+                break;
+            }
+        }
+        if (!stepNeedsReorder)
+        {
+            continue;
+        }
+
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
+        }
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g >= genLens[b])
+            {
+                continue;
+            }
+            auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            auto const srcSlot = slotTrace[b][g];
+            std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
+        }
+    }
+
+    // Cross-check: after reorder, logits[beam][g][gatheredToken] should equal the 1.0f sentinel
+    // placed there during population. This is non-tautological: gatheredIdsData is produced
+    // independently by gatherTree tracing through parentIds, while the logits were reordered via
+    // the slot trace. A wrong slot's logits would have 0.0f at this position.
+    bool allCorrect = true;
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const genLen = genLens[beam];
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            TokenIdType const gatheredToken = gatheredIdsData[beam * maxSeqLen + (promptLen + g)];
+            float const logitAtGatheredToken
+                = logits[static_cast<size_t>(beam * maxNewTokens + g) * vocabSizePadded + gatheredToken];
+            if (logitAtGatheredToken != 1.0f)
+            {
+                TLLM_LOG_ERROR("Beam %d, step %d: logit at gathered token %d is %.1f, expected 1.0", beam, g,
+                    gatheredToken, logitAtGatheredToken);
+                allCorrect = false;
+            }
+        }
+    }
+    EXPECT_TRUE(allCorrect);
+}
+
+namespace
+{
 
 enum AcceptKernelMode
 {

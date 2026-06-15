@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import unittest
 from dataclasses import dataclass
 from unittest.mock import Mock
@@ -6,7 +9,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -188,6 +191,96 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             self.assertEqual(
                 kv_cache_manager.get_num_free_blocks() + new_dummy_block,
                 pages_before)
+
+        kv_cache_manager.shutdown()
+
+    def test_pad_batch_strips_cudagraph_dummies_on_clean_exit(self) -> None:
+        # Regression guard for the invariant that CUDAGraphRunner.pad_batch's
+        # `finally` strips every is_cuda_graph_dummy=True entry from
+        # scheduled_requests.generation_requests before the `with` block
+        # exits. Downstream consumers of scheduled_batch.generation_requests
+        # — including the per-iteration stats populate block in
+        # PyExecutor._update_iter_stats — rely on never observing
+        # cudagraph dummies.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # batch_size=5 rounds up to 8 (nearest captured graph size in the
+        # fixture config) -> padding_size=3, deterministically.
+        real_batch_size = 5
+        max_seq_len = 1
+        real_requests = [
+            _create_request(max_seq_len, i) for i in range(real_batch_size)
+        ]
+        real_ids = [id(r) for r in real_requests]
+
+        batch = ScheduledRequests()
+        batch.generation_requests = list(real_requests)
+
+        with model_engine.cuda_graph_runner.pad_batch(
+                batch, resource_manager) as padded_batch:
+            # Positive assertion that padding actually fired — guards
+            # against a vacuous pass where padding was a no-op.
+            self.assertGreater(
+                len(padded_batch.generation_requests), real_batch_size,
+                "padding did not fire; fixture config may have drifted "
+                "so that 5 no longer rounds up to 8")
+            # Every appended entry past the original count is a
+            # cudagraph-flagged dummy.
+            for req in padded_batch.generation_requests[real_batch_size:]:
+                self.assertTrue(
+                    getattr(req, "is_cuda_graph_dummy", False),
+                    "pad_batch appended a request without "
+                    "is_cuda_graph_dummy=True")
+            # Real requests' identities and order are untouched.
+            self.assertEqual([
+                id(r)
+                for r in padded_batch.generation_requests[:real_batch_size]
+            ], real_ids)
+
+        # After the with-block: finally must have sliced off the padding.
+        self.assertEqual(
+            len(batch.generation_requests), real_batch_size,
+            "pad_batch.finally did not strip cudagraph dummies — "
+            "downstream consumers of scheduled_batch.generation_requests "
+            "would observe the leaked dummies")
+        for req in batch.generation_requests:
+            self.assertFalse(
+                getattr(req, "is_cuda_graph_dummy", False),
+                "cudagraph dummy leaked out of pad_batch's finally")
+
+        kv_cache_manager.shutdown()
+
+    def test_pad_batch_strips_cudagraph_dummies_on_exception(self) -> None:
+        # The strip must fire even when the body raises. This is the
+        # critical property of `finally` vs. a plain trailing statement —
+        # it guards the invariant on the error path. A refactor that
+        # accidentally dropped the `finally` would be caught here but not
+        # by the clean-exit variant.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        real_batch_size = 5
+        real_requests = [_create_request(1, i) for i in range(real_batch_size)]
+
+        batch = ScheduledRequests()
+        batch.generation_requests = list(real_requests)
+
+        class _ForwardBoom(Exception):
+            pass
+
+        with self.assertRaises(_ForwardBoom):
+            with model_engine.cuda_graph_runner.pad_batch(
+                    batch, resource_manager) as padded_batch:
+                self.assertGreater(len(padded_batch.generation_requests),
+                                   real_batch_size)
+                raise _ForwardBoom()
+
+        self.assertEqual(len(batch.generation_requests), real_batch_size)
+        for req in batch.generation_requests:
+            self.assertFalse(getattr(req, "is_cuda_graph_dummy", False))
 
         kv_cache_manager.shutdown()
 
@@ -472,6 +565,91 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                    'seq_lens') and attn_metadata.seq_lens is not None:
             actual_seq_lens = attn_metadata.seq_lens.cpu().tolist()
             self.assertEqual(actual_seq_lens, expected_seq_lens)
+
+    def test_prepare_tp_inputs_with_partial_mrope_segments(self) -> None:
+        """Test generation-only MRoPE assembly with a real multimodal span and a dummy padded request."""
+        llm_args = TorchLlmArgs(model="dummy")
+        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
+        model_engine.model.model_config.pretrained_config.rope_scaling = {
+            "type": "mrope"
+        }
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_config = KvCacheConfig(max_tokens=32)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=16,
+            head_dim=16,
+            tokens_per_block=1,
+            max_seq_len=32,
+            max_batch_size=4,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=32,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        model_engine.max_num_tokens = 32
+        model_engine.input_ids_cuda = torch.zeros(32,
+                                                  dtype=torch.int32,
+                                                  device='cuda')
+        model_engine.position_ids_cuda = torch.zeros(32,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+        model_engine.mrope_position_ids_cuda = torch.zeros((3, 1, 32),
+                                                           dtype=torch.int32,
+                                                           device='cuda')
+        model_engine.previous_batch_indices_cuda = torch.zeros(
+            32, dtype=torch.int32, device='cuda')
+
+        multimodal_request = _create_request(4, 1)
+        multimodal_request.py_prompt_len = 4
+        multimodal_request.py_batch_idx = None
+        multimodal_request.py_seq_slot = 0
+        multimodal_request.sampling_config.beam_width = 1
+        multimodal_request.py_multimodal_data = {
+            "mrope_config": {
+                "mrope_position_deltas": torch.tensor([[10]], dtype=torch.int32)
+            },
+            "multimodal_embedding": torch.ones((1, 1), dtype=torch.float16),
+        }
+
+        dummy_request = _create_request(6, 2)
+        dummy_request.py_prompt_len = 6
+        dummy_request.py_batch_idx = None
+        dummy_request.py_seq_slot = 1
+        dummy_request.sampling_config.beam_width = 1
+        dummy_request.py_multimodal_data = {}
+        dummy_request.is_cuda_graph_dummy = True
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = [
+            multimodal_request, dummy_request
+        ]
+
+        result, _ = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 2))
+        expected = torch.tensor([[[13, 5]], [[13, 5]], [[13, 5]]],
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertNotIn("multimodal_embedding",
+                         multimodal_request.py_multimodal_data)
+        kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):
         """Test that KVCacheManager uses the provided execution_stream.

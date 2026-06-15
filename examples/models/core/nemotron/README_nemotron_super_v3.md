@@ -143,7 +143,7 @@ kv_cache_config:
   mamba_ssm_philox_rounds: 5
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 5
+  max_draft_len: 5
   allow_advanced_sampling: true
 cuda_graph_config:
   max_batch_size: 64
@@ -200,4 +200,4 @@ Key options:
 # Notes
 
 * prefix-cache is not supported for Nemotron Super V3 yet, so please set `enable_block_reuse: false` when launching a server.
-* For detailed deployment instructions, see the [deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.md).
+* For detailed deployment instructions, see the [deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.md).

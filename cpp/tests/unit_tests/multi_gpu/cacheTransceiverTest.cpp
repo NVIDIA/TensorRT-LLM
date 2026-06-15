@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -215,15 +216,14 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
-            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
-            dataType, sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, CacheType::kSELF,
+            mMaxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dataType,
+            sinkTokenLength, stream, maxAttentionWindow, maxAttentionWindow, enableBlockReuse, CacheType::kSELF,
             std::nullopt, nullptr, true);
         auto attentionLayerNumPerPP = std::vector<SizeType32>{numLayers};
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
@@ -333,7 +333,8 @@ protected:
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -347,11 +348,11 @@ protected:
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
             }
-            mFutures.emplace_back(mSender->sendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->sendAsync(llmRequest));
         }
         else
         {
-            auto future = mRequester->receiveAsync(*llmRequest);
+            auto future = mRequester->receiveAsync(llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -408,6 +409,7 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     mFutures.clear();
     for (auto& request : requests)
     {
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
         mManager->removeSequence(request->mRequestId, request);
     }
     requests.clear();
@@ -446,13 +448,11 @@ struct CPMetaData
         mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
         mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(
             cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
-        mSeqLenOnThisCPRank = totalSeqLen;
+        // For round-robin distribution of blocks among CP ranks, the last block (which may have padded tokens)
+        // belongs to the CP rank with index (mTotalNumBlocksAcrossCPRanks - 1) % cpSize.
         int numPaddedTokensLastBlock = 0;
-        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(),
-            "Round-robin block distribution for CP needs further adjustments.");
-        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of
-        // blocks.
-        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0)
+        int const lastBlockOwnerCPRank = (mTotalNumBlocksAcrossCPRanks - 1) % cpSize;
+        if (cpRank == lastBlockOwnerCPRank && totalSeqLen % numTokensPerBlock != 0)
         {
             numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
         }
@@ -460,20 +460,21 @@ struct CPMetaData
         mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
         for (int i = 0; i < mNumBlocksThisCPRank; i++)
         {
-            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(
-                i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+            // Round-robin distribution: localBlockIdx i on cpRank maps to global blockId (i * cpSize + cpRank).
+            mGlobalBlockIds[i] = i * cpSize + cpRank;
         }
     }
 };
 
 struct WrappedLlmRequest
 {
-    std::unique_ptr<LlmRequest> mLlmRequest;
+    // shared_ptr to match CacheSender::sendAsync / CacheReceiver::receiveAsync signatures.
+    std::shared_ptr<LlmRequest> mLlmRequest;
     std::optional<CPMetaData> mCPMetaData;
 
     using RequestIdType = LlmRequest::RequestIdType;
 
-    WrappedLlmRequest(std::unique_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
+    WrappedLlmRequest(std::shared_ptr<LlmRequest> llmRequest, std::optional<CPMetaData> cpMetaData)
         : mLlmRequest(std::move(llmRequest))
         , mCPMetaData(std::move(cpMetaData))
     {
@@ -649,7 +650,6 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = false;
-        auto constexpr onboardBlocks = true;
         CacheType cacheType = CacheType::kSELF;
         if (kvFactor == 1)
         {
@@ -689,10 +689,11 @@ protected:
         }
         TLLM_LOG_DEBUG(" cacheManager isWindowAttention: %d", mIsWindowAttention);
         mManager = std::make_unique<KVCacheManager>(layerNumthisRank, numHeadsPerRank, sizePerHead, tokensPerBlock,
-            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, std::nullopt, dataType,
-            sinkTokenLength, stream, maxNumTokens, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr,
-            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
-            /*enableIndexerKCache=*/isIndexerKCache, /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
+            blocksPerWindow, mMaxNumSequences, maxBeamWidth, maxAttentionWindowVec, dataType, sinkTokenLength, stream,
+            maxAttentionWindow, maxAttentionWindow, enableBlockReuse, cacheType, std::nullopt, nullptr,
+            /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
+            /*kvCacheConnectorManager=*/nullptr, /*enableIndexerKCache=*/isIndexerKCache,
+            /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
             /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
@@ -887,7 +888,7 @@ protected:
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_unique<LlmRequest>(mRequestId++, std::move(request));
+        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -919,7 +920,7 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_unique<LlmRequest>(requestId, std::move(request));
+        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
 
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
@@ -929,7 +930,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
 
         int const numPools = mManager->getBlockManager().getNumPools(
@@ -972,7 +974,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mSender->sendAsync(*llmRequest);
+        auto future = mSender->sendAsync(llmRequest);
         return future;
     }
 
@@ -981,8 +983,9 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        return mRequester->receiveAsync(*llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
+        return mRequester->receiveAsync(llmRequest);
     }
 
     void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)
@@ -1084,8 +1087,10 @@ protected:
         {
             TLLM_CHECK(mCacheState->getIndexerKCacheQuantBlockSize() != 0);
             TLLM_CHECK(mCacheState->getIndexerDimPerHead() % mCacheState->getIndexerKCacheQuantBlockSize() == 0);
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1178,8 +1183,10 @@ protected:
         int sizePerHead;
         if (isIndexerKCache)
         {
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1406,6 +1413,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
             }
             for (auto&& request : requests)
             {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
                 mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
             }
             requests.clear();

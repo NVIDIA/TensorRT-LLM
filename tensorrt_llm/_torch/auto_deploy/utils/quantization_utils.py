@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from fnmatch import fnmatch
 from typing import Dict, Optional, Tuple, Union
 
@@ -18,9 +21,61 @@ from .node_utils import (
 )
 
 try:
-    from ....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
+
+
+FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, dtype_name, None)) is not None
+)
+
+
+def ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
+    """Re-apply TMA-aligned column-major layout to a torch.int scale tensor.
+
+    torch.cat always produces contiguous (row-major) output, which violates
+    DeepGEMM's stride(-2) == 1 requirement. This function re-creates the
+    column-major layout.
+
+    Only affects Blackwell + DeepGEMM: post_load_hook converts scales to
+    UE8M0 (torch.int) col-major only in that configuration. On other GPUs
+    or without DeepGEMM, scales remain torch.float and this is a no-op.
+    """
+    if t.dtype != torch.int:
+        return t  # Not UE8M0
+    # Both stride(-2) and stride(-1) must match the col-major TMA-aligned
+    # layout DeepGEMM expects. When size(-1) == 1, a row-major contiguous
+    # tensor has stride(-2) == 1 too, so checking stride(-2) alone would
+    # incorrectly short-circuit and leave stride(-1) un-aligned.
+    expected_inner = ((t.size(-2) + 3) // 4) * 4
+    if t.stride(-2) == 1 and t.stride(-1) == expected_inner:
+        return t  # Already column-major and TMA-aligned
+
+    remove_dim = False
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+        remove_dim = True
+
+    b, mn, k = t.shape
+    # TMA alignment: 16 bytes / 4 bytes per int32 = 4 elements
+    aligned_mn = ((mn + 3) // 4) * 4
+
+    # Create column-major buffer via transpose trick (same as get_col_major_tma_aligned_packed_tensor)
+    col_major = torch.transpose(
+        torch.empty((b, k, aligned_mn), device=t.device, dtype=torch.int), 1, 2
+    )
+    col_major[:, :mn, :] = t
+    result = col_major[:, :mn, :]
+
+    return result.squeeze(0) if remove_dim else result
 
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:

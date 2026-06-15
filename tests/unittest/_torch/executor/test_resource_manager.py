@@ -19,6 +19,8 @@ from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
+from tensorrt_llm.bindings.internal.testing import \
+    simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -732,7 +734,6 @@ class TestResourceManager(unittest.TestCase):
         global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                               event_buffer_max_size=1024,
                                               enable_block_reuse=True,
-                                              onboard_blocks=True,
                                               max_tokens=256)
 
         kv_cache_manager = KVCacheManager(
@@ -750,18 +751,19 @@ class TestResourceManager(unittest.TestCase):
 
         # First request: Add sequence and store blocks for reuse
         req1 = self.create_llm_request(0, [1, 2, 3, 4, 5])
-        kv_cache_manager.impl.add_sequence(req1.py_request_id, req1.prompt_len,
-                                           1, req1)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(req1.py_request_id, req1.prompt_len, 1)], [req1])
 
         stats_initial = kv_cache_manager.get_kv_cache_stats()
         initial_reused_blocks = stats_initial.reused_blocks
 
+        simulate_prefill_completion_only_use_for_testing(req1)
         kv_cache_manager.free_resources(req1)
 
         # Second request with same tokens - should reuse blocks from the reuse tree
         req2 = self.create_llm_request(1, [1, 2, 3, 4, 5])
-        kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len,
-                                           1, req2)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(req2.py_request_id, req2.prompt_len, 1)], [req2])
 
         stats_after_reuse = kv_cache_manager.get_kv_cache_stats()
         self.assertGreater(
@@ -770,6 +772,7 @@ class TestResourceManager(unittest.TestCase):
             f"reused_blocks before: {initial_reused_blocks}, after: {stats_after_reuse.reused_blocks}"
         )
 
+        simulate_prefill_completion_only_use_for_testing(req2)
         kv_cache_manager.free_resources(req2)
 
         # Reset reuse state
@@ -779,8 +782,8 @@ class TestResourceManager(unittest.TestCase):
 
         # Third request with same tokens - should NOT reuse blocks after reset
         req3 = self.create_llm_request(2, [1, 2, 3, 4, 5])
-        kv_cache_manager.impl.add_sequence(req3.py_request_id, req3.prompt_len,
-                                           1, req3)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(req3.py_request_id, req3.prompt_len, 1)], [req3])
 
         stats_after_third = kv_cache_manager.get_kv_cache_stats()
         self.assertEqual(
@@ -788,6 +791,7 @@ class TestResourceManager(unittest.TestCase):
             f"Third request should NOT reuse blocks after reset. "
             f"reused_blocks after reset: {reused_blocks_after_reset}, after third request: {stats_after_third.reused_blocks}"
         )
+        simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
     def test_kv_cache_manager_with_execution_stream(self):

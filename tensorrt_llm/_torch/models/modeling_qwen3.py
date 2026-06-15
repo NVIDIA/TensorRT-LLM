@@ -56,8 +56,8 @@ class Qwen3Attention(QKNormRoPEAttention):
                 mrope_section=config.rope_scaling.get("mrope_section", None),
                 mrope_interleaved=config.rope_scaling.get(
                     "mrope_interleaved", False))
-            if config.rope_scaling.get("mrope_interleaved", False):
-                fuse_qk_norm_rope = False
+            # Interleaved mRoPE is now supported by the fused qk_norm_rope kernel
+            # (use_mrope path), so it no longer forces the unfused RoPE path.
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
@@ -121,6 +121,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             dtype=config.torch_dtype,
             overridden_tp_size=1 if self.enable_attention_dp else None,
             config=model_config,
+            layer_idx=layer_idx,
         )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,

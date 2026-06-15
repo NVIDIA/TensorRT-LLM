@@ -10,7 +10,8 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
-from .mamba_cache_manager import MambaCacheManager
+from .mamba_cache_manager import (BaseMambaCacheManager,
+                                  CppMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -36,7 +37,7 @@ def create_kv_cache_transceiver(
         kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[MambaCacheManager] = None):
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
@@ -80,12 +81,11 @@ def create_kv_cache_transceiver(
                 f"got {cache_transceiver_config.backend}. "
                 f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
             )
-        from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
-            PyNativeCacheTransceiver
-        logger.info("Using PyNativeCacheTransceiver")
-        return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
-                                        attention_type,
-                                        cache_transceiver_config)
+        from tensorrt_llm._torch.disaggregation.transceiver import \
+            KvCacheTransceiverV2
+        logger.info("Using KvCacheTransceiverV2")
+        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                    cache_transceiver_config)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
@@ -141,6 +141,9 @@ class KvCacheTransceiver(ABC):
         """
         ...
 
+    def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
+        """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 
@@ -153,30 +156,48 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  kv_cache_manager: KVCacheManager,
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
-                 mamba_cache_manager: Optional[MambaCacheManager] = None):
+                 mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
         world_config = mapping_to_world_config(mapping)
-        total_num_kv_heads_per_layer = kv_cache_manager.total_num_kv_heads_per_layer
+        # Filter out mamba/recurrent state layers (kv_heads == 0) so that
+        # CacheState::ModelConfig::mNbKvHeadsPerLayer only contains attention
+        # layers — matching the factory path (modelConfig.getNumKvHeadsPerLayer()).
+        # This is critical: splitKVCacheDispatch uses mNbKvHeadsPerLayer.size()
+        # as the layer count for the CUDA kernel grid dimension.
+        total_num_kv_heads_per_layer = [
+            h for h in kv_cache_manager.total_num_kv_heads_per_layer if h > 0
+        ]
         head_dim = kv_cache_manager.head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         dtype = kv_cache_manager.dtype
-        # get the layer num per pp rank, which is required by cache transceiver.
-        pp_layer_num = len(kv_cache_manager.pp_layers)
+        # Get the *attention* layer count per PP rank (C++ uses this as
+        # mAttentionLayerNumPerPP).  For CppMambaHybridCacheManager the local
+        # pp_layers list includes mamba layers (kv_heads == 0); those must be
+        # excluded so the C++ buffer-size calculations stay correct.
+        pp_layer_num = sum(1 for h in kv_cache_manager.num_kv_heads_per_layer
+                           if h > 0)
         pp_layer_num_per_pp_rank = dist.pp_allgather(pp_layer_num)
 
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.kv_transfer_sender_future_timeout_ms = cache_transceiver_config.kv_transfer_sender_future_timeout_ms
 
-        # Get RNN state manager and layer distribution if mamba_cache_manager is provided
+        # Get RNN state manager and layer distribution if mamba_cache_manager is provided.
         rnn_state_manager = None
         rnn_layer_num_per_pp_rank = []
         if mamba_cache_manager is not None:
-            rnn_state_manager = mamba_cache_manager._impl.mamba_impl
-            # Get the number of local RNN layers and allgather across PP ranks
-            rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
-            rnn_layer_num_per_pp_rank = dist.pp_allgather(rnn_local_layer_num)
-            logger.info(
-                f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
-            )
+            if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
+                # Unified pool path: RNN model config is in LinearAttentionMetadata,
+                # C++ reads it from BlockManager during CacheTransceiver construction.
+                rnn_layer_num_per_pp_rank = dist.pp_allgather(
+                    mamba_cache_manager.local_num_mamba_layers)
+            else:
+                rnn_state_manager = mamba_cache_manager._impl.mamba_impl
+                # Get the number of local RNN layers and allgather across PP ranks
+                rnn_local_layer_num = rnn_state_manager.get_num_local_layers()
+                rnn_layer_num_per_pp_rank = dist.pp_allgather(
+                    rnn_local_layer_num)
+                logger.info(
+                    f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
+                )
 
         self.impl = CacheTransceiverCpp(
             kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
@@ -207,7 +228,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         return self.impl.cancel_request(req)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        raise NotImplementedError
+        # not implemented, an empty placeholder to allow being invoked unconditionally
+        ...
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response

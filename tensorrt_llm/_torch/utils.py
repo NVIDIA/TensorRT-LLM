@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import os
 import threading
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ aux_stream_name_list = [
     'MoeChunkingOverlap',
     'MoeBalancer',
     'MoeOutputMemset',
+    'MoeFc2Alpha',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -296,6 +298,16 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return tuple(num_token_buckets[::-1])
 
 
+def deep_gemm_gen_tuning_buckets(x: int):
+    buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
+    if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
+        buckets += tuple(range(128, x, 128))
+    return buckets
+
+
 def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     """Calculate the dimensions of the fp4 scale tensor.
     """
@@ -411,6 +423,19 @@ def maybe_compile(func=None, **compile_kwargs):
         return wrapper
 
     return decorator(func) if func else decorator
+
+
+# This decorator selectively disables inference_mode() to avoid conflicts with torch.dynamo tracing.
+def inference_mode_unless_compiling(func):
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def split(x: torch.Tensor,

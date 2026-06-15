@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 import torch
 from _graph_test_helpers import run_test_transformed_gm
@@ -107,3 +121,30 @@ def test_rmsnorm_fusion_nemotron_h():
     # Only the triton backend supports the nemotron h rmsnorm
     model = TestModel(eps=1e-6, use_nemotron_h=True)
     _run_test(model, torch.ops.auto_deploy.triton_rms_norm, variant="triton")
+
+
+def test_fuse_rmsnorm_preserves_node_metadata():
+    model = TestModel(eps=1e-6)
+    x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
+    dynamic_shapes = {0: Dim.DYNAMIC}
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
+            "fuse_rmsnorm": {
+                "stage": "post_load_fusion",
+                "gated_rmsnorm_backend": "triton",
+                "rmsnorm_backend": "flashinfer",
+            },
+        },
+    )(None, gm)
+
+    rms_nodes = [
+        n for n in gm_transformed.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm)
+    ]
+    assert len(rms_nodes) >= 1
+    assert all("val" in n.meta and hasattr(n.meta["val"], "dtype") for n in rms_nodes)

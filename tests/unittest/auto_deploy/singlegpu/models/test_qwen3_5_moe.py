@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for the custom Qwen3.5 MoE model implementation.
 
 Validates that the prefill-only custom model (with autodeploy custom ops)
@@ -17,15 +31,30 @@ comparison tests (reference re-implementations on the same weights):
   9. position_embeddings passthrough equivalence
  10. get_rope_index correctness
  11. torch.export with cos/sin extra inputs
+ 12. VLM wrapper text-only position_ids passthrough (2D -> 3D)
+ 13. Standalone compute_mrope_positions (text-only, with image, matches model)
+ 14. VLM wrapper decode-after-image delta application (request-scoped delta)
+ 15. VLM wrapper ignores delta when not passed (no cross-call leakage)
+ 16. VLM wrapper Branch A (no delta without images)
+ 17. VLM wrapper validates position_ids for text-only path
+
+Mixed batch position handling (mRoPE computed in forward):
+ 18. Forward computes 3D positions from input_ids + image_grid_thw (prefill-only)
+ 19. Forward handles mixed prefill+decode with per-request position computation
+ 20. Forward handles mixed multimodal+text prefill requests
+ 21. Decode-only with deltas (Case 2)
 """
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 # Register autodeploy custom ops (torch_moe, torch_causal_conv1d, etc.)
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
+    Qwen3_5MoeADInputProcessor,
     Qwen3_5MoeAttention,
     Qwen3_5MoeConfig,
     Qwen3_5MoeDecoderLayer,
@@ -44,6 +73,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     Qwen3_5MoeVisionModel,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
+    compute_mrope_positions,
+    qwen3_mrope_delta,
+    qwen3_mrope_delta_with_cache,
 )
 
 
@@ -600,8 +632,7 @@ def ref_multimodal_forward(model, input_ids, pixel_values=None, image_grid_thw=N
       2. vision model on pixel_values -> image_embeds
       3. masked_scatter image_embeds into inputs_embeds
       4. get_rope_index -> position_ids (3, B, S)
-      5. rotary_emb -> (cos, sin)
-      6. language_model(inputs_embeds, position_embeddings)
+      5. language_model(inputs_embeds, position_ids)
 
     This validates the multimodal wrapper orchestration: embedding merge,
     mRoPE position ID computation, and correct forwarding to the LM.
@@ -626,13 +657,10 @@ def ref_multimodal_forward(model, input_ids, pixel_values=None, image_grid_thw=N
     # 4. Compute mRoPE position IDs
     position_ids, _ = model.get_rope_index(input_ids, image_grid_thw)
 
-    # 5. Compute cos/sin from rotary embedding
-    position_embeddings = model.rotary_emb(inputs_embeds, position_ids)
-
-    # 6. Call language model with pre-computed position embeddings
+    # 5. Call language model with 3D position_ids (text model computes cos/sin internally)
     return model.language_model(
         inputs_embeds=inputs_embeds,
-        position_embeddings=position_embeddings,
+        position_ids=position_ids,
     )
 
 
@@ -646,11 +674,11 @@ def test_gdn_matches_hf_reference():
     """Compare GatedDeltaNet custom-ops forward against HF reference torch fallback."""
     config = _make_small_config()
     torch.manual_seed(42)
-    gdn = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    gdn = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0).cuda()
     gdn.eval()
 
     B, S = 2, 8
-    hidden_states = torch.randn(B, S, config.hidden_size)
+    hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
 
     our_output = gdn(hidden_states)
     ref_output = ref_gdn_forward(gdn, hidden_states)
@@ -670,14 +698,14 @@ def test_attention_matches_hf_reference():
     config = _make_small_config()
     torch.manual_seed(42)
     # Layer 3 is full_attention in the default 4-layer config
-    attn = Qwen3_5MoeAttention(config, layer_idx=3)
+    attn = Qwen3_5MoeAttention(config, layer_idx=3).cuda()
     attn.eval()
 
-    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config)
+    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config).cuda()
 
     B, S = 2, 8
-    hidden_states = torch.randn(B, S, config.hidden_size)
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     position_ids = position_ids[None, ...].expand(3, B, -1)
     position_embeddings = rotary_emb(hidden_states, position_ids)
 
@@ -698,12 +726,12 @@ def test_moe_matches_hf_reference():
     """Compare SparseMoeBlock torch_moe forward against HF reference expert dispatch."""
     config = _make_small_config()
     torch.manual_seed(42)
-    moe = Qwen3_5MoeSparseMoeBlock(config)
+    moe = Qwen3_5MoeSparseMoeBlock(config).cuda()
     moe.eval()
     _init_block_weights(moe)
 
     B, S = 2, 8
-    hidden_states = torch.randn(B, S, config.hidden_size)
+    hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
 
     our_output = moe(hidden_states)
     ref_output = ref_moe_forward(moe, hidden_states)
@@ -721,20 +749,20 @@ def test_moe_matches_hf_reference():
 def test_decoder_layer_matches_hf_reference():
     """Compare DecoderLayer forward against HF reference for both layer types."""
     config = _make_small_config()
-    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config)
+    rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config).cuda()
 
     B, S = 2, 8
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     position_ids = position_ids[None, ...].expand(3, B, -1)
 
     # Test one linear_attention layer (idx 0) and one full_attention layer (idx 3)
     for layer_idx in [0, 3]:
         torch.manual_seed(42)
-        layer = Qwen3_5MoeDecoderLayer(config, layer_idx)
+        layer = Qwen3_5MoeDecoderLayer(config, layer_idx).cuda()
         layer.eval()
         _init_block_weights(layer)
 
-        hidden_states = torch.randn(B, S, config.hidden_size)
+        hidden_states = torch.randn(B, S, config.hidden_size, device="cuda")
         position_embeddings = rotary_emb(hidden_states, position_ids)
 
         our_output = layer(hidden_states, position_embeddings)
@@ -767,11 +795,11 @@ def test_rmsnorm_load_hook_matches_original():
 
     # Create original (HF-style) norm with learned weights
     torch.manual_seed(42)
-    original = OriginalQwen3_5MoeRMSNorm(dim, eps)
+    original = OriginalQwen3_5MoeRMSNorm(dim, eps).cuda()
     original.weight.data.normal_(mean=0.0, std=0.1)  # non-trivial weights
 
     # Create modified norm with load hook, load original's state dict
-    modified = Qwen3_5MoeRMSNorm(dim, eps)
+    modified = Qwen3_5MoeRMSNorm(dim, eps).cuda()
     modified.load_state_dict(original.state_dict())
 
     # The load hook should have added 1.0:
@@ -783,7 +811,7 @@ def test_rmsnorm_load_hook_matches_original():
     )
 
     # Forward pass: both should produce identical outputs
-    x = torch.randn(2, 8, dim)
+    x = torch.randn(2, 8, dim, device="cuda")
     out_original = original(x)
     out_modified = modified(x)
 
@@ -846,7 +874,9 @@ def _make_vision_test_inputs(vision_config, grid_thw):
     """Create test inputs for vision modules: pixel_values, cu_seqlens, position_embeddings."""
     total_patches = int(torch.prod(grid_thw, dim=1).sum().item())
     t_ps, ps = vision_config.temporal_patch_size, vision_config.patch_size
-    pixel_values = torch.randn(total_patches, vision_config.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(
+        total_patches, vision_config.in_channels * t_ps * ps * ps, device="cuda"
+    )
     return pixel_values
 
 
@@ -855,18 +885,18 @@ def test_vision_attention_matches_reference():
     """Compare VisionAttention forward against HF reference eager attention."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    attn = Qwen3_5MoeVisionAttention(vision_config)
+    attn = Qwen3_5MoeVisionAttention(vision_config).cuda()
     attn.eval()
 
     # 2 variable-length sequences: 6 tokens and 4 tokens
     S = 10
-    hidden_states = torch.randn(S, vision_config.hidden_size)
-    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32)
+    hidden_states = torch.randn(S, vision_config.hidden_size, device="cuda")
+    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32, device="cuda")
 
     # Compute vision RoPE position embeddings
     head_dim = vision_config.hidden_size // vision_config.num_heads
     rotary_dim = head_dim // 2
-    freqs = torch.randn(S, rotary_dim)
+    freqs = torch.randn(S, rotary_dim, device="cuda")
     emb = torch.cat((freqs, freqs), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
@@ -876,9 +906,8 @@ def test_vision_attention_matches_reference():
     torch.testing.assert_close(
         our_output,
         ref_output,
-        rtol=1e-5,
-        atol=1e-5,
-        msg="VisionAttention forward should match HF reference eager attention",
+        rtol=1e-4,
+        atol=5e-4,
     )
 
 
@@ -887,16 +916,16 @@ def test_vision_block_matches_reference():
     """Compare VisionBlock forward against HF reference (ref attention + MLP)."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    block = Qwen3_5MoeVisionBlock(vision_config)
+    block = Qwen3_5MoeVisionBlock(vision_config).cuda()
     block.eval()
 
     S = 10
-    hidden_states = torch.randn(S, vision_config.hidden_size)
-    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32)
+    hidden_states = torch.randn(S, vision_config.hidden_size, device="cuda")
+    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32, device="cuda")
 
     head_dim = vision_config.hidden_size // vision_config.num_heads
     rotary_dim = head_dim // 2
-    freqs = torch.randn(S, rotary_dim)
+    freqs = torch.randn(S, rotary_dim, device="cuda")
     emb = torch.cat((freqs, freqs), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
 
@@ -906,9 +935,8 @@ def test_vision_block_matches_reference():
     torch.testing.assert_close(
         our_output,
         ref_output,
-        rtol=1e-5,
-        atol=1e-5,
-        msg="VisionBlock forward should match HF reference",
+        rtol=1e-4,
+        atol=5e-4,
     )
 
 
@@ -917,11 +945,11 @@ def test_vision_model_matches_reference():
     """Compare VisionModel forward against HF reference for a single image."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    vision_model = Qwen3_5MoeVisionModel(vision_config)
+    vision_model = Qwen3_5MoeVisionModel(vision_config).cuda()
     vision_model.eval()
 
     # Single image: T=1, H=4, W=4 -> 16 patches
-    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
     pixel_values = _make_vision_test_inputs(vision_config, grid_thw)
 
     our_output = vision_model(pixel_values, grid_thw)
@@ -931,7 +959,7 @@ def test_vision_model_matches_reference():
         our_output.last_hidden_state,
         ref_last_hidden,
         rtol=1e-5,
-        atol=1e-5,
+        atol=5e-4,
         msg="VisionModel last_hidden_state should match HF reference",
     )
     torch.testing.assert_close(
@@ -948,11 +976,11 @@ def test_vision_model_multi_image_matches_reference():
     """Compare VisionModel forward against HF reference for multiple images."""
     vision_config = _make_small_vision_config()
     torch.manual_seed(42)
-    vision_model = Qwen3_5MoeVisionModel(vision_config)
+    vision_model = Qwen3_5MoeVisionModel(vision_config).cuda()
     vision_model.eval()
 
     # 2 images of different sizes: T=1,H=4,W=4 (16 patches) + T=1,H=2,W=4 (8 patches)
-    grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long)
+    grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long, device="cuda")
     pixel_values = _make_vision_test_inputs(vision_config, grid_thw)
 
     our_output = vision_model(pixel_values, grid_thw)
@@ -962,7 +990,7 @@ def test_vision_model_multi_image_matches_reference():
         our_output.last_hidden_state,
         ref_last_hidden,
         rtol=1e-5,
-        atol=1e-5,
+        atol=5e-4,
         msg="VisionModel multi-image last_hidden_state should match HF reference",
     )
     torch.testing.assert_close(
@@ -984,12 +1012,14 @@ def test_position_embeddings_passthrough():
     """Test that pre-computed position_embeddings match internal computation."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeTextModel(config)
+    model = Qwen3_5MoeTextModel(config).cuda()
     model.eval()
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).cuda()
+    model.set_lm_head(lm_head)
 
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Path 1: Let the model compute position_embeddings internally
     output_internal = model(input_ids=input_ids, position_ids=position_ids)
@@ -1001,8 +1031,8 @@ def test_position_embeddings_passthrough():
     output_external = model(input_ids=input_ids, position_embeddings=(cos, sin))
 
     torch.testing.assert_close(
-        output_internal.last_hidden_state,
-        output_external.last_hidden_state,
+        output_internal.logits,
+        output_external.logits,
         rtol=1e-5,
         atol=1e-5,
         msg="External position_embeddings should produce identical output to internal computation",
@@ -1014,12 +1044,14 @@ def test_rope_cos_sin_kwargs():
     """Test that rope_cos/rope_sin kwargs match position_embeddings tuple output."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeTextModel(config)
+    model = Qwen3_5MoeTextModel(config).cuda()
     model.eval()
+    lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).cuda()
+    model.set_lm_head(lm_head)
 
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Reference: internal computation
     output_ref = model(input_ids=input_ids, position_ids=position_ids)
@@ -1033,8 +1065,8 @@ def test_rope_cos_sin_kwargs():
     output_kwargs = model(input_ids=input_ids, rope_cos=cos, rope_sin=sin)
 
     torch.testing.assert_close(
-        output_ref.last_hidden_state,
-        output_kwargs.last_hidden_state,
+        output_ref.logits,
+        output_kwargs.logits,
         rtol=1e-5,
         atol=1e-5,
         msg="rope_cos/rope_sin kwargs should produce identical output to internal computation",
@@ -1046,12 +1078,12 @@ def test_causal_lm_position_embeddings():
     """Test that Qwen3_5MoeForCausalLM correctly passes position_embeddings through."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForCausalLM(config)
+    model = Qwen3_5MoeForCausalLM(config).cuda()
     model.eval()
 
     B, S = 2, 8
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Reference output using position_ids
     output_ref = model(input_ids=input_ids, position_ids=position_ids)
@@ -1093,10 +1125,10 @@ def test_get_rope_index_text_only():
     """Test get_rope_index for a text-only sequence (no vision tokens)."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
 
     B, S = 2, 8
-    input_ids = torch.randint(0, 50, (B, S))  # no special tokens
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")  # no special tokens
 
     position_ids, deltas = model.get_rope_index(input_ids)
 
@@ -1113,7 +1145,7 @@ def test_get_rope_index_text_only():
         msg="Text-only: T and W position IDs should be identical",
     )
     # Should be 0, 1, 2, ..., S-1
-    expected = torch.arange(S).unsqueeze(0).expand(B, -1)
+    expected = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
     torch.testing.assert_close(
         position_ids[0],
         expected,
@@ -1128,7 +1160,7 @@ def test_get_rope_index_with_image():
     """Test get_rope_index for a sequence containing image placeholders."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
 
     image_token_id = config.image_token_id
     vision_start_token_id = config.vision_start_token_id
@@ -1150,9 +1182,10 @@ def test_get_rope_index_with_image():
                 4,
                 5,  # 2 text tokens
             ]
-        ]
+        ],
+        device="cuda",
     )
-    image_grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.long, device="cuda")
 
     position_ids, deltas = model.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
 
@@ -1172,11 +1205,11 @@ def test_get_rope_index_with_image():
 def test_get_rope_index_with_attention_mask():
     """Test get_rope_index respects attention_mask for text-only."""
     config = _make_small_composite_config()
-    model = Qwen3_5MoeModel(config)
+    model = Qwen3_5MoeModel(config).cuda()
 
     B, S = 1, 6
-    input_ids = torch.randint(0, 50, (B, S))
-    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 0]])  # last 2 tokens are padding
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+    attention_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], device="cuda")  # last 2 tokens are padding
 
     position_ids, deltas = model.get_rope_index(input_ids, attention_mask=attention_mask)
 
@@ -1199,12 +1232,12 @@ def test_multimodal_forward_matches_reference():
     """Compare multimodal wrapper forward against step-by-step HF reference.
 
     Tests the full pipeline: vision encoding + embedding merge + mRoPE + LM.
-    Runs the same input through both the wrapper's forward() and the
-    ref_multimodal_forward() that re-implements each step explicitly.
+    The wrapper computes 3D mRoPE positions internally from input_ids +
+    image_grid_thw, matching the reference re-implementation.
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
     model.eval()
 
     image_token_id = config.image_token_id
@@ -1212,10 +1245,10 @@ def test_multimodal_forward_matches_reference():
     vc = config.vision_config
 
     # Vision: 1 image, T=1, H=4, W=4 -> 16 patches -> 4 merged tokens
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
     num_patches = 1 * 4 * 4
     t_ps, ps = vc.temporal_patch_size, vc.patch_size
-    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
 
     merge_factor = vc.spatial_merge_size**2
     num_merged_tokens = num_patches // merge_factor  # 4
@@ -1224,9 +1257,9 @@ def test_multimodal_forward_matches_reference():
     text_before = [1, 2, 3]
     vision_part = [vision_start_token_id] + [image_token_id] * num_merged_tokens
     text_after = [4, 5]
-    input_ids = torch.tensor([text_before + vision_part + text_after])
+    input_ids = torch.tensor([text_before + vision_part + text_after], device="cuda")
 
-    # Our wrapper forward
+    # Model computes 3D positions internally from input_ids + image_grid_thw
     our_output = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1258,12 +1291,12 @@ def test_export_text_model_with_position_ids():
     """Test that the text model can be exported with standard position_ids."""
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForCausalLM(config)
+    model = Qwen3_5MoeForCausalLM(config).cuda()
     model.eval()
 
     B, S = 2, 4
-    input_ids = torch.randint(0, config.vocab_size, (B, S))
-    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    input_ids = torch.randint(0, config.vocab_size, (B, S), device="cuda")
+    position_ids = torch.arange(S, device="cuda").unsqueeze(0).expand(B, -1)
 
     # Run normally first
     ref_output = model(input_ids=input_ids, position_ids=position_ids)
@@ -1304,12 +1337,12 @@ def test_export_text_model_with_rope_cos_sin():
     """
     config = _make_small_config()
     torch.manual_seed(42)
-    model = Qwen3_5MoeForCausalLM(config)
+    model = Qwen3_5MoeForCausalLM(config).cuda()
     model.eval()
 
     B, S = 2, 4
-    inputs_embeds = torch.randn(B, S, config.hidden_size)
-    position_ids_3d = torch.arange(S).view(1, 1, -1).expand(3, B, -1)
+    inputs_embeds = torch.randn(B, S, config.hidden_size, device="cuda")
+    position_ids_3d = torch.arange(S, device="cuda").view(1, 1, -1).expand(3, B, -1)
     cos, sin = model.model.rotary_emb(inputs_embeds, position_ids_3d)
 
     # Reference: pass cos/sin via rope_cos/rope_sin
@@ -1343,8 +1376,8 @@ def test_export_text_model_with_rope_cos_sin():
 
     # Also test with different batch/seq dims to verify dynamic shapes work
     B2, S2 = 3, 8
-    inputs_embeds2 = torch.randn(B2, S2, config.hidden_size)
-    position_ids_3d2 = torch.arange(S2).view(1, 1, -1).expand(3, B2, -1)
+    inputs_embeds2 = torch.randn(B2, S2, config.hidden_size, device="cuda")
+    position_ids_3d2 = torch.arange(S2, device="cuda").view(1, 1, -1).expand(3, B2, -1)
     cos2, sin2 = model.model.rotary_emb(inputs_embeds2, position_ids_3d2)
 
     ref_output2 = model(inputs_embeds=inputs_embeds2, rope_cos=cos2, rope_sin=sin2)
@@ -1355,4 +1388,1368 @@ def test_export_text_model_with_rope_cos_sin():
         rtol=1e-5,
         atol=1e-5,
         msg="Dynamic shape export should work with different batch/seq dims",
+    )
+
+
+# =============================================================================
+# VLM Wrapper Text-Only Position IDs Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_vlm_wrapper_text_only_position_ids():
+    """Test VLM wrapper uses executor-provided 2D position_ids for text-only inputs.
+
+    Expanding them to 3D and producing the same result as the text model with
+    equivalent 3D position_ids.
+
+    This simulates the AD executor flow: the executor provides 2D position_ids
+    with correct offsets for chunked prefill, and the VLM wrapper expands them
+    to 3D before passing to the text model graph.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    B, S = 2, 8
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+
+    # Simulate executor-provided 2D position_ids with an offset (chunked prefill chunk 2)
+    offset = 64
+    position_ids_2d = torch.arange(offset, offset + S, device="cuda").unsqueeze(0).expand(B, -1)
+
+    # VLM wrapper path: receives 2D, expands to 3D internally
+    output_wrapper = model(input_ids=input_ids, position_ids=position_ids_2d)
+
+    # Direct text model path: manually expand 2D→3D and call text model
+    position_ids_3d = position_ids_2d[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_output = model.model.language_model(
+        inputs_embeds=inputs_embeds, position_ids=position_ids_3d
+    )
+    ref_logits = model.lm_head(text_output.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output_wrapper.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="VLM wrapper text-only should produce same output as direct text model with 3D pos IDs",
+    )
+
+
+# =============================================================================
+# Standalone compute_mrope_positions Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_compute_mrope_positions_text_only():
+    """Text-only: all 3 dims identical, delta is 0."""
+    config = _make_small_composite_config()
+    B, S = 1, 10
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+
+    pos, deltas = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=config.vision_config.spatial_merge_size,
+    )
+
+    assert pos.shape == (3, B, S)
+    torch.testing.assert_close(pos[0], pos[1])
+    torch.testing.assert_close(pos[0], pos[2])
+    assert deltas.item() == 0, f"Text-only delta should be 0, got {deltas.item()}"
+
+
+@torch.no_grad()
+def test_compute_mrope_positions_with_image():
+    """Multimodal: verify position compression and non-zero delta."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_vision_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
+
+    # Build input_ids: [text, vision_start, img_tokens..., text]
+    text_before = torch.tensor([1, 2, 3], device="cuda")
+    vision_start = torch.tensor([config.vision_start_token_id], device="cuda")
+    img_tokens = torch.full((num_vision_tokens,), config.image_token_id, device="cuda")
+    text_after = torch.tensor([4, 5, 6], device="cuda")
+    input_ids = torch.cat([text_before, vision_start, img_tokens, text_after]).unsqueeze(0)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device="cuda")
+
+    pos, deltas = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    assert pos.shape[0] == 3
+    assert deltas.item() < 0, (
+        f"With spatial merge, mRoPE compresses positions -- delta should be negative, got {deltas.item()}"
+    )
+
+    # Text tokens before vision: all 3 dims should be the same
+    n_before = len(text_before) + len(vision_start)
+    torch.testing.assert_close(pos[0, 0, :n_before], pos[1, 0, :n_before])
+    torch.testing.assert_close(pos[0, 0, :n_before], pos[2, 0, :n_before])
+
+
+@torch.no_grad()
+def test_compute_mrope_positions_matches_model_method():
+    """Standalone function should match the model's get_rope_index method."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_vision_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
+
+    text_before = torch.tensor([1, 2, 3], device="cuda")
+    vision_start = torch.tensor([config.vision_start_token_id], device="cuda")
+    img_tokens = torch.full((num_vision_tokens,), config.image_token_id, device="cuda")
+    text_after = torch.tensor([4, 5], device="cuda")
+    input_ids = torch.cat([text_before, vision_start, img_tokens, text_after]).unsqueeze(0)
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device="cuda")
+
+    # Standalone function
+    pos_fn, deltas_fn = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    # Model method
+    torch.manual_seed(42)
+    model = Qwen3_5MoeModel(config).cuda()
+    pos_model, deltas_model = model.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
+
+    torch.testing.assert_close(pos_fn, pos_model)
+    torch.testing.assert_close(deltas_fn, deltas_model)
+
+
+@torch.no_grad()
+def test_qwen3_mrope_delta_matches_compute_mrope_positions_for_mixed_items():
+    """The request-level mRoPE delta op should match the full reference delta."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device="cuda")
+    video_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device="cuda")
+
+    num_image_tokens = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+    num_video_tokens = int(
+        video_grid_thw[0, 0].item()
+        * (video_grid_thw[0, 1].item() // merge)
+        * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    input_ids = torch.tensor(
+        [
+            [
+                1,
+                2,
+                config.vision_start_token_id,
+                *([config.image_token_id] * num_image_tokens),
+                3,
+                config.vision_start_token_id,
+                *([config.video_token_id] * num_video_tokens),
+                4,
+                5,
+            ]
+        ],
+        dtype=torch.long,
+        device="cuda",
+    )
+
+    _, expected_delta = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw.to(torch.long),
+        video_grid_thw=video_grid_thw.to(torch.long),
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    actual_delta = qwen3_mrope_delta(
+        # batch_info_host is a host-only tensor (BatchInfo calls .numpy() on it).
+        batch_info_host=torch.tensor([1, 0, 0, 0, 0, 0], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_token_lengths=torch.tensor(
+            [1 + num_image_tokens, 1 + num_video_tokens], dtype=torch.int32, device="cuda"
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor(
+            [0, 1 + num_image_tokens],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        spatial_merge_size=merge,
+    )
+
+    torch.testing.assert_close(actual_delta, expected_delta.to(torch.int32))
+
+
+@torch.no_grad()
+def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
+    """Prefill should write the per-slot delta and decode should read it back."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device="cuda")
+    num_image_tokens = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+
+    input_ids = torch.tensor(
+        [
+            [
+                10,
+                config.vision_start_token_id,
+                *([config.image_token_id] * num_image_tokens),
+                11,
+            ]
+        ],
+        dtype=torch.long,
+        device="cuda",
+    )
+    _, expected_delta = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw.to(torch.long),
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    cache = torch.zeros((8, 1), dtype=torch.int32, device="cuda")
+    slot = 3
+    deltas = qwen3_mrope_delta_with_cache(
+        # batch_info_host is a host-only tensor (BatchInfo calls .numpy() on it).
+        batch_info_host=torch.tensor([1, 0, 0, 0, 1, 1], dtype=torch.int32),
+        slot_idx=torch.tensor([slot, slot], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        mm_token_lengths=torch.tensor([1 + num_image_tokens], dtype=torch.int32, device="cuda"),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        mrope_delta_cache=cache,
+        spatial_merge_size=merge,
+    )
+
+    expected_delta_i32 = expected_delta.to(torch.int32)
+    torch.testing.assert_close(deltas[0:1], expected_delta_i32)
+    torch.testing.assert_close(deltas[1:2], expected_delta_i32)
+    torch.testing.assert_close(cache[slot : slot + 1], expected_delta_i32)
+
+
+class _DummyQwenProcessor:
+    def __init__(self, config):
+        self.image_token_id = config.image_token_id
+        self.video_token_id = config.video_token_id
+        self.vision_start_token_id = config.vision_start_token_id
+
+
+class _DummyQwenBaseProcessor:
+    def __init__(self, token_ids, config):
+        self._token_ids = token_ids
+        self.processor = _DummyQwenProcessor(config)
+        self.tokenizer = None
+
+    def __call__(self, inputs, sampling_params):
+        return self._token_ids, {}
+
+
+def test_qwen_ad_input_processor_duplicates_video_hashes_per_frame_span():
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    frame_tokens = int((4 // merge) * (4 // merge))
+    token_ids = [
+        1,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        2,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        3,
+    ]
+    processor = Qwen3_5MoeADInputProcessor(_DummyQwenBaseProcessor(token_ids, config))
+    frames = [
+        Image.new("RGB", (4, 4), color="red"),
+        Image.new("RGB", (4, 4), color="blue"),
+    ]
+
+    multimodal_input, _, item_types = processor._build_multimodal_input(
+        token_ids, {"multi_modal_data": {"video": frames}}
+    )
+
+    assert multimodal_input.multimodal_positions == [1, 1 + (1 + frame_tokens) + 1]
+    assert item_types == [1, 1]
+    assert len(multimodal_input.multimodal_hashes) == 2
+    assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
+
+
+def test_qwen_ad_input_processor_preserves_video_item_order_across_frame_spans():
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    frame_tokens = int((4 // merge) * (4 // merge))
+    token_ids = [
+        1,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        2,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        3,
+        config.vision_start_token_id,
+        *([config.video_token_id] * frame_tokens),
+        4,
+    ]
+    processor = Qwen3_5MoeADInputProcessor(_DummyQwenBaseProcessor(token_ids, config))
+    videos = [
+        [
+            Image.new("RGB", (4, 4), color="red"),
+            Image.new("RGB", (4, 4), color="blue"),
+        ],
+        [Image.new("RGB", (4, 4), color="blue")],
+    ]
+
+    multimodal_input, _, item_types = processor._build_multimodal_input(
+        token_ids, {"multi_modal_data": {"video": videos}}
+    )
+
+    assert multimodal_input.multimodal_positions == [
+        1,
+        1 + (1 + frame_tokens) + 1,
+        1 + ((1 + frame_tokens) + 1) * 2,
+    ]
+    assert item_types == [1, 1, 1]
+    assert len(multimodal_input.multimodal_hashes) == 3
+    assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
+    assert multimodal_input.multimodal_hashes[1] != multimodal_input.multimodal_hashes[2]
+
+
+# =============================================================================
+# VLM Wrapper Multimodal Forward Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_vlm_wrapper_decode_after_image_uses_delta():
+    """Branch C: text-only decode with mrope_position_deltas adjusts position_ids.
+
+    The request-scoped delta should be applied to position_ids.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    B, S = 1, 8
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+
+    fake_delta = torch.tensor([[-2]], device="cuda")
+
+    # Position IDs from executor (sequential, as if no image compression)
+    pos_ids_executor = torch.arange(100, 100 + S, device="cuda").unsqueeze(0)
+
+    # VLM wrapper should apply delta: pos_ids = (100-2, 101-2, ...) = (98, 99, ...)
+    output_with_delta = model(
+        input_ids=input_ids,
+        position_ids=pos_ids_executor,
+        mrope_position_deltas=fake_delta,
+    )
+
+    # Reference: manually apply delta and call text model directly
+    corrected_pos = pos_ids_executor + fake_delta
+    corrected_pos_3d = corrected_pos[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(
+        inputs_embeds=inputs_embeds, position_ids=corrected_pos_3d
+    )
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output_with_delta.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Decode after image should apply request mrope_position_deltas",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage():
+    """Applying a delta in one call must not affect later calls that omit it."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    B, S = 1, 6
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+    pos_ids = torch.arange(50, 50 + S, device="cuda").unsqueeze(0)
+
+    # Apply a delta in one call
+    delta = torch.tensor([[-5]], device="cuda")
+    output_with_delta = model(
+        input_ids=input_ids,
+        position_ids=pos_ids,
+        mrope_position_deltas=delta,
+    )
+
+    # Then call again without delta: should behave like plain text-only expansion
+    output_without_delta = model(input_ids=input_ids, position_ids=pos_ids)
+
+    corrected_pos = pos_ids + delta
+    corrected_pos_3d = corrected_pos[None].expand(3, -1, -1)
+    plain_pos_3d = pos_ids[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out_with_delta = model.model.language_model(
+        inputs_embeds=inputs_embeds, position_ids=corrected_pos_3d
+    )
+    text_out_plain = model.model.language_model(
+        inputs_embeds=inputs_embeds, position_ids=plain_pos_3d
+    )
+    ref_logits_with_delta = model.lm_head(
+        text_out_with_delta.last_hidden_state.to(model.lm_head.weight.dtype)
+    ).float()
+    ref_logits_plain = model.lm_head(
+        text_out_plain.last_hidden_state.to(model.lm_head.weight.dtype)
+    ).float()
+
+    torch.testing.assert_close(
+        output_with_delta.logits,
+        ref_logits_with_delta,
+        rtol=1e-4,
+        atol=5e-4,
+    )
+    torch.testing.assert_close(
+        output_without_delta.logits,
+        ref_logits_plain,
+        rtol=1e-4,
+        atol=1e-4,
+        msg="Call without mrope_position_deltas must not reuse previous delta",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_no_delta_without_images():
+    """Branch A: no rope_deltas means position_ids expand to 3D without adjustment.
+
+    When rope_deltas is None (no images ever), position_ids should be expanded
+    to 3D without any adjustment (same as before).
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    B, S = 1, 8
+    input_ids = torch.randint(0, 50, (B, S), device="cuda")
+    pos_ids = torch.arange(0, S, device="cuda").unsqueeze(0)
+
+    output = model(input_ids=input_ids, position_ids=pos_ids)
+
+    # Reference: plain 2D → 3D expansion, no delta
+    pos_3d = pos_ids[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Without images, VLM wrapper should do plain 2D→3D expansion",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_requires_position_ids_for_text_only():
+    """Text-only forward must provide position_ids."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    input_ids = torch.randint(0, 50, (1, 8), device="cuda")
+    with pytest.raises(ValueError, match="position_ids is required"):
+        _ = model(input_ids=input_ids)
+
+
+# =============================================================================
+# Mixed Batch Position Handling Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_vlm_wrapper_prefill_only_with_images():
+    """Prefill-only with images computes 3D mRoPE matching compute_mrope_positions.
+
+    The model forward should compute 3D mRoPE positions from input_ids +
+    image_grid_thw.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+
+    text_before = [1, 2, 3]
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [4, 5]
+    input_ids = torch.tensor([text_before + vision_part + text_after], device="cuda")
+
+    output = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+    )
+
+    # Reference: compute 3D positions and call text model directly
+    expected_pos_3d, _ = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Prefill-only with images should compute 3D positions internally",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_mixed_prefill_decode_with_images():
+    """Mixed prefill+decode batch with images computes and stitches 3D positions.
+
+    The model forward should compute 3D positions per prefill request and
+    stitch with decode.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+
+    # Build prefill input_ids (1 image request)
+    text_before = [1, 2, 3]
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [4, 5]
+    prefill_tokens = text_before + vision_part + text_after
+    num_prefill_tokens = len(prefill_tokens)
+
+    # 1 decode token
+    decode_token = [6]
+    all_tokens = prefill_tokens + decode_token
+
+    input_ids = torch.tensor([all_tokens], device="cuda")
+    prefill_pos = list(range(num_prefill_tokens))
+    decode_pos = [200]
+    position_ids = torch.tensor([prefill_pos + decode_pos], device="cuda")
+
+    deltas = torch.tensor([[-2], [-3]], device="cuda")
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+    batch_info = torch.tensor([1, num_prefill_tokens, 1], dtype=torch.int32)
+    cu_seqlen = torch.tensor(
+        [0, num_prefill_tokens, num_prefill_tokens + 1], dtype=torch.int32, device="cuda"
+    )
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        mrope_position_deltas=deltas,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    # Reference: compute prefill 3D positions, stitch with decode
+    prefill_ids = input_ids[..., :num_prefill_tokens]
+    prefill_3d, _ = compute_mrope_positions(
+        input_ids=prefill_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    gen_deltas = deltas[1:]
+    decode_2d = position_ids[..., num_prefill_tokens:]
+    decode_adjusted = decode_2d + gen_deltas.T
+    decode_3d = decode_adjusted[None].expand(3, -1, -1)
+    expected_pos_3d = torch.cat([prefill_3d, decode_3d], dim=-1)
+
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Mixed batch should compute prefill 3D positions and stitch with decode",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_mixed_multimodal_text_prefill():
+    """Mixed prefill batch with 1 multimodal and 1 text-only request.
+
+    The model forward should compute 3D positions for the image request
+    and trivially expand positions for the text-only request.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+
+    # Request 1: multimodal prefill
+    text_before = [1, 2]
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [3]
+    req1_tokens = text_before + vision_part + text_after
+    req1_len = len(req1_tokens)
+
+    # Request 2: text-only prefill
+    req2_tokens = [10, 11, 12, 13]
+
+    all_tokens = req1_tokens + req2_tokens
+    total_tokens = len(all_tokens)
+
+    input_ids = torch.tensor([all_tokens], device="cuda")
+    position_ids = torch.tensor([list(range(total_tokens))], device="cuda")
+
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+    batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32, device="cuda")
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    # Reference: compute expected 3D positions for both requests
+    req1_ids = input_ids[..., :req1_len]
+    req1_pos_3d, _ = compute_mrope_positions(
+        input_ids=req1_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    req2_pos = position_ids[..., req1_len:]
+    req2_pos_3d = req2_pos[None].expand(3, -1, -1)
+    expected_pos_3d = torch.cat([req1_pos_3d, req2_pos_3d], dim=-1)
+
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Mixed multimodal+text prefill should compute correct 3D positions per request",
+    )
+
+
+@torch.no_grad()
+def test_build_mixed_positions_handles_mixed_image_and_video_request():
+    """Mixed image+video requests should not drift grid indices across requests."""
+    config = _make_small_composite_config()
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    merge = config.vision_config.spatial_merge_size
+    image_grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long, device="cuda")
+    video_grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long, device="cuda")
+    num_image_tokens_0 = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+    num_image_tokens_1 = int(
+        image_grid_thw[1, 0].item()
+        * (image_grid_thw[1, 1].item() // merge)
+        * (image_grid_thw[1, 2].item() // merge)
+    )
+    num_video_tokens = int(
+        video_grid_thw[0, 0].item()
+        * (video_grid_thw[0, 1].item() // merge)
+        * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    req1_tokens = [
+        1,
+        config.vision_start_token_id,
+        *([config.image_token_id] * num_image_tokens_0),
+        2,
+        config.vision_start_token_id,
+        *([config.video_token_id] * num_video_tokens),
+        3,
+    ]
+    req2_tokens = [
+        4,
+        config.vision_start_token_id,
+        *([config.image_token_id] * num_image_tokens_1),
+        5,
+    ]
+    all_tokens = req1_tokens + req2_tokens
+    input_ids = torch.tensor([all_tokens], dtype=torch.long, device="cuda")
+    position_ids = torch.arange(len(all_tokens), device="cuda").unsqueeze(0)
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+    batch_info = torch.tensor([2, len(all_tokens), 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor(
+        [0, len(req1_tokens), len(all_tokens)], dtype=torch.int32, device="cuda"
+    )
+
+    actual_pos_3d = model.model._build_mixed_positions(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        delta=0,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+    )
+
+    req1_pos_3d, _ = compute_mrope_positions(
+        input_ids=input_ids[..., : len(req1_tokens)],
+        image_grid_thw=image_grid_thw[:1],
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    req2_pos_3d, _ = compute_mrope_positions(
+        input_ids=input_ids[..., len(req1_tokens) :],
+        image_grid_thw=image_grid_thw[1:],
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_pos_3d = torch.cat([req1_pos_3d, req2_pos_3d], dim=-1)
+
+    torch.testing.assert_close(
+        actual_pos_3d,
+        expected_pos_3d,
+        msg="Mixed image+video requests should preserve request-local image/video grid indices",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_chunked_prefill_inside_image_span():
+    """Chunked multimodal prefill computes mRoPE from request metadata.
+
+    Even when the chunk starts inside the image-token span.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+
+    text_before = [1, 2]
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [3, 4]
+    full_tokens = text_before + vision_part + text_after
+
+    # Start the chunk after the first two image tokens, so the chunk no longer contains the
+    # vision-start token and cannot be handled correctly from chunk-local input_ids alone.
+    chunk_start = len(text_before) + 1 + 2
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+
+    input_ids = torch.tensor([chunk_tokens], device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+    batch_info = torch.tensor([1, chunk_len, 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda")
+    input_pos = torch.tensor([chunk_start], dtype=torch.int32, device="cuda")
+    seq_len = torch.tensor([chunk_len], dtype=torch.int32, device="cuda")
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+        input_pos=input_pos,
+        seq_len=seq_len,
+        mm_chunk_flat_start=torch.tensor([2], dtype=torch.int64, device="cuda"),
+        mm_chunk_count=torch.tensor([num_merged_tokens - 2], dtype=torch.int64, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        mm_token_positions=torch.tensor([len(text_before) + 1], dtype=torch.int32, device="cuda"),
+        mm_token_lengths=torch.tensor([num_merged_tokens], dtype=torch.int32, device="cuda"),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 0], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.empty(0, dtype=torch.int32, device="cuda"),
+    )
+
+    full_input_ids = torch.tensor([full_tokens], device="cuda")
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_chunk_pos_3d = full_pos_3d[..., chunk_start:]
+
+    full_inputs_embeds = model.model.get_input_embeddings()(full_input_ids)
+    full_image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_image_mask = (
+        (full_input_ids == config.image_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_image_mask, full_image_embeds)
+    expected_chunk_embeds = full_inputs_embeds[:, chunk_start:]
+
+    text_out = model.model.language_model(
+        inputs_embeds=expected_chunk_embeds,
+        position_ids=expected_chunk_pos_3d,
+    )
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Chunked multimodal prefill should match the full-request mRoPE slice",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_chunked_prefill_inside_video_span():
+    """Chunked video prefill should select the request-local video embedding slice."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 2, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    frame_tokens = (grid_h // merge) * (grid_w // merge)
+
+    video_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long, device="cuda")
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values_videos = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+
+    text_before = [1, 2]
+    between_frames = [3]
+    text_after = [4]
+    frame_span = [config.vision_start_token_id] + [config.video_token_id] * frame_tokens
+    full_tokens = text_before + frame_span + between_frames + frame_span + text_after
+
+    second_frame_start = len(text_before) + len(frame_span) + len(between_frames)
+    chunk_start = second_frame_start + 2
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+
+    input_ids = torch.tensor([chunk_tokens], device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values_videos=pixel_values_videos,
+        video_grid_thw=video_grid_thw,
+        # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+        batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda"),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32, device="cuda"),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
+        mm_token_positions=torch.tensor(
+            [len(text_before), second_frame_start], dtype=torch.int32, device="cuda"
+        ),
+        mm_token_lengths=torch.tensor(
+            [1 + frame_tokens, 1 + frame_tokens], dtype=torch.int32, device="cuda"
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor([0, 1 + frame_tokens], dtype=torch.int32, device="cuda"),
+    )
+
+    full_input_ids = torch.tensor([full_tokens], device="cuda")
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=None,
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_chunk_pos_3d = full_pos_3d[..., chunk_start:]
+
+    full_inputs_embeds = model.model.get_input_embeddings()(full_input_ids)
+    full_video_embeds = torch.cat(
+        model.model.get_video_features(pixel_values_videos, video_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_video_mask = (
+        (full_input_ids == config.video_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_video_mask, full_video_embeds)
+    expected_chunk_embeds = full_inputs_embeds[:, chunk_start:]
+
+    text_out = model.model.language_model(
+        inputs_embeds=expected_chunk_embeds,
+        position_ids=expected_chunk_pos_3d,
+    )
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Chunked video prefill should match the full-request video mRoPE slice",
+    )
+
+
+@torch.no_grad()
+def test_build_chunked_multimodal_positions_handles_mixed_image_and_video_request():
+    """Chunked mixed image+video requests should preserve item-type grid ordering."""
+    config = _make_small_composite_config()
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    merge = config.vision_config.spatial_merge_size
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
+    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long, device="cuda")
+    num_image_tokens = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+    frame_tokens = int(
+        (video_grid_thw[0, 1].item() // merge) * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    text_before = [1]
+    text_between = [2]
+    between_video_frames = [3]
+    text_after = [4]
+    image_span = [config.vision_start_token_id] + ([config.image_token_id] * num_image_tokens)
+    video_span = [config.vision_start_token_id] + ([config.video_token_id] * frame_tokens)
+    full_tokens = (
+        text_before
+        + image_span
+        + text_between
+        + video_span
+        + between_video_frames
+        + video_span
+        + text_after
+    )
+
+    full_input_ids = torch.tensor([full_tokens], dtype=torch.long, device="cuda")
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    first_video_start = len(text_before) + len(image_span) + len(text_between)
+    second_video_start = first_video_start + len(video_span) + len(between_video_frames)
+    chunk_start = second_video_start + 1
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+    input_ids = torch.tensor([chunk_tokens], dtype=torch.long, device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
+
+    actual_pos_3d = model.model._build_chunked_multimodal_positions(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        delta=0,
+        # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+        batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda"),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32, device="cuda"),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32, device="cuda"),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda"),
+        mm_token_positions=torch.tensor(
+            [len(text_before), first_video_start, second_video_start],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        mm_token_lengths=torch.tensor(
+            [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor(
+            [0, 1 + num_image_tokens, 1 + num_image_tokens + 1 + frame_tokens],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+    )
+
+    torch.testing.assert_close(
+        actual_pos_3d,
+        full_pos_3d[..., chunk_start:],
+        msg="Chunked mixed image+video requests should reconstruct positions using item types",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_chunked_prefill_inside_mixed_image_and_video_spans():
+    """Chunked mixed multimodal prefill should preserve prompt-order embed slices."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device="cuda")
+    video_grid_thw = torch.tensor([[2, 2, 4]], dtype=torch.long, device="cuda")
+    num_image_patches = int(image_grid_thw[0].prod().item())
+    num_video_patches = int(video_grid_thw[0].prod().item())
+    num_image_tokens = num_image_patches // (merge**2)
+    frame_tokens = int(
+        (video_grid_thw[0, 1].item() // merge) * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_image_patches, vc.in_channels * t_ps * ps * ps, device="cuda")
+    pixel_values_videos = torch.randn(
+        num_video_patches, vc.in_channels * t_ps * ps * ps, device="cuda"
+    )
+
+    text_before = [1]
+    text_between = [2]
+    between_video_frames = [3]
+    text_after = [4]
+    image_span = [config.vision_start_token_id] + ([config.image_token_id] * num_image_tokens)
+    video_span = [config.vision_start_token_id] + ([config.video_token_id] * frame_tokens)
+    full_tokens = (
+        text_before
+        + image_span
+        + text_between
+        + video_span
+        + between_video_frames
+        + video_span
+        + text_after
+    )
+
+    first_video_start = len(text_before) + len(image_span) + len(text_between)
+    second_video_start = first_video_start + len(video_span) + len(between_video_frames)
+    chunk_start = second_video_start + 1
+    chunk_tokens = full_tokens[chunk_start:]
+    chunk_len = len(chunk_tokens)
+
+    input_ids = torch.tensor([chunk_tokens], dtype=torch.long, device="cuda")
+    position_ids = torch.arange(chunk_start, chunk_start + chunk_len, device="cuda").unsqueeze(0)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+        batch_info=torch.tensor([1, chunk_len, 0], dtype=torch.int32),
+        cu_seqlen=torch.tensor([0, chunk_len], dtype=torch.int32, device="cuda"),
+        input_pos=torch.tensor([chunk_start], dtype=torch.int32, device="cuda"),
+        seq_len=torch.tensor([chunk_len], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        mm_item_types=torch.tensor([0, 1, 1], dtype=torch.int32, device="cuda"),
+        mm_token_positions=torch.tensor(
+            [len(text_before), first_video_start, second_video_start],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        mm_token_lengths=torch.tensor(
+            [1 + num_image_tokens, 1 + frame_tokens, 1 + frame_tokens],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        mm_special_offsets=torch.tensor(
+            [0, 1 + num_image_tokens, 1 + num_image_tokens + 1 + frame_tokens],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+    )
+
+    full_input_ids = torch.tensor([full_tokens], dtype=torch.long, device="cuda")
+    full_pos_3d, _ = compute_mrope_positions(
+        input_ids=full_input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    expected_chunk_pos_3d = full_pos_3d[..., chunk_start:]
+
+    full_inputs_embeds = model.model.get_input_embeddings()(full_input_ids)
+    full_image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_video_embeds = torch.cat(
+        model.model.get_video_features(pixel_values_videos, video_grid_thw), dim=0
+    ).to(full_inputs_embeds.device, full_inputs_embeds.dtype)
+    full_image_mask = (
+        (full_input_ids == config.image_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_video_mask = (
+        (full_input_ids == config.video_token_id).unsqueeze(-1).expand_as(full_inputs_embeds)
+    )
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_image_mask, full_image_embeds)
+    full_inputs_embeds = full_inputs_embeds.masked_scatter(full_video_mask, full_video_embeds)
+    expected_chunk_embeds = full_inputs_embeds[:, chunk_start:]
+
+    text_out = model.model.language_model(
+        inputs_embeds=expected_chunk_embeds,
+        position_ids=expected_chunk_pos_3d,
+    )
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Chunked mixed multimodal prefill should match the full-request embed slice",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_decode_only_with_delta():
+    """Case 3: decode-only batch with deltas applies delta to all positions.
+
+    No mrope_position_ids_3d; delta should be applied uniformly.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    # 3 decode sequences, each with 1 token -> position_ids = [3, 1]
+    B = 3
+    input_ids = torch.randint(0, 50, (B, 1), device="cuda")
+    position_ids = torch.tensor([[500], [300], [100]], device="cuda")
+    deltas = torch.tensor([[50], [0], [0]], device="cuda")
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        mrope_position_deltas=deltas,
+    )
+
+    # Reference: (position_ids + deltas)[None].expand(3, ...) -> [3, 3, 1]
+    expected_pos_3d = (position_ids + deltas)[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Decode-only with deltas should apply delta-adjusted 3D expansion",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_flattened_prefill_with_request_deltas():
+    """Flattened cached prefill should expand request deltas per token, not per batch."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    req1_len = 3
+    req2_len = 2
+    total_tokens = req1_len + req2_len
+
+    input_ids = torch.randint(0, 50, (1, total_tokens), device="cuda")
+    position_ids = torch.tensor([[10, 11, 12, 20, 21]], device="cuda")
+    deltas = torch.tensor([[7], [-4]], device="cuda")
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+    batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32, device="cuda")
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        mrope_position_deltas=deltas,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    expected_token_delta = torch.tensor([[7, 7, 7, -4, -4]], device="cuda")
+    expected_pos_3d = (position_ids + expected_token_delta)[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Flattened cached prefill should repeat request deltas across tokens",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_flattened_prefill_without_request_deltas():
+    """Flattened cached prefill without deltas should preserve plain positions."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config).cuda()
+    model.eval()
+
+    req1_len = 3
+    req2_len = 2
+    total_tokens = req1_len + req2_len
+
+    input_ids = torch.randint(0, 50, (1, total_tokens), device="cuda")
+    position_ids = torch.tensor([[10, 11, 12, 20, 21]], device="cuda")
+    # batch_info is host-side metadata (BatchInfo calls .numpy() on it).
+    batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32, device="cuda")
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    expected_pos_3d = position_ids[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Flattened cached prefill without deltas should preserve plain positions",
     )

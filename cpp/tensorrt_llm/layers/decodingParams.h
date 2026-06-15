@@ -507,6 +507,10 @@ public:
     std::optional<TensorPtr> finished;       // [maxBatchSize * maxBeamWidth], on pinned
     std::optional<TensorPtr> sequenceLength; // [maxBatchSize * maxBeamWidth], on gpu
     std::optional<TensorPtr> cumLogProbs;    // [maxBatchSize * maxBeamWidth], on gpu, for Beam Search
+    //! NOTE: In the TRT backend, temperature is applied to logits in-place before sampling
+    //! (see decodingCommon.cu), so these log probs reflect the temperature-adjusted distribution.
+    //! This differs from the PyTorch backend's default behavior (LogprobMode.RAW), which computes
+    //! log probs from the raw model logits without temperature scaling.
     std::optional<TensorPtr> outputLogProbs; // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
     std::optional<TensorPtr> parentIds;      // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu, for Beam Search
 

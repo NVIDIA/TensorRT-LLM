@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,6 +69,11 @@ struct XQAParams
     bool const* helix_is_inactive_rank = nullptr;
     // Softmax stats output buffer for Helix parallelism (max and LSE per head).
     float2* softmax_stats = nullptr;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllm_gen_jit_warmup = false;
+    int32_t trtllm_gen_jit_warmup_max_num_requests = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_q = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_kv = 0;
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
@@ -121,7 +126,7 @@ struct XQAParams
 
     // sparse attention parameters
     SparseAttentionParams sparse_params;
-    bool use_sparse_attention = false;
+    bool use_sparse_attention_gen_paged = false;
 
     // Skip softmax threshold.
     float skip_softmax_threshold_scale_factor = 0;
@@ -210,7 +215,7 @@ struct XQAParams
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
            << "sparse_params: " << sparse_params.toString() << std::endl
-           << "use_sparse_attention :" << (use_sparse_attention ? "true" : "false") << std ::endl
+           << "use_sparse_attention_gen_paged :" << (use_sparse_attention_gen_paged ? "true" : "false") << std ::endl
            << "skip_softmax_threshold_scale_factor :" << skip_softmax_threshold_scale_factor << std ::endl
 #ifdef SKIP_SOFTMAX_STAT
            << "skip_softmax_total_blocks :" << skip_softmax_total_blocks << std ::endl

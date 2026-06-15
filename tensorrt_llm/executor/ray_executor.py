@@ -123,7 +123,17 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         logger.debug(f"{num_gpus=} for each worker.")
 
         runtime_env = ray.runtime_env.RuntimeEnv()
-        runtime_env["env_vars"] = os.environ.copy()
+        # Exclude node-local env vars. e.g., The raylet that spawns each worker sets
+        # RAY_RAYLET_PID to its own PID at exec time.
+        _NODE_LOCAL_VARS = {
+            "RAY_RAYLET_PID",
+            "RAY_NODE_IP_ADDRESS",
+        }
+
+        runtime_env["env_vars"] = {
+            k: v
+            for k, v in os.environ.items() if k not in _NODE_LOCAL_VARS
+        }
         runtime_env["env_vars"].update({
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
@@ -298,6 +308,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                   leader_only=True,
                                   async_call=False,
                                   request_id=request_id)
+
+    def abort_all_requests(self) -> None:
+        """Abort all active generation requests."""
+        for result in list(self._results.values()):
+            result.abort()
 
     def shutdown(self):
         if hasattr(self, '_shutdown_event') and self._shutdown_event.is_set():

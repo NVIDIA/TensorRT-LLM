@@ -1,15 +1,18 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple,
+                    TypeAlias)
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...inputs.multimodal import MultimodalParams
+from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
@@ -19,7 +22,6 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
 from .llm_request import get_draft_token_length
-from .mamba_cache_manager import MambaCacheManager, use_cpp_mamba_cache_manager
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -117,6 +119,11 @@ class CUDAGraphRunner:
             self._create_shared_static_tensors()
         self.cuda_graph_meta_buffers = get_memory_buffers()
 
+        # On-the-fly capture is disabled by default to prevent workspace
+        # tensor reallocation from invalidating addresses baked into existing
+        # CUDA graphs.  Use allow_capture() context manager during warmup.
+        self._capture_allowed = False
+
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
         max_draft_len = self.config.original_max_total_draft_tokens if self.config.spec_config is not None else 0
@@ -135,16 +142,9 @@ class CUDAGraphRunner:
         if self.config.use_mrope:
             self.shared_static_tensors["position_ids"] = torch.zeros(
                 (3, 1, max_total_tokens), device="cuda", dtype=torch.int32)
-            self.shared_static_tensors["multimodal_params"] = [
-                MultimodalParams(
-                    multimodal_data={
-                        "mrope_config": {
-                            "mrope_position_deltas":
-                            torch.zeros(
-                                (1, 1), device="cuda", dtype=torch.int32)
-                        }
-                    }) for _ in range(max_total_tokens)
-            ]
+            self.shared_static_tensors[
+                "mrope_delta_read_seq_slots"] = torch.zeros(
+                    (max_total_tokens, ), device="cuda", dtype=torch.long)
 
     def _get_seq_len_mode(
             self,
@@ -263,12 +263,26 @@ class CUDAGraphRunner:
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
+        if self.config.use_mrope and any(
+                request.py_seq_slot is not None and not request.is_dummy
+                and getattr(request, "py_mrope_delta_cache_slot",
+                            None) != request.py_seq_slot
+                for request in batch.generation_requests):
+            # Requests whose current seq slot has not been seeded in the
+            # model-side MRoPE delta cache must run eagerly. Later decode steps
+            # can replay CUDA graphs using the cache.
+            return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager)
 
         if key in self.graphs:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
+
+        # Graph doesn't exist yet.  If on-the-fly capture is not allowed,
+        # fall back to eager so the caller doesn't need a separate check.
+        if not self._capture_allowed:
+            return None, None, None
 
         if batch_size not in self.supported_batch_sizes:
             return None, None, None
@@ -287,7 +301,22 @@ class CUDAGraphRunner:
         return graph_attn_metadata, graph_spec_metadata, key
 
     def needs_capture(self, key: KeyType):
-        return key not in self.graph_outputs
+        return self._capture_allowed and key not in self.graph_outputs
+
+    @contextlib.contextmanager
+    def allow_capture(self):
+        """Context manager that enables CUDA graph capture.
+
+        Capture is disabled by default.  On-the-fly captures outside this
+        context are prevented because they can resize the shared
+        cuda_graph_workspace tensor, invalidating addresses baked into
+        previously captured graphs.
+        """
+        self._capture_allowed = True
+        try:
+            yield
+        finally:
+            self._capture_allowed = False
 
     def get_graph_pool(self):
         """Returns the CUDA memory pool used by this graph runner.
@@ -324,9 +353,11 @@ class CUDAGraphRunner:
         if self.config.use_mrope:
             sliced_static_tensors["position_ids"] = self.shared_static_tensors[
                 "position_ids"][:, :, :num_tokens_for_capture]
-            sliced_static_tensors[
-                "multimodal_params"] = self.shared_static_tensors[
-                    "multimodal_params"][:batch_size * self.max_beam_width]
+            if "mrope_delta_read_seq_slots" in initial_inputs:
+                sliced_static_tensors[
+                    "mrope_delta_read_seq_slots"] = self.shared_static_tensors[
+                        "mrope_delta_read_seq_slots"][:batch_size *
+                                                      self.max_beam_width]
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
@@ -383,17 +414,16 @@ class CUDAGraphRunner:
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
-        if self.config.use_mrope and current_inputs.get(
-                'multimodal_params') is not None:
+        if self.config.use_mrope:
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
-            for i, multimodal_param in enumerate(
-                    current_inputs['multimodal_params']):
-                # NOTE: Currently, we only need 'mrope_position_deltas' on generation phase for multimodal models.
-                static_tensors['multimodal_params'][i].multimodal_data[
-                    'mrope_config']['mrope_position_deltas'].copy_(
-                        multimodal_param.multimodal_data['mrope_config']
-                        ['mrope_position_deltas'],
-                        non_blocking=True)
+            mrope_delta_read_seq_slots = current_inputs.get(
+                'mrope_delta_read_seq_slots')
+            if mrope_delta_read_seq_slots is not None:
+                static_tensors[
+                    'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
+                                                  shape[0]].copy_(
+                                                      mrope_delta_read_seq_slots,
+                                                      non_blocking=True)
         else:
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
@@ -478,11 +508,6 @@ class CUDAGraphRunner:
                 spec_res_mgr.add_dummy_requests([dummy_request_id])
             self.padding_dummy_requests[runtime_draft_len] = dummy_request
 
-        if (isinstance(kv_cache_manager, MambaCacheManager)
-                and not use_cpp_mamba_cache_manager()):
-            kv_cache_manager.reorder_state_indices_when_padding_requests(
-                batch_size, padding_size)
-
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
@@ -540,6 +565,435 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self.padding_dummy_requests = {}
+        del self.memory_pool
+        self.memory_pool = None
+        torch.cuda.empty_cache()
+
+
+EncoderKeyType: TypeAlias = Tuple[int, int, int]
+
+
+@dataclass
+class EncoderCUDAGraphRunnerConfig:
+    """Configuration for EncoderCUDAGraphRunner."""
+    use_cuda_graph: bool
+    cuda_graph_padding_enabled: bool
+    cuda_graph_batch_sizes: List[int]
+    cuda_graph_num_tokens: List[int]
+    cuda_graph_seq_lens: List[int]
+    max_cuda_graph_batch_size: int
+    max_cuda_graph_num_tokens: int
+    max_num_tokens: int
+    max_seq_len: int
+    cuda_graph_mem_pool: Any
+
+
+class EncoderCUDAGraphRunner:
+    """CUDA graph runner for models using encode_only path.
+
+    Designed for the `LLM.encode()` API — consumes raw inputs dicts with
+    `input_ids` (flat [total_tokens]), `seq_lens` ([batch_size]). Encoder CUDA graphs
+    are keyed on the 3-tuple (padded_batch_size, padded_num_tokens, padded_max_seq_len)
+
+    Restricted to `TrtllmAttentionMetadata` — FlashInfer's per-batch planner state is not compatible with CUDA graph capture/replay.
+    """
+
+    WARMUP_STEPS = 2
+
+    def __init__(self, config: EncoderCUDAGraphRunnerConfig):
+        self.config = config
+
+        self.enabled = config.use_cuda_graph
+        self.padding_enabled = config.cuda_graph_padding_enabled
+        self.supported_batch_sizes = sorted(config.cuda_graph_batch_sizes)
+        self.max_supported_batch_size = config.max_cuda_graph_batch_size
+        self.supported_num_tokens = sorted(config.cuda_graph_num_tokens)
+        self.max_supported_num_tokens = config.max_cuda_graph_num_tokens
+        self.supported_seq_lens = sorted(config.cuda_graph_seq_lens)
+
+        self.graphs: Dict[EncoderKeyType, torch.cuda.CUDAGraph] = {}
+        self.graph_outputs: Dict[EncoderKeyType, Callable[[],
+                                                          Optional[Any]]] = {}
+        self.graph_metadata: Dict[EncoderKeyType, Dict[str, Any]] = {}
+        self.memory_pool = config.cuda_graph_mem_pool
+
+        self.shared_static_tensors: Dict[str, torch.Tensor] = {}
+        self.shared_static_tensors_cpu: Dict[str, torch.Tensor] = {}
+        if self.enabled:
+            self._create_shared_static_tensors()
+        self.cuda_graph_meta_buffers = get_memory_buffers()
+
+        self._capture_allowed = False
+
+        # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
+        # prefer_pinned() is false: pageable host buffers are preferred, so the
+        # H2D copies must be issued before graph replay instead of captured.
+        self._capture_h2d_copy = prefer_pinned()
+
+    def _create_shared_static_tensors(self):
+        """Allocates static tensors sized for the largest supported num_tokens."""
+        max_total_tokens = min(self.max_supported_num_tokens,
+                               self.config.max_num_tokens)
+        max_batch_size = self.max_supported_batch_size
+
+        self.shared_static_tensors = {
+            "input_ids":
+            torch.ones((max_total_tokens, ), device="cuda", dtype=torch.int32),
+            "position_ids":
+            torch.zeros((1, max_total_tokens), device="cuda",
+                        dtype=torch.int32),
+        }
+        self.shared_static_tensors_cpu = {
+            "input_ids":
+            torch.ones((max_total_tokens, ),
+                       device="cpu",
+                       dtype=torch.int32,
+                       pin_memory=prefer_pinned()),
+            "position_ids":
+            torch.zeros((1, max_total_tokens),
+                        device="cpu",
+                        dtype=torch.int32,
+                        pin_memory=prefer_pinned()),
+            # Pinned static buffer for seq_lens. Each captured graph's attn_metadata._seq_lens
+            # is reseated (in maybe_get_cuda_graph) to a stable slice of this buffer, and the
+            # corresponding H2D copy into _seq_lens_cuda is captured inside the graph itself.
+            "seq_lens":
+            torch.ones((max_batch_size, ),
+                       device="cpu",
+                       dtype=torch.int32,
+                       pin_memory=prefer_pinned()),
+        }
+
+        # Cached arange used by replay() to build packed position_ids in-place via slice copies.
+        self._arange_max = torch.arange(max_total_tokens, dtype=torch.int32)
+
+    @staticmethod
+    def _round_up(value: int, supported: List[int]) -> int:
+        """Smallest element of `supported` >= value, or 0 if none exists."""
+        if not supported:
+            return 0
+        idx = bisect.bisect_left(supported, value)
+        if idx == len(supported):
+            return 0
+        return supported[idx]
+
+    def _get_valid_graph_key(self, batch_size: int, num_tokens: int,
+                             max_seq_len: int) -> EncoderKeyType:
+        num_tokens_idx = bisect.bisect_left(self.supported_num_tokens,
+                                            num_tokens)
+        seq_len_idx = bisect.bisect_left(self.supported_seq_lens, max_seq_len)
+
+        while (num_tokens_idx < len(self.supported_num_tokens)
+               and seq_len_idx < len(self.supported_seq_lens)):
+            padded_num_tokens = self.supported_num_tokens[num_tokens_idx]
+            padded_max_seq_len = self.supported_seq_lens[seq_len_idx]
+
+            if padded_num_tokens > batch_size * padded_max_seq_len:
+                seq_len_idx += 1
+            elif padded_max_seq_len > padded_num_tokens:
+                num_tokens_idx += 1
+            else:
+                return batch_size, padded_num_tokens, padded_max_seq_len
+
+        return batch_size, 0, 0
+
+    def get_graph_key(
+            self, inputs: Dict[str, Any]) -> Tuple[EncoderKeyType, bool, bool]:
+        """Compute the (bs, padded_num_tokens, padded_max_seq_len) bucket.
+
+        `inputs['seq_lens']` must already be padded to padded_batch_size via
+        `pad_batch(...)` before calling this. Dummy entries are 1-token each
+        and do not raise max_seq_len since real requests dominate.
+        """
+        seq_lens = inputs['seq_lens']
+
+        num_tokens = sum(
+            seq_lens
+        )  # Can't use len(inputs['input_ids']) because it's not padded
+        batch_size = len(seq_lens)
+        max_seq_len = max(seq_lens) if batch_size > 0 else 0
+
+        key = self._get_valid_graph_key(batch_size, num_tokens, max_seq_len)
+        _, padded_num_tokens, padded_max_seq_len = key
+
+        is_padding_performed = (padded_num_tokens != num_tokens
+                                or padded_max_seq_len != max_seq_len)
+        is_padding_successful = (padded_num_tokens != 0
+                                 and padded_max_seq_len != 0)
+
+        return key, is_padding_performed, is_padding_successful
+
+    @contextlib.contextmanager
+    def allow_capture(self):
+        """Context manager that enables CUDA graph capture.
+
+        Capture is disabled by default.  On-the-fly captures outside this
+        context are prevented — unseen keys fall back to eager instead of
+        incurring a multi-millisecond capture latency spike at runtime.
+        """
+        self._capture_allowed = True
+        try:
+            yield
+        finally:
+            self._capture_allowed = False
+
+    @contextlib.contextmanager
+    def pad_batch(self, inputs: Dict[str, Any],
+                  batch_size: int) -> Iterator[Dict[str, Any]]:
+        if not self.enabled or not self.padding_enabled:
+            yield inputs
+            return
+
+        padded_batch_size = self._round_up(batch_size,
+                                           self.supported_batch_sizes)
+        if padded_batch_size == 0 or padded_batch_size == batch_size:
+            yield inputs
+            return
+
+        padding_size = padded_batch_size - batch_size
+        # Should not pad inputs if it would exceed the max supported number of tokens
+        # maybe_get_cuda_graph will check this and fall back to eager if batch size is not in the supported list
+        if len(inputs['input_ids']
+               ) + padding_size > self.max_supported_num_tokens:
+            yield inputs
+            return
+
+        # Only seq_lens is padded — that's all the attention metadata needs.
+        # Token-shaped inputs (input_ids, position_ids, ...) are padded implicitly
+        # by zero-filling the static buffer in `replay`.
+        padded_inputs = dict(inputs)
+        padded_inputs['seq_lens'] = list(
+            inputs['seq_lens']) + [1] * padding_size
+
+        yield padded_inputs
+
+    def maybe_get_cuda_graph(
+        self,
+        inputs: Dict[str, Any],
+        attn_metadata: Any,
+    ) -> Tuple[Optional[Any], Optional[EncoderKeyType]]:
+        """
+        Decide whether the batch can use a CUDA graph.
+
+        Returns (graph_attn_metadata, key) when a graph can be used, else
+        (None, None). On graph hit, the returned `attn_metadata` is the
+        graph-resident metadata whose `_seq_lens` is permanently aliased to
+        a slice of the runner's pinned `seq_lens` buffer; per-replay seq_lens
+        updates are pure CPU memcpys into that buffer (the H2D copy that
+        feeds `_seq_lens_cuda` is captured inside the graph).
+        """
+        if not self.enabled:
+            return None, None
+
+        # Only TRTLLM attention backend supports encoder CUDA graphs. Other
+        # backends (FlashInfer) have per-batch planner state that breaks
+        # graph replay.
+        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+            logger.warning_once(
+                "Encoder CUDA graph only supports TrtllmAttentionMetadata; "
+                "falling back to eager.",
+                key="encoder_cuda_graph_backend_warning")
+            return None, None
+
+        if ExpertStatistic.should_record():
+            return None, None
+
+        seq_lens = inputs['seq_lens']
+        padded_batch_size = len(seq_lens)
+        if padded_batch_size not in self.supported_batch_sizes:
+            return None, None
+
+        key, is_padding_performed, is_padding_successful = self.get_graph_key(
+            inputs)
+        _, _, padded_max_seq_len = key
+        if (not self.padding_enabled and is_padding_performed) \
+                or not is_padding_successful:
+            return None, None
+
+        if key in self.graphs:
+            return self.graph_metadata[key]["attn_metadata"], key
+
+        # New key not yet captured. Only create metadata if capture is
+        # allowed (warmup time); otherwise fall back to eager.
+        if not self._capture_allowed:
+            return None, None
+
+        if attn_metadata.has_cross_sub_metadata:
+            logger.warning_once(
+                "Encoder CUDA graph does not support cross-attention metadata; "
+                "falling back to eager.",
+                key="encoder_cuda_graph_cross_attention_warning")
+            return None, None
+
+        # First sighting of this key: create graph-resident metadata and bind
+        # it to stable pinned seq_lens storage for future replays.
+        graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
+            padded_batch_size,
+            False,
+            0,
+            self.cuda_graph_meta_buffers,
+            encode_only=True,
+        )
+        assert graph_attn_metadata.is_cuda_graph
+
+        # Lock FMHA kernel launch params to the padded max_seq_len so the
+        # cubin + grid dims stay constant across replays for this key.
+        graph_attn_metadata.max_context_q_len_override = padded_max_seq_len
+
+        # Bind graph metadata to stable host seq_lens storage. The storage may
+        # be pinned or pageable; only captured H2D copies require pinned memory.
+        graph_attn_metadata.bind_encoder_cuda_graph_seq_lens(
+            self.shared_static_tensors_cpu["seq_lens"], padded_batch_size)
+        graph_attn_metadata.max_seq_len = self.config.max_seq_len
+        graph_attn_metadata.request_ids = list(range(padded_batch_size))
+
+        return graph_attn_metadata, key
+
+    def _contains_nested_tensor(self, x: Any) -> bool:
+        if isinstance(x, torch.Tensor):
+            return x.is_nested
+        if isinstance(x, dict):
+            return any(self._contains_nested_tensor(v) for v in x.values())
+        if isinstance(x, (list, tuple)):
+            return any(self._contains_nested_tensor(v) for v in x)
+        return False
+
+    def needs_capture(self, key: EncoderKeyType) -> bool:
+        return self._capture_allowed and key not in self.graphs
+
+    def capture(
+        self,
+        key: EncoderKeyType,
+        forward_fn: Callable[[Dict[str, Any]], Any],
+        inputs: Dict[str, Any],
+    ) -> None:
+        """Capture a CUDA graph for the given key."""
+        _, padded_num_tokens, _ = key
+
+        sliced_static_tensors = {
+            "input_ids":
+            self.shared_static_tensors["input_ids"][:padded_num_tokens],
+            "position_ids":
+            self.shared_static_tensors["position_ids"][:, :padded_num_tokens],
+        }
+        sliced_static_tensors_cpu = {
+            "input_ids":
+            self.shared_static_tensors_cpu["input_ids"][:padded_num_tokens],
+            "position_ids":
+            self.shared_static_tensors_cpu["position_ids"]
+            [:, :padded_num_tokens],
+        }
+
+        capture_inputs = dict(inputs)
+        capture_inputs.update(sliced_static_tensors)
+
+        attn_md = capture_inputs["attn_metadata"]
+
+        self.graph_metadata[key] = {
+            "attn_metadata": attn_md,
+        }
+
+        graph = torch.cuda.CUDAGraph()
+        # Warmup runs required by CUDA graph semantics. See
+        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+        with with_multi_stream(True), piecewise_cuda_graph(False):
+            for _ in range(self.WARMUP_STEPS):
+                forward_fn(capture_inputs)
+
+            with torch.cuda.graph(graph, pool=self.memory_pool):
+                if self._capture_h2d_copy:
+                    # H2D copies for captured inside the graph: at replay
+                    # time it re-issues from the pinned static buffer without
+                    # an eager driver call.
+                    capture_inputs["input_ids"].copy_(
+                        sliced_static_tensors_cpu["input_ids"],
+                        non_blocking=True)
+                    capture_inputs["position_ids"].copy_(
+                        sliced_static_tensors_cpu["position_ids"],
+                        non_blocking=True)
+                    attn_md._seq_lens_cuda.copy_(attn_md._seq_lens,
+                                                 non_blocking=True)
+                output = forward_fn(capture_inputs)
+
+        if self._contains_nested_tensor(output):
+            raise TypeError(
+                "Encoder CUDA graph does not support nested tensor outputs. "
+                "Disable encoder CUDA graphs for models with ragged outputs.")
+        self.graphs[key] = graph
+        self.graph_outputs[key] = make_weak_ref(output)
+        self.memory_pool = graph.pool()
+
+    def replay(
+        self,
+        key: EncoderKeyType,
+        inputs: Dict[str, Any],
+    ) -> Any:
+        """Replay a captured graph with current inputs."""
+        stored_meta = self.graph_metadata[key]
+        assert inputs["attn_metadata"] is stored_meta["attn_metadata"]
+
+        _, padded_num_tokens, _ = key
+
+        # According to prefer_pinned(), CC forces most transfers to be synchronous.
+        # So we don't put non_blocking=True here.
+        static_tensors = self.shared_static_tensors_cpu if self._capture_h2d_copy else self.shared_static_tensors
+
+        # input_ids: convert (if list) and write into pinned active region in
+        # one allocation + one memcpy. Padding region is zero-filled below.
+        input_ids = inputs["input_ids"]
+        if isinstance(input_ids, list):
+            actual_tokens = len(input_ids)
+            static_tensors["input_ids"][:actual_tokens].copy_(
+                torch.tensor(input_ids, dtype=torch.int32))
+        elif isinstance(input_ids, torch.Tensor):
+            actual_tokens = int(input_ids.shape[0])
+            static_tensors["input_ids"][:actual_tokens].copy_(input_ids)
+        else:
+            raise TypeError(f"Unsupported input_ids type: {type(input_ids)}")
+        static_tensors["input_ids"][actual_tokens:padded_num_tokens].fill_(0)
+
+        # position_ids: pinned buffer is shape [1, max_total_tokens]; use the
+        # 1-D row view. Auto-generate via the cached arange (zero allocations,
+        # N small memcpys) or copy user-provided values.
+        pinned_pos = static_tensors["position_ids"][0]
+        position_ids = inputs.get("position_ids")
+        if position_ids is None:
+            # Pad entries (seq_len=1) get arange[:1] = [0], the correct
+            # position for a 1-token dummy request.
+            offset = 0
+            for s in inputs["seq_lens"]:
+                pinned_pos[offset:offset + s].copy_(self._arange_max[:s])
+                offset += s
+        else:
+            if isinstance(position_ids, list):
+                pinned_pos[:actual_tokens].copy_(
+                    torch.tensor(position_ids, dtype=torch.int32))
+            elif isinstance(position_ids, torch.Tensor):
+                pinned_pos[:actual_tokens].copy_(position_ids.flatten())
+            else:
+                raise TypeError(
+                    f"Unsupported position_ids type: {type(position_ids)}")
+            offset = actual_tokens
+
+        pinned_pos[offset:padded_num_tokens].fill_(0)
+
+        if not self._capture_h2d_copy:
+            stored_meta["attn_metadata"]._seq_lens_cuda.copy_(
+                stored_meta["attn_metadata"]._seq_lens, non_blocking=True)
+
+        self.graphs[key].replay()
+
+        return self.graph_outputs[key]
+
+    def get_graph_pool(self):
+        return self.memory_pool
+
+    def clear(self):
+        for graph in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+        self.graph_outputs.clear()
+        self.graph_metadata.clear()
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()

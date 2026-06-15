@@ -17,7 +17,7 @@ Forward Pass Flow:
 5. norm_out + proj_out -> noise prediction
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -27,17 +27,17 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 # HF checkpoint key → our module attribute name
 _WEIGHT_KEY_REMAPS = [
@@ -96,6 +96,7 @@ class _AdaLayerNormBase(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.norm = LayerNorm(
             hidden_size=embedding_dim,
@@ -269,12 +270,14 @@ class FluxTransformerBlock(nn.Module):
         quant_config=None,
         skip_create_weights: bool = False,
         force_dynamic_quant: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
 
         # AdaLN for image and text
         self.norm1 = AdaLayerNormZero(
@@ -324,7 +327,7 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
         self.ff_context = MLP(
             hidden_size=dim,
@@ -334,7 +337,7 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
 
     def forward(
@@ -431,7 +434,7 @@ class FluxSingleTransformerBlock(nn.Module):
         quant_config=None,
         skip_create_weights: bool = False,
         force_dynamic_quant: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -457,18 +460,25 @@ class FluxSingleTransformerBlock(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN if config.mapping.tp_size > 1 else None,
+            reduce_output=False,
         )
         self.act_mlp = _gelu_tanh_eager
 
-        # Output projection (concat of attn + mlp) - TRT-LLM Linear
-        self.proj_out = Linear(
-            dim + self.mlp_hidden_dim,
-            dim,
+        kv_dim = num_attention_heads * attention_head_dim
+
+        # MLP + Attn Output projection, requires special handling for TP
+        self.proj_out = FluxJointAttnMLPProj(
+            attn_dim=kv_dim,
+            mlp_dim=self.mlp_hidden_dim,
+            out_dim=dim,
             bias=True,
             dtype=dtype,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            config=config,
         )
 
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
@@ -525,9 +535,9 @@ class FluxSingleTransformerBlock(nn.Module):
         )
 
         # Concat and project
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        hidden_states = self.proj_out(attn_output, mlp_hidden_states)
         gate = gate.unsqueeze(1)
-        hidden_states = gate * self.proj_out(hidden_states)
+        hidden_states = gate * hidden_states
 
         # Residual
         hidden_states = residual + hidden_states
@@ -545,7 +555,7 @@ class FluxSingleTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class FluxTransformer2DModel(nn.Module):
+class FluxTransformer2DModel(BaseDiffusionModel):
     """FLUX Transformer model for text-to-image generation.
 
     This is the native TRT-LLM implementation of FLUX transformer.
@@ -562,18 +572,12 @@ class FluxTransformer2DModel(nn.Module):
     - proj_out: Linear projection to output
     """
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
-        super().__init__()
-        self.model_config = model_config
+    def __init__(self, model_config: DiffusionModelConfig):
+        super().__init__(model_config)
 
-        # Setup sequence parallelism (Ulysses)
+        vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 24)
-        self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=num_heads,
-            )
-        )
+        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
 
         # Extract pretrained config from model_config
         pretrained_config = model_config.pretrained_config
@@ -657,6 +661,7 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # NOTE: x_embedder quantization is excluded when in_channels < 128.
         # FLUX.1 has in_channels=64, which is below the 128-block size required by
@@ -675,6 +680,7 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
 
         # Dual-stream transformer blocks
@@ -733,6 +739,7 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
 
         self.__post_init__()
@@ -809,33 +816,11 @@ class FluxTransformer2DModel(nn.Module):
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
 
-        # Ulysses: shard sequences and position IDs before RoPE
-        if self.use_ulysses:
-            img_seq_len = img_ids.shape[0]
-            txt_seq_len = txt_ids.shape[0]
-
-            if img_seq_len % self.ulysses_size != 0:
-                raise ValueError(
-                    f"Image seq len ({img_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
-                )
-            if txt_seq_len % self.ulysses_size != 0:
-                raise ValueError(
-                    f"Text seq len ({txt_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
-                )
-
-            img_chunk = img_seq_len // self.ulysses_size
-            txt_chunk = txt_seq_len // self.ulysses_size
-            r = self.ulysses_rank
-
-            # Shard position IDs (before RoPE computation)
-            img_ids = img_ids[r * img_chunk : (r + 1) * img_chunk]
-            txt_ids = txt_ids[r * txt_chunk : (r + 1) * txt_chunk]
-
-            # Shard hidden states
-            hidden_states = hidden_states[:, r * img_chunk : (r + 1) * img_chunk, :]
-            encoder_hidden_states = encoder_hidden_states[:, r * txt_chunk : (r + 1) * txt_chunk, :]
+        # Shard sequences and position IDs before RoPE (no-op when sharder is inactive).
+        img_ids = self.sharder.shard(img_ids, dim=0)
+        txt_ids = self.sharder.shard(txt_ids, dim=0)
+        hidden_states = self.sharder.shard(hidden_states, dim=1)
+        encoder_hidden_states = self.sharder.shard(encoder_hidden_states, dim=1)
 
         # Compute RoPE embeddings (from potentially sharded IDs)
         ids = torch.cat((txt_ids, img_ids), dim=0)
@@ -861,12 +846,8 @@ class FluxTransformer2DModel(nn.Module):
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
-        # Ulysses: gather output sequence from all ranks
-        if self.use_ulysses:
-            hidden_states = hidden_states.contiguous()
-            gathered = [torch.zeros_like(hidden_states) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(gathered, hidden_states, group=self.ulysses_pg)
-            hidden_states = torch.cat(gathered, dim=1)
+        # All-gather hidden states across ranks (no-op when sharder is inactive).
+        hidden_states = self.sharder.gather(hidden_states, dim=1)
 
         # Output projection
         hidden_states = self.norm_out(hidden_states, temb)
@@ -897,11 +878,27 @@ class FluxTransformer2DModel(nn.Module):
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
+        # Track prefixes of wrapper projectors whose sub-Linears are loaded
+        # by the parent's load_weights — the generic Linear loader must skip
+        # them (their FUSED weight modes would look for nonexistent checkpoint
+        # keys via params_map and error).
+        managed_prefixes = set()
+
         for name, module in tqdm(self.named_modules(), desc="Loading weights"):
+            if any(name.startswith(p) for p in managed_prefixes):
+                continue
+
             # Create weights for modules with skip_create_weights_in_init=True
             # This must be done before loading weights (following Wan pattern)
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
+
+            # Wrapper modules have no direct _parameters; handle before the guard.
+            if isinstance(module, FluxJointAttnMLPProj):
+                managed_prefixes.add(name + ".")
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights, loader)
+                continue
 
             if len(module._parameters) == 0:
                 continue

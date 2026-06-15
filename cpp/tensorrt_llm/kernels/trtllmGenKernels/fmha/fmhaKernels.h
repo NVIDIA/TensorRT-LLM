@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,22 +18,49 @@
 
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
+#include <algorithm>
+#include <cfloat>
+#include <cstring>
+#include <filesystem>
+#include <limits>
+#include <linux/limits.h>
 #include <memory>
 #include <mutex>
+#include <regex>
+#include <sstream>
+#include <tuple>
+#include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 #include "cubin/kernelMetaInfo.h"
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
-#include "kernelParams.h"
 #include "prepareCustomMask.h"
-#include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include <chrono>
 
+// Switch to streaming-style TLLM_LOG_* macros for trtllm-gen export headers,
+// which use streaming syntax (e.g., TLLM_LOG_INFO("val=", x)) instead of
+// TRT-LLM's printf-style (e.g., TLLM_LOG_INFO("val=%d", x)).
+#include "trtllmGen_fmha_export/FmhaAutoTuner.h"
+#include "trtllmGen_fmha_export/FmhaInterface.h"
+#include "trtllmGen_fmha_export/FmhaOptions.h"
+#include "trtllmGen_fmha_export/KernelParams.h"
+#include "trtllmGen_fmha_export/trtllmGenLogCompat.h"
+// Restore original printf-style TLLM_LOG_* macros for the rest of this file.
+#include "trtllmGen_fmha_export/trtllmGenLogCompatEnd.h"
+
+namespace
+{
 namespace tc = tensorrt_llm::common;
+namespace tg = trtllm::gen;
+} // namespace
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -94,17 +121,30 @@ public:
     using KernelMeta = TllmGenFmhaKernelMetaInfo;
     using RunnerParams = TllmGenFmhaRunnerParams;
     using SelectKernelParams = TllmGenSelectKernelParams;
+    using FmhaOptions = fmha::FmhaOptions;
+    using FmhaOptionsFromArgs = fmha::FmhaOptionsFromArgs;
+    using FmhaAutoTuner = fmha::FmhaAutoTuner;
+    using FmhaInterface = fmha::FmhaInterface;
+    using FmhaConfig = fmha::FmhaConfig;
+    using FmhaData = fmha::FmhaData;
+    using KernelParams = fmha::KernelParams;
 
     // Ctor.
-    TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeKv,
-        Data_type dtypeOut, unsigned int smArch)
+    TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeK,
+        Data_type dtypeV, Data_type dtypeOut, unsigned int smArch, int numEltsPerSageAttnBlkQ = 0,
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
         : mDtypeQ(dtypeQ)
-        , mDtypeKv(dtypeKv)
+        , mDtypeK(dtypeK)
+        , mDtypeV(dtypeV)
         , mDtypeOut(dtypeOut)
         , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
         , mKernelMeta(pMetaStart)
         , mKernelMetaCount(nMetaCount)
         , mSM(smArch)
+        , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
+        , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
+        , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
+        , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
     {
     }
 
@@ -115,7 +155,11 @@ public:
         {
             auto const& kernelMeta = mKernelMeta[i];
             if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ
-                && kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut)
+                && kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV
+                && kernelMeta.mDataTypeO == mDtypeOut && kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ
+                && kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK
+                && kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP
+                && kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV)
             {
                 // Load CUmodules
                 CUmodule hmod{0};
@@ -135,8 +179,20 @@ public:
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
                 if (kernelMeta.mSharedMemBytes >= 48 * 1024)
                 {
-                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
+                    auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
+                    if (result != CUDA_SUCCESS)
+                    {
+                        char const* errorName = nullptr;
+                        char const* errorString = nullptr;
+                        mDriver->cuGetErrorName(result, &errorName);
+                        mDriver->cuGetErrorString(result, &errorString);
+                        TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
+                            + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
+                            + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
+                            + std::string(errorString != nullptr ? errorString : "unknown"));
+                        continue;
+                    }
                 }
                 // Make sure the hashIds are not duplicated.
                 // Except for the case where we have both family version and specific version of the same config.
@@ -161,18 +217,362 @@ public:
         }
     }
 
+    static bool shouldUseNvrtc(FmhaOptions const& options)
+    {
+        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+        if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
+        {
+            return true;
+        }
+        // Dynamic sparse MLA uses cubin as a compiler issue in NVRTC path.
+        // This constraint can be removed when CUDA version upgrades to 13.2 or later.
+        if (isDynamicTokenSparse(options.mSparseType))
+        {
+            return false;
+        }
+        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
+            && options.mDtypeKv != tg::Dtype::E2m1;
+    }
+
+    std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
+    {
+        // Some conditions to check if the kernel is supported.
+        // This is meant to avoid occupying unnecessary hashId bits.
+        if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+        {
+            return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
+        }
+
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return std::make_pair(false, "Empty batch or zero sequence length");
+        }
+
+        // The selectKernelParams that might be updated.
+        SelectKernelParams selectKernelParams{params};
+
+        int32_t ctaDim = 512;
+        FmhaOptions options;
+        FmhaOptionsFromArgs optionsFromArgs;
+        parseOptionsFromRunnerParams(params, options);
+        options.mCudaArch = intToCudaArch(mSM);
+
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        // Check if the options are valid or not.
+        checkFmhaOptions(options, optionsFromArgs);
+        // Update the options if needed.
+        updateFmhaOptions(options, optionsFromArgs);
+
+        // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
+        // dimension.
+        computeNumCtas(options, params.mMultiProcessorCount);
+
+        if (shouldUseNvrtc(options))
+        {
+            // For the NVRTC path, we return supported as long as autotuner successfully selected a kernel config.
+            return std::make_pair(true, "NVRTC path is supported");
+        }
+
+        // Check if a precompiled cubin exists for this configuration (same lookup as run()).
+        // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
+        algoFilterForCubinPath(options);
+        auto [hashId, info] = hashFromFmhaOptions(options);
+
+        if (mFunctions.find(hashId) == mFunctions.end())
+        {
+            TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
+            return std::make_pair(false, info);
+        }
+        TLLM_LOG_DEBUG("TRTLLM-Gen kernel traits: %s", info.c_str());
+
+        return std::make_pair(true, info);
+    }
+
+    void algoFilterForCubinPath(FmhaOptions& options) const
+    {
+        if (!isContextKernel(options.mFmhaKernelType) && options.mMaskType == TrtllmGenAttentionMaskType::Dense
+            && !options.mIsMlaGen && !isTokenSparse(options.mSparseType))
+        {
+            options.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        }
+    }
+
+private:
+    inline static std::vector<int> const kDefaultWarmupBatchSizeCandidates
+        = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 128, 256, 512, 1024};
+    inline static std::vector<int> const kDefaultWarmupPrefillBatchSizeCandidates
+        = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256};
+    inline static std::vector<int> const kDefaultWarmupSeqLenQkvCandidates
+        = {1, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+
+    static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
+    {
+        std::vector<int> candidateSizes;
+        for (int size : defaultCandidateSizes)
+        {
+            if (size >= maxSize)
+            {
+                break;
+            }
+            candidateSizes.push_back(size);
+        }
+        candidateSizes.push_back(maxSize);
+        return candidateSizes;
+    }
+
+    void warmupOneKernel(RunnerParams const& params)
+    {
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return;
+        }
+
+        int32_t ctaDim = 512;
+        FmhaOptions options;
+        FmhaOptionsFromArgs optionsFromArgs;
+        parseOptionsFromRunnerParams(params, options);
+        options.mCudaArch = intToCudaArch(mSM);
+
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        checkFmhaOptions(options, optionsFromArgs);
+        updateFmhaOptions(options, optionsFromArgs);
+
+        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
+        tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
+
+        if (shouldUseNvrtc(options))
+        {
+            FmhaConfig fmhaConfig;
+            fmhaConfig.mOptions = options;
+            std::ostringstream sstream;
+            populateJsonConfig(options, sstream);
+            fmhaConfig.mGenCfgJsonStr = sstream.str();
+
+            fmhaConfig.mExecPath = getExecPath().c_str();
+            fmhaConfig.mCtaDim = ctaDim;
+            fmhaConfig.mGrid = grid;
+            auto const compileStart = std::chrono::steady_clock::now();
+            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
+            auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
+            if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
+            {
+                auto const& kernelName = fmhaConfig.mFunctionName;
+                TLLM_LOG_INFO("JIT Warmup: Warmup for %s took %.3f ms", kernelName.c_str(), compileElapsedMs);
+            }
+        }
+    }
+
+    void runJITWarmupGridIfRequested(RunnerParams const& runnerParams)
+    {
+        if (!runnerParams.mJITWarmup || runnerParams.mKernelType != FmhaKernelType::Generation)
+        {
+            return;
+        }
+
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(runnerParams.stream, &captureStatus));
+        TLLM_CHECK_WITH_INFO(captureStatus == cudaStreamCaptureStatusNone,
+            "TRTLLM-Gen FMHA JIT warmup must not run during CUDA graph capture.");
+
+        bool const useGenKernelForPrefill = runnerParams.mUseGenKernelForPrefill;
+        int const maxBatchSize = runnerParams.mJITWarmupMaxNumRequests;
+        int const maxSeqLenQ = runnerParams.mJITWarmupMaxSeqLenQ;
+        int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
+
+        TLLM_LOG_DEBUG(
+            "TRTLLM-Gen Fmha Warmup Params: maxBatchSize=%d, maxSeqLenKv=%d, useGenKernelForPrefill=%d, maxSeqLenQ=%d",
+            maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
+        TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
+            "TRTLLM-Gen Fmha Warmup Param is invalid.");
+
+        auto const& batchSizeDefaults
+            = useGenKernelForPrefill ? kDefaultWarmupPrefillBatchSizeCandidates : kDefaultWarmupBatchSizeCandidates;
+        std::vector<int> batchSizeCandidates = makeWarmupCandidateSizes(batchSizeDefaults, maxBatchSize);
+        // Use specified Q for generation, and use our Q grid for prefill
+        std::vector<int> seqLenQCandidates = useGenKernelForPrefill
+            ? makeWarmupCandidateSizes(kDefaultWarmupSeqLenQkvCandidates, maxSeqLenQ)
+            : std::vector<int>{runnerParams.mMaxSeqLenQ};
+        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenQkvCandidates, maxSeqLenKv);
+
+        auto warmupParams = runnerParams;
+
+        for (int batchSize : batchSizeCandidates)
+        {
+            warmupParams.mBatchSize = batchSize;
+            for (int seqLenQ : seqLenQCandidates)
+            {
+                warmupParams.mMaxSeqLenQ = seqLenQ;
+                for (int seqLenKv : seqLenKvCandidates)
+                {
+                    warmupParams.mMaxSeqLenKv = seqLenKv;
+                    int64_t const sumOfSeqLensQ
+                        = static_cast<int64_t>(warmupParams.mBatchSize) * warmupParams.mMaxSeqLenQ;
+                    int64_t const sumOfSeqLensKv
+                        = static_cast<int64_t>(warmupParams.mBatchSize) * warmupParams.mMaxSeqLenKv;
+                    warmupParams.mSumOfSeqLensQ
+                        = static_cast<int>(std::min<int64_t>(sumOfSeqLensQ, std::numeric_limits<int>::max()));
+                    warmupParams.mSumOfSeqLensKv
+                        = static_cast<int>(std::min<int64_t>(sumOfSeqLensKv, std::numeric_limits<int>::max()));
+                    if (useGenKernelForPrefill && warmupParams.mMaxSeqLenKv < warmupParams.mMaxSeqLenQ)
+                    {
+                        continue;
+                    }
+                    warmupOneKernel(warmupParams);
+                }
+            }
+        }
+    }
+
+public:
+    void run(RunnerParams const& params)
+    {
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return;
+        }
+        runJITWarmupGridIfRequested(params);
+
+        int32_t ctaDim = 512;
+        FmhaOptions options;
+        FmhaOptionsFromArgs optionsFromArgs;
+        parseOptionsFromRunnerParams(params, options);
+        options.mCudaArch = intToCudaArch(mSM);
+
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
+        // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
+        if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
+        {
+            options.mTileScheduler = TileScheduler::Static;
+        }
+
+        // Check if the options are valid or not.
+        checkFmhaOptions(options, optionsFromArgs);
+        // Update the options if needed.
+        updateFmhaOptions(options, optionsFromArgs);
+
+        // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
+        // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
+            || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
+        {
+            TLLM_CHECK_WITH_INFO(params.multiCtasKvScratchPtr != nullptr && params.multiCtasKvCounterPtr != nullptr,
+                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when fmha kernel uses gmem-based "
+                "multi-CTA reduction. "
+                "The dispatcher must allocate and pass these buffers.");
+        }
+
+        // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
+        // dimension.
+        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
+
+        // Set the launch grid size.
+        tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
+
+        // Prepare custom mask for spec-decoding generation kernels if needed.
+        if (params.mLayerIdx == 0 && params.mIsSpecDecTree)
+        {
+            int32_t stepQ = options.mTileSizeQ * options.mNumInstsQ;
+            int32_t stepKv = options.mTileSizeKv * options.mNumInstsKv;
+            runPrepareCustomMask(
+                params, options.mFmhaKernelType, stepQ, stepKv, options.mTileSizeQ, options.mTileSizeKv, params.stream);
+        }
+
+        FmhaData fmhaData;
+        setFmhaData(params, options, fmhaData);
+
+        if (shouldUseNvrtc(options))
+        {
+            // nvrtc path - uses mFmhaInterface member for kernel caching
+            FmhaConfig fmhaConfig;
+            fmhaConfig.mOptions = options;
+            std::ostringstream sstream;
+            populateJsonConfig(options, sstream);
+            fmhaConfig.mGenCfgJsonStr = sstream.str();
+
+            fmhaConfig.mExecPath = getExecPath().c_str();
+            fmhaConfig.mCtaDim = ctaDim;
+            fmhaConfig.mGrid = grid;
+            auto const compileStart = std::chrono::steady_clock::now();
+            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
+            auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
+            if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
+            {
+                auto const& kernelName = fmhaConfig.mFunctionName;
+                TLLM_LOG_WARNING(
+                    "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took %.3f ms, kernelName=%s, "
+                    "batchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d. This could affect performance measurement.",
+                    compileElapsedMs, kernelName.c_str(), params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
+            }
+            mFmhaInterface.run(fmhaConfig, fmhaData, params.stream, params.mMultiProcessorCount, 0);
+        }
+        else
+        {
+            algoFilterForCubinPath(options);
+            auto [hashId, info] = hashFromFmhaOptions(options);
+
+            // load from cubin
+            auto const findIter = mFunctions.find(hashId);
+            // Add debug info when kernels are not found.
+            TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "Trtllm-gen kernels not found: " + info);
+
+            auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+            const CUfunction func = findIter->second.mDeviceFunction;
+
+            // mGroupsHeadsQ and mGroupsTokensHeadsQ are not part of the hashID, so they don't
+            // affect kernel lookup. Use cubin-side values from kernelMeta instead of AutoTuner
+            // output, since cubins are exported with enableAutotuner=false.
+            options.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
+            options.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
+
+            KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
+                fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
+                fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
+                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
+                fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr, fmhaData.mMetaData.kvPageIdxD,
+                fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
+                fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
+                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
+                fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mScales.sageAttnSfsQPtrD,
+                fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD, fmhaData.mScales.sageAttnSfsVPtrD,
+                fmhaData.mInputBuffers.attentionSinksPtrD, fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD,
+                fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
+                fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
+                fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
+                fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
+                options.mUsesSharedPagedKvIdx);
+
+            launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
+            // Run the separate reduction kernel if needed.
+            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+        }
+    }
+
+private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
             "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
             "headDimV=%d",
             headDimPerCtaV, headDimQk, headDimV);
-        // The numTokensPerPage must be power of 2.
-        TLLM_CHECK_WITH_INFO(
-            (numTokensPerPage & (numTokensPerPage - 1)) == 0, "The numTokensPerPage must be power of 2.");
+        // The numTokensPerPage must be 0 (non-paged layouts) or a power of 2 (paged layouts).
+        TLLM_CHECK_WITH_INFO(numTokensPerPage == 0 || (numTokensPerPage & (numTokensPerPage - 1)) == 0,
+            "The numTokensPerPage must be 0 or power of 2, got %d.", numTokensPerPage);
         TLLM_CHECK_WITH_INFO(tileSizeQ <= 128 && tileSizeKv <= 128, "The tileSizeQ and tileSizeKv must be <= 128.");
         TLLM_CHECK_WITH_INFO((tileSizeQ & (tileSizeQ - 1)) == 0 && (tileSizeKv & (tileSizeKv - 1)) == 0,
             "The tileSizeQ and tileSizeKv must be power of 2.");
@@ -191,16 +591,17 @@ public:
         // Bit 49 - 52: (log2(tileSizeQ)).
         // Bit 53 - 53: reuseSmemKForV.
         // Bit 54 - 54: uses2CtaMma.
-        // Bit 55 - 55: sparseMla.
-        // Bit 56 - 56: skipsSoftmax.
+        // Bit 55 - 56: sparseAttention.
+        // Bit 57 - 57: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
             | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
-            | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(log2(numTokensPerPage)) << 44)
+            | (static_cast<uint64_t>(tileSizeKv >> 6) << 42)
+            | (static_cast<uint64_t>(numTokensPerPage > 0 ? static_cast<int>(log2(numTokensPerPage)) : 0) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
-            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 56);
+            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
+            | (static_cast<uint64_t>(skipsSoftmax) << 57);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -208,645 +609,555 @@ public:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseMla, kernelMeta.mSkipsSoftmaxWhenPossible);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible);
     }
 
-    std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
+    std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
     {
-        // Some conditions to check if the kernel is supported.
-        // This is meant to avoid occupying unnecessary hashId bits.
-        if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+        // uses2CtaMma: "2CTA MMA kernel variant" (MLA KeepsMmaAb with clusterDimX=2).
+        // CGA scaling (clusterDimX *= mMaxNumCtasKv) is applied only at launch time in launchFmhaKernel,
+        // so options.mClusterDimX here is the unscaled value from the autotuner.
+        bool uses2CtaMma = (options.mClusterDimX == 2);
+        // Debug info.
+        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK="
+            + std::to_string(static_cast<int>(mDtypeK)) + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
+            + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut)) + ", sm=" + std::to_string(mSM)
+            + ", mNumEltsPerSageAttnBlkQ=" + std::to_string(mNumEltsPerSageAttnBlkQ)
+            + ", mNumEltsPerSageAttnBlkK=" + std::to_string(mNumEltsPerSageAttnBlkK)
+            + ", mNumEltsPerSageAttnBlkP=" + std::to_string(mNumEltsPerSageAttnBlkP)
+            + ", mNumEltsPerSageAttnBlkV=" + std::to_string(mNumEltsPerSageAttnBlkV)
+            + ", qkvLayout=" + std::to_string(static_cast<int>(options.mQkvLayout))
+            + ", maskType=" + std::to_string(static_cast<int>(options.mMaskType))
+            + ", kernelType=" + std::to_string(static_cast<int>(options.mFmhaKernelType))
+            + ", tileScheduler=" + std::to_string(static_cast<int>(options.mTileScheduler))
+            + ", multiCtasKvMode=" + std::to_string(static_cast<int>(options.mMultiCtasKvMode)) + ", headDimPerCtaV="
+            + std::to_string(options.mHeadDimPerCtaV) + ", headDimQk=" + std::to_string(options.mHeadDimQk)
+            + ", headDimV=" + std::to_string(options.mHeadDimV) + ", tileSizeQ=" + std::to_string(options.mTileSizeQ)
+            + ", tileSizeKv=" + std::to_string(options.mTileSizeKv) + ", numTokensPerPage="
+            + std::to_string(options.mNumTokensPerPage) + ", reuseSmemKForV=" + std::to_string(options.mReuseSmemKForV)
+            + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
+            + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
+            + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible);
+
+        TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
+        return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
+                                  static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
+                                  static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
+                                  static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
+                                  static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
+                                  static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible),
+            info);
+    }
+
+    std::string const& getExecPath() const
+    {
+        static std::string execPathStr;
+        if (execPathStr.empty())
         {
-            return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
-        }
-
-        // The selectKernelParams that might be updated.
-        SelectKernelParams selectKernelParams{params};
-        // Select the kernel.
-        selectKernel(params, selectKernelParams);
-        // Hash the runner params.
-        auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
-        return std::make_pair(mFunctions.find(hashId) != mFunctions.end(), info);
-    }
-
-    std::pair<CUfunction, KernelMeta> loadKernel(
-        RunnerParams const& params, SelectKernelParams const& selectKernelParams) const
-    {
-        auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
-        auto const findIter = mFunctions.find(hashId);
-
-        // Add debug info when kernels are not found.
-        TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "Trtllm-gen kernels not found: " + info);
-
-        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-        const CUfunction func = findIter->second.mDeviceFunction;
-        // Return the kernel function and kernel meta.
-        return std::make_pair(func, kernelMeta);
-    }
-
-    void run(RunnerParams const& params) const
-    {
-        // The selectKernelParams that might be updated.
-        SelectKernelParams selectKernelParams{params};
-        // The parameters for launching the kernel.
-        CtaLaunchParams ctaLaunchParams;
-        // The iteration index (used to detect a deadlock of selecting new kernels).
-        int selectKernelIter = 0;
-        // While loop.
-        while (true)
-        {
-            // Any value >= 2 should work here, but we set it larger in case that we might have more complicated
-            // heuristic in the future.
-            TLLM_CHECK_WITH_INFO(selectKernelIter < 8, "A deadlock is detected when selecting trtllm-gen kernels.");
-
-            // Select the kernel.
-            selectKernel(params, selectKernelParams);
-            // Load the kernel.
-            auto [func, kernelMeta] = loadKernel(params, selectKernelParams);
-
-            // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
-            computeNumCtas(ctaLaunchParams, params, kernelMeta, selectKernelParams);
-
-            // Need to select a new kernel if mSelectNewKernel is true.
-            if (selectKernelParams.mSelectNewKernel)
+            // Get build directory relative path from CMake macro
+            // This is the relative path from project root to build directory
+            std::string buildRelPath = "cpp/build/tensorrt_llm/kernels/trtllmGenKernels/fmha";
+#ifdef TRTLLM_FMHA_BUILD_DIR
+            // Try to extract relative path from absolute path
+            // TRTLLM_FMHA_BUILD_DIR is the absolute build directory path
+            std::string buildAbsDir = TRTLLM_FMHA_BUILD_DIR;
+            // Extract relative path by finding "cpp/build" in the absolute path
+            size_t pos = buildAbsDir.find("cpp/build");
+            if (pos != std::string::npos)
             {
-                selectKernelIter++;
-                continue;
+                buildRelPath = buildAbsDir.substr(pos);
             }
-            // Prepare custom mask for spec-decoding generation kernels.
-            if (params.mLayerIdx == 0 && params.mIsSpecDecTree)
+#endif
+
+            // Always use pip show to find installation location at runtime
+            char const* cmd = "pip show tensorrt_llm 2>/dev/null";
+
+            // Buffer to store the output
+            std::array<char, 128> buffer;
+            std::string result;
+            // Open pipe to command
+#ifdef _MSC_VER
+            FILE* pipe = _popen(cmd, "r");
+#else
+            FILE* pipe = popen(cmd, "r");
+#endif
+            if (pipe)
             {
-                runPrepareCustomMask(kernelMeta, params, params.stream);
-            }
-
-            // Prepare the kernel parameters.
-            auto kernelParams = KernelParams::setKernelParams(
-                params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
-
-            // Prepare kernel parameters list for cuLaunchKernelEx.
-            void* kernelParamsList[] = {&kernelParams};
-            CUlaunchConfig launch_config;
-            launch_config.blockDimX = kernelMeta.mThreadsPerCTA;
-            launch_config.blockDimY = 1;
-            launch_config.blockDimZ = 1;
-            launch_config.gridDimX = ctaLaunchParams.mNumCtasX;
-            launch_config.gridDimY = ctaLaunchParams.mNumCtasY;
-            launch_config.gridDimZ = ctaLaunchParams.mNumCtasZ;
-            launch_config.hStream = params.stream;
-            launch_config.sharedMemBytes = kernelMeta.mSharedMemBytes;
-
-            // Debug info.
-            TLLM_LOG_DEBUG("TRTLLM-Gen launch info: kernelName = %s", kernelMeta.mFuncName);
-            TLLM_LOG_DEBUG(
-                "TRTLLM-Gen launch info: maxSeqLenQ = %d, "
-                "maxSeqLenKv = %d, "
-                "numHeadsQ = %d, "
-                "numHeadsKv = %d, batchSize = %d, kernelType = %d",
-                params.mMaxSeqLenQ, params.mMaxSeqLenKv, params.mNumHeadsQ, params.mNumHeadsKv, params.mBatchSize,
-                static_cast<int>(params.mKernelType));
-            TLLM_LOG_DEBUG("TRTLLM-Gen launch info: numCtasX = %d, numCtasY = %d, numCtasZ = %d, clusterDimX = %d",
-                ctaLaunchParams.mNumCtasX, ctaLaunchParams.mNumCtasY, ctaLaunchParams.mNumCtasZ,
-                ctaLaunchParams.mClusterDimX);
-
-            CUlaunchAttribute launch_attribute[3];
-            launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-            launch_attribute[0].value.clusterDim.x = ctaLaunchParams.mClusterDimX;
-            launch_attribute[0].value.clusterDim.y = 1;
-            launch_attribute[0].value.clusterDim.z = 1;
-            launch_attribute[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
-            launch_attribute[1].value.clusterSchedulingPolicyPreference = ctaLaunchParams.mClusterDimX > 1
-                ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD
-                : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
-            launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
-            launch_attribute[2].value.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-
-            launch_config.attrs = launch_attribute;
-            launch_config.numAttrs = 3;
-
-            // Add setting for non-portable cluster size.
-            if (ctaLaunchParams.mClusterDimX > 8)
-            {
-                TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-                    1 // Enable non-portable cluster sizes
-                    ));
-            }
-
-            // Force using GmemReduction for the multiCtasKvMode if the CgaSmemReduction needs more than one wave (due
-            // to the cluster occupancy limit).
-            // TODO: find a better heuristic of using CgaSmemReduction.
-            if (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode))
-            {
-                // The maximum number of active clusters that could co-exist.
-                int maxActiveClusters = 1;
-                TLLM_CU_CHECK(mDriver->cuOccupancyMaxActiveClusters(&maxActiveClusters, func, &launch_config));
-                // Use the GmemReduction instead if it needs more than one wave.
-                if (maxActiveClusters * ctaLaunchParams.mClusterDimX
-                    < (ctaLaunchParams.mNumCtasX * ctaLaunchParams.mNumCtasY * ctaLaunchParams.mNumCtasZ))
+                // Read the output
+                while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
                 {
-                    selectKernelParams.mForceGmemReduction = true;
-                    selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
-                    // continue to select a new kernel.
-                    continue;
+                    result += buffer.data();
                 }
-            }
+// Close the pipe
+#ifdef _MSC_VER
+                _pclose(pipe);
+#else
+                pclose(pipe);
+#endif
+                // Parse the location using regex
+                // `pip show tensorrt_llm` will output something like:
+                // Location: /usr/local/lib/python3.12/dist-packages
+                // Editable project location: /code
+                std::regex locationRegex("(Location|Editable project location): (.+)");
+                // Find all matches
+                auto match_begin = std::sregex_iterator(result.begin(), result.end(), locationRegex);
+                auto match_end = std::sregex_iterator();
 
-            TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
+                // Get the number of matches
+                auto match_count = std::distance(match_begin, match_end);
 
-            // Run the separate reduction kernel if needed.
-            runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount, params.stream);
+                if (match_count > 0)
+                {
+                    std::string location;
+                    bool foundEditable = false;
 
-            // Break the while op.
-            break;
-        }
-    }
+                    // First, try to find "Editable project location" (preferred)
+                    for (auto it = match_begin; it != match_end; ++it)
+                    {
+                        std::string matchType = it->str(1);
+                        if (matchType == "Editable project location")
+                        {
+                            location = it->str(2);
+                            foundEditable = true;
+                            break;
+                        }
+                    }
 
-private:
-    // Is it MLA generation kernel ?
-    inline bool isMlaGenKernel(RunnerParams const& params) const
-    {
-        return params.mHeadDimQk == 576 && params.mHeadDimV == 512;
-    }
+                    // If not found, use "Location" as fallback
+                    if (!foundEditable)
+                    {
+                        for (auto it = match_begin; it != match_end; ++it)
+                        {
+                            std::string matchType = it->str(1);
+                            if (matchType == "Location")
+                            {
+                                location = it->str(2);
+                                break;
+                            }
+                        }
+                    }
 
-    void computeNumCtas(CtaLaunchParams& ctaLaunchParams, RunnerParams const& params, KernelMeta const& kernelMeta,
-        SelectKernelParams& selectKernelParams) const
-    {
-        bool isDsv3MinLatencyMode = params.mBatchSize == 1 && params.mMaxSeqLenQ >= 1 && params.mMaxSeqLenQ <= 16
-            && params.mHeadDimQk == 576 && params.mHeadDimV == 512;
-        // Do we need to select a new kernel ?
-        selectKernelParams.mSelectNewKernel = false;
+                    // If still not found, use the last match as fallback
+                    if (location.empty())
+                    {
+                        TLLM_LOG_WARNING("No location found, using the last match as fallback.");
+                        auto last_match_iter = match_begin;
+                        std::advance(last_match_iter, match_count - 1);
+                        location = last_match_iter->str(2);
+                    }
 
-        // The number of Ctas per Q sequence.
-        int numCtasPerSeqQ = (params.mMaxSeqLenQ + kernelMeta.mStepQ - 1) / kernelMeta.mStepQ;
-        // The generation-phase kernels might need to group both tokensQ and headsQ into one CTA.
-        if (params.mMaxSeqLenQ > 1 && !isContextKernel(params.mKernelType))
-        {
-            // Each CTA handles one tokenQ by default for spec-decoding generation kernel.
-            if (!kernelMeta.mGroupsTokensHeadsQ)
-            {
-                numCtasPerSeqQ = params.mMaxSeqLenQ;
+                    // Trim whitespace
+                    location.erase(location.find_last_not_of(" \n\r\t") + 1);
+
+                    // Build the exec path: try candidate paths in order of priority.
+                    std::vector<std::filesystem::path> candidatePaths;
+                    if (foundEditable)
+                    {
+                        candidatePaths.push_back(std::filesystem::path(location) / buildRelPath);
+                    }
+                    auto fmhaIncludeSuffix
+                        = std::filesystem::path("tensorrt_llm") / "include" / "trtllm_gen_kernels" / "fmha";
+                    candidatePaths.push_back(std::filesystem::path(location) / fmhaIncludeSuffix);
+
+                    bool pathFound = false;
+                    for (auto const& candidate : candidatePaths)
+                    {
+                        if (std::filesystem::exists(candidate))
+                        {
+                            execPathStr = (candidate / "numb").string();
+                            pathFound = true;
+                            break;
+                        }
+                    }
+                    TLLM_CHECK_WITH_INFO(pathFound,
+                        "FMHA NVRTC kernel headers not found in any candidate path. "
+                        "FMHA JIT compilation may fail. Please check the installation of TensorRT-LLM.");
+                }
             }
             else
             {
-                // Compute numTokensPerCtaQ where each CTA must process complete numGroupedHeadsQ.
-                // Note that each CTA must process complete numHeadsQPerKv.
-                int numTokensPerCtaQ = kernelMeta.mStepQ / params.mNumHeadsQPerKv;
-                // Group both headsQ and tokensQ into one CTA.
-                numCtasPerSeqQ = tc::divUp(params.mMaxSeqLenQ, numTokensPerCtaQ);
+                TLLM_LOG_WARNING("Failed to find TensorRT-LLM installation, NVRTC FMHA path will be unavailable.");
             }
         }
-
-        // Compute the grid dimension Y.
-        int numHeadsPerCta = kernelMeta.mGroupsHeadsQ ? std::min(params.mNumHeadsQPerKv, kernelMeta.mStepQ) : 1;
-        int numCtasForAllHeadsQ = params.mNumHeadsQ / numHeadsPerCta;
-        TLLM_CHECK_WITH_INFO(
-            numHeadsPerCta * numCtasForAllHeadsQ == params.mNumHeadsQ, "The numHeadsQ/numHeadsKv is not supported.");
-        // Take the number of headDim CTAs.
-        TLLM_CHECK_WITH_INFO(
-            kernelMeta.mHeadDimV % selectKernelParams.mHeadDimPerCtaV == 0, "The headDimPerCtaV is not supported.");
-        int numCtasPerHeadDim = kernelMeta.mHeadDimV / selectKernelParams.mHeadDimPerCtaV;
-        // Compute the current numCtasX.
-        int numCtasX = numCtasPerSeqQ;
-        // Update the numCtasY.
-        int numCtasY = numCtasForAllHeadsQ * numCtasPerHeadDim;
-        // Compute the grid dimension Z.
-        int numCtasZ = params.mBatchSize;
-        // The 2CtaMma kernels will use 2 Ctas in the x dimension (only used by MLA generation kernels) for heads,
-        // so numCtasPerHeadDim and numCtasForAllHeadsQ will be handled by the 2Ctas in the x dimension.
-        if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma)
-        {
-            TLLM_CHECK_WITH_INFO(
-                numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2, "Internal error: numCtasPerHeadDim should be 2.");
-            numCtasX *= 2;
-            numCtasY /= (numCtasForAllHeadsQ * numCtasPerHeadDim);
-        }
-
-        // First split the seqLenKv into multiple CTAs if the utilization is not full.
-        // The number of Ctas per KV sequence.
-        int numCtasPerSeqKv = 1;
-        // Consider the multiCtasKvMode for better GPU utilization.
-        if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode))
-        {
-            // The maximum attention window (the maximum number of tokensKv that will be attended to).
-            int maxAttentionWindow{params.mMaxSeqLenKv};
-            // The sparseMla only selects topK tokensKv.
-            if (params.mSparseMla)
-            {
-                maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
-            }
-            // Some of the tilesKv will be skipped if the sliding window attention or chunked attention is used.
-            if (isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType))
-            {
-                if (params.mMaxSeqLenKv > params.mAttentionWindowSize)
-                {
-                    // Consider that the first tileKv might contain tokensKv that is out of the attention window.
-                    maxAttentionWindow
-                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mTileSizeKv - 1);
-                }
-                else
-                {
-                    maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
-                }
-            }
-
-            // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
-            // The factor of 2 is applied here to ensure the reduction overhead does not outweigh the benefits of a
-            // shorter mainloop.
-            int const maxNumCtasPerSeqKv = (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
-            // Compute numCtasPerSeqKv.
-            numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
-                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
-            // Update the numCtasX.
-            numCtasX *= numCtasPerSeqKv;
-            // The current total number of CTAs.
-            int totalNumCtas = numCtasX * numCtasZ * numCtasY;
-            // Disable the multiCtasKvMode if there is only one CtaKv.
-            if (numCtasPerSeqKv <= 1)
-            {
-                selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-                // Enable the persistent scheduler for better performance.
-                selectKernelParams.mTileScheduler = TileScheduler::Persistent;
-                // Need to select a different kernel.
-                selectKernelParams.mSelectNewKernel = true;
-            }
-            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseMla
-                && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
-            {
-                // Use smaller tileSizeKv to fully utilize the SMs.
-                selectKernelParams.mTileSizeKv = 64;
-                // Need to select a different kernel.
-                selectKernelParams.mSelectNewKernel = true;
-            }
-
-            // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension is 16.
-            // Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-            if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16
-                && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
-                && isGmemReduction(selectKernelParams.mMultiCtasKvMode) && !selectKernelParams.mForceGmemReduction)
-            {
-                selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
-                // Need to select a different kernel.
-                selectKernelParams.mSelectNewKernel = true;
-            }
-
-            // Add the debug info when multiCtasKvMode is enabled.
-            if (numCtasPerSeqKv > 1)
-            {
-                TLLM_LOG_DEBUG(
-                    "TRTLLM-Gen launch info: multiCtasKvMode is enabled with tileSizeKv = %d, numCtasPerSeqKv = %d, "
-                    "numCtasPerSeqQ = "
-                    "%d, numCtasY = %d, numCtasZ = %d",
-                    selectKernelParams.mTileSizeKv, numCtasPerSeqKv, numCtasPerSeqQ, numCtasY, numCtasZ);
-            }
-        }
-
-        // The cluster size in the X dimension.
-        int clusterDimX = selectKernelParams.mUses2CtaMma ? 2 : 1;
-        if (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode))
-        {
-            // Note 2CtaMma and CgaSmemReduction cannot be used together currently.
-            clusterDimX *= numCtasPerSeqKv;
-        }
-
-        // Compute the current number of CTAs in total.
-        int totalNumCtas = numCtasX * numCtasZ * numCtasY;
-
-        // Then split the headDimV into multiple CTAs if there are still unused SMs.
-        if (isMlaGenKernel(params) && !selectKernelParams.mReuseSmemKForV && !selectKernelParams.mSelectNewKernel
-            && !selectKernelParams.mUses2CtaMma)
-        {
-            // Split the headDimV into multiple CTAs if the utilization is not full.
-            // It doesn't work with reuseSmemKForV currently.
-            // TODO: find better heuristic of splitting headDimV across multiple CTAs.
-
-            int corrFactor = isDsv3MinLatencyMode ? 1 : 2;
-            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * corrFactor <= params.mMultiProcessorCount)
-            {
-                // Use smaller headDimPerCtaV to fully utilize the SMs.
-                selectKernelParams.mHeadDimPerCtaV
-                    = totalNumCtas * 2 * corrFactor <= params.mMultiProcessorCount ? 128 : 256;
-                // Need to select a different kernel.
-                selectKernelParams.mSelectNewKernel = true;
-            }
-        }
-
-        // Update the parameters for launching the kernel.
-        ctaLaunchParams.mMaxNumCtasQ = numCtasPerSeqQ;
-        ctaLaunchParams.mMaxNumCtasKv = numCtasPerSeqKv;
-        ctaLaunchParams.mNumCtasX = numCtasX;
-        ctaLaunchParams.mNumCtasY = numCtasY;
-        ctaLaunchParams.mNumCtasZ = numCtasZ;
-        ctaLaunchParams.mClusterDimX = clusterDimX;
+        return execPathStr;
     }
 
-    // Determine if we should use the SwapsMmaAbForGeneration kernel for MLA generation.
-    bool useSwapsMmaAbMlaGenKernel(RunnerParams const& params) const
+    // Prepare pointers for TMA descriptors.
+    static std::tuple<void const*, void const*, void const*> getDevicePtrs(
+        TllmGenFmhaRunnerParams const& runnerParams, int32_t bitsPerElt)
     {
-        // Use the SwapsMmaAbForGeneration kernel for MLA generation when the following conditions are met:
-        // 1. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later).
-        // 2. The numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
+        // Declare the q, k, v ptrs.
+        void const *qPtr{runnerParams.qPtr}, *kPtr{runnerParams.kPtr}, *vPtr{runnerParams.vPtr};
 
-        // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
-        // Here we assume the stepKv is 256.
-        int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + 256 - 1) / 256;
-        // The number of Ctas.
-        int const numCtas
-            = static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16));
-        if (numCtas == 0)
+        // Set Q, K and V pointer from packed QKV tensor.
+        if (isPackedQkv(runnerParams.mQkvLayout))
         {
-            return false;
+            qPtr = runnerParams.qkvPtr;
+            kPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr)
+                + runnerParams.mNumHeadsQ * runnerParams.mHeadDimQk * bitsPerElt / 8 /*bits*/);
+            vPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr)
+                + (runnerParams.mNumHeadsQ + runnerParams.mNumHeadsKv) * runnerParams.mHeadDimQk * bitsPerElt
+                    / 8 /*bits*/);
         }
-        // Compute numCtasPerSeqKv.
-        int const numCtasPerSeqKv
-            = std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
-        // Compute the seqLenPerCtaKv.
-        int const seqLenPerCtaKv = (params.mMaxSeqLenKv + numCtasPerSeqKv - 1) / numCtasPerSeqKv;
-        // Whether we should use the SwapsMmaAbForGeneration kernel for MLA generation.
-        return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
+        // Set K and V pointer from pagedKv tensor.
+        else if (isPagedKv(runnerParams.mQkvLayout))
+        {
+            // Note that the offsets will be fully handled by the pageIdx buffer.
+            kPtr = runnerParams.kvPtr;
+            vPtr = runnerParams.kvPtr;
+        }
+        // Set K and V pointer from contiguousQAnddKv tensor.
+        else if (isContiguousKv(runnerParams.mQkvLayout))
+        {
+            kPtr = runnerParams.kvPtr;
+            // The maximum headDim of K and V.
+            // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
+            int32_t const maxHeadDimKv{std::max(runnerParams.mHeadDimQk, runnerParams.mHeadDimV)};
+            vPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.kvPtr)
+                + runnerParams.mNumHeadsKv * runnerParams.mMaxSeqLenCacheKv * maxHeadDimKv * bitsPerElt / 8 /*bits*/);
+        }
+
+        // Return the pointers.
+        return std::make_tuple(qPtr, kPtr, vPtr);
     }
 
-    // Selects a heuristic kernel for MLA generation.
-    void selectMlaGenerationKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
+    void setFmhaData(RunnerParams const& params, FmhaOptions const& options, FmhaData& fmhaData) const
     {
-        // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
-        // conditions are met:
-        // 1. The number of headsQPerKv is <= 32.
-        // 2. The number of headsQPerKv is < 128 for sparseMla.
-        // 3. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
-        //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
-        // The sparseMla kernel will always use the 2CTA high-throughput kernel.
+        // Fill MetaData
+        fmhaData.mMetaData.cumSeqLensQPtrD = params.cumSeqLensQPtr;
+        fmhaData.mMetaData.cumSeqLensKvPtrD = params.cumSeqLensKvPtr;
+        fmhaData.mMetaData.seqLensKvD = params.seqLensKvPtr;
+        fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD = params.firstSparseMaskOffsetsKvPtr;
+        fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
+        fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
+        fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
+        fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
 
-        // The kernel type.
-        FmhaKernelType& kernelType = selectKernelParams.mKernelType;
-        // The tile size for Q.
-        int& tileSizeQ = selectKernelParams.mTileSizeQ;
+        // Fill Scales
+        fmhaData.mScales.kSfBasePtr = params.kvSfPtr;
+        fmhaData.mScales.vSfBasePtr = params.kvSfPtr;
+        fmhaData.mScales.scaleSoftmaxLog2D = params.scaleSoftmaxLog2Ptr;
+        fmhaData.mScales.outputScaleD = params.outputScalePtr;
+        fmhaData.mScales.kvSfScaleD = params.kvSfScalePtr;
+        fmhaData.mScales.oSfScaleD = params.oSfScalePtr;
+        // Sage Attention scaling factors
+        fmhaData.mScales.sageAttnSfsQPtrD = params.sageAttnSfsQPtr;
+        fmhaData.mScales.sageAttnSfsKPtrD = params.sageAttnSfsKPtr;
+        fmhaData.mScales.sageAttnSfsPPtrD = params.sageAttnSfsPPtr;
+        fmhaData.mScales.sageAttnSfsVPtrD = params.sageAttnSfsVPtr;
+        // Host-side scale values (from params)
+        TLLM_CHECK_WITH_INFO(params.mScaleQ != 0.f, "mScaleQ must not be zero (used as divisor in softmaxScale).");
+        fmhaData.mScales.softmaxScale
+            = (1.f / (std::sqrt(static_cast<float>(params.mHeadDimQk)) * params.mScaleQ)) * M_LOG2E;
 
-        // Check the conditions.
-        if (params.mNumHeadsQPerKv <= 32 || (params.mSparseMla && params.mNumHeadsQPerKv < 128)
-            || useSwapsMmaAbMlaGenKernel(params))
+        fmhaData.mScales.kvSfScale = 1.f; // Default value; per-token scale from kvSfScaleD when set
+        fmhaData.mScales.oSfScale = 1.f;  // Default value; per-token scale from oSfScaleD (e2m1/NVFP4 O) when set
+        fmhaData.mScales.oSfPtrD = params.oSfPtr;
+
+        // Get qkv pointers.
+        auto [qPtr, kPtr, vPtr] = getDevicePtrs(params, tg::dtypeGetNumBits(options.mDtypeK));
+        // Fill InputBuffers
+        fmhaData.mInputBuffers.qBasePtr = qPtr;
+        fmhaData.mInputBuffers.kBasePtr = kPtr;
+        fmhaData.mInputBuffers.vBasePtr = vPtr;
+        fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr = params.slidingWindowKvPoolBasePtr;
+        fmhaData.mInputBuffers.attentionSinksPtrD = params.attentionSinksPtr;
+        fmhaData.mInputBuffers.customMaskPtrD = params.customMaskPtr;
+        fmhaData.mInputBuffers.customMaskOffsetsPtrD = params.customMaskOffsetsPtr;
+
+        // Fill OutputBuffers
+        fmhaData.mOutputBuffers.oPtrD = params.oPtr;
+        fmhaData.mOutputBuffers.multiCtasKvCounterPtrD = params.multiCtasKvCounterPtr;
+        // Split multiCtasKvScratchPtr into partialStats and partialO
+        // Note: The split calculation is done in setKernelParams with kernelMeta.mStepQ
+        // For FmhaData, we store the base pointer and let the kernel params handle the split
+        fmhaData.mOutputBuffers.partialStatsPtrD = reinterpret_cast<float2*>(params.multiCtasKvScratchPtr);
+        // The partial buffers' pointers when the multiCtasKv mode is enabled.
+        int64_t partialStatsBufferSize = params.mMultiProcessorCount * options.mTileSizeQ * options.mNumInstsQ;
+        // partialO comes after partialStats, but exact offset depends on kernelMeta
+        // This will be properly set in setKernelParams
+        fmhaData.mOutputBuffers.partialOPtrD = fmhaData.mOutputBuffers.partialStatsPtrD + partialStatsBufferSize;
+        fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD = nullptr; // Not available in params (would need to be added)
+        fmhaData.mOutputBuffers.softmaxStatsD = params.softmaxStatsPtr;
+        fmhaData.mOutputBuffers.oDebugPtrD = nullptr;           // Debug output not supported in TensorRT-LLM
+
+        // Print all primitive type variables in FmhaData for debugging
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Convert Data_type to trtllm::gen::Dtype
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    tg::Dtype dataTypeToDtype(Data_type dataType) const
+    {
+        switch (dataType)
         {
-            kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-            // Currently, only tileSizeQ = 8 or 16 are supported.
-            tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
-        }
-        else
-        {
-            // Otherwise, we use the high-throughput kernel.
-            kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-            // Use the tileSizeQ = 64 for MLA high-throughput generation kernels.
-            tileSizeQ = 64;
-            // Always use the separate reduction kernel.
-            if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode))
-            {
-                selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
-            }
-            // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
-            TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
-                "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
-                params.mNumHeadsQPerKv);
-            // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
-            if (params.mNumHeadsQPerKv == 128)
-            {
-                selectKernelParams.mUses2CtaMma = true;
-                // Each Cta only handles 256 headDimV.
-                selectKernelParams.mHeadDimPerCtaV = 256;
-            }
+        case DATA_TYPE_BOOL: return tg::Dtype::Bool;
+        case DATA_TYPE_FP16: return tg::Dtype::Fp16;
+        case DATA_TYPE_FP32: return tg::Dtype::Fp32;
+        case DATA_TYPE_INT4:
+            // Note: DATA_TYPE_INT4 could map to MxInt4 (block format)
+            // Adjust based on your use case
+            return tg::Dtype::MxInt4;
+        case DATA_TYPE_INT8: return tg::Dtype::Int8;
+        case DATA_TYPE_INT32: return tg::Dtype::Int32;
+        case DATA_TYPE_BF16: return tg::Dtype::Bfloat16;
+        case DATA_TYPE_E2M1: return tg::Dtype::E2m1;
+        case DATA_TYPE_E4M3: return tg::Dtype::E4m3;
+        case DATA_TYPE_E5M2: return tg::Dtype::E5m2;
+        default:
+            // Fallback or throw error
+            return tg::Dtype::Void;
         }
     }
 
-    // Selects a heuristic tileSizeQ if groupsTokensHeadsQ is true.
-    void selectTileSizeQForGqaGeneration(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
+    void parseOptionsFromRunnerParams(RunnerParams const& params, FmhaOptions& options) const
     {
+        // Basic dimensions
+        options.mBatchSize = params.mBatchSize;
+        options.mMaxSeqLenQ = params.mMaxSeqLenQ;
+        options.mMinSeqLenQ = params.mMaxSeqLenQ;
+        // For context self-attention without prior KV cache, TRT-LLM passes
+        // mMaxSeqLenKv=0. trtllm-gen requires mMaxSeqLenKv>0, so use mMaxSeqLenQ
+        // as the effective KV length (Q produces KV of equal length).
+        options.mMaxSeqLenKv = (isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0) ? params.mMaxSeqLenQ
+                                                                                                 : params.mMaxSeqLenKv;
+        options.mMinSeqLenKv = options.mMaxSeqLenKv;
 
-        // Define the per-tile mainloop cost model for different tileSizeQ choices.
-        std::unordered_map<int, float> kernelMainloopCost = {
-            {128, 2.2}, // Cost factor when tileSizeQ = 128
-            {64, 1.68}, // Cost factor when tileSizeQ = 64
-            {32, 1.48}, // Cost factor when tileSizeQ = 32
-            {16, 1.2},  // Cost factor when tileSizeQ = 16
-            {8, 1.0}    // Cost factor when tileSizeQ = 8
+        // Variable sequence length support
+        options.mSumOfSeqLensQ = params.mSumOfSeqLensQ;
+        options.mSumOfSeqLensKv = params.mSumOfSeqLensKv;
+
+        // Head configuration
+        options.mNumHeadsQ = params.mNumHeadsQ;
+        options.mNumHeadsKv = params.mNumHeadsKv;
+        options.mNumHeadsQPerKv = params.mNumHeadsQPerKv;
+        options.mHeadDimQk = params.mHeadDimQk;
+        options.mHeadDimV = params.mHeadDimV;
+
+        // Layout and mask configuration
+        options.mQkvLayout = params.mQkvLayout;
+        options.mMaskType = params.mMaskType;
+        options.mFmhaKernelType = params.mKernelType;
+        options.mTileScheduler = params.mTileScheduler;
+
+        // Multi-CTA KV mode (bool -> enum conversion)
+        options.mMultiCtasKvMode = params.mMultiCtasKvMode ? tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
+                                                           : tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+        options.mStoresSoftmaxStats = true;
+
+        // Attention features
+        options.mUseBlockSparseAttention = params.mUseBlockSparseAttention;
+        options.mAttentionWindowSize = params.mAttentionWindowSize;
+        options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
+
+        // Sparse attention (MLA / MQA / GQA)
+        options.mSparseType = params.mSparseAttention;
+        options.mSparseAttnTopK = params.mSparseTopK;
+        options.mHasSlidingWindowKvPool = isMlaGenKernel(params) && isDynamicTokenSparse(params.mSparseAttention);
+
+        // Softmax optimization
+        options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
+        options.mSkipsSoftmaxWhenPossible = params.mSkipSoftmaxThresholdScaleFactor != 0.0f;
+
+        // Paged KV cache
+        options.mMaxNumPagesPerSeqKv = params.mMaxNumPagesPerSeqKv;
+        options.mNumTokensPerPage = params.mNumTokensPerPage;
+        options.mNumPagesInMemPool = params.mNumPagesInMemPool;
+
+        options.mEnablesAutoTuner = true;
+        options.mIsMlaGen = isMlaGenKernel(params);
+        options.mDtypeQ = dataTypeToDtype(mDtypeQ);
+        options.mDtypeKv = dataTypeToDtype(mDtypeK);
+        options.mDtypeK = dataTypeToDtype(mDtypeK);
+        options.mDtypeV = dataTypeToDtype(mDtypeV);
+        options.mDtypeOut = dataTypeToDtype(mDtypeOut);
+        options.mNumEltsPerSageAttnBlkQ = mNumEltsPerSageAttnBlkQ;
+        options.mNumEltsPerSageAttnBlkK = mNumEltsPerSageAttnBlkK;
+        options.mNumEltsPerSageAttnBlkP = mNumEltsPerSageAttnBlkP;
+        options.mNumEltsPerSageAttnBlkV = mNumEltsPerSageAttnBlkV;
+        options.mSupportsVarSeqLens = true;
+        if (options.mQkvLayout != QkvLayout::PackedQkv)
+        {
+            options.mSupportsDiffSeqLensForQAndKv = true;
+        }
+
+        // Enables the optimization to skip the correction step when possible.
+        options.mSkipsCorrWhenPossible = true;
+
+        // Enables interleaveSfV by default.
+        options.mInterleaveSfV = true;
+
+        // Enables PDL if specified.
+        options.mEnablesPdl = tensorrt_llm::common::getEnvEnablePDL();
+
+        // spec-decoding
+        bool isContext = params.mKernelType == FmhaKernelType::Context;
+        options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
+        options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
+        options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
+        // Carry static tree length into FMHA kernel selection.
+        options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
+
+        options.mIsTrtllmLayout = true;
+    }
+
+    void populateJsonConfig(FmhaOptions const& options, std::ostringstream& sstream) const
+    {
+        sstream << "{\n";
+        sstream << "\"clusterDimX\": " << options.mClusterDimX << ",\n";
+        // The 2CTA UTCMMA is used by default if the clusterDimX is set to 2.
+        if (options.mClusterDimX == 2)
+        {
+            sstream << "\"usesTwoCtasForMma\": true,\n";
+        }
+        // Use dynamic cluster dimensions if the CGA reduction is used.
+        if (isCgaSmemReduction(options.mMultiCtasKvMode))
+        {
+            sstream << "\"usesDynamicClusterDims\": true,\n";
+        }
+
+        // Disable checksTaskSchedules as there are multiple acquire/commit, wait/release steps in one
+        // loop. And the number of loops are not the same in different tasks.
+        sstream << "\"checksTaskSchedules\": false,\n";
+
+        bool hasCompileDefs = false;
+        auto writeCompileDef = [&](char const* compileDef)
+        {
+            if (!hasCompileDefs)
+            {
+                sstream << "\"compileDefs\": [";
+                hasCompileDefs = true;
+            }
+            else
+            {
+                sstream << ", ";
+            }
+            sstream << "\"" << compileDef << "\"";
         };
 
-        // Define the per-tile reduction cost model for different tileSizeQ choices.
-        std::unordered_map<int, float> kernelReductionCost = {
-            {128, 1.32}, // Reduction cost factor when tileSizeQ = 128
-            {64, 1.2},   // Reduction cost factor when tileSizeQ = 64
-            {32, 1.08},  // Reduction cost factor when tileSizeQ = 32
-            {16, 1.03},  // Reduction cost factor when tileSizeQ = 16
-            {8, 1.0}     // Reduction cost factor when tileSizeQ = 8
-        };
-
-        // The reduction cost emulated as a sequence length factor.
-        float const kernelReductionSeqLenFactor = 128.0f;
-
-        // The parameters for launching the kernel.
-        CtaLaunchParams ctaLaunchParams;
-        // The copy of the selectKernelParams, which makes sure it won't modify the original selectKernelParams when
-        // computing the number of CTAs.
-        SelectKernelParams selectKernelParamsCopy = selectKernelParams;
-        // Load the kernel.
-        auto [func, kernelMeta] = loadKernel(params, selectKernelParamsCopy);
-        // Compute numCtasX, numCtasY and numCtasZ.
-        computeNumCtas(ctaLaunchParams, params, kernelMeta, selectKernelParamsCopy);
-
-        // If there are no free SMs or tileSizeQ is already the smallest one, skip the heuristic selection.
-        if (ctaLaunchParams.mNumCtasX * ctaLaunchParams.mNumCtasY * ctaLaunchParams.mNumCtasZ * 2
-                > params.mMultiProcessorCount
-            || selectKernelParamsCopy.mTileSizeQ <= 8)
+        if (options.mIsExportingCubin)
         {
-            // No need to select the kernel further.
-            return;
+            writeCompileDef("-DTLLM_EXPORT_CUBIN");
         }
 
-        // Candidate tile sizes for tileSizeQ to explore.
-        int const candidateTileSizesQ[] = {128, 64, 32, 16, 8};
-
-        // The default tileSizeQ.
-        int defaultTileSizeQ = selectKernelParamsCopy.mTileSizeQ;
-        // The selected tileSizeQ.
-        int selectedTileSizeQ = selectKernelParamsCopy.mTileSizeQ;
-
-        // The minimum modeling kernel time.
-        float globalModelingKernelTime = FLT_MAX;
-        // Loop over each candidate tile size.
-        for (int tileSizeQ : candidateTileSizesQ)
+        // Set compile flags for E2M1 KV kernel benchmark.
+        // NOTE(tizheng): This is to be removed after compiler fixes PTX exposure of QMUL4. See Fp4Utils.h for details.
+        if (options.mChecksResults == 0 && options.mDtypeKv == tg::Dtype::E2m1)
         {
-            // Only consider candidates <= default tileSizeQ.
-            if (tileSizeQ > defaultTileSizeQ)
-            {
-                continue;
-            }
-            // If tileSizeQ < mNumHeadsQPerKv, this will result in 0, causing division by zero.
-            if (tileSizeQ < params.mNumHeadsQPerKv)
-            {
-                continue;
-            }
-
-            // Update the tileSizeQ.
-            selectKernelParamsCopy.mTileSizeQ = tileSizeQ;
-            if (tileSizeQ >= 64)
-            {
-                selectKernelParamsCopy.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-            }
-            else
-            {
-                selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-            }
-            // Load the kernel.
-            std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
-
-            // Compute the number of CTAs.
-            computeNumCtas(ctaLaunchParams, params, kernelMeta, selectKernelParamsCopy);
-
-            // Compute the seqLenPerCtaKv.
-            int32_t seqLenPerCtaKv
-                = tc::divUp(tc::divUp(params.mMaxSeqLenKv, kernelMeta.mStepKv), ctaLaunchParams.mMaxNumCtasKv)
-                * kernelMeta.mStepKv;
-
-            // Compute the modeling kernel time = mainloop cost + reduction cost.
-            float modelingKernelTime = kernelMainloopCost[tileSizeQ] * seqLenPerCtaKv
-                + kernelReductionCost[tileSizeQ] * kernelReductionSeqLenFactor * ctaLaunchParams.mMaxNumCtasKv;
-
-            // Compute the total number of CTAs.
-            int32_t numCtas = ctaLaunchParams.mNumCtasX * ctaLaunchParams.mNumCtasY * ctaLaunchParams.mNumCtasZ;
-            // Compute the number of waves.
-            int32_t numWaves = tc::divUp(numCtas, params.mMultiProcessorCount);
-            // Compute the total modeling kernel time.
-            modelingKernelTime *= numWaves;
-
-            // If this candidate has a lower time than the global minimum, update the global minimum.
-            if (modelingKernelTime < globalModelingKernelTime)
-            {
-                globalModelingKernelTime = modelingKernelTime;
-                selectedTileSizeQ = tileSizeQ;
-            }
+            TLLM_LOG_INFO("Forcing -DTLLM_BENCHMARK_E2M1_KV_CACHE for E2m1 Kv. The results are not correct.");
+            writeCompileDef("-DTLLM_BENCHMARK_E2M1_KV_CACHE");
         }
 
-        // Update the tileSizeQ.
-        selectKernelParams.mTileSizeQ = selectedTileSizeQ;
-        // Update the kernel type.
-        if (selectKernelParams.mTileSizeQ >= 64)
+        // SwapsMmaAb NVRTC kernels already emit __launch_bounds__; avoid a CUDA 13 .reqntid/.maxntid conflict.
+        if (shouldUseNvrtc(options) && options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration)
         {
-            selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+            writeCompileDef("-DTLLM_DISABLE_BLOCK_SIZE");
         }
-        else
+
+        if (hasCompileDefs)
         {
-            selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+            sstream << "],\n";
         }
+
+        // Enable programmatic dependent launch.
+        sstream << "\"enablesPdl\": " << ((options.mEnablesPdl) ? "true" : "false") << ",\n";
+
+        // Postpone the waitsForPrimaryGrid to loading smemQ/smemKv in order to hide the latency as much as possible.
+        // This avoids adding the cudaGridDependencySynchronize in the very beginning of the kernel.
+        sstream << "\"gridWaitForPrimaryEarlyExit\": false,\n";
+
+        // This forces the schedule to be printed and for the generator to look for deadlocks. It may
+        // detect false-positive. If that's the case, disable that feature.
+        sstream << "\"printsFullSchedule\": false,\n";
+
+        sstream << "\"skipsKernelGen\": " << ((options.mSkipsKernelGen) ? "true" : "false") << ",\n";
+        sstream << "\"smVersion\": \"" << tg::cudaArchToString(options.mCudaArch) << "\",\n";
+
+        // Loads scales from gmem when it is quantized.
+        if (options.mDtypeQ == tg::Dtype::E4m3 || options.mDtypeKv == tg::Dtype::E4m3
+            || options.mDtypeOut == tg::Dtype::E4m3 || options.mDtypeQ == tg::Dtype::E2m1
+            || options.mDtypeKv == tg::Dtype::E2m1 || options.mDtypeOut == tg::Dtype::E2m1)
+        {
+            sstream << "\"loadsScalesFromGmem\": true,\n";
+        }
+
+        // The code uses CUDA PTX.
+        sstream << "\"usesCudaPtx\": true,\n";
+
+        if (options.mTileScheduler == TileScheduler::Persistent)
+        {
+            sstream << "\"skipsFirstProdAcquiresLastConsReleases\": false,\n";
+        }
+        // Reduce the number of anti-dependencies in the generated code.
+        // See https://nvbugs/4940327
+        // WARNING: Increase this might lead to more register usage and even spills. Please finetune it carefully.
+        sstream << "\"antiDepWeight\": 25,\n";
+
+        sstream << "\"usesNvRtc\": "
+                << "true"
+                << ",\n";
+        sstream << "\"usesTma\": true\n";
+        sstream << "}\n";
     }
 
-    // Selects a heuristic kernel for GQA generation.
-    void selectGqGenerationKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
+    void launchFmhaKernel(KernelParams const& kernelParams, KernelMeta const& kernelMeta, CUfunction const& func,
+        tg::CudaRunner::Grid const& grid, FmhaOptions const& options, CUstream stream) const
     {
-
-        // The kernel type.
-        FmhaKernelType& kernelType = selectKernelParams.mKernelType;
-        // The tile size for Q.
-        int& tileSizeQ = selectKernelParams.mTileSizeQ;
-
-        // Check the conditions.
-        if (params.mIsSpecDecTree)
+        int launchedClusterDimX = options.mClusterDimX;
+        if (isCgaSmemReduction(options.mMultiCtasKvMode))
         {
-
-            bool isSupported = params.mNumHeadsQPerKv <= 16 && (params.mHeadDimQk == 64 || params.mHeadDimQk == 128);
-            if (isSupported)
-            {
-                kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // Only support tileSizeQ = 128 for tree-based speculative decoding.
-                tileSizeQ = 128;
-            }
-            else
-            {
-                TLLM_LOG_ERROR(
-                    "Tree-based speculative decoding is not supported with numHeadsQPerKv = %d and headDimQk = %d "
-                    "by TRTLLM-GEN",
-                    params.mNumHeadsQPerKv, params.mHeadDimQk);
-            }
-
-            // No need to select the kernel further.
-            return;
+            launchedClusterDimX *= options.mMaxNumCtasKv;
         }
 
-        // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-        if (mDtypeQ != mDtypeKv)
+        // Prepare kernel parameters list for cuLaunchKernelEx.
+        void* kernelParamsList[] = {const_cast<void*>(static_cast<void const*>(&kernelParams))};
+        CUlaunchConfig launch_config;
+        launch_config.blockDimX = kernelMeta.mThreadsPerCTA;
+        launch_config.blockDimY = 1;
+        launch_config.blockDimZ = 1;
+        launch_config.gridDimX = grid[0];
+        launch_config.gridDimY = grid[1];
+        launch_config.gridDimZ = grid[2];
+        launch_config.hStream = stream;
+        launch_config.sharedMemBytes = kernelMeta.mSharedMemBytes;
+
+        // Debug info.
+        TLLM_LOG_DEBUG("TRTLLM-Gen launch info: kernelName = %s", kernelMeta.mFuncName);
+        TLLM_LOG_DEBUG(
+            "TRTLLM-Gen launch info: maxSeqLenQ = %d, "
+            "maxSeqLenKv = %d, "
+            "numHeadsQ = %d, "
+            "numHeadsKv = %d, batchSize = %d, kernelType = %d",
+            options.mMaxSeqLenQ, options.mMaxSeqLenKv, options.mNumHeadsQ, options.mNumHeadsKv, options.mBatchSize,
+            static_cast<int>(options.mFmhaKernelType));
+        TLLM_LOG_DEBUG("TRTLLM-Gen launch info: numCtasX = %d, numCtasY = %d, numCtasZ = %d, clusterDimX = %d",
+            launch_config.gridDimX, launch_config.gridDimY, launch_config.gridDimZ, launchedClusterDimX);
+
+        CUlaunchAttribute launch_attribute[3];
+        launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        launch_attribute[0].value.clusterDim.x = launchedClusterDimX;
+        launch_attribute[0].value.clusterDim.y = 1;
+        launch_attribute[0].value.clusterDim.z = 1;
+        launch_attribute[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
+        launch_attribute[1].value.clusterSchedulingPolicyPreference
+            = launchedClusterDimX > 1 ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
+        launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        launch_attribute[2].value.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+
+        launch_config.attrs = launch_attribute;
+        launch_config.numAttrs = 3;
+
+        // Add setting for non-portable cluster size.
+        if (launchedClusterDimX > 8)
         {
-            tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
-            kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-            return;
+            TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                1 // Enable non-portable cluster sizes
+                ));
         }
 
-        // The number of tokensQ and headsQ that can be grouped into one CTA.
-        int numTokensHeadsQ = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
-        // When numHeadsQPerKv >= 64, use KeepsMmaAbForGeneration kernel.
-        if (numTokensHeadsQ <= 8)
-        {
-            tileSizeQ = 8;
-            kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-        }
-        else if (numTokensHeadsQ <= 16)
-        {
-            tileSizeQ = 16;
-            kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-        }
-        else if (numTokensHeadsQ <= 32)
-        {
-            tileSizeQ = 32;
-            kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-        }
-        else if (numTokensHeadsQ <= 64)
-        {
-            tileSizeQ = 64;
-            kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-        }
-        else
-        {
-            tileSizeQ = 128;
-            kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-        }
-
-        // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that groups both
-        // tokensQ and headsQ into one CTA.
-        if (params.mMaxSeqLenQ > 1)
-        {
-            selectTileSizeQForGqaGeneration(params, selectKernelParams);
-        }
-    }
-
-    // Select a kernel based on the heuristic.
-    void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
-    {
-
-        // Select the kernel based on the kernel type.
-        if (isGenerationKernel(params.mKernelType) && isMlaGenKernel(params))
-        {
-            selectMlaGenerationKernel(params, selectKernelParams);
-        }
-        else if (isGenerationKernel(params.mKernelType))
-        {
-            selectGqGenerationKernel(params, selectKernelParams);
-        }
-
-        // Enable sliding window or chunked causal if the max kv sequence length exceeds attention window size or
-        // chunked attention size.
-        // This is supported by causal-mask context kernels and generation-phase kernels.
-        if ((selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
-            && (params.mMaxSeqLenKv > params.mAttentionWindowSize || params.mChunkedAttentionSize != INT_MAX))
-        {
-            TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize
-                    || params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
-                "Sliding window attention and chunked attention should not be used together");
-            selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-        }
-
-        // SparseMla kernels use a fixed numTokensPerPage = 1.
-        if (params.mSparseMla)
-        {
-            selectKernelParams.mNumTokensPerPage = 1;
-        }
-        else if (!isPagedKv(params.mQkvLayout))
-        {
-            // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
-            selectKernelParams.mNumTokensPerPage = 0;
-        }
+        TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
     }
 
     std::pair<uint64_t, std::string> hashFromRunnerParams(
@@ -854,9 +1165,14 @@ private:
     {
 
         // Debug info.
-        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
-            + std::to_string(static_cast<int>(mDtypeKv)) + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut))
-            + ", sm=" + std::to_string(mSM) + ", qkvLayout=" + std::to_string(static_cast<int>(params.mQkvLayout))
+        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK="
+            + std::to_string(static_cast<int>(mDtypeK)) + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
+            + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut)) + ", sm=" + std::to_string(mSM)
+            + ", mNumEltsPerSageAttnBlkQ=" + std::to_string(mNumEltsPerSageAttnBlkQ)
+            + ", mNumEltsPerSageAttnBlkK=" + std::to_string(mNumEltsPerSageAttnBlkK)
+            + ", mNumEltsPerSageAttnBlkP=" + std::to_string(mNumEltsPerSageAttnBlkP)
+            + ", mNumEltsPerSageAttnBlkV=" + std::to_string(mNumEltsPerSageAttnBlkV)
+            + ", qkvLayout=" + std::to_string(static_cast<int>(params.mQkvLayout))
             + ", maskType=" + std::to_string(static_cast<int>(selectKernelParams.mMaskType))
             + ", kernelType=" + std::to_string(static_cast<int>(selectKernelParams.mKernelType))
             + ", tileScheduler=" + std::to_string(static_cast<int>(selectKernelParams.mTileScheduler))
@@ -866,8 +1182,9 @@ private:
             + ", tileSizeQ=" + std::to_string(selectKernelParams.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv)
             + ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
-            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla)
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
+            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
+            + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -878,15 +1195,53 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
-                selectKernelParams.mUses2CtaMma, params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
+                selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 
-    Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+    tg::CudaArch intToCudaArch(int smVersion) const
+    {
+        switch (smVersion)
+        {
+        case 90: return tg::CudaArch::Sm90a;
+        case 100: return tg::CudaArch::Sm100a;
+        case 103: return tg::CudaArch::Sm103a;
+        default: assert(false && "Unsupported CUDA architecture"); return tg::CudaArch::Sm100a;
+        }
+    }
+
+    int cudaArchToInt(tg::CudaArch cudaArch) const
+    {
+        switch (cudaArch)
+        {
+        case tg::CudaArch::Sm90a: return 90;
+        case tg::CudaArch::Sm100a: return 100;
+        case tg::CudaArch::Sm100f: return 100;
+        case tg::CudaArch::Sm103a: return 103;
+        default: assert(false && "Unsupported CUDA architecture"); return 100;
+        }
+    }
+
+    // Is it MLA generation kernel ?
+    inline bool isMlaGenKernel(RunnerParams const& params) const
+    {
+        return (params.mHeadDimQk == 576 && params.mHeadDimV == 512)
+            || (isTokenSparse(params.mSparseAttention) && params.mHeadDimQk == 512 && params.mHeadDimV == 512);
+    }
+
+    // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
+    using CtaInfo = std::tuple<int, int, int, int, int, int>;
+
+    Data_type mDtypeQ, mDtypeK, mDtypeV, mDtypeOut;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     KernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
+    int mNumEltsPerSageAttnBlkQ;
+    int mNumEltsPerSageAttnBlkK;
+    int mNumEltsPerSageAttnBlkP;
+    int mNumEltsPerSageAttnBlkV;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
 
     struct KernelInfo
@@ -896,6 +1251,8 @@ private:
     };
 
     std::unordered_map<uint64_t, KernelInfo> mFunctions;
+
+    FmhaInterface mFmhaInterface{false, 1};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -905,17 +1262,23 @@ class TllmFmhaKernelFactory
 public:
     using KernelType = TllmGenFmhaKernel;
 
-    KernelType const* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels,
-        Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
+    KernelType* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
+        Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
+        TLLM_CHECK_WITH_INFO(numEltsPerSageAttnBlkQ <= 64 && numEltsPerSageAttnBlkK <= 64
+                && numEltsPerSageAttnBlkP <= 64 && numEltsPerSageAttnBlkV <= 64,
+            "SageAttention allows numEltsPerSageAttnBlk up to 64.");
 
-        auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
+        auto const id = hashID(dtypeQ, dtypeK, dtypeV, dtypeOut, sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK,
+            numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
-            KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+            KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeK, dtypeV, dtypeOut, sm,
+                numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV};
             newKernel->loadKernels();
             mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
             return newKernel;
@@ -938,22 +1301,49 @@ public:
 private:
     TllmFmhaKernelFactory() = default;
 
-    inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm) const
+    inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm,
+        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+        int numEltsPerSageAttnBlkV) const
     {
-        return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeKv) << 20
-            | static_cast<uint64_t>(dtypeOut) << 24;
+        auto const computeLog2BlockSizePlus1 = [](int blockSize) -> int
+        {
+            if (blockSize <= 0)
+            {
+                return 0;
+            }
+            TLLM_CHECK_WITH_INFO((blockSize & (blockSize - 1)) == 0, "SageAttn block size must be a power of 2.");
+            return __builtin_ctz(static_cast<unsigned int>(blockSize)) + 1;
+        };
+        // Format of the hash key:
+        // Bit 0  - 15: smVer
+        // Bit 16 - 19: dtypeQ
+        // Bit 20 - 23: dtypeK
+        // Bit 24 - 27: dtypeV
+        // Bit 28 - 31: dtypeOut
+        // Bit 32 - 34: log2NumEltsPerSageAttnBlkQ + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkQ is 64.
+        // Bit 35 - 37: log2NumEltsPerSageAttnBlkK + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkK is 64.
+        // Bit 38 - 40: log2NumEltsPerSageAttnBlkP + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkP is 64.
+        // Bit 41 - 43: log2NumEltsPerSageAttnBlkV + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkV is 64.
+        return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeK) << 20
+            | static_cast<uint64_t>(dtypeV) << 24 | static_cast<uint64_t>(dtypeOut) << 28
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkQ)) << 32)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkK)) << 35)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkP)) << 38)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41);
     }
 
     std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
 };
 
-inline TllmGenFmhaKernel const* getTllmFmhaKernels(
-    Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
+inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
+    unsigned int sm, int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
+    int numEltsPerSageAttnBlkV = 0)
 {
 
 #ifndef EXCLUDE_SM_100F
     return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
-        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
+        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeK, dtypeV, dtypeOut,
+        sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100F

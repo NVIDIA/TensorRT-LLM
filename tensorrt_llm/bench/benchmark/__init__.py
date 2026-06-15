@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Set
 
 from pydantic import AliasChoices, BaseModel, Field
 
@@ -10,7 +10,33 @@ from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
+from tensorrt_llm.commands.utils import \
+    collect_explicit_cli_keys as _collect_explicit_cli_keys
 from tensorrt_llm.logger import logger
+
+# Map trtllm-bench Click parameter names to the LlmArgs field name (or
+# merge-function CLI scalar name) used by `update_llm_args_with_extra_options`.
+# `--beam_width` is intentionally absent: it feeds SamplingParams, not
+# llm_args, so it must not participate in the CLI-vs-YAML precedence.
+_BENCH_CLICK_TO_LLM_ARG = {
+    "tp": "tensor_parallel_size",
+    "pp": "pipeline_parallel_size",
+    "ep": "moe_expert_parallel_size",
+    "cluster_size": "moe_cluster_parallel_size",
+    "kv_cache_free_gpu_mem_fraction": "free_gpu_memory_fraction",
+    "enable_chunked_context": "enable_chunked_prefill",
+}
+
+
+def collect_explicit_cli_keys() -> Set[str]:
+    """Return CLI flag names the user typed, translated to LlmArgs field names.
+
+    Thin trtllm-bench-specific wrapper around the shared
+    `tensorrt_llm.commands.utils.collect_explicit_cli_keys` helper.
+    """
+    return _collect_explicit_cli_keys(exclude=("extra_llm_api_options",
+                                               "config"),
+                                      translate=_BENCH_CLICK_TO_LLM_ARG)
 
 
 class GeneralExecSettings(BaseModel):
@@ -155,6 +181,7 @@ def generate_json_report(report_path: Optional[Path], func: Callable):
         logger.debug("No report path provided, skipping report generation.")
     else:
         logger.info(f"Writing report information to {report_path}...")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w") as f:
             f.write(json.dumps(func(), indent=4))
         logger.info(f"Report information written to {report_path}.")

@@ -10,14 +10,26 @@ from torch import nn
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+
+# Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
+# the window buffer so the allreduce needs no extra copy).  On by default
+# (1); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=0 to disable.
+# Evaluated once at import — O(1) module-global lookup on every call,
+# equivalent to a C++ static-bool cached env var.
+_NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
+    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
+
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
 _thread_local = threading.local()
 
@@ -513,9 +525,20 @@ class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
-    for certain operations when using NVLink for multi-node communication.
+    for certain operations when using NVLink for multi-node communication. The oneshot kernel
+    is deterministic across ranks. For TP sizes up to 8, it uses a rank-specialized
+    fast path that keeps the local value in registers and volatile-loads only peers
+    from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+
+    SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
+        AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+    })
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
@@ -553,8 +576,9 @@ class MNNVLAllReduce(nn.Module):
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
-        # This should match the heuristic in allreduceOp.cpp
-        is_one_shot = num_tokens * hidden_dim * group_size * elem_size <= 64 * 1024 * 8
+        # This should match the heuristic in allreduceOp.cpp.
+        is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
+                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
             workspace_size = num_tokens * hidden_dim * group_size * elem_size
@@ -573,17 +597,18 @@ class MNNVLAllReduce(nn.Module):
         """Forward pass for MNNVL AllReduce.
 
         Args:
-            input (torch.Tensor): Input tensor to be reduced
-            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations
+            input (torch.Tensor): Input tensor to be reduced; last dim is the hidden dimension.
+            all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
 
         Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
+            preserve the input's N-D shape (NVFP4 quant output has its last dim halved; the
+            NVFP4 scale-factor output is 1-D).
         """
 
         fusion_op = all_reduce_params.fusion_op
-        shape = input.shape
-        input = input.view(-1, shape[-1])
-        (num_tokens, hidden_dim) = input.shape
+        hidden_dim = input.shape[-1]
+        num_tokens = input.numel() // hidden_dim
 
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
@@ -607,30 +632,22 @@ class MNNVLAllReduce(nn.Module):
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
 
-        if fusion_op == AllReduceFusionOp.NONE:
-            output, _ = torch.ops.trtllm.mnnvl_fusion_allreduce(
-                input,
-                None,  # gamma
-                None,  # residual
-                1e-6,  # epsilon
-                buffer_base,  # comm_buffer
-                buffer_flags,  # buffer_flags
-                False,  # rmsnorm_fusion
-            )
-            return output.view(shape)
-        # Fallback to use other allreduce if hidden_size is not supported
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            output, residual_out = torch.ops.trtllm.mnnvl_fusion_allreduce(
-                input,
-                all_reduce_params.norm_weight,  # gamma
-                all_reduce_params.residual,  # residual
-                all_reduce_params.eps,  # epsilon
-                buffer_base,  # comm_buffer
-                buffer_flags,  # buffer_flags
-                True,  # rmsnorm_fusion
-            )
-            return output.view(shape), residual_out.view(shape)
-        return None
+        is_fusion = fusion_op != AllReduceFusionOp.NONE
+        if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
+            return None
+
+        outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
+            input,
+            all_reduce_params.norm_weight,  # gamma
+            all_reduce_params.residual,  # residual
+            all_reduce_params.eps,  # epsilon
+            buffer_base,  # comm_buffer
+            buffer_flags,  # buffer_flags
+            is_fusion,  # rmsnorm_fusion
+            all_reduce_params.scale,  # scale
+            int(fusion_op),
+        )
+        return tuple(outputs) if is_fusion else outputs[0]
 
 
 class AllReduce(nn.Module):
@@ -691,6 +708,29 @@ class AllReduce(nn.Module):
         self._disable_mpi = mpi_disabled()
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+
+        # Propagate model-level prealloc config to AllReduceRunner once per
+        # process.  extra_attrs is only active during model __init__, so we
+        # read it here and stash the values as class-level attributes that
+        # AllReduceRunner.forward can use during the autotuner warm-up phase.
+        extra_attrs = get_model_extra_attrs()
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+            _init_gb10_nccl_symmetric_workaround
+        _init_gb10_nccl_symmetric_workaround()
+
+        if extra_attrs:
+            from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+                AllReduceRunner
+            max_num_tokens = extra_attrs.get('allreduce_max_num_tokens')
+            hidden_size = extra_attrs.get('allreduce_hidden_size')
+            if max_num_tokens is not None:
+                AllReduceRunner._prealloc_max_num_tokens = max_num_tokens
+            if hidden_size is not None:
+                AllReduceRunner._prealloc_hidden_size = hidden_size
+            prealloc_dtype = extra_attrs.get('allreduce_dtype')
+            if prealloc_dtype is not None:
+                AllReduceRunner._prealloc_dtype = prealloc_dtype
+
         if self.mapping.tp_size > 1 and not self.mapping.enable_attention_dp:
             # Initialize Symmetric Memory AllReduce if needed (before workspace allocation)
             if self.strategy == AllReduceStrategy.SYMM_MEM:
@@ -749,6 +789,30 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+    def uses_nccl_symmetric_memory_window(self) -> bool:
+        """Return True if this allreduce can use an NCCL window output buffer.
+
+        Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
+        strategy AND tp_size > 1 AND MPI not disabled.
+        """
+        return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
+                in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
+                    AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
+                and not self._disable_mpi)
+
+    @property
+    def output_buffer_kind(self) -> int:
+        """Buffer kind callers should use when allocating the tensor that will
+        be passed into this allreduce.
+
+        Returns int(BufferKind.NCCL_WINDOW) when zero-copy window output is
+        active, int(BufferKind.DEFAULT) otherwise.  The value depends solely on
+        compile-time constants so it is safe to branch on inside torch.compile.
+        """
+        return (int(BufferKind.NCCL_WINDOW)
+                if self.uses_nccl_symmetric_memory_window() else int(
+                    BufferKind.DEFAULT))
+
     def forward(
         self,
         input: torch.Tensor,
@@ -772,6 +836,7 @@ class AllReduce(nn.Module):
         Returns:
             A tensor lists with different tensor outptus according to the fusion_op.
             NONE: [hidden_states]
+            RMS_NORM: [hidden_states]
             RESIDUAL_RMS_NORM: [hidden_states, residual]
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
@@ -943,8 +1008,9 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
         else:
-            assert all_reduce_params.residual.shape[
-                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+            if all_reduce_params.residual is not None:
+                assert all_reduce_params.residual.shape[
+                    0] <= self.max_token, "Num tokens must be less than or equal to max_token"
 
             return torch.ops.trtllm.moe_finalize_allreduce(
                 input=input,
@@ -1156,3 +1222,36 @@ def all_to_all_5d(
         gathered_heads = heads * world_size
         return out.reshape(batch, sharded_seq, qkv_count, gathered_heads,
                            head_dim)
+
+
+class MiniMaxAllReduceRMS(nn.Module):
+
+    def __init__(self, mapping: Mapping):
+        super().__init__()
+        self.mapping = mapping
+        self.workspace = get_allreduce_workspace(self.mapping)
+
+    def forward(self, input: torch.Tensor, rms_weights: torch.Tensor,
+                eps: float):
+        return torch.ops.trtllm.minimax_allreduce_rms(input, rms_weights,
+                                                      self.workspace,
+                                                      self.mapping.tp_rank,
+                                                      self.mapping.tp_size, eps,
+                                                      True)
+
+    def forward_qk(self, q: torch.Tensor, k: torch.Tensor,
+                   rms_weights_q: torch.Tensor, rms_weights_k: torch.Tensor,
+                   eps: float):
+        """Fused Q+K RMS norm with allreduce. Returns (q_out, k_out)."""
+        out_list = torch.ops.trtllm.minimax_allreduce_rms_qk(
+            q,
+            k,
+            rms_weights_q,
+            rms_weights_k,
+            self.workspace,
+            self.mapping.tp_rank,
+            self.mapping.tp_size,
+            eps,
+            True,
+        )
+        return (out_list[0], out_list[1])

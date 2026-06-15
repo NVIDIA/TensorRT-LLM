@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,7 +69,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -110,8 +112,9 @@ std::map<SizeType32, SizeType32> TrtGptModelInflightBatching::calculateCacheSize
     std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
     for (auto const& [windowSize, globalLayerIds] : uniqueWindowSizeToLayers)
     {
-        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
-            modelConfig, globalLayerIds, isCrossAttention, kvFactor);
+        auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(globalLayerIds, isCrossAttention);
+        auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
+        auto const cacheSizePerToken = sumLocalHeads * kvFactor * modelConfig.getSizePerHead();
         auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(modelConfig.getKvDataType()).getSize();
         cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
     }
@@ -217,12 +220,6 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     mNumBuffers = (mCtxGenFusion ? 1 : 2) * mNumMicroBatches;
 
     auto const& kvCacheConfig = executorConfig.getKvCacheConfig();
-
-    if (!kvCacheConfig.getOnboardBlocks())
-    {
-        TLLM_CHECK_WITH_INFO(
-            !mModelConfig.getPagedContextFMHA(), "KV cache blocks need to be onboarded if context FMHA.");
-    }
 
     if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
     {
@@ -488,9 +485,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         = executorConfig.getSpecDecConfig().has_value() && executorConfig.getSpecDecConfig()->fastLogits;
     if (mSpeculativeDecodingFastLogits && modelConfig.getSpeculativeDecodingMode().isNone() && mIsLeaderInOrchMode)
     {
-        mDraftModelSendLogitsThread = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice,
-            &mDraftModelThreadShouldExit, &mDraftRequestsWaitingToSendLogits, mSeqSlotManager, getMaxInputLen(),
-            mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
+        mDraftModelSendLogitsThread
+            = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice, &mDraftModelThreadShouldExit,
+                &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsMtx);
     }
 
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
@@ -659,8 +656,10 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
     auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
-    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, isCrossAttention, kvDtype, mModelConfig,
-        mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes, extraCostMemory, 2);
+    auto const sizePerHead = mModelConfig.getSizePerHead();
+    auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, kvDtype, numKvHeadsPerLayer,
+        sizePerHead, tokensPerBlock, mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes,
+        extraCostMemory, 2, getMaxBatchSize());
 
     // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
     // this can happen if e.g. maxSeqLen is deduced from the model and is too large
@@ -671,11 +670,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
     }
 
-    kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
-    tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
-    tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
-    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
-
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.getEnableBlockReuse())
     {
         TLLM_LOG_INFO(
@@ -683,13 +677,12 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             "Thus, KV cache reuse is disabled for cross KV cache.");
     }
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.getEnableBlockReuse() : false;
-    auto const sizePerHead = mModelConfig.getSizePerHead();
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(),
-        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(), enableBlockReuse,
-        kvCacheConfig.getOnboardBlocks(), kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, kvDtype, getSinkTokenLen(),
+        mRuntime->getStreamPtr(),
+        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(),
+        getMaxNumTokens().value(), enableBlockReuse, kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
@@ -906,6 +899,19 @@ void TrtGptModelInflightBatching::forwardSync()
             }
         }
 
+        // Terminate draft requests whose logits have been sent by the background thread.
+        {
+            RequestVector doneSending;
+            {
+                std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
+                doneSending.swap(mDraftRequestsDoneSendingLogits);
+            }
+            for (auto const& llmReq : doneSending)
+            {
+                terminateRequest(llmReq);
+            }
+        }
+
         // Finished context requests have been moved to generationRequests by moveFinishedContextRequestsToGeneration
         for (auto const& llmReq : currRequests.generationRequests)
         {
@@ -917,7 +923,7 @@ void TrtGptModelInflightBatching::forwardSync()
                     TLLM_CHECK_WITH_INFO(mCacheTransceiver,
                         "Disaggregated serving is not enabled, please check the configuration of "
                         "cacheTransceiverConfig.");
-                    mCacheTransceiver->respondAndSendAsync(llmReq.get());
+                    mCacheTransceiver->respondAndSendAsync(llmReq);
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
             }
@@ -1598,11 +1604,11 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
             mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
         if (common::getEnvDisableKVCacheTransferOverlap())
         {
-            mCacheTransceiver->requestAndReceiveSync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveSync(newGenReq);
         }
         else
         {
-            mCacheTransceiver->requestAndReceiveAsync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveAsync(newGenReq);
         }
     }
     if (!common::getEnvDisableKVCacheTransferOverlap())
@@ -1954,6 +1960,181 @@ void TrtGptModelInflightBatching::postProcessRequest(
 
     // store the generated tokens into the mTokensGathered buffer
     llmReq.setGeneratedTokens(generatedTokens);
+
+    if (llmReq.getReturnGenerationLogits() && llmReq.getGenerationLogitsHost()
+        && mWorldConfig.isLastPipelineParallelRank())
+    {
+        reorderGenerationLogitsForBeamSearch(
+            llmReq, seqSlot, reqBeamWidth, maxSeqLength, outputIdsHostData, sequenceLengthsHostData);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void TrtGptModelInflightBatching::reorderGenerationLogitsForBeamSearch(LlmRequest& llmReq, SizeType32 seqSlot,
+    SizeType32 reqBeamWidth, SizeType32 maxSeqLength, TokenIdType const* outputIdsHostData,
+    SizeType32 const* sequenceLengthsHostData)
+{
+    // Reorder generation logits to match the gathered (finalized) beam ordering.
+    // During generation, logits are stored indexed by beam SLOT position. After beam search
+    // finalization (gatherTree), output_ids are reordered by tracing parentIds to reconstruct
+    // the correct beam paths. However, generation_logits are NOT reordered by gatherTree.
+    // We fix this here by tracing parentIds on the host to build the beam-slot mapping,
+    // then reindexing the logits accordingly.
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const promptLen = llmReq.mPromptLen;
+
+    // Copy parentIds and ids (ungathered step IDs) from GPU to temporary host buffers.
+    // parentIds[slot][t] = the parent slot of beam slot `slot` at position t.
+    // ids[slot][t] = the token in beam slot `slot` at position t (before gather).
+    auto parentIdsDevice = ITensor::at(mDecoderState->getParentIds(), {seqSlot});
+    auto idsDevice = mDecoderState->getIds(seqSlot);
+
+    auto parentIdsHost = runtime::BufferManager::pinnedPool(parentIdsDevice->getShape(), nvinfer1::DataType::kINT32);
+    auto idsHost = runtime::BufferManager::pinnedPool(idsDevice->getShape(), nvinfer1::DataType::kINT32);
+
+    mCopyBufferManager.copy(*parentIdsDevice, *parentIdsHost);
+    mCopyBufferManager.copy(*idsDevice, *idsHost);
+    mCopyBufferManager.getStream().synchronize();
+
+    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
+    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
+
+    // For each final beam b, find the beam slot at the last generated step, then
+    // trace back through parentIds to build the slot trace for every generation step.
+    // slotTrace[beam][genStep] = the beam slot that produced the logits at that step.
+    auto const generationLogitsHost = llmReq.getGenerationLogitsHost();
+    auto const& logitsShape = generationLogitsHost->getShape();
+    // Non-streaming shape: [beamWidth, maxNewTokens, vocabSizePadded]
+    TLLM_CHECK_WITH_INFO(logitsShape.d[0] == reqBeamWidth,
+        "Generation logits beam dimension (%ld) does not match beam width (%d).", logitsShape.d[0], reqBeamWidth);
+    auto const maxNewTokens = logitsShape.d[1];
+    auto const vocabSizePadded = logitsShape.d[2];
+
+    std::vector<std::vector<SizeType32>> slotTrace(reqBeamWidth, std::vector<SizeType32>(maxNewTokens, 0));
+    bool anyReorderNeeded = false;
+
+    for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
+    {
+        auto const seqLen = sequenceLengthsHostData[beam];
+        auto const genLen = seqLen - promptLen;
+        if (genLen <= 0)
+        {
+            continue;
+        }
+
+        // Find the starting beam slot at the last generated step by matching the
+        // backtracked token sequence against the gathered (finalized) output.
+        SizeType32 startSlot = -1;
+        for (SizeType32 s = 0; s < reqBeamWidth; ++s)
+        {
+            SizeType32 slot = s;
+            bool matches = true;
+            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+            {
+                if (idsData[slot * maxSeqLength + t] != outputIdsHostData[beam * maxSeqLength + t])
+                {
+                    matches = false;
+                    break;
+                }
+                if (t > promptLen)
+                {
+                    slot = parentIdsData[slot * maxSeqLength + t];
+                }
+            }
+            if (matches)
+            {
+                startSlot = s;
+                break;
+            }
+        }
+
+        TLLM_CHECK_WITH_INFO(startSlot >= 0,
+            "Could not determine beam slot mapping for beam %d during generation logits reordering.", beam);
+
+        // Build the slot trace: slotTrace[beam][g] = the pre-reassignment slot whose
+        // logits correspond to generation step g of this beam.
+        //
+        // The model runs BEFORE beam search reassigns beams to slots, so
+        // generationLogits[slot][g] was produced by the pre-reassignment slot —
+        // i.e. the slot the beam occupied in the *previous* step.
+        // parentIds[postSlot][promptLen+g] gives exactly that pre-reassignment slot,
+        // so taking the parentIds lookup before storing (rather than after) yields
+        // the correct source slot in a single pass.
+        SizeType32 slot = startSlot;
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+        {
+            slot = parentIdsData[slot * maxSeqLength + t];
+            slotTrace[beam][t - promptLen] = slot;
+        }
+
+        // Check if any reordering is actually needed for this beam
+        auto& slotTraceIds = slotTrace[beam];
+        anyReorderNeeded |= std::any_of(
+            slotTraceIds.begin(), slotTraceIds.begin() + genLen, [beam](SizeType32 s) { return s != beam; });
+    }
+
+    // Reorder the generation logits in-place using a per-step temporary buffer.
+    if (anyReorderNeeded)
+    {
+        auto const logitsDataType = generationLogitsHost->getDataType();
+        auto const elemSize = runtime::BufferDataType(logitsDataType).getSize();
+        auto const stepSize = static_cast<size_t>(vocabSizePadded) * elemSize;
+
+        // Temp buffer for one generation step across all beams: [beamWidth, vocabSizePadded]
+        auto tempLogits
+            = runtime::BufferManager::pinnedPool(ITensor::makeShape({reqBeamWidth, vocabSizePadded}), logitsDataType);
+
+        auto* logitsPtr = static_cast<uint8_t*>(generationLogitsHost->data());
+        auto* tempPtr = static_cast<uint8_t*>(tempLogits->data());
+
+        std::vector<SizeType32> genLens(reqBeamWidth);
+        SizeType32 maxGenLen = 0;
+        for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+        {
+            genLens[b] = std::max(SizeType32{0}, sequenceLengthsHostData[b] - promptLen);
+            maxGenLen = std::max(maxGenLen, genLens[b]);
+        }
+
+        for (SizeType32 g = 0; g < maxGenLen; ++g)
+        {
+            // Check if any beam that generated this step needs reordering
+            bool stepNeedsReorder = false;
+            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+            {
+                if (g < genLens[b] && slotTrace[b][g] != b)
+                {
+                    stepNeedsReorder = true;
+                    break;
+                }
+            }
+            if (!stepNeedsReorder)
+            {
+                continue;
+            }
+
+            // Copy all beams' logits at this step to the temp buffer
+            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+            {
+                // logits layout: [beamWidth, maxNewTokens, vocabSizePadded]
+                auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+                std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
+            }
+
+            // Reorder: logits[b][g] = temp[slotTrace[b][g]]
+            for (SizeType32 b = 0; b < reqBeamWidth; ++b)
+            {
+                if (g >= genLens[b])
+                {
+                    continue;
+                }
+                auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+                auto const srcSlot = slotTrace[b][g];
+                std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
+            }
+        }
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -2351,6 +2532,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             {
                 if (llmReq->getReturnGenerationLogits() && mSpeculativeDecodingFastLogits && mIsLeaderInOrchMode)
                 {
+                    std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
                     mDraftRequestsWaitingToSendLogits.push_back(llmReq);
                 }
                 else
@@ -2490,6 +2672,12 @@ nvinfer1::DataType TrtGptModelInflightBatching::getLogitDataType() const
     return mModelConfig.getLogitsDtype();
 }
 
+TrtGptModelInflightBatching::SizeType32 TrtGptModelInflightBatching::numCachedCudaGraphs() const
+{
+    return std::accumulate(mCudaGraphExecutorCaches.begin(), mCudaGraphExecutorCaches.end(), SizeType32{0},
+        [](SizeType32 sum, auto const& cache) { return sum + cache.size(); });
+}
+
 void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -2501,6 +2689,13 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_DEBUG("Changing operating beam width from %d to %d", mOperatingBeamWidth, beamWidth);
     mOperatingBeamWidth = beamWidth;
 
+    if (isCudaGraphMode())
+    {
+        for (auto& cache : mCudaGraphExecutorCaches)
+        {
+            cache.clear();
+        }
+    }
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     createDecoder(mDecodingConfig.getDecodingMode());
 

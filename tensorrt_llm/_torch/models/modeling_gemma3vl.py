@@ -1,6 +1,5 @@
 import copy
 import dataclasses
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -12,8 +11,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 
 from ..._utils import nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -23,16 +22,10 @@ from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_gemma3 import Gemma3ForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
+                                        fuse_input_embeds)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
-
-_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
-
-
-# Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
 class Gemma3InputProcessor(BaseMultimodalInputProcessor,
@@ -102,7 +95,7 @@ class Gemma3InputProcessor(BaseMultimodalInputProcessor,
         return input_ids, pixel_values
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         input_ids, pixel_values = self._preprocess(inputs)
@@ -180,11 +173,12 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={"image": "<start_of_image>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Gemma3VLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Gemma3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
@@ -259,6 +253,10 @@ class Gemma3VLM(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

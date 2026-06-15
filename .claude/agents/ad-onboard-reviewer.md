@@ -1,8 +1,11 @@
 ---
-name: onboard-reviewer
+name: ad-onboard-reviewer
 description: Independent reviewer for AutoDeploy model onboarding. Validates created model and test files against all onboarding requirements. Use after completing model onboarding work.
-tools: Read, Grep, Glob
+tools: ["Read", "Grep", "Glob"]
 model: sonnet
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
 You are an independent code reviewer for AutoDeploy model onboarding.

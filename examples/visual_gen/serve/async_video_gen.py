@@ -33,7 +33,7 @@ def test_async_video_generation(
     fps: int = 24,
     size: str = "256x256",
     output_file: str = "output_async.mp4",
-    output_format: str = "auto",
+    format: str = "auto",
 ):
     """Test asynchronous video generation with OpenAI SDK.
 
@@ -77,7 +77,7 @@ def test_async_video_generation(
             "seconds": duration,
             "extra_body": {
                 "fps": fps,
-                "output_format": output_format,
+                "format": format,
             },
         }
 
@@ -131,12 +131,18 @@ def test_async_video_generation(
         # For binary content, use the underlying HTTP client
         content = client.videos.download_content(video_id, variant="video")
 
-        # Check content type to determine actual file extension
-        content_type = getattr(content.response, "headers", {}).get("content-type", "video/mp4")
-        if "x-msvideo" in content_type or "avi" in content_type:
-            actual_ext = ".avi"
+        # Determine the on-disk extension. Tensor formats are
+        # selected by the request and the server returns
+        # ``application/octet-stream``; encoder formats can be
+        # disambiguated from Content-Type (mp4 vs avi).
+        if format in ("safetensors", "pt"):
+            actual_ext = f".{format}"
         else:
-            actual_ext = ".mp4"
+            content_type = getattr(content.response, "headers", {}).get("content-type", "video/mp4")
+            if "x-msvideo" in content_type or "avi" in content_type:
+                actual_ext = ".avi"
+            else:
+                actual_ext = ".mp4"
 
         # Adjust output filename if extension doesn't match
         output_path = Path(output_file)
@@ -233,11 +239,15 @@ Examples:
     )
 
     parser.add_argument(
-        "--output-format",
+        "--format",
         type=str,
         default="auto",
-        choices=["mp4", "avi", "auto"],
-        help="Output video format: mp4 or avi or auto",
+        choices=["mp4", "avi", "auto", "safetensors", "pt"],
+        help=(
+            "Generation content encoding format. Encoders: mp4 / avi / auto. "
+            "Tensor formats safetensors / pt return raw tensor bytes for "
+            "programmatic post-processing."
+        ),
     )
 
     args = parser.parse_args()
@@ -264,7 +274,7 @@ Examples:
         fps=args.fps,
         size=args.size,
         output_file=args.output,
-        output_format=args.output_format,
+        format=args.format,
     )
 
     sys.exit(0 if success else 1)

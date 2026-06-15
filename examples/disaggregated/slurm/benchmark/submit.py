@@ -50,8 +50,17 @@ def save_worker_config(worker_config, output_path):
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):
-    """Calculate required nodes based on world size and server count."""
-    return math.ceil(world_size * num_servers / gpus_per_node)
+    """Required node count under per-worker whole-node ownership.
+
+    Mirrors assign_server_round_robin: each worker consumes
+    ceil(world_size / gpus_per_node) whole nodes, with no node sharing
+    across workers. Pooling all GPUs and rounding once under-counts
+    nodes whenever world_size is not a multiple of gpus_per_node
+    (e.g. world_size=1, num_servers=2, gpus_per_node=4: pooled gives 1,
+    but the allocator needs 2). compact_packing computes nodes
+    separately because it does share nodes across workers.
+    """
+    return num_servers * math.ceil(world_size / gpus_per_node)
 
 
 def allocate_gpus(
@@ -62,27 +71,52 @@ def allocate_gpus(
     gen_world_size: int,
     ctx_world_size: int,
     base_port: int = 8000,
+    compact_packing: bool = False,
 ) -> List[Dict[str, Any]]:
     allocations = {}
     hostnames = [f"<node{i}_placeholder>" for i in range(total_nodes)]
 
     global_gpu_cursor = 0
 
-    def get_gpu_location(gpus_per_node: int):
-        node_id = global_gpu_cursor // gpus_per_node
-        local_gpu_id = global_gpu_cursor % gpus_per_node
-        return node_id, local_gpu_id
-
-    def assign_server(server_allocation: Dict[str, Any], world_size: int,
-                      gpus_per_node: int):
+    def assign_server_compact(server_allocation: Dict[str, Any],
+                              world_size: int, gpus_per_node: int):
+        # Compact packing: advance cursor by one GPU per task. Workers may
+        # share a physical node when their GPU counts don't align with node
+        # boundaries (e.g. two TP=6 ctx workers fit in 3 four-GPU nodes via
+        # 4+2 / 2+4). Each task's (host, local_gpu_id) is recorded in
+        # insertion order, so the per-worker hostfile/gpu_map drives srun
+        # --distribution=arbitrary and start_worker.sh's CUDA_VISIBLE_DEVICES.
         nonlocal global_gpu_cursor
         for _ in range(world_size):
-            node_id, gpu_id = get_gpu_location(gpus_per_node)
-            hostname = hostnames[node_id]
+            host_idx = global_gpu_cursor // gpus_per_node
+            gpu_idx = global_gpu_cursor % gpus_per_node
+            hostname = hostnames[host_idx]
             if hostname not in server_allocation["nodes"]:
                 server_allocation["nodes"][hostname] = []
-            server_allocation["nodes"][hostname].append(gpu_id)
+            server_allocation["nodes"][hostname].append(gpu_idx)
             global_gpu_cursor += 1
+
+    def assign_server_round_robin(server_allocation: Dict[str, Any],
+                                  world_size: int, gpus_per_node: int):
+        # Default packing: each worker owns ceil(world_size/gpus_per_node)
+        # whole nodes, round-robin across nodes so each node gets
+        # ceil(world_size/num_nodes) GPUs. Matches SLURM block distribution,
+        # so SLURM_LOCALID directly maps to the physical GPU id in
+        # start_worker.sh.
+        nonlocal global_gpu_cursor
+        num_nodes_for_server = math.ceil(world_size / gpus_per_node)
+        start_node = global_gpu_cursor // gpus_per_node
+        for task_idx in range(world_size):
+            node_within = task_idx % num_nodes_for_server
+            gpu_within = task_idx // num_nodes_for_server
+            hostname = hostnames[start_node + node_within]
+            if hostname not in server_allocation["nodes"]:
+                server_allocation["nodes"][hostname] = []
+            server_allocation["nodes"][hostname].append(gpu_within)
+        global_gpu_cursor += num_nodes_for_server * gpus_per_node
+
+    assign_server = (assign_server_compact
+                     if compact_packing else assign_server_round_robin)
 
     port = base_port
 
@@ -105,15 +139,20 @@ def allocate_gpus(
             server_allocations[server_type][i] = server_allocation
             port += 1
 
-    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
-                   gpus_per_node)
+    # Keep the allocation order aligned with disagg_utils, which builds
+    # server_configs as ctx_cfgs + gen_cfgs and assigns rank offsets in that
+    # same order during split_world_comm().
     assign_servers(allocations, "CTX", num_ctx_servers, ctx_world_size,
+                   gpus_per_node)
+    assign_servers(allocations, "GEN", num_gen_servers, gen_world_size,
                    gpus_per_node)
 
     return allocations
 
 
-def convert_allocations_to_server_config(allocations, server_port=8333):
+def convert_allocations_to_server_config(allocations,
+                                         server_port=8333,
+                                         router_config=None):
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -127,6 +166,8 @@ def convert_allocations_to_server_config(allocations, server_port=8333):
                 f"{list(instance['nodes'].keys())[0]}:{instance['port']}")
 
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
+        if router_config:
+            server_config_entry['router'] = router_config.copy()
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -189,7 +230,7 @@ def replace_env_in_file(log_dir, file_path, env_var):
 
 
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
-                             nsys_on, profile_range, concurrency, gpu_ids):
+                             nsys_on, profile_range, concurrency):
     """Build complete environment dictionary for worker processes.
 
     Args:
@@ -200,14 +241,14 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         nsys_on: Whether nsys profiling is enabled
         profile_range: Profile range string (e.g., "10-30")
         concurrency: Concurrency level
-        gpu_ids: List of GPU IDs assigned to this worker
 
     Returns:
         Dictionary of environment variables
 
     Note:
-        CUDA_VISIBLE_DEVICES is NOT set here. It is passed as an argument to
-        start_worker.sh and set per-rank based on SLURM_LOCALID.
+        CUDA_VISIBLE_DEVICES is passed as an argument to start_worker.sh,
+        not via srun --export (which cannot reliably pass comma-separated
+        values inside shared containers).
     """
     env = {}
 
@@ -221,9 +262,25 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
         if role == "GEN":
+            gen_config = worker_config.get('gen', {})
+            concurrency_int = int(concurrency)
+            max_batch_size = int(
+                gen_config.get('max_batch_size', concurrency_int))
+            enable_attention_dp = gen_config.get('enable_attention_dp', False)
+            tp_size = int(gen_config.get('tensor_parallel_size', 1))
+            max_capacity = ((max_batch_size * tp_size)
+                            if enable_attention_dp else max_batch_size)
+            queue_size = min(max_capacity, concurrency_int)
+            if queue_size < concurrency_int:
+                print(f"[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
+                      f"{queue_size} (max_batch_size={max_batch_size} x "
+                      f"tp_size={tp_size} with "
+                      f"attention_dp={enable_attention_dp}) "
+                      f"which is less than concurrency={concurrency}. "
+                      f"Fill loop would hang if set to {concurrency}.")
             upsert_env_config(env_config, 'gen_worker_env_var',
                               'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
+                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
@@ -243,11 +300,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                               'TLLM_PROFILE_START_STOP',
                               f'TLLM_PROFILE_START_STOP={profile_range}')
 
-    # 3. Set CUDA_VISIBLE_DEVICES from gpu_ids
-    cuda_devices = ','.join(map(str, gpu_ids))
-    env["CUDA_VISIBLE_DEVICES"] = cuda_devices
-
-    # 4. Parse user-defined worker env vars from config
+    # 3. Parse user-defined worker env vars from config
     #    (now includes mode-based and profiling vars from steps 1-2)
     worker_env_var = env_config.get('worker_env_var', '')
     for var_string in worker_env_var.split():
@@ -255,7 +308,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
             key, val = var_string.split('=', 1)
             env[key] = val
 
-    # 5. Add role-specific env vars (CTX or GEN)
+    # 4. Add role-specific env vars (CTX or GEN)
     #    (now includes role-specific mode/profiling vars from steps 1-2)
     role_env_vars = {
         "CTX": env_config.get('ctx_worker_env_var', ''),
@@ -391,23 +444,40 @@ def submit_job(config, log_dir, dry_run):
     ctx_num = hw_config['num_ctx_servers']
     gen_num = hw_config['num_gen_servers']
     gpus_per_node = hw_config['gpus_per_node']
+    # Only recommended on full-mesh NVLink fabrics like GB200/GB300 NVL72
+    # where two workers sharing a physical node pay no extra cost. On
+    # PCIe or partitioned-NVLink hosts the shared node becomes a bottleneck.
+    compact_packing = bool(hw_config.get('compact_packing', False))
 
     # Calculate nodes based on world sizes
     ctx_tp_size = worker_config['ctx'].get('tensor_parallel_size', 1)
     ctx_cp_size = worker_config['ctx'].get('context_parallel_size', 1)
     ctx_pp_size = worker_config['ctx'].get('pipeline_parallel_size', 1)
     ctx_world_size = ctx_tp_size * ctx_cp_size * ctx_pp_size
-    ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
 
     gen_tp_size = worker_config['gen'].get('tensor_parallel_size', 1)
     gen_cp_size = worker_config['gen'].get('context_parallel_size', 1)
     gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
-    gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
-    ucx_warmup_requests = 2 * ctx_world_size * \
-        gen_world_size if benchmark_config['mode'] == "e2e" else 0
 
-    total_nodes = ctx_nodes + gen_nodes
+    ctx_dp_size = ctx_tp_size if worker_config['ctx'].get(
+        'enable_attention_dp', False) else 1
+    gen_dp_size = gen_tp_size if worker_config['gen'].get(
+        'enable_attention_dp', False) else 1
+    ucx_warmup_requests = 2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size \
+        if benchmark_config['mode'] == "e2e" else 0
+
+    if compact_packing:
+        # Compact packing: pack all workers into the minimum number of nodes,
+        # letting workers share a node when their GPU counts straddle a node
+        # boundary. Matches the per-GPU cursor in allocate_gpus.
+        total_gpus = ctx_world_size * ctx_num + gen_world_size * gen_num
+        total_nodes = math.ceil(total_gpus / gpus_per_node)
+    else:
+        # Default: each worker owns whole nodes, no node sharing.
+        ctx_nodes = calculate_nodes(ctx_world_size, ctx_num, gpus_per_node)
+        gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
+        total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
 
     # Generate log directory path based on configuration
@@ -424,12 +494,19 @@ def submit_job(config, log_dir, dry_run):
             load_balancer_config = yaml.safe_load(f)
     eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-    # Get mtp_size from gen config's speculative_config
+    # Get mtp_size from gen config's speculative_config. Leave it unset when
+    # max_draft_len is omitted so auto-MTP runs are not mislabeled as mtp0.
     mtp_size = worker_config['gen'].get('speculative_config',
-                                        {}).get('num_nextn_predict_layers', 0)
+                                        {}).get('max_draft_len')
+
+    # Get gen moe_expert_parallel_size; only tag when it differs from TP
+    gen_ep_size = worker_config['gen'].get('moe_expert_parallel_size',
+                                           gen_tp_size)
+    ep_tag = f"_ep{gen_ep_size}" if gen_ep_size != gen_tp_size else ""
 
     # Create base log directory path
-    if 'log_dir' in env_config and env_config['log_dir']:
+    # CLI --log-dir takes precedence; fall back to yaml log_dir only when not set
+    if log_dir is None and 'log_dir' in env_config and env_config['log_dir']:
         log_dir = env_config['log_dir']
     if log_dir is None:
         log_base = os.path.join(script_dir, "logs")
@@ -437,11 +514,13 @@ def submit_job(config, log_dir, dry_run):
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
+        mtp_suffix = "" if mtp_size is None else f"_mtp{mtp_size}"
+
         # Determine directory suffix based on attention_dp
         if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}{ep_tag}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
         else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}{ep_tag}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
 
         # Create full log directory path
         log_dir = os.path.join(log_base, dir_suffix)
@@ -480,12 +559,18 @@ def submit_job(config, log_dir, dry_run):
         num_ctx_servers=ctx_num,
         gen_world_size=gen_world_size,
         ctx_world_size=ctx_world_size,
+        compact_packing=compact_packing,
     )
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)
 
     # Generate disagg server config
-    server_config = convert_allocations_to_server_config(allocations)
+    router_config = config.get('router_config', None)
+    server_config = convert_allocations_to_server_config(
+        allocations, router_config=router_config)
+    # Merge server_config_extra into disagg server config
+    if 'server_config_extra' in config:
+        server_config.update(config['server_config_extra'])
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
     disagg_server_hostname = server_config['hostname']
@@ -510,17 +595,40 @@ def submit_job(config, log_dir, dry_run):
         }
     }
 
-    # Generate start worker commands with placeholder hostnames
     for server_type in allocations.keys():
         server_cfg = server_configs[server_type]
 
         for server_id in allocations[server_type].keys():
             allocation = allocations[server_type][server_id]
-            # Get GPU IDs for this server from allocation
-            # When multi-node, all nodes have same device list, so use first node [0]
-            gpu_ids = list(allocation["nodes"].values())[0]
 
-            # Build environment for this worker
+            if compact_packing:
+                # Emit per-worker hostfile (one host per task in rank order)
+                # and gpu_map (rank -> local gpu id). Nodes carry placeholder
+                # names at this point; disaggr_torch.slurm rewrites them at
+                # runtime. SLURM_HOSTFILE + --distribution=arbitrary lets us
+                # express non-uniform layouts (e.g. 4+2 / 2+4) so two workers
+                # can share one physical node.
+                hostfile_base = os.path.join(
+                    log_dir, f"hostfile_{server_type}_{server_id}_base.txt")
+                gpu_map_base = os.path.join(
+                    log_dir, f"gpu_map_{server_type}_{server_id}_base.txt")
+                hostfile_runtime = os.path.join(
+                    log_dir, f"hostfile_{server_type}_{server_id}.txt")
+                with open(hostfile_base, 'w') as hf, \
+                        open(gpu_map_base, 'w') as gm:
+                    rank = 0
+                    for host, gpus in allocation["nodes"].items():
+                        for gpu in gpus:
+                            hf.write(f"{host}\n")
+                            gm.write(f"{rank} {host} {gpu}\n")
+                            rank += 1
+            else:
+                # Default packing: each node is dedicated to one worker, so
+                # SLURM_LOCALID directly maps to the physical GPU id in
+                # start_worker.sh (no hostfile/gpu_map needed).
+                node_list = list(allocation["nodes"].keys())
+                num_nodes = len(node_list)
+
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -529,17 +637,25 @@ def submit_job(config, log_dir, dry_run):
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
                 concurrency=benchmark_config['concurrency_list'].split(',')[0],
-                gpu_ids=gpu_ids,
             )
             export_str = format_export_string(worker_env)
 
-            # Use script_dir for start_worker.sh
-            cmd = [
-                "srun -l",
-                f"--nodelist {','.join(allocation['nodes'].keys())}",
-                f"-N {len(allocation['nodes'])}",
-                f"--ntasks {server_cfg['world_size']}",
-                f"--ntasks-per-node {gpus_per_node}",
+            if compact_packing:
+                srun_prefix = [
+                    f"SLURM_HOSTFILE={hostfile_runtime}",
+                    "srun -l",
+                    f"--ntasks {server_cfg['world_size']}",
+                    "--distribution=arbitrary",
+                ]
+            else:
+                srun_prefix = [
+                    "srun -l",
+                    f"--nodelist {','.join(node_list)}",
+                    f"-N {num_nodes}",
+                    f"--ntasks {server_cfg['world_size']}",
+                ]
+
+            cmd = srun_prefix + [
                 f"--export=\"{export_str}\"",
                 f"--container-image {env_config['container_image']}",
                 f"--container-name {container_name}",
@@ -603,7 +719,7 @@ def submit_job(config, log_dir, dry_run):
     client_slurm_prefix = [
         f"srun -l --container-name={container_name}",
         f"--container-mounts={container_mount_str}",
-        f"--mpi=pmix --overlap -N 1 -n 1",
+        "--no-container-mount-home --mpi=pmix --overlap -N 1 -n 1",
     ]
     # Append benchmark commands
     if benchmark_config.get('enable_benchmark', True):
@@ -611,7 +727,14 @@ def submit_job(config, log_dir, dry_run):
         benchmark_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        if benchmark_config['use_nv_sa_benchmark']:
+        if benchmark_config.get('use_aiperf', False):
+            benchmark_cmd = [
+                f"bash {os.path.join(script_dir, 'run_benchmark_aiperf.sh')}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+        elif benchmark_config['use_nv_sa_benchmark']:
             if benchmark_config['mode'] == "gen_only":
                 print(
                     f"[ERROR] SA benchmark client script is not supported for gen_only mode"

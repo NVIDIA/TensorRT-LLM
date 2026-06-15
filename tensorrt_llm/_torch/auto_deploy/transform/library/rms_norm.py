@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Graph transform to optimize RMSNorm execution using FlashInfer."""
 
 from typing import Tuple, Type
@@ -182,6 +196,7 @@ class MatchRMSNormPattern(BaseTransform):
         op_ignore_types = {
             torch.ops.aten.reshape.default: (int, list, tuple),
             torch.ops.aten.view.default: (int, list, tuple),
+            torch.ops.auto_deploy.view.default: (int, list, tuple),
             torch.ops.aten.mean.dim: (list, tuple),
             torch.ops.aten.to.dtype: (torch.dtype,),
         }
@@ -263,7 +278,10 @@ class FuseRMSNorm(BaseTransform):
 
         graph = gm.graph
         backend = self.config.rmsnorm_backend.lower()
-        target_op = _BACKEND_OPS[backend]
+        # Use the .default overload so downstream pattern matchers (which trace
+        # the pattern via Python dispatch and end up with OpOverload targets)
+        # see matching node targets, not an OpOverloadPacket.
+        target_op = _BACKEND_OPS[backend].default
         cnt = 0
 
         # First, fuse the norm-before-gate decomposition:
@@ -331,7 +349,7 @@ class FuseRMSNorm(BaseTransform):
 
             with graph.inserting_after(output_node):
                 fused_node: Node = graph.call_function(
-                    torch.ops.auto_deploy.triton_rmsnorm_gated,
+                    torch.ops.auto_deploy.triton_rmsnorm_gated.default,
                     args=(x, weight, gate, eps, group_size, True),
                 )
 
@@ -364,6 +382,8 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    # Preserve metadata (including val/tensor_meta) for downstream transforms.
+                    new_node.meta.update(node.meta)
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1
@@ -374,10 +394,11 @@ class FuseRMSNorm(BaseTransform):
                 # Replace with triton_rmsnorm_gated op
                 with graph.inserting_after(node):
                     new_node: Node = graph.call_function(
-                        torch.ops.auto_deploy.triton_rmsnorm_gated,
+                        torch.ops.auto_deploy.triton_rmsnorm_gated.default,
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    new_node.meta.update(node.meta)
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1

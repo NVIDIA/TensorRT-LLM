@@ -30,12 +30,13 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _KVCache,
     )
-    from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
+    from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress, PageIndexMode
     from kv_cache_manager_v2._utils import (
+        HalfOpenRange,
         div_up,
         exact_div,
         get_uniform_attribute,
-        overlap,
+        intersect,
         temporary_sys_path,
         typed_range,
         value_or,
@@ -52,12 +53,18 @@ else:
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
+    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
+        BAD_PAGE_INDEX,
+        NDEBUG,
+        MemAddress,
+        PageIndexMode,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+        HalfOpenRange,
         div_up,
         exact_div,
         get_uniform_attribute,
-        overlap,
+        intersect,
         temporary_sys_path,
         typed_range,
         value_or,
@@ -147,7 +154,12 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
-        pool = manager.get_mem_pool_base_address(layer_id, role)
+        index_mode = (
+            PageIndexMode.SHARED
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            else PageIndexMode.PER_LAYER
+        )
+        pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         if is_ssm:
@@ -159,28 +171,29 @@ class FakeEngine:
             history = history[-1:]
         else:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)
-        page_converter = manager.get_page_index_converter(layer_id, role).__call__
-        pages = list(
-            itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
-        )
+        page_converter = manager.get_page_index_converter(layer_id, role)
+        scratch_desc = kv_cache.get_scratch_desc(lc_id)
+        pages = page_converter(base_pages, index_mode, scratch_desc)
         capacity = kv_cache.capacity
         history_len = len(history)
         if is_ssm:
-            window = (0, 1)
+            window = HalfOpenRange(0, 1)
             sink = 0
         else:
             window = (
-                (0, capacity)
+                HalfOpenRange(0, capacity)
                 if layer_cfg.window_size is None
-                else (max(0, history_len + 1 - layer_cfg.window_size), capacity)
+                else HalfOpenRange(max(0, history_len + 1 - layer_cfg.window_size), capacity)
             )
             sink = value_or(layer_cfg.num_sink_tokens, 0)
         # check history
         for ordinal, page in enumerate(pages):
             if page == BAD_PAGE_INDEX or tokens_per_block * ordinal >= (1 if is_ssm else capacity):
                 continue
-            page_range = (tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
-            need_page = overlap(page_range, (0, sink)) or overlap(page_range, window)
+            page_range = HalfOpenRange(tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
+            need_page = intersect(page_range, HalfOpenRange(0, sink)) or intersect(
+                page_range, window
+            )
             if need_page:
                 assert page != BAD_PAGE_INDEX
             else:
@@ -217,7 +230,12 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
-        pool = manager.get_mem_pool_base_address(layer_id, role)
+        index_mode = (
+            PageIndexMode.SHARED
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            else PageIndexMode.PER_LAYER
+        )
+        pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         if is_ssm:
@@ -231,12 +249,11 @@ class FakeEngine:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
                 : div_up(history_len + len(input), tokens_per_block)
             ]
-        page_converter = manager.get_page_index_converter(layer_id, role).__call__
-        pages = list(
-            itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
-        )
+        page_converter = manager.get_page_index_converter(layer_id, role)
+        scratch_desc = kv_cache.get_scratch_desc(lc_id)
+        pages = page_converter(base_pages, index_mode, scratch_desc)
         capacity = kv_cache.capacity
-        input_range = (history_len, history_len + len(input))
+        input_range = HalfOpenRange(history_len, history_len + len(input))
         if not is_ssm:
             assert input_range[1] <= capacity
         ordinal_beg = input_range[0] // tokens_per_block
@@ -245,8 +262,8 @@ class FakeEngine:
         for i, page in enumerate(pages):
             ordinal = ordinal_beg + i
             assert page != BAD_PAGE_INDEX
-            page_range = (tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
-            batch_range = tuple(i for i in overlap(input_range, page_range))
+            page_range = HalfOpenRange(tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
+            batch_range = tuple(i for i in intersect(input_range, page_range))
             assert batch_range
             tokens = input[(batch_range[0] - history_len) : (batch_range[1] - history_len)]
             addr = MemAddress(

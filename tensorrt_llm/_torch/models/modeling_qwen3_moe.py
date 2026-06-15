@@ -111,7 +111,7 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend_cls=get_moe_cls(model_config),
+            moe_backend_cls=get_moe_cls(model_config, layer_idx=layer_idx),
         )
 
         self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA
@@ -398,7 +398,8 @@ class Qwen3MoEModel(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 mrope_config=mrope_config,
-                deepstack_embeds=deepstack_embeds)
+                deepstack_embeds=deepstack_embeds,
+                **kwargs)
         return hidden_states
 
 

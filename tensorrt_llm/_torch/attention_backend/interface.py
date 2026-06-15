@@ -10,20 +10,23 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
-from tensorrt_llm._utils import maybe_pin_memory
-from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RopeEmbeddingUtils, RotaryScalingType)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.mamba_cache_manager import MambaCacheManager
-from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
 
 try:
@@ -65,9 +68,9 @@ class AttentionMetadata:
     # The max number of sequences in a single batch.
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
-    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
+    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
-    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
+    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
@@ -133,6 +136,12 @@ class AttentionMetadata:
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
 
+    # Explicit query/KV sequence boundaries for attention kernels that operate
+    # on packed varlen context inputs. These are sequence/segment boundaries,
+    # not necessarily request boundaries.
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
+
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
     # are enabled.
@@ -174,6 +183,9 @@ class AttentionMetadata:
         assert self.cross is None or type(self) is type(
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
+
+    def on_update_kv_lens(self):
+        pass
 
     def on_update(self):
         if (self._seq_lens is not None
@@ -302,8 +314,7 @@ class AttentionMetadata:
             return
 
         if self.mamba_metadata is None:
-            if (self.kv_cache_manager is not None
-                    and isinstance(self.kv_cache_manager, MambaCacheManager)):
+            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
                 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
                 self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
                                                      self.mamba_chunk_size)
@@ -317,12 +328,16 @@ class AttentionMetadata:
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
                                    max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   buffers=None,
+                                   encode_only: bool = False) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        When encode_only is True, initialize seq_lens as ones(max_batch_size)
+        and leave num_contexts at the caller's discretion.
         """
         if self.is_cuda_graph:
             return self
@@ -332,13 +347,20 @@ class AttentionMetadata:
         cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True)
+                max_batch_size, True, max_draft_tokens, buffers, encode_only)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
             cuda_graph_metadata._seq_lens_cuda = None
-            cuda_graph_metadata.seq_lens = torch.ones(
-                (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
+            if encode_only:
+                # Encoder: variable seq_lens per batch; the runner in-place
+                # updates them via the seq_lens setter each replay.
+                cuda_graph_metadata.seq_lens = torch.ones((max_batch_size, ),
+                                                          dtype=torch.int)
+            else:
+                cuda_graph_metadata.seq_lens = torch.ones(
+                    (max_batch_size, ),
+                    dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
@@ -353,7 +375,11 @@ class AttentionMetadata:
                     device='cuda',
                 )
 
-        cuda_graph_metadata.num_contexts = 0
+        if not encode_only:
+            # Decoder CUDA graphs are always generation-only (no context
+            # requests). Encoder CUDA graphs are the opposite (all context);
+            # the caller sets num_contexts = padded_batch_size.
+            cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -381,9 +407,14 @@ class AttentionMetadata:
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+            num_contexts: int = 0):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+
+        ``num_contexts`` is the number of context (prefill) requests in the
+        mixed batch, occupying the leading rows of slot-storage buffers.
+        Backends that consume gen-only slots (e.g. dynamic tree) must skip
+        these rows to align with the XQA kernel's expected row layout.
         """
 
     def update_helix_param(
@@ -474,7 +505,7 @@ class RopeParams:
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
     max_seq_len: Optional[int] = None
-    duplicate_data: bool = True
+    duplicate_data: bool = False
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -482,10 +513,23 @@ class RopeParams:
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
         if hf_rope_parameters is not None:
-            assert not set(hf_rope_parameters.keys()).issubset(
-                ALLOWED_ATTENTION_LAYER_TYPES), (
-                    "Per-layer-type RoPE configuration is not supported yet.")
-            config.update(hf_rope_parameters)
+            if set(hf_rope_parameters.keys()).issubset(
+                    ALLOWED_ATTENTION_LAYER_TYPES):
+                # Per-layer-type RoPE config (e.g. Gemma3 in transformers 5.x).
+                # Pick "full_attention" as the default; callers override theta
+                # for sliding-window layers independently.
+                if "full_attention" in hf_rope_parameters:
+                    flat = hf_rope_parameters["full_attention"]
+                else:
+                    fallback_key = next(iter(hf_rope_parameters))
+                    logger.warning(
+                        f"Per-layer-type rope_parameters has no 'full_attention' entry; "
+                        f"falling back to '{fallback_key}'. Available layer types: "
+                        f"{list(hf_rope_parameters.keys())}.")
+                    flat = hf_rope_parameters[fallback_key]
+                config.update(flat)
+            else:
+                config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -495,15 +539,18 @@ class RopeParams:
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
-        rope_params.theta = getattr(config, 'rope_theta', 10000.0)
+        rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)
                            or getattr(config, 'partial_rotary_factor', None)
                            or 1.0)
         # rotary embedding dim.
+        qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', None)
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
-                           or getattr(config, 'qk_rope_head_dim', None)
+                           or qk_rope_head_dim
                            or int(head_dim * rope_percentage))
+        if qk_rope_head_dim is not None:
+            rope_params.duplicate_data = True
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
@@ -530,7 +577,8 @@ class RopeParams:
                 rope_params.short_factor = tuple(rope_scaling["short_factor"])
             if "long_factor" in rope_scaling:
                 rope_params.long_factor = tuple(rope_scaling["long_factor"])
-        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in
+        # config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
         # Other metdadata for RoPE.
@@ -577,6 +625,7 @@ class RopeParams:
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
                 max_seq_len=self.max_seq_len,
+                duplicate_data=self.duplicate_data,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
@@ -592,7 +641,9 @@ class RopeParams:
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":
                     self.original_max_positions,
-                })
+                },
+                duplicate_data=self.duplicate_data,
+            )
         if rope_inv_freq is not None:
             rope_inv_freq = torch.tensor(
                 rope_inv_freq,
@@ -665,6 +716,103 @@ class CustomAttentionMask(str, Enum):
 AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
+@dataclass(kw_only=True, slots=True)
+class AttentionSparseArgs:
+    """Sparse-attention inputs passed to the attention op.
+
+    Backends without sparse attention leave ``AttentionForwardArgs.sparse``
+    at its default-constructed value (all-``None`` / ``0`` fields).
+    """
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
+class AttentionForwardArgs:
+    """Per-forward optional arguments for attention backends."""
+
+    output: Optional[torch.Tensor] = None
+    output_sf: Optional[torch.Tensor] = None
+
+    out_scale: Optional[torch.Tensor] = None
+    out_scale_sf: Optional[torch.Tensor] = None
+    kv_scale_orig_quant: Optional[torch.Tensor] = None
+    kv_scale_quant_orig: Optional[torch.Tensor] = None
+
+    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
+    attention_input_type: AttentionInputType = AttentionInputType.mixed
+    attention_window_size: Optional[int] = None
+    attention_mask_data: Optional[torch.Tensor] = None
+    attention_sinks: Optional[torch.Tensor] = None
+
+    latent_cache: Optional[torch.Tensor] = None
+    q_pe: Optional[torch.Tensor] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    mrope_position_deltas: Optional[torch.Tensor] = None
+
+    softmax_stats_tensor: Optional[torch.Tensor] = None
+    chunked_prefill_buffer_batch_size: int = 1
+
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
+    fmha_scheduler_counter: Optional[torch.Tensor] = None
+
+    mla_bmm1_scale: Optional[torch.Tensor] = None
+    mla_bmm2_scale: Optional[torch.Tensor] = None
+    quant_q_buffer: Optional[torch.Tensor] = None
+
+    sage_attn_num_elts_per_blk_q: int = 0
+    sage_attn_num_elts_per_blk_k: int = 0
+    sage_attn_num_elts_per_blk_v: int = 0
+    sage_attn_qk_int8: bool = False
+
+    topk_indices: Optional[torch.Tensor] = None
+
+    is_fused_qkv: bool = False
+    update_kv_cache: bool = True
+
+    sparse: AttentionSparseArgs = field(default_factory=AttentionSparseArgs)
+
+    @property
+    def mask_type(self) -> int:
+        """Integer mask type accepted by the C++ attention op
+        (``causal`` or ``padding``)."""
+        if self.attention_mask == PredefinedAttentionMask.CAUSAL:
+            return int(AttentionMaskType.causal)
+        if self.attention_mask == PredefinedAttentionMask.FULL:
+            return int(AttentionMaskType.padding)
+        raise ValueError(
+            f"Unexpected attention mask type: {self.attention_mask!r}")
+
+
+_ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
+    AttentionForwardArgs.__dataclass_fields__)
+
+
+def merge_attention_forward_args(
+    forward_args: Optional[AttentionForwardArgs],
+    kwargs: Dict[str, Any],
+) -> AttentionForwardArgs:
+    """Merge legacy attention kwargs into explicit forward arguments."""
+
+    unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
+    if unknown_kwargs:
+        raise ValueError(
+            f"Unknown attention forward arguments: {unknown_kwargs}")
+
+    if forward_args is not None:
+        if kwargs:
+            raise ValueError(
+                "Pass attention forward options either through forward_args "
+                f"or as legacy kwargs, not both: {sorted(kwargs)}")
+        return forward_args
+
+    return AttentionForwardArgs(**kwargs)
+
+
 class AttentionBackend(Generic[TMetadata]):
     """
     Base class for attention backends.
@@ -678,7 +826,6 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
-        skip_create_weights_in_init: bool = False,
         sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
@@ -712,8 +859,7 @@ class AttentionBackend(Generic[TMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: TMetadata,
-                *,
-                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         """
         Update KV Cache and perform the attention operation.
@@ -726,7 +872,7 @@ class AttentionBackend(Generic[TMetadata]):
             v (Optional[torch.Tensor]): Value tensor with shape (num_new_kv_tokens, num_kv_heads * head_dim),
                                         or None if QKV tensor is provided, or there's no new kv token.
             metadata (AttentionMetadata): Metadata for the attention operation.
-            attention_mask (AttentionMask): Attention mask. See definition of `AttentionMask` for accepted types. Defaults to predefined causal mask.
+            forward_args (AttentionForwardArgs): Per-forward optional attention arguments.
         Returns:
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """
@@ -760,6 +906,7 @@ class MLAParams:
     qk_rope_head_dim: int = 0
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
+    rope_append: bool = True
     predicted_tokens_per_seq: int = 1
     chunked_prefill_buffer_batch_size: int = 1
     hidden_size: int = 0

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1415,8 +1415,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     epilog_threads = 32 * len(self.epilog_warp_id)
                     cute.arch.barrier(
@@ -1896,9 +1896,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         is_valid = True
         # Skip invalid mma tile shape
-        if not mma_tiler_mn[0] in [128, 256]:
+        if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        if not mma_tiler_mn[1] in [64, 128, 192, 256]:
+        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:

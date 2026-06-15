@@ -178,6 +178,7 @@ class ZMQMessenger(MessengerInterface):
         def _close_socket(socket: zmq.Socket) -> None:
             try:
                 if not socket.closed:
+                    socket.setsockopt(zmq.LINGER, 0)
                     socket.close()
             except Exception as e:
                 logger.error(f"Error closing socket: {e}")

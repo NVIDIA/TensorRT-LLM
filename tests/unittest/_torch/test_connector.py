@@ -22,7 +22,7 @@ import mpi4py
 import pytest
 
 from tensorrt_llm import mpi_rank
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -181,6 +181,7 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
 
     kv_cache_manager = MagicMock()
     kv_cache_manager.get_cache_indices.return_value = [0, 1, 2]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
     # Create a mock request in generation state with draft tokens
     req = MagicMock()
@@ -204,3 +205,48 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     expected_num_scheduled_tokens = 1 + NUM_DRAFT_TOKENS
     assert request_data.num_scheduled_tokens == expected_num_scheduled_tokens, \
         f"Expected {expected_num_scheduled_tokens}, got {request_data.num_scheduled_tokens}"
+
+
+def test_scheduler_output_block_hashes_read_through():
+    """``RequestData.block_hashes`` reflects the chain returned by the KV cache manager.
+
+    The connector path does not recompute hashes Python-side; each scheduler step
+    is a pure pass-through of whatever ``commit_and_get_block_hashes`` returns.
+    A subsequent step that observes a longer chain simply forwards the longer
+    chain. The block-completion semantics (when the next hash actually appears)
+    are owned by the C++ KV cache manager and exercised by the C++ unit tests
+    for ``commitAndGetBlockHashesForRequest``.
+    """
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0]
+    # Two consecutive scheduler steps: first sees no full block yet, second sees
+    # one full block whose hash has just been committed by the manager.
+    kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
+
+    req = MagicMock()
+    req.request_id = 42
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_draft_tokens = []
+    req.get_tokens.return_value = [1, 2, 3]
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    output = manager.build_scheduler_output(scheduled_batch,
+                                            AsyncRequests({}, {}),
+                                            kv_cache_manager)
+    assert output.cached_requests[0].block_hashes == []
+
+    req.get_tokens.return_value = [1, 2, 3, 4]
+    output = manager.build_scheduler_output(scheduled_batch,
+                                            AsyncRequests({}, {}),
+                                            kv_cache_manager)
+    assert output.cached_requests[0].block_hashes == [12345]
+
+    # Each scheduler step asks the manager exactly once per request; no Python
+    # caching layer reshapes the request between calls.
+    assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
+    for call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
+        assert call.args == (req, )

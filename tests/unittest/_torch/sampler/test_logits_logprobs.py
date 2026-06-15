@@ -38,6 +38,11 @@ def sampler_type_fixture(request) -> str:
     return request.param
 
 
+@pytest.fixture(scope="module", params=[False, True])
+def enable_early_first_token_response_fixture(request) -> bool:
+    return request.param
+
+
 class CacheSalter:
     _salt = 0
 
@@ -63,9 +68,16 @@ class CacheSalter:
 def llm(
     sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
+    enable_early_first_token_response_fixture: bool,
 ):
     sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
+    enable_early_first_token_response = enable_early_first_token_response_fixture
+
+    if enable_early_first_token_response and disable_overlap_scheduler:
+        pytest.skip(
+            "enable_early_first_token_response is relevant only when the overlap scheduler is enabled."
+        )
 
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
@@ -73,6 +85,7 @@ def llm(
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
+        enable_early_first_token_response=enable_early_first_token_response,
     )
     with llm:
         yield llm
@@ -303,7 +316,7 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
         print(f"Prompt token IDs: {output.prompt_token_ids}")
 
         logprobs = output.outputs[0].prompt_logprobs
-        token_ids = output.prompt_token_ids
+        token_ids = output.prompt_token_ids[1:] + output.outputs[0].token_ids[:1]
 
         assert len(logprobs) == len(token_ids), (
             f"Expected {len(token_ids)} logprob entries, got {len(logprobs)}"
@@ -348,6 +361,92 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
         print(f"{'=' * 80}\n")
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_logprobs_simple_format(simple_llm: LLM):
+    """When ``logprobs_simple_format=True`` and ``prompt_logprobs_simple_format=True``
+    with the corresponding K==0, the per-token logprobs are returned as a flat
+    ``list[float]`` instead of the default ``list[dict[int, Logprob]]`` and the
+    numeric values match the dict-format path within tolerance."""
+
+    prompt = "The future of AI is"
+    common_kwargs = dict(max_tokens=8, temperature=0.0)
+
+    dict_params = SamplingParams(logprobs=0, prompt_logprobs=0, **common_kwargs)
+    simple_params = SamplingParams(
+        logprobs=0,
+        prompt_logprobs=0,
+        logprobs_simple_format=True,
+        prompt_logprobs_simple_format=True,
+        **common_kwargs,
+    )
+
+    [dict_out] = list(simple_llm.generate([prompt], sampling_params=dict_params))
+    [simple_out] = list(simple_llm.generate([prompt], sampling_params=simple_params))
+
+    dict_gen_logprobs = dict_out.outputs[0].logprobs
+    simple_gen_logprobs = simple_out.outputs[0].logprobs
+
+    # Simple format must be list[float]; dict format must remain list[dict].
+    assert all(isinstance(x, float) for x in simple_gen_logprobs), (
+        f"Expected list[float], got element types: {[type(x) for x in simple_gen_logprobs]}"
+    )
+    assert all(isinstance(x, dict) for x in dict_gen_logprobs)
+
+    for token_id, lp_simple, lp_dict in zip(
+        dict_out.outputs[0].token_ids, simple_gen_logprobs, dict_gen_logprobs, strict=True
+    ):
+        torch.testing.assert_close(
+            torch.tensor(lp_simple, dtype=torch.float32),
+            torch.tensor(lp_dict[token_id].logprob, dtype=torch.float32),
+            atol=1e-4,
+            rtol=0,
+        )
+
+    dict_prompt_logprobs = dict_out.outputs[0].prompt_logprobs
+    simple_prompt_logprobs = simple_out.outputs[0].prompt_logprobs
+    assert all(isinstance(x, float) for x in simple_prompt_logprobs)
+    assert all(isinstance(x, dict) for x in dict_prompt_logprobs)
+    prompt_token_ids = dict_out.prompt_token_ids[1:] + dict_out.outputs[0].token_ids[:1]
+    for token_id, lp_simple, lp_dict in zip(
+        prompt_token_ids, simple_prompt_logprobs, dict_prompt_logprobs, strict=True
+    ):
+        torch.testing.assert_close(
+            torch.tensor(lp_simple, dtype=torch.float32),
+            torch.tensor(lp_dict[token_id].logprob, dtype=torch.float32),
+            atol=1e-4,
+            rtol=0,
+        )
+
+
+def test_logprobs_simple_format_validation():
+    """``SamplingParams`` rejects incompatible combinations of the simple-format
+    flag with non-zero / unset ``logprobs`` and with beam search."""
+    SamplingParams(max_tokens=4, logprobs=0, logprobs_simple_format=True)
+    SamplingParams(max_tokens=4, prompt_logprobs=0, prompt_logprobs_simple_format=True)
+
+    with pytest.raises(ValueError, match=r"logprobs_simple_format=True requires logprobs == 0"):
+        SamplingParams(max_tokens=4, logprobs=2, logprobs_simple_format=True)
+    with pytest.raises(ValueError, match=r"logprobs_simple_format=True requires logprobs == 0"):
+        SamplingParams(max_tokens=4, logprobs=None, logprobs_simple_format=True)
+    with pytest.raises(
+        ValueError, match=r"prompt_logprobs_simple_format=True requires prompt_logprobs == 0"
+    ):
+        SamplingParams(max_tokens=4, prompt_logprobs=3, prompt_logprobs_simple_format=True)
+    with pytest.raises(
+        ValueError, match=r"prompt_logprobs_simple_format=True requires prompt_logprobs == 0"
+    ):
+        SamplingParams(max_tokens=4, prompt_logprobs=None, prompt_logprobs_simple_format=True)
+    with pytest.raises(ValueError, match="beam search"):
+        SamplingParams(
+            max_tokens=4,
+            logprobs=0,
+            logprobs_simple_format=True,
+            use_beam_search=True,
+            best_of=2,
+            n=2,
+        )
+
+
 @pytest.mark.parametrize("logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
 @pytest.mark.parametrize("prompt_logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
 @pytest.mark.threadleak(enabled=False)
@@ -372,6 +471,7 @@ def test_logprobs_against_logits(
         logprobs: TokenLogprobs,
         logits_cuda: torch.Tensor,
         case_str: str,
+        logprobs_offset: int = 0,
     ):
         """Checks if the provided logprobs match the logprobs calculated from the logits"""
         expected_logprobs = torch.nn.functional.log_softmax(logits_cuda, dim=-1).to(device="cpu")
@@ -385,7 +485,7 @@ def test_logprobs_against_logits(
             processed_ranks_and_logprobs: dict[int, float] = {}
             for token_id, logprob_obj in token_logprobs.items():
                 # the sampled token may have any rank > 0
-                if token_id != tokens[generation_idx]:
+                if token_id != tokens[generation_idx + logprobs_offset]:
                     # All other tokens should have a rank <= num_logprobs
                     assert logprob_obj.rank <= num_logprobs, (
                         f"{case_str} logprob rank is greater than {num_logprobs}"
@@ -427,9 +527,10 @@ def test_logprobs_against_logits(
                 generation_logprobs,
                 generation_logits,
                 "generation",
+                logprobs_offset=0,
             )
         if prompt_logprobs_k is not None:
-            context_tokens = output.prompt_token_ids
+            context_tokens = output.prompt_token_ids + output.outputs[0].token_ids[:1]
             context_logprobs = output.outputs[0].prompt_logprobs
             context_logits = output.context_logits.to(device="cuda")
             check_logprobs(
@@ -438,7 +539,49 @@ def test_logprobs_against_logits(
                 context_logprobs,
                 context_logits,
                 "context",
+                logprobs_offset=1,  # Prompt logprobs are offset by 1 relative to the prompt token ids
             )
+        # The last context logprob dict and the first generation logprob dict should agree on
+        # the top-n entries (n = min(prompt_logprobs_k, logprobs_k)) and the sampled token's logprob.
+        if prompt_logprobs_k is not None and logprobs_k is not None:
+            last_context_logprob = context_logprobs[-1]
+            first_generation_logprob = generation_logprobs[0]
+            less_prompt_logprobs = prompt_logprobs_k <= logprobs_k
+            expected = last_context_logprob if less_prompt_logprobs else first_generation_logprob
+            compare = first_generation_logprob if less_prompt_logprobs else last_context_logprob
+            sampled_token_id = generation_tokens[0]
+            assert sampled_token_id in last_context_logprob, (
+                f"Sampled token {sampled_token_id} is not a valid key in the last entry "
+                f"of the context logprob dict: {list(last_context_logprob.keys())}"
+            )
+            assert sampled_token_id in first_generation_logprob, (
+                f"Sampled token {sampled_token_id} is not a valid key in the first entry "
+                f"of the generation logprob dict: {list(first_generation_logprob.keys())}"
+            )
+            torch.testing.assert_close(
+                last_context_logprob[sampled_token_id].logprob,
+                first_generation_logprob[sampled_token_id].logprob,
+                msg=(
+                    f"logprob {last_context_logprob[sampled_token_id].logprob} in the last "
+                    f"entry of the context logprob dict does not match the corresponding "
+                    f"logprob {first_generation_logprob[sampled_token_id].logprob} in the "
+                    f"first entry of the generation logprob dict for token {sampled_token_id}"
+                ),
+            )
+            for token_id, logprob_obj in expected.items():
+                assert token_id in compare, (
+                    f"Token {token_id} is not a valid key in the other dict: {list(compare.keys())}"
+                )
+                expected_logprob = logprob_obj.logprob
+                compare_logprob = compare[token_id].logprob
+                torch.testing.assert_close(
+                    expected_logprob,
+                    compare_logprob,
+                    msg=(
+                        f"logprob {expected_logprob} does not match the corresponding "
+                        f"logprob {compare_logprob} in the other dict for token {token_id}"
+                    ),
+                )
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
@@ -715,3 +858,36 @@ def test_logprobs_match_hf_tp2():
     print(f"Diff: {(trtllm_logprobs - hf_logprobs).abs()}")
 
     torch.testing.assert_close(trtllm_logprobs, hf_logprobs, atol=0.15, rtol=0)
+
+
+@pytest.mark.gpu2
+def test_logprobs_pp2():
+    """Test that logprobs count matches generated token count with PP=2.
+
+    Regression test for https://github.com/NVIDIA/TensorRT-LLM/issues/12444
+    Without the fix, logprobs length = 2N-1 instead of N due to duplication
+    in the PP ring broadcast diff mechanism.
+    """
+    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    max_tokens = 16
+    llm = LLM(
+        model=model_path,
+        pipeline_parallel_size=2,
+        max_batch_size=1,
+        max_num_tokens=128,
+        max_seq_len=256,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens,
+        logprobs=5,
+    )
+
+    output = list(llm.generate(["The future of the AI is"], sampling_params=sampling_params))[0]
+
+    num_tokens = len(output.outputs[0].token_ids)
+    num_logprobs = len(output.outputs[0].logprobs)
+    assert num_logprobs == num_tokens, (
+        f"logprobs length {num_logprobs} != generated tokens {num_tokens} "
+        f"(expected 1:1 ratio, got {num_logprobs / num_tokens:.2f}:1)"
+    )

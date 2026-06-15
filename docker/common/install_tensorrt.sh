@@ -2,20 +2,20 @@
 
 set -ex
 
-TRT_VER="10.14.1.48"
+TRT_VER="10.15.1.29"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-12.html#rel-25-12
-CUDA_VER="13.1" # 13.1.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-02.html#rel-26-02
+CUDA_VER="13.1" # 13.1.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.17.0.29-1"
-NCCL_VER="2.28.9-1+cuda13.0"
-CUBLAS_VER="13.2.0.9-1"
+CUDNN_VER="9.19.0.56-1"
+NCCL_VER="2.29.2-1+cuda13.1"
+CUBLAS_VER="13.2.1.1-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.1.80-1"
+NVRTC_VER="13.1.115-1"
 CUDA_RUNTIME="13.1.80-1"
-CUDA_DRIVER_VERSION="590.44.01-1.el8"
+CUDA_DRIVER_VERSION="590.48.01-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -39,6 +39,11 @@ install_ubuntu_requirements() {
     ARCH=$(uname -m)
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+
+    # this file exists in cuda base image, and has conflicts with cuda-keyring with the following error, so we need to remove it first:
+    # E: Conflicting values set for option Signed-By regarding
+    # source https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/ /: /usr/share/keyrings/cuda-archive-keyring.gpg !=
+    rm -f /etc/apt/sources.list.d/cuda.list
 
     curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH}/cuda-keyring_1.1-1_all.deb
     dpkg -i cuda-keyring_1.1-1_all.deb
@@ -120,10 +125,6 @@ install_tensorrt() {
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
 
     TRT_CUDA_VERSION=${CUDA_VER}
-    # No CUDA 13.1 version for TensorRT yet. Use CUDA 13.0 package instead.
-    if [ "$CUDA_VER" = "13.1" ]; then
-        TRT_CUDA_VERSION="13.0"
-    fi
     TRT_VER_SHORT=$(echo $TRT_VER | cut -d. -f1-3)
 
     if [ -z "$RELEASE_URL_TRT" ];then

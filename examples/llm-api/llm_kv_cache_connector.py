@@ -85,12 +85,13 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Optional
 
 import click
 import torch
 
 from tensorrt_llm import LLM, SamplingParams, logger
-from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
@@ -190,7 +191,8 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             for block_pos in range(num_computed_blocks + len(pending_load),
                                    len(block_ids)):
                 if len(chunks[block_pos]) == self.block_size:
-                    hashed_tokens = self._hash_tokens(chunks[block_pos])
+                    hashed_tokens = self._hash_tokens(chunks[block_pos],
+                                                      req.cache_salt)
 
                     file_path = self._file_path(hashed_tokens)
 
@@ -200,8 +202,10 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         return metadata
 
-    def _hash_tokens(self, tokens: list[int]) -> int:
-        return abs(hash(tuple(tokens)))
+    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> int:
+        # cache_salt must participate in the hash so that requests carrying
+        # different salts (or no salt) cannot collide on the same cache file.
+        return abs(hash((cache_salt, tuple(tokens))))
 
     def _file_path(self, hash_value: int) -> Path:
         return Path(self.cache_folder) / f"{hash_value}.pt"
@@ -233,7 +237,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         for chunk in remaining_chunks:
             # Only do full blocks.
             if len(chunk) == self.block_size:
-                hashed_tokens = self._hash_tokens(chunk)
+                hashed_tokens = self._hash_tokens(chunk, request.cache_salt)
 
                 file_path = self._file_path(hashed_tokens)
 

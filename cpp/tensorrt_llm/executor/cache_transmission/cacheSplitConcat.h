@@ -1,6 +1,6 @@
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,7 +63,7 @@ TargetRanksInfo targetIRanksForRnn(
  * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
  *
  * This function determines how many blocks should be allocated to a given CP rank when
- * distributing a total number of blocks across multiple CP ranks.
+ * distributing a total number of blocks across multiple CP ranks in a round-robin fashion.
  *
  * @param cpRank The rank (index) of the current CP process. Must be in range [0, cpSize).
  * @param cpSize The total number of CP ranks/processes in the parallel group.
@@ -72,22 +72,6 @@ TargetRanksInfo targetIRanksForRnn(
  * @return The number of blocks allocated to the specified CP rank.
  */
 int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
-
-/**
- * @brief Convert a local block index to a global block ID when Context Parallelism (CP) is enabled.
- *
- * This function maps a local block index (within a specific CP rank) to its corresponding
- * global block ID across all CP ranks. It supports two distribution strategies controlled
- * by the environment variable TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP.
- *
- * @param localBlockIdx The local block index within the current CP rank (0-based).
- * @param cpSize The total number of CP ranks in the parallel group.
- * @param cpRank The rank of the current CP process. Must be in range [0, cpSize).
- * @param numTotalBlocks The total number of blocks distributed across all CP ranks.
- *
- * @return The global block ID corresponding to the local block index.
- */
-int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks);
 
 void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
@@ -141,5 +125,54 @@ void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
     std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
     size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState,
     int selfIdx, runtime::BufferManager const& bufferManager);
+
+// ===========================================================================
+// Unified pool split/concat dispatchers (CppMambaHybridCacheManager path)
+// ===========================================================================
+
+/**
+ * @brief Split SSM state from unified pool blocks to per-target-rank buffers.
+ *
+ * @param pool           The recurrent states pool tensor {numLayers, numBlocks, blockSize}.
+ * @param realBlockIndices  Memory pool block indices of real (non-placeholder) blocks.
+ * @param outputSplitBlocks Per-target output SSM buffers.
+ * @param destCacheState    Destination (peer) cache state.
+ * @param selfCacheState    Self cache state.
+ * @param selfIdx           Self rank index.
+ * @param ssmBytes          SSM portion size in bytes per layer per block.
+ * @param blockSizeBytes    Total block size in bytes (ssm + conv).
+ * @param ssmDataType       Data type of SSM state.
+ * @param bufferManager     Buffer manager for temp allocations.
+ */
+void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
+    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType ssmDataType,
+    runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Split conv state from unified pool blocks with section-aware TP splitting.
+ */
+void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
+    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType convDataType,
+    runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Concat SSM state from per-source buffers into unified pool blocks.
+ */
+void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
+    size_t blockSizeBytes, nvinfer1::DataType ssmDataType, runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Concat conv state from per-source buffers into unified pool blocks (section-aware).
+ */
+void concatUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
+    std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
+    size_t blockSizeBytes, nvinfer1::DataType convDataType, runtime::BufferManager const& bufferManager);
 
 } // namespace tensorrt_llm::executor::rnn_cache

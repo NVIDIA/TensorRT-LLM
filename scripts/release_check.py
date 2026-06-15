@@ -22,8 +22,7 @@ import time
 
 
 def run_cmd(cmd):
-    """Run a command and return output, raising error by default if command fails"""
-
+    """Run a command and return output, raising error by default if command fails."""
     print(f"Running command: {cmd}")
     result = sp.run(cmd,
                     shell=True,
@@ -152,8 +151,7 @@ def run_precommit_with_timing(cmd):
 
 
 def handle_check_failure(error_msg):
-    """Helper function to handle check failures with consistent messaging"""
-
+    """Handle check failures with consistent messaging."""
     print(f"\nError: {error_msg}")
     print(
         "Please refer to our coding style guidelines at: https://github.com/NVIDIA/TensorRT-LLM/blob/main/CONTRIBUTING.md#coding-style to fix this issue"
@@ -206,14 +204,15 @@ def main():
         precommit_cmd = base_cmd + ["--all-files"]
         print("=== No arguments specified, running pre-commit on ALL files ===")
 
-    # Install pre-commit and bandit from requirements-dev.txt
+    # Install relevant packages from requirements-dev.txt
+    deps = ["pre-commit", "bandit", "mypy"]
     with open("requirements-dev.txt") as f:
         reqs = f.readlines()
-        pre_commit_req = next(line for line in reqs if "pre-commit" in line)
-        bandit_req = next(line for line in reqs if "bandit" in line)
-
-    run_cmd(f"pip3 install {pre_commit_req.strip()}")
-    run_cmd(f"pip3 install {bandit_req.strip()}")
+    reqs_to_install = [
+        selected_line for dep in deps
+        for selected_line in [line.strip() for line in reqs if dep in line]
+    ]
+    run_cmd(f"pip3 install {' '.join(reqs_to_install)}")
 
     # Install pre-commit hooks
     run_cmd("pre-commit install")

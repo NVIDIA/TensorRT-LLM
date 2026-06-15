@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 from typing import Any, Dict, Optional
 
@@ -6,6 +20,15 @@ import torch.nn.functional as F
 from test_common.llm_data import hf_id_to_local_model_dir
 from torch import nn
 from torch.export import Dim
+
+
+def default_max_num_tokens(max_seq_len: int, max_batch_size: int) -> int:
+    """Compute the default max_num_tokens for AutoDeploy tests.
+
+    The +1 is a WAR for a flashinfer attention issue with (max_batch_size, max_seq_len) input.
+    See https://github.com/NVIDIA/TensorRT-LLM/issues/4504
+    """
+    return (max_seq_len + 1) * max_batch_size
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -552,6 +575,35 @@ _SMALL_MODEL_CONFIGS = {
             "num_hidden_layers": 8,
         },
     },
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": {
+        "model_kwargs": {
+            "num_hidden_layers": 3,
+            "layers_block_type": ["mamba", "attention", "moe"],
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 8,
+            "n_groups": 2,
+            "ssm_state_size": 8,
+            "conv_kernel": 4,
+            # Attention/MoE dimensions for the reduced target.
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "moe_shared_expert_intermediate_size": 64,
+            "moe_latent_size": 16,
+            "n_group": 1,
+            "topk_group": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": {
+        "model_kwargs": {
+            "num_hidden_layers": 8,
+        },
+    },
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": {
         "model_kwargs": {
             "hidden_size": 64,
@@ -589,6 +641,7 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
         "free_gpu_memory_fraction": 0.0,  # No resizing of the cache to keep the mem footprint small
     }
     llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
+    llm_args["cuda_graph_config"] = {"max_batch_size": 2}  # Match max_batch_size
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
 

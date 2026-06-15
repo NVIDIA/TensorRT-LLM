@@ -218,7 +218,7 @@ Visual Generation Serving
 ``trtllm-serve`` supports diffusion-based visual generation models (FLUX.1, FLUX.2, Wan2.1, Wan2.2) for image and video generation. When a diffusion model directory is provided (detected by the presence of ``model_index.json``), the server automatically launches in visual generation mode with dedicated endpoints.
 
 .. note::
-   VisualGen is in **prototype** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
+   VisualGen is in **beta** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
 
 .. code-block:: bash
 
@@ -317,7 +317,7 @@ Example output:
 Configuring with YAML Files
 ----------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. The arguments in the file override the corresponding command line arguments.
+You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias

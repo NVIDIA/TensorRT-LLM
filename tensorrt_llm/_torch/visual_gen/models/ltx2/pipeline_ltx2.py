@@ -3,21 +3,25 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
 import copy
+import gc
 import json
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
 import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import CacheContext
+from tensorrt_llm._torch.utils import make_weak_ref
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -42,15 +46,127 @@ from .ltx2_core.types import (
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
 from .transformer_ltx2 import LTXModel, LTXModelType
 
+LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
-def _assert_resolution(height: int, width: int) -> None:
-    """Validate that height/width are divisible by the VAE spatial scale factor (32)."""
-    divisor = 32
+
+def ltx2_force_one_stage_enabled() -> bool:
+    return os.environ.get(LTX2_FORCE_ONE_STAGE_ENV, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _get_ltx2_auxiliary_search_dir(checkpoint_path: Path) -> Optional[Path]:
+    if checkpoint_path.is_dir():
+        return checkpoint_path
+    if checkpoint_path.is_file():
+        return checkpoint_path.parent
+    return None
+
+
+def _pick_unique_file(search_dir: Path, pattern: str) -> str:
+    matches = sorted(search_dir.glob(pattern))
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        logger.warning(
+            f"Multiple files matching {pattern!r} under {search_dir}: "
+            f"{[m.name for m in matches]}. Pass the path explicitly to disambiguate."
+        )
+    return ""
+
+
+def discover_ltx2_two_stage_paths(
+    checkpoint_path: Path,
+    spatial_upsampler_path: str = "",
+    distilled_lora_path: str = "",
+) -> Tuple[str, str]:
+    """Resolve LTX2 two-stage auxiliary checkpoint paths."""
+    search_dir = _get_ltx2_auxiliary_search_dir(checkpoint_path)
+    if search_dir is None:
+        return spatial_upsampler_path, distilled_lora_path
+
+    if not spatial_upsampler_path:
+        spatial_upsampler_path = _pick_unique_file(
+            search_dir, "*spatial-upscaler*.safetensors"
+        ) or _pick_unique_file(search_dir, "*upsampler*.safetensors")
+    if not distilled_lora_path:
+        distilled_lora_path = _pick_unique_file(
+            search_dir, "*distilled-lora*.safetensors"
+        ) or _pick_unique_file(search_dir, "*distilled*lora*.safetensors")
+
+    return spatial_upsampler_path, distilled_lora_path
+
+
+def resolve_ltx2_pipeline_extra_attrs(
+    checkpoint_path: Path,
+    extra_attrs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve LTX2 pipeline-selection attributes before variant selection."""
+    extra_attrs = dict(extra_attrs or {})
+    spatial_upsampler_path = extra_attrs.get("spatial_upsampler_path", "")
+    distilled_lora_path = extra_attrs.get("distilled_lora_path", "")
+    resolved_upsampler_path, resolved_lora_path = discover_ltx2_two_stage_paths(
+        checkpoint_path,
+        spatial_upsampler_path,
+        distilled_lora_path,
+    )
+    if not resolved_upsampler_path and not resolved_lora_path:
+        return {}
+
+    if bool(resolved_upsampler_path) != bool(resolved_lora_path):
+        if spatial_upsampler_path or distilled_lora_path:
+            missing = "distilled_lora_path" if resolved_upsampler_path else "spatial_upsampler_path"
+            raise ValueError(
+                "LTX2 two-stage pipeline requires both spatial_upsampler_path "
+                f"and distilled_lora_path, but {missing} was not provided or discovered."
+            )
+        logger.warning(
+            "Found only one LTX2 two-stage auxiliary checkpoint in "
+            f"{checkpoint_path}; falling back to the one-stage pipeline. "
+            "Pass both paths explicitly to enable two-stage inference."
+        )
+        return {}
+
+    if not spatial_upsampler_path:
+        logger.info(f"Discovered LTX2 spatial upsampler: {resolved_upsampler_path}")
+    if not distilled_lora_path:
+        logger.info(f"Discovered LTX2 distilled LoRA: {resolved_lora_path}")
+    return {
+        "spatial_upsampler_path": resolved_upsampler_path,
+        "distilled_lora_path": resolved_lora_path,
+    }
+
+
+def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -> None:
+    """Validate that height/width are divisible by the VAE spatial scale factor.
+
+    Two-stage pipelines run stage 1 at half resolution, so the full resolution
+    must be divisible by 64 (32 * 2).  One-stage pipelines require divisibility
+    by 32.
+    """
+    divisor = 64 if is_two_stage else 32
     if height % divisor != 0 or width % divisor != 0:
         raise ValueError(
             f"Resolution ({height}x{width}) is not divisible by {divisor}. "
-            f"Height and width must be multiples of {divisor}."
+            f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
+            f"height and width must be multiples of {divisor}."
         )
+
+
+_LTX2_PREFETCHED_SAFETENSORS: Set[str] = set()
+
+
+def _prefetch_ltx2_safetensors_files(file_names: List[str]) -> bool:
+    """Warm LTX-2 safetensors files in the host page cache.
+
+    For distributed runs, local ranks split the file list and synchronize before
+    weight loading so ranks do not duplicate the prefetch work on the same node.
+    """
+    return prefetch_files_to_host_cache(
+        file_names,
+        description="LTX-2 checkpoint",
+        prefetched_paths=_LTX2_PREFETCHED_SAFETENSORS,
+        ignore_errors=True,
+    )
 
 
 def _load_ltx2_transformer_weights(
@@ -79,6 +195,8 @@ def _load_ltx2_transformer_weights(
 
     if not sft_paths:
         raise ValueError(f"No safetensors files found in {checkpoint_dir}")
+
+    _prefetch_ltx2_safetensors_files(sft_paths)
 
     exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
 
@@ -185,6 +303,217 @@ class LTX2TeaCacheExtractor:
 
 
 # ---------------------------------------------------------------------------
+# CUDA graph runner for Modality-based transformer interface
+# ---------------------------------------------------------------------------
+
+
+class _LTX2CUDAGraphRunner(CUDAGraphRunner):
+    """CUDAGraphRunner extended for LTX-2's ``Modality``-based transformer.
+
+    The base runner derives graph keys from flat ``torch.Tensor`` args.
+    LTX-2's transformer takes ``Modality`` dataclasses (bundles of tensors),
+    optional ``BatchedPerturbationConfig``, and a ``TextCache`` kwarg.
+
+    This subclass overrides key derivation, capture, and replay so that
+    ``Modality`` tensors are included in the graph key, cloned into static
+    buffers at capture time, and copied in-place at replay time.
+
+    ``TextCache`` is step-invariant (constant across the denoise loop),
+    so it is excluded from the graph key and passed through without
+    cloning or copying.
+    """
+
+    @staticmethod
+    def _perturbation_fingerprint(perturbations):
+        """Return a hashable fingerprint of a ``BatchedPerturbationConfig``."""
+        parts = []
+        for pc in perturbations.perturbations:
+            if pc.perturbations is None:
+                parts.append(None)
+            else:
+                for p in pc.perturbations:
+                    blocks = tuple(p.blocks) if p.blocks is not None else None
+                    parts.append((p.type.value, blocks))
+        return tuple(parts)
+
+    # -- key derivation ------------------------------------------------------
+
+    def _key_parts_for(self, prefix, v):
+        """Yield ``(label, shape_or_tag)`` pairs for a single argument."""
+        from .text_cache import TextCache
+
+        if isinstance(v, TextCache):
+            # Step-invariant contents, but shape must still drive graph key:
+            # warmup and denoise may use different context lengths, which
+            # would otherwise silently reuse the wrong graph.
+            if v.video_context is not None:
+                yield (f"{prefix}.vctx", tuple(v.video_context.shape))
+            if v.audio_context is not None:
+                yield (f"{prefix}.actx", tuple(v.audio_context.shape))
+            return
+        elif isinstance(v, torch.Tensor):
+            yield (prefix, tuple(v.shape))
+        elif isinstance(v, Modality):
+            yield (f"{prefix}.latent", tuple(v.latent.shape))
+            yield (f"{prefix}.timesteps", tuple(v.timesteps.shape))
+            yield (f"{prefix}.positions", tuple(v.positions.shape))
+            yield (f"{prefix}.context", tuple(v.context.shape))
+            if v.context_mask is not None:
+                yield (f"{prefix}.context_mask", tuple(v.context_mask.shape))
+        elif isinstance(v, BatchedPerturbationConfig):
+            fp = self._perturbation_fingerprint(v)
+            yield (prefix, f"perturbed:{fp}")
+        elif v is None:
+            yield (prefix, None)
+
+    def get_graph_key(self, *args, **kwargs):
+        parts = []
+        for i, arg in enumerate(args):
+            parts.extend(self._key_parts_for(f"a{i}", arg))
+        for k in sorted(kwargs.keys()):
+            parts.extend(self._key_parts_for(k, kwargs[k]))
+        return tuple(parts)
+
+    # -- clone / copy helpers ------------------------------------------------
+
+    @staticmethod
+    def _clone_tensor_pair(pair):
+        return (pair[0].clone(), pair[1].clone()) if pair is not None else None
+
+    @staticmethod
+    def _copy_tensor_pair(dst, src):
+        if dst is None or src is None:
+            return
+        dst[0].copy_(src[0])
+        dst[1].copy_(src[1])
+
+    @staticmethod
+    def _clone_value(v):
+        from .text_cache import TextCache
+
+        if isinstance(v, TextCache):
+            # Clone every tensor into static buffers — replay copies into these.
+            clone_pair = _LTX2CUDAGraphRunner._clone_tensor_pair
+            return TextCache(
+                video_context=v.video_context.clone() if v.video_context is not None else None,
+                video_mask=v.video_mask.clone() if v.video_mask is not None else None,
+                video_pe=clone_pair(v.video_pe),
+                video_cross_pe=clone_pair(v.video_cross_pe),
+                video_kv=[clone_pair(kv) for kv in v.video_kv] if v.video_kv is not None else None,
+                audio_context=v.audio_context.clone() if v.audio_context is not None else None,
+                audio_mask=v.audio_mask.clone() if v.audio_mask is not None else None,
+                audio_pe=clone_pair(v.audio_pe),
+                audio_cross_pe=clone_pair(v.audio_cross_pe),
+                audio_kv=[clone_pair(kv) for kv in v.audio_kv] if v.audio_kv is not None else None,
+            )
+        if isinstance(v, torch.Tensor):
+            return v.clone()
+        if isinstance(v, Modality):
+            # NOTE: must be kept in sync with Modality dataclass fields.
+            return Modality(
+                latent=v.latent.clone(),
+                timesteps=v.timesteps.clone(),
+                positions=v.positions.clone(),
+                context=v.context.clone(),
+                enabled=v.enabled,
+                context_mask=v.context_mask.clone() if v.context_mask is not None else None,
+            )
+        return v
+
+    @staticmethod
+    def _copy_value(dst, src):
+        """Copy data from *src* into *dst* static buffer in-place."""
+        from .text_cache import TextCache
+
+        if isinstance(src, TextCache) and isinstance(dst, TextCache):
+            copy_pair = _LTX2CUDAGraphRunner._copy_tensor_pair
+            if dst.video_context is not None and src.video_context is not None:
+                dst.video_context.copy_(src.video_context)
+            if dst.video_mask is not None and src.video_mask is not None:
+                dst.video_mask.copy_(src.video_mask)
+            copy_pair(dst.video_pe, src.video_pe)
+            copy_pair(dst.video_cross_pe, src.video_cross_pe)
+            if dst.video_kv is not None and src.video_kv is not None:
+                for d, s in zip(dst.video_kv, src.video_kv):
+                    copy_pair(d, s)
+            if dst.audio_context is not None and src.audio_context is not None:
+                dst.audio_context.copy_(src.audio_context)
+            if dst.audio_mask is not None and src.audio_mask is not None:
+                dst.audio_mask.copy_(src.audio_mask)
+            copy_pair(dst.audio_pe, src.audio_pe)
+            copy_pair(dst.audio_cross_pe, src.audio_cross_pe)
+            if dst.audio_kv is not None and src.audio_kv is not None:
+                for d, s in zip(dst.audio_kv, src.audio_kv):
+                    copy_pair(d, s)
+            return dst
+        if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
+            dst.copy_(src)
+            return dst
+        if isinstance(src, Modality) and isinstance(dst, Modality):
+            dst.latent.copy_(src.latent)
+            dst.timesteps.copy_(src.timesteps)
+            dst.positions.copy_(src.positions)
+            dst.context.copy_(src.context)
+            if src.context_mask is not None and dst.context_mask is not None:
+                dst.context_mask.copy_(src.context_mask)
+            return dst
+        return src
+
+    @staticmethod
+    def _make_output_ref(x):
+        """``make_weak_ref`` variant that tolerates ``None`` in tuples.
+
+        The LTX-2 transformer returns ``(video_vel, audio_vel)`` where
+        either element may be ``None`` for modality-isolated passes.
+        """
+        if x is None:
+            return None
+        if isinstance(x, tuple):
+            return tuple(_LTX2CUDAGraphRunner._make_output_ref(i) for i in x)
+        if isinstance(x, list):
+            return [_LTX2CUDAGraphRunner._make_output_ref(i) for i in x]
+        return make_weak_ref(x)
+
+    # -- capture / replay ----------------------------------------------------
+
+    def capture(self, key, fn, args, kwargs):
+        logger.info(
+            f"Capturing CUDA graph for LTX2 transformer (key hash={hash(key) & 0xFFFF:04x})"
+        )
+
+        static_args = [self._clone_value(arg) for arg in args]
+        static_kwargs = {k: self._clone_value(v) for k, v in kwargs.items()}
+
+        graph = torch.cuda.CUDAGraph()
+        for _ in range(self.WARMUP_STEPS):
+            fn(*static_args, **static_kwargs)
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        with torch.cuda.graph(graph, pool=self._get_pool()):
+            output = fn(*static_args, **static_kwargs)
+
+        self.graphs[key] = graph
+        self.static_inputs[key] = (static_args, static_kwargs)
+        self.graph_outputs[key] = self._make_output_ref(output)
+        self.memory_pool = graph.pool()
+
+        if self._shared_pool is not None and self._shared_pool.handle is None:
+            self._shared_pool.handle = self.memory_pool
+
+    def replay(self, key, args, kwargs):
+        static_args, static_kwargs = self.static_inputs[key]
+        for i, arg in enumerate(args):
+            static_args[i] = self._copy_value(static_args[i], arg)
+        for k, v in kwargs.items():
+            if k in static_kwargs:
+                static_kwargs[k] = self._copy_value(static_kwargs[k], v)
+        self.graphs[key].replay()
+        return self.graph_outputs[key]
+
+
+# ---------------------------------------------------------------------------
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
 
@@ -255,7 +584,32 @@ def _load_component_weights(
 # ---------------------------------------------------------------------------
 
 
-@register_pipeline("LTX2Pipeline")
+# ``LTX2Pipeline`` owns the canonical ``Lightricks/LTX-2`` discovery
+# surface. ``_detect_from_checkpoint()`` returns ``"LTX2Pipeline"`` from
+# ``model_index.json`` / safetensors metadata, and the pipeline_config
+# validator runs against this entry's ``defaults`` BEFORE
+# ``resolve_variant()`` swaps in ``LTX2TwoStagesPipeline``. So the
+# superset of knobs (``text_encoder_path`` + the two two-stage paths)
+# lives here; the two-stage class registers without ``hf_ids`` /
+# ``defaults`` to avoid duplicating the discovery entry.
+@register_pipeline(
+    "LTX2Pipeline",
+    hf_ids=[
+        "Lightricks/LTX-2",
+    ],
+    defaults={
+        "text_encoder_path": "google/gemma-3-12b-it",
+        "spatial_upsampler_path": None,
+        "distilled_lora_path": None,
+    },
+    doc=(
+        "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
+        "superset of knobs for one-stage and two-stage. Pipeline will "
+        "run two-stage if both ``spatial_upsampler_path`` and "
+        "``distilled_lora_path`` are not ``None``, either set by the "
+        "user or auto-discovered from the checkpoint."
+    ),
+)
 class LTX2Pipeline(BasePipeline):
     """Pipeline for text-to-video generation with audio using LTX2 model.
 
@@ -265,9 +619,32 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    @classmethod
+    def resolve_variant(cls, config):
+        if getattr(config, "cache_backend", None) == "cache_dit":
+            logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
+            return cls
+
+        if ltx2_force_one_stage_enabled():
+            logger.info(f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; forcing one-stage LTX2 pipeline.")
+            return cls
+
+        checkpoint_path = getattr(config.primary_pretrained_config, "_name_or_path", "")
+        if checkpoint_path:
+            config.extra_attrs.update(
+                resolve_ltx2_pipeline_extra_attrs(Path(checkpoint_path), config.extra_attrs)
+            )
+        if config.extra_attrs.get("spatial_upsampler_path") and config.extra_attrs.get(
+            "distilled_lora_path"
+        ):
+            from .pipeline_ltx2_two_stages import LTX2TwoStagesPipeline
+
+            return LTX2TwoStagesPipeline
+        return cls
+
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def default_warmup_resolutions(self):
@@ -278,6 +655,7 @@ class LTX2Pipeline(BasePipeline):
         return [121]
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        # T2V warmup
         self.forward(
             prompt="warmup",
             negative_prompt="",
@@ -287,6 +665,20 @@ class LTX2Pipeline(BasePipeline):
             num_inference_steps=steps,
             guidance_scale=4.0,
             seed=42,
+        )
+        # I2V warmup — use a dummy image to compile the per-token timestep
+        # graph, preventing torch.compile recompilation on first I2V request.
+        dummy_image = torch.zeros(1, 3, height, width, device=self.device)
+        self.forward(
+            prompt="warmup",
+            negative_prompt="",
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=4.0,
+            seed=42,
+            image=dummy_image,
         )
 
     # ------------------------------------------------------------------
@@ -341,7 +733,14 @@ class LTX2Pipeline(BasePipeline):
         the reference ``LTXModelConfigurator.from_config()``.  Missing keys
         fall back to the same defaults the reference uses.
         """
-        cfg = self.model_config.pretrained_config
+        attn_cfg = getattr(self.pipeline_config, "attention", None)
+        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
+            raise NotImplementedError(
+                "Quantized attention is not yet supported for the LTX-2 pipeline."
+            )
+
+        model_config = self.pipeline_config.model_configs["transformer"]
+        cfg = model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
         freq_prec = getattr(cfg, "frequencies_precision", False)
@@ -382,9 +781,42 @@ class LTX2Pipeline(BasePipeline):
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
-            model_config=self.model_config,
+            model_config=model_config,
         )
         self.transformer._transformer_config = vars(cfg)
+
+    # ------------------------------------------------------------------
+    # CUDA graph setup (Modality-aware override)
+    # ------------------------------------------------------------------
+
+    def _setup_cuda_graphs(self):
+        """Wrap the transformer with Modality-aware CUDA graph capture/replay.
+
+        Overrides the base implementation because LTX-2's transformer forward
+        takes ``Modality`` dataclass inputs and optional
+        ``BatchedPerturbationConfig``, neither of which the base
+        ``CUDAGraphRunner`` can handle (it only processes flat tensors).
+
+        Uses ``_LTX2CUDAGraphRunner`` which extends key derivation, cloning,
+        and in-place copy to support these types.
+
+        Compatible with torch.compile: when both are enabled, the CUDA graph
+        runner wraps the compiled transformer.  The graph capture happens
+        during warmup — by that time torch.compile's lazy compilation has
+        already been triggered by the CUDAGraphRunner's internal warmup
+        iterations (WARMUP_STEPS=2), so the captured graph contains the
+        optimized compiled kernels.
+        """
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+
+        runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
+        logger.info(
+            f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
+        )
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
 
     # ------------------------------------------------------------------
     # Component loading
@@ -411,13 +843,14 @@ class LTX2Pipeline(BasePipeline):
             checkpoint_dir: Path to the native LTX-2 checkpoint
                 (directory containing ``*.safetensors`` files).
             device: Target device.
-            skip_components: Components to skip.
+            skip_components: Components to skip loading (internal escape
+                hatch for memory-constrained unit tests).
             text_encoder_path: Path to the Gemma3 model directory.
                 Must contain model weights (``model*.safetensors``),
                 tokenizer files, and ``preprocessor_config.json``.
         """
         skip_components = skip_components or []
-        dtype = self.model_config.torch_dtype
+        dtype = self.pipeline_config.torch_dtype
 
         needs_text = (
             PipelineComponent.TOKENIZER not in skip_components
@@ -426,8 +859,8 @@ class LTX2Pipeline(BasePipeline):
         if needs_text and not text_encoder_path:
             raise ValueError(
                 "text_encoder_path is required for loading the tokenizer "
-                "and text encoder. Set VisualGenArgs.text_encoder_path to "
-                "the Gemma3 model directory."
+                "and text encoder. Set the LTX-2 pipeline_config "
+                "'text_encoder_path' entry to the Gemma3 model directory."
             )
 
         # --- Tokenizer & text encoder (from separate Gemma directory) -----
@@ -446,8 +879,9 @@ class LTX2Pipeline(BasePipeline):
             ).to(device)
 
         # --- Resolve native config ----------------------------------------
-        native_config = self.model_config.extra_attrs.get("monolithic_safetensors_config")
+        native_config = self.pipeline_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
+        _prefetch_ltx2_safetensors_files(sft_paths)
 
         if native_config is None and sft_paths:
             native_config = _read_safetensors_config(sft_paths[0])
@@ -475,9 +909,10 @@ class LTX2Pipeline(BasePipeline):
         sft_paths: List[str],
         device: torch.device,
         dtype: torch.dtype,
-        skip_components: List,
+        skip_components: Optional[list] = None,
     ) -> None:
         """Instantiate and load weights for native LTX-2 components."""
+        skip_components = skip_components or []
 
         # Video decoder — native checkpoint stores decoder weights under
         # "vae.decoder." and statistics under "vae.per_channel_statistics.".
@@ -574,7 +1009,7 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def post_load_weights(self) -> None:
-        """Finalize after weight loading: TeaCache, derived attributes."""
+        """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
         # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
@@ -584,6 +1019,10 @@ class LTX2Pipeline(BasePipeline):
         #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
         # )
         # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+
+        # Cache-DiT
+        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
+            self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
@@ -826,36 +1265,99 @@ class LTX2Pipeline(BasePipeline):
     # Inference
     # ------------------------------------------------------------------
 
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 512,
+            "width": 768,
+            "num_inference_steps": 40,
+            "guidance_scale": 4.0,
+            "max_sequence_length": 1024,
+            "num_frames": 121,
+            "frame_rate": 24.0,
+        }
+
+    @property
+    def extra_param_specs(self):
+        return {
+            "output_type": ExtraParamSchema(
+                type="str",
+                default="pt",
+                description="Output type: 'pt' for PyTorch tensors, 'pil' for PIL images.",
+            ),
+            "guidance_rescale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                description="Guidance rescale factor to prevent overexposure.",
+            ),
+            "image_cond_strength": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Image conditioning strength for I2V (1.0 = fully conditioned first frame).",
+            ),
+            "stg_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                description="Spatiotemporal guidance scale for multi-modal guidance.",
+            ),
+            "stg_blocks": ExtraParamSchema(
+                type="list",
+                description="Transformer block indices for STG perturbation.",
+            ),
+            "modality_scale": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Modality guidance scale for multi-modal generation.",
+            ),
+            "rescale_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                range=(0.0, 1.0),
+                description="CFG rescale factor for multi-modal guidance.",
+            ),
+            "guidance_skip_step": ExtraParamSchema(
+                type="int",
+                default=0,
+                description="Number of initial denoising steps to skip guidance.",
+            ),
+            "enhance_prompt": ExtraParamSchema(
+                type="bool",
+                default=False,
+                description="Use Gemma3 LLM to enhance the prompt before generation.",
+            ),
+        }
+
     def infer(self, req):
         """Run inference with request parameters."""
+        extra = req.params.extra_params or {}
         return self.forward(
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            frame_rate=req.frame_rate,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            output_type=req.output_type,
-            guidance_rescale=req.guidance_rescale,
-            max_sequence_length=req.max_sequence_length,
-            image=getattr(req, "image", None),
-            image_cond_strength=getattr(req, "image_cond_strength", 1.0),
-            stg_scale=getattr(req, "stg_scale", 0.0),
-            stg_blocks=getattr(req, "stg_blocks", None),
-            modality_scale=getattr(req, "modality_scale", 1.0),
-            rescale_scale=getattr(req, "rescale_scale", 0.0),
-            guidance_skip_step=getattr(req, "guidance_skip_step", 0),
-            enhance_prompt=getattr(req, "enhance_prompt", False),
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            frame_rate=req.params.frame_rate,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
+            output_type=extra["output_type"],
+            guidance_rescale=extra["guidance_rescale"],
+            max_sequence_length=req.params.max_sequence_length,
+            image=req.params.image,
+            image_cond_strength=extra["image_cond_strength"],
+            stg_scale=extra["stg_scale"],
+            stg_blocks=extra["stg_blocks"],
+            modality_scale=extra["modality_scale"],
+            rescale_scale=extra["rescale_scale"],
+            guidance_skip_step=extra["guidance_skip_step"],
+            enhance_prompt=extra["enhance_prompt"],
         )
 
     # ------------------------------------------------------------------
     # Prompt enhancement
     # ------------------------------------------------------------------
 
-    def _enhance_prompt(self, prompt: str, seed: int = 42) -> str:
+    def _enhance_prompt(self, prompt: str, seed: int) -> str:
         """Use Gemma3 as an LLM to enhance the prompt for video generation."""
         system_prompt = (
             "You are a helpful assistant that enhances text prompts for video generation. "
@@ -894,6 +1396,7 @@ class LTX2Pipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -902,7 +1405,6 @@ class LTX2Pipeline(BasePipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,
@@ -928,8 +1430,10 @@ class LTX2Pipeline(BasePipeline):
                 (``1.0`` = fully conditioned first frame).
         """
         if image is not None:
-            _assert_resolution(height, width)
+            _assert_resolution(height, width, is_two_stage=False)
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Build guider params
@@ -967,14 +1471,21 @@ class LTX2Pipeline(BasePipeline):
         # CFG parallel for multi-modal guidance: each GPU handles one
         # CFG pass (cond or uncond), results are all-gathered, then
         # STG/modality passes run on every GPU before the guidance formula.
-        cfg_size = self.model_config.parallel.dit_cfg_size
-        ulysses_size = self.model_config.parallel.dit_ulysses_size
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
-        cfg_group = self.rank // ulysses_size
+        if do_cfg_parallel_mm and cfg_size != 2:
+            raise ValueError(
+                f"Multi-modal CFG parallel only supports cfg_size=2 "
+                f"(cond/uncond), got cfg_size={cfg_size}"
+            )
+        cfg_rank = vgm.cfg_rank if vgm else 0
+        cfg_pg = vgm.cfg_group if vgm else None
         if do_cfg_parallel_mm and self.rank == 0:
             logger.info(
                 f"CFG parallel (multi-modal guidance): cfg_size={cfg_size}, "
-                f"ulysses_size={ulysses_size}"
+                f"seq_parallel_size={seq_parallel_size}"
             )
 
         # ---- 0. Optional prompt enhancement -----------------------------
@@ -1142,7 +1653,66 @@ class LTX2Pipeline(BasePipeline):
         if do_stg and stg_blocks:
             stg_perturbation = build_stg_perturbation_config(stg_blocks)
 
-        # ---- 8. Denoising loop ------------------------------------------
+        # ---- 8. Pre-compute text cache(s) for the denoise loop ---------------
+        # Determine which text context this rank needs:
+        #   batched CFG (1 GPU, no multi-modal guidance): cat([neg, cond]) batch=2
+        #   CFG parallel rank 1: neg context only
+        #   everything else: cond context only
+        has_audio = audio_latents is not None
+        batched_cfg = do_cfg and cfg_size < 2 and not use_multi_modal_guidance
+        is_uncond_rank = cfg_size >= 2 and cfg_rank != 0 and do_cfg
+
+        if batched_cfg:
+            v_ctx = torch.cat([neg_video_embeds, video_embeds])
+            v_mask = (
+                torch.cat([neg_connector_mask, connector_mask])
+                if connector_mask is not None
+                else None
+            )
+            a_ctx = torch.cat([neg_audio_embeds, audio_embeds]) if has_audio else None
+            a_mask = (
+                torch.cat([neg_connector_mask, connector_mask])
+                if has_audio and connector_mask is not None
+                else None
+            )
+        elif is_uncond_rank:
+            v_ctx, v_mask = neg_video_embeds, neg_connector_mask
+            a_ctx = neg_audio_embeds if has_audio else None
+            a_mask = neg_connector_mask if has_audio else None
+        else:
+            v_ctx, v_mask = video_embeds, connector_mask
+            a_ctx = audio_embeds if has_audio else None
+            a_mask = connector_mask if has_audio else None
+
+        _text_cache = self.transformer.prepare_text_cache(
+            video_context=v_ctx,
+            video_context_mask=v_mask,
+            video_positions=video_positions,
+            audio_context=a_ctx,
+            audio_context_mask=a_mask,
+            audio_positions=audio_positions if has_audio else None,
+            dtype=self.dtype,
+        )
+
+        # Uncond cache — only when multi-modal guidance runs separate uncond passes.
+        _text_cache_uncond = (
+            self.transformer.prepare_text_cache(
+                video_context=neg_video_embeds,
+                video_context_mask=neg_connector_mask,
+                video_positions=video_positions,
+                audio_context=neg_audio_embeds if has_audio else None,
+                audio_context_mask=neg_connector_mask if has_audio else None,
+                audio_positions=audio_positions if has_audio else None,
+                dtype=self.dtype,
+            )
+            if use_multi_modal_guidance and do_cfg
+            else None
+        )
+
+        # Cache encoder output for two-stage Stage 2 reuse.
+        self._cached_encoder_output = (video_embeds, audio_embeds, connector_mask)
+
+        # ---- 9. Denoising loop ------------------------------------------
         def _run_transformer(
             v_latents,
             a_latents,
@@ -1151,6 +1721,8 @@ class LTX2Pipeline(BasePipeline):
             a_context,
             mask,
             perturbations=None,
+            *,
+            text_cache,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
@@ -1200,6 +1772,7 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
+                text_cache=text_cache,
             )
 
             dn_v = None
@@ -1243,13 +1816,15 @@ class LTX2Pipeline(BasePipeline):
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
                     extra_tensors.get("attention_mask", connector_mask),
+                    text_cache=_text_cache,
                 )
                 return dn_v, {"audio": dn_a}
 
             # --- CFG: conditional + unconditional passes --------------------
             if do_cfg_parallel_mm:
-                # CFG parallel: split cond/uncond across GPUs, all-gather
-                if cfg_group == 0:
+                # CFG parallel: each CFG rank runs one pass (cond or uncond),
+                # then all-gather across the CFG group (size 2).
+                if cfg_rank == 0:
                     local_v, local_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
@@ -1257,6 +1832,7 @@ class LTX2Pipeline(BasePipeline):
                         video_embeds,
                         audio_embeds,
                         connector_mask,
+                        text_cache=_text_cache,
                     )
                 else:
                     local_v, local_a = _run_transformer(
@@ -1266,20 +1842,21 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        text_cache=_text_cache_uncond,
                     )
 
                 local_v = local_v.contiguous()
-                gather_v = [torch.empty_like(local_v) for _ in range(self.world_size)]
-                dist.all_gather(gather_v, local_v)
+                gather_v = [torch.empty_like(local_v) for _ in range(cfg_size)]
+                dist.all_gather(gather_v, local_v, group=cfg_pg)
                 cond_v = gather_v[0]
-                uncond_v = gather_v[ulysses_size]
+                uncond_v = gather_v[1]
 
                 if local_a is not None:
                     local_a = local_a.contiguous()
-                    gather_a = [torch.empty_like(local_a) for _ in range(self.world_size)]
-                    dist.all_gather(gather_a, local_a)
+                    gather_a = [torch.empty_like(local_a) for _ in range(cfg_size)]
+                    dist.all_gather(gather_a, local_a, group=cfg_pg)
                     cond_a = gather_a[0]
-                    uncond_a = gather_a[ulysses_size]
+                    uncond_a = gather_a[1]
                 else:
                     cond_a = None
                     uncond_a = 0.0
@@ -1291,6 +1868,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     audio_embeds,
                     connector_mask,
+                    text_cache=_text_cache,
                 )
                 uncond_v = 0.0
                 uncond_a = 0.0
@@ -1302,6 +1880,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        text_cache=_text_cache_uncond,
                     )
 
             # STG: perturbed attention pass
@@ -1319,6 +1898,7 @@ class LTX2Pipeline(BasePipeline):
                     audio_embeds,
                     connector_mask,
                     perturbations=batched,
+                    text_cache=_text_cache,
                 )
 
             # Modality guidance: disable cross-modal attention
@@ -1332,6 +1912,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     None,
                     connector_mask,
+                    text_cache=_text_cache,
                 )
                 if audio_latents_in is not None:
                     _, iso_a = _run_transformer(
@@ -1341,6 +1922,7 @@ class LTX2Pipeline(BasePipeline):
                         None,
                         audio_embeds,
                         connector_mask,
+                        text_cache=_text_cache,
                     )
 
             guided_v = video_guider.calculate(cond_v, uncond_v, perturbed_v, iso_v)
@@ -1357,6 +1939,7 @@ class LTX2Pipeline(BasePipeline):
         # forward_fn, so tell BasePipeline not to apply its own CFG.
         effective_guidance = 1.0 if use_multi_modal_guidance else guidance_scale
 
+        timer.mark_denoise_start()
         result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -1381,6 +1964,8 @@ class LTX2Pipeline(BasePipeline):
 
         latents, extra_stream_latents = result
         audio_latents = extra_stream_latents["audio"]
+
+        timer.mark_post_start()
 
         # ---- 8. Decode --------------------------------------------------
         logger.info("Decoding video and audio...")
@@ -1424,4 +2009,16 @@ class LTX2Pipeline(BasePipeline):
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(video=video, audio=audio)
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None and audio is not None
+                    else None
+                ),
+            )
+        )

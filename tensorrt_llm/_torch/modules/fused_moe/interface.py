@@ -50,7 +50,36 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
-from .routing import BaseMoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
+                      get_cached_perfect_router_logits,
+                      precompute_common_perfect_router_logits)
+
+
+def _compute_ep_partition(num_experts: int, ep_size: int,
+                          ep_rank: int) -> tuple:
+    """Compute per-rank expert count and slot boundaries.
+
+    Uses ceil/floor distribution: ranks 0..remainder-1 hold (base+1) experts
+    and remaining ranks hold base. Covers all experts even when
+    num_experts % ep_size != 0.
+
+    Returns:
+        (expert_size, slot_start, slot_end)
+    """
+    # Reject num_experts < ep_size: would yield zero-expert ranks, which no
+    # MoE backend / comm strategy supports end-to-end. The downstream alltoall
+    # op has a backstop check (numExperts >= epSize) but the AllGatherReduceScatter
+    # fallback path bypasses it, so guard upfront here.
+    if num_experts < ep_size:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be >= ep_size ({ep_size}); "
+            f"configurations producing ranks with zero local experts are not supported."
+        )
+    base = num_experts // ep_size
+    remainder = num_experts % ep_size
+    expert_size = base + (1 if ep_rank < remainder else 0)
+    slot_start = ep_rank * base + min(ep_rank, remainder)
+    return expert_size, slot_start, slot_start + expert_size
 
 
 class MoEWeightLoadingMode(Enum):
@@ -74,6 +103,30 @@ class AlltoallMethodType(IntEnum):
     DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 4
+
+
+class MoESchedulerKind(Enum):
+    """Selects which forward-execution scheduler ConfigurableMoE picks for a backend.
+
+    Backends declare this via the ``scheduler_kind`` class attribute on
+    ``MoE``. ``ConfigurableMoE`` reads it once at init time to construct the
+    matching scheduler and to gate communication-strategy creation.
+
+    The axis is whether the cross-rank EP exchange is fused into the MoE
+    kernel or is a separate host-orchestrated step:
+
+    - ``EXTERNAL_COMM``: comm lives outside the MoE kernel boundary; the
+      scheduler issues ``Communication.dispatch`` / ``Communication.combine``
+      from the host with per-chunk EPLB hooks and optional multi-stream
+      chunk overlap (Cutlass, DeepGemm, CuteDSL, DenseGEMM, TRTLLMGen).
+    - ``FUSED_COMM``: comm is fused into the backend's fused kernel via
+      NVLink SymmBuffer (DeepGEMM ``fp8_fp4_mega_moe``). No host comm;
+      lockstep chunk launches; EPLB statistic update with
+      ``ignore_allreduce=False``.
+    """
+
+    EXTERNAL_COMM = "external_comm"
+    FUSED_COMM = "fused_comm"
 
 
 def extract_extra_attrs(layer_idx: str):
@@ -167,6 +220,17 @@ class MoE(nn.Module):
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
 
+    # Default scheduler kind for ConfigurableMoE forward dispatch. Backends
+    # whose fused kernel owns cross-rank exchange (e.g. MegaMoE-style)
+    # override this to ``MoESchedulerKind.FUSED_COMM``.
+    scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
+
+    # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
+    # so backends whose dispatch/combine paths still assume uniform partitioning fail
+    # fast with a clear error. Backends that fully exercise the ceil/floor partition
+    # (see ``_compute_ep_partition``) should override this to ``True``.
+    _supports_non_divisible_ep: bool = False
+
     @classmethod
     @abstractmethod
     def can_implement(
@@ -250,6 +314,9 @@ class MoE(nn.Module):
 
         # could be modified later
         self.quant_config = model_config.quant_config
+        self.force_dynamic_quantization = getattr(model_config,
+                                                  'force_dynamic_quantization',
+                                                  False)
 
         self.cluster_rank = model_config.mapping.moe_cluster_rank
         self.cluster_size = model_config.mapping.moe_cluster_size
@@ -262,6 +329,20 @@ class MoE(nn.Module):
 
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
+
+        # Non-divisible EP gate. Backends opt in via the class attribute
+        # ``_supports_non_divisible_ep``. Default is to reject so that any backend
+        # whose dispatch/combine paths still assume uniform partitioning fails fast
+        # with a clear error instead of silently using a wrong local-expert range.
+        if (self.num_experts % self.ep_size != 0
+                and not type(self)._supports_non_divisible_ep):
+            raise ValueError(
+                f"{type(self).__name__} does not support non-divisible EP: "
+                f"num_experts ({self.num_experts}) must be divisible by "
+                f"ep_size ({self.ep_size}). Override "
+                f"`_supports_non_divisible_ep = True` on the subclass after "
+                f"verifying the kernel/comm path handles ceil/floor partitioning."
+            )
 
         self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -297,14 +378,133 @@ class MoE(nn.Module):
             self.layer_load_balancer = None
             self.repeat_idx = 0
             self.repeat_count = 1
-            self.expert_size_per_partition = self.num_experts // self.ep_size
+            _size, _start, _end = _compute_ep_partition(self.num_experts,
+                                                        self.ep_size,
+                                                        self.ep_rank)
+            self.expert_size_per_partition = _size
             self.num_slots = self.num_experts
-            self.slot_start = self.ep_rank * self.expert_size_per_partition
-            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.slot_start = _start
+            self.slot_end = _end
             self.initial_local_expert_ids = list(
                 range(self.slot_start, self.slot_end))
             self.initial_global_assignments = list(range(self.num_experts))
             self.allreduce = None
+
+        # Override expert layout when DWDP is enabled.  This must run before
+        # create_weights() (which is invoked later by ConfigurableMoE) so the
+        # fused MoE backend allocates ``num_experts_per_worker`` slots per
+        # rank — not ``num_experts // ep_size``.  fixup_moe_backends() at
+        # setup_dwdp() time later promotes these to the full composite-VA
+        # view (``ep_size = 1``, ``slot_start = 0``,
+        # ``slot_end = num_experts``); the earlier override is still
+        # required because ``mapping.moe_ep_size`` is now 1, so the
+        # un-overridden default would be ``expert_size_per_partition =
+        # num_experts`` (each rank allocating storage for every expert).
+        self._init_dwdp_expert_layout()
+        self._init_perfect_router()
+
+    def _init_dwdp_expert_layout(self):
+        """Override expert layout when DWDP is enabled.
+
+        Plumbs ``num_experts_per_worker`` (storage size) and
+        ``start_expert_id`` (storage start) from the active
+        ``DwdpManager``.  This is a no-op when DWDP is not enabled
+        (``get_global_dwdp_manager()`` returns ``None``).
+
+        For the uniform partition case (``num_prefetch_experts ==
+        num_experts_per_worker == num_experts // dwdp_size``) this is
+        mathematically equivalent to the legacy ``ep_size = dwdp_size``
+        layout.  It additionally enables:
+
+        * Non-uniform partition (``dwdp_size`` does not divide
+          ``num_experts``): user picks ``num_prefetch_experts < num_experts_per_worker``
+          so that ``(dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker
+          == num_experts`` exactly.  Adjacent ranks' valid ranges
+          overlap by ``num_experts_per_worker - num_prefetch_experts``
+          experts; ``_validate_partition_config`` rejects
+          configurations whose last-rank end exceeds ``num_experts``
+          because the GB200 cuMemMap-with-fabric-handle ABI requires
+          ``mnnvl_size == handle_phys_size`` (no partial mapping), so
+          tail-padded storage cannot be partially mapped into a
+          ``num_experts``-sized composite VA.
+        * Redundancy (``num_prefetch_experts < num_experts_per_worker``
+          with ``(dwdp_size - 1) * stride + size == num_experts``):
+          consecutive ranks' ranges overlap; peer-side
+          ``lookup_owner`` (Phase 2) picks the lowest-rank owner so
+          reads of shared experts are deterministic.
+
+        DWDP and MoE EPLB are mutually exclusive — DWDP swaps
+        ``param.data`` to a composite-VA tensor at runtime, which the
+        EPLB rebalancer would clobber.
+        """
+        from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
+
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is None:
+            return
+        assert self.layer_load_balancer is None, (
+            "DWDP and EPLB (MoE load balancer) cannot be used together. "
+            "Disable one of dwdp_config or moe_load_balancer.")
+
+        self.num_slots = self.num_experts
+        self.expert_size_per_partition = dwdp_manager.num_experts_per_worker
+        dwdp_size = dwdp_manager.dwdp_size
+        # Routing-side expert assignment: distribute ``num_experts`` round-robin
+        # across DWDP ranks.  Independent of the storage layout — the gate uses
+        # this to map expert ids to ranks, while DWDP composite VA handles the
+        # actual weight access.
+        self.initial_global_assignments = [
+            (ep_rank * self.num_experts // dwdp_size + local_slot_id) %
+            self.num_experts for ep_rank in range(dwdp_size)
+            for local_slot_id in range(self.expert_size_per_partition)
+        ]
+        # Storage range: ``[start, start + size)``.  Phase 2's strict
+        # validation guarantees ``slot_end <= num_experts``, so every
+        # storage slot maps to a valid expert id.  ``len(initial_local_expert_ids)
+        # == expert_size_per_partition`` is preserved, which is required
+        # by the per-slot weight-scale copy in
+        # ``quantization.load_quant_scales``.
+        self.slot_start = dwdp_manager.start_expert_id
+        self.slot_end = self.slot_start + self.expert_size_per_partition
+        self.initial_local_expert_ids = list(
+            range(self.slot_start, self.slot_end))
+
+    def _get_perfect_router_dtype(self) -> torch.dtype:
+        if self.routing_method.routing_method_type in (
+                RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2):
+            return torch.float32
+        return self.dtype if self.dtype is not None else torch.float32
+
+    def _init_perfect_router(self):
+        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
+                                                     "0") == "1"
+        if not self._enable_perfect_router:
+            return
+
+        precompute_common_perfect_router_logits(
+            num_experts=self.num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            dtype=self._get_perfect_router_dtype(),
+            routing_method=self.routing_method,
+            ep_rank=self.ep_rank)
+
+    def _maybe_get_perfect_router_logits(
+            self,
+            router_logits: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if router_logits is None or not self._enable_perfect_router:
+            return router_logits
+
+        num_tokens, num_experts = router_logits.shape
+        return get_cached_perfect_router_logits(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            device=router_logits.device,
+            dtype=router_logits.dtype,
+            routing_method=self.routing_method)
 
     def _init_load_balancer(
         self,
@@ -328,15 +528,16 @@ class MoE(nn.Module):
         moe_load_balancer_config = model_config.moe_load_balancer
 
         # Calculate initial expert assignments
-        init_expert_size_per_partition = (
-            moe_load_balancer_config.num_local_slots
-            if moe_load_balancer_config else self.num_experts // self.ep_size)
-
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(init_expert_size_per_partition)
-        ]
+        if moe_load_balancer_config:
+            init_expert_size_per_partition = moe_load_balancer_config.num_local_slots
+            self.initial_global_assignments = [
+                (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
+                self.num_experts for ep_rank in range(self.ep_size)
+                for local_slot_id in range(init_expert_size_per_partition)
+            ]
+        else:
+            # Sequential mapping: expert i → slot i; covers all experts regardless of divisibility
+            self.initial_global_assignments = list(range(self.num_experts))
 
         # Setup load balancer if available
         if moe_load_balancer:
@@ -381,19 +582,28 @@ class MoE(nn.Module):
             logger.info(
                 f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
             )
-        else:
-            # Fallback when no load balancer
-            assert self.num_experts % self.ep_size == 0
-            self.expert_size_per_partition = self.num_experts // self.ep_size
-            self.num_slots = self.num_experts
 
-        # Calculate slot boundaries
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
+            # Slot boundaries for EPLB (uniform: all ranks hold same num_local_slots)
+            self.slot_start = self.ep_rank * self.expert_size_per_partition
+            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.initial_local_expert_ids = self.initial_global_assignments[
+                self.slot_start:self.slot_end]
+            assert len(
+                self.initial_local_expert_ids) == self.expert_size_per_partition
+        else:
+            # Fallback: ceil/floor distribution across ranks.
+            # Ranks 0..remainder-1 each hold (base+1) experts; remaining ranks hold base.
+            _size, _start, _end = _compute_ep_partition(self.num_experts,
+                                                        self.ep_size,
+                                                        self.ep_rank)
+            self.expert_size_per_partition = _size
+            self.num_slots = self.num_experts
+            self.slot_start = _start
+            self.slot_end = _end
+            self.initial_local_expert_ids = self.initial_global_assignments[
+                self.slot_start:self.slot_end]
+            assert len(
+                self.initial_local_expert_ids) == self.expert_size_per_partition
 
         # Setup AllReduce for dynamic routing if needed
         if self._using_dynamic_load_balancer():
@@ -417,6 +627,18 @@ class MoE(nn.Module):
         Subclasses can override this to indicate load balancer support.
         """
         return False
+
+    def validate_configurable_moe(self, moe: "nn.Module") -> None:
+        """Backend-specific validation hook called by ``ConfigurableMoE``.
+
+        ``ConfigurableMoE.validate_backend`` invokes this AFTER the generic
+        EPLB/load-balancer compatibility check, so backends may inspect
+        ``moe.num_slots``, ``moe.ep_size``, ``moe._using_load_balancer()``,
+        ``moe._using_dynamic_load_balancer()``. Default is a no-op; backends
+        with extra constraints (e.g. fused-comm backends rejecting
+        dynamic EPLB) override this.
+        """
+        del moe
 
     def _using_load_balancer(self) -> bool:
         """Check if this MoE is using load balancer."""
@@ -743,7 +965,21 @@ class MoE(nn.Module):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        router_logits = self._maybe_get_perfect_router_logits(router_logits)
         if self.register_to_config and is_torch_compiling():
+            # Routed-expert MoE LoRA is fused into torch.ops.trtllm.fused_moe
+            # via lora_params, but the trtllm::moe_custom_op graph path used here
+            # cannot carry lora_params. Dropping it silently would apply no LoRA,
+            # so reject instead. _moe_lora_enabled is only set by backends that
+            # fuse MoE LoRA, so other backends are unaffected.
+            if getattr(self, "_moe_lora_enabled", False):
+                raise RuntimeError(
+                    "Routed-expert MoE LoRA is not supported together with "
+                    "`register_to_config` + `torch.compile` (the "
+                    "`trtllm::moe_custom_op` graph path cannot carry LoRA "
+                    "adapter pointers). Disable `register_to_config`/"
+                    "torch.compile for this model, or remove the MoE modules "
+                    "from `lora_config.lora_target_modules`.")
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,

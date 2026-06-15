@@ -115,22 +115,37 @@ def resmooth_to_fp8_e8m0(
     num_batches = w_view.shape[0]
     BLOCK_M, BLOCK_K = block_size
 
-    grid = (num_batches, triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_k = triton.cdiv(K, BLOCK_K)
+    blocks_per_batch = grid_m * grid_k
 
-    _resmooth_kernel[grid](
-        w_view,
-        s_view,
-        M,
-        K,
-        w_view.stride(0),
-        w_view.stride(1),
-        w_view.stride(2),
-        s_view.stride(0),
-        s_view.stride(1),
-        s_view.stride(2),
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-    )
+    # Workaround for Triton compiler/runtime bug on SM100f (Blackwell):
+    # CUDA illegal memory access when total grid blocks exceed ~65K.
+    # Split launches along the batch dimension to stay under the limit.
+    MAX_GRID_BLOCKS = 65536
+    if blocks_per_batch > 0:
+        max_batches_per_launch = max(1, MAX_GRID_BLOCKS // blocks_per_batch)
+    else:
+        max_batches_per_launch = num_batches
+
+    for batch_offset in range(0, num_batches, max_batches_per_launch):
+        batch_count = min(max_batches_per_launch, num_batches - batch_offset)
+        grid = (batch_count, grid_m, grid_k)
+
+        _resmooth_kernel[grid](
+            w_view[batch_offset:],
+            s_view[batch_offset:],
+            M,
+            K,
+            w_view.stride(0),
+            w_view.stride(1),
+            w_view.stride(2),
+            s_view.stride(0),
+            s_view.stride(1),
+            s_view.stride(2),
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=BLOCK_K,
+        )
     # this is an in-place operation, however, we return for simplicity
     return weight, weight_scale
 
@@ -206,6 +221,78 @@ def check_sf_layout(sf: torch.Tensor,
         assert sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size())
 
     return sf
+
+
+def unpack_col_major_tma_aligned_packed_tensor(
+    packed: torch.Tensor,
+    mn: int,
+    k: int,
+) -> torch.Tensor:
+    """Inverse of :func:`get_col_major_tma_aligned_packed_tensor`.
+
+    Recovers a ``(mn, k)`` float32 UE8M0 scale tensor from the packed
+    int32 col-major layout produced by the forward transform.
+
+    Only valid when the original scales were UE8M0 (all power-of-two),
+    which is guaranteed after :func:`resmooth_to_fp8_e8m0`.
+    """
+    assert packed.dtype == torch.int
+
+    remove_dim = False
+    if packed.dim() == 2:
+        packed = packed.unsqueeze(0)
+        remove_dim = True
+    b = packed.shape[0]
+
+    aligned_mn = get_tma_aligned_size(mn, 4)  # int32 element_size = 4
+    aligned_k = align(k, 4)
+
+    # The packed tensor may have col-major strides from the forward
+    # transform.  Flatten to 1-D via clone() so dtype views always work.
+    packed.shape[-2] * packed.shape[-1]
+    flat_int = packed.reshape(b, -1).clone()  # (b, mn * cols) contiguous
+
+    # Pad mn back to aligned_mn (forward sliced [:mn])
+    if mn < aligned_mn:
+        extra = (aligned_mn - mn) * packed.shape[-1]
+        pad = torch.zeros(b, extra, device=packed.device, dtype=torch.int)
+        flat_int = torch.cat([flat_int, pad], dim=1)
+        aligned_mn * packed.shape[-1]
+
+    # int32 → uint8: 4 bytes per element
+    flat_bytes = flat_int.view(torch.uint8)  # (b, n_int32 * 4)
+    unpacked = flat_bytes.view(b, aligned_mn, aligned_k)
+
+    # Slice away padding, reconstruct float32 from UE8M0 exponent byte
+    ue8m0 = unpacked[:, :mn, :k]  # (b, mn, k) uint8
+    float_bits = ue8m0.to(torch.int32) << 23
+    result = float_bits.reshape(b, -1).view(torch.float32).reshape(b, mn, k)
+
+    return result.squeeze(0) if remove_dim else result
+
+
+def inverse_transform_sf(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Recover a ``(nb_m, nb_k)`` float32 block-scale grid from a packed SF.
+
+    This reverses the ``(FP32, 128, 128) → (INT, 1, 128)`` path in
+    :func:`transform_sf_into_required_layout` (the path taken by
+    ``FP8BlockScalesLinearMethod.post_load_weights`` on SM100f / SM120).
+    """
+    nb_k = ceil_div(k, block_size)
+
+    # Step 1: unpack to per-row float32 UE8M0 grid  (mn, nb_k)
+    per_row = unpack_col_major_tma_aligned_packed_tensor(sf, mn, nb_k)
+
+    # Step 2: collapse replicated rows back to (nb_m, nb_k).
+    # Forward did index_select with indices = arange(mn) // block_size,
+    # so rows within a 128-block are identical.  Take one per block.
+    per_block = per_row[::block_size]  # (nb_m, nb_k)
+    return per_block
 
 
 @nvtx_range("[DG] transform_sf_into_required_layout")

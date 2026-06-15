@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 import asyncio
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
@@ -99,6 +99,7 @@ class OpenAIHttpClient(OpenAIClient):
         max_retries: int = 1,
         retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
+        disagg_id_generator: Optional[Callable[[], int]] = None,
     ):
         self._router = router
         self._role = role
@@ -109,12 +110,13 @@ class OpenAIHttpClient(OpenAIClient):
                 limit_per_host=0,
                 force_close=False,
                 # Set keepalive_timeout below the server-side keepalive timeout to avoid reusing stale connections.
-                keepalive_timeout=3,
+                keepalive_timeout=1,
             ),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
         )
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
+        self._disagg_id_generator = disagg_id_generator
 
     async def _send_request(
         self,
@@ -161,9 +163,14 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
     ) -> AsyncGenerator[Any, None]:
-        json_data = request.model_dump(exclude_unset=True, mode="json")
         is_stream = request.stream
         for attempt in range(self._max_retries + 1):
+            # Regenerate disagg_request_id on retry to avoid ID collision on workers
+            if attempt > 0 and self._disagg_id_generator is not None:
+                dp = getattr(request, "disaggregated_params", None)
+                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                    dp.disagg_request_id = self._disagg_id_generator()
+            json_data = request.model_dump(exclude_unset=True, mode="json")
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -183,7 +190,15 @@ class OpenAIHttpClient(OpenAIClient):
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
-                        http_response.raise_for_status()
+                        if http_response.status >= 400:
+                            error_body = await http_response.text()
+                            raise aiohttp.ClientResponseError(
+                                http_response.request_info,
+                                http_response.history,
+                                status=http_response.status,
+                                message=f"{http_response.reason}: {error_body[:2048]}",
+                                headers=http_response.headers,
+                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
@@ -288,7 +303,12 @@ class OpenAIHttpClient(OpenAIClient):
         await self._session.close()
 
     async def check_ready(self) -> Tuple[List[str], List[str]]:
-        return await OpenAIHttpClient.check_ready_for_servers(self._session, self._router.servers)
+        ready_servers, unready_servers = await OpenAIHttpClient.check_ready_for_servers(
+            self._session, self._router.servers
+        )
+        if ready_servers:
+            await self._router.prepare_servers(ready_servers)
+        return ready_servers, unready_servers
 
     @staticmethod
     async def check_ready_for_servers(

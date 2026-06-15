@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import flashinfer
 import pytest
 import torch
@@ -6,6 +20,7 @@ from torch_attention_reference import TorchAttentionReference
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
     _GlobalFlashInferPlanner,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 def _create_combined_kv_cache(k_cache: torch.Tensor, v_cache: torch.Tensor) -> torch.Tensor:
@@ -107,10 +122,9 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor(
-        [BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0], dtype=torch.int32, device=device
-    )
+    _bi = BatchInfo()
+    _bi.update([BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
@@ -131,6 +145,7 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -237,9 +252,9 @@ def test_flashinfer_attention_op_decode(
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    # For decode phase: num_decode = BATCH_SIZE, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, BATCH_SIZE], dtype=torch.int32, device=device)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, BATCH_SIZE, BATCH_SIZE])
+    batch_info_host = _bi.serialize()
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
@@ -260,6 +275,7 @@ def test_flashinfer_attention_op_decode(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -367,10 +383,9 @@ def test_flashinfer_attention_context_and_generate(
         ),
         BATCH_SIZE * PREFILL_SEQ_LEN,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor(
-        [BATCH_SIZE, BATCH_SIZE * PREFILL_SEQ_LEN, 0], dtype=torch.int32, device=device
-    )
+    _bi = BatchInfo()
+    _bi.update([BATCH_SIZE, BATCH_SIZE * PREFILL_SEQ_LEN, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     flashinfer_output_1 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_1,
@@ -391,6 +406,7 @@ def test_flashinfer_attention_context_and_generate(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -462,8 +478,9 @@ def test_flashinfer_attention_context_and_generate(
         ),
         BATCH_SIZE * 1,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([0, 0, BATCH_SIZE], dtype=torch.int32, device=device)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, BATCH_SIZE, BATCH_SIZE])
+    batch_info_host = _bi.serialize()
     flashinfer_output_3 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_3,
@@ -484,6 +501,7 @@ def test_flashinfer_attention_context_and_generate(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -594,10 +612,9 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor(
-        [BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0], dtype=torch.int32, device=device
-    )
+    _bi = BatchInfo()
+    _bi.update([BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
@@ -618,6 +635,7 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -753,10 +771,9 @@ def test_flashinfer_attention_with_fp8_cache(
         ),
         BATCH_SIZE * SEQ_LEN,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor(
-        [BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0], dtype=torch.int32, device=device
-    )
+    _bi = BatchInfo()
+    _bi.update([BATCH_SIZE, BATCH_SIZE * SEQ_LEN, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
@@ -777,6 +794,7 @@ def test_flashinfer_attention_with_fp8_cache(
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         K_SCALE,
         V_SCALE,
@@ -861,8 +879,9 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         ),
         SEQ_LEN,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([BATCH_SIZE, SEQ_LEN, 0], dtype=torch.int32, device=device)
+    _bi = BatchInfo()
+    _bi.update([BATCH_SIZE, SEQ_LEN, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
@@ -883,6 +902,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,
@@ -954,8 +974,9 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         ),
         BATCH_SIZE * 1,
     )
-    # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([0, 0, BATCH_SIZE], dtype=torch.int32, device=device)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, BATCH_SIZE, BATCH_SIZE])
+    batch_info_host = _bi.serialize()
     flashinfer_output_gen = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_gen,
@@ -976,6 +997,7 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         # CACHES - combined KV cache in HND layout
         kv_cache,
         # CONSTANTS
+        None,
         None,
         1.0,
         1.0,

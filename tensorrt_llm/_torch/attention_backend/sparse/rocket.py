@@ -7,7 +7,8 @@ from triton import next_power_of_2
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs, AttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
@@ -355,7 +356,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Predict sparse KV indices using optimized SnapKV algorithm.
@@ -513,7 +514,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if metadata.num_generations == 0:
             return None, None
@@ -971,6 +972,7 @@ class RocketKVCacheManager(KVCacheManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         num_extra_decoding_steps: int = 0,
@@ -982,6 +984,7 @@ class RocketKVCacheManager(KVCacheManager):
             is_gen=is_gen,
             prepare_resource=prepare_resource,
             max_num_draft_tokens=max_num_draft_tokens,
+            kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1037,7 +1040,9 @@ class RocketKVCacheManager(KVCacheManager):
         self.kt_cache_manager.free_resources(request)
 
     @staticmethod
-    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+    def get_cache_size_per_token(model_config: ModelConfig,
+                                 mapping: Mapping,
+                                 num_layers: Optional[int] = None,
                                  **kwargs):
         # get kv cache dtype bytes
         mem_per_token = 2
@@ -1061,9 +1066,8 @@ class RocketKVCacheManager(KVCacheManager):
             head_dim = config.hidden_size // config.num_attention_heads
         head_dim = head_dim * num_key_value_heads // tp_size
 
-        # provide at least 1 layer to prevent division by zero cache size
-        num_attention_layers = max(
-            len(mapping.pp_layers(model_config.get_num_attention_layers())), 1)
+        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+            model_config, mapping, num_layers)
         mem_per_token *= num_attention_layers * head_dim
 
         # K and V

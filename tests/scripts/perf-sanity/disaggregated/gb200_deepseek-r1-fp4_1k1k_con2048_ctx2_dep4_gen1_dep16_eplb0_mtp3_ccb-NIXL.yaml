@@ -35,20 +35,15 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     print_iter_log: true
     max_batch_size: 768
-    max_num_tokens: 1536
+    max_num_tokens: 3072
     tensor_parallel_size: 16
     moe_expert_parallel_size: 16
     pipeline_parallel_size: 1
@@ -64,13 +59,14 @@ worker_config:
       dtype: fp8
     moe_config:
       backend: CUTEDSL
+      use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
     disable_overlap_scheduler: true
     speculative_config: &id001
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     num_postprocess_workers: 4
     stream_interval: 20
   ctx:
@@ -90,6 +86,7 @@ worker_config:
       dtype: fp8
     moe_config:
       backend: CUTEDSL
+      use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL

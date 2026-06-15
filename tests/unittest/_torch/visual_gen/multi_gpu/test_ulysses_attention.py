@@ -23,7 +23,10 @@ try:
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+    from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
+        AttentionBackend,
+        AttentionTensorLayout,
+    )
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
@@ -218,13 +221,13 @@ def _logic_ulysses_forward(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
 
-    output = attention(q, k, v, batch_size=batch, seq_len=seq_per_rank * world_size)
+    output = attention(q, k, v)
 
     assert output.shape == q.shape, f"Rank {rank}: Expected shape {q.shape}, got {output.shape}"
     assert output.device == device
@@ -234,7 +237,6 @@ def _logic_ulysses_with_mask(rank, world_size):
     """UlyssesAttention with attention mask."""
     batch = 2
     seq_per_rank = 8
-    seq_full = seq_per_rank * world_size
     num_heads = world_size * 4
     head_dim = 64
 
@@ -244,7 +246,7 @@ def _logic_ulysses_with_mask(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
@@ -252,7 +254,7 @@ def _logic_ulysses_with_mask(rank, world_size):
 
     mask = PredefinedAttentionMask.CAUSAL
 
-    output = attention(q, k, v, batch_size=batch, seq_len=seq_full, attention_mask=mask)
+    output = attention(q, k, v, attention_mask=mask)
 
     assert output.shape == q.shape
 
@@ -283,9 +285,9 @@ def _logic_ulysses_vs_standard_multi_gpu(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
-    ulysses_output = attention(q_shard, k_shard, v_shard, batch_size=batch, seq_len=seq_full)
+    ulysses_output = attention(q_shard, k_shard, v_shard)
 
     # Standard attention on the full tensors.
     q_std = q_full.transpose(1, 2)  # [B, H, S, D]
@@ -306,6 +308,67 @@ def _logic_ulysses_vs_standard_multi_gpu(rank, world_size):
         atol=1e-4,
         msg=f"Rank {rank}: Ulysses multi-GPU output differs from standard attention",
     )
+
+
+def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
+    """UlyssesAttention forwards ``key_padding_mask`` through a2a + sharded SDPA;
+    valid Q rows match plain SDPA on the unpadded prefix.
+
+    Mirrors LTX-2 audio_attn1 under Ulysses padding: audio is padded so the
+    seq dim divides ulysses_size, each rank holds
+    ``[B, S_padded/U, H, D]``, and ``key_padding_mask=[B, S_padded]`` zeroes
+    the padded K/V columns inside the wrapped backend. Catches regressions
+    where the wrapper would consume / shadow / misalign the mask across the
+    a2a + reverse-a2a pipeline.
+    """
+    batch = 2
+    s_real = 30  # deliberately not divisible by world_size
+    pad = (world_size - s_real % world_size) % world_size
+    s_padded = s_real + pad
+    seq_per_rank = s_padded // world_size
+    num_heads = world_size * 4
+    head_dim = 64
+    # CPU + gloo (use_cuda=False): the test validates wrapper math, not
+    # kernel perf. Forcing CPU avoids ``cuda:rank`` ordinal errors when fewer
+    # GPUs are visible than spawned ranks.
+    device = torch.device("cpu")
+
+    # Identical full tensors on every rank (same seed); the [s_real, s_padded)
+    # tail is junk but mask must zero its contribution.
+    torch.manual_seed(42)
+    x_full = torch.randn(batch, s_padded, num_heads, head_dim, device=device)
+    mask = torch.zeros(batch, s_padded, dtype=torch.bool, device=device)
+    mask[:, :s_real] = True
+
+    # Reference: plain SDPA on the unpadded prefix.
+    ref = F.scaled_dot_product_attention(
+        x_full[:, :s_real].transpose(1, 2),
+        x_full[:, :s_real].transpose(1, 2),
+        x_full[:, :s_real].transpose(1, 2),
+        scale=1.0 / math.sqrt(head_dim),
+        dropout_p=0.0,
+    ).transpose(1, 2)  # [B, s_real, H, D]
+
+    # Wrapped path: this rank holds the [rank*seq_per_rank, (rank+1)*seq_per_rank) shard.
+    inner = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    attention = UlyssesAttention(inner_backend=inner, process_group=None)
+    x_shard = x_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    out_shard = attention.forward(q=x_shard, k=x_shard, v=x_shard, key_padding_mask=mask)
+
+    # Compare this rank's valid Q rows (those that fall within s_real) to ref.
+    start, end = rank * seq_per_rank, (rank + 1) * seq_per_rank
+    valid_in_shard = max(0, min(end, s_real) - start)
+    if valid_in_shard > 0:
+        torch.testing.assert_close(
+            out_shard[:, :valid_in_shard],
+            ref[:, start : start + valid_in_shard],
+            rtol=1e-4,
+            atol=1e-4,
+            msg=(
+                f"Rank {rank}: UlyssesAttention with key_padding_mask diverges "
+                f"from unpadded SDPA on valid Q rows"
+            ),
+        )
 
 
 def _logic_ulysses_invalid_heads(rank, world_size):
@@ -335,14 +398,14 @@ def _logic_different_batch_sizes(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     for batch_size in [1, 2, 4, 8]:
         q = torch.randn(batch_size, seq_per_rank, num_heads, head_dim, device=device)
         k = torch.randn(batch_size, seq_per_rank, num_heads, head_dim, device=device)
         v = torch.randn(batch_size, seq_per_rank, num_heads, head_dim, device=device)
 
-        output = attention(q, k, v, batch_size=batch_size, seq_len=seq_per_rank * world_size)
+        output = attention(q, k, v)
         assert output.shape == q.shape
 
 
@@ -358,13 +421,13 @@ def _logic_different_head_dims(rank, world_size):
         attention = UlyssesAttention(
             inner_backend=inner,
             process_group=None,
-        ).to(device)
+        )
 
         q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
         k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
         v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
 
-        output = attention(q, k, v, batch_size=batch, seq_len=seq_per_rank * world_size)
+        output = attention(q, k, v)
         assert output.shape == q.shape
 
 
@@ -381,13 +444,13 @@ def _logic_world_size_4(rank, world_size):
     attention = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
 
-    output = attention(q, k, v, batch_size=batch, seq_len=seq_per_rank * world_size)
+    output = attention(q, k, v)
     assert output.shape == q.shape
 
 
@@ -450,17 +513,16 @@ def _logic_a2a_5d_roundtrip(rank, world_size):
     torch.testing.assert_close(reconstructed, original, rtol=1e-5, atol=1e-5)
 
 
-class _FusedVanillaAttention(torch.nn.Module):
+class _FusedVanillaAttention(AttentionBackend):
     """Test-only backend that supports fused QKV to exercise the 5D A2A path."""
 
     def __init__(self, num_heads: int, head_dim: int):
-        super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
         self._preferred_layout = AttentionTensorLayout.NHD
 
-    def forward(self, q, k=None, v=None, batch_size=None, seq_len=None, **kwargs):
+    def forward(self, q, k=None, v=None, **kwargs):
         if k is None and v is None:
             q_t, k_t, v_t = q[:, :, 0], q[:, :, 1], q[:, :, 2]
         else:
@@ -484,7 +546,6 @@ def _logic_ulysses_fused_vs_unfused(rank, world_size):
     """Fused 5D A2A (auto-selected via support_fused_qkv) matches unfused 4D path."""
     batch = 2
     seq_per_rank = 8
-    seq_full = seq_per_rank * world_size
     num_heads = world_size * 4
     head_dim = 64
 
@@ -499,16 +560,16 @@ def _logic_ulysses_fused_vs_unfused(rank, world_size):
     attn_unfused = UlyssesAttention(
         inner_backend=inner_unfused,
         process_group=None,
-    ).to(device)
+    )
 
     inner_fused = _FusedVanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
     attn_fused = UlyssesAttention(
         inner_backend=inner_fused,
         process_group=None,
-    ).to(device)
+    )
 
-    out_unfused = attn_unfused(q, k, v, batch_size=batch, seq_len=seq_full)
-    out_fused = attn_fused(q, k, v, batch_size=batch, seq_len=seq_full)
+    out_unfused = attn_unfused(q, k, v)
+    out_fused = attn_fused(q, k, v)
 
     torch.testing.assert_close(
         out_fused,
@@ -542,9 +603,9 @@ def _logic_ulysses_fused_vs_standard(rank, world_size):
     attn_fused = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-    ).to(device)
+    )
 
-    fused_output = attn_fused(q_shard, k_shard, v_shard, batch_size=batch, seq_len=seq_full)
+    fused_output = attn_fused(q_shard, k_shard, v_shard)
 
     q_std = q_full.transpose(1, 2)
     k_std = k_full.transpose(1, 2)
@@ -620,54 +681,25 @@ class TestUlyssesAttention:
         """Test UlyssesAttention with attention mask."""
         run_test_in_distributed(world_size=2, test_fn=_logic_ulysses_with_mask, use_cuda=True)
 
-    def test_ulysses_vs_standard_attention_single_gpu(self):
-        """Compare UlyssesAttention with standard attention on single GPU."""
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-
-        if not torch.cuda.is_available():
-            pytest.skip("Test requires CUDA")
-
-        batch = 2
-        seq = 16
-        num_heads = 8
-        head_dim = 64
-        device = torch.device("cuda:0")
-
-        inner = VanillaAttention(num_heads=num_heads, head_dim=head_dim)
-        ulysses_attn = UlyssesAttention(
-            inner_backend=inner,
-            process_group=None,
-        ).to(device)
-
-        torch.manual_seed(42)
-        q = torch.randn(batch, seq, num_heads, head_dim, device=device)
-        k = torch.randn(batch, seq, num_heads, head_dim, device=device)
-        v = torch.randn(batch, seq, num_heads, head_dim, device=device)
-
-        ulysses_output = ulysses_attn(q, k, v, batch_size=batch, seq_len=seq)
-
-        q_std = q.transpose(1, 2)  # [B, H, S, D]
-        k_std = k.transpose(1, 2)
-        v_std = v.transpose(1, 2)
-
-        std_output = F.scaled_dot_product_attention(
-            q_std, k_std, v_std, scale=1.0 / math.sqrt(head_dim), dropout_p=0.0
-        )
-        std_output = std_output.transpose(1, 2).contiguous()  # [B, S, H, D]
-
-        torch.testing.assert_close(
-            ulysses_output,
-            std_output,
-            rtol=1e-4,
-            atol=1e-4,
-            msg="Ulysses attention output differs from standard attention",
-        )
-
     def test_ulysses_vs_standard_attention_multi_gpu(self):
         """Compare UlyssesAttention across GPUs with standard attention on full sequence."""
         run_test_in_distributed(
             world_size=2, test_fn=_logic_ulysses_vs_standard_multi_gpu, use_cuda=True
+        )
+
+    def test_ulysses_with_key_padding_mask_parity(self):
+        """Padded Q=K=V + key_padding_mask: valid Q rows match unpadded SDPA.
+
+        Verifies that ``UlyssesAttention`` correctly forwards
+        ``key_padding_mask`` through its a2a + sharded SDPA + reverse-a2a
+        pipeline (the audio_attn1 path under Ulysses with audio padding).
+        ws=2 exercises a single sharding boundary; CPU + gloo so the test
+        runs without GPUs.
+        """
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_ulysses_with_key_padding_mask_parity,
+            use_cuda=False,
         )
 
     def test_ulysses_attention_invalid_heads(self):

@@ -22,14 +22,14 @@ import sys
 import sysconfig
 import tempfile
 import warnings
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
-from typing import Sequence
+from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
@@ -404,8 +404,11 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
     try:
         build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
                   env=env_stub_gen)
+        # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
+        # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+            "-o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
         if flash_mla:
             build_run(
@@ -491,7 +494,9 @@ def main(*,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
+         configure_only: bool = False,
          use_ccache: bool = False,
+         use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
@@ -505,7 +510,8 @@ def main(*,
          no_venv: bool = False,
          nvrtc_dynamic_linking: bool = False,
          mypyc: bool = False,
-         require_dynamic_attributions: bool = False):
+         require_dynamic_attributions: bool = False,
+         plat_name: Optional[str] = None):
 
     if clean:
         clean_wheel = True
@@ -549,6 +555,27 @@ def main(*,
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
+
+    # Debug and RelWithDebInfo enable CUDA `--generate-line-info`, which
+    # inflates .text so much that linking against every supported arch
+    # overflows section limits. Require an explicit arch list so the build
+    # won't silently fail deep into compilation.
+    if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
+        raise RuntimeError(
+            f"Building {build_type} requires --cuda_architectures to be set "
+            "explicitly (e.g. --cuda_architectures=90-real). Building for all "
+            "architectures with line info enabled exceeds linker section "
+            "limits. Pass a narrow arch list matching the GPU you intend to "
+            "debug/profile.")
+
+    if build_type == "Debug":
+        print(
+            "-- Debug build: only --generate-line-info is enabled by default. "
+            "Full device debug info (-G) is NOT enabled because it can make "
+            "ptxas memory usage explode and get OOM-killed on some kernels. "
+            "If you need cuda-gdb stepping inside kernels, opt in with "
+            "`--extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` and make sure "
+            "the build host has enough memory for ptxas.")
 
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
@@ -609,6 +636,20 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    # FetchContent bare-repo cache (see 3rdparty/CMakeLists.txt).  Forwarded
+    # as -D vars so the configuration is reproducible from CMakeCache.txt
+    # alone and doesn't depend on the caller's env.  The env var hand-off
+    # lets a wrapping agent point at a shared cache without patching
+    # build_wheel.py.
+    if use_3rdparty_cache:
+        cache_dir = os.environ.get("TRTLLM_FETCHCONTENT_CACHE") or str(
+            project_dir / "3rdparty" / ".cache_3rdparty")
+        cmake_def_args.append(f"-DTRTLLM_FETCHCONTENT_CACHE={cache_dir}")
+        update_cmd = os.environ.get("TRTLLM_FETCHCONTENT_UPDATE_CMD", "")
+        if update_cmd:
+            cmake_def_args.append(
+                f"-DTRTLLM_FETCHCONTENT_UPDATE_CMD={update_cmd}")
+
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
@@ -662,7 +703,7 @@ def main(*,
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
-        if clean or first_build or configure_cmake:
+        if clean or first_build or configure_cmake or configure_only:
             build_run(
                 f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
@@ -684,6 +725,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+
+        if configure_only:
+            return
 
         maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
@@ -728,7 +772,20 @@ def main(*,
         clear_folder(cache_dir)
 
     install_file = copy
-    install_tree = copytree
+
+    # Wrapper for copytree that checks if source and destination are the same
+    def safe_copytree(src, dst, dirs_exist_ok=True):
+        """Copy tree, but skip if source and destination resolve to the same directory."""
+        src_path = Path(src).resolve()
+        dst_path = Path(dst).resolve()
+        if src_path == dst_path:
+            # Source and destination are the same, skip copying
+            return
+        if dst_path.exists() and dirs_exist_ok:
+            rmtree(dst_path)
+        copytree(src_path, dst_path, dirs_exist_ok=dirs_exist_ok)
+
+    install_tree = safe_copytree
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -756,6 +813,63 @@ def main(*,
     install_tree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
                  include_dir / "deep_gemm",
                  dirs_exist_ok=True)
+
+    # Copy FMHA kernel generation headers for JIT compilation
+    fmha_build_dir = build_dir / "tensorrt_llm" / "kernels" / "trtllmGenKernels" / "fmha"
+    fmha_include_dir = include_dir / "trtllm_gen_kernels" / "fmha"
+    if fmha_build_dir.exists():
+        fmha_include_dir.mkdir(parents=True, exist_ok=True)
+
+        # Helper function to resolve symlinks and copy actual content
+        def copy_resolving_symlink(src_path, dst_path):
+            """Copy file or directory, resolving symlinks to copy actual content."""
+            if src_path.is_symlink():
+                resolved_src = src_path.resolve()
+            else:
+                resolved_src = src_path
+
+            if resolved_src.is_dir():
+                if dst_path.exists():
+                    rmtree(dst_path)
+                # Use symlinks=False (default) to follow symlinks and copy actual content
+                # This ensures nested symlinks are also resolved
+                copytree(resolved_src, dst_path, symlinks=False)
+            else:
+                if dst_path.is_dir():
+                    dst_path = dst_path / src_path.name
+                copy(resolved_src, dst_path)
+
+        # Copy cuda_ptx directory (actual directory, not symlink)
+        cuda_ptx_src = fmha_build_dir / "cuda_ptx"
+        if cuda_ptx_src.exists():
+            copy_resolving_symlink(cuda_ptx_src, fmha_include_dir / "cuda_ptx")
+
+        # Copy cutlass (symlink, need to resolve)
+        cutlass_src = fmha_build_dir / "cutlass"
+        if cutlass_src.exists():
+            copy_resolving_symlink(cutlass_src, fmha_include_dir / "cutlass")
+
+        # Copy trtllm directory (contains dev symlink)
+        trtllm_src = fmha_build_dir / "trtllm"
+        if trtllm_src.exists():
+            copy_resolving_symlink(trtllm_src, fmha_include_dir / "trtllm")
+
+        # Copy cuda (symlink, need to resolve)
+        cuda_src = fmha_build_dir / "cuda"
+        if cuda_src.exists():
+            copy_resolving_symlink(cuda_src, fmha_include_dir / "cuda")
+
+        # Copy KernelParams.h (actual file)
+        kernel_params_src = fmha_build_dir / "KernelParams.h"
+        if kernel_params_src.exists():
+            copy(kernel_params_src, fmha_include_dir / "KernelParams.h")
+
+        # Copy KernelParamsDecl.h (actual file)
+        kernel_params_decl_src = fmha_build_dir / "KernelParamsDecl.h"
+        if kernel_params_decl_src.exists():
+            copy(kernel_params_decl_src,
+                 fmha_include_dir / "KernelParamsDecl.h")
+
     required_cuda_headers = [
         "cuda_fp16.h", "cuda_fp16.hpp", "cuda_bf16.h", "cuda_bf16.hpp",
         "cuda_fp8.h", "cuda_fp8.hpp"
@@ -988,6 +1102,11 @@ def main(*,
             clear_folder(dist_dir)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
+        plat_name_arg = ""
+        if plat_name:
+            plat_name_arg = f'--config-setting="--build-option=--plat-name={plat_name}"'
+            extra_wheel_build_args = " ".join(
+                arg for arg in (extra_wheel_build_args, plat_name_arg) if arg)
 
         # Attempt to generate attributions using the dependency database
         # Skip if output already exists and the build system hasn't changed
@@ -1030,7 +1149,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
@@ -1072,10 +1191,21 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")
+    parser.add_argument(
+        "--configure-only",
+        action="store_true",
+        help="Run cmake configure and exit, skipping build and wheel packaging")
     parser.add_argument("--use_ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
+    parser.add_argument(
+        "--use-3rdparty-cache",
+        default=False,
+        action="store_true",
+        help="Accelerate FetchContent git clones via bare reference "
+        "repos under $TRTLLM_FETCHCONTENT_CACHE "
+        "(default: <project>/3rdparty/.cache_3rdparty).")
     parser.add_argument(
         "--fast_build",
         "-f",
@@ -1180,6 +1310,21 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--require_dynamic_attributions",
                         action="store_true",
                         help="Fail the build if attribution generation fails")
+
+    def _plat_name_type(value):
+        import re
+        if not re.fullmatch(r'[a-zA-Z0-9_]+', value):
+            raise ArgumentTypeError(
+                f"Invalid plat name '{value}': only alphanumerics and underscores are allowed"
+            )
+        return value
+
+    parser.add_argument(
+        "--plat-name",
+        type=_plat_name_type,
+        help=
+        "Wheel platform tag passed to bdist_wheel --plat-name (e.g. linux_x86_64, manylinux_2_28_x86_64)"
+    )
 
 
 if __name__ == "__main__":

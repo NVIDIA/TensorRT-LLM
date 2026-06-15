@@ -1,26 +1,14 @@
-from typing import Union
-
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
-from tensorrt_llm.models.modeling_utils import DecoderModelForCausalLM
 
 
 @register_mapper("HF", "Qwen3NextForCausalLM")
 class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
-
-    def init_model_and_config(self, model: Union[nn.Module,
-                                                 DecoderModelForCausalLM],
-                              config: ModelConfig):
-        super().init_model_and_config(model, config)
-        self._num_kv_heads = model.config.num_key_value_heads if hasattr(
-            model.config, 'num_key_value_heads'
-        ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
     def should_skip_module(self, module_name: str) -> bool:
         if module_name.startswith("draft_model"):
@@ -56,6 +44,7 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         config = self.config.pretrained_config
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
+        mtp_layer_offset = config.num_hidden_layers
 
         if self.config.mapping.enable_attention_dp:
             tp_size = 1
@@ -66,9 +55,27 @@ class Qwen3NextHfWeightMapper(Qwen2MoeHfWeightMapper):
         linear_key_dim = config.linear_key_head_dim * config.linear_num_key_heads  # 16 * 128
         linear_value_dim = config.linear_value_head_dim * config.linear_num_value_heads  # 32 * 128
 
+        mtp_mapping = {
+            "mtp.fc": "fc",
+            "mtp.norm": "shared_head.norm",
+            "mtp.pre_fc_norm_embedding": "pre_fc_norm_embedding",
+            "mtp.pre_fc_norm_hidden": "pre_fc_norm_hidden",
+        }
+
         new_weights = {}
         for name, _ in weights.items():
             key = name
+
+            if key.startswith("mtp.layers."):
+                _, _, mtp_layer_idx, module_name = key.split(".", 3)
+                key = (f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}."
+                       f"{module_name}")
+            elif key.startswith("mtp."):
+                for mtp_prefix, trtllm_name in mtp_mapping.items():
+                    if key.startswith(mtp_prefix):
+                        suffix = key[len(mtp_prefix):]
+                        key = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
+                        break
 
             if "A_log" in key:
                 w = split(weights[name], tp_size, tp_rank)

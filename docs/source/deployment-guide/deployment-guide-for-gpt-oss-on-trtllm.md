@@ -54,7 +54,7 @@ Note:
 * The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
 * See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
+If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html>.
 
 ### Recommended Performance Settings
 
@@ -393,12 +393,4 @@ The following sections help you pick a known-good `trtllm-serve --config` for yo
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
-```
-
-### Recipe database
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-openai/gpt-oss-120b
-   :end-before: .. end-openai/gpt-oss-120b
 ```

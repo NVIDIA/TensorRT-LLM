@@ -78,6 +78,12 @@ class LoraModuleType(IntEnum):
     SHARED_EXPERT_4H_TO_H = 20  # Shared expert second projection
     SHARED_EXPERT_GATE = 21  # Shared expert gate projection
 
+    MAMBA_IN_PROJ = 22  # Mamba input projection
+    MAMBA_OUT_PROJ = 23  # Mamba output projection
+
+    MOE_LATENT_FC1 = 24  # MoE latent fc1 projection (fc1_latent_proj)
+    MOE_LATENT_FC2 = 25  # MoE latent fc2 projection (fc2_latent_proj)
+
     def __str__(self):
         """Return the name of the enum value."""
         return self.name
@@ -122,8 +128,14 @@ class LoraModuleType(IntEnum):
     def is_moe(self) -> bool:
         """Check if this is a Mixture of Experts (MoE) module type."""
         return self in {
-            self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER
+            self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER,
+            self.MOE_LATENT_FC1, self.MOE_LATENT_FC2
         }
+
+    @property
+    def is_mamba(self) -> bool:
+        """Check if this is a Mamba module type."""
+        return self in {self.MAMBA_IN_PROJ, self.MAMBA_OUT_PROJ}
 
 
 class LoraLayer(torch.nn.Module):
@@ -479,14 +491,16 @@ class LoraLayer(torch.nn.Module):
         lora_weight_pointers = []
         active_lora_module_ids = []
 
+        # Check if this layer has any LoRA weights
+        layer_params = lora_params.get(layer_idx, {})
+
         for module_idx in self.lora_module_types:
             module_idx = int(module_idx)
-            if module_idx in lora_params[layer_idx]:
+            if module_idx in layer_params:
                 active_lora_module_ids.append(module_idx)
-                lora_ranks.append(
-                    lora_params[layer_idx][module_idx]['adapter_size'])
+                lora_ranks.append(layer_params[module_idx]['adapter_size'])
                 lora_weight_pointers.append(
-                    lora_params[layer_idx][module_idx]['weight_pointers'])
+                    layer_params[module_idx]['weight_pointers'])
 
         num_seqs = lora_params['num_seqs']
 
@@ -526,3 +540,25 @@ class LoraLayer(torch.nn.Module):
                                         device=x.device))
                 lora_output = torch.cat(lora_output, dim=-1)
                 return lora_output
+
+
+class MoeLoraLayer(LoraLayer):
+    """Marker LoraLayer for routed-expert MoE modules.
+
+    Routed-expert LoRA is *fused* into the MoE kernel
+    (torch.ops.trtllm.fused_moe with LoRA kwargs); the actual GEMMs are not
+    performed by LoraLayer.forward. This subclass exists so that
+    CudaGraphLoraManager._initialize_from_model and the LoRA target-module
+    validator can discover MoE LoRA layers via isinstance(module, LoraLayer)
+    and inspect their lora_module_types / output_hidden_sizes, without
+    altering the standalone LoraLayer call semantics elsewhere in the model.
+
+    Calling forward() directly is a programming error: the MoE module owns
+    LoRA application.
+    """
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "MoeLoraLayer is a discovery marker; routed-expert LoRA is applied "
+            "inside torch.ops.trtllm.fused_moe via the MoE module. Do not call "
+            "MoeLoraLayer.forward directly.")

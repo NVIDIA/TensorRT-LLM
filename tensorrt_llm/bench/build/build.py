@@ -5,7 +5,7 @@ from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid, load_pretrained_config
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
@@ -14,7 +14,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig, Qwen3HybridConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
 
 TUNED_QUANTS = {
@@ -33,6 +33,7 @@ def get_benchmark_engine_settings(
     target_input_len: int,
     target_output_len: int,
     kv_cache_gpu_mem_fraction: float = 0.95,
+    enable_attention_dp: bool = False,
 ) -> Tuple[int, int]:
     """ Retrieve benchmark settings for a specific model + configuration.
 
@@ -43,6 +44,10 @@ def get_benchmark_engine_settings(
         pp_size (int): Number of pipeline parallel stages.
         target_input_len (int): Target input length to compile the engine.
         target_output_len (int): Target output length to compile the engine.
+        kv_cache_gpu_mem_fraction (float): Fraction of free memory to allocate
+            for KV cache.
+        enable_attention_dp (bool): Whether attention data parallelism is
+            enabled.
 
     Raises:
         ValueError: When the model_name is not supported.
@@ -61,6 +66,7 @@ def get_benchmark_engine_settings(
             target_input_len,
             target_output_len,
             kv_cache_gpu_mem_fraction,
+            enable_attention_dp=enable_attention_dp,
         )
     else:
         max_batch_size = DEFAULT_MAX_BATCH_SIZE
@@ -89,6 +95,8 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
                                                trust_remote_code=True)
     if is_nemotron_hybrid(pretrained_config):
         return NemotronHybridConfig.from_hf(model_name, model_path)
+    if is_qwen3_hybrid(pretrained_config):
+        return Qwen3HybridConfig.from_hf(model_name, model_path)
     return ModelConfig.from_hf(model_name, model_path)
 
 
@@ -332,7 +340,8 @@ def build_command(
               quant_config=quant_config,
               workspace=str(bench_env.workspace),
               load_format=load_format,
-              trust_remote_code=trust_remote_code)
+              trust_remote_code=trust_remote_code,
+              telemetry_config=bench_env.telemetry_config)
     # Save the engine.
     llm.save(engine_dir)
     llm.shutdown()

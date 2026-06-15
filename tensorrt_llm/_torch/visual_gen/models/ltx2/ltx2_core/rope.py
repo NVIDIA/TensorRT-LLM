@@ -52,10 +52,19 @@ def _apply_split_rotary_emb(
 ) -> torch.Tensor:
     needs_reshape = False
     if input_tensor.ndim != 4 and cos_freqs.ndim == 4:
-        _, h, t, _ = cos_freqs.shape
+        # cos/sin are token-major [B, T, H, D]; reshape input to match.
+        _, t, h, _ = cos_freqs.shape
         b = input_tensor.shape[0]
-        input_tensor = input_tensor.reshape(b, t, h, -1).swapaxes(1, 2)
+        input_tensor = input_tensor.reshape(b, t, h, -1)
         needs_reshape = True
+
+    # cos/sin are stored block-duplicated to head_dim (see _split_freqs_cis)
+    # so the fused kernel can read directly. The SPLIT formula uses only the
+    # first half (head_dim/2) since both halves are identical.
+    if cos_freqs.shape[-1] == input_tensor.shape[-1]:
+        half = cos_freqs.shape[-1] // 2
+        cos_freqs = cos_freqs[..., :half]
+        sin_freqs = sin_freqs[..., :half]
 
     split_input = rearrange(input_tensor, "... (d r) -> ... d r", d=2)
     first_half_input = split_input[..., :1, :]
@@ -70,7 +79,7 @@ def _apply_split_rotary_emb(
 
     output = rearrange(output, "... d r -> ... (d r)")
     if needs_reshape:
-        output = output.swapaxes(1, 2).reshape(b, t, -1)
+        output = output.reshape(b, t, -1)
 
     return output
 
@@ -146,7 +155,6 @@ def _generate_freqs(
         indices_grid = indices_grid[..., 0]
 
     fractional_positions = _get_fractional_positions(indices_grid, max_pos)
-    indices = indices.to(device=fractional_positions.device)
     freqs = (indices * (fractional_positions.unsqueeze(-1) * 2 - 1)).transpose(-1, -2).flatten(2)
     return freqs
 
@@ -164,8 +172,18 @@ def _split_freqs_cis(
         sin_freq = torch.cat([sin_padding, sin_freq], dim=-1)
 
     b, t = cos_freq.shape[0], cos_freq.shape[1]
-    cos_freq = cos_freq.reshape(b, t, num_attention_heads, -1).swapaxes(1, 2)
-    sin_freq = sin_freq.reshape(b, t, num_attention_heads, -1).swapaxes(1, 2)
+    # Token-major layout [B, T, H, D]: matches the layout the fused norm+RoPE
+    # kernel consumes after reshape(-1, H*D), so no permute/contiguous is needed
+    # in the helper before kernel launch.
+    cos_freq = cos_freq.reshape(b, t, num_attention_heads, -1)
+    sin_freq = sin_freq.reshape(b, t, num_attention_heads, -1)
+    # Block-duplicate per-head cos/sin from head_dim/2 to head_dim along the last
+    # dim so the fused norm+RoPE kernel (rotate-half / INTERLEAVE=false branch)
+    # can consume the layout directly. The eager _apply_split_rotary_emb slices
+    # back to head_dim/2 when needed; both halves are identical so the operation
+    # is bit-identical to the original SPLIT-format cos/sin.
+    cos_freq = torch.cat([cos_freq, cos_freq], dim=-1)
+    sin_freq = torch.cat([sin_freq, sin_freq], dim=-1)
     return cos_freq, sin_freq
 
 
@@ -190,6 +208,7 @@ def precompute_freqs_cis(
     num_attention_heads: int = 32,
     rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
     freq_grid_generator: Callable[[float, int, int], torch.Tensor] = _generate_freq_grid_pytorch,
+    freq_grid_cache: dict | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Precompute cos/sin RoPE embeddings for the given position indices.
 
@@ -203,6 +222,10 @@ def precompute_freqs_cis(
         num_attention_heads: Number of attention heads (for split mode reshaping).
         rope_type: INTERLEAVED or SPLIT.
         freq_grid_generator: Function to generate the frequency grid.
+        freq_grid_cache: Optional dict for caching GPU copies of frequency grids.
+            When provided, CPU→GPU transfers happen only once (first call) and
+            subsequent calls reuse the cached GPU tensor.  This avoids H2D
+            transfers that would block CUDA graph capture.
 
     Returns:
         Tuple of (cos_freq, sin_freq) tensors.
@@ -211,6 +234,19 @@ def precompute_freqs_cis(
         max_pos = [20, 2048, 2048]
 
     indices = freq_grid_generator(theta, indices_grid.shape[1], dim)
+    # When a cache is provided, move indices to the target device once and
+    # reuse.  The freq_grid_generator returns a CPU tensor (via lru_cache);
+    # repeated H2D transfers would block CUDA graph capture.
+    device = indices_grid.device
+    if freq_grid_cache is not None and indices.device != device:
+        cache_key = (freq_grid_generator, theta, indices_grid.shape[1], dim, device)
+        cached = freq_grid_cache.get(cache_key)
+        if cached is None:
+            cached = indices.to(device=device)
+            freq_grid_cache[cache_key] = cached
+        indices = cached
+    else:
+        indices = indices.to(device=device)
     freqs = _generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)
 
     if rope_type == LTXRopeType.SPLIT:

@@ -1,9 +1,115 @@
+import logging
 import math
+from itertools import accumulate
 from typing import List
 
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+
+logger = logging.getLogger(__name__)
+
+
+class DynamicTreeSlotStorage:
+    """Per-slot GPU storage for dynamic tree data, indexed by py_seq_slot.
+
+    Buffers are [S, ...] where S = num_slots + 1 (+1 for CUDA graph dummy).
+    """
+
+    def __init__(self, num_slots: int, n_dt: int, mask_width: int):
+        S = num_slots + 1
+        self.dummy_slot_id = num_slots
+
+        # Slot buffers — C++ kernel writes directly via slotIds
+        self.packed_mask = torch.zeros((S, n_dt, mask_width),
+                                       dtype=torch.int32,
+                                       device='cuda')
+        self.position_offsets = torch.zeros((S, n_dt),
+                                            dtype=torch.int32,
+                                            device='cuda')
+        self.retrieve_index = torch.zeros((S, n_dt),
+                                          dtype=torch.int32,
+                                          device='cuda')
+        self.retrieve_next_token = torch.full((S, n_dt),
+                                              -1,
+                                              dtype=torch.int32,
+                                              device='cuda')
+        self.retrieve_next_sibling = torch.full((S, n_dt),
+                                                -1,
+                                                dtype=torch.int32,
+                                                device='cuda')
+        self.has_tree = torch.zeros(S, dtype=torch.bool, device='cuda')
+
+        # Slot-ID buffers
+        self.all_ids_buf = torch.zeros(num_slots,
+                                       dtype=torch.long,
+                                       device='cuda')
+        self._pin_batch = torch.empty(num_slots,
+                                      dtype=torch.long,
+                                      pin_memory=prefer_pinned())
+        self._verify_staging = torch.empty((num_slots, n_dt, 3),
+                                           dtype=torch.int32,
+                                           device='cuda')
+        self._next_token_staging = torch.empty((num_slots, n_dt),
+                                               dtype=torch.int32,
+                                               device='cuda')
+        self._next_sibling_staging = torch.empty((num_slots, n_dt),
+                                                 dtype=torch.int32,
+                                                 device='cuda')
+
+    def fill_all_slot_ids(self, context_requests, generation_requests):
+        """Fill all_ids_buf for full batch [ctx | gen] via one HtoD copy."""
+        dummy_slot = self.dummy_slot_id
+        pin = self._pin_batch
+        cursor = 0
+        for req in context_requests:
+            pin[cursor] = req.py_seq_slot if req.py_seq_slot is not None else dummy_slot
+            cursor += 1
+        for req in generation_requests:
+            slot = req.py_seq_slot if (
+                not getattr(req, 'is_cuda_graph_dummy', False)
+                and req.py_seq_slot is not None) else dummy_slot
+            pin[cursor] = slot
+            cursor += 1
+        if cursor > 0:
+            self.all_ids_buf[:cursor].copy_(pin[:cursor], non_blocking=True)
+
+    def mark_valid(self, slot_ids, count):
+        if count == 0:
+            return
+        self.has_tree.index_fill_(0, slot_ids[:count], True)
+        self.has_tree.narrow(0, self.dummy_slot_id, 1).fill_(False)
+
+    def mark_invalid(self, slot_id):
+        """Clear validity and reset slot data."""
+        self.has_tree[slot_id] = False
+        self.packed_mask[slot_id] = 0
+        self.position_offsets[slot_id] = 0
+        self.retrieve_index[slot_id] = 0
+        self.retrieve_next_token[slot_id] = -1
+        self.retrieve_next_sibling[slot_id] = -1
+
+    def pack_retrieve_from_slots(self, slot_ids, count):
+        """Pack retrieve data into [count, n_dt, 3] staging buffer."""
+        if count == 0:
+            return self._verify_staging[:0]
+        ids = slot_ids[:count]
+        staging = self._verify_staging[:count]
+        staging[:, :, 0] = self.retrieve_index[ids]
+        staging[:, :, 1] = self.retrieve_next_token[ids]
+        staging[:, :, 2] = self.retrieve_next_sibling[ids]
+        return staging
+
+    def next_links_from_slots(self, slot_ids, count):
+        """Gather next-token and next-sibling links into contiguous staging buffers."""
+        if count == 0:
+            return self._next_token_staging[:0], self._next_sibling_staging[:0]
+        ids = slot_ids[:count]
+        next_token = self._next_token_staging[:count]
+        next_sibling = self._next_sibling_staging[:count]
+        torch.index_select(self.retrieve_next_token, 0, ids, out=next_token)
+        torch.index_select(self.retrieve_next_sibling, 0, ids, out=next_sibling)
+        return next_token, next_sibling
 
 
 class SpecTreeManager:
@@ -15,11 +121,11 @@ class SpecTreeManager:
 
     # Auxiliary buffers
     # The top k  list for each draft layer.
-    top_k_list = []
+    top_k_list: list
     # The user input eagle choices, only available when using static tree.
-    eagle_choices: List[List[int]] = None
-    # If dynamice tree, each request has their own tree. If static tree, all requests share the same tree.
-    num_trees: int = None
+    eagle_choices: List[List[int]]
+    # If dynamic tree, each request has their own tree. If static tree, all requests share the same tree.
+    num_trees: int
 
     # Convert the choice to a path. Each path is an array of indices from the root to other nodes in the tree.
     # shape: [num_trees, max_total_draft_tokens + 1, max_draft_len + 1]
@@ -37,46 +143,59 @@ class SpecTreeManager:
     # shape: [num_trees, max_total_draft_tokens + 1], device tensor.
     spec_dec_position_offsets: torch.Tensor = None
 
-    # TODO: Optimized together with the subsequent dynamic tree.
-    # Auxiliary buffers for the static tree.
+    ############################ Auxiliary buffers for the static tree. ############################
     # Considering that the static tree does not modify the tree structure during inference, we can calculate some buffers in advance.
     # NOTE: Most of these buffers are introduced due to limitations of XQA:
     #       With tree attention, XQA cannot simply take the tokens to be processed in the next round as input. Instead, it needs to take ALL of their parent nodes as input.
     #       This incurs additional computation, but it is unavoidable.
 
     # NOTE: The reason why most of these auxiliary buffers are with `len == max_draft_len - 1` is that: we do not need to prepare specific input data for the first draft layer.
-
     # The top k value for each draft layer. Device tensor.
     top_k_list_cuda: list[torch.Tensor] = None
 
     # The max top k value for all draft layers. Which is used for torch.topk and cuda graph.
     max_top_k = -1
 
-    # Gather the required draft tokens from all currently generated draft tokens as the input of the next draft layer.
+    # Gather the required draft tokens among the 'max_total_draft_tokens + 1' tokens.
     # Only the nodes has child(s) this layer and all their parents nodes will be gathered.
-    # Device tensor. len(tokens_gather_idx) == max_draft_len - 1. Each element is a tensor with shape [num_tokens_for_next_layer].
     tokens_gather_idx_for_drafter_model: list[torch.Tensor] = None
 
-    # Gather the required logits from all currently generated logits.
-    # Device tensor. len(tokens_gather_idx) == max_draft_len - 1.
-    logits_gather_idx: list[torch.Tensor] = None
-
     # The packed mask for the drafter model's attention (i.e., xqa).
+    # shape: [1, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)], device tensor.
     spec_dec_packed_mask_for_drafter_model: torch.Tensor = None
 
     # The read indices offset for the drafter model.
+    # shape: [max_total_draft_tokens + 1], device tensor.
     hidden_states_read_indices_offset_for_drafter_model: torch.Tensor = None
 
     # The write back start indices for the drafter tokens between different draft layers.
+    # shape: [max_draft_len + 1], device tensor.
     draft_tokens_indices_cumsum: torch.Tensor = None
+
+    # Work buffers for dynamic tree build kernel output
+    retrieve_index: torch.Tensor = None
+    retrieve_next_token: torch.Tensor = None
+    retrieve_next_sibling: torch.Tensor = None
+    slot_storage: 'DynamicTreeSlotStorage | None' = None
 
     def __init__(self, max_num_requests: int, use_dynamic_tree: bool,
                  max_total_draft_tokens: int, max_draft_len: int,
-                 eagle_choices: [List[List[int]]], dynamic_tree_max_topK: int):
+                 eagle_choices: List[List[int]] | None,
+                 dynamic_tree_max_topK: int):
 
         self.use_dynamic_tree = use_dynamic_tree
         self.max_total_draft_tokens = max_total_draft_tokens
         self.max_draft_len = max_draft_len
+
+        # In dynamic tree mode the draft loop can produce up to
+        # K * max_draft_len tokens, which may exceed max_total_draft_tokens+1.
+        # Size the working buffers to the larger of the two so the masks and
+        # position-offset tensors never run out of columns/rows.
+        if use_dynamic_tree and dynamic_tree_max_topK > 0:
+            self._internal_buf_dim = max(max_total_draft_tokens + 1,
+                                         dynamic_tree_max_topK * max_draft_len)
+        else:
+            self._internal_buf_dim = max_total_draft_tokens + 1
         self.eagle_choices = eagle_choices
         self.num_trees = max_num_requests if use_dynamic_tree else 1
         self.dynamic_tree_max_topK = dynamic_tree_max_topK
@@ -84,42 +203,60 @@ class SpecTreeManager:
         self.top_k_list = []
 
         # Initialize the buffers
-        self.eagle_paths = torch.ones(
-            (self.num_trees, self.max_total_draft_tokens + 1,
-             self.max_draft_len + 1),
-            dtype=torch.int32,
-            device='cpu',
-            pin_memory=prefer_pinned(),
-        ) * -1
+        # eagle_paths and spec_dec_mask_matrix are only used in static tree mode.
+        # Skip allocation in dynamic tree mode to save memory.
+        if not use_dynamic_tree:
+            self.eagle_paths = torch.ones(
+                (self.num_trees, self.max_total_draft_tokens + 1,
+                 self.max_draft_len + 1),
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            ) * -1
 
-        self.spec_dec_mask_matrix = torch.eye(
-            self.max_total_draft_tokens + 1,
-            dtype=torch.int32,
-            device='cuda',
-        ).unsqueeze(0).repeat(self.num_trees, 1, 1)
+            self.spec_dec_mask_matrix = torch.eye(
+                self.max_total_draft_tokens + 1,
+                dtype=torch.int32,
+                device='cuda',
+            ).unsqueeze(0).repeat(self.num_trees, 1, 1)
 
+        n_dt = self.max_total_draft_tokens + 1
         self.spec_dec_packed_mask = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1,
-             math.ceil((self.max_total_draft_tokens + 1) / 32)),
+            (self.num_trees, n_dt, math.ceil(n_dt / 32)),
             dtype=torch.int32,
             device='cuda',
         )
         self.spec_dec_position_offsets = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1),
+            (self.num_trees, n_dt),
             dtype=torch.int32,
             device='cuda',
         )
+
+        # Cached constants for compute_spec_dec_packed_mask (avoids per-call allocation)
+        self._pack_weights = (
+            1 << torch.arange(32, device='cuda', dtype=torch.int32))
+        # Python-only internal buffers — enlarged to _internal_buf_dim
+        num_blocks = math.ceil(self._internal_buf_dim / 32)
+        total_bits = num_blocks * 32
+        self._padded_mask_buf = torch.zeros(self.num_trees,
+                                            self._internal_buf_dim,
+                                            total_bits,
+                                            dtype=torch.int32,
+                                            device='cuda')
+        self._pack_result_buf = torch.zeros(self.num_trees,
+                                            self._internal_buf_dim,
+                                            num_blocks,
+                                            dtype=torch.int32,
+                                            device='cuda')
 
         if self.use_dynamic_tree:
             self.init_tree_info_for_dynamic_tree()
         else:
             self.init_tree_info_for_static_tree()
 
-        # self.dump_tree_info()
-
     def init_tree_info_for_dynamic_tree(self):
-        # For the dynamic tree
-        # To the internal layer, the number of nodes is the same as the dynamic_tree_max_topK.
+        num_draft_with_root = self.max_total_draft_tokens + 1
+
         self.top_k_list = [
             torch.ones(self.dynamic_tree_max_topK,
                        dtype=torch.int32,
@@ -127,7 +264,43 @@ class SpecTreeManager:
                        pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
         ]
 
-    # For the static tree
+        # Work buffers for build_dynamic_tree kernel output
+        self.retrieve_index = torch.zeros((self.num_trees, num_draft_with_root),
+                                          dtype=torch.int32,
+                                          device='cuda')
+        self.retrieve_next_token = torch.full(
+            (self.num_trees, num_draft_with_root),
+            -1,
+            dtype=torch.int32,
+            device='cuda')
+        self.retrieve_next_sibling = torch.full(
+            (self.num_trees, num_draft_with_root),
+            -1,
+            dtype=torch.int32,
+            device='cuda')
+
+        mask_width = math.ceil(num_draft_with_root / 32)
+        self.slot_storage = DynamicTreeSlotStorage(
+            num_slots=self.num_trees,
+            n_dt=num_draft_with_root,
+            mask_width=mask_width,
+        )
+
+    def scatter_to_slot_storage(self, ss, gen_slots, num_gens):
+        """Scatter work buffers to slot storage via index_copy_."""
+        if num_gens == 0:
+            return
+        ids = gen_slots[:num_gens]
+        ss.packed_mask.index_copy_(0, ids, self.spec_dec_packed_mask[:num_gens])
+        ss.position_offsets.index_copy_(
+            0, ids, self.spec_dec_position_offsets[:num_gens])
+        ss.retrieve_index.index_copy_(0, ids, self.retrieve_index[:num_gens])
+        ss.retrieve_next_token.index_copy_(0, ids,
+                                           self.retrieve_next_token[:num_gens])
+        ss.retrieve_next_sibling.index_copy_(
+            0, ids, self.retrieve_next_sibling[:num_gens])
+        ss.mark_valid(ids, num_gens)
+
     def init_tree_info_for_static_tree(self):
         self.index_mapping_set = {}
         self.nodes_list_per_layer = [[] for _ in range(self.max_draft_len + 1)]
@@ -176,9 +349,7 @@ class SpecTreeManager:
                              pin_memory=prefer_pinned()))
 
         # 6) Compute the spec decoding according to the eagle_paths for the target model
-        for i, path in enumerate(self.eagle_paths[0]):
-            indices = path[path > -1]
-            self.spec_dec_mask_matrix[0][i, indices] = 1
+        self.compute_spec_dec_mask_matrix(0)
         self.compute_spec_dec_packed_mask(self.spec_dec_mask_matrix,
                                           self.spec_dec_packed_mask)
 
@@ -217,7 +388,6 @@ class SpecTreeManager:
         num_nodes_per_layer = [0]
         num_nodes_per_layer.extend(
             [len(node_list) for node_list in self.nodes_list_per_layer[1:]])
-        from itertools import accumulate
         self.draft_tokens_indices_cumsum = torch.tensor(list(
             accumulate(num_nodes_per_layer)),
                                                         dtype=torch.int32,
@@ -255,89 +425,89 @@ class SpecTreeManager:
                                                                      device=
                                                                      'cuda')
 
-    # Get the eagle_paths
     def get_eagle_paths(self, tree_idx=0):
-        if self.use_dynamic_tree:
-            self.eagle_paths[tree_idx].fill_(-1)
-            # If dynamic tree, return the eagle_paths according to the mask.
-            for i in range(self.max_total_draft_tokens + 1):
-                self.eagle_paths[tree_idx][:, i, :] = self.spec_dec_mask_matrix[
-                    tree_idx][i, :].nonzero()
-            return self.eagle_paths[tree_idx]
-        else:
-            # If static tree, return the prepared eagle_paths. These paths are immutable.
-            return self.eagle_paths[0]
+        if self.eagle_paths is None:
+            raise RuntimeError(
+                "get_eagle_paths() is not supported in dynamic tree mode; "
+                "use retrieve_index/retrieve_next_token/retrieve_next_sibling instead"
+            )
+        return self.eagle_paths[0]
 
     # Get the topK list for the specific draft layer
     def get_top_k_list(self, draft_layer_id):
         assert draft_layer_id >= 0
         return self.top_k_list[draft_layer_id]
 
-    # Compute the packed mask according to the mask matrix
+    def compute_spec_dec_mask_matrix(self, tree_idx=0):
+        if self.eagle_paths is None:
+            raise RuntimeError(
+                "compute_spec_dec_mask_matrix() is not supported in dynamic tree mode"
+            )
+        for i, path in enumerate(self.eagle_paths[0]):
+            indices = path[path > -1]
+            self.spec_dec_mask_matrix[0][i, indices] = 1
+
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
-        # mask_matrix: shape: [num_trees, max_total_draft_tokens + 1, max_total_draft_tokens + 1]
-        # packed_mask: shape: [num_trees, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)]
-        assert mask_matrix.ndim == 3
-        assert packed_mask.ndim == 3
+        bs, num_tokens, num_tokens_attend = mask_matrix.shape
+        assert mask_matrix.ndim == 3, f"Expected 3D mask_matrix, got {mask_matrix.ndim}D"
+        assert packed_mask.ndim == 3, f"Expected 3D packed_mask, got {packed_mask.ndim}D"
+        assert bs <= self._padded_mask_buf.shape[0], \
+            f"batch size {bs} exceeds pre-allocated buffer size {self._padded_mask_buf.shape[0]}"
+        num_blocks = packed_mask.shape[-1]
 
-        num_trees = mask_matrix.shape[0]
-        assert mask_matrix.shape == (num_trees, self.max_total_draft_tokens + 1,
-                                     self.max_total_draft_tokens + 1)
-        assert packed_mask.shape == (num_trees, self.max_total_draft_tokens + 1,
-                                     math.ceil(
-                                         (self.max_total_draft_tokens + 1) /
-                                         32))
+        # Use cached bit weights
+        weights = self._pack_weights
+        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
+            torch.int32)
 
-        num_blocks = math.ceil((self.max_total_draft_tokens + 1) / 32)
-        int_tensor = mask_matrix.reshape(
-            -1, self.max_total_draft_tokens + 1
-        )  # shape: [num_trees * (self.max_total_draft_tokens + 1), self.max_total_draft_tokens + 1]
-        packed_mask = packed_mask.reshape(
-            -1, num_blocks
-        )  # shape: [num_trees * (self.max_total_draft_tokens + 1), num_blocks]
+        if num_blocks == 1 and num_tokens_attend <= 32:
+            result = self._pack_result_buf[:bs, :num_tokens, :1]
+            torch.sum(src * weights[:num_tokens_attend],
+                      dim=-1,
+                      out=result[:, :, 0])
+            packed_mask[:, :num_tokens, :1] = result
+            return packed_mask
 
-        for block_idx in range(num_blocks):
-            start_idx = block_idx * 32
-            end_idx = min(start_idx + 32, self.max_total_draft_tokens + 1)
-            if end_idx < start_idx:
-                break
-            block_bits = int_tensor[:, start_idx:end_idx]
-            weight = torch.pow(
-                2,
-                torch.arange(end_idx - start_idx,
-                             dtype=torch.int32,
-                             device=int_tensor.device))
-            block_value = torch.sum(block_bits * weight, dim=-1)
-            packed_mask[:, block_idx] = block_value
+        # Pad into pre-allocated buffer
+        total_bits = num_blocks * 32
+        padded_m = self._padded_mask_buf[:bs, :num_tokens, :total_bits]
+        padded_m.zero_()
+        padded_m[:, :, :num_tokens_attend].copy_(src)
 
-        packed_mask = packed_mask.reshape(num_trees,
-                                          self.max_total_draft_tokens + 1,
-                                          num_blocks)
+        # Reshape last dim into [num_blocks, 32] for blocked packing
+        blocked_matrix = padded_m.view(bs, num_tokens, num_blocks, 32)
 
-    # Print the tree info
+        # Vectorized dot product into pre-allocated result buffer
+        result = self._pack_result_buf[:bs, :num_tokens, :num_blocks]
+        torch.sum(blocked_matrix * weights, dim=-1, out=result)
+
+        # Write results back to the output buffer
+        packed_mask[:, :num_tokens, :] = result
+        return packed_mask
+
     def dump_tree_info(self):
-        print(f"TopK list: {self.top_k_list}")
-        if not self.use_dynamic_tree:
-            print(f"Max top k list cuda: {self.max_top_k}")
-            print(f"Static tree: {self.eagle_paths}")
-            print(f"Index mapping set: {self.index_mapping_set}")
-            print(f"Nodes list per layer: {self.nodes_list_per_layer}")
-            print(
-                f"Spec dec position offsets: {self.spec_dec_position_offsets}")
-            print(f"Spec dec mask matrix: {self.spec_dec_mask_matrix.int()}")
-            print(f"Spec dec pack mask: {self.spec_dec_packed_mask}")
-            print("Auxiliary buffers for the static tree.")
-            print(f"TopK list cuda: {self.top_k_list_cuda}")
-            print(
-                f"Tokens gather idx for drafter model: {self.tokens_gather_idx_for_drafter_model}"
-            )
-            print(
-                f"Draft tokens indices cumsum: {self.draft_tokens_indices_cumsum}"
-            )
-            print(f"Logits gather idx: {self.logits_gather_idx}")
-            print(
-                f"Spec dec packed mask for drafter model: {self.spec_dec_packed_mask_for_drafter_model}"
-            )
-            print(
-                f"Hidden states read indices offset for drafter model: {self.hidden_states_read_indices_offset_for_drafter_model}"
+        logger.debug("TopK list: %s", self.top_k_list)
+        if self.use_dynamic_tree:
+            logger.debug("Dynamic max top k: %s", self.dynamic_tree_max_topK)
+        else:
+            logger.debug("Max top k list cuda: %s", self.max_top_k)
+            logger.debug("Eagle paths: %s", self.eagle_paths)
+            logger.debug("Index mapping set: %s", self.index_mapping_set)
+            logger.debug("Nodes list per layer: %s", self.nodes_list_per_layer)
+            logger.debug("Spec dec position offsets: %s",
+                         self.spec_dec_position_offsets)
+            logger.debug("Spec dec mask matrix: %s",
+                         self.spec_dec_mask_matrix.int())
+            logger.debug("Spec dec pack mask: %s", self.spec_dec_packed_mask)
+            logger.debug("Auxiliary buffers for the static tree.")
+            logger.debug("TopK list cuda: %s", self.top_k_list_cuda)
+            logger.debug("Tokens gather idx for drafter model: %s",
+                         self.tokens_gather_idx_for_drafter_model)
+            logger.debug("Draft tokens indices cumsum: %s",
+                         self.draft_tokens_indices_cumsum)
+            logger.debug("Spec dec packed mask for drafter model: %s",
+                         self.spec_dec_packed_mask_for_drafter_model)
+            logger.debug(
+                "Hidden states read indices offset for drafter model: %s",
+                self.hidden_states_read_indices_offset_for_drafter_model,
             )

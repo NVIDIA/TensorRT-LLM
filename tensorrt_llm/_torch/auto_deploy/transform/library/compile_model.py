@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import List, Literal, Optional, Tuple, Type
 
 import torch.nn as nn
-from pydantic import Field
+from pydantic import Field, model_validator
+from torch.fx import GraphModule
 
 from ...compile import ArgsKwargs, CompileBackendRegistry
 from ...models.factory import ModelFactory
@@ -14,6 +29,15 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
+
+
+def _set_submodule(model: nn.Module, key: str, new_module: nn.Module) -> None:
+    """Replace a nested submodule given a dotted key path (e.g. 'model.language_model')."""
+    parts = key.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
 
 
 def _generate_default_piecewise_num_tokens(max_num_tokens: int) -> List[int]:
@@ -46,8 +70,13 @@ class CompileModelConfig(TransformConfig):
     cuda_graph_batch_sizes: Optional[List[int]] = Field(
         default=None, description="The batch sizes to use for CUDA graphs."
     )
-    num_batched_inputs: int = Field(
-        default=2, description="The number of batched inputs to use for CUDA graphs."
+    num_batched_inputs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "The number of batched inputs to use for CUDA graphs. If unset, infer it "
+            "from runtime inputs by excluding explicit cache/resource inputs."
+        ),
     )
     backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = Field(
         description="The backend to use for compiling the model."
@@ -64,6 +93,14 @@ class CompileModelConfig(TransformConfig):
             "up to max_num_tokens (e.g. [64, 128, 256, ..., max_num_tokens])."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_piecewise_backend(self):
+        if self.piecewise_enabled and self.backend not in {"torch-cudagraph", "torch-opt"}:
+            raise ValueError(
+                "piecewise_enabled requires backend to be 'torch-cudagraph' or 'torch-opt'."
+            )
+        return self
 
 
 @TransformRegistry.register("compile_model")
@@ -84,17 +121,27 @@ class CompileModel(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
         cm.info.reset()
+        spec_config = cm._spec_config
 
         def _get_args_kwargs(bs: int) -> ArgsKwargs:
-            cm.info.set_generate_only_batch(bs)
+            if spec_config is not None:
+                cm.info.set_capture_batch(batch_size=bs, max_draft_len=spec_config.max_draft_len)
+                return (), {**cm.named_args, "cache_seq_interface": cm}
+            cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
 
-        extra_kwargs = {}
+        resource_input_names = list(cm.resource_names)
+        if spec_config is not None and "cache_seq_interface" not in resource_input_names:
+            resource_input_names.append("cache_seq_interface")
+        extra_kwargs = {"resource_input_names": tuple(resource_input_names)}
         config_overrides = {}
-
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info
             extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
+
+            max_seq = cm.info.max_seq_len
+            max_batch = cm.info.max_batch_size
+            batch_capacity = (max_batch - 1) * max_seq + 1
 
             # Auto-generate piecewise_num_tokens if not explicitly specified
             if self.config.piecewise_num_tokens is None:
@@ -116,17 +163,73 @@ class CompileModel(BaseTransform):
                     )
                 config_overrides["piecewise_num_tokens"] = valid_buckets
 
+            # Filter out buckets that exceed the mixed-batch capacity
+            buckets = config_overrides.get(
+                "piecewise_num_tokens", self.config.piecewise_num_tokens or []
+            )
+            over = [nt for nt in buckets if nt > batch_capacity]
+            if over:
+                buckets = [nt for nt in buckets if nt <= batch_capacity]
+                ad_logger.warning(
+                    f"Dropping piecewise buckets {over} that exceed mixed-batch capacity "
+                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode = {batch_capacity}). "
+                    f"Remaining: {buckets}"
+                )
+                config_overrides["piecewise_num_tokens"] = buckets
+
         # Merge config with any overrides
         config_dict = self.config.model_dump()
         config_dict.update(config_overrides)
 
-        compiler_backend = CompileBackendRegistry.get(self.config.backend)(
-            mod,
-            get_args_kwargs_for_compile=_get_args_kwargs,
-            **extra_kwargs,
-            **config_dict,
-        )
-        mod_compiled = compiler_backend.compile()
+        def _compile_one(
+            target: nn.Module,
+            *,
+            full_model: Optional[nn.Module] = None,
+        ) -> nn.Module:
+            backend_kwargs = {
+                "get_args_kwargs_for_compile": _get_args_kwargs,
+                **extra_kwargs,
+                **config_dict,
+            }
+            if full_model is not None:
+                backend_kwargs["full_model"] = full_model
+            compiler_backend = CompileBackendRegistry.get(self.config.backend)(
+                target,
+                **backend_kwargs,
+            )
+            return compiler_backend.compile()
+
+        if self.config.piecewise_enabled:
+            # Walk the module tree and collect the top-level GraphModules to compile.
+            # Once a GM is found, its children are skipped (they're part of the GM).
+            compile_targets = []
+            seen = set()
+            if isinstance(mod, GraphModule):
+                compile_targets.append(("", mod))
+                seen.add("")
+            for name, submod in mod.named_modules():
+                if any(p == "" or name.startswith(p + ".") for p in seen):
+                    continue
+                if isinstance(submod, GraphModule):
+                    compile_targets.append((name, submod))
+                    seen.add(name)
+
+            if compile_targets:
+                ad_logger.info(
+                    f"CompileModel: compiling {len(compile_targets)} GraphModule(s): "
+                    f"{[name or '(root)' for name, _ in compile_targets]}"
+                )
+                for gm_key, gm in compile_targets:
+                    compiled_gm = _compile_one(gm, full_model=mod if gm_key else None)
+                    if gm_key:
+                        _set_submodule(mod, gm_key, compiled_gm)
+                    else:
+                        mod = compiled_gm
+                mod_compiled = mod
+            else:
+                mod_compiled = _compile_one(mod)
+        else:
+            mod_compiled = _compile_one(mod)
 
         # store info object about the transform
         info = TransformInfo(skipped=False, num_matches=1, is_clean=True, has_valid_shapes=True)

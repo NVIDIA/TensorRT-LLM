@@ -1,11 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
+from tensorrt_llm.evaluate.post_processing import strip_thinking_and_extract_mmmu_answer
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    KvCacheConfig,
+    MoeConfig,
+    MTPDecodingConfig,
+    SamplingParams,
+)
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_pre_blackwell, skip_pre_hopper
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness
+from ..conftest import (
+    get_sm_version,
+    llm_models_root,
+    parametrize_with_ids,
+    skip_post_blackwell_ultra,
+    skip_pre_blackwell,
+    skip_pre_hopper,
+)
+from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -80,24 +108,33 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
-class TestNano_V2_VLM(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Nano-v2-VLM"
-    MODEL_PATH = f"{llm_models_root()}/Nano-v2-VLM"
-    MAX_NUM_TOKENS = 25600
+class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.5-33B"
+    MODEL_PATH = f"{llm_models_root()}/EXAONE-4.5-33B"
+    MAX_NUM_TOKENS = 16384
 
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    # EXAONE 4.5 ends each assistant turn with `<|endofturn|>`.
     sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endofturn|>",
     )
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8, enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
 
-    @pytest.mark.skip(reason="Nano V2 VLM ckpt is not released yet.")
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
-            max_batch_size=128,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
             kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
@@ -206,12 +243,22 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8, enable_block_reuse=False)
 
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
             max_batch_size=128,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
             kv_cache_config=self.kv_cache_config,
+            trust_remote_code=True,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
@@ -275,9 +322,17 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         )
 
     def test_fp8_prequantized(self):
+        # Blackwell FP8 numerics differ from Hopper at the cubin level
+        # (~5pt drop on MMMU). Route to a Blackwell-calibrated reference
+        # rather than relaxing the Hopper one.
+        extra_acc_spec = "sm100_fp8" if get_sm_version() >= 100 else None
         with self._make_llm(self.MODEL_PATH) as llm:
             task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
+            task.evaluate(
+                llm,
+                extra_acc_spec=extra_acc_spec,
+                sampling_params=self.sampling_params,
+            )
 
     @skip_pre_blackwell
     def test_nvfp4_prequantized(self):
@@ -351,11 +406,14 @@ class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
@@ -409,7 +467,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
-            checkpoint_format="mistral",
+            checkpoint_format="mistral_large_3",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
@@ -430,13 +488,87 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
-    def test_auto_dtype(self):
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestKimiK25(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K2.5"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.75,
+    )
+
+    # Thinking mode (thinking=True): model uses <think>...</think>
+    # chain-of-thought reasoning before outputting the answer.
+    # post_process_fn strips the thinking block and extracts the final
+    # answer, compensating for lm-eval's MMMU regex which fails on common
+    # reasoning-model output formats (see
+    # tensorrt_llm.evaluate.post_processing for cross-engine evidence).
+    # preserve_caller_max_tokens=True keeps our 16384 max_tokens instead of
+    # being overridden by lm-eval task's default 512 (too small for CoT).
+    EXTRA_EVALUATOR_KWARGS = dict(
+        chat_template_kwargs={"thinking": True},
+        post_process_fn=strip_thinking_and_extract_mmmu_answer,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp",
+        [(1, False), (1, True), (8, False), (8, True)],
+        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp):
+        """NVFP4 accuracy on MMMU benchmark (8x B200)."""
+        # Do not pass ``max_num_tokens`` here: keep it at the LLM default
+        # (8192) so the resolved ``moe_max_num_tokens`` stays at
+        # ``8192 * dp_size`` and the per-call fused_moe workspace fits
+        # within activation headroom. Raising it pushed the workspace
+        # past the fragmented allocator budget on dep8 (NVBug 6182617).
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=self.kv_cache_config,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=attention_dp,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
 
 
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):
@@ -452,13 +584,247 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     )
 
     @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            MAX_NUM_TOKENS,
+            1024,
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, max_num_tokens):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_num_tokens=max_num_tokens,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+# Skip for B300 / GB300:
+# * B300 coverage does not meaningfully extend what we test via B200.
+# * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide CI errors.
+@skip_post_blackwell_ultra
+class TestNanoV3Omni(LlmapiAccuracyTestHarness):
+    # The score here may be lower than VLMEvalKitMcore (official) runs. This path uses
+    # lm_eval's MMMU task, prompt formatting, and scoring, while VLMEvalKitMcore
+    # uses MMMU_DEV_VAL with its own MCQ prompt builder, answer extraction, and
+    # explicit image tiling/token accounting in the Mcore wrapper.
+    # We also keep the generation budget small for CI speed, and this evaluator
+    # does not strip reasoning traces after </think> before scoring. If the model
+    # ignores the non-thinking directive, answer extraction may see the reasoning.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        is_multimodal=True,
+    )
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+        temperature=0.0,
+        top_k=1,
+    )
+    MMMU_TASK_SPEC = (MMMU, sampling_params, EXTRA_EVALUATOR_KWARGS)
+
+    voxpopuli_sampling_params = SamplingParams(
+        max_tokens=512,
+        truncate_prompt_tokens=VoxPopuli.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    no_thinking_evaluator_kwargs = {
+        # We explicitly disable thinking, because otherwise the thinking traces could
+        # be absurdly long (20k+ tokens), which is not helpful for test-runtime, nor
+        # for reproducibility (the more tokens there are, the higher likelihood of the
+        # end output not being the same).
+        # In addition, if reasoning is cut off, then the WER goes through the roof,
+        # since each word in the output is treated as an error.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    VOXPOPULI_TASK_SPEC = (
+        VoxPopuli,
+        voxpopuli_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
+
+    videomme_sampling_params = SamplingParams(
+        max_tokens=VideoMME.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    VIDEOMME_TASK_SPEC = (
+        VideoMME,
+        videomme_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        "model_name,model_path,kv_cache_config,max_batch_size,expected_quant_algo,task_specs",
+        [
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                ),
+                32,
+                None,
+                (MMMU_TASK_SPEC,),
+                id="bf16",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                64,
+                QuantAlgo.FP8,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                marks=skip_pre_hopper,
+                id="fp8",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                128,
+                QuantAlgo.MIXED_PRECISION,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                marks=(skip_pre_blackwell,),
+                id="nvfp4",
+            ),
+        ],
+    )
+    # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
+    @pytest.mark.threadleak(enabled=False)
+    def test_auto_dtype(
+        self,
+        model_name: str,
+        model_path: str,
+        kv_cache_config: KvCacheConfig,
+        max_batch_size: int,
+        expected_quant_algo: QuantAlgo | None,
+        task_specs: tuple[
+            tuple[type[MMMU] | type[VoxPopuli], SamplingParams, dict[str, object]],
+            ...,
+        ],
+    ) -> None:
+        with LLM(
+            model_path,
+            trust_remote_code=True,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            # Use a low-ish value for the below to force chunking for requests (helping to surface
+            # runtime errors if introduced by a change).
+            max_num_tokens=512,
+            # The amount of memory pre-allocated for mamba SSM states is proportional to the below,
+            # so lower it from its default of 2048.
+            # Quantized variants fit larger batches within the CI GPU memory budget.
+            max_batch_size=max_batch_size,
+        ) as llm:
+            if expected_quant_algo is not None:
+                assert llm.args.quant_config.quant_algo == expected_quant_algo
+            for task_cls, sampling_params, extra_evaluator_kwargs in task_specs:
+                task = task_cls(model_name)
+                task.evaluate(
+                    llm,
+                    sampling_params=sampling_params,
+                    extra_evaluator_kwargs=extra_evaluator_kwargs,
+                )
+
+
+class TestStep3_7(LlmapiAccuracyTestHarness):
+    # Step-3.7-Flash is a reasoning VLM: a PerceptionEncoder vision tower plus a
+    # MoE text decoder, registered under the Step3p7ForConditionalGeneration
+    # architecture (custom HF config -> trust_remote_code). MMMU exercises the
+    # vision path end to end. The model emits <think>...</think> traces before
+    # its answer, so we strip them and extract the final MMMU letter (same
+    # handling as Kimi K2.5); preserve_caller_max_tokens keeps our larger
+    # generation budget instead of lm-eval's 512-token default (too small for
+    # the chain-of-thought). The text-only GSM8K path lives in
+    # test_llm_api_pytorch.py::TestStep3_7.
+    MODEL_NAME = "stepfun-ai/Step-3.7-Flash"
+
+    # Validated with --max_input_length / --max_output_length 4096.
+    sampling_params = SamplingParams(
+        max_tokens=4096,
+        truncate_prompt_tokens=4096,
+    )
+
+    EXTRA_EVALUATOR_KWARGS = dict(
+        post_process_fn=strip_thinking_and_extract_mmmu_answer,
+        preserve_caller_max_tokens=True,
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.7,
+        use_kv_cache_manager_v2=True,
+    )
+
+    def _make_llm(self, model_path: str, mtp_nextn: int = 0):
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(enable_padding=False),
+            moe_config=MoeConfig(backend="TRTLLM"),
+        )
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        return LLM(
+            model_path,
+            tensor_parallel_size=4,
+            moe_expert_parallel_size=4,
+            kv_cache_config=self.kv_cache_config,
+            max_seq_len=8192,
+            attn_backend="TRTLLM",
+            speculative_config=mtp_config,
+            trust_remote_code=True,
+            **pytorch_config,
+        )
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @parametrize_with_ids("mtp_nextn", [0, 3])
+    def test_fp8_block_scales(self, mtp_nextn):
+        with self._make_llm(f"{llm_models_root()}/Step-3.7-Flash-FP8", mtp_nextn=mtp_nextn) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @parametrize_with_ids("mtp_nextn", [0, 3])
+    def test_nvfp4(self, mtp_nextn):
+        with self._make_llm(
+            f"{llm_models_root()}/Step-3.7-Flash-NVFP4", mtp_nextn=mtp_nextn
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )

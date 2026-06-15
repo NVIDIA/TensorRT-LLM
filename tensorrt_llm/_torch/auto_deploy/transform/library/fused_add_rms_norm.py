@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -111,6 +112,9 @@ class FuseAddRMSNorm(BaseTransform):
                 )
                 norm_out = graph.call_function(operator.getitem, args=(fused_node, 0))
                 add_out = graph.call_function(operator.getitem, args=(fused_node, 1))
+                # Preserve metadata needed by downstream transforms.
+                norm_out.meta.update(norm_node.meta)
+                add_out.meta.update(add_node.meta)
 
             # Rewire all consumers of the original norm → norm_out
             norm_node.replace_all_uses_with(norm_out)

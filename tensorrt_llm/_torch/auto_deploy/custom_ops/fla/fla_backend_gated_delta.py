@@ -1,3 +1,10 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -26,21 +33,25 @@ GQA repeat-interleave, and gating computation are performed internally:
   - Prefill: explicit repeat-interleave + chunk_gated_delta_rule(use_qk_l2norm_in_kernel=True)
 """
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
-from ....modules.fla.chunk import chunk_gated_delta_rule
-from ....modules.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
+
+from ..._compat import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    BatchInfo,
     Constant,
     MHACallable,
     ResourceHandlerDict,
@@ -68,6 +79,7 @@ def fla_cached_gated_delta_rule(
     delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
     # CONSTANTS
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     bsz, s, H_k, K = q.shape
     HV = v.shape[2]
@@ -83,8 +95,10 @@ def fla_cached_gated_delta_rule(
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
     y_flat = y.view(bsz * s, HV, -1)
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
 
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
     slot_idx = slot_idx[:num_seq].to(torch.long)
@@ -161,6 +175,13 @@ def fla_cached_gated_delta_rule(
         y_flat[None, num_prefill_tokens:] = y_decode.to(y_flat.dtype)
         del y_decode
 
+    if out is not None:
+        out_flat = out.view(bsz * s, HV, -1)
+        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
+        if num_total_tokens < bsz * s:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y
 
 
@@ -180,7 +201,10 @@ def fla_cached_gated_delta_rule_fake(
     any_prefill_use_initial_states_host: torch.Tensor,
     delta_cache: torch.Tensor,
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out.new_empty(0)
     return torch.empty_like(v)
 
 

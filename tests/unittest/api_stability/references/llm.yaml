@@ -80,13 +80,17 @@ methods:
         default: pytorch
         status: deprecated
       cuda_graph_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
       attention_dp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
         status: beta
+      dwdp_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DwdpConfig]
+        default: null
+        status: prototype
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
@@ -95,7 +99,19 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_config:
+        annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
+      gms_config:
+        annotation: tensorrt_llm.llmapi.llm_args.GmsConfig
+        default: null
+        status: prototype
       mm_encoder_only:
+        annotation: bool
+        default: False
+        status: prototype
+      encode_only:
         annotation: bool
         default: False
         status: prototype
@@ -122,8 +138,16 @@ methods:
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
-        status: beta
+        status: deprecated
       sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_speculative_beam_history_d2h:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_early_first_token_response:
         annotation: bool
         default: False
         status: prototype
@@ -154,6 +178,10 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
+        status: prototype
+      prometheus_metrics_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
+        default: null
         status: prototype
       enable_energy_metrics:
         annotation: bool
@@ -223,8 +251,20 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
         default: null
         status: prototype
+      reorder_policy_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig]
+        default: null
+        status: prototype
+      enable_resource_governor:
+        annotation: bool
+        default: False
+        status: prototype
       env_overrides:
         annotation: Optional[Dict[str, str]]
+        default: null
+        status: prototype
+      telemetry_config:
+        annotation: tensorrt_llm.usage.config.TelemetryConfig
         default: null
         status: prototype
       max_stats_len:
@@ -233,6 +273,10 @@ methods:
         status: prototype
       layer_wise_benchmarks_config:
         annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
+        default: null
+        status: prototype
+      video_pruning_rate:
+        annotation: Optional[float]
         default: null
         status: prototype
       model_kwargs:
@@ -244,6 +288,14 @@ methods:
         default: False
         status: prototype
       use_cute_dsl_blockscaling_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_gemm:
         annotation: bool
         default: False
         status: prototype
@@ -262,6 +314,10 @@ methods:
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      priority:
+        annotation: Union[float, List[float]]
+        default: 0.5
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -282,7 +338,28 @@ methods:
         annotation: Optional[Mapping[str, str]]
         default: null
         status: prototype
+      priority:
+        annotation: float
+        default: 0.5
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  encode:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        default: inspect._empty
+      add_special_tokens:
+        annotation: bool
+        default: True
+      return_raw_logits:
+        annotation: bool
+        default: False
+      model_kwargs:
+        annotation: Any
+        default: inspect._empty
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
+    status: prototype
   preprocess:
     parameters:
       inputs:

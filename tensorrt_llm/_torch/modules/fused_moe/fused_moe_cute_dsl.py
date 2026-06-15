@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -26,19 +27,39 @@ from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
 from ...custom_ops.cute_dsl_custom_ops import (
     GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+from ...utils import (ActivationType, AuxStreamType, EventType,
+                      Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
+
+
+@dataclass
+class NvFp4WeightView:
+    """Bundles all NVFP4 weight tensors for MoE computation.
+
+    Under the VA-based DWDP pipeline ``param.data`` is swapped to a
+    composite [num_experts, ...] tensor before the kernel call, so every
+    field is a single tensor — the bundle is just a convenient grouping
+    that lets the runner forward a single object instead of six.
+    """
+    w3_w1_weight: torch.Tensor
+    fc1_weight_scale: torch.Tensor
+    fc1_global_scale: torch.Tensor
+    w2_weight: torch.Tensor
+    fc2_weight_scale: torch.Tensor
+    fc2_global_scale: torch.Tensor
+    expert_size_per_partition: int
+    slot_start: int
 
 
 @torch.compile(options={"max-autotune": True})
@@ -306,8 +327,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 (Sm100BlockScaledContiguousGroupedGemmRunner,
                  Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
                  Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner
-                 )):
+                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
@@ -315,6 +335,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
 
 class CuteDslFusedMoE(CutlassFusedMoE):
+    # CuteDSL dispatch/combine path exercises the ceil/floor partition
+    # (NVLinkOneSided alltoall with kernel-level remainder handling), so this
+    # backend is the only opt-in for non-divisible EP today.
+    _supports_non_divisible_ep: bool = True
     """CuteDSL flow of fused mixture of experts (MoE) Layer.
 
     Args:
@@ -409,6 +433,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -424,7 +449,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
+            activation_type=activation_type,
         )
+
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
         if AuxStreamType.MoeOutputMemset not in self.aux_stream_dict:
@@ -435,6 +462,19 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+
+    def _build_local_weight_view(self) -> NvFp4WeightView:
+        """Build the weight view from this backend's per-layer weights."""
+        return NvFp4WeightView(
+            w3_w1_weight=self.w3_w1_weight,
+            fc1_weight_scale=self.quant_scales.fc1_weight_block,
+            fc1_global_scale=self.quant_scales.fc1_global,
+            w2_weight=self.w2_weight,
+            fc2_weight_scale=self.quant_scales.fc2_weight_block,
+            fc2_global_scale=self.quant_scales.fc2_global,
+            expert_size_per_partition=self.expert_size_per_partition,
+            slot_start=self.slot_start,
+        )
 
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         return AlltoallMethodType.NotEnabled
@@ -499,8 +539,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x_sf: Optional[torch.Tensor] = None,
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
+        weight_view: Optional[NvFp4WeightView] = None,
     ) -> torch.Tensor:
+        """NVFP4 MoE computation.
+
+        Uses the single-tensor ``run_moe_nvfp4_impl`` path. (The former
+        multi-B DWDP path was removed once DWDP switched to VA: VA swaps
+        ``param.data`` to a full [num_experts, ...] tensor, so the single-
+        tensor kernel is sufficient.)
+
+        Args:
+            weight_view: Bundled weight tensors. Must not be None.
+        """
         assert self.has_nvfp4
+        assert weight_view is not None
         output_dtype = torch.bfloat16
 
         if moe_output is None:
@@ -513,24 +565,28 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
 
-        # After DeepEPLowLatency dispatch, token_selected_experts has shape
-        # [N, 1] instead of [N, top_k], because each row is already assigned
-        # to exactly one expert. Use the tensor shape as the effective top_k.
         effective_top_k = token_selected_experts.size(-1)
+
+        forward_impl = self.run_moe_nvfp4_impl
 
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=self.run_moe_nvfp4_impl,
+            forward_impl=forward_impl,
             num_experts=self.num_slots,
             top_k=effective_top_k,
-            num_local_experts=self.expert_size_per_partition,
-            local_expert_offset=self.slot_start,
+            num_local_experts=weight_view.expert_size_per_partition,
+            local_expert_offset=weight_view.slot_start,
             enable_finalize_fusion=self.use_fused_finalize,
             enable_alltoall=enable_alltoall,
         )
 
         inputs = [
-            x, token_selected_experts, token_final_scales, x_sf, moe_output
+            x,
+            token_selected_experts,
+            token_final_scales,
+            x_sf,
+            moe_output,
+            weight_view,
         ]
         _, best_tactic = tuner.choose_one(
             "CuteDslFusedMoE::run_moe_nvfp4",
@@ -547,22 +603,23 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         token_final_scales: Optional[torch.Tensor],
         x_sf: torch.Tensor,
         moe_output: torch.Tensor,
+        weight_view: NvFp4WeightView,
         enable_alltoall: bool = False,
         tile_size: int = 128,
     ) -> torch.Tensor:
+        """Non-DWDP NVFP4 MoE implementation using single-tensor ops."""
         output_dtype = torch.bfloat16
-
-        # Use effective top_k from tensor shape rather than routing config.
-        # After DeepEPLowLatency dispatch, each row maps to one expert (top_k=1).
         effective_top_k = token_selected_experts.size(1)
+        esp = weight_view.expert_size_per_partition
+        slot_start = weight_view.slot_start
 
         tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
             top_k=effective_top_k,
-            local_expert_offset=self.slot_start,
-            local_num_experts=self.expert_size_per_partition,
+            local_expert_offset=slot_start,
+            local_num_experts=esp,
             tile_tokens_dim=tile_size,
         )
 
@@ -571,12 +628,15 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             moe_output.record_stream(
                 self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
 
-        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_swiglu_blackwell(
+        # Fused gather + GEMM + activation + quantize for FC1.
+        # For gated (SwiGLU): weights are interleaved [up, gate], output is N/2.
+        # For non-gated (Relu2): weights are plain, output is N.
+        x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
             input=x.view(torch.float4_e2m1fn_x2),
-            weight=self.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
             input_scale=x_sf.view(torch.uint8),
-            weight_scale=self.quant_scales.fc1_weight_block.view(torch.uint8),
-            alpha=self.quant_scales.fc1_global,
+            weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
+            alpha=weight_view.fc1_global_scale,
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
@@ -584,9 +644,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             global_sf=self.fc2_input_scale,
             num_experts=self.num_slots,
             top_k=effective_top_k,
-            num_local_experts=self.expert_size_per_partition,
-            local_expert_offset=self.slot_start,
+            num_local_experts=esp,
+            local_expert_offset=slot_start,
             tile_size=tile_size,
+            activation_type=self.activation_type,
         )
 
         if self.use_fused_finalize:
@@ -609,11 +670,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
             torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
-                weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+                weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
-                weight_scale=self.quant_scales.fc2_weight_block.view(
-                    torch.uint8),
-                alpha=self.quant_scales.fc2_global,
+                weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+                alpha=weight_view.fc2_global_scale,
                 output=moe_output,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -622,25 +682,24 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,
                 top_k=effective_top_k,
-                num_local_experts=self.expert_size_per_partition,
-                local_expert_offset=self.slot_start,
+                num_local_experts=esp,
+                local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
         else:
             x = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell(
                 input=x.view(torch.float4_e2m1fn_x2),
-                weight=self.w2_weight.view(torch.float4_e2m1fn_x2),
+                weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
                 input_scale=x_sf.view(torch.uint8),
-                weight_scale=self.quant_scales.fc2_weight_block.view(
-                    torch.uint8),
-                alpha=self.quant_scales.fc2_global,
+                weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+                alpha=weight_view.fc2_global_scale,
                 tile_idx_to_group_idx=tile_idx_to_expert_idx,
                 num_non_exiting_tiles=num_non_exiting_tiles,
                 num_experts=self.num_slots,
                 top_k=effective_top_k,
-                num_local_experts=self.expert_size_per_partition,
-                local_expert_offset=self.slot_start,
+                num_local_experts=esp,
+                local_expert_offset=slot_start,
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
@@ -662,6 +721,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     ) -> torch.Tensor:
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
+        assert self.activation_type == ActivationType.Swiglu, (
+            "FP8 block-scales MoE path hardcodes SwiGLU (see swiglu_fused_moe "
+            f"below); got activation_type={ActivationType(self.activation_type).name}"
+        )
         weight_dtype = self.w3_w1_weight.dtype
 
         (
@@ -739,6 +802,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         x_sf: Optional[torch.Tensor] = None,
         moe_output: Optional[torch.Tensor] = None,
         enable_alltoall: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         """
         Run MoE computation with CuteDSL backend.
@@ -759,16 +823,20 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         Returns:
             final_hidden_states tensor.
         """
+        # Execute MoE computation
         if self.has_nvfp4:
-            return self.run_moe_nvfp4(
+            weight_view = self._build_local_weight_view()
+            result = self.run_moe_nvfp4(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
                 x_sf=x_sf,
                 moe_output=moe_output,
-                enable_alltoall=enable_alltoall)
+                enable_alltoall=enable_alltoall,
+                weight_view=weight_view,
+            )
         elif self.has_deepseek_fp8_block_scales:
-            return self.run_moe_fp8_block_scales(
+            result = self.run_moe_fp8_block_scales(
                 x=x,
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
@@ -778,6 +846,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             raise ValueError(
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
+        return result
 
     def forward_chunk(
             self,
@@ -815,3 +884,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                          x_sf=x_sf,
                          enable_alltoall=False)
         return x
+
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        super().load_weights(weights,
+                             allow_partial_loading=allow_partial_loading)

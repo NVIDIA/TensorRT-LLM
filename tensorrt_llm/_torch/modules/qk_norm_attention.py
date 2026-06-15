@@ -169,8 +169,9 @@ class QKNormRoPEAttention(Attention):
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
         self.skip_rope = skip_rope
-        if use_gemma_rms_norm:
-            assert fuse_qk_norm_rope is False, "fused_qk_norm_rope is not supported for gemma rms norm."
+        # Gemma-style RMSNorm (scale by (1 + weight)) is supported by the fused
+        # qk_norm_rope kernel via the use_gemma flag threaded through below.
+        self.use_gemma_rms_norm = use_gemma_rms_norm
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope.
@@ -228,6 +229,7 @@ class QKNormRoPEAttention(Attention):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         return q, k
@@ -240,14 +242,34 @@ class QKNormRoPEAttention(Attention):
             self.pretrained_config, "partial_rotary_factor") else 1.0
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
+        # Interleaved mRoPE: position_ids is 3D [3, ...] (temporal/height/width)
+        # and each rotary half-dim picks a section per
+        # MRotaryEmbedding.apply_interleaved_rope. Fall back to plain RoPE for
+        # 2D/1D position_ids (e.g. dummy requests), mirroring the unfused path.
+        mrope_section = getattr(self.pos_embd_params, "mrope_section", None)
+        use_mrope = bool(
+            getattr(self.pos_embd_params, "mrope_interleaved", False)
+        ) and mrope_section is not None and position_ids.dim() == 3
+        if use_mrope:
+            # [3, num_tokens] row-major (sec*num_tokens + token); the upstream 3D
+            # position_ids may be a non-contiguous view, and the op requires
+            # contiguous, so force it here.
+            position_ids_arg = position_ids.reshape(3, -1).contiguous().to(
+                torch.int32)
+            mrope_section1, mrope_section2 = mrope_section[1], mrope_section[2]
+        else:
+            position_ids_arg = position_ids.reshape(-1).contiguous().to(
+                torch.int32)
+            mrope_section1, mrope_section2 = 0, 0
+
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
             self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight,
-            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
-            position_ids.view(-1), factor, low, high, attention_factor,
-            self.is_qk_norm)
+            self.k_norm.weight, self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox, position_ids_arg, factor, low, high,
+            attention_factor, self.is_qk_norm, self.use_gemma_rms_norm,
+            use_mrope, mrope_section1, mrope_section2)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

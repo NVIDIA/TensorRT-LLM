@@ -12,13 +12,14 @@ from pathlib import Path
 import tensorrt as trt
 
 from tensorrt_llm._common import _is_building
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import np_dtype_to_trt
 from tensorrt_llm.builder import EngineConfig, optimize_model_with_config
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 
 from ..logger import logger
 
-ENGINE_RE = re.compile('rank(\d+).engine')
+ENGINE_RE = re.compile(r'rank(\d+).engine')
 
 
 @_is_building
@@ -119,6 +120,8 @@ def refit(engine_dir: str, checkpoint_dir: str, engine_config: EngineConfig,
 
 
 def main():
+    emit_engine_arch_deprecation("trtllm-refit")
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--engine_dir',

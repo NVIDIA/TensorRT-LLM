@@ -1,5 +1,8 @@
+import gc
+import sys
 import time
 import uuid
+import weakref
 
 import pytest
 import torch
@@ -117,9 +120,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
             disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
         ctx_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                           ctx_request.prompt_len, 1,
-                                           ctx_request)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -148,9 +150,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 
         gen_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                           gen_request.prompt_len, 1,
-                                           gen_request)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -198,9 +199,8 @@ def test_cancel_request_in_transmission(attention_type):
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                           ctx_request.prompt_len, 1,
-                                           ctx_request)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -222,9 +222,8 @@ def test_cancel_request_in_transmission(attention_type):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         context_phase_params=ctx_request.context_phase_params)
 
-    kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                           gen_request.prompt_len, 1,
-                                           gen_request)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -233,12 +232,208 @@ def test_cancel_request_in_transmission(attention_type):
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
+@pytest.mark.timeout(120)
+def test_async_transfer_keeps_llm_request_alive():
+    """Async entry points must hold a strong shared_ptr to the LlmRequest.
+
+    A regression to raw-pointer storage in mSenderFutures /
+    mRequesterFutures lets Python GC the wrapper while a C++ status check
+    still dereferences it.
+    """
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+    transceiver_gen = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_gen,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    # Snapshot ctx refcount *before* submission. add_sequence_batch takes
+    # std::reference_wrapper<LlmRequest> (no Python ref retained), so the
+    # baseline here is clean and the +1 below isolates exactly the
+    # shared_ptr captured by respond_and_send_async.
+    ctx_ref = weakref.ref(ctx_request)
+    baseline_ctx_refcount = sys.getrefcount(ctx_request)
+
+    # respond_and_send_async also populates ctx_request.context_phase_params
+    # as a side effect — gen_request below requires this to be non-empty.
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    assert sys.getrefcount(ctx_request) == baseline_ctx_refcount + 1, (
+        f"respond_and_send_async did not capture a shared_ptr<LlmRequest>; "
+        f"refcount={sys.getrefcount(ctx_request)} "
+        f"(expected baseline {baseline_ctx_refcount} + 1)")
+
+    gen_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=ctx_request.context_phase_params)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
+
+    gen_ref = weakref.ref(gen_request)
+    baseline_gen_refcount = sys.getrefcount(gen_request)
+
+    transceiver_gen.request_and_receive_async(gen_request)
+    assert sys.getrefcount(gen_request) == baseline_gen_refcount + 1, (
+        f"request_and_receive_async did not capture a shared_ptr<LlmRequest>; "
+        f"refcount={sys.getrefcount(gen_request)} "
+        f"(expected baseline {baseline_gen_refcount} + 1)")
+
+    # Drop the external Python refs. After this, the only owners are the
+    # nanobind-managed shared_ptr entries inside mSenderFutures /
+    # mRequesterFutures.
+    del ctx_request
+    del gen_request
+    gc.collect()
+
+    assert ctx_ref() is not None, (
+        "Sender-side LlmRequest was destroyed prematurely; "
+        "respond_and_send_async must hold a strong shared_ptr while the "
+        "sender future is in flight")
+    assert gen_ref() is not None, (
+        "Receiver-side LlmRequest was destroyed prematurely; "
+        "request_and_receive_async must hold a strong shared_ptr while "
+        "the requester future is in flight")
+
+    # Drive the transfer to completion so the harness tears down cleanly.
+    transceiver_ctx.check_context_transfer_status(1)
+    transceiver_gen.check_gen_transfer_status(1)
+
+
+def _build_ctx_request_for_timeout_test(request_id: int) -> LlmRequest:
+    sampling_params = SamplingParams()
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+
+@pytest.mark.timeout(60)
+def test_kv_transfer_timeout_warns_once_per_request(capfd):
+    """Observe-only timeout WARN must fire exactly once per stuck request.
+
+    checkContextTransferStatus emits a TLLM_LOG_WARNING when elapsed time
+    exceeds kv_transfer_timeout_ms; mTimedOutSenderIds dedup suppresses
+    repeat emissions across subsequent polls of the same in-flight future.
+    """
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    ctx_request = _build_ctx_request_for_timeout_test(request_id=42)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    capfd.readouterr()  # drain prior noise
+
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    time.sleep(0.3)  # > kv_transfer_timeout_ms
+
+    transceiver_ctx.check_context_transfer_status(0)
+    first = capfd.readouterr()
+    marker = "Context KV cache transfer for request 42 exceeded configured timeout"
+    # TLLM_LOG_WARNING writes to stdout; check first.out (not first.err).
+    assert marker in first.out, (
+        f"Expected observe-only WARN after timeout; stdout:\n{first.out}")
+    assert first.out.count(marker) == 1, (
+        f"WARN should fire exactly once per poll for a single stuck request; "
+        f"got {first.out.count(marker)} emissions:\n{first.out}")
+
+    transceiver_ctx.check_context_transfer_status(0)
+    second = capfd.readouterr()
+    assert marker not in second.out, (
+        f"WARN re-emitted on a subsequent poll; dedup broken. "
+        f"stdout:\n{second.out}")
+
+    transceiver_ctx.cancel_request(ctx_request)
+
+
+@pytest.mark.timeout(60)
+def test_kv_transfer_timeout_silent_when_unset(capfd):
+    """Without kv_transfer_timeout_ms the observe-only WARN must stay silent.
+
+    The elapsed-time check is gated by the optional config field; absence
+    of the field must short-circuit the WARN path even on a long-running
+    transfer.
+    """
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    ctx_request = _build_ctx_request_for_timeout_test(request_id=99)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    capfd.readouterr()
+
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    time.sleep(0.3)
+    transceiver_ctx.check_context_transfer_status(0)
+
+    out = capfd.readouterr()
+    # TLLM_LOG_WARNING writes to stdout; check out.out (not out.err).
+    assert "exceeded configured timeout" not in out.out, (
+        f"Observe-only WARN must not fire when kv_transfer_timeout_ms is "
+        f"unset; stdout:\n{out.out}")
+
+    transceiver_ctx.cancel_request(ctx_request)
+
+
 def create_hybrid_cache_manager(mapping,
                                 dtype,
                                 mamba_conv_dtype=torch.float16,
                                 mamba_ssm_dtype=torch.float16):
-    """
-    Create a MambaHybridCacheManager for testing hybrid models.
+    """Create a MambaHybridCacheManager for testing hybrid models.
+
     This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
 
     Args:
@@ -265,6 +460,7 @@ def create_hybrid_cache_manager(mapping,
         mamba_layer_mask=mamba_layer_mask,
         mamba_cache_dtype=mamba_conv_dtype,
         mamba_ssm_cache_dtype=mamba_ssm_dtype,
+        is_disagg=True,
         kv_cache_config=KvCacheConfig(
             max_tokens=256,
             enable_block_reuse=False,
@@ -440,13 +636,23 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
         hybrid_cache_manager_gen.get_buffers(0),
         hybrid_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
 
-    assert torch.equal(hybrid_cache_manager_gen.get_conv_states(1),
-                       hybrid_cache_manager_ctx.get_conv_states(
-                           1)), "different mamba conv states"
+    # The transceiver copies a single request's state between
+    # independently-allocated slots on each side, so we check the
+    # request's own slot instead of the full state buffer (which has
+    # extra padding-dummy slots that only the ctx side touched).
+    slot_ctx = hybrid_cache_manager_ctx._impl.mamba_impl.get_cache_index(
+        ctx_request.py_request_id)
+    slot_gen = hybrid_cache_manager_gen._impl.mamba_impl.get_cache_index(
+        gen_request.py_request_id)
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_conv_states(1)[slot_gen],
+        hybrid_cache_manager_ctx.get_conv_states(1)[slot_ctx]), (
+            "different mamba conv states")
 
-    assert torch.equal(hybrid_cache_manager_gen.get_ssm_states(1),
-                       hybrid_cache_manager_ctx.get_ssm_states(
-                           1)), "different mamba ssm states"
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_ssm_states(1)[slot_gen],
+        hybrid_cache_manager_ctx.get_ssm_states(1)[slot_ctx]), (
+            "different mamba ssm states")
 
 
 @pytest.mark.timeout(120)

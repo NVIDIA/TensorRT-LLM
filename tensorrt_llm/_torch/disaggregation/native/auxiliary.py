@@ -3,6 +3,7 @@ from collections import deque, namedtuple
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -10,25 +11,25 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 @dataclass
 class AuxBufferMeta:
-    ptrs: list[int]
-    size: list[int]
-    item_sizes: list[int] = field(default_factory=list)
+    ptrs: np.ndarray  # dtype=np.int64
+    size: np.ndarray  # dtype=np.int64
+    item_sizes: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     device: str = "cpu"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "ptrs": self.ptrs,
-            "size": self.size,
-            "item_sizes": self.item_sizes,
+            "ptrs": self.ptrs.tolist(),
+            "size": self.size.tolist(),
+            "item_sizes": self.item_sizes.tolist(),
             "device": self.device,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AuxBufferMeta":
         return cls(
-            ptrs=data["ptrs"],
-            size=data["size"],
-            item_sizes=data.get("item_sizes", []),
+            ptrs=np.array(data["ptrs"], dtype=np.int64),
+            size=np.array(data["size"], dtype=np.int64),
+            item_sizes=np.array(data.get("item_sizes", []), dtype=np.int64),
             device=data.get("device", "cpu"),
         )
 
@@ -78,6 +79,16 @@ class AuxBufferBase(ABC):
         """
         ...
 
+    @abstractmethod
+    def get_slot_data(self, slot: int) -> tuple[list[int], list[int], tuple[int, int]]:
+        """
+        Get the token data and prompt token counts from the specified slot.
+
+        Returns:
+            (first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens))
+        """
+        ...
+
 
 class AuxBuffer(AuxBufferBase):
     def __init__(self, max_slot_num: int, beam_width: int, max_draft_len: int, device: str = "cpu"):
@@ -107,23 +118,40 @@ class AuxBuffer(AuxBufferBase):
         self._token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
+        self._prompt_token_counts_buffer = torch.zeros(
+            self._max_slot_num, 2, dtype=data_type, device=self._device
+        )
 
         self._meta = AuxBufferMeta(
-            ptrs=[
-                self._first_tokens_buffer.data_ptr(),
-                self._draft_tokens_buffer.data_ptr(),
-                self._token_counts_buffer.data_ptr(),
-            ],
-            size=[
-                self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
-                self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
-                self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
-            ],
-            item_sizes=[
-                self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
-                self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
-                self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
-            ],
+            ptrs=np.array(
+                [
+                    self._first_tokens_buffer.data_ptr(),
+                    self._draft_tokens_buffer.data_ptr(),
+                    self._token_counts_buffer.data_ptr(),
+                    self._prompt_token_counts_buffer.data_ptr(),
+                ],
+                dtype=np.int64,
+            ),
+            size=np.array(
+                [
+                    self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
+                    self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
+                    self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
+                    self._prompt_token_counts_buffer.numel()
+                    * self._prompt_token_counts_buffer.element_size(),
+                ],
+                dtype=np.int64,
+            ),
+            item_sizes=np.array(
+                [
+                    self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
+                    self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
+                    self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
+                    self._prompt_token_counts_buffer[0].numel()
+                    * self._prompt_token_counts_buffer.element_size(),
+                ],
+                dtype=np.int64,
+            ),
             device=self._device,
         )
 
@@ -194,6 +222,26 @@ class AuxBuffer(AuxBufferBase):
                 [len(first_gen_tokens), len(draft_tokens)], dtype=torch.int32, device=self._device
             )
         )
+        prompt_tokens, cached_tokens = self._resolve_prompt_token_counts(request)
+        self._prompt_token_counts_buffer[slot].copy_(
+            torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
+        )
+
+    @staticmethod
+    def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
+        ctx_usage = (
+            request.py_disaggregated_params.ctx_usage
+            if request.py_disaggregated_params is not None
+            else None
+        )
+        if ctx_usage is not None:
+            prompt_tokens = ctx_usage.get("prompt_tokens", 0)
+            details = ctx_usage.get("prompt_tokens_details") or {}
+            cached_tokens = details.get("cached_tokens", 0)
+        else:
+            prompt_tokens = request.prompt_len
+            cached_tokens = request.cached_tokens
+        return int(prompt_tokens or 0), int(cached_tokens or 0)
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
         if slot not in self._occupied_slots:
@@ -203,3 +251,8 @@ class AuxBuffer(AuxBufferBase):
         draft_tokens = self._draft_tokens_buffer[slot][:draft_len].tolist()
 
         return first_gen_tokens, draft_tokens
+
+    def get_slot_data(self, slot: int) -> tuple[list[int], list[int], tuple[int, int]]:
+        first_gen_tokens, draft_tokens = self.get_slot_tokens(slot)
+        prompt_tokens, cached_tokens = self._prompt_token_counts_buffer[slot].tolist()
+        return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))

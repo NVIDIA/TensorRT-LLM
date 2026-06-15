@@ -26,7 +26,7 @@ detokenization and return token IDs only.
 import asyncio
 import traceback
 from collections.abc import AsyncGenerator
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.request import LoRARequest, PromptAdapterRequest
@@ -168,10 +168,20 @@ class GrpcRequestManager:
             if self.llm is None:
                 return False, "LLM not initialized"
 
-            # Check if executor is available and not shutdown
+            # Check executor health (includes error queue, MPI worker
+            # liveness, and fatal error state — not just doing_shutdown).
             if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None or self.llm._executor.is_shutdown():
-                    return False, "Executor is shutdown"
+                if self.llm._executor is None:
+                    return False, "Executor is not available"
+                if not self.llm._executor.check_health():
+                    error_msg = "Executor is unhealthy"
+                    if self.llm._executor._fatal_error is not None:
+                        exc = self.llm._executor._fatal_error
+                        lines = str(exc).splitlines()
+                        short = (lines[0] if lines else type(exc).__name__)[:200]
+                        error_msg = f"{type(exc).__name__}: {short}"
+                        logger.error(f"Health check fatal error: {repr(exc)}")
+                    return False, error_msg
 
             return True, "OK"
         except Exception as e:
@@ -245,7 +255,9 @@ def create_sampling_params_from_proto(
     bad: Optional[List[str]] = None,
     bad_token_ids: Optional[List[int]] = None,
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
-    embedding_bias: Optional[List[float]] = None,
+    embedding_bias: Optional[Sequence[float]] = None,
+    vocab_size: Optional[int] = None,
+    include_stop_token_in_output: bool = False,
 ) -> SamplingParams:
     """Convert protobuf configuration to TensorRT-LLM SamplingParams.
 
@@ -260,6 +272,7 @@ def create_sampling_params_from_proto(
         bad_token_ids: Bad word token IDs
         guided_decoding: Guided decoding parameters
         embedding_bias: Embedding bias tensor
+        vocab_size: Vocabulary size used to validate embedding bias length
 
     Returns:
         TensorRT-LLM SamplingParams with detokenize=False
@@ -332,6 +345,8 @@ def create_sampling_params_from_proto(
         kwargs["stop_token_ids"] = stop_token_ids
     if ignore_eos:
         kwargs["ignore_eos"] = True
+    if include_stop_token_in_output:
+        kwargs["include_stop_str_in_output"] = True
 
     # Bad words (TRT-LLM's _setup() tokenizes bad word strings)
     if bad:
@@ -353,6 +368,10 @@ def create_sampling_params_from_proto(
 
     # Embedding bias
     if embedding_bias:
+        if vocab_size and len(embedding_bias) != vocab_size:
+            raise ValueError(
+                f"embedding_bias length ({len(embedding_bias)}) must match vocab_size ({vocab_size})"
+            )
         kwargs["embedding_bias"] = list(embedding_bias)
 
     # Guided decoding
@@ -369,6 +388,8 @@ def create_sampling_params_from_proto(
             kwargs["guided_decoding"] = GuidedDecodingParams(regex=guide_content)
         elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_EBNF_GRAMMAR:
             kwargs["guided_decoding"] = GuidedDecodingParams(grammar=guide_content)
+        elif guide_type == pb2.GuidedDecodingParams.GUIDE_TYPE_STRUCTURAL_TAG:
+            kwargs["guided_decoding"] = GuidedDecodingParams(structural_tag=guide_content)
 
     params = SamplingParams(**kwargs)
 

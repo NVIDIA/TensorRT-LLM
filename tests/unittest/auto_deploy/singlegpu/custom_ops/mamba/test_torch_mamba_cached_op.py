@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for cached Mamba (SSM) custom ops.
 
 Covers:
@@ -10,6 +24,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
 def _random_params(device, dtype, batch, seq, num_heads, head_dim, n_groups, ssm_state_size):
@@ -66,9 +81,10 @@ def test_generate_only_with_slot_mapping(mamba_env):
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     cu_seqlen = torch.zeros(batch, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    _bi = BatchInfo()
+    _bi.update([0, 0, 0, 0, batch, batch])
+    batch_info_host = _bi.serialize()
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = ssm_state_cache.clone().index_select(0, slot_idx)
 
@@ -141,13 +157,12 @@ def test_context_flattened_and_state_writeback(mamba_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     cu_seqlen = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
     # For context/prefill phase: num_prefill = len(lens), num_decode = 0
     num_seqs = len(lens)
     num_prefill_tokens = sum(lens)
-    batch_info_host = torch.tensor(
-        [num_seqs, num_prefill_tokens, 0], device=device, dtype=torch.int32
-    )
+    _bi = BatchInfo()
+    _bi.update([num_seqs, num_prefill_tokens, 0, 0, 0, 0])
+    batch_info_host = _bi.serialize()
     y = torch.ops.auto_deploy.torch_cached_ssm(
         # INPUTS
         hidden_states,

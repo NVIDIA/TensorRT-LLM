@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.12-py3
-ARG TRITON_BASE_TAG=25.12-py3
+ARG BASE_TAG=26.02-py3
+ARG TRITON_BASE_TAG=26.02-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -31,74 +31,57 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-# Copy all installation scripts at once to reduce layers
-COPY docker/common/install.sh \
-     docker/common/install_base.sh \
-     docker/common/install_cmake.sh \
-     docker/common/install_ccache.sh \
-     docker/common/install_cuda_toolkit.sh \
-     docker/common/install_tensorrt.sh \
-     docker/common/install_polygraphy.sh \
-     docker/common/install_mpi4py.sh \
-     docker/common/install_pytorch.sh \
-     docker/common/install_ucx.sh \
-     docker/common/install_nixl.sh \
-     docker/common/install_etcd.sh \
-     ./
-
 ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} \
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    echo "Using GitHub mirror: ${GITHUB_MIRROR}" && \
+    echo "Using Python version: ${PYTHON_VERSION}" && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
-    TRT_VER=${TRT_VER} \
-    CUDA_VER=${CUDA_VER} \
-    CUDNN_VER=${CUDNN_VER} \
-    NCCL_VER=${NCCL_VER} \
-    CUBLAS_VER=${CUBLAS_VER} \
+    TRT_VER=${TRT_VER} CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
+    NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
-    bash ./install.sh --base --cmake --ccache --cuda_toolkit --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
-    rm install_base.sh && \
-    rm install_cmake.sh && \
-    rm install_ccache.sh && \
-    rm install_cuda_toolkit.sh && \
-    rm install_tensorrt.sh && \
-    rm install_polygraphy.sh && \
-    rm install_mpi4py.sh && \
-    rm install_pytorch.sh && \
-    rm install.sh
+    bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
+         --tensorrt --polygraphy --mpi4py --pytorch --opencv
 
-# Copy and install dependencies from constraints.txt
+# Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
-RUN pip3 install --no-cache-dir -r /tmp/constraints.txt && rm /tmp/constraints.txt
-
-# Remove nbconvert to avoid https://github.com/advisories/GHSA-xm59-rqc7-hhvf in the base NGC PyTorch image.
-RUN pip3 uninstall -y nbconvert || true
+RUN --mount=type=cache,target=/root/.cache/pip \
+    # WAR: uninstall dependencies that has vulnerability or need upgrading.
+    apt remove python3-wheel \
+    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy || true && \
+    # Remove any leftover namespace dirs or dist-info that pip missed
+    rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
+    pip3 install -r /tmp/constraints.txt && \
+    rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_ucx.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_nixl.sh && \
-    bash ./install_etcd.sh && \
-    rm install_ucx.sh && \
-    rm install_nixl.sh && \
-    rm install_etcd.sh && \
-    rm -rf /root/.cache/pip && \
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
+    bash /opt/docker/common/install_etcd.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
-    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-0.45.1.dist-info
+    rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
 ARG TARGETARCH
-COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
-RUN bash /tmp/generate_container_oss_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}" && \
-    rm /tmp/generate_container_oss_attribution.sh
+RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/tmp/gen_attribution.sh \
+    bash /tmp/gen_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -111,20 +94,15 @@ COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
 COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 
-# Copy all installation scripts at once to reduce layers
-COPY docker/common/install_triton.sh \
-     docker/common/install_mooncake.sh \
-     ./
-
-# Install Mooncake, after triton handles boost requirement
-RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && \
+# Install Triton deps, Mooncake, and CI tooling packages
+RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_triton.sh && \
     if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping mooncake installation"; \
     else \
-        bash ./install_mooncake.sh; \
+        bash /opt/docker/common/install_mooncake.sh; \
     fi && \
-    rm install_triton.sh && \
-    rm install_mooncake.sh
+    bash /opt/docker/common/install_ci.sh
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
@@ -133,11 +111,10 @@ COPY cpp cpp
 COPY docker docker
 COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
+COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
 COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
 
-# Create cache directories for pip and ccache
-RUN mkdir -p /root/.cache/pip /root/.cache/ccache
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
@@ -148,43 +125,45 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
 
 FROM ${DEVEL_IMAGE} AS release
 
-# Create a cache directory for pip
-RUN mkdir -p /root/.cache/pip
-
 WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
     pip install /tmp/wheel/tensorrt_llm*.whl
 
-COPY README.md ./
-COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl ./
-COPY docs docs
-COPY cpp/include include
-
-RUN ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
-    test -f bin/executorWorker && \
-    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
-    test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
-    echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
-    ldconfig && \
-    ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
-
-ARG SRC_DIR=/src/tensorrt_llm
-COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
-ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build
-COPY --from=wheel \
-     ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
-     benchmarks/cpp/
-
-COPY examples examples
-RUN chmod -R a+w examples && \
+RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
+    --mount=type=bind,source=docs,target=/mnt/ctx/docs \
+    --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
+    --mount=type=bind,source=examples,target=/mnt/ctx/examples \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/benchmarks,target=/mnt/cpp_benchmarks \
+    # Copy build context files
+    cp /mnt/ctx/README.md ./ && \
+    cp -r /mnt/ctx/docs ./docs && \
+    cp -r /mnt/ctx/include ./include && \
+    cp -r /mnt/ctx/examples ./examples && \
+    chmod -R a+w examples && \
+    # Copy wheel stage outputs
+    cp /mnt/wheel/tensorrt_llm*.whl ./ && \
+    cp -r /mnt/benchmarks ./benchmarks && \
+    mkdir -p benchmarks/cpp && \
+    cp /mnt/cpp_benchmarks/bertBenchmark \
+       /mnt/cpp_benchmarks/gptManagerBenchmark \
+       /mnt/cpp_benchmarks/disaggServerBenchmark \
+       benchmarks/cpp/ && \
     rm -v \
       benchmarks/cpp/bertBenchmark.cpp \
       benchmarks/cpp/gptManagerBenchmark.cpp \
       benchmarks/cpp/disaggServerBenchmark.cpp \
       benchmarks/cpp/CMakeLists.txt && \
-    rm -rf /root/.cache/pip && \
+    # Create symlinks to installed package binaries and libraries
+    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/bin")') bin && \
+    test -f bin/executorWorker && \
+    ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
+    test -f lib/libnvinfer_plugin_tensorrt_llm.so && \
+    echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
+    ldconfig && \
+    ! ( ldd -v bin/executorWorker | grep tensorrt_llm | grep -q "not found" ) && \
+    # Clean up caches and CVE workarounds
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
@@ -198,8 +177,8 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
 
 # Generate OSS attribution file for release image
-COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
-RUN bash /tmp/generate_container_oss_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}" && rm /tmp/generate_container_oss_attribution.sh
+RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
+    bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
 FROM wheel AS tritonbuild
 

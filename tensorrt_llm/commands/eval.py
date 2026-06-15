@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,12 +20,24 @@ import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
-from ..evaluate import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
-                        GPQAExtended, GPQAMain, JsonModeEval, LongBenchV1,
-                        LongBenchV2)
+from ..evaluate import (AIME2025, AIME2026, GSM8K, MMLU, MMMU, CnnDailymail,
+                        CoVoST2, GPQADiamond, GPQAExtended, GPQAMain,
+                        JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro)
 from ..llmapi import BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
+from ..usage import config as _telemetry_config
+from .utils import collect_explicit_cli_keys
+
+# Map Click parameter names to the LlmArgs field name (or merge-function CLI
+# scalar name) used by `update_llm_args_with_extra_options`.
+_CLICK_TO_LLM_ARG = {
+    "tp_size": "tensor_parallel_size",
+    "pp_size": "pipeline_parallel_size",
+    "ep_size": "moe_expert_parallel_size",
+    "kv_cache_free_gpu_memory_fraction": "free_gpu_memory_fraction",
+    "disable_kv_cache_reuse": "enable_block_reuse",
+}
 
 
 @click.group()
@@ -111,12 +123,16 @@ from ..logger import logger, severity_map
               "extra_llm_api_options",
               type=str,
               default=None,
-              help="Path to a YAML file that overwrites the parameters. "
-              "Can be specified as either --config or --extra_llm_api_options.")
+              help="Path to a YAML configuration file. Explicit CLI flags "
+              "take precedence over values in this file. Can be specified "
+              "as either --config or --extra_llm_api_options.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
               default=False,
               help="Flag for disabling KV cache reuse.")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
 @click.pass_context
 def main(ctx, model: str, tokenizer: Optional[str],
          custom_tokenizer: Optional[str], log_level: str, backend: str,
@@ -124,24 +140,43 @@ def main(ctx, model: str, tokenizer: Optional[str],
          max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
          gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
          trust_remote_code: bool, revision: Optional[str],
-         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
+         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool,
+         telemetry: bool):
     logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config"),
+        translate=_CLICK_TO_LLM_ARG)
 
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         enable_block_reuse=not disable_kv_cache_reuse)
 
     llm_args = {
-        "model": model,
-        "tokenizer": tokenizer,
-        "custom_tokenizer": custom_tokenizer,
-        "tensor_parallel_size": tp_size,
-        "pipeline_parallel_size": pp_size,
-        "moe_expert_parallel_size": ep_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "revision": revision,
-        "kv_cache_config": kv_cache_config,
+        "model":
+        model,
+        "tokenizer":
+        tokenizer,
+        "custom_tokenizer":
+        custom_tokenizer,
+        "tensor_parallel_size":
+        tp_size,
+        "pipeline_parallel_size":
+        pp_size,
+        "moe_expert_parallel_size":
+        ep_size,
+        "gpus_per_node":
+        gpus_per_node,
+        "trust_remote_code":
+        trust_remote_code,
+        "revision":
+        revision,
+        "kv_cache_config":
+        kv_cache_config,
+        "telemetry_config":
+        _telemetry_config.TelemetryConfig(
+            disabled=not telemetry,
+            usage_context=_telemetry_config.UsageContext.CLI_EVAL),
     }
 
     if backend == 'pytorch':
@@ -163,8 +198,10 @@ def main(ctx, model: str, tokenizer: Optional[str],
             param_hint="backend")
 
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(llm_args,
-                                                      extra_llm_api_options)
+        llm_args = update_llm_args_with_extra_options(
+            llm_args,
+            extra_llm_api_options,
+            explicit_cli_keys=explicit_cli_keys)
 
     profiler.start("trtllm init")
     llm = llm_cls(**llm_args)
@@ -185,8 +222,12 @@ main.add_command(GPQAMain.command)
 main.add_command(GPQAExtended.command)
 main.add_command(JsonModeEval.command)
 main.add_command(MMMU.command)
+main.add_command(MMMUPro.command)
+main.add_command(CoVoST2.command)
 main.add_command(LongBenchV1.command)
 main.add_command(LongBenchV2.command)
+main.add_command(AIME2025.command)
+main.add_command(AIME2026.command)
 
 if __name__ == "__main__":
     main()

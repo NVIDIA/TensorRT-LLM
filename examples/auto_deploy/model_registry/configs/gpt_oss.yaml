@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenAI GPT-OSS (20B / 120B, MXFP4 quantized) — shared AD serving config.
+# - 20B: 24 layers, 32 experts, top-4
+# - 120B: 36 layers, 128 experts, top-4
+# Both share GQA (64 Q / 8 KV heads), head_dim=64, hidden=2880, and MXFP4
+# weights on HF that AD's `quantize_mxfp4_moe` transform handles.
+# world_size is set via the registry's `world_size_N.yaml` overlay — not here.
+model_factory: AutoModelForCausalLM
+model_kwargs:
+  dtype: bfloat16
+attn_backend: trtllm
+compile_backend: torch-cudagraph
+skip_loading_weights: false
+max_batch_size: 128
+max_seq_len: 4096
+max_num_tokens: 8192
+enable_chunked_prefill: true
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+transforms:
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
+    requires_shape_prop: true
+    shard_layers: ["mha", "moe", "lm_head"]  # V3: vocab-parallel lm_head (colwise + all_gather)
+    # TP2 trial: AUTO -> tunable_allreduce picks oneshot-lamport fused AR.
+    # NCCL has no fused residual+rmsnorm kernel -> RING_LL + separate rmsnorm.
+    allreduce_strategy: AUTO
+  quantize_mxfp4_moe:
+    backend: trtllm
+    trtllm_quant_act: mxfp8
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_gemms:
+    enabled: true
+  fuse_rope_into_trtllm_attention:
+    enabled: true
+  fuse_add_rms_norm:
+    enabled: true

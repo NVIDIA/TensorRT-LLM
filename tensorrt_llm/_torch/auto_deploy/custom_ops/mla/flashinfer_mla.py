@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """FlashInfer-based MLA (Multi-head Latent Attention) backend with paged caching.
 
 This module provides:
@@ -28,13 +42,16 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
+    BatchInfo,
     Constant,
     MHACallable,
     PrepareMetadataCallable,
@@ -393,7 +410,8 @@ def prepare_flashinfer_mla_metadata(
     the standard FlashInfer attention preparation.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
 
@@ -434,7 +452,8 @@ def prepare_flashinfer_mla_metadata_host(
     For decode-only batches, this function pre-plans the cached CUDA graph
     wrappers to avoid planning during graph capture/replay.
     """
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
 
     if num_prefill == 0:
         _GlobalFlashInferMLAPlanner.plan_generate_only(
@@ -445,7 +464,9 @@ def prepare_flashinfer_mla_metadata_host(
         )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_mla_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::flashinfer_mla_with_cache", mutates_args=("ckv_cache", "kpe_cache")
+)
 def flashinfer_mla_with_cache(
     # 5 tensor args (matching torch_mla source op)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
@@ -471,6 +492,7 @@ def flashinfer_mla_with_cache(
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FlashInfer MLA attention with paged cache.
 
@@ -510,7 +532,8 @@ def flashinfer_mla_with_cache(
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Get batch info
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
 
@@ -545,8 +568,10 @@ def flashinfer_mla_with_cache(
         last_page_len[:num_seq],
     )
 
-    # Pre-allocate output as zeros so padding positions are clean
-    y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
+    if out is not None:
+        y = out.view(bs, num_heads, v_head_dim)
+    else:
+        y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
 
     # =========================================================================
     # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
@@ -748,6 +773,13 @@ def flashinfer_mla_with_cache(
 
         y[num_prefill_tokens:num_total_tokens] = y_decode
 
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y.view(b, s, num_heads, v_head_dim)
 
 
@@ -772,8 +804,12 @@ def flashinfer_mla_with_cache_fake(
     kpe_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for flashinfer_mla_with_cache."""
+    if out is not None:
+        return out.new_empty(0)
+
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]
     out_features = kv_b_proj_weight.shape[0]
@@ -812,6 +848,7 @@ class MLAPagedResourceHandler(ResourceHandler):
         """
         self.token_shape = token_shape
         self.dtype = dtype
+        self.attention_type = AttentionType.mla
 
     def _get_bytes_per_token(self) -> int:
         """The size of the resource per token in bytes."""
@@ -959,7 +996,6 @@ class FlashInferMLAAttention(AttentionDescriptor):
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
 
-        # Get scale from kwargs
-        scale = source_attn_node.kwargs.get("scale", None)
+        (scale,) = extract_op_args(source_attn_node, "scale")
 
         return [scale, kv_lora_rank]

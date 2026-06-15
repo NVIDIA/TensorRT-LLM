@@ -1,0 +1,3 @@
+include: _template_yaml
+task: mmmu_pro_standard_10
+dataset_name: "standard (10 options)"

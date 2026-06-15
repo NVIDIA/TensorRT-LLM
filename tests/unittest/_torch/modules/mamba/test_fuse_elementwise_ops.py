@@ -20,6 +20,7 @@ import torch
 from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
     extract_transpose_xbc_prefill,
     fused_split_rearrange_after_conv1d,
+    ssd_output_transpose,
 )
 
 skip_no_cuda = pytest.mark.skipif(
@@ -111,3 +112,86 @@ def test_fused_split_rearrange_after_conv1d(
     torch.testing.assert_close(x_fused, x_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(B_fused, B_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(C_fused, C_ref, rtol=1e-3, atol=1e-3)
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_extract_transpose_large_input_no_overflow(dtype):
+    """
+    Test extract_transpose_xbc_prefill with large inputs that would overflow int32.
+
+    This test verifies the fix for integer overflow in Triton kernel offset calculations.
+    For NemotronH Nano 12B with max_num_tokens=131072:
+    - d_in_proj = 22656
+    - max_src_offset = (num_prefill_tokens - 1) * d_in_proj > INT32_MAX
+
+    We use smaller but still overflow-inducing parameters to keep the test memory-efficient.
+    """
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    # Parameters that would cause int32 overflow: 100000 * 22000 = 2.2B > INT32_MAX
+    num_prefill_tokens = 100000
+    d_in_proj = 22000
+    d_inner = 10000
+    conv_dim = 12000
+
+    # Check available GPU memory - skip if not enough
+    free_memory = torch.cuda.get_device_properties(
+        device
+    ).total_memory - torch.cuda.memory_allocated(device)
+    required_memory = num_prefill_tokens * d_in_proj * 2 * 3  # input + output + overhead
+    if free_memory < required_memory:
+        pytest.skip(
+            f"Insufficient GPU memory: {free_memory / 1e9:.1f}GB available, {required_memory / 1e9:.1f}GB required"
+        )
+
+    zxbcdt = torch.randn(num_prefill_tokens, d_in_proj, dtype=dtype, device=device)
+    out_ref = extract_transpose_xbc_prefill_ref(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+    out_fused = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens, d_inner, conv_dim)
+
+    assert out_fused.shape == out_ref.shape, f"Shape mismatch: {out_fused.shape} vs {out_ref.shape}"
+    torch.testing.assert_close(out_fused, out_ref, rtol=1e-3, atol=1e-3)
+
+
+def ssd_output_transpose_ref(
+    out_contig: torch.Tensor,
+    num_prefill_tokens: int,
+) -> torch.Tensor:
+    """Reference implementation: permute+reshape+slice."""
+    B, H, D, NC, CS = out_contig.shape
+    seqlen = NC * CS
+    out_view = out_contig.permute(0, 3, 4, 1, 2).reshape(B, seqlen, H, D)
+    dst = out_view[:, :num_prefill_tokens].contiguous().view(num_prefill_tokens, H * D)
+    return dst
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "H,D,CS,num_prefill_tokens",
+    [
+        (32, 64, 256, 1),
+        (32, 64, 256, 128),
+        (32, 64, 256, 1024),
+        (32, 64, 256, 4096),
+        (32, 64, 256, 50176),  # exact multiple of CS
+        (32, 64, 256, 50224),  # trailing padding
+        (16, 64, 128, 8192),
+        (64, 64, 256, 16384),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_ssd_output_transpose(H, D, CS, num_prefill_tokens, dtype):
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    NC = (num_prefill_tokens + CS - 1) // CS
+    out_contig = torch.randn(1, H, D, NC, CS, dtype=dtype, device=device)
+
+    dst_ref = ssd_output_transpose_ref(out_contig, num_prefill_tokens)
+    dst = torch.empty(num_prefill_tokens, H * D, dtype=dtype, device=device)
+    ssd_output_transpose(out_contig, dst, num_prefill_tokens)
+
+    assert dst.shape == dst_ref.shape
+    # Pure data movement — must be bit-exact.
+    torch.testing.assert_close(dst, dst_ref, rtol=0, atol=0)

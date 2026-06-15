@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +34,25 @@ reviews:
     auto_incremental_review: false
     drafts: false
     base_branches: ["main", "release/.+"]
+  path_instructions:
+    - path: "tests/**"
+      instructions: |
+        Act as a QA engineer reviewing test changes and coverage for TensorRT-LLM.
+        Keep feedback actionable: suggest concrete list file names and whether
+        coverage is sufficient, insufficient, or needs follow-up outside the PR.
+    - path: "tests/integration/test_lists/qa/**"
+      instructions: |
+        Files here are manually-triggered QA perf/regression lists, maintained
+        by the QA team. They are NOT derived from, and do NOT need to mirror,
+        the auto-run CI test-db under tests/integration/test_lists/test-db/.
+        Do NOT suggest cross-syncing entries between qa/ and test-db/; coverage
+        in one does not imply coverage in the other and is decided independently.
+    - path: "tests/integration/test_lists/test-db/**"
+      instructions: |
+        Files here drive the auto-run CI test-db (per-GPU l0_*.yml tiers).
+        Adding or removing entries here changes what CI runs either in every PR (pre-merge) or three times a day (post-merge).
+        Do NOT suggest cross-syncing with the QA lists under
+        tests/integration/test_lists/qa/.
 knowledge_base:
   code_guidelines:
     enabled: true

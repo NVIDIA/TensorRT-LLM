@@ -1,5 +1,6 @@
 server_configs:
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -17,7 +18,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -33,6 +34,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc32_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -50,7 +52,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -66,6 +68,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_1024_conc2048_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -88,7 +91,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -104,6 +107,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -121,7 +125,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -137,6 +141,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc32_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -154,7 +159,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -169,6 +174,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_1024_8192_conc2048_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -191,7 +197,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -207,6 +213,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -224,7 +231,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -240,6 +247,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc32_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -262,7 +270,7 @@ server_configs:
     timeout_iters: 100
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -278,6 +286,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: deepseek_ai_DeepSeek_R1_0528_8192_1024_conc2048_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
@@ -300,7 +309,7 @@ server_configs:
     timeout_iters: 100
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -316,6 +325,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -333,7 +343,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -348,6 +358,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc32_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -365,7 +376,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -415,6 +426,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -432,7 +444,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -448,6 +460,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc32_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -465,7 +478,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -481,6 +494,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc1024_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -503,7 +517,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -518,6 +532,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc2048_gpu4
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
@@ -540,7 +555,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
@@ -555,6 +570,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc1_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -572,7 +588,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -588,6 +604,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc16_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -605,7 +622,7 @@ server_configs:
     backend: TRTLLM
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 3
+    max_draft_len: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -621,6 +638,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc512_gpu8
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
@@ -641,7 +659,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -657,6 +675,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc1024_gpu4
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
@@ -679,7 +698,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
@@ -695,6 +714,7 @@ server_configs:
     backend: openai
     streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc2048_gpu4
+  server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1"
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
@@ -717,7 +737,7 @@ server_configs:
     timeout_iters: 60
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true

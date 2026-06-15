@@ -18,7 +18,7 @@
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with
 # smaller block size and the same number of blocks for block scale.
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import ClassVar, NewType, Protocol
 
@@ -141,6 +141,26 @@ class SsmLayerConfig:
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
 
+@dataclass(slots=True, frozen=True)
+class KVCacheDesc:
+    capacity: int
+    history_length: int
+
+    def __post_init__(self) -> None:
+        assert 0 <= self.history_length <= self.capacity
+
+
+# A batch of requests, working as a use case the KVCacheManager must always support.
+@dataclass(slots=True, frozen=True)
+class BatchDesc:
+    kv_caches: list[KVCacheDesc]
+    # Tokens shared by all requests. Set to 0 if no kv cache reuse.
+    system_prompt_length: int = 0
+
+    def __post_init__(self) -> None:
+        assert self.system_prompt_length >= 0
+
+
 @dataclass(slots=True)
 class HelixConfig:
     helix_group_size: int
@@ -149,6 +169,23 @@ class HelixConfig:
     helix_shard_size: int
     # must be the same for all ranks in the same helix group and different for different helix groups.
     shared_comm_port: int
+
+
+@dataclass(slots=True)
+class SwaScratchReuseConfig:
+    """
+    Configuration for SWA scratch reuse.
+
+    Args:
+        max_rewind_len: Maximum number of tail tokens that can be rewound after
+            scratch-enabled allocation. Scratch reuse will not cover blocks that
+            may be needed to preserve those tokens.
+    """
+
+    max_rewind_len: int = 0
+
+    def __post_init__(self) -> None:
+        assert self.max_rewind_len >= 0, "max_rewind_len must be non-negative"
 
 
 @dataclass(slots=True)
@@ -175,8 +212,43 @@ class KVCacheManagerConfig:
     If True, we will try to reuse tokens from partially matched blocks.
     """
 
+    constraints: list[BatchDesc] = field(default_factory=list)
+    """
+    A list of step configurations that must always be supported.
+    """
+
+    typical_step: BatchDesc | None = None
+    """
+    A typical step configuration used to decide initial memory partitioning between
+    layer groups.
+    """
+
+    ssm_reuse_interval: int = 512
+    """
+    Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
+    Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
+    """
+
+    swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    """
+    When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
+    Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
+    layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
+    have no preserved data after the step.
+
+    If max_rewind_len is non-zero, the rewindable tail is excluded from scratch reuse so
+    draft/target shared KV cache can preserve tokens that may survive speculative rewind.
+
+    Most useful for disaggregated prefill servers handling long prompts or long prompt chunks,
+    where the number of out-of-window blocks dominates memory usage.
+    """
+
     # unsupported yet
     helix_config: HelixConfig | None = None
+
+    @property
+    def enable_swa_scratch_reuse(self) -> bool:
+        return self.swa_scratch_reuse is not None
 
     def __post_init__(self) -> None:
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
@@ -189,3 +261,12 @@ class KVCacheManagerConfig:
             for layer in self.layers
             for buffer in layer.buffers
         )
+        if any(layer.type == LayerType.SSM for layer in self.layers):
+            assert self.ssm_reuse_interval > 0, "ssm_reuse_interval must be positive"
+            assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
+                f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
+                f"tokens_per_block ({self.tokens_per_block})"
+            )
+            assert not self.enable_partial_reuse, (
+                "enable_partial_reuse must be False when SSM layers are present"
+            )

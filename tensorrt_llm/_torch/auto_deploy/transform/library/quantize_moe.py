@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.utils import ActivationType
-
+from ..._compat import ActivationType
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -71,7 +70,8 @@ def _quantize_moe_node(
                 submod.register_buffer(scale_name, scale_val)
 
             # Register load hook
-            gm._register_load_state_dict_pre_hook(partial(quant_impl.load_hook, weight_name=name))
+            hook = partial(quant_impl.load_hook, weight_name=name)
+            gm._register_load_state_dict_pre_hook(hook)
 
             # Create get_attr nodes for new param and each scale
             with gm.graph.inserting_before(node):
@@ -205,7 +205,10 @@ class QuantizeFP8MOE(FP8LinearQuantizationFromConfig):
                     skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
                 )
             quantized_layers = qcfg.get("quantized_layers", {})
-        elif qcfg.get("quant_algo", "").upper() != self.algo_name:
+        elif (
+            qcfg.get("quant_algo", "").upper() != self.algo_name
+            and qcfg.get("quant_method", "").upper() != self.algo_name
+        ):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -370,6 +373,10 @@ class QuantizeFineGrainedFP8MOE(Quantization):
 
         quant_method = str(qcfg.get("quant_method", "")).lower()
         if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        if qcfg.get("weight_block_size") is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

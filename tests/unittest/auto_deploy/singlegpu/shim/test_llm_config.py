@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import MagicMock, patch
 
 import pydantic
@@ -39,6 +53,60 @@ def test_custom_values():
     assert args.transforms["insert_cached_attention"]["backend"] == "flashinfer"
 
 
+def test_requires_uniform_kv_caches_follows_attention_backend():
+    """No attention backend currently requires uniform KV caches.
+
+    The trtllm backend used to force a single KV pool, but it now supports
+    multiple KV cache memory pools for non-uniform sliding-window models, so the
+    flag defaults to False for all backends.
+    """
+    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is False
+    assert (
+        LlmArgs(model="test-model", attn_backend="flashinfer").requires_uniform_kv_caches is False
+    )
+
+
+@pytest.mark.parametrize("compile_backend", ["torch-simple", "torch-compile"])
+def test_non_piecewise_compile_backend_disables_default_piecewise(compile_backend):
+    args = LlmArgs(model="test-model", compile_backend=compile_backend)
+
+    assert args.transforms["compile_model"]["backend"] == compile_backend
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+@pytest.mark.parametrize("compile_backend", ["torch-simple", "torch-compile"])
+def test_transform_compile_backend_disables_default_piecewise(compile_backend):
+    args = LlmArgs(
+        model="test-model",
+        transforms={"compile_model": {"backend": compile_backend}},
+    )
+
+    assert args.compile_backend == compile_backend
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_yaml_compile_backend_disables_default_piecewise(tmp_path):
+    yaml_path = tmp_path / "ad.yaml"
+    yaml_path.write_text("compile_backend: torch-simple\n")
+
+    args = LlmArgs(model="test-model", yaml_extra=[yaml_path])
+
+    assert args.compile_backend == "torch-simple"
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+
+
+def test_cache_transceiver_rejects_unmanaged_persistent_caches():
+    """Cache transceiver rejects unmanaged persistent cache resources."""
+    args = LlmArgs(
+        model="test-model",
+        attn_backend="flashinfer",
+        cache_transceiver_config={"backend": "DEFAULT"},
+    )
+
+    assert args.requires_uniform_kv_caches is False
+    assert args.reject_unmanaged_persistent_caches is True
+
+
 # ================================
 # Config Flow Tests
 # ================================
@@ -52,7 +120,7 @@ def test_config_params():
         "model_factory": "AutoModelForImageTextToText",
         "skip_loading_weights": True,
         "max_seq_len": 19,
-        "max_batch_size": 5,
+        "max_batch_size": 128,
         "world_size": 3,
         "transforms": {
             "detect_sharding": {
@@ -138,6 +206,23 @@ def test_config_flow(
         pass
 
 
+def test_build_model_replaces_parent_model_specific_input_processor():
+    """Parent model build can create a registered multimodal input processor."""
+    llm = object.__new__(LLM)
+    llm.input_processor = object()
+    llm._tokenizer = None
+    replacement_processor = object()
+
+    with (
+        patch.object(LLM, "_prefetch_model"),
+        patch("tensorrt_llm._torch.auto_deploy.llm._TorchLLM._build_model"),
+        patch.object(LLM, "_create_input_processor", return_value=replacement_processor),
+    ):
+        LLM._build_model(llm)
+
+    assert llm.input_processor is replacement_processor
+
+
 @pytest.mark.parametrize(
     "model_factory",
     [
@@ -180,107 +265,144 @@ def test_parallel_config_validation(parallel_field, invalid_value):
 
 
 # ================================
+# Speculative Config Validation
+# ================================
+
+
+class TestSpeculativeConfigValidation:
+    """AutoDeploy only supports Eagle3 one-model and MTP-Eagle one-model speculative decoding.
+
+    Verify that supported speculative modes are accepted and configured before executor setup.
+    """
+
+    def test_accepts_eagle_one_model(self):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+        # Should not raise.
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        assert args.model_factory == "eagle_one_model"
+
+    def test_accepts_mtp_eagle_one_model(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+        # Should not raise.
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        assert args.model_factory == "eagle_one_model"
+
+    @pytest.mark.parametrize("compile_backend", ["torch-cudagraph", "torch-opt"])
+    def test_rejects_flashinfer_cuda_graph_backend(self, compile_backend):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+
+        with pytest.raises(pydantic.ValidationError):
+            LlmArgs(
+                model="test-model",
+                speculative_config=spec_config,
+                attn_backend="flashinfer",
+                compile_backend=compile_backend,
+            )
+
+    def test_accepts_flashinfer_torch_simple(self):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+
+        LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            attn_backend="flashinfer",
+            compile_backend="torch-simple",
+        )
+
+
+class TestSSMReplayValidation:
+    """The replay SSM kernel (ssm_replay) is only meaningful with speculative decoding.
+
+    Its replay state buffers are read on the speculative extend path and are only bound by
+    the Mamba cache manager when spec is enabled, so enabling replay without spec would leak
+    unmanaged allocations. LlmArgs must reject that combination.
+    """
+
+    def test_ssm_replay_without_spec_raises(self):
+        with pytest.raises(ValueError, match="requires speculative decoding"):
+            LlmArgs(
+                model="test-model",
+                transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+            )
+
+    def test_ssm_replay_with_spec_ok(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3, mtp_eagle_one_model=True)
+        # Replay + spec is valid and must not raise.
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+        )
+        assert args.transforms["insert_cached_ssm_attention"]["ssm_replay"] is True
+
+    def test_no_ssm_replay_without_spec_ok(self):
+        # The default (replay off) with spec off is the common case and must not raise.
+        args = LlmArgs(model="test-model")
+        assert not args.transforms.get("insert_cached_ssm_attention", {}).get("ssm_replay", False)
+
+
+# ================================
 # CUDA Graph Batch Sizes Tests
 # ================================
 
 
-class TestCudaGraphBatchSizesHeuristic:
-    """Test that cuda_graph_batch_sizes heuristic respects max_batch_size."""
+class TestCudaGraphConfig:
+    """Test CudaGraphConfig batch size generation and LlmArgs validation."""
 
-    def test_small_max_batch_size_caps_heuristic(self):
-        """Test that heuristic batch sizes are capped at small max_batch_size.
-
-        When max_batch_size is small (e.g., 4), the heuristic should NOT include
-        batch sizes like 17, 33, 49, 65, 81, 97, 113 which exceed max_batch_size.
-        """
+    @pytest.mark.parametrize("max_batch_size", [4, 64, 256])
+    def test_generated_batch_sizes_respect_max(self, max_batch_size):
+        """Test that auto-generated batch sizes stay within CudaGraphConfig.max_batch_size."""
         args = LlmArgs(
             model="test-model",
-            max_batch_size=4,
+            cuda_graph_config={"max_batch_size": max_batch_size},
         )
 
-        # All batch sizes should be <= max_batch_size
-        assert all(bs <= 4 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 4, got {args.cuda_graph_batch_sizes}"
-        )
-        # Should include 1 and max_batch_size
-        assert 1 in args.cuda_graph_batch_sizes
-        assert 4 in args.cuda_graph_batch_sizes
-        # Should NOT include heuristic values that exceed max_batch_size
-        assert 17 not in args.cuda_graph_batch_sizes
-        assert 113 not in args.cuda_graph_batch_sizes
-
-    def test_medium_max_batch_size_caps_heuristic(self):
-        """Test heuristic with medium max_batch_size (e.g., 64)."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=64,
+        cuda_graph_batch_sizes = args.cuda_graph_config.batch_sizes
+        assert all(bs <= max_batch_size for bs in cuda_graph_batch_sizes), (
+            f"Expected all batch sizes <= {max_batch_size}, got {cuda_graph_batch_sizes}"
         )
 
-        # All batch sizes should be <= max_batch_size
-        assert all(bs <= 64 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 64, got {args.cuda_graph_batch_sizes}"
-        )
-        # Should include some heuristic values up to 64
-        assert 1 in args.cuda_graph_batch_sizes
-        assert 17 in args.cuda_graph_batch_sizes
-        assert 33 in args.cuda_graph_batch_sizes
-        assert 49 in args.cuda_graph_batch_sizes
-        assert 64 in args.cuda_graph_batch_sizes
-        # Should NOT include values > 64
-        assert 65 not in args.cuda_graph_batch_sizes
-        assert 81 not in args.cuda_graph_batch_sizes
-
-    def test_large_max_batch_size_includes_all_heuristic_values(self):
-        """Test heuristic with large max_batch_size (e.g., 256)."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=256,
-        )
-
-        # All batch sizes should be <= max_batch_size
-        assert all(bs <= 256 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 256, got {args.cuda_graph_batch_sizes}"
-        )
-        # Should include heuristic values from range(1, 129, 16)
-        for bs in [1, 17, 33, 49, 65, 81, 97, 113]:
-            assert bs in args.cuda_graph_batch_sizes, f"Expected {bs} in batch sizes"
-        # Should include 128 from range(128, max_batch_size+1, 128)
-        assert 128 in args.cuda_graph_batch_sizes
-        assert 256 in args.cuda_graph_batch_sizes
-
-    def test_explicit_cuda_graph_batch_sizes_filtered(self):
-        """Test that explicitly provided batch sizes are filtered to max_batch_size."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=16,
-            cuda_graph_batch_sizes=[1, 4, 8, 16, 32, 64, 128],
-        )
-
-        # Should only include values <= max_batch_size
-        assert all(bs <= 16 for bs in args.cuda_graph_batch_sizes), (
-            f"Expected all batch sizes <= 16, got {args.cuda_graph_batch_sizes}"
-        )
-        # Values <= 16 should be present
-        assert 1 in args.cuda_graph_batch_sizes
-        assert 4 in args.cuda_graph_batch_sizes
-        assert 8 in args.cuda_graph_batch_sizes
-        assert 16 in args.cuda_graph_batch_sizes
-        # Values > 16 should be filtered out
-        assert 32 not in args.cuda_graph_batch_sizes
-        assert 64 not in args.cuda_graph_batch_sizes
-        assert 128 not in args.cuda_graph_batch_sizes
-
-    def test_batch_sizes_sorted_descending(self):
-        """Test that cuda_graph_batch_sizes are sorted in descending order."""
-        args = LlmArgs(
-            model="test-model",
-            max_batch_size=64,
-        )
-
-        # Should be sorted in descending order
-        assert args.cuda_graph_batch_sizes == sorted(args.cuda_graph_batch_sizes, reverse=True), (
-            f"Expected descending order, got {args.cuda_graph_batch_sizes}"
-        )
+    @pytest.mark.parametrize(
+        "top_level_mbs,cg_mbs",
+        [
+            (4, 128),
+            (64, 256),
+            (1, 2),
+        ],
+    )
+    def test_raises_when_max_batch_size_below_cuda_graph_config(self, top_level_mbs, cg_mbs):
+        """Test that LlmArgs raises ValueError when max_batch_size < cuda_graph_config.max_batch_size."""
+        with pytest.raises(ValueError, match="must be greater than or equal to"):
+            LlmArgs(
+                model="test-model",
+                max_batch_size=top_level_mbs,
+                cuda_graph_config={"max_batch_size": cg_mbs},
+            )
 
 
 class TestSequenceInfoExampleBatchSize:

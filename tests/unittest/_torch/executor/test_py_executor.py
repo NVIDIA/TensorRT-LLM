@@ -7,8 +7,11 @@ to PyExecutor, including:
 - waiting_queue management
 - is_shutdown state management
 - expected_num_active_requests tracking
+- Event-loop crash propagation to await_responses callers (nvbug 6038228)
 """
 
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -17,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
@@ -178,3 +182,372 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
+    """Reproduce the termination logic from _handle_responses (py_executor.py).
+
+    Returns:
+        "terminate" | "stats_only" | "skip"
+    """
+    force_terminate_for_partial_reuse = (
+        enable_partial_reuse_for_disagg and not is_vswa and pp_size == 1
+    )
+    if request.is_disagg_context_complete_state:
+        return "stats_only"
+    elif force_terminate_for_partial_reuse:
+        return "terminate"
+    elif not request.is_disagg_context_transmission_state:
+        return "terminate"
+    return "skip"
+
+
+def _make_request(complete_state, transmission_state):
+    req = Mock()
+    req.is_disagg_context_complete_state = complete_state
+    req.is_disagg_context_transmission_state = transmission_state
+    return req
+
+
+class TestDisaggTerminationGuard:
+    """Verify _handle_responses does not double-terminate DISAGG_CONTEXT_COMPLETE
+    requests that were already cleaned up by _check_disagg_ctx_cache_transfer_status
+    (nvbug/5961736)."""
+
+    def test_normal_path_skips_context_complete(self):
+        """Without partial reuse, CONTEXT_COMPLETE goes to stats only."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, False, False, 1) == "stats_only"
+
+    def test_normal_path_skips_transmission_in_progress(self):
+        """Without partial reuse, TRANS_IN_PROGRESS is skipped (still in flight)."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, False, False, 1) == "skip"
+
+    def test_normal_path_terminates_regular_request(self):
+        """Without partial reuse, a normal finished request is terminated."""
+        req = _make_request(complete_state=False, transmission_state=False)
+        assert _classify_termination(req, False, False, 1) == "terminate"
+
+    def test_partial_reuse_terminates_non_complete(self):
+        """With partial reuse, non-CONTEXT_COMPLETE requests are terminated."""
+        for complete, transmission in [(False, True), (False, False)]:
+            req = _make_request(complete, transmission)
+            assert _classify_termination(req, True, False, 1) == "terminate"
+
+    def test_partial_reuse_skips_context_complete(self):
+        """With partial reuse, CONTEXT_COMPLETE still goes to stats only."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, True, False, 1) == "stats_only"
+
+    def test_partial_reuse_disabled_by_vswa(self):
+        """VSWA disables partial reuse path, falling back to normal logic."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, True, True, 1) == "stats_only"
+
+    def test_partial_reuse_disabled_by_pp(self):
+        """PP > 1 disables partial reuse path, falling back to normal logic."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, True, False, 2) == "stats_only"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _compute_scheduled_tokens with KV cache reuse chunk-shift logic
+# ---------------------------------------------------------------------------
+
+
+def _make_ctx_request(
+    context_chunk_size,
+    context_remaining_length,
+    estimated_reusable_tokens=0,
+    is_first_context_chunk=True,
+    context_current_position=0,
+):
+    """Helper to create a mock context request for token computation tests."""
+    req = Mock()
+    req.context_chunk_size = context_chunk_size
+    req.context_remaining_length = context_remaining_length
+    req.estimated_reusable_tokens = estimated_reusable_tokens
+    req.is_first_context_chunk = is_first_context_chunk
+    req.context_current_position = context_current_position
+    return req
+
+
+def _make_gen_request(num_draft_tokens=0):
+    """Helper to create a mock generation request."""
+    req = Mock()
+    req.num_draft_tokens = num_draft_tokens
+    return req
+
+
+class TestComputeScheduledTokens:
+    """Tests for PyExecutor._compute_scheduled_tokens.
+
+    Validates the chunk-shift aware token accounting: setPrepopulatedPromptLen
+    shifts the chunk window right by the reused amount rather than shrinking it.
+    Non-last chunks cost chunkSize; only last chunks cost remaining - reusable.
+    """
+
+    def test_no_reuse(self):
+        """Without reuse, compute = chunk_size."""
+        ctx = [_make_ctx_request(context_chunk_size=100, context_remaining_length=100)]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 100
+
+    def test_last_chunk_with_reuse(self):
+        """Last chunk (reusable + chunk >= remaining): compute = chunk - reusable."""
+        # promptLen=100, reusable=60, chunk=100 (full context)
+        # 60 + 100 >= 100 → last chunk → compute = max(1, 100 - 60) = 40
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=100, context_remaining_length=100, estimated_reusable_tokens=60
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 40
+
+    def test_non_last_chunk_with_reuse(self):
+        """Non-last chunk (reusable + chunk < remaining): compute = chunk_size.
+
+        This is the core chunk-shift scenario. The old formula would compute
+        max(0, 25 - 30) = 0, but the correct cost is 25 because the chunk
+        window shifts right rather than shrinking.
+        """
+        # promptLen=100, reusable=30, chunk=25
+        # 30 + 25 = 55 < 100 → non-last chunk → compute = 25
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=25, context_remaining_length=100, estimated_reusable_tokens=30
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 25
+
+    def test_non_first_chunk_ignores_reuse(self):
+        """Reusable tokens only apply to the first context chunk."""
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=50,
+                context_remaining_length=50,
+                estimated_reusable_tokens=30,
+                is_first_context_chunk=False,
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 50
+
+    def test_v2_scheduler_position_advanced(self):
+        """V2 scheduler: context_current_position already advanced past reuse.
+
+        reusable_in_chunk = max(0, 30 - 30) = 0 → no credit → compute = chunk.
+        """
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=50,
+                context_remaining_length=70,
+                estimated_reusable_tokens=30,
+                context_current_position=30,
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 50
+
+    def test_min_compute_is_one(self):
+        """Compute cost is floored at 1 even when reusable >= chunk_size."""
+        # chunk=10, remaining=10, reusable=15 → last chunk → max(1, 10-15) = 1
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=10, context_remaining_length=10, estimated_reusable_tokens=15
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 1
+
+    def test_generation_tokens(self):
+        """Generation requests contribute 1 + num_draft_tokens each."""
+        gen = [_make_gen_request(3), _make_gen_request(0)]
+        assert PyExecutor._compute_scheduled_tokens([], gen) == (1 + 3) + (1 + 0)
+
+    def test_mixed_context_and_generation(self):
+        """Combined context (with chunk-shift) and generation tokens."""
+        # Non-last chunk: compute = 25
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=25, context_remaining_length=100, estimated_reusable_tokens=30
+            )
+        ]
+        gen = [_make_gen_request(2)]
+        # 25 ctx + (1 + 2) gen = 28
+        assert PyExecutor._compute_scheduled_tokens(ctx, gen) == 28
+
+    def test_multiple_ctx_requests_mixed_chunks(self):
+        """Multiple context requests: one non-last chunk, one last chunk."""
+        # req0: non-last chunk → compute = 20
+        req0 = _make_ctx_request(
+            context_chunk_size=20, context_remaining_length=100, estimated_reusable_tokens=30
+        )
+        # req1: last chunk (reuse=10, chunk=50, remaining=50) → 10+50>=50
+        # → compute = max(1, 50-10) = 40
+        req1 = _make_ctx_request(
+            context_chunk_size=50, context_remaining_length=50, estimated_reusable_tokens=10
+        )
+        assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40
+
+
+# ---------------------------------------------------------------------------
+# Tests for event-loop crash propagation to _await_single_response callers.
+#
+# nvbug 6038228: when PyExecutor._event_loop_wrapper crashed (e.g. KV cache
+# OOM), the main thread parked in _await_single_response would block forever
+# because is_shutdown was never set / observed by the wait predicate. The fix
+# stashes the original error in self._event_loop_error, sets is_shutdown +
+# notifies in _executor_loop_cleanup, and re-raises the error from
+# _await_single_response so callers exit promptly with a meaningful message.
+#
+# We exercise the actual PyExecutor methods by binding them to a lightweight
+# stub that carries only the attributes those methods touch.
+# ---------------------------------------------------------------------------
+
+
+class _ResponseStub:
+    """Minimal stub carrying only the state used by _await_single_response."""
+
+    def __init__(self):
+        self.response_lock = threading.Lock()
+        self.response_cv = threading.Condition(self.response_lock)
+        self.responses = {}
+        self.is_shutdown = False
+        self._event_loop_error = None
+
+    # Bind the real production method so the test exercises real code.
+    _await_single_response = PyExecutor._await_single_response
+
+
+class TestAwaitSingleResponseShutdown:
+    """_await_single_response must not block forever when the event loop dies."""
+
+    def test_returns_response_when_available(self):
+        """Normal path: response exists, returned and consumed."""
+        stub = _ResponseStub()
+        stub.responses = {7: ["resp_a", "resp_b"]}
+
+        result = stub._await_single_response(id=7, timeout=1.0)
+        assert result == ["resp_a", "resp_b"]
+        assert 7 not in stub.responses
+
+    def test_returns_response_even_during_shutdown(self):
+        """If a response was enqueued before shutdown it is still returned;
+        the shutdown branch only fires when nothing is queued for this id."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub._event_loop_error = RuntimeError("crash")
+        stub.responses = {7: ["resp"]}
+
+        result = stub._await_single_response(id=7, timeout=1.0)
+        assert result == ["resp"]
+
+    def test_raises_on_shutdown_with_event_loop_error(self):
+        """When the event loop crashed, _await_single_response surfaces the
+        original error as RuntimeError instead of hanging."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+        stub._event_loop_error = RuntimeError("KV cache OOM")
+
+        with pytest.raises(RuntimeError, match="Event loop terminated"):
+            stub._await_single_response(id=42, timeout=1.0)
+
+    def test_raises_on_shutdown_without_event_loop_error(self):
+        """Shutdown without a stored error still raises rather than blocking
+        — distinguishes "shutdown" from "timed out without shutdown"."""
+        stub = _ResponseStub()
+        stub.is_shutdown = True
+
+        with pytest.raises(RuntimeError, match="Event loop shut down"):
+            stub._await_single_response(id=42, timeout=1.0)
+
+    def test_returns_empty_on_timeout(self):
+        """Pre-fix behaviour: a bare timeout (no shutdown, no response) used
+        to KeyError. The fix returns an empty list to match the documented
+        timeout contract used elsewhere in the executor API."""
+        stub = _ResponseStub()
+        result = stub._await_single_response(id=99, timeout=0.01)
+        assert result == []
+
+    def test_wakes_up_when_shutdown_set_from_another_thread(self):
+        """Real-world scenario: main thread is parked in
+        _await_single_response while the event-loop thread crashes and
+        triggers _executor_loop_cleanup, which sets is_shutdown + notifies.
+        The waiter must wake and re-raise."""
+        stub = _ResponseStub()
+        original_error = RuntimeError("simulated event-loop crash")
+
+        def crash_after_delay():
+            time.sleep(0.05)
+            stub._event_loop_error = original_error
+            with stub.response_cv:
+                stub.is_shutdown = True
+                stub.response_cv.notify_all()
+
+        crash_thread = threading.Thread(target=crash_after_delay, daemon=True)
+        crash_thread.start()
+
+        with pytest.raises(RuntimeError, match="Event loop terminated"):
+            stub._await_single_response(id=1, timeout=5.0)
+
+        crash_thread.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _executor_loop_cleanup ordering (notify before PP wait).
+# ---------------------------------------------------------------------------
+
+
+class _CleanupStub:
+    """Stub for _executor_loop_cleanup: records the order in which the
+    shutdown notification and PP-handle wait happen."""
+
+    def __init__(self, pp_handles_raise=False):
+        self.response_lock = threading.Lock()
+        self.response_cv = threading.Condition(self.response_lock)
+        self.is_shutdown = False
+        self.shutdown_event = threading.Event()
+        self.num_micro_batches = 1
+        self.send_handles = {}
+        self.send_schedule_handles = {}
+        self.send_expected_batch_num_handles = {}
+        self._pp_handles_raise = pp_handles_raise
+        self._events: list = []
+
+        original_notify = self.response_cv.notify_all
+
+        def record_notify():
+            self._events.append("notify_all")
+            original_notify()
+
+        self.response_cv.notify_all = record_notify
+
+    def wait_on_pp_send_handles(self, handles, idx):
+        self._events.append(f"wait_pp_{idx}")
+        if self._pp_handles_raise:
+            raise RuntimeError("PP send handle in bad state")
+
+    _executor_loop_cleanup = PyExecutor._executor_loop_cleanup
+
+
+class TestExecutorLoopCleanup:
+    """Cleanup must wake waiters BEFORE doing potentially-blocking PP work,
+    and a PP-handle exception must not skip the shutdown notification."""
+
+    def test_notify_happens_before_pp_wait(self):
+        stub = _CleanupStub()
+        stub._executor_loop_cleanup()
+
+        assert stub._events[0] == "notify_all"
+        assert "wait_pp_0" in stub._events
+        assert stub._events.index("notify_all") < stub._events.index("wait_pp_0")
+        assert stub.is_shutdown is True
+        assert stub.shutdown_event.is_set()
+
+    def test_pp_wait_exception_does_not_skip_notify(self):
+        """If wait_on_pp_send_handles raises, the shutdown notification
+        must still have happened (it ran first), and cleanup must not
+        propagate the error so the executor thread terminates cleanly."""
+        stub = _CleanupStub(pp_handles_raise=True)
+        stub._executor_loop_cleanup()
+
+        assert stub.is_shutdown is True
+        assert "notify_all" in stub._events

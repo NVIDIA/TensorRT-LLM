@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for EP sharding transformation."""
 
 from functools import partial
@@ -18,7 +32,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils._graph import lint, recompile
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
@@ -73,9 +87,9 @@ def _run_ep_shard_job(
             assert "mapping_config" in moe_node.kwargs, (
                 f"Mapping config not found in MoE node {moe_node.name}"
             )
-            # deserialize the mapping config string to dict
-            mapping_config = deserialize_mapping(moe_node.kwargs["mapping_config"])
-            return mapping_config.enable_attention_dp
+            # deserialize the mapping config string to DistConfig
+            dc = DistConfig.deserialize(moe_node.kwargs["mapping_config"])
+            return dc.enable_attention_dp
     else:
 
         def transform_check(gm):

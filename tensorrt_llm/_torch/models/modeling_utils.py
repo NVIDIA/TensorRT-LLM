@@ -303,7 +303,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx in range(num_hidden_layers):
+            layer = self.layers[layer_idx]
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
@@ -324,6 +325,17 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 has_pp_layer and layer_idx == pp_layer_list[-1])
             if is_last_pp_layer and not mapping.is_last_pp_rank():
                 layer.forward = forward_before_send(layer.forward)
+
+        # Extra layers (e.g., MTP speculative layers) appended beyond
+        # the base model. Skip their forward on all ranks so they are
+        # no-ops in the main decoder loop, but preserve weights on the
+        # last PP rank where the MTP draft worker needs them.
+        for layer_idx in range(num_hidden_layers, len(self.layers)):
+            layer = self.layers[layer_idx]
+            if hasattr(layer, 'skip_forward'):
+                layer.forward = layer.skip_forward
+            if not mapping.is_last_pp_rank():
+                remove_weights(layer)
 
 
 class PostInitCaller(type):
@@ -401,7 +413,7 @@ class DecoderModelForCausalLM(nn.Module,
                     self.lm_head.weight.data.copy_(x)
 
         # use embedding weights in lm_head if tie word embedding is enabled
-        if config.pretrained_config.tie_word_embeddings:
+        if getattr(config.pretrained_config, 'tie_word_embeddings', False):
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
                 "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
@@ -514,6 +526,19 @@ class DecoderModelForCausalLM(nn.Module,
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
+                        # Reset _weights_created so create_weights() in
+                        # __post_init__ will re-create this module's weights
+                        # with the updated (non-quantized) config. Some
+                        # wrappers (e.g. ConfigurableMoE) expose
+                        # _weights_created as a read-only property that
+                        # delegates to a child backend module — that backend
+                        # is itself an nn.Module child and will be visited
+                        # separately, so swallow the resulting AttributeError.
+                        if hasattr(module, '_weights_created'):
+                            try:
+                                module._weights_created = False
+                            except AttributeError:
+                                pass
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()
@@ -553,6 +578,63 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    def setup_aliases(self) -> None:
+        """Wire structural Python references between modules.
+
+        This stage is for module-tree structure only, such as assigning
+        cross-layer module references or shared module aliases. It must not
+        read or mutate tensor values, so callers may run it before weight bytes
+        are available, materialized, or transformed.
+
+        The method is intentionally idempotent. Reassigning the same module
+        reference should preserve the same module graph, matching
+        ``torch.nn.Module.__setattr__`` semantics.
+
+        Returns:
+            None.
+        """
+
+    def transform_weights(self) -> None:
+        """Apply one-shot post-load transformations to weight tensors.
+
+        This stage is for irreversible or layout-changing tensor operations,
+        such as fusing weights or converting quantized weight representations.
+        Subclasses that migrate transform logic here should return early when
+        ``_weights_transformed`` is already true, and set it only after the
+        transform succeeds. Orchestrators that replace the underlying tensors
+        with fresh, untransformed bytes are responsible for resetting that flag.
+
+        Returns:
+            None.
+        """
+
+    def cache_derived_state(self) -> None:
+        """Recompute Python-side state derived from currently loaded weights.
+
+        This stage is reserved for idempotent recomputation from real tensors,
+        such as cached scalars, validation results, or fingerprints. It should
+        not perform one-shot weight transforms. Callers may run it after weight
+        bytes arrive from any loading or sharing mechanism.
+
+        Returns:
+            None.
+        """
+
+    def post_load_weights(self) -> None:
+        """Run the default staged post-load hook sequence.
+
+        Existing model-loading paths continue to call this method for backward
+        compatibility. More specialized loaders can call individual stages when
+        they need a subset of alias setup, tensor transformation, or derived
+        state recomputation.
+
+        Returns:
+            None.
+        """
+        self.setup_aliases()
+        self.transform_weights()
+        self.cache_derived_state()
 
     def forward(
         self,
@@ -673,12 +755,13 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
+        registered = False
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls.__name__ == model_cls.__name__:
+            if registered_cls is model_cls:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
                     vision_encoder_cls, vlm_base_model)
-                break
-        else:
+                registered = True
+        if not registered:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."
@@ -742,6 +825,12 @@ def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
 
 
+_GEMMA4_ARCHITECTURES = (
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+)
+
+
 def get_model_architecture(
         model_config: TConfig) -> Tuple[Type[nn.Module], str]:
     cls = None
@@ -752,8 +841,13 @@ def get_model_architecture(
         raise RuntimeError(f"Model architecture is not provided.")
 
     if cls is None:
-        raise RuntimeError(
-            f"Unknown model architecture: {model_config.architectures[0]}")
+        arch = model_config.architectures[0]
+        if arch in _GEMMA4_ARCHITECTURES:
+            raise RuntimeError(
+                f"Gemma4 model support requires transformers>=5.5.0, "
+                f"please upgrade: pip install 'transformers>=5.5.0' "
+                f"(architecture: {arch}).")
+        raise RuntimeError(f"Unknown model architecture: {arch}")
     return cls, model_config.architectures[0]
 
 
@@ -896,7 +990,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             # skip load weights if tie word embeddings is enabled and layer is lm_head
-            if model.config.tie_word_embeddings and name.startswith("lm_head"):
+            if getattr(model.config, 'tie_word_embeddings',
+                       False) and name.startswith("lm_head"):
                 return
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
