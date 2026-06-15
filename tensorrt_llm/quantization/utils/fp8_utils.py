@@ -29,6 +29,17 @@ def ceil_to_ue8m0(x: torch.Tensor):
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
+def _is_e8m0_compatible_scale(scale: torch.Tensor) -> bool:
+    if scale.dtype != torch.float32:
+        return False
+    if not torch.all(torch.isfinite(scale) & (scale > 0)).item():
+        return False
+
+    mantissa_mask = (1 << 23) - 1
+    scale_bits = scale.contiguous().view(torch.int32)
+    return torch.all((scale_bits & mantissa_mask) == 0).item()
+
+
 @nvtx_range("[DG] quantization")
 @torch.compile(dynamic=True)
 def per_token_cast_to_fp8_e8m0(
@@ -105,6 +116,8 @@ def resmooth_to_fp8_e8m0(
 
     weight = weight.cuda()
     weight_scale = weight_scale.cuda()
+    if _is_e8m0_compatible_scale(weight_scale):
+        return weight, weight_scale
 
     orig_shape = weight.shape
     M, K = orig_shape[-2:]
