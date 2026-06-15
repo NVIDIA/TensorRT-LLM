@@ -5771,7 +5771,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Int32, (n_rows, top_k),
                 stride_order=(1, 0),
                 assumed_align=16)
-            # seqlen_sorted=False compiles the LJF indirection out via
+            # seqlen_sorted=False compiles the row-reorder indirection out via
             # const_expr → no order_row read → fake = None (mirrors the
             # out_values optional pattern). seqlen_sorted=True compiles
             # the indirection in; fake shape = batch (n_batch) since
@@ -5962,7 +5962,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # seqlen_sorted = (order_row is not None). When True the
             # kernel resolves the owning row via order_row[req] * next_n
-            # + nn so longer rows hit earlier waves (LJF). order_row is
+            # + nn so longer rows hit earlier waves (row reorder by
+            # descending seq_len). order_row is
             # request-level (shape == seq_lens.shape).
             seqlen_sorted = order_row is not None
             if seqlen_sorted:
@@ -5999,15 +6000,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # ``out_values = None``  — return_output_values=False, kernel
             #                          skips STG.value.
             # ``order_row``           — None when seqlen_sorted=False (no
-            #                          LJF indirection), else the
+            #                          row-reorder indirection), else the
             #                          caller-provided request-level
             #                          dispatch order.
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
                                   output_indices, order_row)
 
     # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
-    # into this op to activate the kernel's ``seqlen_sorted=True`` LJF
-    # branch (longer rows land in earlier waves). argsort runs on device,
+    # into this op to activate the kernel's ``seqlen_sorted=True`` row-
+    # reorder branch (longest-job-first dispatch — longer rows land in
+    # earlier waves). argsort runs on device,
     # graph-safe. Recommended gate:
     #   num_rows > num_sms  AND  max_seq_len >= 64 * 1024
     # Stricter (theoretically exact) form is
@@ -6055,8 +6057,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 processing one row via DSMEM + cluster sync). ``None``
                 (default) delegates to the wrapper's auto-dispatch heuristic
                 based on (N, BS); pass an explicit int to pin the choice.
-            order_row: Optional request-level LJF (longest-job-first)
-                dispatch order. When provided, must be ``int32`` on CUDA
+            order_row: Optional request-level row-reorder (longest-job-first)
+                dispatch order — typically a descending argsort of
+                ``seq_lens``. When provided, must be ``int32`` on CUDA
                 with ``shape == seq_lens.shape``; ``order_row[i]`` is the
                 original request_id of the i-th-priority request. The
                 kernel then resolves the owning row per CTA as
