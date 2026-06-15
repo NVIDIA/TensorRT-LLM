@@ -488,6 +488,7 @@ zai-org/GLM-5-FP8:
 # (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
 # baseline accuracy.
 stepfun-ai/Step-3.7-Flash:
+  - accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES
