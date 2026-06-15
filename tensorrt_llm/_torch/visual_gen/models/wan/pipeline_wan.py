@@ -388,6 +388,7 @@ class WanPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         height: int = 720,
         width: int = 1280,
@@ -396,7 +397,6 @@ class WanPipeline(BasePipeline):
         guidance_scale: Optional[float] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
-        seed: int = 42,
         max_sequence_length: int = 512,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):

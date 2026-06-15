@@ -24,8 +24,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
+from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
 
 try:
@@ -134,6 +135,12 @@ class AttentionMetadata:
     # For generation-phase sequence, the value is the token number of its context phase.
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
+
+    # Explicit query/KV sequence boundaries for attention kernels that operate
+    # on packed varlen context inputs. These are sequence/segment boundaries,
+    # not necessarily request boundaries.
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
 
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these

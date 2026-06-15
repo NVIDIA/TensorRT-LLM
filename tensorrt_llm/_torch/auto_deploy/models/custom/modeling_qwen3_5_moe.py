@@ -55,12 +55,22 @@ from ..hf import (
 )
 
 try:
+    from tensorrt_llm.inputs.content_format import ContentFormat
     from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
+    from tensorrt_llm.inputs.registry import (
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        MultimodalPlaceholderMetadata,
+        MultimodalPlaceholderPlacement,
+    )
     from tensorrt_llm.inputs.utils import VideoData
 except ModuleNotFoundError:
+    ContentFormat = None
     MultimodalInput = None
     apply_mm_hashes = None
     hexdigest_to_int32 = None
+    MULTIMODAL_PLACEHOLDER_REGISTRY = None
+    MultimodalPlaceholderMetadata = None
+    MultimodalPlaceholderPlacement = None
     VideoData = None
 
 
@@ -625,26 +635,25 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Intentionally left untagged: with no ``layer_type`` it defaults to "unknown",
+        # which the ``shard_layers`` inclusion whitelist excludes -> kept replicated.
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
             tp_mode="colwise",
-            layer_type="shared_expert",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise",
-            layer_type="shared_expert",
         )
         return torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise",
-            layer_type="shared_expert",
         )
 
 
@@ -3075,3 +3084,17 @@ AutoModelForCausalLMFactory.register_custom_model_cls(
     "Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration
 )
 Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)
+
+if MULTIMODAL_PLACEHOLDER_REGISTRY is not None:
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        "qwen3_5_moe",
+        MultimodalPlaceholderMetadata(
+            placeholder_map={
+                "image": "<|vision_start|><|image_pad|><|vision_end|>",
+                "video": "<|vision_start|><|video_pad|><|vision_end|>",
+            },
+            placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+            placeholders_separator="",
+            content_format=ContentFormat.STRING,
+        ),
+    )

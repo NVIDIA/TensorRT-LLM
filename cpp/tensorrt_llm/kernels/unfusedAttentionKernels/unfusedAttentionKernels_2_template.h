@@ -900,12 +900,20 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
 
         // Cos/sin cache.
+        // For mrope, index by `bounded_global_token_idx` (batch-flat
+        // per-token entry) rather than `rotary_position` (request-internal
+        // KV-cache position). Mrope cos/sin is a per-token, per-axis quantity
+        // -- different requests at the same `rotary_position` have different
+        // (T, H, W) coordinates, so sharing a buffer slot across requests
+        // (which request-internal indexing forces once `batch_idx` is
+        // dropped) silently corrupts attention for multi-context-request
+        // batches. Batch-flat indexing also lets Python materialize cos/sin
+        // for only the current iteration's tokens (no chunk_end_pos padding).
         [[maybe_unused]] float2 const* rotary_coef_cache_buffer = nullptr;
         if (params.mrope_rotary_cos_sin != nullptr)
         {
-            rotary_coef_cache_buffer = params.mrope_rotary_cos_sin
-                + batch_idx * params.rotary_embedding_max_positions * params.half_rotary_dim
-                + static_cast<size_t>(rotary_position) * params.half_rotary_dim;
+            rotary_coef_cache_buffer
+                = params.mrope_rotary_cos_sin + static_cast<size_t>(bounded_global_token_idx) * params.half_rotary_dim;
         }
         else
         {

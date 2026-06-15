@@ -35,6 +35,7 @@ from defs.trt_test_alternative import check_call
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
+WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 DIFFUSERS_REFERENCE_VIDEO = "diffusers_reference.mp4"
 WAN_T2V_PROMPT = "A cute cat playing piano"
@@ -1295,5 +1296,198 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
             "--output_path",
             output_path,
         ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/models/flux1.py with NVFP4 config end-to-end.
+
+    Validates that the FLUX.1-dev example script and ``configs/flux1-dev-fp4-1gpu.yaml``
+    work together as documented. Uses the local FLUX.1-dev checkpoint and the shared
+    NVFP4 dynamic-quant config.
+    """
+    model_path = _lpips_model_path("FLUX.1-dev")
+    _skip_if_missing(model_path, "FLUX.1-dev checkpoint", is_dir=True)
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux1_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux1_output.png")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux1.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "flux1-dev-fp4-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/models/flux2.py with NVFP4 config end-to-end.
+
+    Validates that the FLUX.2-dev example script and ``configs/flux2-dev-fp4-1gpu.yaml``
+    work together as documented. Uses the local FLUX.2-dev checkpoint and the shared
+    NVFP4 dynamic-quant config.
+    """
+    model_path = _lpips_model_path("FLUX.2-dev")
+    _skip_if_missing(model_path, "FLUX.2-dev checkpoint", is_dir=True)
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux2_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux2_output.png")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux2.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "flux2-dev-fp4-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/models/ltx2.py with NVFP4 config end-to-end.
+
+    Validates that the LTX-2 example script and ``configs/ltx2-t2v-fp4-1gpu.yaml``
+    work together as documented. The Gemma3 text encoder is passed separately via
+    ``--text_encoder_path`` because the shared YAML intentionally omits it to keep
+    the config model-path-agnostic.
+    """
+    model_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
+    _skip_if_missing(model_path, "LTX-2 checkpoint")
+    text_encoder_path = _ltx2_lpips_text_encoder_path()
+    _skip_if_missing(text_encoder_path, "LTX-2 text encoder (gemma-3-12b-it)", is_dir=True)
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "ltx2_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "ltx2_output.mp4")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx2.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "ltx2-t2v-fp4-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--text_encoder_path",
+            text_encoder_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
+
+    Validates that the Wan I2V example script and ``configs/wan2.2-i2v-fp4-1gpu.yaml``
+    work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
+    checkpoint and the default input image (cat_piano.png) bundled with the examples.
+    """
+    scratch_space = conftest.llm_models_root()
+    model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
+    if not os.path.isdir(model_path):
+        pytest.skip(
+            f"Model not found: {model_path} "
+            f"(set LLM_MODELS_ROOT or place {WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH} under models root)"
+        )
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "wan_i2v_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "wan_i2v_output.mp4")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_i2v.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "wan2.2-i2v-fp4-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/models/cosmos3_ti2v.py with FP8 config end-to-end.
+
+    Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
+    work together as documented. Uses the local Cosmos3-Nano checkpoint and
+    the shared FP8 dynamic-quant config.
+    """
+    model_path = _lpips_model_path("Cosmos3-Nano")
+    _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_example")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "cosmos3_output.mp4")
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "cosmos3_ti2v.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "cosmos3-nano-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--prompt",
+            "A serene mountain landscape with snow-capped peaks and a flowing river",
+            "--output_path",
+            output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
