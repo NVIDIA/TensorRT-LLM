@@ -26,6 +26,7 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -641,10 +642,9 @@ class Cosmos3LanguageModel(nn.Module):
         return cached_kv
 
 
-class Cosmos3VFMTransformer(nn.Module):
+class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
-        super().__init__()
-        self.model_config = model_config
+        super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
 
         self.hidden_size = pretrained_config.hidden_size
@@ -679,7 +679,7 @@ class Cosmos3VFMTransformer(nn.Module):
         )
         tp_size = vgm.tp_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
-        cp_size = vgm.cp_size if vgm else 1
+        ring_size = vgm.ring_size if vgm else 1
         head_divisibility_factor = tp_size * ulysses_size
 
         if (ulysses_size > 1 or tp_size > 1) and (
@@ -692,10 +692,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 f"TP * Ulysses size ({tp_size} * {ulysses_size})"
             )
 
-        if cp_size > 1:
-            # Context parallelism is not compatible with Cosmos3 cross-attention: its forward()
-            # TODO: Re-enable once Ring/Attn2D PRs with cross-attention support have landed.
-            raise NotImplementedError("Context parallelism is not supported for Cosmos3. ")
+        if ring_size > 1:
+            # Ring parallelism is not compatible with Cosmos3 cross-attention.
+            raise NotImplementedError(
+                "Ring parallelism is not supported for Cosmos3 cross-attention."
+            )
 
         self.language_model = Cosmos3LanguageModel(model_config)
 

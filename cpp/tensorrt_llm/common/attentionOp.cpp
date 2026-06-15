@@ -265,17 +265,6 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         = mAttentionChunkSize && !tc::getEnvDisableChunkedAttentionInGenPhase() ? *mAttentionChunkSize : INT_MAX;
     xqaParams.max_attention_window_size = generationsParams.max_attention_window_size;
     xqaParams.cyclic_attention_window_size = generationsParams.cyclic_attention_window_size;
-    // Treat the layer as sliding-window-causal only for explicit SWA masks or
-    // in-attention positional encodings whose max position exceeds the layer window.
-    // Exclude sparse attention and chunked attention
-    bool const has_in_attention_pos_encoding = mPositionEmbeddingType != PositionEmbeddingType::kLEARNED_ABSOLUTE;
-    // chunked_attention_size is set to INT_MAX above as the "disabled" sentinel.
-    bool const chunked_attention_enabled
-        = xqaParams.chunked_attention_size > 0 && xqaParams.chunked_attention_size != INT_MAX;
-    xqaParams.is_sliding_window = !mUseSparseAttention && !chunked_attention_enabled
-        && ((mMaskType == AttentionMaskType::SLIDING_WINDOW_CAUSAL)
-            || (has_in_attention_pos_encoding && generationsParams.max_attention_window_size > 0
-                && generationsParams.max_attention_window_size < mRotaryEmbeddingMaxPositions));
     xqaParams.max_blocks_per_sequence = generationsParams.max_blocks_per_sequence;
     xqaParams.sink_token_length = generationsParams.sink_token_length;
     xqaParams.max_past_kv_length = generationsParams.max_past_kv_length;
@@ -305,6 +294,10 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
     xqaParams.helix_is_inactive_rank = generationsParams.helix_is_inactive_rank;
     xqaParams.softmax_stats = generationsParams.softmax_stats;
+    xqaParams.trtllm_gen_jit_warmup = generationsParams.trtllm_gen_jit_warmup;
+    xqaParams.trtllm_gen_jit_warmup_max_num_requests = mMaxNumRequests;
+    xqaParams.trtllm_gen_jit_warmup_max_seq_len_q = mMaxContextLength;
+    xqaParams.trtllm_gen_jit_warmup_max_seq_len_kv = mMaxSeqLen;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
@@ -1136,13 +1129,11 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
-        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
-        // PagedKv on this path because the strides do not depend on mMaxSeqLenKv, and extra
-        // KV CTAs exit early through seqLensKvPtr.
-        // TODO: mirror the is_swa + W+1 logic from xqaDispatcher.cpp when MLA gains SWA
-        // support (also requires adding Sliding cubins to the MLA gen kernel set).
-        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
+        tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
+        tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
+        tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
+        tllmRunnerParams.mJITWarmupMaxSeqLenKv = mMaxSeqLen;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
@@ -1593,8 +1584,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
     // moreover, attn mask for cross attn should be set separately (see below)
     BuildDecoderInfoParams<T> decoder_params{};
+    int32_t const* precomputedCuQSeqlens = params.cu_q_seqlens;
+    int32_t const* precomputedCuKvSeqlens = params.cu_kv_seqlens != nullptr ? params.cu_kv_seqlens
+        : params.cu_q_seqlens != nullptr                                    ? params.cu_q_seqlens
+                                                                            : nullptr;
     decoder_params.seqQOffsets = workspaceViews.cuQSeqlens;
     decoder_params.seqKVOffsets = workspaceViews.cuKvSeqlens;
+    decoder_params.precomputedSeqQOffsets = precomputedCuQSeqlens;
+    decoder_params.precomputedSeqKVOffsets = precomputedCuKvSeqlens;
     decoder_params.seqCpPartialOffsets = workspaceViews.cuCpPartialSeqlens;
     decoder_params.cpSize = mCpSize;
     decoder_params.packedMaskRowOffsets = workspaceViews.cuMaskRows;
@@ -1637,6 +1634,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
     invokeBuildDecoderInfo(decoder_params, stream);
     sync_check_cuda_error(stream);
+
+    int32_t const* contextCuQSeqlens
+        = precomputedCuQSeqlens != nullptr ? precomputedCuQSeqlens : workspaceViews.cuQSeqlens;
+    int32_t const* contextCuKvSeqlens
+        = precomputedCuKvSeqlens != nullptr ? precomputedCuKvSeqlens : workspaceViews.cuKvSeqlens;
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // Override the attention mask produced by invokeBuildDecoderInfo().
@@ -1702,8 +1704,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPreprocess<T>(attention_input, workspaceViews.gatherInBuffer,
-                workspaceViews.gatherOutBuffer, params, workspaceViews.cuQSeqlens, workspaceViews.cuCpPartialSeqlens,
-                stream);
+                workspaceViews.gatherOutBuffer, params, contextCuQSeqlens, workspaceViews.cuCpPartialSeqlens, stream);
             attention_input = workspaceViews.gatherInBuffer;
             sync_check_cuda_error(stream);
         }
@@ -1733,9 +1734,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Indicate if chunked-context is used (i.e. q_seqlen > kv_seqlen).
         preprocessingParams.cache_seq_lens = params.sequence_lengths;
         preprocessingParams.encoder_seq_lens = params.encoder_input_lengths;
-        preprocessingParams.cu_seq_lens = workspaceViews.cuQSeqlens;
+        preprocessingParams.cu_seq_lens = contextCuQSeqlens;
         // Cross-attention only.
-        preprocessingParams.cu_kv_seq_lens = workspaceViews.cuKvSeqlens;
+        preprocessingParams.cu_kv_seq_lens = contextCuKvSeqlens;
         preprocessingParams.rotary_embedding_inv_freq = workspaceViews.rotaryInvFreq;
         preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
@@ -1794,7 +1795,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
             params.mla_param->cache_type = cache_type;
-            params.mla_param->cu_q_seqlens = workspaceViews.cuQSeqlens;
+            params.mla_param->cu_q_seqlens = const_cast<int*>(contextCuQSeqlens);
+            params.mla_param->cu_kv_seqlens = const_cast<int*>(contextCuKvSeqlens);
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
             // Set BMM scales for FP8 context computation
             params.mla_param->bmm1_scale = workspaceViews.fmhaBmm1Scale;
@@ -1982,9 +1984,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fmhaParams.pagedKvCache = kv_cache_buffer;
             fmhaParams.pagedKvSfCache = kv_scale_cache_buffer;
         }
-        fmhaParams.cuQSeqLenPtr = workspaceViews.cuQSeqlens;
+        fmhaParams.cuQSeqLenPtr = contextCuQSeqlens;
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
-        fmhaParams.cuKvSeqLenPtr = workspaceViews.cuKvSeqlens;
+        fmhaParams.cuKvSeqLenPtr = contextCuKvSeqlens;
         fmhaParams.cuMaskRowsPtr = workspaceViews.cuMaskRows;
         fmhaParams.tileCounterPtr = workspaceViews.fmhaTileCounter;
         fmhaParams.scaleBmm1Ptr = workspaceViews.fmhaBmm1Scale;
@@ -1993,6 +1995,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
+        fmhaParams.trtllmGenJITWarmup = params.trtllm_gen_jit_warmup;
+        fmhaParams.trtllmGenJITWarmupMaxNumRequests = mMaxNumRequests;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenQ = mMaxContextLength;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenKv = mMaxSeqLen;
 
         // Sparse attention parameters
         if (useTllmGenSparseAttention())
@@ -2028,8 +2034,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
         {
             this->template ulyssesContextPostprocess<T>(workspaceViews.gatherOutBuffer,
-                reinterpret_cast<T*>(params.context_buf), workspaceViews.gatherInBuffer, params,
-                workspaceViews.cuQSeqlens, workspaceViews.cuCpPartialSeqlens, stream);
+                reinterpret_cast<T*>(params.context_buf), workspaceViews.gatherInBuffer, params, contextCuQSeqlens,
+                workspaceViews.cuCpPartialSeqlens, stream);
             sync_check_cuda_error(stream);
         }
 
@@ -3162,6 +3168,7 @@ int AttentionOp::initialize() noexcept
         fixedParams.isSpecDecoding = mIsSpecDecodingEnabled;
         fixedParams.hasAlibi = isALiBi();
         fixedParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
+        fixedParams.specDecodingTargetMaxGenLen = mSpecDecodingTargetMaxGenLen;
 
         mXqaDispatcher.reset(new XqaDispatcher(fixedParams));
 

@@ -467,21 +467,8 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids,
-                    multimodal_item_run_cu_offsets=request.multimodal_params.
-                    multimodal_input.multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=request.multimodal_params.
-                    multimodal_input.multimodal_run_positions,
-                    multimodal_run_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_run_lengths)
+                multimodal_input = request.multimodal_params.multimodal_input.to_binding(
+                    tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -606,8 +593,8 @@ class BaseWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
+                cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
@@ -621,7 +608,8 @@ class BaseWorker(GenerationExecutor):
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
+                    # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
@@ -832,6 +820,7 @@ class BaseWorker(GenerationExecutor):
         host_step_time_ms = stats[4] if len(stats) > 4 else None
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
+        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -890,6 +879,11 @@ class BaseWorker(GenerationExecutor):
         # comment in PyExecutor._profiler for the design rationale.
         if prev_device_step_time_ms is not None:
             stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+        # Batch-matched GPU forward time measured from the CUDA events around
+        # this record's _forward_step. This is the preferred field for
+        # ForwardPassMetrics wall_time.
+        if gpu_forward_time_ms is not None:
+            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
         # Scheduler mode for this record. "overlap" means iterLatencyMS
         # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
         # "non_overlap" means iterLatencyMS is itself the clean per-loop

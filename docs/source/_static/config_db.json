@@ -37,6 +37,18 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve nvidia/Qwen3.5-397B-A17B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.5.yaml",
+      "config_filename": "qwen3.5.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.5.yaml",
+      "config_path": "examples/configs/curated/qwen3.5.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.5.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+      "model_display_name": "Qwen3.5-397B-A17B (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",
+      "scenario": "Max Throughput"
+    },
+    {
       "command": "trtllm-serve Qwen/Qwen3-30B-A3B --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml",
       "config_filename": "qwen3.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.yaml",
@@ -3531,6 +3543,10 @@
     "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4": {
       "display_name": "Nemotron v3 Ultra (NVFP4)",
       "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+    },
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": {
+      "display_name": "Qwen3.5-397B-A17B (NVFP4)",
+      "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4"
     },
     "openai/gpt-oss-120b": {
       "display_name": "gpt-oss-120b",

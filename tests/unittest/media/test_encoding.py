@@ -78,10 +78,23 @@ def test_image_to_bytes_returns_nonempty_png():
     assert img.format == "PNG"
 
 
-def test_save_image_strips_batch_dim(tmp_path):
-    """save_image accepts (B, H, W, C) and writes the first slice."""
+def test_save_image_rejects_batched_tensor_size_gt_1(tmp_path):
+    """save_image raises ValueError for (B>1, H, W, C) tensors.
+
+    The single-path API requires the caller to disambiguate when the
+    tensor carries a real batch axis; see :func:`save_images` for the
+    multi-path fan-out.
+    """
     batched = torch.stack([_dummy_image(), _dummy_image(), _dummy_image()])
-    target = tmp_path / "first.png"
+    target = tmp_path / "out.png"
+    with pytest.raises(ValueError, match="batched tensor of size 3"):
+        save_image(batched, target)
+
+
+def test_save_image_accepts_batch_size_1(tmp_path):
+    """save_image accepts (1, H, W, C) — the leading axis is unwrapped."""
+    batched = _dummy_image().unsqueeze(0)
+    target = tmp_path / "single.png"
     saved = save_image(batched, target)
     assert Path(saved).exists()
     img = Image.open(saved)
