@@ -1030,6 +1030,20 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         allowed_tuple = tuple(self.allowed_backends)
         return (self.output_buffer_kind, self.output_dtype, allowed_tuple)
 
+    def should_profile_tactic_in_subprocess(
+        self,
+        custom_op: str,
+        inputs: List[torch.Tensor],
+        tactic,
+        tuning_config,
+        **kwargs,
+    ) -> bool:
+        # get_valid_tactics wraps every backend tactic as
+        # (backend_name, backend_tactic). Only the CuTe DSL backend JIT-compiles
+        # per tactic, so only delegate those to subprocess profiling.
+        return (isinstance(tactic, tuple) and len(tactic) == 2
+                and tactic[0] == "cutedsl")
+
     def _is_backend_allowed(self, backend_name: str) -> bool:
         """Check if a backend is allowed based on allowed_backends list."""
         return backend_name in self.allowed_backends

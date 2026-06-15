@@ -1,3 +1,4 @@
+import os
 import sys
 
 import pytest
@@ -162,6 +163,118 @@ def test_fp4_linear_cute_dsl(dtype, mnk):
     # compare
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12),
+                    reason="cutlass-dsl 4.1.0 requires Python 3.12+")
+@pytest.mark.skipif(
+    get_sm_version() not in [100, 103],
+    reason="This test is only supported in sm100 and sm103 architecture",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
+                    reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mnk", [(128, 7168, 16384)])
+def test_fp4_linear_cute_dsl_multiprocess(dtype, mnk, tmp_path, monkeypatch):
+    """Verify CuTe DSL NVFP4 GEMM tactics are JIT-compiled and profiled across
+    worker subprocesses (multiprocess autotuning):
+
+    1. The per-tactic cute.compile() JIT really runs in multiple worker
+       processes (proven via the per-PID debug markers).
+    2. No functional regression: the autotuned output matches the reference.
+    3. A real (non-fallback) tactic is selected by the autotuner.
+    """
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
+    torch.manual_seed(0)
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+
+    w = torch.randn((OUTPUT_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
+    w_sf_global = (448 * 6) / w.abs().max().float()
+    w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+
+    qc = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    l_fp4 = Linear(in_features=HIDDEN_SIZE,
+                   out_features=OUTPUT_SIZE,
+                   bias=False,
+                   dtype=dtype,
+                   quant_config=qc,
+                   nvfp4_allowed_backends=['cutedsl'])
+
+    w_sf_block_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
+        w_sf_block.cpu().view(pad_up(OUTPUT_SIZE, 128), -1)))
+    l_fp4.load_weights([{
+        'input_scale':
+        1.0 / x_sf_global.cpu(),
+        'weight':
+        w_fp4.cpu(),
+        'weight_scale':
+        w_sf_block_unswizzled.view(torch.float8_e4m3fn),
+        'weight_scale_2':
+        1.0 / w_sf_global.cpu()
+    }])
+    l_fp4 = l_fp4.cuda()
+    alpha_ref = 1.0 / (w_sf_global * x_sf_global)
+
+    # Enable multiprocess tactic profiling and record worker PIDs.
+    pid_dir = str(tmp_path / "mp_pids")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "1")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_WORKERS", "4")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "2")
+    # Surface (don't silently swallow) any worker failure so the test really
+    # exercises the subprocess path rather than falling back to local profiling.
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
+                       "0")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_DEBUG_PID_DIR", pid_dir)
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.shutdown_subprocess_pools()
+
+    try:
+        with torch.inference_mode(), autotune():
+            output = l_fp4.forward(x)
+        output = l_fp4.forward(x)
+    finally:
+        tuner.shutdown_subprocess_pools()
+
+    # 2. Functional correctness vs reference fp4 GEMM.
+    with torch.inference_mode():
+        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
+            x, x_sf_global, scaling_vector_size, False)
+        output_ref = torch.ops.trtllm.fp4_gemm(
+            x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, dtype)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref)
+
+    # 1. The JIT profiling really ran across multiple worker subprocesses.
+    child_pids = set()
+    if os.path.isdir(pid_dir):
+        child_pids = {
+            int(f.split("_")[1])
+            for f in os.listdir(pid_dir) if f.startswith("pid_")
+        }
+    assert len(child_pids) >= 2, (
+        f"Expected CuTe DSL JIT to be profiled across >=2 worker subprocesses, "
+        f"but only saw PIDs {sorted(child_pids)}")
+    assert os.getpid() not in child_pids, (
+        "Profiling ran in the parent process, not in worker subprocesses.")
+
+    # 3. A real (non-fallback) tactic was profiled and selected.
+    assert any(v > 0 for v in tuner.stats.tuned_op_profiled_configs.values()), (
+        "Autotuner did not profile any tactic.")
+    selected_tactics = [
+        tac for (_, tac, _) in tuner.profiling_cache.cache.values()
+    ]
+    assert any(tac != -1 for tac in selected_tactics), (
+        f"Expected a real autotuned tactic to be selected, got {selected_tactics}"
+    )
 
 
 def fp4_linear_perf_test(dtype, SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE):
