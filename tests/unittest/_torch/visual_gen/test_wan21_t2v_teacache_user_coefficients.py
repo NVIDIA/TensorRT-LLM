@@ -120,7 +120,7 @@ def _run_forward(coefficients: list, thresh: float, label: str) -> dict:
                 num_inference_steps=NUM_STEPS,
                 seed=SEED,
             )
-        stats = pipeline.transformer_cache_backend.get_stats()
+        stats = pipeline.cache_accelerator.get_stats()
     finally:
         del pipeline
         gc.collect()

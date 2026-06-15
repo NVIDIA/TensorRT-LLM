@@ -101,16 +101,6 @@ if TYPE_CHECKING:
     from .config import DiffusionPipelineConfig
 
 
-def _teacache_coefficients_are_explicit_user_override(teacache_cfg: Any) -> bool:
-    """Return True if teacache.coefficients should skip built-in variant table matching.
-
-    Only None means auto (use checkpoint path table). Any non-empty list, including
-    the identity polynomial [1.0, 0.0], is treated as an explicit user override.
-    """
-
-    return teacache_cfg.coefficients is not None
-
-
 class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
@@ -138,8 +128,6 @@ class BasePipeline(nn.Module):
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
-        # Wan 2.2 manual TeaCacheBackend pair; see WanPipeline.post_load_weights
-        self._teacache_backends: List[Any] = []
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -431,7 +419,7 @@ class BasePipeline(nn.Module):
         teacache_cfg = self.pipeline_config.teacache
         if teacache_cfg is None:
             return
-        if _teacache_coefficients_are_explicit_user_override(teacache_cfg):
+        if teacache_cfg.is_explicit_user_override():
             logger.info(
                 "TeaCache: Using user-configured coefficients "
                 "(skipping built-in checkpoint variant matching)"
@@ -441,6 +429,12 @@ class BasePipeline(nn.Module):
         teacache_explicit = teacache_cfg.model_dump(exclude_unset=True)
 
         if not coefficients:
+            if teacache_cfg.coefficients is None:
+                raise ValueError(
+                    "TeaCache is enabled but no polynomial coefficients were resolved. "
+                    "Set teacache.coefficients in VisualGenArgs, or use a pipeline and "
+                    "checkpoint whose path matches a built-in coefficient table."
+                )
             return
 
         checkpoint_path = (
@@ -487,11 +481,7 @@ class BasePipeline(nn.Module):
                 f"or use a checkpoint path that contains one of the variant keys."
             )
 
-    def _setup_cache_acceleration(
-        self,
-        model: Optional[nn.Module] = None,
-        coefficients: Optional[Dict] = None,
-    ) -> None:
+    def _setup_cache_acceleration(self) -> None:
         """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
 
         if getattr(self, "cache_accelerator", None) is not None:
@@ -510,28 +500,9 @@ class BasePipeline(nn.Module):
         if not use_teacache:
             return
 
-        self._apply_teacache_coefficients(coefficients)
-
-        teacache_cfg = cfg.teacache
-        if teacache_cfg is None or teacache_cfg.coefficients is None:
-            raise ValueError(
-                "TeaCache is enabled but no polynomial coefficients were resolved. "
-                "Set teacache.coefficients in VisualGenArgs, or use a pipeline and "
-                "checkpoint whose path matches a built-in coefficient table."
-            )
-
-        if model is None:
-            return
-
-        acc = TeaCacheAccelerator(cfg.teacache)
-        acc.wrap(model=model)
+        acc = TeaCacheAccelerator(self, cfg.teacache)
+        acc.wrap()
         self.cache_accelerator = acc
-
-    def _refresh_teacache_backends(self, total_steps: int) -> None:
-        """Reset manual TeaCache backends (e.g. Wan 2.2 dual transformers)."""
-        for backend in self._teacache_backends:
-            if backend is not None and backend.is_enabled():
-                backend.refresh(total_steps)
 
     def setup_parallel_vae(self):
         """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
@@ -1048,7 +1019,6 @@ class BasePipeline(nn.Module):
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
-        self._refresh_teacache_backends(total_steps)
 
         if self.rank == 0:
             if has_extra_streams:
@@ -1175,11 +1145,20 @@ class BasePipeline(nn.Module):
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
                         logger.info("Cache-DiT stats: %s", stats)
-                    elif "hit_rate" in stats:
-                        logger.info(
-                            f"TeaCache: {stats['hit_rate']:.1%} hit rate "
-                            f"({stats['cached']}/{stats['total']} steps)"
-                        )
+                    elif self.pipeline_config.cache_backend == "teacache":
+                        first_val = next(iter(stats.values()), None)
+                        if isinstance(first_val, dict):
+                            for key, s in stats.items():
+                                if "hit_rate" in s:
+                                    logger.info(
+                                        f"TeaCache {key}: {s['hit_rate']:.1%} hit rate "
+                                        f"({s['cached']}/{s['total']} steps)"
+                                    )
+                        elif "hit_rate" in stats:
+                            logger.info(
+                                f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                                f"({stats['cached']}/{stats['total']} steps)"
+                            )
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 

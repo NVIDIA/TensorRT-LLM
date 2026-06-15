@@ -333,6 +333,10 @@ class TeaCacheConfig(BaseCacheConfig):
             raise ValueError("TeaCache coefficients_2 list cannot be empty")
         return self
 
+    def is_explicit_user_override(self) -> bool:
+        """Return True if coefficients were set by the user and should skip built-in table matching."""
+        return self.coefficients is not None
+
 
 class CacheDiTConfig(BaseCacheConfig):
     """Configuration for Cache-DiT (DBCache, TaylorSeer, SCM).

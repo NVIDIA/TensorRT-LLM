@@ -1023,11 +1023,11 @@ class LTX2Pipeline(BasePipeline):
                 "LTXModel",
                 LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
             )
-            self._setup_cache_acceleration(self.transformer, coefficients=None)
+            self._setup_cache_acceleration()
 
         # Cache-DiT
         if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
-            self._setup_cache_acceleration(self.transformer, coefficients=None)
+            self._setup_cache_acceleration()
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width

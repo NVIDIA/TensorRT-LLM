@@ -171,7 +171,7 @@ def _assert_i2v_teacache(
             seed=INFER_SEED,
         )
 
-    stats = pipeline.transformer_cache_backend.get_stats()
+    stats = pipeline.cache_accelerator.get_stats()
 
     print(f"\n  ===== TeaCache — Wan 2.1 {model} single-stage {height}x{width} =====")
     print(

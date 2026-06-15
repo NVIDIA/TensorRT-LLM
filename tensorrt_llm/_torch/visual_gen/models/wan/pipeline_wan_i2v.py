@@ -13,7 +13,6 @@ from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT
 
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
-    TeaCacheBackend,
     register_extractor_from_config,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
@@ -329,14 +328,11 @@ class WanImageToVideoPipeline(BasePipeline):
                 )
 
             if not self.is_wan22_14b:
-                self._setup_cache_acceleration(
-                    self.transformer, coefficients=WAN_I2V_TEACACHE_COEFFICIENTS
-                )
-                self.transformer_cache_backend = self.cache_accelerator
+                self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
+                self._setup_cache_acceleration()
             else:
                 if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration(self.transformer, coefficients=None)
-                    self.transformer_cache_backend = self.cache_accelerator
+                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
@@ -347,7 +343,6 @@ class WanImageToVideoPipeline(BasePipeline):
             and self.transformer_2 is not None
             and self.pipeline_config.cache_backend == "teacache"
         ):
-            self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
             tc = self.pipeline_config.teacache
             if tc.coefficients is None or tc.coefficients_2 is None:
                 raise ValueError(
@@ -355,19 +350,7 @@ class WanImageToVideoPipeline(BasePipeline):
                     "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
                     "There is no built-in coefficient table for Wan 2.2."
                 )
-            cfg_high = tc.model_copy()
-            cfg_low = tc.model_copy(update={"coefficients": tc.coefficients_2})
-            logger.info("TeaCache: Initializing (Wan 2.2 I2V high-noise transformer)...")
-            self.cache_backend = TeaCacheBackend(cfg_high)
-            self.cache_backend.enable(self.transformer)
-            self.transformer_cache_backend = self.cache_backend
-            logger.info("TeaCache: Initializing (Wan 2.2 I2V low-noise transformer_2)...")
-            self.transformer_2_cache_backend = TeaCacheBackend(cfg_low)
-            self.transformer_2_cache_backend.enable(self.transformer_2)
-            self._teacache_backends = [
-                self.cache_backend,
-                self.transformer_2_cache_backend,
-            ]
+            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         dummy_image = PIL.Image.new("RGB", (width, height))

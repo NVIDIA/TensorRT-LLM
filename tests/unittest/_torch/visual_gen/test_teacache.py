@@ -109,13 +109,15 @@ class TestSetupTeacache:
         """Fails if TeaCache is on but the pipeline passes no coefficient table."""
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
         with pytest.raises(ValueError, match="no polynomial coefficients were resolved"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), None)
+            BasePipeline._apply_teacache_coefficients(pipeline, None)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
     def test_setup_cache_acceleration_raises_when_empty_table(self):
         """Same as no table: nothing to resolve from."""
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
         with pytest.raises(ValueError, match="no polynomial coefficients were resolved"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), {})
+            BasePipeline._apply_teacache_coefficients(pipeline, {})
+            BasePipeline._setup_cache_acceleration(pipeline)
 
     def test_matching_variant_selects_ret_steps_mode(self):
         """Nested table: use_ret_steps=True selects ret_steps coefficients."""
@@ -124,7 +126,8 @@ class TestSetupTeacache:
             "dev": {"standard": [1.0, 2.0, 3.0], "ret_steps": [4.0, 5.0]},
         }
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
+            BasePipeline._apply_teacache_coefficients(pipeline, coefficients)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.model_config.teacache.coefficients == [4.0, 5.0]
 
@@ -133,7 +136,8 @@ class TestSetupTeacache:
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
         coefficients = {"dev": [11.0, 22.0, 33.0]}
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
+            BasePipeline._apply_teacache_coefficients(pipeline, coefficients)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.model_config.teacache.coefficients == [11.0, 22.0, 33.0]
 
@@ -148,7 +152,8 @@ class TestSetupTeacache:
             },
         }
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), builtin)
+            BasePipeline._apply_teacache_coefficients(pipeline, builtin)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.model_config.teacache.coefficients == [1.0, 2.0]
         assert pipeline.model_config.teacache.teacache_thresh == 0.42
@@ -161,11 +166,11 @@ class TestSetupTeacache:
             coefficients=[1.0, 0.0],
         )
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(
+            BasePipeline._apply_teacache_coefficients(
                 pipeline,
-                MagicMock(),
                 {"dev": {"standard": [99.0, 99.0]}},
             )
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.model_config.teacache.coefficients == [1.0, 0.0]
 
@@ -177,7 +182,8 @@ class TestSetupTeacache:
             "schnell": {"standard": [10.0, 20.0]},
         }
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
+            BasePipeline._apply_teacache_coefficients(pipeline, coefficients)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.pipeline_config.teacache.coefficients == [1.0, 2.0, 3.0]
 
@@ -189,14 +195,14 @@ class TestSetupTeacache:
             "schnell": {"standard": [10.0, 20.0]},
         }
         with pytest.raises(ValueError, match="No coefficients found"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), coefficients)
+            BasePipeline._apply_teacache_coefficients(pipeline, coefficients)
 
     def test_disabled_teacache_is_noop(self):
         """No-op when cache is None (TeaCache not selected)."""
         pipeline = self._make_pipeline_mock("FLUX.1-dev")
         pipeline.pipeline_config = pipeline.pipeline_config.model_copy(update={"cache": None})
 
-        BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), {"dev": [1.0]})
+        BasePipeline._setup_cache_acceleration(pipeline)
         assert pipeline.cache_accelerator is None
 
     def test_user_configured_coefficients_skip_variant_matching(self):
@@ -210,7 +216,8 @@ class TestSetupTeacache:
             "dev": {"standard": [1.0, 2.0, 3.0], "ret_steps": [4.0, 5.0]},
         }
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), builtin)
+            BasePipeline._apply_teacache_coefficients(pipeline, builtin)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.model_config.teacache.coefficients == [0.25, 0.5, 0.75]
 
@@ -225,7 +232,8 @@ class TestSetupTeacache:
             "dev": {"standard": [1.0, 2.0, 3.0], "ret_steps": [4.0, 5.0]},
         }
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(pipeline, MagicMock(), builtin)
+            BasePipeline._apply_teacache_coefficients(pipeline, builtin)
+            BasePipeline._setup_cache_acceleration(pipeline)
 
         assert pipeline.model_config.teacache.coefficients == [9.0, 8.0, 7.0]
 
@@ -265,35 +273,32 @@ class TestTeaCacheConfigValidation:
             TeaCacheConfig(coefficients_2=[])
 
 
-class TestRefreshTeacacheBackends:
-    """BasePipeline._refresh_teacache_backends walks _teacache_backends only."""
+class TestTeaCacheAcceleratorRefresh:
+    """TeaCacheAccelerator.refresh delegates to all registered backends."""
+
+    def _make_accelerator(self, backends):
+        from tensorrt_llm._torch.visual_gen.cache.teacache_accelerator import TeaCacheAccelerator
+
+        acc = TeaCacheAccelerator.__new__(TeaCacheAccelerator)
+        acc._backends = backends
+        return acc
 
     def test_single_backend_refresh(self):
-        shared = MagicMock()
-        shared.is_enabled.return_value = True
-        pipe = SimpleNamespace(_teacache_backends=[shared])
-        BasePipeline._refresh_teacache_backends(pipe, 50)
-        shared.refresh.assert_called_once_with(50)
+        backend = MagicMock()
+        acc = self._make_accelerator([(MagicMock(), backend)])
+        acc.refresh(50)
+        backend.refresh.assert_called_once_with(50)
 
     def test_refreshes_two_distinct_backends(self):
-        b1 = MagicMock()
-        b1.is_enabled.return_value = True
-        b2 = MagicMock()
-        b2.is_enabled.return_value = True
-        pipe = SimpleNamespace(_teacache_backends=[b1, b2])
-        BasePipeline._refresh_teacache_backends(pipe, 30)
+        b1, b2 = MagicMock(), MagicMock()
+        acc = self._make_accelerator([(MagicMock(), b1), (MagicMock(), b2)])
+        acc.refresh(30)
         b1.refresh.assert_called_once_with(30)
         b2.refresh.assert_called_once_with(30)
 
-    def test_skips_disabled_backends(self):
-        active = MagicMock()
-        active.is_enabled.return_value = True
-        disabled = MagicMock()
-        disabled.is_enabled.return_value = False
-        pipe = SimpleNamespace(_teacache_backends=[active, disabled])
-        BasePipeline._refresh_teacache_backends(pipe, 10)
-        active.refresh.assert_called_once_with(10)
-        disabled.refresh.assert_not_called()
+    def test_no_backends_is_noop(self):
+        acc = self._make_accelerator([])
+        acc.refresh(10)  # should not raise
 
 
 class TestFlux2TeacacheTable:
@@ -314,9 +319,8 @@ class TestFlux2TeacacheTable:
             )
         )
         with patch.object(TeaCacheBackend, "enable"):
-            BasePipeline._setup_cache_acceleration(
-                pipeline, MagicMock(), FLUX2_TEACACHE_COEFFICIENTS
-            )
+            BasePipeline._apply_teacache_coefficients(pipeline, FLUX2_TEACACHE_COEFFICIENTS)
+            BasePipeline._setup_cache_acceleration(pipeline)
         assert pipeline.model_config.teacache.coefficients is not None
         assert len(pipeline.model_config.teacache.coefficients) >= 2
 
@@ -441,15 +445,14 @@ class TestExplicitTeaCacheCoefficientsRequired:
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
             ):
                 with patch(
-                    "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.TeaCacheBackend"
+                    "tensorrt_llm._torch.visual_gen.cache.teacache_accelerator.TeaCacheBackend"
                 ) as TB:
                     TB.side_effect = [backend_a, backend_b]
                     WanPipeline.post_load_weights(pipe)
         assert TB.call_count == 2
         assert mock_enable.call_count == 2
-        assert pipe.transformer_cache_backend is pipe.cache_backend
-        assert pipe.transformer_2_cache_backend is not None
-        assert pipe.transformer_2_cache_backend is not pipe.cache_backend
+        assert pipe.cache_accelerator is not None
+        assert len(pipe.cache_accelerator.backends) == 2
 
     def test_wan22_t2v_transformer_gets_coefficients_and_transformer_2_gets_coefficients_2(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
@@ -473,7 +476,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
             ):
                 with patch(
-                    "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.TeaCacheBackend"
+                    "tensorrt_llm._torch.visual_gen.cache.teacache_accelerator.TeaCacheBackend"
                 ) as TB:
                     TB.return_value = MagicMock()
                     WanPipeline.post_load_weights(pipe)
@@ -508,7 +511,7 @@ class TestExplicitTeaCacheCoefficientsRequired:
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.register_extractor_from_config"
             ):
                 with patch(
-                    "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.TeaCacheBackend"
+                    "tensorrt_llm._torch.visual_gen.cache.teacache_accelerator.TeaCacheBackend"
                 ) as TB:
                     TB.return_value = MagicMock()
                     WanImageToVideoPipeline.post_load_weights(pipe)

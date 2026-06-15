@@ -328,7 +328,8 @@ class Flux2Pipeline(BasePipeline):
                     )
                 )
 
-            self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+            self._apply_teacache_coefficients(FLUX2_TEACACHE_COEFFICIENTS)
+            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):
