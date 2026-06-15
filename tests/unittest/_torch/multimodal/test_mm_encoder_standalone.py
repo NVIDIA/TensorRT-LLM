@@ -41,8 +41,7 @@ _MODEL_DIR_PARAMS = [
     pytest.param(_LLAVA_DIR, id="llava_7b"),
     pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
     pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
-    pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
-                 id="qwen3_30b_a3b_fp8"),
+    pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL, id="qwen3_30b_a3b_fp8"),
 ]
 _PD_DISAGG_PARAMS = [
     pytest.param(False, id="no_pd_disagg"),
