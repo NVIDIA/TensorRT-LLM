@@ -306,7 +306,6 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
   - unittest/trt/model/eagle # 1 mins on H100
-  - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
