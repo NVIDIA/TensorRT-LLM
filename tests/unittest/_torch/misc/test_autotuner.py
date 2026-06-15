@@ -1,3 +1,4 @@
+import contextlib
 import enum
 import itertools
 import json
@@ -1546,3 +1547,280 @@ def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
                               *zip(*[(world_size, )] * world_size)))
     for got in results:
         assert got == ["rank0", "rank1"]
+
+
+# ===========================================================================
+# Multiprocess tactic profiling (generalized subprocess profiling)
+# ===========================================================================
+
+
+class _SubprocOffRunner(TunableRunner):
+    """Does not opt into subprocess profiling (default)."""
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0, 1, 2]
+
+    def forward(self, inputs, *, tactic=-1, **kwargs):
+        return inputs[0]
+
+
+class _SubprocOnRunner(_SubprocOffRunner):
+    """Opts in declaratively via the JIT-property flag."""
+    tactic_compile_dominates = True
+
+
+class _SubprocOverrideRunner(_SubprocOffRunner):
+    """Opts in by overriding the hook (per-tactic granularity)."""
+
+    def should_profile_tactic_in_subprocess(self, custom_op, inputs, tactic,
+                                            tuning_config, **kwargs):
+        return tactic != 1  # delegate everything except tactic 1
+
+
+def _pad_dim0_by_8(inputs):
+    """Deliberately NON-idempotent, shape-changing inputs_pre_hook.
+
+    Each application grows dim0 by 8, so the shape the runner observes tells us
+    exactly how many times the hook was applied.
+    """
+    x = inputs[0]
+    padded = torch.cat([x, x.new_zeros((8, ) + tuple(x.shape[1:]))], dim=0)
+    return [padded] + list(inputs[1:])
+
+
+class _MPParityRunner(TunableRunner):
+    """Opt-in runner whose runtime cost is data-independent and tactic-ordered
+    (tactic 0 is always fastest), using extra compute rather than delay_kernel
+    so ordering is deterministic. Records "pid_<pid>_m<dim0>" for each forward()
+    so the test can confirm both that work ran in worker subprocesses and which
+    input shape those workers actually saw."""
+    tactic_compile_dominates = True
+
+    def __init__(self, pid_dir=None):
+        self.pid_dir = pid_dir
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0, 1]
+
+    def forward(self, inputs, *, tactic=-1, **kwargs):
+        x = inputs[0]
+        if self.pid_dir is not None:
+            os.makedirs(self.pid_dir, exist_ok=True)
+            open(
+                os.path.join(self.pid_dir,
+                             f"pid_{os.getpid()}_m{int(x.shape[0])}"),
+                "a").close()
+        # Shape-agnostic (works for non-square inputs produced by the pre-hook).
+        out = torch.tanh(x) + 1.0
+        for _ in range(0 if tactic in (0, -1) else 64):
+            out = torch.tanh(out) + 1.0
+        return out
+
+    def unique_id(self):
+        return (type(self).__name__, )
+
+
+def test_subprocess_profiling_logic(monkeypatch):
+    """Opt-in hook, tensor (de)serialization, enable-gating (env / distributed /
+    strategy), tactic selection, worker-count & lock-path config, and the
+    persistent-pool lifecycle for multiprocess tactic profiling."""
+    cfg = TuningConfig()
+
+    # --- JIT-property default + override hook ---
+    assert _SubprocOffRunner().should_profile_tactic_in_subprocess(
+        "op", [], 0, cfg) is False
+    assert _SubprocOnRunner().should_profile_tactic_in_subprocess(
+        "op", [], 0, cfg) is True
+    ov = _SubprocOverrideRunner()
+    assert ov.should_profile_tactic_in_subprocess("op", [], 0, cfg) is True
+    assert ov.should_profile_tactic_in_subprocess("op", [], 1, cfg) is False
+
+    # --- tensor spec round-trip; non-tensors map to None ---
+    t = torch.empty_strided((3, 5), (5, 1), dtype=torch.float16)
+    rebuilt = autotuner._make_subprocess_tensor(
+        autotuner._serialize_subprocess_tensor_spec(t), None)
+    assert (rebuilt.shape, rebuilt.dtype,
+            rebuilt.stride()) == (t.shape, t.dtype, t.stride())
+    assert autotuner._serialize_subprocess_tensor_spec(7)["is_tensor"] is False
+    assert autotuner._make_subprocess_tensor({"is_tensor": False}, None) is None
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: False)
+
+    # --- opt-in by default: with the env var unset, multiprocess profiling is
+    # OFF, so merging this feature cannot change existing tuning behaviour. ---
+    monkeypatch.delenv("TLLM_AUTOTUNER_MULTIPROCESS", raising=False)
+    assert tuner._is_subprocess_profiling_enabled(cfg) is False
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(),
+                                         [torch.randn(4, 8)], [0, 1, 2],
+                                         cfg) == []
+
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "1")
+
+    # --- enable-gating: distributed and unsupported strategy disable it ---
+    assert tuner._is_subprocess_profiling_enabled(cfg) is True
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: True)
+    assert tuner._is_subprocess_profiling_enabled(cfg) is False
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: False)
+    assert tuner._is_subprocess_profiling_enabled(
+        TuningConfig(distributed_tuning_strategy=DistributedTuningStrategy.MERGE
+                     )) is False
+
+    # A PP-only / CP-only MPI job has tp_size == 1, so _is_distributed() is
+    # False, but it is still multi-rank and must NOT spawn worker processes.
+    tuner.mapping = Mapping(world_size=2, rank=0, pp_size=2)
+    assert tuner._is_multi_rank() is True
+    assert tuner._is_subprocess_profiling_enabled(cfg) is False
+    tuner.mapping = Mapping()
+    assert tuner._is_multi_rank() is False
+    assert tuner._is_subprocess_profiling_enabled(cfg) is True
+
+    # --- tactic selection: opt-in, override exclusion, opt-out, threshold ---
+    x = torch.randn(4, 8)
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(), [x],
+                                         [0, 1, 2], cfg) == [0, 1, 2]
+    assert tuner._get_subprocess_tactics("op", _SubprocOverrideRunner(), [x],
+                                         [0, 1, 2], cfg) == [0, 2]
+    assert tuner._get_subprocess_tactics("op", _SubprocOffRunner(), [x],
+                                         [0, 1, 2], cfg) == []
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "5")
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(), [x],
+                                         [0, 1, 2], cfg) == []
+    monkeypatch.delenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", raising=False)
+
+    # --- worker count + lock path config ---
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_WORKERS", "3")
+    assert tuner._get_subprocess_worker_count() == 3
+    monkeypatch.delenv("TLLM_AUTOTUNER_MP_WORKERS", raising=False)
+    assert tuner._get_subprocess_worker_count() >= 1
+    assert tuner._get_subprocess_profile_lock_path(
+        0) != tuner._get_subprocess_profile_lock_path(1)
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_PROFILE_LOCK", "0")
+    assert tuner._get_subprocess_profile_lock_path(0) is None
+
+    # --- persistent pool: lazily created, reused, recreated after shutdown ---
+    try:
+        shards1 = tuner._get_persistent_pool(None)
+        assert tuner._get_persistent_pool(None) is shards1
+        assert len(shards1) == tuner._get_subprocess_worker_count()
+        assert tuner._atexit_registered is True
+        tuner.shutdown_subprocess_pools()
+        assert tuner._subprocess_pools == {}
+        assert tuner._get_persistent_pool(None) is not shards1
+    finally:
+        tuner.shutdown_subprocess_pools()
+
+    # --- sticky affinity: a tactic always maps to the same worker shard, and
+    # distinct tactics spread across shards (so compiles still run in parallel
+    # while each tactic keeps hitting its own worker's kernel cache).
+    assert tuner._tactic_shard_index("tac_a", 8) == tuner._tactic_shard_index(
+        "tac_a", 8)
+    assert tuner._tactic_shard_index("anything", 1) == 0
+    spread = {tuner._tactic_shard_index(f"tactic_{i}", 8) for i in range(32)}
+    assert len(spread) > 1, f"tactics must spread across shards, got {spread}"
+
+    # --- worker failure: pool is drained/discarded and work falls back locally,
+    # and the fallback measures under the exclusive lock (so it can never
+    # overlap a surviving worker's timed window on the same device).
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
+                       "1")
+    lock_states = []
+
+    def recording_lock(lock_path, exclusive):
+        lock_states.append(exclusive)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(autotuner, "_subprocess_profile_lock", recording_lock)
+    monkeypatch.setattr(
+        tuner, "_get_persistent_pool", lambda dev:
+        (_ for _ in ()).throw(RuntimeError("pool is broken")))
+    monkeypatch.setattr(tuner,
+                        "_profile_single_kernel",
+                        lambda runner, inputs, tactic, tuning_config,
+                        use_cuda_graph=False, **kw: 1.0 + float(tactic))
+
+    out = tuner._profile_tactics_in_subprocesses("op", _SubprocOnRunner(), 0,
+                                                 [x], [0, 1, 2], cfg)
+    assert [t for t, _, _ in out] == [0, 1, 2]
+    assert [tm for _, tm, _ in out] == [1.0, 2.0, 3.0], out
+    assert all(err is None for _, _, err in out), out
+    # every fallback measurement took the lock EXCLUSIVELY
+    assert lock_states == [True, True, True], lock_states
+    assert tuner._subprocess_pools == {}, "broken pool must be discarded"
+
+    # --- hard off-switch disables delegation entirely ---
+    monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "0")
+    assert tuner._get_subprocess_tactics("op", _SubprocOnRunner(), [x],
+                                         [0, 1, 2], cfg) == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="End-to-end subprocess profiling requires CUDA.")
+def test_multiprocess_profiling_runs_and_matches_local(tmp_path, monkeypatch):
+    """End-to-end: an opt-in runner profiled in subprocesses selects the same
+    (correct) best tactic as local profiling, and work really runs in workers.
+
+    Also covers two regressions:
+    - ``inputs_pre_hook`` must be applied EXACTLY ONCE on the subprocess path
+      (applying it in both the parent and the worker breaks shape-changing or
+      non-idempotent hooks).
+    - ``autotune()`` must release the worker pool on exit, so workers (and their
+      CUDA contexts) never outlive the tuning phase.
+    """
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
+                       "0")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_WORKERS", "2")
+    monkeypatch.setenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "2")
+
+    x = torch.randn(64, 64, device="cuda")
+    # AutoTuner is a process-wide singleton shared with the other tests here, so
+    # neutralize any leftover distributed state (which would silently disable
+    # delegation) and guarantee the worker pool is released on any exit path.
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "_is_distributed", lambda: False)
+    monkeypatch.setattr(tuner, "_is_multi_rank", lambda: False)
+
+    try:
+        # Local profiling baseline.
+        monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "0")
+        tuner.clear_cache()
+        tuner.shutdown_subprocess_pools()
+        with autotune():
+            _, local_tactic = tuner.choose_one("mp_parity", [_MPParityRunner()],
+                                               TuningConfig(), [x])
+
+        # Multiprocess profiling. The pre_hook pads dim0 by +8 and is NOT
+        # idempotent, so the shape the runner observes reveals how many times it
+        # was applied.
+        pid_dir = str(tmp_path / "pids")
+        monkeypatch.setenv("TLLM_AUTOTUNER_MULTIPROCESS", "1")
+        tuner.clear_cache()
+        tuner.shutdown_subprocess_pools()
+        mp_runner = _MPParityRunner(pid_dir)
+        with autotune():
+            _, mp_tactic = tuner.choose_one(
+                "mp_parity", [mp_runner],
+                TuningConfig(inputs_pre_hook=_pad_dim0_by_8), [x])
+    finally:
+        tuner.shutdown_subprocess_pools()
+
+    child_pids, observed_dim0 = set(), set()
+    if os.path.isdir(pid_dir):
+        for f in os.listdir(pid_dir):
+            # marker file name: "pid_<pid>_m<dim0>"
+            parts = f.split("_")
+            child_pids.add(int(parts[1]))
+            observed_dim0.add(int(parts[2][1:]))
+    # Work really happened in worker subprocesses (not the parent).
+    assert child_pids and os.getpid() not in child_pids
+    # inputs_pre_hook applied exactly once (64 + 8), not twice (64 + 16).
+    assert observed_dim0 == {
+        x.shape[0] + 8
+    }, (f"inputs_pre_hook should be applied exactly once on the subprocess "
+        f"path; runner observed dim0={sorted(observed_dim0)}")
+    # autotune() released the pool on exit -- no leaked workers/CUDA contexts.
+    assert tuner._subprocess_pools == {}, (
+        "autotune() must shut down subprocess pools on exit")
+    # Same correct best tactic via both paths.
+    assert local_tactic == 0
+    assert mp_tactic == 0
