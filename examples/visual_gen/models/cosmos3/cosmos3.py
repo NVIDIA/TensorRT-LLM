@@ -13,11 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-r"""Cosmos3 Text(+Image)-to-Video generation.
+r"""Cosmos3 Text(+Image)-to-Video(+Audio) generation.
 
-Cosmos3 OmniMoT supports text-only (T2V) and image-conditioned (I2V/TI2V)
-generation from the same checkpoint. Pass ``--image_path`` to condition on a
-reference frame, or use ``prompts/i2v.json`` which includes a ``vision_path``.
+Cosmos3 supports four generation modes from a single checkpoint:
+
+- **T2V** — text-to-video (``prompts/t2v.json``).
+- **T2I** — text-to-image (``prompts/t2i.json``);
+  emits a still frame (use ``--output_type image`` / a non-video ``--output_path``).
+- **I2V / TI2V** — image-conditioned video (``prompts/i2v.json``). Condition on a reference frame via the prompt
+  file's ``vision_path`` or ``--image_path``. The image may be a local path, a
+  ``file://`` / ``http(s)://`` URL, or a ``data:`` URI.
+- **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
+  ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
+  ``vision_path`` for image-conditioned audio-video (TI2AV).
 
 Checkpoints (pass the Hub ID or local path via ``--model``):
 
@@ -41,36 +49,43 @@ To run without guardrails (you are responsible for safe deployment)::
 
 Deployment configs (``examples/visual_gen/configs/``):
 
-- ``cosmos3-nano-1gpu.yaml`` — 1 GPU, FP8 dynamic quant
+- ``cosmos3-nano-1gpu.yaml`` — 1 GPU
 - ``cosmos3-super-4gpu.yaml`` — 4 GPU, CFG + Ulysses + parallel VAE
 
 Example prompts live under ``prompts/`` (mirroring ``cosmos3-internal/inputs/omni``).
 
 Usage::
 
-    # Text-to-video
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+    # T2V: text-to-video
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt_file prompts/t2v.json \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
-    # Image-to-video (vision_path is read from the prompt file)
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+    # I2V/TI2V: image-conditioned video (vision_path is read from the prompt file;
+    # local path, file://, http(s):// URL, or data: URI are all accepted)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt_file prompts/i2v.json \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
-    # Text-to-video with audio
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+    # I2V with an explicit conditioning image (overrides the prompt file)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt_file prompts/i2v.json \
+        --image_path https://example.com/frame.jpg \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # T2AV: text-to-video with synchronized audio
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt_file prompts/t2av.json \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
-    # Text-to-image
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+    # T2I: text-to-image
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt_file prompts/t2i.json \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
         --output_path output.png
 
     # Inline prompt (``--prompt`` or a JSON file path)
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt "A cute puppy playing with a ball in a park" \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 """
@@ -142,7 +157,7 @@ def resolve_prompt_and_options(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cosmos3 Text(+Image)-to-Video example")
+    parser = argparse.ArgumentParser(description="Cosmos3 Text(+Image)-to-Video(+Audio) example")
     parser.add_argument(
         "--model",
         type=str,
@@ -183,7 +198,7 @@ def main():
     parser.add_argument(
         "--output_path",
         type=str,
-        default="cosmos3_ti2v_output.mp4",
+        default="cosmos3_output.mp4",
         help="Path to save the output video",
     )
     parser.add_argument(
