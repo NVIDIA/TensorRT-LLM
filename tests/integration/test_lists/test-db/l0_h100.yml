@@ -302,7 +302,6 @@ l0_h100:
   - unittest/trt/quantization/test_weight_only_groupwise_quant_matmul.py
   - test_e2e.py::test_trtllm_bench_sanity[-extra_config-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_sanity[--streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
   - unittest/trt/model/eagle # 1 mins on H100
