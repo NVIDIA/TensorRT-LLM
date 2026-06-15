@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sample post-processing hooks for the trtllm-serve hook integration test
-(TRTLLM-12622).
+"""Sample post-processing hooks for the trtllm-serve hook integration test.
 
 These are deliberately stateless and deterministic so the test can assert the
 client-visible effect regardless of the (non-deterministic) model output. Each

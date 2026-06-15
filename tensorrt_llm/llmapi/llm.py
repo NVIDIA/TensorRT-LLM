@@ -89,9 +89,8 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         inst.tokenizer = tokenizer
         inst._streaming = generation_result._streaming
         inst._prompt = prompt
-        # User post-processing hook (TRTLLM-12622) owned by the LLM instance;
-        # threaded onto the result the user holds (the object the in-proxy detok
-        # runs on) alongside the tokenizer. None when unconfigured.
+        # User post-processing hook; threaded onto the result the
+        # user holds, where the in-proxy detok runs. None when unconfigured.
         inst._post_processor_hook = post_processor_hook
         return inst
 
@@ -238,11 +237,9 @@ class BaseLLM:
                      "yellow")
         self.mpi_session = self.args.mpi_session
 
-        # Build this LLM's post-processing hook instance (TRTLLM-12622), if
-        # configured. Ownership is per-instance: this instance is threaded onto
-        # the results this LLM produces (in-proxy detok path), and each postproc
-        # worker builds its own from the same import path. Resolving here also
-        # fails fast on a bad import path at startup rather than per-request.
+        # Build this LLM's post-processing hook for the in-proxy detok path (each
+        # postproc worker builds its own). Resolving here fails fast on a bad
+        # import path at startup rather than per-request.
         _post_processor_path = getattr(self.args, "post_processor", None)
         self._post_processor_hook = (
             load_post_processor_hook(_post_processor_path)

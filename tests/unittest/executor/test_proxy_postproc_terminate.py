@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for proxy late-response handling after a hook terminate.
 
-When a post-processor hook (TRTLLM-12622) returns ``terminate`` the result is
+When a post-processor hook returns ``terminate`` the result is
 marked done and popped from the
 proxy's ``_results`` map, but the engine may still have in-flight responses for
 the same ``client_id`` (abort is async). ``GenerationExecutorProxy.dispatch_result_task``

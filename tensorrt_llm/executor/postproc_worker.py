@@ -47,10 +47,9 @@ class PostprocWorkerConfig:
     ''' The config for the postprocess worker. '''
     num_postprocess_workers: int = 0
     postprocess_tokenizer_dir: Optional[str] = None
-    # Dotted import path of the user post-processing hook (TRTLLM-12622), or
-    # None. Propagated into each postproc worker process so the detok chokepoint
-    # can apply it. NOTE: distinct from ``PostprocParams.post_processor`` above,
-    # which is the per-endpoint response *formatter* (a Callable), not this hook.
+    # Dotted import path of the user post-processing hook, or
+    # None. NOTE: distinct from ``PostprocParams.post_processor``, which is the
+    # per-endpoint response *formatter* (a Callable), not this hook.
     post_processor_hook: Optional[str] = None
 
     @property
@@ -100,7 +99,7 @@ class PostprocWorker:
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
-            post_processor_hook (Optional[str]): Import path of the user post-processing hook (TRTLLM-12622). This worker builds and owns one instance, threaded onto each record it creates.
+            post_processor_hook (Optional[str]): Import path of the user post-processing hook; built once and threaded onto each record.
         '''
 
         self._records: Dict[int, GenerationResult] = {}
@@ -121,9 +120,8 @@ class PostprocWorker:
         # Load the tokenizer and share in all records
         self._tokenizer = load_hf_tokenizer(tokenizer_dir)
 
-        # Build the user post-processing hook once (TRTLLM-12622) and own it for
-        # this worker's lifetime, mirroring the tokenizer above; threaded onto
-        # each record in ``_handle_input``. None when unconfigured.
+        # Build the user post-processing hook once, like the
+        # tokenizer above; threaded onto each record in ``_handle_input``.
         self._post_processor_hook = (
             load_post_processor_hook(post_processor_hook)
             if post_processor_hook else None)
@@ -159,9 +157,8 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
-                # Thread this worker's owned hook onto the record (TRTLLM-12622)
-                # for the detok chokepoint. Set here, not via the record_creator
-                # signature, so custom record_creators keep working.
+                # Thread the hook onto the record here rather than
+                # via record_creator, so custom record_creators keep working.
                 self._records[
                     req_id]._post_processor_hook = self._post_processor_hook
                 if input.disaggregated_params is not None:
@@ -222,10 +219,9 @@ class PostprocWorker:
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
-                # A post-processing hook that returned `terminate` forces the
-                # record done (TRTLLM-12622); honor it so the stream stops
-                # promptly and the record is popped, instead of waiting for the
-                # engine's own is_final.
+                # A `terminate` verdict forces the record done;
+                # honor it so the stream stops and the record is popped without
+                # waiting for the engine's own is_final.
                 if record is not None and record._done:
                     is_final = True
                 should_abort = record._aborted if record else False
@@ -297,9 +293,7 @@ def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
                          tokenizer_dir: str,
                          record_creator: Callable,
                          post_processor_hook: Optional[str] = None):
-    # The worker owns its post-processing hook instance (TRTLLM-12622): pass the
-    # import path through to PostprocWorker, which builds it once and threads it
-    # onto each record for the detok chokepoint in DetokenizedGenerationResultBase.
+    # Pass the hook import path; PostprocWorker builds it once.
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,
                             tokenizer_dir=tokenizer_dir,

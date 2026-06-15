@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end tests for the trtllm-serve post-processing hook (TRTLLM-12622).
+"""End-to-end tests for the trtllm-serve post-processing hook.
 
 Launches a real ``trtllm-serve`` with ``--post_processor`` pointing at one of
 the sample hooks in ``_postproc_hook_samples`` and asserts the client-visible
@@ -110,7 +110,7 @@ def test_completions_detokenize_false_does_not_bypass_hook(
 ):
     """A server-side hook is a guardrail and must run even when the client sets
     ``detokenize=false`` — that flag controls only the returned channel, not
-    whether the hook executes (TRTLLM-12622)."""
+    whether the hook executes."""
     completion = client.completions.create(
         model=model_name,
         prompt="Hello, my name is",

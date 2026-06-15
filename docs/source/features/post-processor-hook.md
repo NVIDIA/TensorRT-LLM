@@ -186,6 +186,13 @@ form — so keying state on `chunk.request_id` is sufficient to keep concurrent 
 - **Reasoning / tool parsing**: the hook runs before the reasoning and tool-call parsers. A hook that
   rewrites or suppresses text may desync those parsers; prefer `terminate`, or apply such hooks to
   plain-text requests.
+- **Hook errors fail closed**: if the hook raises, the request fails with an error rather than serving
+  the un-vetted chunk (the server and other requests stay alive). A returned verdict with an unknown
+  action is rejected the same way.
+- **`n` > 1 / beam search**: `emit` and `suppress` act per output sequence, but `terminate` cancels the
+  **whole** request (all sequences), because the engine request is the unit of cancellation — a
+  `terminate` on one candidate ends the others too. Hooks needing per-sequence state should key on
+  `(request_id, output_index)`.
 
 ## Tests
 

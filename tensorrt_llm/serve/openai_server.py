@@ -456,10 +456,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                          post_processor: Optional[str]) -> None:
         """Reject ``--post_processor`` combined with a harmony/gpt-oss model.
 
-        The harmony output path rebuilds the client-visible output from raw
-        output token ids rather than the detokenized text, so the text-based
-        post-processing hook (TRTLLM-12622) cannot act there. Fail fast at
-        startup rather than silently bypassing a guardrail.
+        The harmony output path is rebuilt from raw token ids, not detokenized
+        text, so the text-based hook cannot act there.
         """
         if use_harmony and post_processor:
             raise ValueError(

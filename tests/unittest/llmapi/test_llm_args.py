@@ -225,7 +225,7 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
 
 
 def test_post_processor_rejected_with_skip_tokenizer_init():
-    """post_processor + skip_tokenizer_init must fail fast (TRTLLM-12622).
+    """post_processor + skip_tokenizer_init must fail fast.
 
     The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
     detokenized text) must be rejected rather than silently disabling it.

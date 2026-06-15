@@ -828,9 +828,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         )
         self.tokenizer = tokenizer
         self._streaming = streaming
-        # User post-processing hook (TRTLLM-12622) owned by this result's
-        # creator (the LLM for the in-proxy path, the worker for the worker
-        # path) and threaded in alongside the tokenizer; None when unconfigured.
+        # User post-processing hook, threaded in alongside the
+        # tokenizer by this result's creator; None when unconfigured.
         self._post_processor_hook = post_processor_hook
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
@@ -847,11 +846,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             self.sampling_params.spaces_between_special_tokens
         }
         # Detokenize when the client asked for text, OR whenever a post-processing
-        # hook (TRTLLM-12622) is configured: the hook is a server-side guardrail
-        # and must run on every response regardless of the client's
-        # ``detokenize`` flag (which only controls the returned channel, honored
-        # separately by the response formatter). Without this, a client could
-        # bypass the guardrail with ``detokenize=False``.
+        # hook is configured: the hook runs on every response regardless of the
+        # client's ``detokenize`` flag, else it could be bypassed with
+        # ``detokenize=False``.
         if (self.sampling_params.detokenize or self._post_processor_hook
                 is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
@@ -896,13 +893,12 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             self._apply_post_processor_hook()
 
     def _apply_post_processor_hook(self):
-        """Run the user post-processing hook (TRTLLM-12622) at the detok chokepoint.
+        """Run the user post-processing hook at the detok chokepoint.
 
         Runs after detok populated ``text``/``text_diff`` and before any
-        per-endpoint formatter reads them. Shared by the postproc-worker path
-        and the in-proxy path; the hook instance is owned by this result's
-        creator and threaded in via ``post_processor_hook`` (``None`` when
-        unconfigured), so independent ``LLM`` instances stay isolated.
+        per-endpoint formatter reads them. The hook instance is threaded in via
+        ``post_processor_hook`` (``None`` when unconfigured) so independent
+        ``LLM`` instances stay isolated.
         """
         hook = self._post_processor_hook
         if hook is None:

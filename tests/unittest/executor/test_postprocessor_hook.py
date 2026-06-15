@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the trtllm-serve post-processing hook (TRTLLM-12622)."""
+"""Unit tests for the trtllm-serve post-processing hook."""
 
 import pytest
 
@@ -33,7 +33,7 @@ class _FakeResult:
         self._done = done
         self._aborted = aborted
         self._streaming = streaming
-        # Per-instance hook ownership (TRTLLM-12622): the detok read site reads
+        # Per-instance hook ownership: the detok read site reads
         # this attribute rather than a process global.
         self._post_processor_hook = post_processor_hook
         self.abort_called = 0
@@ -111,7 +111,7 @@ def test_suppress_blanks_token_and_logprob_diffs():
 
 
 def test_suppress_blanks_full_token_and_logprob_channels_non_streaming():
-    """Non-streaming suppress must blank the full token/logprob channels (TRTLLM-12622).
+    """Non-streaming suppress must blank the full token/logprob channels.
 
     Non-streaming emits the full token_ids/logprobs (not the diff), so suppress
     must truncate the full channels — otherwise a detokenize=False completion
@@ -155,18 +155,19 @@ def test_terminate_without_abort_attr_does_not_crash():
     assert result._done is True
 
 
-def test_hook_exception_fails_open_passthrough():
+def test_hook_exception_fails_closed_and_reraises():
     out = _make_output("hello world", last_text_len=len("hello"))
     result = _FakeResult([out])
 
     def boom(chunk):
         raise RuntimeError("hook bug")
 
-    # Must not propagate; the chunk passes through unchanged (fail-open).
-    apply_post_processor_hook(boom, result, streaming=True)
+    # Fail-closed: the exception propagates so the request errors rather than
+    # serving the un-vetted chunk. The text is not advanced past the prefix.
+    with pytest.raises(RuntimeError, match="hook bug"):
+        apply_post_processor_hook(boom, result, streaming=True)
 
     assert out.text == "hello world"
-    assert out.text_diff == " world"
 
 
 def test_non_streaming_rewrites_full_text():
@@ -224,12 +225,21 @@ def test_per_request_state_is_keyed_by_request_id():
     assert 1 not in hook.state
 
 
-def test_unknown_verdict_action_raises():
+def test_unknown_verdict_action_rejected_at_construction():
+    """An unknown action cannot be smuggled: the verdict rejects it on build."""
+    from tensorrt_llm.executor.postprocessor_hook import PostProcVerdict
+
+    with pytest.raises(ValueError):
+        PostProcVerdict(action="bogus")
+
+
+def test_unknown_action_fails_closed_through_apply():
+    """A hook constructing a bad verdict fails the request closed (re-raised)."""
     from tensorrt_llm.executor.postprocessor_hook import PostProcVerdict
 
     out = _make_output("x", 0)
     result = _FakeResult([out])
-    with pytest.raises(ValueError, match="Unknown post-processor verdict"):
+    with pytest.raises(ValueError):
         apply_post_processor_hook(lambda c: PostProcVerdict(action="bogus"), result, streaming=True)
 
 
@@ -247,7 +257,7 @@ def test_loader_raises_on_bad_path():
 def test_loader_builds_independent_instances():
     """Each owner builds its own instance (no shared process-global cache).
 
-    This is the core of per-instance ownership (TRTLLM-12622): two owners
+    This is the core of per-instance ownership: two owners
     loading the same import path get distinct instances, so their per-request
     state never collides.
     """
@@ -282,7 +292,7 @@ def test_apply_method_is_noop_when_instance_has_no_hook():
 
 
 def test_harmony_model_rejects_post_processor():
-    """A harmony/gpt-oss model + post_processor must fail fast (TRTLLM-12622).
+    """A harmony/gpt-oss model + post_processor must fail fast.
 
     The harmony output path is rebuilt from raw token ids and would bypass the
     text-based hook, so the server refuses the combination at startup.
