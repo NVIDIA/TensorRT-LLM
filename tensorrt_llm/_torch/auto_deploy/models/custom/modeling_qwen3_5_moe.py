@@ -635,26 +635,25 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Intentionally left untagged: with no ``layer_type`` it defaults to "unknown",
+        # which the ``shard_layers`` inclusion whitelist excludes -> kept replicated.
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
             tp_mode="colwise",
-            layer_type="shared_expert",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise",
-            layer_type="shared_expert",
         )
         return torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise",
-            layer_type="shared_expert",
         )
 
 

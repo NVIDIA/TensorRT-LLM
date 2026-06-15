@@ -88,6 +88,49 @@ def _build_lora_request_buffers(
     )
 
 
+def _build_lora_slot_buffers(
+    num_tokens, fc1_a, fc1_b, fc2_a, fc2_b, rank, lora_max_low_rank=None, gated_a=None, gated_b=None
+):
+    """Pack LoRA into the slot-indexed CPU tensors used by the CUDA-graph path.
+
+    Uses a single adapter slot (max_lora_size == 1) and routes every token
+    to slot 0 via token_to_slot. The per-token expansion the op performs
+    from these tables is identical to the single-request per-request path, so
+    the two schemas must produce bit-identical kernel inputs (and outputs).
+    """
+    if lora_max_low_rank is None:
+        lora_max_low_rank = rank
+    if gated_a is None:
+        gated_a = fc1_a
+    if gated_b is None:
+        gated_b = fc1_b
+    max_lora_size = 1
+    fc1_slot_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    fc2_slot_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    gated_slot_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    fc1_slot_ptrs = torch.tensor(
+        [[fc1_a.data_ptr(), fc1_b.data_ptr(), 0]], dtype=torch.int64, device="cpu"
+    )
+    fc2_slot_ptrs = torch.tensor(
+        [[fc2_a.data_ptr(), fc2_b.data_ptr(), 0]], dtype=torch.int64, device="cpu"
+    )
+    gated_slot_ptrs = torch.tensor(
+        [[gated_a.data_ptr(), gated_b.data_ptr(), 0]], dtype=torch.int64, device="cpu"
+    )
+    token_to_slot = torch.zeros(num_tokens, dtype=torch.int32, device="cpu")
+    assert max_lora_size == fc1_slot_ranks.size(0)
+    return dict(
+        fc1_slot_lora_ranks=fc1_slot_ranks,
+        fc1_slot_lora_weight_ptrs=fc1_slot_ptrs,
+        fc2_slot_lora_ranks=fc2_slot_ranks,
+        fc2_slot_lora_weight_ptrs=fc2_slot_ptrs,
+        gated_slot_lora_ranks=gated_slot_ranks,
+        gated_slot_lora_weight_ptrs=gated_slot_ptrs,
+        token_to_slot=token_to_slot,
+        lora_max_low_rank=lora_max_low_rank,
+    )
+
+
 def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs=None):
     common = dict(
         input=x,
@@ -160,6 +203,115 @@ def test_moe_per_expert_lora_changes_output():
     assert torch.isfinite(out_lora).all()
     diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
     assert diff > 1e-3, f"LoRA had no observable effect (mean abs diff={diff})"
+
+
+@requires_cuda_and_op
+def test_moe_lora_slot_indexed_matches_per_request(monkeypatch):
+    """The slot-indexed (CUDA-graph) input schema must produce bit-identical
+    output to the per-request schema for the same adapter, since both expand to
+    the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
+
+    The slot-indexed schema always takes the capture-safe device path, so for an
+    apples-to-apples bit-exact comparison we force the per-request schema onto
+    the device path too (TLLM_MOE_LORA_USE_DEVICE_PATH=1). Both then share the
+    pointer-expand + grouped-GEMM kernels, so identical per-token tables yield
+    bit-identical output.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+
+    fc1_adapter = make_per_expert_lora(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=10
+    )
+    fc2_adapter = make_per_expert_lora(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
+    )
+
+    per_request_kwargs = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+    slot_kwargs = _build_lora_slot_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+
+    # Force both schemas onto the device path, via a fresh runner.
+    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    MoERunner.runner_dict.clear()
+    try:
+        out_per_request = _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=per_request_kwargs
+        )[0]
+        out_slot = _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=slot_kwargs
+        )[0]
+    finally:
+        MoERunner.runner_dict.clear()
+
+    assert torch.isfinite(out_slot).all()
+    # Identical per-token kernel inputs => bit-identical output.
+    torch.testing.assert_close(out_slot, out_per_request, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+def test_moe_lora_rejects_mixed_per_request_and_slot_indexed():
+    """Supplying both the per-request and slot-indexed schemas in one call is
+    ambiguous and must be rejected before the kernel runs.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    fc1_adapter = make_per_expert_lora(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=10
+    )
+    fc2_adapter = make_per_expert_lora(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
+    )
+    mixed = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+    mixed.update(
+        _build_lora_slot_buffers(
+            num_tokens,
+            fc1_adapter["A"],
+            fc1_adapter["B"],
+            fc2_adapter["A"],
+            fc2_adapter["B"],
+            rank=rank,
+        )
+    )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=mixed)
 
 
 @requires_cuda_and_op

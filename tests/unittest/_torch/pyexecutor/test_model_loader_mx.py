@@ -70,7 +70,9 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     loader._call_load_weights = MagicMock(
         side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
     )
-    loader._load_and_validate_config = MagicMock(return_value=SimpleNamespace(name="config"))
+    loader._load_and_validate_config = MagicMock(
+        return_value=SimpleNamespace(name="config", mapping=SimpleNamespace())
+    )
 
     monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
