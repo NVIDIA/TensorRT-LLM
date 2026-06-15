@@ -1131,12 +1131,29 @@ class KVCacheManager(BaseResourceManager):
             # deferred requests from this iteration's batch.
             scheduled_batch.reset_context_requests(kept)
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def maybe_fit_token_budget(self,
+                               scheduled_batch: ScheduledRequests) -> None:
+        """Apply the prep-boundary token-budget fallback to ``scheduled_batch``.
+
+        This is a *batch-level* scheduling decision (defer/re-chunk context
+        requests so the forward pass cannot exceed ``max_num_tokens``) and MUST
+        run before any resource manager allocates KV cache for the batch. It is
+        therefore driven once by ``ResourceManager.prepare_resources`` rather
+        than from this manager's own ``prepare_resources``: the target KV cache
+        manager is deliberately invoked *last* (see ``_util.py``'s
+        ``move_to_end(KV_CACHE_MANAGER)``), so running the fallback here would
+        let an earlier manager -- e.g. a separate draft KV cache manager under
+        MTP -- add sequences for context requests the fallback then defers,
+        orphaning those sequences and tripping a double-add (``emplaceDone``,
+        kvCacheManager.cpp) when the deferred requests reschedule.
+        """
         if not self.is_draft and self.enable_token_budget_fallback:
             # The draft-model engine builds inputs with a different token shape;
             # its budget is handled separately. Gated by an opt-out flag so the
             # fallback can be disabled to restore pre-fallback behavior.
             self._fit_token_budget(scheduled_batch)
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
@@ -3964,6 +3981,20 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        # Apply the prep-boundary token-budget fallback (#13318) once, before
+        # any manager allocates resources. It defers/re-chunks context requests
+        # so the forward pass cannot exceed max_num_tokens, and mutates
+        # scheduled_batch in place. It must run up front so every manager --
+        # including a separate draft KV cache manager (MTP) that is invoked
+        # before the target KV cache manager -- observes the same deferred
+        # batch; otherwise an earlier manager adds sequences for context
+        # requests the fallback later defers, orphaning them and tripping a
+        # double-add (emplaceDone) when those requests reschedule.
+        kv_cache_manager = self.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is not None and hasattr(kv_cache_manager,
+                                                    "maybe_fit_token_budget"):
+            kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)

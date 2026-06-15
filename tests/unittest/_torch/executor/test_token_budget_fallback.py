@@ -11,13 +11,20 @@ requests.
 """
 
 import unittest
+from collections import OrderedDict
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 
 class _FakeRequest:
     """Minimal stand-in exposing only the attributes _fit_token_budget reads."""
+
+    _next_id = 0
 
     def __init__(
         self,
@@ -31,6 +38,8 @@ class _FakeRequest:
         is_disagg_generation_init_state=False,
         mm_bidirectional=False,
     ):
+        _FakeRequest._next_id += 1
+        self.py_request_id = _FakeRequest._next_id
         self.context_chunk_size = context_chunk_size
         self.context_current_position = context_current_position
         # Mirrors the C++ semantics: is_last_context_chunk is a *computed*
@@ -239,6 +248,84 @@ class TestFitTokenBudget(unittest.TestCase):
 
         field = TorchLlmArgs.model_fields["enable_token_budget_fallback"]
         self.assertEqual(field.default, True)
+
+    def test_maybe_fit_token_budget_honors_flag_and_draft(self):
+        # maybe_fit_token_budget is the single entry point driven by the
+        # aggregate ResourceManager. It must apply the fallback only for the
+        # non-draft manager and only when the opt-out flag is enabled.
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        gen = _FakeRequest(py_beam_width=120)  # remaining = 8 -> defer ctx
+
+        # Non-draft + enabled -> defers.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False)
+        mgr.is_draft = False
+        mgr.enable_token_budget_fallback = True
+        batch = _make_batch([ctx], [gen])
+        mgr.maybe_fit_token_budget(batch)
+        self.assertEqual(batch.num_context_requests, 0)
+
+        # Draft manager -> never fits (handled separately).
+        mgr.is_draft = True
+        batch = _make_batch([ctx], [gen])
+        mgr.maybe_fit_token_budget(batch)
+        self.assertEqual(batch.num_context_requests, 1)
+
+        # Disabled flag -> no-op.
+        mgr.is_draft = False
+        mgr.enable_token_budget_fallback = False
+        batch = _make_batch([ctx], [gen])
+        mgr.maybe_fit_token_budget(batch)
+        self.assertEqual(batch.num_context_requests, 1)
+
+    def test_fallback_runs_before_other_managers(self):
+        # Regression for the emplaceDone double-add (PR #15187): the token-budget
+        # fallback must mutate scheduled_batch BEFORE any resource manager
+        # allocates sequences. A separate draft KV cache manager (MTP) is
+        # invoked before the target KV cache manager (the target is moved to the
+        # end of the manager dict on purpose), so if the fallback ran inside the
+        # target's own prepare_resources the draft manager would already have
+        # added sequences for context requests the fallback then defers --
+        # orphaning them and causing a double-add when they reschedule.
+        #
+        # Build the aggregate ResourceManager with the same ordering as
+        # production (draft-like manager first, KV cache manager last) and assert
+        # the earlier manager observes the *already-deferred* batch.
+        target = _make_manager(
+            max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False
+        )
+        target.is_draft = False
+        target.enable_token_budget_fallback = True
+        # Don't touch the GPU: only the budget fallback matters for ordering.
+        target.prepare_resources = lambda batch: None
+
+        observed = []
+
+        class _RecordingManager:
+            def prepare_resources(self, batch):
+                observed.append([r.py_request_id for r in batch.context_requests])
+
+        ctx_keep = _FakeRequest(context_chunk_size=96)
+        ctx_defer = _FakeRequest(context_chunk_size=64)
+        gen = _FakeRequest(py_beam_width=16)  # remaining = 112
+        batch = _make_batch([ctx_keep, ctx_defer], [gen])
+
+        # Draft-like manager registered FIRST, KV cache manager LAST (mirrors
+        # _util.py's move_to_end(KV_CACHE_MANAGER)).
+        rm = ResourceManager(
+            OrderedDict(
+                [
+                    (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, _RecordingManager()),
+                    (ResourceManagerType.KV_CACHE_MANAGER, target),
+                ]
+            )
+        )
+        rm.prepare_resources(batch)
+
+        # ctx_keep (96) fits into 112; ctx_defer (64) does not and is deferred.
+        # The draft-like manager, though invoked first, must have seen only the
+        # kept request -- proving the fallback ran up front.
+        self.assertEqual(observed, [[ctx_keep.py_request_id]])
+        self.assertEqual(batch.num_context_requests, 1)
 
     def test_generation_alone_over_budget_raises(self):
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
