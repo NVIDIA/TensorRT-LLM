@@ -123,7 +123,9 @@ add_library(
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
   trtllmGenQKVProcessOp.cpp
-  inplaceSliceCopyOp.cpp)
+  inplaceSliceCopyOp.cpp
+  mhcOp.cpp
+  compressorOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
