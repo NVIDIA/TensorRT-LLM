@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -188,6 +189,16 @@ class Attention(nn.Module):
             and enable_sequence_parallel
             and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses or cp_size == 1)
         )
+        if ulysses_size > 1 and enable_sequence_parallel and not use_ulysses:
+            # Ulysses was requested (ulysses_size > 1, SP on) but disabled: this is a
+            # SEPARATE_QKV cross-attention that is neither async nor pure-Ulysses
+            # (cp_size > 1), so it falls back to the all-gather K/V path.
+            logger.debug(
+                f"Attention(layer={layer_idx}): Ulysses disabled despite ulysses_size="
+                f"{ulysses_size} — qkv_mode={self.qkv_mode.value}, "
+                f"async_ulysses={async_ulysses}, cp_size={cp_size} "
+                f"(SEPARATE_QKV cross-attn needs async_ulysses or cp_size==1)."
+            )
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -235,6 +246,7 @@ class Attention(nn.Module):
             self.attn,
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
+            use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
 
