@@ -21,6 +21,21 @@ so that it can be imported and tested in any environment.
 import dataclasses
 import time
 
+
+class TokenBudgetExceededError(RuntimeError):
+    """A scheduled batch overshot ``max_num_tokens`` in the forward pass.
+
+    Raised by ``_prepare_tp_inputs`` when the materialized token count exceeds
+    ``max_num_tokens``. This is normally prevented by the prep-boundary
+    token-budget fallback (``KVCacheManager._fit_token_budget``); when that
+    fallback is disabled (``enable_token_budget_fallback=False``) an over-budget
+    batch reaches the forward pass and trips this error. The executor routes it
+    to a fatal, server-terminating shutdown so every in-flight and queued
+    request fails with this message -- rather than the bare assert killing only
+    the executor loop thread and leaving the server up but hanging.
+    """
+
+
 # Patterns that corrupt the CUDA context beyond recovery.
 # Matched case-insensitively against the error message.
 IMMEDIATE_FATAL_PATTERNS: list[str] = [

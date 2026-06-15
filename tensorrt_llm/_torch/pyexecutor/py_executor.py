@@ -54,7 +54,7 @@ from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
-from .error_classification import ErrorBudget
+from .error_classification import ErrorBudget, TokenBudgetExceededError
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -2013,6 +2013,13 @@ class PyExecutor:
                                 self.guided_decoder.add_batch(scheduled_batch)
                                 self.guided_decoder.init_disagg_gen_requests()
 
+                            # NOTE: the pipeline-parallel loop intentionally does
+                            # not translate TokenBudgetExceededError into a fatal
+                            # shutdown here -- a mid-iteration bail would skip the
+                            # PP send/recv handle bookkeeping and risk a collective
+                            # hang. PP retains the pre-existing assert behavior for
+                            # this path; the single-node (overlap / non-overlap)
+                            # loops handle it (see _handle_token_budget_error).
                             batch_outputs = self._forward_step(scheduled_batch)
 
                             guided_decoder_failed_requests = None
@@ -2792,7 +2799,11 @@ class PyExecutor:
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         if self.dwdp_manager is not None:
                             self.dwdp_manager.prefetch_first_layers()
-                        batch_outputs = self._forward_step(scheduled_batch)
+                        try:
+                            batch_outputs = self._forward_step(scheduled_batch)
+                        except TokenBudgetExceededError as e:
+                            self._handle_token_budget_error(e)
+                            continue
 
                     guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
@@ -3190,9 +3201,13 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        batch_outputs = self._forward_step(
-                            scheduled_batch, previous_tensors_device,
-                            num_accepted_tokens_device)
+                        try:
+                            batch_outputs = self._forward_step(
+                                scheduled_batch, previous_tensors_device,
+                                num_accepted_tokens_device)
+                        except TokenBudgetExceededError as e:
+                            self._handle_token_budget_error(e)
+                            continue
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -4281,6 +4296,14 @@ class PyExecutor:
             self._kv_connector_wait_for_save()
 
             return outputs
+        except TokenBudgetExceededError:
+            # A token-budget overshoot (fallback disabled) is fatal for the whole
+            # engine, not a per-request failure. Re-raise so the executor loop
+            # routes it to a clean, server-terminating shutdown
+            # (_handle_token_budget_error) instead of the generic per-request
+            # handler below, which would only charge the error budget and leave
+            # the server running.
+            raise
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -4416,12 +4439,35 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _handle_token_budget_error(self,
+                                   error: TokenBudgetExceededError) -> None:
+        """Turn an over-budget batch into a clean, server-terminating shutdown.
+
+        ``_prepare_tp_inputs`` raises ``TokenBudgetExceededError`` when a
+        scheduled batch overshoots ``max_num_tokens`` -- only reachable with the
+        prep-boundary token-budget fallback disabled
+        (``enable_token_budget_fallback=False``). Route it through the fatal
+        path so every in-flight and queued request fails with the message and
+        the executor shuts down, instead of the exception killing only this loop
+        thread and leaving the server up but hanging.
+        """
+        logger.error(f"Token budget exceeded; terminating server: {error}")
+        self._handle_errors(str(error), immediate_fatal=True)
+
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None,
-                       charge_budget: bool = True) -> None:
+                       charge_budget: bool = True,
+                       immediate_fatal: bool = False) -> None:
         """Fail requests and optionally initiate shutdown on fatal errors.
+
+        When ``immediate_fatal`` is True, the error is treated as fatal
+        unconditionally (bypassing the error budget): **all** active and queued
+        requests are failed and a shutdown is enqueued. Use this for conditions
+        that are known to be unrecoverable for the whole engine (e.g. a token
+        budget overshoot with the fallback disabled), so the server terminates
+        with the error message instead of leaving a half-dead, hanging process.
 
         When ``charge_budget`` is True (the default), classifies the error
         via the error budget.  If deemed fatal (immediate-fatal pattern or
@@ -4456,8 +4502,8 @@ class PyExecutor:
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
 
-        is_fatal = (self._error_budget.consume(error_msg)
-                    if charge_budget else False)
+        is_fatal = immediate_fatal or (self._error_budget.consume(error_msg)
+                                       if charge_budget else False)
         if is_fatal and self._error_budget.budget < 1e-9:
             logger.error(f"Error budget exhausted "
                          f"(budget={self._error_budget.budget:.3f}), "

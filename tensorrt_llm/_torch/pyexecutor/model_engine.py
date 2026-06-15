@@ -65,6 +65,7 @@ from .config_utils import is_mla
 from .cuda_graph_runner import (CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
+from .error_classification import TokenBudgetExceededError
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
@@ -3066,9 +3067,20 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
-        assert total_num_tokens <= self.max_num_tokens, (
-            f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
-        )
+        if total_num_tokens > self.max_num_tokens:
+            # The scheduled batch overshot the token budget. This is normally
+            # prevented by the prep-boundary token-budget fallback
+            # (KVCacheManager._fit_token_budget); when that fallback is disabled
+            # the overshoot reaches here. Raise a typed error (instead of a bare
+            # assert) so the executor can route it to a clean, server-terminating
+            # shutdown rather than silently killing only the loop thread and
+            # leaving the server up but hanging.
+            raise TokenBudgetExceededError(
+                f"total_num_tokens ({total_num_tokens}) exceeds max_num_tokens "
+                f"({self.max_num_tokens}); the scheduled batch overshot the "
+                "token budget. This is normally avoided by the prep-boundary "
+                "token-budget fallback -- it is disabled "
+                "(enable_token_budget_fallback=False).")
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids,
