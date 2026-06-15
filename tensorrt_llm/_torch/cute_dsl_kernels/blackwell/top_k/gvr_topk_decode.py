@@ -164,7 +164,7 @@ class GvrParams:
         ``GvrParams<T, K>`` template specialization. For K ∈ {512, 1024}
         cr=1 (DSv3.2) and cr=4 (DSv4, PR #14413) use different kFTarget —
         V4 aligns kFTarget with kK to avoid upper-clamp saturation on
-        tight-σ layers (1.5-2.2× fewer P2 iters on swe-bench). K=2048 is
+        tight-sigma layers (1.5-2.2x fewer P2 iters on swe-bench). K=2048 is
         identical across cr (V4 doesn't natively use it).
         """
         TABLE = {
@@ -2210,6 +2210,28 @@ class GvrTopKKernel:
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
+        # SMEM-cache launch-time guard: when ``enable_smem_cache=True`` the
+        # kernel stages each CTA's slice into a fixed-size
+        # ``smem_input[smem_cache_elems]`` buffer. ``load_slice_to_smem``
+        # and the Phase 2 / Phase 3 paths that read from it index by
+        # slice-local position with no out-of-bounds guard, so a slice
+        # longer than the compile-time cache budget would silently overrun
+        # SMEM. Per-CTA slice length is ``ceil(input_data.shape[1] /
+        # cluster_size)``; check the worst-case (= input_data.shape[1] when
+        # cluster_size == 1) at launch and bail out with a clear error.
+        # The docstring on ``enable_smem_cache`` promises a wrapper-side
+        # auto-disable for oversized slices but the wrapper hook is not
+        # universally wired up yet — this assert backstops any caller
+        # (UT / bench / future production) that enables the path without
+        # the matching size check.
+        if cutlass.const_expr(self.enable_smem_cache):
+            max_slice_len = (input_data.shape[1] + cluster_size - 1) // cluster_size
+            assert max_slice_len <= self.smem_cache_elems, (
+                f"enable_smem_cache=True requires per-CTA slice_len "
+                f"({max_slice_len}) <= smem_cache_elems "
+                f"({self.smem_cache_elems}); raise smem_cache_elems, "
+                f"increase cluster_size, or disable enable_smem_cache."
+            )
         # Grid = num_rows * cluster_size. Adjacent bidx in
         # [cluster_id*cs, (cluster_id+1)*cs) form one thread-block cluster
         # that owns row[cluster_id]. ``cluster=None`` at cs=1 keeps the

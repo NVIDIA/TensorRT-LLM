@@ -348,7 +348,7 @@ def test_lb_prepare_partition(B, ratio):
     """
     long_threshold = 64 * 1024
     torch.manual_seed(B * 1000 + int(ratio * 100))
-    n_long_expect = int(round(B * ratio))
+    n_long_expect = round(B * ratio)
     seq_lens = torch.empty(B, dtype=torch.int32, device="cuda")
     seq_lens[:n_long_expect] = long_threshold * 2
     seq_lens[n_long_expect:] = long_threshold // 2

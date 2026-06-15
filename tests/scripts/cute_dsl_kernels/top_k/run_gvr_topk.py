@@ -387,6 +387,16 @@ def gvr_topk_lb_prepare(
     """
     assert seq_lens.is_cuda and seq_lens.dtype == torch.int32
     batch_size = seq_lens.shape[0]
+    if batch_size > max_batch_size:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be <= max_batch_size "
+            f"({max_batch_size}): the LB prepare kernel hard-wires a block "
+            f"of max_batch_size threads and order_row[max_batch_size]; "
+            f"tail requests beyond that would never be classified into the "
+            f"long/short partition and order_row[batch_size:] would be -1, "
+            f"so the decode path's order_row lookup would return invalid "
+            f"row indices."
+        )
     if order_row is None:
         order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device=seq_lens.device)
     if counters is None:
