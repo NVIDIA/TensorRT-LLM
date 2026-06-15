@@ -41,7 +41,11 @@ l0_h100:
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/multimodal -k "not nemotron_nano_v2_vl_fp8"
-  - unittest/_torch/sampler
+  # test_speculative_d2h_parity_real_predictor[no_stop_token] is a HW-agnostic
+  # sampler D2H-parity invariant (plain CUDA stream/event, no SM gating), covered
+  # on A30 pre-merge; drop the Hopper copy of just that leaf, keep the rest of
+  # the sampler dir (incl. the [stop_token_15] parametrize).
+  - unittest/_torch/sampler -k "not (test_speculative_d2h_parity_real_predictor and no_stop_token)"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/thop/parallel
