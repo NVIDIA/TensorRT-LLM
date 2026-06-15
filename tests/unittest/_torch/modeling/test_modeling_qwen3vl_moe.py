@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 from dataclasses import dataclass
 from typing import List, Optional
@@ -154,16 +157,30 @@ class TestQwen3VLMoe(TestModelingMultimodal):
                 )
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
         else:
-            # Mrope position ids
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production `PyTorchModelEngine` behavior and slice the
+            # request's full `mrope_position_ids` to the current chunk's range.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq] * len(multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param in multimodal_params_list:
-                mrope_position_ids.append(
-                    multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
-                )
+            for multimodal_param, begin in zip(multimodal_params_list, begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :, begin : begin + chunk_len])
             position_ids = torch.cat(mrope_position_ids, dim=-1)
             position_ids = position_ids.cuda()
             trtllm_inputs["position_ids"] = position_ids
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
 
         return trtllm_inputs
 

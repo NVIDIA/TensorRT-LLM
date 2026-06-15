@@ -203,7 +203,10 @@ def test_build_ad_eagle(register_mock_eagle_factory):
         "model_factory": "MockEagleDrafter",
         "transforms": {
             "insert_cached_attention": {"backend": "trtllm"},
-            "compile_model": {"backend": "torch-simple"},
+            "compile_model": {
+                "backend": "torch-simple",
+                "piecewise_enabled": False,
+            },
         },
     }
     experiment_config = get_small_model_config(EAGLE_MODEL_HUB_ID, **llm_extra_args)

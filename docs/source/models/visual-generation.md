@@ -16,7 +16,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
 - Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
-- **TeaCache** — a runtime caching optimization that skips transformer steps when timestep embeddings change slowly.
+- **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
@@ -43,16 +43,16 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
-|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1 VSA** [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+|---|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1 VSA** [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **LTX-2** | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image** [^2] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -158,7 +158,11 @@ args = VisualGenArgs(
 )
 ```
 
-### TeaCache
+### Step Caching
+
+Both caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
+
+#### TeaCache
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via `VisualGenArgs.cache_config` (YAML or programmatic):
 
@@ -168,7 +172,54 @@ cache_config:
   teacache_thresh: 0.2
 ```
 
-The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is also supported via `cache_backend: cache_dit` with its own set of knobs (see `CacheDiTConfig`).
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for FLUX.2 and Wan 2.1. |
+| `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
+| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
+
+#### Cache-DiT
+
+Cache-DiT uses residual-difference gating (`DBCache`) to adaptively skip transformer blocks, with optional TaylorSeer polynomial prediction and step-computation mask (`SCM`).
+
+Enable via `VisualGenArgs.cache_config`:
+
+```yaml
+cache_config:
+  cache_backend: cache_dit
+```
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import CacheDiTConfig
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    cache_config=CacheDiTConfig(
+        residual_diff_threshold=0.20,
+        max_continuous_cached_steps=4,
+    ),
+)
+```
+
+**Commonly used parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `Fn_compute_blocks` | int | `1` | Number of leading transformer blocks that are always fully computed at every denoising step (Fn in the Cache-DiT paper). |
+| `Bn_compute_blocks` | int | `0` | Number of trailing transformer blocks used for prediction refinement (Bn). |
+| `max_warmup_steps` | int | `4` | Initial denoising steps that always run a full forward pass; caching is disabled for this many steps at the start. |
+| `max_cached_steps` | int | `-1` | Total cap on cached (skipped) steps across the run; `-1` means unlimited. |
+| `max_continuous_cached_steps` | int | `3` | Maximum consecutive cached steps before a forced full-compute step is inserted. `-1` means unlimited. |
+| `residual_diff_threshold` | float | `0.24` | L1-distance threshold for DBCache residual gating. Increase to cache more aggressively (higher speedup, potential quality loss); decrease for more conservative caching. |
+| `enable_taylorseer` | bool | `false` | Enable TaylorSeer calibration. Uses Taylor series expansion to approximate hidden states at cached steps, improving output quality over plain residual reuse. |
+| `taylorseer_order` | int | `1` | Polynomial order for TaylorSeer (1–4). Only used when `enable_taylorseer=true`. |
+| `scm_steps_mask_policy` | str \| None | `None` | Named step-computation mask policy from the `cache_dit` library (`"slow"`, `"medium"`, `"fast"`, `"ultra"`). |
+| `scm_steps_policy` | `"dynamic"` \| `"static"` | `"dynamic"` | Execution policy for the SCM mask; only active when `scm_steps_mask_policy` is set. |
+| `force_refresh_step_hint` | int \| None | `None` | Step index at which a forced full-compute pass is injected (useful for scheduled quality checkpoints). |
+| `force_refresh_step_policy` | `"once"` \| `"repeat"` | `"once"` | Whether `force_refresh_step_hint` fires only on the first call (`"once"`) or at that interval repeatedly (`"repeat"`). |
+
+**Wan 2.2 dual-transformer note:** Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All `CacheDiTConfig` parameters apply to both stacks, except `max_warmup_steps` and `max_cached_steps`: the low-noise stack always uses fixed internal caps (`max_warmup_steps=2`, `max_cached_steps=20`) regardless of user config.
 
 ### Video Sparse Attention (VSA)
 
@@ -236,7 +287,7 @@ Key components:
 |---|---|---|
 | `VisualGen` | `tensorrt_llm/visual_gen/__init__.py` | High-level API: manages workers, `generate()` / `generate_async()` |
 | `DiffusionExecutor` | `visual_gen/executor.py` | Worker process: loads pipeline, processes requests via ZeroMQ |
-| `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, TeaCache, CUDA graph |
+| `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, step caching (TeaCache / Cache-DiT), CUDA graph |
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |
 | `PipelineLoader` | `visual_gen/pipeline_loader.py` | Resolves checkpoint, loads config/weights, creates pipeline |
 | `TeaCacheAccelerator` / `CacheDiTAccelerator` | `visual_gen/cache/` | Runtime caching backends (TeaCache, Cache-DiT) wrapping the transformer forward |

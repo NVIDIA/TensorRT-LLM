@@ -56,6 +56,15 @@ def venv_check_output(venv, cmd, env=None, **kwargs):
     return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
+def resolve_llm_model_path(model_path: str) -> str:
+    """Resolve a model subpath relative to the test LLM model root."""
+    if os.path.isabs(model_path):
+        return model_path
+
+    from .conftest import llm_models_root
+    return os.path.join(llm_models_root(), model_path)
+
+
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd, **kwargs):
     """
     This function WAR check_call() to run python_cmd with mpi.
@@ -1287,9 +1296,11 @@ def parse_gsm8k_output(output_text: str) -> float:
         float: The accuracy value (0.7582 in the example)
     """
 
-    # Look for the specific pattern: |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # Look for the specific pattern:
+    # |gsm8k|...|flexible-extract|     5|exact_match|↑  |0.7559|±  |0.0118|
+    # lm-eval pads table cells, so allow whitespace around the value.
     patterns = [
-        r'flexible-extract\|\s+\d+\|exact_match\|\↑\s+\|(\d+\.\d+)',
+        r'flexible-extract\s*\|\s*\d+\s*\|\s*exact_match\s*\|\s*↑\s*\|\s*(\d+(?:\.\d+)?)',
     ]
 
     for pattern in patterns:

@@ -183,7 +183,7 @@ def make_scheduler(
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerV2",
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.KVCacheManagerV2",
         new=type(kv_cache_manager),
     ):
         kwargs = {}
