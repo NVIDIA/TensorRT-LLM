@@ -3937,9 +3937,6 @@ class KVCacheManagerV2(BaseResourceManager):
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
-            if (req.state == LlmRequestState.GENERATION_COMPLETE
-                    or req.is_finished_due_to_cancellation):
-                continue
             kv_cache = self.kv_cache_map[req.py_request_id]
             # In the overlap scheduler, iteration N+1's eviction may
             # suspend a ctx request's KV cache while iteration N's
