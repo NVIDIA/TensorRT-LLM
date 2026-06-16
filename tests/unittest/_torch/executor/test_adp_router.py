@@ -21,8 +21,20 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     KVCacheAwareADPRouter,
     RankIterStatsPayload,
     RankState,
+    _num_input_tokens,
 )
 from tensorrt_llm.scheduling_params import SchedulingParams
+
+
+class _MockRequest(MagicMock):
+    """Mock executor Request whose ``num_input_tokens`` mirrors the real binding
+    (it equals ``len(input_token_ids)``) instead of an auto-generated child mock,
+    so the routers' cheap token-count reads work without setting it per call site.
+    """
+
+    @property
+    def num_input_tokens(self):
+        return len(self.input_token_ids)
 
 
 def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
@@ -35,7 +47,7 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
-    mock_request = Mock()
+    mock_request = _MockRequest()
     if attention_dp_rank is not None:
         mock_schedule_params = Mock()
         mock_schedule_params.attention_dp_rank = attention_dp_rank
@@ -59,7 +71,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
-    item.request = MagicMock()
+    item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
     item.request.input_token_ids = list(range(num_tokens))
     return item
@@ -1102,7 +1114,7 @@ def _make_conv_request_item(
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
-    item.request = MagicMock()
+    item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
     item.request.input_token_ids = list(range(num_tokens))
     item.request.py_orig_prompt_len = num_tokens
@@ -1259,3 +1271,24 @@ class TestConversationAwareADPRouter:
         final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
         assert all(expected >= f for f in final), (expected, final)
         assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
+
+
+class TestNumInputTokens:
+    """The cheap token-count accessor used by the routers (avoids copying the
+    full input_token_ids list just to count it)."""
+
+    def test_none_request(self):
+        assert _num_input_tokens(None) == 0
+
+    def test_prefers_num_input_tokens_without_touching_token_list(self):
+        """When num_input_tokens is available it must be used, and the heavy
+        input_token_ids getter must NOT be accessed."""
+
+        class _Req:
+            num_input_tokens = 1234
+
+            @property
+            def input_token_ids(self):  # materializing it would be a regression
+                raise AssertionError("input_token_ids must not be materialized")
+
+        assert _num_input_tokens(_Req()) == 1234
