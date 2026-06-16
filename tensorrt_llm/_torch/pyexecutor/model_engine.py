@@ -4499,6 +4499,7 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = inputs['input_ids']
         seq_lens = inputs['seq_lens']  # Only seq_lens includes padding
         position_ids = inputs.get('position_ids')
+        multi_item_part_lens = inputs.get('multi_item_part_lens')
         actual_num_tokens = len(input_ids)
         batch_size = len(seq_lens)
 
@@ -4527,9 +4528,10 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = list(range(batch_size))
             if hasattr(attn_metadata, 'prepare_encoder_only'):
-                attn_metadata.prepare_encoder_only()
+                attn_metadata.prepare_encoder_only(
+                    multi_item_part_lens=multi_item_part_lens)
             else:
-                attn_metadata.prepare()
+                attn_metadata.prepare(multi_item_part_lens=multi_item_part_lens)
 
             self.input_ids_cuda[:actual_num_tokens].copy_(input_ids_t,
                                                           non_blocking=True)
@@ -4547,6 +4549,10 @@ class PyTorchModelEngine(ModelEngine):
 
         # CUDA graph hit path.
         assert self.encoder_cuda_graph_runner.enabled, "Encoder CUDA graph runner is not enabled"
+
+        # NB: As of 06/10/2026, the multi-item scoring arguments lacked '_buf' counterparts (cf., e.g.,
+        #     https://github.com/flashinfer-ai/flashinfer/blob/2aa1d49cf140d73ccdd3761051c5f2944406cb83/flashinfer/prefill.py#L1622 ).
+        assert multi_item_part_lens is None, "multi-item scoring with CUDA graph not implemented"
 
         attn_metadata.prepare_encoder_cuda_graph_replay(seq_lens,
                                                         padded_num_tokens)

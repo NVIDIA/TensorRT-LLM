@@ -489,8 +489,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_is_inactive_rank[:batch_size].copy_(
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
-    def prepare(self) -> None:
-        super().prepare()
+    def prepare(self,
+                *,
+                multi_item_part_lens: list[list[int]] | None = None) -> None:
+        if multi_item_part_lens is not None:
+            raise ValueError(
+                "TRT-LLM Attention does not support multi-item scoring")
+        super().prepare(multi_item_part_lens=multi_item_part_lens)
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -589,8 +594,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
 
-    def prepare_encoder_only(self) -> None:
+    def prepare_encoder_only(
+            self,
+            *,
+            multi_item_part_lens: list[list[int]] | None = None) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
+        if multi_item_part_lens is not None:
+            raise ValueError(
+                "TRT-LLM Attention does not support multi-item scoring")
+
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
@@ -1749,10 +1761,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
-
-        if forward_args.multi_item_part_lens is not None:
-            raise ValueError(
-                "TRT-LLM Attention does not support multi-item scoring")
 
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
