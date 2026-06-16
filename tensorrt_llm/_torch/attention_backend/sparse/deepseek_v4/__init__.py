@@ -14,6 +14,13 @@
 # limitations under the License.
 
 from .cache_manager import DeepseekV4CacheManager
-from .deepseek_v4 import DeepseekV4AttentionType
+from .cache_utils import DeepseekV4AttentionType
+from .deepseek_v4 import DeepSeekV4MetadataParams, DeepSeekV4Params, DeepseekV4TrtllmAttention
 
-__all__ = ["DeepseekV4AttentionType", "DeepseekV4CacheManager"]
+__all__ = [
+    "DeepSeekV4MetadataParams",
+    "DeepSeekV4Params",
+    "DeepseekV4AttentionType",
+    "DeepseekV4CacheManager",
+    "DeepseekV4TrtllmAttention",
+]
