@@ -543,6 +543,55 @@ def launch_mm_encoder_server(
     asyncio.run(server(host, port))
 
 
+# HF causal-LM architecture -> TRT-LLM text-embedding architecture. The embeddings
+# subcommand declares embedding intent (cf. SGLang --is-embedding); this maps known
+# sentence-transformers decoder backbones onto their pooling+normalize wrapper class.
+_EMBEDDING_ARCH_MAP = {
+    "Qwen3ForCausalLM": "Qwen3ForTextEmbedding",
+}
+
+
+def _resolve_embedding_architecture_override(
+        model: str, trust_remote_code: bool) -> Optional[dict]:
+    """Return a ``model_kwargs`` architecture override for a known embedder.
+
+    Returns ``None`` to leave the model's declared architecture unchanged.
+    Qwen3-Embedding ships as ``Qwen3ForCausalLM`` (a causal decoder) plus a
+    sentence-transformers pooling/normalize pipeline. Overriding ``architectures``
+    flips both the model-class selection (``get_model_architecture``) and the
+    encoder-vs-generation routing (``is_generation_model``) with one change.
+    """
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code)
+        architectures = getattr(hf_config, "architectures", None) or []
+    except Exception as e:  # noqa: BLE001 - config read is best-effort
+        logger.warning(
+            f"Could not read model config for embedding routing ({model}): {e}")
+        return None
+
+    if not architectures:
+        return None
+    target = _EMBEDDING_ARCH_MAP.get(architectures[0])
+    if target is None:
+        return None
+
+    # Best-effort sanity check on a local checkpoint: warn (don't fail) if the
+    # sentence-transformers pooling layout is absent. The subcommand is explicit
+    # embedding intent, so we still proceed with last-token pooling + L2 norm.
+    if os.path.isdir(model):
+        pooling_cfg = os.path.join(model, "1_Pooling", "config.json")
+        if not os.path.isfile(pooling_cfg):
+            logger.warning(
+                f"{model} maps to {target} but has no 1_Pooling/config.json; "
+                "proceeding with last-token pooling + L2 normalize.")
+
+    logger.info(f"Embedding routing: overriding architecture "
+                f"{architectures[0]} -> {target}")
+    return {"architectures": [target]}
+
+
 def launch_embedding_server(
     host: str,
     port: int,
@@ -556,6 +605,17 @@ def launch_embedding_server(
     # encode_only is forced on below; drop any value coming from --config to avoid
     # a duplicate keyword argument.
     llm_args.pop("encode_only", None)
+
+    # Sentence-transformers decoder embedders (e.g. Qwen3-Embedding) declare a
+    # causal-LM architecture; remap it to the text-embedding model class so the
+    # forward returns pooled+normalized sentence embeddings instead of LM logits.
+    override = _resolve_embedding_architecture_override(
+        model, llm_args.get("trust_remote_code", False))
+    if override is not None:
+        model_kwargs = dict(llm_args.get("model_kwargs") or {})
+        model_kwargs.setdefault("architectures", override["architectures"])
+        llm_args["model_kwargs"] = model_kwargs
+
     # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path
     # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
     llm = PyTorchLLM(encode_only=True, **llm_args)
