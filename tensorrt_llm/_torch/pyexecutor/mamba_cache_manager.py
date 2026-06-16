@@ -777,6 +777,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._refresh_dummy_request_mask(is_dummy)
         return indices
 
+    @torch.inference_mode()
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
         n = len(is_dummy)
         assert n <= self._dummy_request_mask_host.shape[0]
@@ -1979,6 +1980,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                     src_state_indices,
                                     num_accepted_draft_tokens, state_indices_d)
 
+    @torch.inference_mode()
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
         if self._dummy_request_mask is None:
             return
