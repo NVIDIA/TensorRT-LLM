@@ -501,7 +501,7 @@ class TestKVCacheFailuresGen:
         # gen99 evicted as victim for gen1; gen1 self-evicts after
         assert set(ids(out.paused_requests)) == {1, 99}
 
-    def test_gen_alloc_fails_recompute_pauses_host_victim(self):
+    def test_host_tier_recompute_pause_delays_retry(self):
         """host-tier victim is recompute-paused before gen self-evicts."""
         call_count = [0]
 
@@ -1964,7 +1964,7 @@ class TestMixedOrdering:
         assert len(out.generation_requests) == 0
         assert set(ids(out.paused_requests)) == {0, 1, 2}
 
-    def test_multiple_gen_after_gen_fail_with_host_tier_recompute_pause(self):
+    def test_host_tier_recompute_pause_multiple_victims(self):
         """Host-tier evicted victims are recompute-paused before self-evict."""
 
         def selective_gen_alloc(req):
