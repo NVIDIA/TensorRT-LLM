@@ -7,8 +7,13 @@ endif()
 # Prepare files
 # =============
 
-# Use DeepGEMM submodule
-set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
+# Use FetchContent's resolved DeepGEMM source directory. This also supports
+# FETCHCONTENT_SOURCE_DIR_DEEPGEMM for local validation builds.
+if(DEFINED deepgemm_SOURCE_DIR)
+  set(DEEP_GEMM_SOURCE_DIR ${deepgemm_SOURCE_DIR})
+else()
+  set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
+endif()
 get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR} ABSOLUTE)
 
 # Check if submodules are initialized

@@ -50,6 +50,42 @@ def test_fp8_block_scale_gemm(m, k, n):
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 90,
+    reason="The test is for Hopper only. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (2048, 7168)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 128],
+)
+def test_fp8_block_scale_gemm_direct_deep_gemm(monkeypatch, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16) / k
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16) / k
+
+    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    monkeypatch.setenv("TRTLLM_FP8_BLOCK_SCALING_GEMM_BACKEND", "trtllm")
+    output_trt = torch.ops.trtllm.fp8_block_scaling_gemm(
+        act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+
+    monkeypatch.setenv("TRTLLM_FP8_BLOCK_SCALING_GEMM_BACKEND",
+                       "direct_deep_gemm")
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8, act_b_fp8,
+                                                     act_a_sf, act_b_sf)
+
+    output_expected = a @ b.t()
+    torch.testing.assert_close(output, output_trt, atol=1e-3, rtol=1e-3)
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
 def change_to_offset_layout(
     ms: List[int],
     x_fp8: torch.Tensor,

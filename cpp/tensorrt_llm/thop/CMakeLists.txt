@@ -147,7 +147,30 @@ target_link_libraries(
                     ${SHARED_TARGET} pg_utils)
 
 if(BUILD_DEEP_GEMM)
-  target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+  find_library(TORCH_PYTHON_LIB torch_python REQUIRED
+               HINTS ${TORCH_INSTALL_PREFIX}/lib)
+  if(DEFINED deepgemm_SOURCE_DIR)
+    set(DEEP_GEMM_SOURCE_DIR ${deepgemm_SOURCE_DIR})
+  else()
+    set(DEEP_GEMM_SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/deepgemm-src)
+  endif()
+  get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR}
+                         ABSOLUTE)
+
+  target_compile_definitions(th_common
+                             PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC
+                                     TRTLLM_ENABLE_DEEP_GEMM_THOP)
+  target_include_directories(
+    th_common
+    PRIVATE ${DEEP_GEMM_SOURCE_DIR}/csrc
+            ${DEEP_GEMM_SOURCE_DIR}/deep_gemm/include
+            ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include
+            ${DEEP_GEMM_SOURCE_DIR}/third-party/fmt/include
+            ${CUDAToolkit_INCLUDE_DIRS}/cccl)
+  target_link_libraries(
+    th_common PRIVATE ${TORCH_PYTHON_LIB} ${CUDA_DRV_LIB} CUDA::cudart
+                      ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB} ${CMAKE_DL_LIBS})
+  add_dependencies(th_common deep_gemm)
 endif()
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)

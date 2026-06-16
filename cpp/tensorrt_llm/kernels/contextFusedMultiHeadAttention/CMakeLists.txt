@@ -46,6 +46,7 @@ tllm_add_cubin_archive_sources(
   context_attention_src "${CMAKE_CURRENT_SOURCE_DIR}/cubin"
   SYMBOL_PREFIX cubin_
   SYMBOL_SUFFIX _cu_cubin
+  NAMESPACE tensorrt_llm kernels
   ARCHS 80 86 89 90 100 120
   IMPLICIT_FAMILY)
 
