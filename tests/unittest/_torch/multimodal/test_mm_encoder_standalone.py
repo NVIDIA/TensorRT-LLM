@@ -631,13 +631,9 @@ def test_kv_event_mm_keys_with_very_long_uuid():
             f"found {len(matching)} times in {mm_key_hashes}")
 
 
-@pytest.fixture(scope="module",
-                params=[
-                    pytest.param(False, id="no_pd_disagg"),
-                    pytest.param(True, id="pd_disagg"),
-                ])
+@pytest.fixture(scope="module")
 def pd_disagg(request) -> bool:
-    return request.param
+    return getattr(request, "param", False)
 
 
 @pytest.fixture(scope="module")
@@ -779,6 +775,7 @@ def _assert_handles_are_different(x: dict | None, y: dict | None) -> None:
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("pd_disagg", [False, True], indirect=True)
 def test_single_request_chat_multiple_images(
     pd_disagg: bool,
     llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import cuda.bindings.driver as drv
 
 
@@ -42,7 +44,7 @@ class LogicError(Exception):
 
 
 class CuError(Exception):
-    error_code: drv.CUresult
+    error_code: Any
 
     def __init__(self, error_code: drv.CUresult) -> None:
         self.error_code = error_code
@@ -50,6 +52,16 @@ class CuError(Exception):
         if err != drv.CUresult.CUDA_SUCCESS:
             err_str = "<Failed to get error string with cuGetErrorString>"
         super().__init__(f"CUDA driver error: {error_code} ({err_str})")
+
+    @classmethod
+    def _reconstruct(cls, error_code: Any, message: str) -> "CuError":
+        error = cls.__new__(cls)
+        error.error_code = error_code
+        Exception.__init__(error, message)
+        return error
+
+    def __reduce__(self):
+        return (self._reconstruct, (self.error_code, self.args[0]))
 
 
 class ResourceBusyError(Exception):

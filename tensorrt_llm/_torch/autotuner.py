@@ -801,36 +801,6 @@ class AutoTuner:
             cls._instance = AutoTuner()
         return cls._instance
 
-    def _is_cached_tactic_valid(
-        self,
-        runner: TunableRunner,
-        tactic: int,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-        **kwargs,
-    ) -> bool:
-        if tactic == -1:
-            return True
-
-        return tactic in runner.get_valid_tactics(inputs, profile, **kwargs)
-
-    def _drop_stale_cache_entry(
-        self,
-        custom_op: str,
-        runner: TunableRunner,
-        input_shapes: Tuple[torch.Size],
-        tuning_config: TuningConfig,
-        apply_map_to_tuning_buckets: bool,
-    ) -> None:
-        cache_key = self.profiling_cache.get_cache_key(
-            custom_op,
-            runner,
-            input_shapes,
-            tuning_config,
-            apply_map_to_tuning_buckets=apply_map_to_tuning_buckets,
-        )
-        self.profiling_cache.cache.pop(cache_key, None)
-
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.
 
@@ -1001,22 +971,6 @@ class AutoTuner:
             input_shapes,
             tuning_config,
             apply_map_to_tuning_buckets=True)
-        if is_cache_hit and not self._is_cached_tactic_valid(
-                runners[best_runner_id], best_tactic, inputs,
-                OptimizationProfile(), **kwargs):
-            logger.warning_once(
-                f"[AutoTuner] {custom_op} ignored a stale cached tactic={best_tactic} "
-                f"for input shapes={input_shapes}; the tactic is no longer valid.",
-                key=(custom_op, "warning_autotuning_stale_cache_entry"))
-            self._drop_stale_cache_entry(
-                custom_op,
-                runners[best_runner_id],
-                input_shapes,
-                tuning_config,
-                apply_map_to_tuning_buckets=True,
-            )
-            is_cache_hit, best_runner_id, best_tactic, min_time = (
-                False, *self.profiling_cache.fallback_entry())
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1061,30 +1015,13 @@ class AutoTuner:
                 tuning_config.distributed_tuning_strategy):
             for p in profiles:
                 tensors = self._prepare_input_tensors(p, inputs)
-                is_cache_hit, cached_runner_id, cached_tactic, _ = self.profiling_cache.search_cache(
+                is_cache_hit, *_ = self.profiling_cache.search_cache(
                     custom_op,
                     runners,
                     p.get_opt_shapes(),
                     tuning_config,
                     apply_map_to_tuning_buckets=False,
                 )
-                if is_cache_hit:
-                    if not self._is_cached_tactic_valid(
-                            runners[cached_runner_id], cached_tactic, tensors,
-                            p, **kwargs):
-                        logger.warning_once(
-                            f"[AutoTuner] {custom_op} ignored a stale cached tactic={cached_tactic} "
-                            f"for profile shapes={p.get_opt_shapes()}; the tactic is no longer valid.",
-                            key=(custom_op,
-                                 "warning_autotuning_stale_cache_entry"))
-                        self._drop_stale_cache_entry(
-                            custom_op,
-                            runners[cached_runner_id],
-                            p.get_opt_shapes(),
-                            tuning_config,
-                            apply_map_to_tuning_buckets=False,
-                        )
-                        is_cache_hit = False
                 if not is_cache_hit:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
