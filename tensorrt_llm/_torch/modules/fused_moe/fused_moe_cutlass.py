@@ -548,7 +548,10 @@ class CutlassFusedMoE(MoE):
             if entry is None:
                 continue
             kernel_ranks[slot] = entry["adapter_size"]
-            kernel_ptrs[slot] = entry["weight_pointers"]
+            # weight_pointers is built flat ([num_seqs * 3], row-major (A, B,
+            # DoRA) per seq) in PyTorchModelEngine._build_lora_params; the MoE op
+            # expects a [num_seqs, 3] table, so restore that shape.
+            kernel_ptrs[slot] = entry["weight_pointers"].reshape(-1, 3)
             try:
                 active_max_rank = max(active_max_rank,
                                       int(entry["adapter_size"].max().item()))
