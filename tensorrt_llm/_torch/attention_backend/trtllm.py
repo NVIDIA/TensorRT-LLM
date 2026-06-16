@@ -1676,9 +1676,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 update_kv_cache=forward_args.update_kv_cache,
                 cross_kv=forward_args.cross_kv,
                 relative_attention_bias=forward_args.relative_attention_bias,
-                relative_attention_max_distance=(
-                    forward_args.relative_attention_max_distance),
-
+                relative_attention_max_distance=forward_args.
+                relative_attention_max_distance,
+                position_embedding_type=self.position_embedding_type,
                 # --- Module config (TrtllmAttention) ---
                 rotary_inv_freq=self.rotary_inv_freq,
                 rotary_cos_sin=self.rotary_cos_sin,
@@ -1689,7 +1689,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 head_size=self.head_dim,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=self.position_embedding_type,
                 rope_dim=self.rope_dim,
                 rope_base=self.rope_base,
                 rope_scale_type=self.rope_scale_type,
