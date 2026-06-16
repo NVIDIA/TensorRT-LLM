@@ -122,11 +122,6 @@ model emits, serialized into the OpenAI embeddings schema.
   vector — 1024 / 2560 / 4096 respectively), with no extra flags. A configurable pooling
   method (CLS / mean) for other sentence-transformers backbones remains a follow-up.
 
-  > **Instruction prefix:** Qwen3-Embedding's `config_sentence_transformers.json` defines
-  > a query instruction (`"Instruct: ...\nQuery:"`). This is a *client-side* convention —
-  > the server embeds the input text verbatim, so prepend the instruction in your request
-  > when the model card calls for it.
-
 Notes:
 
 - The embeddings path uses the synchronous `llm.encode()` fast path
