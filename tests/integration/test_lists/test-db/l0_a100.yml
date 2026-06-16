@@ -17,6 +17,7 @@ l0_a100:
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
+    - unittest/llmapi/test_llm_pytorch.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks TIMEOUT (90)
     - unittest/llmapi/test_llm_encode.py
     - unittest/llmapi/test_llm_encode_multi_item.py
     - unittest/llmapi/test_mpi_session.py ISOLATION
