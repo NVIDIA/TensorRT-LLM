@@ -85,6 +85,8 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
         "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8",
+        "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
     doc="Wan 2.1 & 2.2 text-to-video family.",
 )
@@ -386,6 +388,7 @@ class WanPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         height: int = 720,
         width: int = 1280,
@@ -394,7 +397,6 @@ class WanPipeline(BasePipeline):
         guidance_scale: Optional[float] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
-        seed: int = 42,
         max_sequence_length: int = 512,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):

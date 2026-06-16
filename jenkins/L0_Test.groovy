@@ -133,6 +133,12 @@ SLURM_INFRA_RETRY_MAX = 1
 // to avoid nesting with the inner SLURM retry.
 K8S_INFRA_RETRY_MAX = 1
 
+// Fallback discriminator for SLURM timeouts.
+// If we can't reach the SLURM node for an authoritative reason,
+// we apply a heuristic: if the job needed more than this of its budget
+// to fail, we treat it as a timeout.
+SLURM_TIMEOUT_RETRY_FRACTION = 0.9
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -300,7 +306,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     return rerunFailed  // Return the updated value
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
+def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -367,8 +373,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
             "--test-list=${cleanedTestDBList}",
             "--quiet",
             "--splits ${splits}",
-            "--group ${splitId}"
+            "--group ${splitId}",
         ]
+        if (durationsPath) {
+            testListCmd += ["--durations-path ${durationsPath}"]
+        }
 
         try {
             // First execute the pytest command and check if it succeeds
@@ -582,7 +591,40 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
+// Authoritative timeout signal: ask the SLURM controller (via sacct on the
+// cluster login node) for a job's terminal state. Returns the uppercased
+// primary state token -- e.g. "TIMEOUT", "COMPLETED", "FAILED", "NODE_FAIL",
+// "OUT_OF_MEMORY", "CANCELLED" -- or null when it can't be determined.
+//
+// Best-effort: any SSH/sacct error returns null so callers fall back to the
+// duration heuristic rather than failing the stage.
+def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
+    if (!slurmJobID || !slurmJobID.toString().isNumber()) {
+        return null
+    }
+    String state = null
+    try {
+        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+            // -X: allocation row only (skip .batch/.extern steps). -Pn:
+            // parsable, no header. First line's first token is the job state;
+            // SLURM renders cancellations as "CANCELLED by <uid>", so we keep
+            // only the leading token.
+            def out = Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(remote, "\"sacct -j ${slurmJobID} --format=State -Pn -X || true\""),
+                returnStdout: true,
+            )?.trim()
+            if (out) {
+                state = out.readLines()[0]?.trim()?.tokenize(' ')?.getAt(0)?.toUpperCase(java.util.Locale.ROOT)
+            }
+        }
+    } catch (Exception e) {
+        pipeline.echo("[INFRA-RETRY] Could not query SLURM job ${slurmJobID} state via sacct: ${e.message}")
+    }
+    return state
+}
+
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -649,6 +691,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
             }
         }
+
+        // Wall-clock at which the SLURM job was first observed RUNNING.
+        // Captured locally so it remains usable even when the controller
+        // is later unreachable (the case the fallback exists for). Null until
+        // Phase 1 confirms RUNNING; callers fall back to executeStartMs.
+        def jobRunningStartMs = null
 
         stage('Check If Node Is Online') {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
@@ -720,6 +768,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // Ocean, and probe job status every ~3 min (every 6th iter) to fail fast if the
                 // job dies during bring-up. 120 * 30s = 1h.
                 if (waitRc == 0) {
+                    // Job is RUNNING: stamp the walltime-budget origin for the
+                    // timeout duration fallback (within Phase 1's ~3min poll
+                    // granularity of the true RUNNING transition).
+                    jobRunningStartMs = System.currentTimeMillis()
                     def onlineCounter = 0
                     while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 120) {
                         Thread.sleep(30L * 1000L)
@@ -801,7 +853,43 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag)
+        long executeStartMs = System.currentTimeMillis()
+        try {
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            // Decide whether this failure is a SLURM timeout (the test ran to
+            // its partition walltime) rather than a transient infra blip.
+            // Measure elapsed from when the job was first observed RUNNING.
+            // Fall back to executeStartMs if the RUNNING stamp was never set.
+            long timeoutBaselineMs = (jobRunningStartMs ?: executeStartMs) as long
+            long elapsedMin = Math.floorDiv(System.currentTimeMillis() - timeoutBaselineMs, 60000L)
+            Integer walltimeMin = (partition?.time ?: SlurmConfig.DEFAULT_TIMEOUT_SHORT) as Integer
+            def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobID)
+
+            if (slurmState == "TIMEOUT") {
+                throw new UserFailure(
+                    "SLURM job ${slurmJobID} for ${stageName} ended in state TIMEOUT " +
+                    "(hit partition walltime ${walltimeMin}min); treating as a test timeout, not retrying. " +
+                    "Original failure: ${e.message}",
+                    e)
+            }
+
+            if (slurmState == null && walltimeMin != null
+                    && elapsedMin >= (long)(SLURM_TIMEOUT_RETRY_FRACTION * walltimeMin)) {
+                throw new UserFailure(
+                    "SLURM job ${slurmJobID} for ${stageName} ran ${elapsedMin}min " +
+                    "(>= ${(int)(SLURM_TIMEOUT_RETRY_FRACTION * 100)}% of the ${walltimeMin}min walltime) and " +
+                    "the SLURM controller was unreachable for an authoritative state; treating as a likely " +
+                    "timeout, not retrying. Original failure: ${e.message}",
+                    e)
+            }
+
+            echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
+                 "ran ${elapsedMin}min of ${walltimeMin}min walltime; deferring to failure classifier."
+            throw e
+        }
     } finally {
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -816,12 +904,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="")
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag, useClusterDurations)
         }, {
             // If the execution test list is null, remove the test result xml
             sh """
@@ -980,7 +1068,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1064,7 +1152,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // line is "Mako options:", maybe we can make it more generic, which
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
-                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson)
+                String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
+                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1111,6 +1200,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
 
+                def clusterDurationsArgsNode = []
+                if (useClusterDurations) {
+                    def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+                    def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
+                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
@@ -1124,7 +1219,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                       "--test-list=$testListPathNode",
                       "--splitting-algorithm least_duration",
                       "--splits $splits",
-                      "--group $splitId"
+                      "--group $splitId",
+                      *clusterDurationsArgsNode,
                     ]
                 ).join(" ")
 
@@ -1449,15 +1545,40 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Track the Slurm job
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptTrackPathNode
-                    ),
-                    numRetries: 3
-                )
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            scriptTrackPathNode
+                        ),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    // The track script squashes the job's terminal SLURM state to
+                    // exit 0/1, so a walltime kill is indistinguishable here from a
+                    // real test failure. Re-query sacct for the allocation-level
+                    // state (SLURM already aggregates it across nodes; TIMEOUT if
+                    // any node hit the walltime) and, when it is TIMEOUT, raise a
+                    // typed UserFailure so neither the SLURM retry loop nor the
+                    // outer K8s pod retry re-runs a job that would just time out
+                    // again. srun --kill-on-bad-exit=1 means a genuine test failure
+                    // surfaces as FAILED, not TIMEOUT, so this stays unambiguous.
+                    def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                    if (slurmState == "TIMEOUT") {
+                        throw new UserFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
+                            "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
+                            "Original failure: ${e.message}",
+                            e)
+                    }
+                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
+                         "deferring to failure classifier."
+                    throw e
+                }
             }
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmSshCredentials
@@ -1513,7 +1634,7 @@ def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
     return [skip: false, splits: 1, splitId: 1]
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="")
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false)
 {
   def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
   if (collapse.skip) {
@@ -1548,9 +1669,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations)
       }
 
       // Job succeeded
@@ -1712,9 +1833,9 @@ class GlobalState {
     static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
 }
 
-def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
+def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount, String clusterName=null)
 {
-    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount)
+    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount, clusterName)
     if (estimate.error) {
         echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${estimate.error}"
     }
@@ -2481,7 +2602,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
-def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
+def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null) {
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
@@ -2543,7 +2664,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
-    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount)
+    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount, clusterName)
 
     return testList
 }
@@ -3053,7 +3174,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="")
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="", boolean useClusterDurations=false)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -3203,7 +3324,23 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
-        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName)
+
+        // When useClusterDurations is set, use a per-cluster durations file keyed on
+        // partition.clusterName (e.g. "aws-dfw", "dlcluster").  This lets each cluster
+        // build its own timing baseline so sharding is not skewed by timings collected
+        // on different hardware.  Falls back to the shared .test_durations when unset.
+        def clusterDurationsArgs = []
+        def clusterDurationsPath = ""
+        String clusterNameForDurations = null
+        if (useClusterDurations) {
+            def partition = SlurmConfig.resolvePlatform(platform)
+            def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+            clusterNameForDurations = clusterKey
+            clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
+            clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
+        }
+
+        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
 
         // Download and Merge waives.txt
         mergeWaivesTxt(pipeline, llmSrc, stageName)
@@ -3214,7 +3351,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -3248,7 +3385,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
-            [],  // extraArgs
+            clusterDurationsArgs,
             containerPortStart,
             containerPortNum
         )
@@ -3337,7 +3474,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (perfMode) {
-            basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
+            // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
+            basePerfFilename = "base_perf_pytorch.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check Perf Result") {
                 def perfCheckResult = sh(
@@ -3420,7 +3558,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
     if (collapse.skip) {
@@ -3430,7 +3568,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
     splitId = collapse.splitId
 
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag, useClusterDurations)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -3925,11 +4063,11 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     }
 }
 
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false) {
+def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false, useClusterDurations=false) {
     def configs = [:]
     for (int k = 1; k <= testCount; k++) {
         def key = "${stageName}-${k}"
-        configs[key] = [platform, testlist, k, testCount, gpuCount, nodeCount, runWithSbatch]
+        configs[key] = [platform, testlist, k, testCount, gpuCount, nodeCount, runWithSbatch, useClusterDurations]
     }
     return configs
 }
@@ -4010,7 +4148,6 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         // "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
         // "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
-        "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
@@ -4065,13 +4202,15 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 7, 1, 1, true],
-        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 7, 1, 1, true],
-        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 7, 1, 1, true],
-        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 7, 1, 1, true],
-        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 7, 1, 1, true],
-        "DGX_B200-PyTorch-6": ["auto:dgx-b200-flex", "l0_b200", 6, 7, 1, 1, true],
-        "DGX_B200-PyTorch-7": ["auto:dgx-b200-flex", "l0_b200", 7, 7, 1, 1, true],
+        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
+        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
+        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
+        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 9, 1, 1, true],
+        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 9, 1, 1, true],
+        "DGX_B200-PyTorch-6": ["auto:dgx-b200-flex", "l0_b200", 6, 9, 1, 1, true],
+        "DGX_B200-PyTorch-7": ["auto:dgx-b200-flex", "l0_b200", 7, 9, 1, 1, true],
+        "DGX_B200-PyTorch-8": ["auto:dgx-b200-flex", "l0_b200", 8, 9, 1, 1, true],
+        "DGX_B200-PyTorch-9": ["auto:dgx-b200-flex", "l0_b200", 9, 9, 1, 1, true],
         "DGX_B200-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
@@ -4099,10 +4238,11 @@ def launchTestJobs(pipeline, testFilter)
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 5, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 5, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 5, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 5, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 5, 5, 8, 1, true],
     ]
     // B200 PerfSanity post-merge disaggregated
     // 2 Nodes
@@ -4151,11 +4291,15 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 4, 4],
-        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 4, 4],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
+        // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
+        // useClusterDurations=true: record actual test times so each cluster builds its own
+        // .test_durations_<clusterName> baseline for load-balanced sharding.
+        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4],
@@ -4165,26 +4309,29 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 7, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 7, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 7, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 7, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 7, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 7, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 7, 7, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 7, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-8": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 8, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-9": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 9, 9, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
         // Each testcase uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 1, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 2, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 1, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 2, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 3, 3, 8, 2],
     ]
     // PerfSanity post-merge aggregated
     // 2 Nodes
@@ -4192,7 +4339,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        7,
+        9,
         8,
         2
     )
@@ -4279,7 +4426,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        11,
+        12,
         36,
         9
     )
@@ -4308,7 +4455,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        4,
+        3,
         8,
         2
     )
@@ -4317,7 +4464,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        4,
+        5,
         12,
         3
     )
@@ -4335,7 +4482,35 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        4,
+        2,
+        36,
+        9
+    )
+    // GB300 GLM-5 disaggregated (ctx DEP2)
+    // 2 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4",
+        1,
+        8,
+        2
+    )
+    // 3 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
+        5,
+        12,
+        3
+    )
+    // 9 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32",
+        2,
         36,
         9
     )
@@ -4343,7 +4518,7 @@ def launchTestJobs(pipeline, testFilter)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -4362,7 +4537,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
         }, [singleAttempt: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -4376,7 +4551,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
         }, [singleAttempt: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs

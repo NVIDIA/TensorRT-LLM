@@ -80,14 +80,43 @@ def _register_fake():
 
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
-    def _(input, residual, gamma, epsilon, buffer, buffer_flags,
-          rmsnorm_fusion):
-        output = input.new_empty(input.shape)
-        if rmsnorm_fusion:
-            residual_out = residual.new_empty(residual.shape)
-        else:
-            residual_out = None
-        return [output, residual_out]
+    def _(input,
+          gamma,
+          residual,
+          epsilon,
+          buffer,
+          buffer_flags,
+          rmsnorm_fusion,
+          scale=None,
+          fusion_op: int = 0):
+        from tensorrt_llm.functional import AllReduceFusionOp
+        op = AllReduceFusionOp(fusion_op)
+        if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
+            op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+        if op == AllReduceFusionOp.NONE:
+            return [torch.empty_like(input)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            return [torch.empty_like(input), torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            return [quant_out, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+            norm_out = torch.empty_like(input)
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            return [norm_out, quant_out, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [quant_fp4, scale_fp4, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            norm_out = torch.empty_like(input)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [norm_out, quant_fp4, scale_fp4, torch.empty_like(residual)]
+        return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
@@ -680,6 +709,7 @@ def _register_fake():
         cluster_rank: int,
         min_latency_mode: bool,
         use_fp8_block_scaling: bool,
+        skip_data_expand: bool = False,
     ):
 
         experts_per_token = token_selected_experts.shape[1]
