@@ -22,7 +22,8 @@ from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model
+from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
+                             register_auto_model)
 
 
 class Qwen3Attention(QKNormRoPEAttention):
@@ -299,3 +300,47 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
+
+
+@register_auto_model("Qwen3ForTextEmbedding")
+class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
+    """Qwen3-Embedding family (0.6B / 4B / 8B).
+
+    The Qwen3 decoder backbone exposed as a sentence-embedding model: ``forward``
+    returns the L2-normalized last-token hidden state (the sentence embedding)
+    instead of vocabulary logits. This matches the model's sentence-transformers
+    pipeline (Transformer -> Pooling[last-token] -> Normalize) and SGLang's
+    ``Pooler(PoolingType.LAST, normalize=True)``.
+
+    ``lm_head`` is intentionally not allocated: like ``Qwen2ForRewardModel`` we call
+    ``nn.Module.__init__`` directly instead of ``DecoderModelForCausalLM.__init__``,
+    which avoids a vocab x hidden parameter we never use and sidesteps tied-embedding
+    checkpoint handling (0.6B/4B tie word embeddings). Weight loading uses the
+    inherited ``load_weights`` (it iterates the model's own params, so the absent
+    ``lm_head`` is a non-issue).
+    """
+
+    def __init__(self, model_config: ModelConfig[Qwen3Config]):
+        nn.Module.__init__(self)
+        self.model_config = model_config
+        self.model = Qwen3Model(model_config)
+
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+
+        # Last-token pooling + L2 normalization (sentence-transformers
+        # Pooling[pooling_mode_lasttoken=true] -> Normalize). hidden_states is the
+        # packed [total_tokens, hidden] tensor; take each sequence's final token.
+        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        pooled = hidden_states[end_indices]
+        return torch.nn.functional.normalize(pooled, p=2, dim=-1)
