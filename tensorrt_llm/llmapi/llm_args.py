@@ -2907,6 +2907,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "your own risk. Only used when using KV cache manager v2 "
         "(experimental).")
 
+    disk_prefetch_num_reqs: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
+        "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
+    )
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
