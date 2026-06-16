@@ -5770,27 +5770,7 @@ class PyExecutor:
             req.pause(self.max_input_len)
 
     def _pause_recompute_request(self, req):
-        req.pause(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
-        req.py_batch_idx = None
-        req.py_seq_slot = None
-        req.py_prompt_len = req.prompt_len
-        req.py_orig_prompt_len = req.prompt_len
-        req.py_max_new_tokens = req.max_new_tokens
-        req.seqlen_this_rank_cp = req.prompt_len
-        req.total_input_len_cp = req.prompt_len
-        req.py_draft_pages_allocated = 0
-        req.py_rewind_len = 0
-        req.py_draft_tokens = []
-        req.draft_tokens = []
-        req.py_last_context_chunk = (None, None)
-        req.py_last_draft_tokens = None
-        req.py_num_accepted_draft_tokens = 0
-        req.py_num_accepted_draft_tokens_indices = []
-        req.py_rewind_draft_token_separate_adjustment = 0
-        req.py_decoding_iter = 0
-        req.py_ctx_pre_resize_cap = None
-        req._cached_tokens = 0
-        req._cached_tokens_set = False
+        req.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
 
     def _terminate_recompute_paused_requests(
             self, scheduled_batch: ScheduledRequests):
