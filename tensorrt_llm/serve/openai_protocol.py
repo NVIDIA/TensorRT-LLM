@@ -809,6 +809,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")
 
+    mm_processor_kwargs: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=
+        "Per-request kwargs forwarded to the multimodal HF processor (e.g. num_frames for video models).",
+    )
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,
