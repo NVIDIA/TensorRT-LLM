@@ -1375,6 +1375,13 @@ class MLA(nn.Module):
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
                                          dtype=dtype)
+            # DSV4-only: fuse the q-slice GEMM + (gamma-folded) drop-RMS + fp8-quant into one
+            # fused fp8-out kernel. Gated by env, off by default. Weights are built lazily on
+            # first forward (split kv_a_proj, fold q_a_layernorm gamma into the q-slice weight).
+            self._dsv4_fused_qa = bool(
+                self.is_deepseek_v4
+                and int(os.environ.get("TRTLLM_DSV4_FUSED_QA", "0")))
+            self._fused_qa_built = False
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
@@ -2094,6 +2101,81 @@ class MLA(nn.Module):
                               indexer_intermediates, position_ids,
                               attn_metadata, output)
 
+    def _build_fused_qa_weights(self):
+        """Lazy: split kv_a_proj_with_mqa weight at q_lora_rank, fold q_a_layernorm gamma into the
+        q-slice (drop RMS), produce the fused-op B operands + the bf16 kv-slice GEMM weight. Built
+        once, before CUDA-graph capture."""
+        from ..custom_ops.dsv4_fused_qa import build_fused_qa_weights
+        built = build_fused_qa_weights(self.kv_a_proj_with_mqa.weight,
+                                       self.kv_a_proj_with_mqa.weight_scale,
+                                       self.q_a_layernorm.weight,
+                                       self.q_lora_rank)
+        self._W_q_fp8 = built["W_q_fp8"]
+        self._W_q_sfb = built["W_q_sfb"]
+        self._W_kvrope_fp8 = built["W_kvrope_fp8"]
+        self._W_kvrope_scale = built["W_kvrope_scale"]
+        self._fused_qa_dbg = True  # one-time q_b format self-check
+        self._fused_qa_built = True
+
+    def _forward_dsa_proj_fused(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> List[torch.Tensor]:
+        """Fused q-path (TRTLLM_DSV4_FUSED_QA). Stage B: split kv_a_proj into a fused fp8-out q-slice
+        GEMM (gamma folded, RMS dropped) + a bf16 kv/rope GEMM; q_b_proj consumes the fused (qr_fp8,qr_sf)
+        DIRECTLY via deep_gemm (skips its own fp8-quant). A one-time self-check compares the deep_gemm-direct
+        q_b against the normal q_b on the dequantized qr to confirm the weight-scale format. The indexer
+        still takes a dequantized bf16 qr for now (Stage A for wq_b)."""
+        from ..custom_ops.dsv4_fused_qa import (deep_gemm_nt_out,
+                                                dequant_qr_to_bf16,
+                                                run_fused_qa_qpath)
+        if not self._fused_qa_built:
+            self._build_fused_qa_weights()
+        M = hidden_states.shape[0]
+        # fused fp8-out q-slice (gamma folded, RMS dropped) + padded quantized hidden (reused for kv)
+        qr_fp8, qr_sf_view, hp_fp8, hp_sf, _ = run_fused_qa_qpath(
+            hidden_states, self._W_q_fp8, self._W_q_sfb)
+        # kv + rope via deep_gemm bf16 on the split W_kvrope slice
+        kv = deep_gemm_nt_out(hp_fp8, hp_sf, self._W_kvrope_fp8,
+                              self._W_kvrope_scale, hidden_states.dtype, M)
+        compressed_kv, k_pe = kv.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        compressed_kv = self.kv_a_layernorm(compressed_kv)
+        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        # q_b_proj: consume the fused (qr_fp8, qr_sf) directly (no re-quantize)
+        q = deep_gemm_nt_out(qr_fp8, qr_sf_view, self.q_b_proj.weight,
+                             self.q_b_proj.weight_scale, hidden_states.dtype, M)
+        if getattr(self, "_fused_qa_dbg",
+                   False) and not torch.cuda.is_current_stream_capturing():
+            self._fused_qa_dbg = False
+            import sys
+            qr_dbg = dequant_qr_to_bf16(
+                qr_fp8, qr_sf_view, self.q_lora_rank).to(hidden_states.dtype)
+            q_ref = self.q_b_proj(qr_dbg)
+            d = (q.float() - q_ref.float()).abs()
+            print(
+                "[DSV4_FUSED_QA] q_b direct-vs-normal max=%.4f mean=%.5f rel=%.4f"
+                %
+                (d.max().item(), d.mean().item(),
+                 (d.max() / q_ref.float().abs().max().clamp_min(1e-6)).item()),
+                file=sys.stderr,
+                flush=True)
+        # indexer still takes bf16 qr (Stage A for wq_b)
+        qr = dequant_qr_to_bf16(qr_fp8, qr_sf_view,
+                                self.q_lora_rank).to(hidden_states.dtype)
+        use_short_mha_for_ctx = self._should_use_short_mha(
+            attn_metadata, position_ids)
+        if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
+            return [q, compressed_kv, k_pe, latent_cache]
+        q_fp8, k_fp8, k_scale, weights, q_scale = (
+            self.mqa.indexer.pre_indexer_proj(qr, hidden_states, position_ids))
+        return [
+            q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
+            weights, q_scale
+        ]
+
     def forward_dsa_proj(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2118,6 +2200,10 @@ class MLA(nn.Module):
         9-tensor shape regardless of indexer dtype.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
+
+        if self._dsv4_fused_qa:
+            return self._forward_dsa_proj_fused(position_ids, hidden_states,
+                                                attn_metadata)
 
         q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
