@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -247,7 +247,7 @@ CudaEvent GptDecoderBatched::finalize(decoder::DecoderState const& decoderState,
 
     auto [dInput, dOutput] = prepareGatherTree(decoderState, batchSlot, streaming, *mRuntimeStream);
 
-    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
+    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream, batchSlot);
 
     CudaEvent event{};
     mRuntimeStream->record(event);

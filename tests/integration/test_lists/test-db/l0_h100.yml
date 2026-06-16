@@ -73,7 +73,20 @@ l0_h100:
   - unittest/disaggregated/test_request_id.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
-  - unittest/disaggregated/test_cache_transceiver_single_process.py
+  # Split the large cache transceiver parametrization into readable chunks.
+  # Main transfer matrix.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v1 and no_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v1 and uniform_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and no_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and uniform_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and vswa"
+  # Uneven pipeline-parallel layer distribution.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "no_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "uniform_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "v2 and vswa"
+  # Boundary request lengths.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v1"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
@@ -219,6 +232,7 @@ l0_h100:
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
+    - unittest/llmapi/test_llm_pytorch.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks TIMEOUT (90)
     - unittest/llmapi/test_async_llm.py -m "not (gpu2 or gpu4)"
     - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
