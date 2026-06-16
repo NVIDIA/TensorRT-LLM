@@ -10,6 +10,7 @@ Lock the multi-arch design (task1) and implement task2: internal forced-backend 
   - Both bypass the process-global `TRTLLM_FP8_BLOCK_SCALING_GEMM_BACKEND` env var → deterministic per-call selection (concurrency / CUDA-graph safe).
   - Registered both ops in `TORCH_LIBRARY_FRAGMENT` / `TORCH_LIBRARY_IMPL`.
   - Public `fp8_block_scaling_gemm_impl` schema and its env-var path: **unchanged**. Copyright year updated to 2026.
+- **DeepGEMM JIT init fix (coding)** in the same file: `init_deep_gemm_runtime_once` now also calls `deep_gemm::IncludeParser::prepare_init(deep_gemm_root)` (previously missing) and includes `jit/include_parser.hpp`, so the C++ DeepGEMM direct path self-initializes its JIT include root instead of depending on a separate `import deep_gemm`. Fixes the new DeepGEMM op and the pre-existing `direct_deep_gemm` path.
 - **task1 (analyze)** — design locked via 2 gen-plan convergence rounds + the multi-arch re-review; SM100/B200 refinements folded into goal-tracker Plan Evolution Log.
 
 ## Files Changed
@@ -21,14 +22,18 @@ Lock the multi-arch design (task1) and implement task2: internal forced-backend 
 ## Validation (GH200, alloc `sc-2653078`, node `lego-cg1-qs-16`, rc17 container)
 - **Compile + link: PASS.** `th_common` built cleanly with the change (`fp8BlockScalingGemm.cpp.o` compiled, `libth_common.so` linked, 0 errors). The build script's later `import tensorrt_llm` failure is an unrelated rc17 packaging gap (`kv_cache_manager_v2.rawref._rawref` missing), not this change.
 - **`fp8_block_scaling_gemm_trtllm`: PASS.** On `11250x5120x5120`, output is exact-equal to `fp8_block_scaling_gemm_impl` (env `trtllm`) and matches the BF16 reference → AC-1 SM90 default routing.
-- **`fp8_block_scaling_gemm_deep_gemm`: routing verified; numerical sanity BLOCKED.** The op correctly dispatches into the existing Hopper DeepGEMM path (reaches the DeepGEMM C++ JIT). The JIT then fails to open `deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh` because the DeepGEMM `IncludeParser` is only initialized as a side effect of `import deep_gemm`; `init_deep_gemm_runtime_once` initializes `Compiler`+`KernelRuntime` but not `IncludeParser`, and `deep_gemm` is not importable in the minimal standalone harness used here. This equally affects the pre-existing `impl`+`direct_deep_gemm` path — environment/harness issue, not a defect in the new op.
+- **`fp8_block_scaling_gemm_deep_gemm`: PASS.** Output is exact-equal to `fp8_block_scaling_gemm_impl` (env `direct_deep_gemm`) and matches the BF16 reference. Reaching this required a real code fix plus a harness/env correction:
+  - **Code fix (committed):** `init_deep_gemm_runtime_once` initialized `Compiler` + `KernelRuntime` but NOT `IncludeParser`, whose static include root was left empty → JIT failed to open `deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh`. DeepGEMM's own canonical init (`csrc/apis/runtime.hpp`) inits all three; added `IncludeParser::prepare_init(deep_gemm_root)` to match. This also fixes the pre-existing `impl`+`direct_deep_gemm` path when run from a process that has not imported the standalone `deep_gemm` (separate C++ runtime).
+  - **Env correction:** the DeepGEMM JIT root must be a packaged deep_gemm whose `include/` bundles CUTLASS (e.g. the build's venv `site-packages/deep_gemm`), not the raw `DeepGEMM/deep_gemm` (no `include/cutlass`), or NVCC fails on `cutlass/arch/barrier.h`.
 
 ## Remaining Items
-- Stand up a proper DeepGEMM validation harness (importable `deep_gemm` via the build's `.venv-3.12`, or self-init the JIT IncludeParser) and re-run the DeepGEMM-forced numerical sanity. Queued; also required for task4/task6.
+- DeepGEMM validation harness: RESOLVED this round (IncludeParser code fix + venv python `/code/TensorRT-LLM/.venv-3.12/bin/python3` + DeepGEMM root = venv `site-packages/deep_gemm` which bundles CUTLASS under `include/`). This run recipe is reusable for task4/task6.
 - task8 (Blackwell SM100/B200 op + 1d1d scale conversion) — needs a B200 node.
 - task3–task7 — not started. This round intentionally scoped to task2 (see round-0-contract); the overall plan is NOT complete.
 
 ## BitLesson Delta
 Action: add
-Lesson ID(s): BL-20260615-deepgemm-jit-includeparser-init
-Notes: The C++ thop DeepGEMM direct path depends on `import deep_gemm` having run to initialize the DeepGEMM JIT `IncludeParser` (kernel-source include root). `init_deep_gemm_runtime_once` initializes `Compiler`/`KernelRuntime` but not `IncludeParser`, so a minimal harness that loads `libth_common.so` without importing `deep_gemm` fails with "Failed to open: deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh". Fix in harnesses: import `deep_gemm` first (as `bench_trtllm_deepgemm_three_way.py` does) or run with the build's venv where it is available.
+Lesson ID(s): BL-20260615-deepgemm-jit-includeparser-init, BL-20260615-deepgemm-jit-root-needs-cutlass
+Notes:
+- BL-20260615-deepgemm-jit-includeparser-init: `init_deep_gemm_runtime_once` must call `IncludeParser::prepare_init` (in addition to `Compiler`/`KernelRuntime`); otherwise the JIT include root is empty and kernel `.cuh` files fail to open. Fixed in code this round (the standalone `import deep_gemm` only inits a SEPARATE C++ runtime's IncludeParser, not libth_common's).
+- BL-20260615-deepgemm-jit-root-needs-cutlass: `TRTLLM_DEEP_GEMM_ROOT` must point to a packaged deep_gemm whose `include/` bundles CUTLASS (e.g. the build venv `site-packages/deep_gemm`), not the raw `DeepGEMM/deep_gemm` (no `include/cutlass`), or NVCC JIT fails on `cutlass/arch/barrier.h`.

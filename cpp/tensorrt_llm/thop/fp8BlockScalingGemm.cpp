@@ -36,6 +36,7 @@
 #include "apis/layout.hpp"
 #include "jit/compiler.hpp"
 #include "jit/kernel_runtime.hpp"
+#include "jit/include_parser.hpp"
 
 #include <dlfcn.h>
 #endif
@@ -229,6 +230,11 @@ void init_deep_gemm_runtime_once()
             auto const cuda_home = find_cuda_home();
             deep_gemm::Compiler::prepare_init(deep_gemm_root.string(), cuda_home.string());
             deep_gemm::KernelRuntime::prepare_init(cuda_home.string());
+            // DeepGEMM's JIT IncludeParser keeps its own static include root, separate from
+            // Compiler's. The canonical deep_gemm runtime init (csrc/apis/runtime.hpp) initializes
+            // all three; initializing only Compiler + KernelRuntime leaves the IncludeParser include
+            // path empty, so JIT compilation fails to open kernel headers (deep_gemm/impls/*.cuh).
+            deep_gemm::IncludeParser::prepare_init(deep_gemm_root.string());
         });
 }
 

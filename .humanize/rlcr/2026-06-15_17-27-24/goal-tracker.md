@@ -40,7 +40,7 @@ Full positive/negative tests are in `fp8-blockscale-gemm-dispatch.plan.md` (repo
 | Task | Target AC | Status | Tag | Owner | Notes |
 |------|-----------|--------|-----|-------|-------|
 | task1 design lock (precedence, per-arch candidates, cache identity, capture rule, Blackwell 1d1d contract) | AC-1,3,4,6,7 | done | analyze | codex | covered by 2 gen-plan rounds + multi-arch re-review (bnwp9izb8); findings in Evolution Log |
-| task2 SM90 Hopper internal forced-backend ops (public op unchanged) | AC-1,10 | done (pending verify) | coding | claude | R0: compiled+linked on GH200; trtllm op exact==env-default+BF16; deep_gemm op routing verified, numerical sanity pending DeepGEMM harness (see queued) |
+| task2 SM90 Hopper internal forced-backend ops (public op unchanged) + DeepGEMM JIT IncludeParser init fix | AC-1,10 | done | coding | claude | R0: compiled+linked on GH200; BOTH ops numerically verified — trtllm op exact==env `trtllm`, deep_gemm op exact==env `direct_deep_gemm`, both match BF16 ref (6.84e-04). Committed. |
 | task8 Blackwell SM100/B200 internal op + 1d1d scale conv + SM100 gate (needs B200 node) | AC-1,5,9,10 | pending | coding | claude | queued out of Round 0 (B200 node) |
 | task3 arch-generic unified runner + static guards + layout revalidation | AC-1,2,3,9,10 | pending | coding | claude | depends task2,task8 |
 | task4 offline correctness+profiling cache builder (BF16 gate) | AC-5,6 | pending | coding | claude | depends task3 |
@@ -58,7 +58,7 @@ Full positive/negative tests are in `fp8-blockscale-gemm-dispatch.plan.md` (repo
 | Exact SM100 TRT→DeepGEMM scale recipe (dtype/shape, FP32→packed-UE8M0, rounding); does model-level accuracy need more than per-op BF16 allclose | 0 | task8/task6 detail; SM90 mainline first | starting task8 (B200) |
 | device_class canonicalization (H100 PCIe/SXM/NVL, H200, B200/GB200) | 0 | task4/task5 cache-identity detail | starting task4 |
 | Full-model-run definition + whether synthetic replay derives from same trace | 0 | task6 deliverable detail | starting task6 |
-| DeepGEMM validation harness: `deep_gemm` not importable at rc17 system python, so JIT IncludeParser uninitialized → DeepGEMM direct path can't open kernel .cuh in a minimal harness (BL-20260615). Need build `.venv-3.12` / proper deep_gemm import, or self-init IncludeParser in thop | 0 | task2 trtllm op already verified; blocks only the DeepGEMM-forced numerical sanity | next round (also required for task4/task6) |
+| ~~DeepGEMM validation harness / JIT IncludeParser uninitialized~~ RESOLVED R0: added `IncludeParser::prepare_init` to thop; run with venv python + DeepGEMM root = venv `site-packages/deep_gemm` (bundles cutlass). Recipe reusable for task4/task6. | 0 | resolved | done |
 
 ### Completed and Verified
 | AC | Task | Completed Round | Verified Round | Evidence |
