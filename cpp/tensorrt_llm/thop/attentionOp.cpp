@@ -768,8 +768,8 @@ public:
         if (is_cross)
         {
             // For cross attention, the KV (encoder) sequence lengths are passed in via
-            // ``sequence_length`` (already sliced into ``sequence_lengths_ptr``), so reuse
-            // it directly instead of a redundant ``encoder_input_lengths`` tensor.
+            // `sequence_length` (already sliced into `sequence_lengths_ptr`), so reuse
+            // it directly instead of a redundant `encoder_input_lengths` tensor.
             common_enqueue_params.encoder_input_lengths = sequence_lengths_ptr;
         }
         if (softmax_stats_tensor.has_value())

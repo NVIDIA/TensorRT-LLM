@@ -828,6 +828,13 @@ class AttentionForwardArgs:
     relative_attention_max_distance: int = 0
     cross_kv: Optional[torch.Tensor] = None
 
+    multi_item_part_lens: Optional[list[list[int]]] = None
+    """Additional token layout information for multi-item scoring.
+
+    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
+    see `TokensPrompt` for details.
+    """
+
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None

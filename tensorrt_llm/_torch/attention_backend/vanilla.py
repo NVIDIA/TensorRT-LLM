@@ -484,6 +484,11 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+
+        if forward_args.multi_item_part_lens is not None:
+            raise ValueError(
+                "Vanilla Attention does not support multi-item scoring")
+
         if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.

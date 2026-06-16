@@ -1679,7 +1679,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 relative_attention_max_distance=forward_args.
                 relative_attention_max_distance,
                 position_embedding_type=self.position_embedding_type,
-
                 # --- Module config (TrtllmAttention) ---
                 rotary_inv_freq=self.rotary_inv_freq,
                 rotary_cos_sin=self.rotary_cos_sin,
@@ -1753,6 +1752,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
+
+        if forward_args.multi_item_part_lens is not None:
+            raise ValueError(
+                "TRT-LLM Attention does not support multi-item scoring")
 
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
