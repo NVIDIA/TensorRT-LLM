@@ -1629,6 +1629,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 spec_decoding_bl_tree_mask_offset=metadata.
                 spec_decoding_bl_tree_mask_offset,
                 spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
+                spec_decoding_target_max_draft_tokens=metadata.
+                max_total_draft_tokens,
                 spec_bl_tree_first_sparse_mask_offset_kv=metadata.
                 spec_bl_tree_first_sparse_mask_offset_kv,
                 num_sparse_topk=metadata.num_sparse_topk,
@@ -1641,8 +1643,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_seq_len=metadata.max_seq_len,
                 trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
                 is_cross=metadata.is_cross,
-                spec_decoding_target_max_draft_tokens=metadata.
-                max_total_draft_tokens,
 
                 # --- Per-call (AttentionForwardArgs) ---
                 out_scale=forward_args.out_scale,
