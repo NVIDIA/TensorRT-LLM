@@ -129,6 +129,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._model_name = str(model_name) if model_name is not None else None
         self._query_timeout_s = query_timeout_s
         self._p2p_succeeded = False
+        self._post_transform_weights_preloaded = False
+        self._source_identity_compatible_for_last_load = False
         # Receiver's local SourceIdentity, supplied per load_weights() call by
         # ModelLoader; the authority for the pre-transfer compatibility gate.
         self._local_source_identity: Optional[SourceIdentity] = None
@@ -184,6 +186,21 @@ class MXCheckpointLoader(HfCheckpointLoader):
         """
         return self._p2p_succeeded
 
+    def is_post_transform_weights_preloaded(self) -> bool:
+        """Whether the last successful MX preload delivered transformed bytes.
+
+        Wave 4 wires the receiver-side staged hook path, but the MX publisher
+        still emits raw pre-transform bytes. Keep this false until Wave 5 wires
+        explicit MX metadata for post-transform publication. The source
+        identity bit is included here so callers have one conservative signal:
+        no identity match, no transform skip.
+        """
+        return (
+            self._p2p_succeeded
+            and self._post_transform_weights_preloaded
+            and self._source_identity_compatible_for_last_load
+        )
+
     def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
         """Load weights, preferring MX P2P transfer when available.
 
@@ -207,6 +224,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # Popped here so it never leaks into the disk-fallback signature.
         self._local_source_identity = kwargs.pop("source_identity", None)
         self._p2p_succeeded = False
+        self._post_transform_weights_preloaded = False
+        self._source_identity_compatible_for_last_load = False
 
         if self._mx_server_url is None or model is None:
             return self._fallback_to_disk(
@@ -237,13 +256,20 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
         # Pre-transfer compatibility gate: on mismatch, skip the transfer
         # before any RDMA work starts and fall back to disk.
-        if not self._source_identity_compatible(checkpoint_dir, MxClient, _build_trtllm_identity):
+        self._source_identity_compatible_for_last_load = self._source_identity_compatible(
+            checkpoint_dir, MxClient, _build_trtllm_identity
+        )
+        if not self._source_identity_compatible_for_last_load:
             return self._fallback_to_disk(
                 checkpoint_dir,
                 mapping,
                 reason="source SourceIdentity incompatible with receiver",
                 **kwargs,
             )
+
+        self._post_transform_weights_preloaded = self._source_metadata_is_post_transform(
+            checkpoint_dir, MxClient, _build_trtllm_identity
+        )
 
         timeout_override = self._resolve_query_timeout_override(
             checkpoint_dir,
@@ -271,6 +297,24 @@ class MXCheckpointLoader(HfCheckpointLoader):
             fallback_bytes = sum(
                 tensor.numel() * tensor.element_size() for tensor in fallback_weights.values()
             )
+            if self._post_transform_weights_preloaded:
+                self._post_transform_weights_preloaded = False
+                self._source_identity_compatible_for_last_load = False
+                logger.warning(
+                    "MX P2P returned %d fallback weights (%.2f MiB, size mismatch) "
+                    "from a post-transform source at %s. Falling back to a full "
+                    "disk load to avoid mixing transformed P2P tensors with raw "
+                    "fallback tensors before the full post-load transform path.",
+                    len(fallback_weights),
+                    fallback_bytes / (1 << 20),
+                    self._mx_server_url,
+                )
+                return self._fallback_to_disk(
+                    checkpoint_dir,
+                    mapping,
+                    reason="post-transform source returned partial fallback weights",
+                    **kwargs,
+                )
             # Mixed-success case: MX delivered matched tensors into model
             # params via P2P and returned only size-mismatched tensors for
             # the standard disk path to apply. Keep the P2P transfer and
@@ -285,6 +329,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 self._mx_server_url,
             )
             self._p2p_succeeded = True
+            self._post_transform_weights_preloaded = False
             return fallback_weights
 
         self._p2p_succeeded = True
@@ -385,6 +430,18 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # metadata channel (get_metadata / WorkerMetadata) once upstream
         # exposes a field for it. This is the single seam the gate depends on.
         return None
+
+    def _source_metadata_is_post_transform(
+        self, _checkpoint_dir: str, _mx_client_type: Type[Any], _build_identity: Callable[..., Any]
+    ) -> bool:
+        """Whether the selected MX source publishes post-transform bytes.
+
+        Wave 4 keeps production behavior dormant: Modelexpress metadata does
+        not yet expose raw-vs-transformed layout state, and the TRT-LLM MX
+        publisher still publishes before module transforms. Wave 5 should wire
+        this seam to explicit source metadata when flipping the publisher.
+        """
+        return False
 
     def _resolve_publish_name(self, checkpoint_dir: Optional[str]) -> str:
         return _resolve_mx_model_name(self._model_name, checkpoint_dir)
