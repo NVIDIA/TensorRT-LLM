@@ -466,6 +466,11 @@ class Eagle3DraftModel(DecoderModel):
 # We use Llama3 as the base architecture for EAGLE3 draft layers
 @register_auto_model("EAGLE3LlamaForCausalLM")
 @register_auto_model("Eagle3DeepSeekV3ForCausalLM")
+# Aliases matching the architecture names emitted by ModelOpt and accepted by
+# vLLM / SGLang for DeepSeek-V3 / Kimi-K2 EAGLE3 draft checkpoints, so the same
+# exported checkpoint deploys across frameworks without editing config.json.
+@register_auto_model("Eagle3DeepseekV2ForCausalLM")
+@register_auto_model("Eagle3DeepseekV3ForCausalLM")
 class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
                                                 PretrainedConfig]):
 
