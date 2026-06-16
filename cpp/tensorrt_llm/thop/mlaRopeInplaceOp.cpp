@@ -37,17 +37,27 @@ namespace torch_ext
 void mla_rope_inplace(torch::Tensor data, torch::Tensor position_ids, torch::Tensor cos_sin_cache, int64_t num_heads,
     int64_t nope_dim, int64_t rope_dim, bool inverse, bool is_neox)
 {
-    auto stream = at::cuda::getCurrentCUDAStream(data.get_device());
-    int const num_tokens = data.size(0);
-    auto const dtype = data.scalar_type();
-
+    TORCH_CHECK(data.is_cuda(), "data must be a CUDA tensor");
+    TORCH_CHECK(position_ids.is_cuda(), "position_ids must be a CUDA tensor");
+    TORCH_CHECK(cos_sin_cache.is_cuda(), "cos_sin_cache must be a CUDA tensor");
+    TORCH_CHECK(position_ids.device() == data.device(), "position_ids must be on the same device as data");
+    TORCH_CHECK(cos_sin_cache.device() == data.device(), "cos_sin_cache must be on the same device as data");
     TORCH_CHECK(data.dim() == 3, "data must be 3D [num_tokens, num_heads, head_dim]");
+    int const num_tokens = data.size(0);
     TORCH_CHECK(data.size(1) == num_heads, "data.size(1) must equal num_heads");
     TORCH_CHECK(data.size(2) == nope_dim + rope_dim, "data.size(2) must equal nope_dim + rope_dim");
     TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
     TORCH_CHECK(position_ids.dim() == 1 && position_ids.size(0) == num_tokens, "position_ids shape mismatch");
+    TORCH_CHECK(position_ids.is_contiguous(), "position_ids must be contiguous");
     TORCH_CHECK(position_ids.scalar_type() == torch::kInt32, "position_ids must be int32");
+    TORCH_CHECK(rope_dim % 2 == 0, "rope_dim must be even");
     TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kFloat32, "cos_sin_cache must be float32");
+    TORCH_CHECK(cos_sin_cache.dim() == 3 && cos_sin_cache.size(1) == 2 && cos_sin_cache.size(2) * 2 == rope_dim,
+        "cos_sin_cache must have shape [max_positions, 2, rope_dim / 2]");
+    TORCH_CHECK(cos_sin_cache.is_contiguous(), "cos_sin_cache must be contiguous");
+
+    auto stream = at::cuda::getCurrentCUDAStream(data.get_device());
+    auto const dtype = data.scalar_type();
 
     if (dtype == torch::kBFloat16)
     {

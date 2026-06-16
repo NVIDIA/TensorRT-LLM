@@ -55,8 +55,9 @@ def _fused_path(
     return fp8_fused, scale_fused
 
 
+@pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("num_tokens", [3, 64, 257, 512])
-def test_fused_inv_rope_fp8_quant_neox(num_tokens):
+def test_fused_inv_rope_fp8_quant_matches_reference(num_tokens, is_neox):
     torch.manual_seed(0)
     device = "cuda"
     n_groups = 4
@@ -77,7 +78,14 @@ def test_fused_inv_rope_fp8_quant_neox(num_tokens):
     position_ids = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int32, device=device)
 
     fp8_ref, scale_ref = _ref_path(
-        o_bf16, position_ids, rotary_cos_sin, num_heads, n_groups, nope_dim, rope_dim, is_neox=True
+        o_bf16,
+        position_ids,
+        rotary_cos_sin,
+        num_heads,
+        n_groups,
+        nope_dim,
+        rope_dim,
+        is_neox=is_neox,
     )
     fp8_fused, scale_fused = _fused_path(
         o_bf16,
@@ -87,7 +95,7 @@ def test_fused_inv_rope_fp8_quant_neox(num_tokens):
         heads_per_group,
         nope_dim,
         rope_dim,
-        is_neox=True,
+        is_neox=is_neox,
     )
 
     assert fp8_ref.shape == fp8_fused.shape, (fp8_ref.shape, fp8_fused.shape)

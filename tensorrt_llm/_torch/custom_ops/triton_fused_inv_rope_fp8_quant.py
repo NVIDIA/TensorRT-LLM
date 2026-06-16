@@ -162,7 +162,8 @@ def _tma_aligned_size(x: int, tma_align_size_in_elems: int = 4) -> int:
     return (x + tma_align_size_in_elems - 1) // tma_align_size_in_elems * tma_align_size_in_elems
 
 
-def _fused_inv_rope_fp8_quant_impl(
+@torch.library.custom_op("trtllm::fused_inv_rope_fp8_quant_vllm_port", mutates_args=())
+def fused_inv_rope_fp8_quant_vllm_port(
     o: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -173,24 +174,59 @@ def _fused_inv_rope_fp8_quant_impl(
     quant_group_size: int,
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not o.is_cuda:
+        raise ValueError("o must be a CUDA tensor")
+    if not positions.is_cuda:
+        raise ValueError("positions must be a CUDA tensor")
+    if not cos_sin_cache.is_cuda:
+        raise ValueError("cos_sin_cache must be a CUDA tensor")
+    if positions.device != o.device:
+        raise ValueError("positions must be on the same device as o")
+    if cos_sin_cache.device != o.device:
+        raise ValueError("cos_sin_cache must be on the same device as o")
+    if o.dim() != 3:
+        raise ValueError(f"o must be 3D [num_tokens, num_heads, head_dim], got {o.dim()}D")
+    if o.stride(-1) != 1:
+        raise ValueError("o last dimension must be contiguous")
+
     num_tokens, num_heads, head_dim = o.shape
-    assert num_heads == n_groups * heads_per_group, (
-        f"num_heads={num_heads} != n_groups({n_groups}) * heads_per_group({heads_per_group})"
-    )
-    assert head_dim == nope_dim + rope_dim, (
-        f"head_dim={head_dim} != nope_dim({nope_dim}) + rope_dim({rope_dim})"
-    )
-    assert head_dim % quant_group_size == 0
+    if num_heads != n_groups * heads_per_group:
+        raise ValueError(
+            f"num_heads={num_heads} != n_groups({n_groups}) * heads_per_group({heads_per_group})"
+        )
+    if head_dim != nope_dim + rope_dim:
+        raise ValueError(f"head_dim={head_dim} != nope_dim({nope_dim}) + rope_dim({rope_dim})")
+    if quant_group_size <= 0:
+        raise ValueError(f"quant_group_size must be positive, got {quant_group_size}")
+    if head_dim % quant_group_size != 0:
+        raise ValueError(
+            f"head_dim={head_dim} must be divisible by quant_group_size={quant_group_size}"
+        )
+    if rope_dim <= 0 or rope_dim > quant_group_size or rope_dim % 2 != 0:
+        raise ValueError(
+            f"rope_dim must be positive, even, and <= quant_group_size, got {rope_dim}"
+        )
     expected_nope_mod = quant_group_size - rope_dim
-    assert nope_dim % quant_group_size == expected_nope_mod, (
-        f"Layout requires nope_dim%{quant_group_size}=="
-        f"{quant_group_size}-rope_dim={expected_nope_mod}, "
-        f"got {nope_dim % quant_group_size}"
-    )
-    assert rope_dim % 2 == 0
-    assert cos_sin_cache.dtype == torch.float32, (
-        f"cos_sin_cache must be fp32, got {cos_sin_cache.dtype}"
-    )
+    if nope_dim % quant_group_size != expected_nope_mod:
+        raise ValueError(
+            f"Layout requires nope_dim%{quant_group_size}=="
+            f"{quant_group_size}-rope_dim={expected_nope_mod}, "
+            f"got {nope_dim % quant_group_size}"
+        )
+    if positions.numel() != num_tokens:
+        raise ValueError(
+            f"positions.numel()={positions.numel()} must equal num_tokens={num_tokens}"
+        )
+    if cos_sin_cache.dtype != torch.float32:
+        raise TypeError(f"cos_sin_cache must be fp32, got {cos_sin_cache.dtype}")
+    if (
+        cos_sin_cache.dim() != 3
+        or cos_sin_cache.size(1) != 2
+        or cos_sin_cache.size(2) * 2 != rope_dim
+    ):
+        raise ValueError("cos_sin_cache must have shape [max_positions, 2, rope_dim / 2]")
+    if not cos_sin_cache.is_contiguous():
+        raise ValueError("cos_sin_cache must be contiguous")
 
     d = heads_per_group * head_dim
     num_scale_blocks = d // quant_group_size
@@ -231,9 +267,6 @@ def _fused_inv_rope_fp8_quant_impl(
     # stores it as [max_pos, 2, rope_dim/2] (cos block then sin block per
     # position) which is bit-identical layout — just a different shape.
     cos_sin_view = cos_sin_cache.view(cos_sin_cache.shape[0], -1)
-    assert cos_sin_view.shape[-1] == rope_dim, (
-        f"cos_sin_cache last dim {cos_sin_view.shape[-1]} != rope_dim {rope_dim}"
-    )
 
     # positions can be int32 or int64; the kernel does an opaque tl.load.
     if positions.dtype != torch.int32 and positions.dtype != torch.int64:
@@ -268,6 +301,7 @@ def _fused_inv_rope_fp8_quant_impl(
     return fp8_buf, scale_buf
 
 
+@torch.library.register_fake("trtllm::fused_inv_rope_fp8_quant_vllm_port")
 def _fused_inv_rope_fp8_quant_fake(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -279,7 +313,7 @@ def _fused_inv_rope_fp8_quant_fake(
     quant_group_size: int,
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_tokens, num_heads, head_dim = o.shape
+    num_tokens, _num_heads, head_dim = o.shape
     d = heads_per_group * head_dim
     num_scale_blocks = d // quant_group_size
     tma_aligned_T = _tma_aligned_size(num_tokens, 4)
@@ -294,19 +328,3 @@ def _fused_inv_rope_fp8_quant_fake(
         device=o.device,
     )
     return fp8_buf, scale_buf
-
-
-# Register as a torch custom op so dynamo / cudagraph see an opaque boundary.
-torch.library.define(
-    "trtllm::fused_inv_rope_fp8_quant_vllm_port",
-    "(Tensor o, Tensor positions, Tensor cos_sin_cache, "
-    "int n_groups, int heads_per_group, int nope_dim, int rope_dim, "
-    "int quant_group_size, bool is_neox) -> (Tensor, Tensor)",
-)
-torch.library.impl(
-    "trtllm::fused_inv_rope_fp8_quant_vllm_port",
-    "CUDA",
-)(_fused_inv_rope_fp8_quant_impl)
-torch.library.register_fake(
-    "trtllm::fused_inv_rope_fp8_quant_vllm_port",
-)(_fused_inv_rope_fp8_quant_fake)

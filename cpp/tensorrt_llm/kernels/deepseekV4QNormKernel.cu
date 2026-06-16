@@ -16,7 +16,8 @@
 
 #include "tensorrt_llm/kernels/deepseekV4QNormKernel.h"
 
-#include <cassert>
+#include "tensorrt_llm/common/assert.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -124,7 +125,7 @@ template <typename T>
 void dispatchDeepseekV4QNorm(
     void const* input, void* output, int totalRows, int headDim, float eps, cudaStream_t stream)
 {
-    assert(headDim == 512);
+    TLLM_CHECK_WITH_INFO(headDim == 512, "deepseek_v4_q_norm only supports head_dim=512, got %d", headDim);
 
     dim3 const block(kThreadsPerBlock);
     dim3 const grid((totalRows + kWarpsPerBlock - 1) / kWarpsPerBlock);

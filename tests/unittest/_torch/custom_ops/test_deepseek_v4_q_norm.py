@@ -60,3 +60,34 @@ def test_deepseek_v4_q_norm_torch_compile_fullgraph():
     ref = _reference_q_norm(q, head_dim, eps)
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+def test_deepseek_v4_q_norm_rejects_invalid_inputs():
+    num_heads = 2
+    head_dim = 512
+    eps = 1e-6
+    q = torch.randn(3, num_heads * head_dim, dtype=torch.float16, device="cuda").contiguous()
+
+    with pytest.raises(RuntimeError, match="CUDA|CPU|backend"):
+        torch.ops.trtllm.deepseek_v4_q_norm(q.cpu(), num_heads, head_dim, eps)
+
+    q_noncontiguous = torch.randn(num_heads * head_dim, 3, dtype=torch.float16, device="cuda").t()
+    with pytest.raises(RuntimeError, match="contiguous"):
+        torch.ops.trtllm.deepseek_v4_q_norm(q_noncontiguous, num_heads, head_dim, eps)
+
+    with pytest.raises(RuntimeError, match="fp16/bf16"):
+        torch.ops.trtllm.deepseek_v4_q_norm(q.float(), num_heads, head_dim, eps)
+
+    with pytest.raises(RuntimeError, match="2D"):
+        torch.ops.trtllm.deepseek_v4_q_norm(
+            q.view(1, 3, num_heads * head_dim), num_heads, head_dim, eps
+        )
+
+    q_bad_shape = torch.randn(
+        3, num_heads * head_dim + 1, dtype=torch.float16, device="cuda"
+    ).contiguous()
+    with pytest.raises(RuntimeError, match="num_heads \\* head_dim"):
+        torch.ops.trtllm.deepseek_v4_q_norm(q_bad_shape, num_heads, head_dim, eps)
+
+    with pytest.raises(RuntimeError, match="head_dim=512"):
+        torch.ops.trtllm.deepseek_v4_q_norm(q, num_heads, 256, eps)

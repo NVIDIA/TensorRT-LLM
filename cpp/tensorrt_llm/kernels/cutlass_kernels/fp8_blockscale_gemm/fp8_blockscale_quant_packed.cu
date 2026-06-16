@@ -194,6 +194,11 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
 void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32_t* packed_scale_output,
     __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, cudaStream_t stream)
 {
+    if (m <= 0 || k <= 0)
+    {
+        return;
+    }
+
     constexpr int kWarpsPerBlock = 4;
     int const num_packed_sf_k = (((k + 127) / 128) + 3) / 4;
     int const m_blocks = (m + kWarpsPerBlock - 1) / kWarpsPerBlock;
