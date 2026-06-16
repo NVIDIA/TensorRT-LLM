@@ -18,9 +18,9 @@ from dataclasses import dataclass, field
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager as KVCacheManagerV1
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
