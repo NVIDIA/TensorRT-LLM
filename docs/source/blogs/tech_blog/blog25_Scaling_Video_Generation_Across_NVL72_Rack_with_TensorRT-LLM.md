@@ -336,7 +336,7 @@ attention_config:
   backend: FA4
 parallel_config:
   cfg_size: 2            # CFG: conditional / unconditional streams on disjoint halves
-  ulysses_size: 4        # Ulysses head sharding
+  ulysses_size: 4        # Ulysses sharding
   attn2d_size: [3, 3]    # Attention2D context parallelism (row × col)
   parallel_vae_size: 8   # spatial VAE sharding (saturates at ~8)
 compilation_config:
