@@ -276,3 +276,87 @@ async def test_prm_concurrent_requests_are_batched(prm_async_client: openai.Asyn
         assert len(response.data) == 1
         assert response.data[0].index == 0
         _assert_reward_embedding(response.data[0].embedding)
+
+
+# --------------------------------------------------------------------------- #
+# Qwen3-Embedding (decoder backbone, last-token pool + L2 normalize) — a real
+# sentence-embedding model. A separate, opt-in server (loads a
+# multi-GB checkpoint). The embeddings launch path auto-remaps Qwen3ForCausalLM
+# -> Qwen3ForTextEmbedding, so no special flags are needed. CI uses 8B until
+# 0.6B is synced — swap QWEN3_EMB_MODEL / QWEN3_EMB_DIM below.
+# --------------------------------------------------------------------------- #
+
+QWEN3_EMB_MODEL = "Qwen3/Qwen3-Embedding-8B"
+QWEN3_EMB_DIM = 4096  # hidden_size: 0.6B=1024, 4B=2560, 8B=4096
+
+
+def _assert_unit_norm_embedding(embedding):
+    """A sentence embedding: non-empty floats, fixed dim, L2 norm ~= 1.0."""
+    assert len(embedding) == QWEN3_EMB_DIM
+    assert all(isinstance(v, float) for v in embedding)
+    norm = sum(v * v for v in embedding) ** 0.5
+    assert abs(norm - 1.0) < 1e-2
+
+
+@pytest.fixture(scope="module")
+def qwen3_emb_server():
+    model_path = get_model_path(QWEN3_EMB_MODEL)
+    args = [
+        "--max_batch_size",
+        "8",
+        "--max_queue_delay",
+        "0.05",
+    ]
+    with RemoteEmbeddingServer(model_path, args) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
+def qwen3_emb_client(qwen3_emb_server: RemoteEmbeddingServer):
+    return qwen3_emb_server.get_client()
+
+
+@pytest.fixture(scope="module")
+def qwen3_emb_async_client(qwen3_emb_server: RemoteEmbeddingServer):
+    return qwen3_emb_server.get_async_client()
+
+
+def test_qwen3_embedding_single(qwen3_emb_client: openai.OpenAI):
+    response = qwen3_emb_client.embeddings.create(
+        model=QWEN3_EMB_MODEL, input="What is the capital of France?"
+    )
+    assert response.object == "list"
+    assert len(response.data) == 1
+    assert response.data[0].object == "embedding"
+    assert response.data[0].index == 0
+    _assert_unit_norm_embedding(response.data[0].embedding)
+    assert response.usage.prompt_tokens > 0
+    assert response.usage.total_tokens == response.usage.prompt_tokens
+
+
+def test_qwen3_embedding_batch_indexing(qwen3_emb_client: openai.OpenAI):
+    response = qwen3_emb_client.embeddings.create(model=QWEN3_EMB_MODEL, input=PROMPTS)
+    assert len(response.data) == len(PROMPTS)
+    assert [d.index for d in response.data] == list(range(len(PROMPTS)))
+    for d in response.data:
+        _assert_unit_norm_embedding(d.embedding)
+
+
+@pytest.mark.asyncio
+async def test_qwen3_embedding_concurrent_are_batched(qwen3_emb_async_client: openai.AsyncOpenAI):
+    # Concurrent independent requests must coalesce in the dynamic batcher yet
+    # still return correct, independently-indexed unit-norm embeddings.
+    num_requests = 8
+    responses = await asyncio.gather(
+        *[
+            qwen3_emb_async_client.embeddings.create(
+                model=QWEN3_EMB_MODEL, input=f"concurrent request {i}"
+            )
+            for i in range(num_requests)
+        ]
+    )
+    assert len(responses) == num_requests
+    for response in responses:
+        assert len(response.data) == 1
+        assert response.data[0].index == 0
+        _assert_unit_norm_embedding(response.data[0].embedding)
