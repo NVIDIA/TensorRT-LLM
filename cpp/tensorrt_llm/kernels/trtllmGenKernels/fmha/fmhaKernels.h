@@ -306,7 +306,7 @@ private:
     inline static std::vector<int> const kDefaultWarmupPrefillBatchSizeCandidates
         = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256};
     inline static std::vector<int> const kDefaultWarmupSeqLenQkvCandidates
-        = {1, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+        = {1, 128, 256, 512, 1024, 2048, 3072, 4096, 8192, 16384, 32768};
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
