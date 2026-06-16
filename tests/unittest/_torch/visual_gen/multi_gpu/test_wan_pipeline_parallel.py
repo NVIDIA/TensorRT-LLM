@@ -76,20 +76,20 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def _llm_models_root() -> str:
+def _llm_models_root() -> str | None:
     root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ["LLM_MODELS_ROOT"])
     if not root.exists():
         root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
+    return str(root) if root.exists() else None
 
 
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
+def _checkpoint(env_var: str, default_name: str) -> str | None:
+    if env_var in os.environ:
+        return os.environ[env_var]
+    models_root = _llm_models_root()
+    return os.path.join(models_root, default_name) if models_root is not None else None
 
 
 WAN21_1_3B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_1_3B", "Wan2.1-T2V-1.3B-Diffusers")
@@ -416,7 +416,7 @@ class TestWanPipelineParallel:
         """world=4, cfg=2, ulysses=2, parallel_vae=2 vs HF reference."""
         if not MODULES_AVAILABLE:
             pytest.skip("Required modules not available")
-        if not os.path.exists(WAN21_1_3B_PATH):
+        if not WAN21_1_3B_PATH or not os.path.exists(WAN21_1_3B_PATH):
             pytest.skip(
                 f"Checkpoint not found: {WAN21_1_3B_PATH}. Set DIFFUSION_MODEL_PATH_WAN21_1_3B."
             )
