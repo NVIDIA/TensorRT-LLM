@@ -32,9 +32,9 @@ tests skip on hardware that does not support MNNVL and on nodes with fewer GPUs 
 
 import pickle
 import sys
-import traceback
 
 import cloudpickle
+import pynvml
 import pytest
 import torch
 from mpi4py import MPI
@@ -61,6 +61,16 @@ EP_MASK_NUM_WORDS = 2
 def setup_test():
     torch.manual_seed(0xA2A)
     tllm.logger.set_level("error")
+
+
+def _skip_if_mnnvl_unsupported() -> None:
+    try:
+        MnnvlMemory.initialize()
+        supports_mnnvl = MnnvlMemory.supports_mnnvl()
+    except (RuntimeError, pynvml.NVMLError) as exc:
+        pytest.skip(f"MNNVL not supported on this system: {exc}")
+    if not supports_mnnvl:
+        pytest.skip("MNNVL not supported on this system")
 
 
 def _ep_mask_words(ep_size: int, dead_ranks: set[int]) -> torch.Tensor:
@@ -162,41 +172,35 @@ def _worker_all_active_matches_no_mask(
 ):
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
-    try:
-        mapping = Mapping(rank=rank, tp_size=ep_size, moe_ep_size=ep_size, world_size=ep_size)
-        moe_a2a = MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=local_num_tokens,
-            top_k=top_k,
-            num_slots=num_experts,
-            workspace_size_per_rank=workspace_size_per_rank,
-        )
+    mapping = Mapping(rank=rank, tp_size=ep_size, moe_ep_size=ep_size, world_size=ep_size)
+    moe_a2a = MoeAlltoAll(
+        mapping=mapping,
+        max_num_tokens=local_num_tokens,
+        top_k=top_k,
+        num_slots=num_experts,
+        workspace_size_per_rank=workspace_size_per_rank,
+    )
 
-        # Same RNG seed across both runs => identical inputs.
-        torch.manual_seed(0xA2A + rank)
-        token_selected_experts = _generate_token_selected_experts(
-            local_num_tokens, num_experts, top_k
-        )
-        payload = _make_payload(local_num_tokens, hidden_size, rank)
+    # Same RNG seed across both runs => identical inputs.
+    torch.manual_seed(0xA2A + rank)
+    token_selected_experts = _generate_token_selected_experts(local_num_tokens, num_experts, top_k)
+    payload = _make_payload(local_num_tokens, hidden_size, rank)
 
-        out_no_mask, topk_no_mask = _run_dispatch_combine(
-            moe_a2a, token_selected_experts, payload, local_num_tokens, active_rank_mask=None
-        )
-        out_all_active, topk_all_active = _run_dispatch_combine(
-            moe_a2a,
-            token_selected_experts,
-            payload,
-            local_num_tokens,
-            active_rank_mask=_ep_mask_words(ep_size, dead_ranks=set()),
-        )
+    out_no_mask, topk_no_mask = _run_dispatch_combine(
+        moe_a2a, token_selected_experts, payload, local_num_tokens, active_rank_mask=None
+    )
+    out_all_active, topk_all_active = _run_dispatch_combine(
+        moe_a2a,
+        token_selected_experts,
+        payload,
+        local_num_tokens,
+        active_rank_mask=_ep_mask_words(ep_size, dead_ranks=set()),
+    )
 
-        return (
-            torch.equal(out_no_mask, out_all_active),
-            torch.equal(topk_no_mask, topk_all_active),
-        )
-    except Exception:
-        traceback.print_exc()
-        raise
+    return (
+        torch.equal(out_no_mask, out_all_active),
+        torch.equal(topk_no_mask, topk_all_active),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -215,53 +219,47 @@ def _worker_one_rank_masked(
 ):
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
-    try:
-        mapping = Mapping(rank=rank, tp_size=ep_size, moe_ep_size=ep_size, world_size=ep_size)
-        # Every rank participates in workspace init (it has MPI barriers internally).
-        moe_a2a = MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=local_num_tokens,
-            top_k=top_k,
-            num_slots=num_experts,
-            workspace_size_per_rank=workspace_size_per_rank,
-        )
+    mapping = Mapping(rank=rank, tp_size=ep_size, moe_ep_size=ep_size, world_size=ep_size)
+    # Every rank participates in workspace init (it has MPI barriers internally).
+    moe_a2a = MoeAlltoAll(
+        mapping=mapping,
+        max_num_tokens=local_num_tokens,
+        top_k=top_k,
+        num_slots=num_experts,
+        workspace_size_per_rank=workspace_size_per_rank,
+    )
 
-        if rank == dead_rank:
-            # Simulate a dead rank: do not call dispatch/combine. Wait at a final
-            # barrier so the surviving ranks have someone to synchronize with at
-            # the end of the test. (The kernel itself never observes us because
-            # the surviving ranks pass a mask with our bit cleared.)
-            MPI.COMM_WORLD.barrier()
-            return ("dead", None, None, None)
-
-        torch.manual_seed(0xA2A + rank)
-        token_selected_experts = _generate_token_selected_experts(
-            local_num_tokens, num_experts, top_k
-        )
-        payload = _make_payload(local_num_tokens, hidden_size, rank)
-
-        # Build mask with dead_rank's bit cleared.
-        mask = _ep_mask_words(ep_size, dead_ranks={dead_rank})
-
-        # Compute the per-token target ranks the way the kernel does so we can
-        # cross-check the workspace afterwards.
-        num_experts_per_rank = num_experts // ep_size
-        expected_target_ranks = (token_selected_experts // num_experts_per_rank).cpu()
-
-        combined, topk_target_ranks = _run_dispatch_combine(
-            moe_a2a, token_selected_experts, payload, local_num_tokens, active_rank_mask=mask
-        )
-
+    if rank == dead_rank:
+        # Simulate a dead rank: do not call dispatch/combine. Wait at a final
+        # barrier so the surviving ranks have someone to synchronize with at
+        # the end of the test. (The kernel itself never observes us because
+        # the surviving ranks pass a mask with our bit cleared.)
         MPI.COMM_WORLD.barrier()
-        return (
-            "alive",
-            combined,
-            topk_target_ranks,
-            expected_target_ranks,
-        )
-    except Exception:
-        traceback.print_exc()
-        raise
+        return ("dead", None, None, None)
+
+    torch.manual_seed(0xA2A + rank)
+    token_selected_experts = _generate_token_selected_experts(local_num_tokens, num_experts, top_k)
+    payload = _make_payload(local_num_tokens, hidden_size, rank)
+
+    # Build mask with dead_rank's bit cleared.
+    mask = _ep_mask_words(ep_size, dead_ranks={dead_rank})
+
+    # Compute the per-token target ranks the way the kernel does so we can
+    # cross-check the workspace afterwards.
+    num_experts_per_rank = num_experts // ep_size
+    expected_target_ranks = (token_selected_experts // num_experts_per_rank).cpu()
+
+    combined, topk_target_ranks = _run_dispatch_combine(
+        moe_a2a, token_selected_experts, payload, local_num_tokens, active_rank_mask=mask
+    )
+
+    MPI.COMM_WORLD.barrier()
+    return (
+        "alive",
+        combined,
+        topk_target_ranks,
+        expected_target_ranks,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +278,7 @@ def _worker_one_rank_masked(
 )
 def test_all_active_mask_matches_no_mask(mpi_pool_executor, local_num_tokens, top_k):
     """An all-ones active_rank_mask must produce identical output to omitting it."""
-    try:
-        MnnvlMemory.initialize()
-        assert MnnvlMemory.supports_mnnvl()
-    except Exception:
-        pytest.skip("MNNVL not supported on this system")
+    _skip_if_mnnvl_unsupported()
 
     ep_size = mpi_pool_executor.num_workers
     if ep_size > torch.cuda.device_count():
@@ -300,7 +294,7 @@ def test_all_active_mask_matches_no_mask(mpi_pool_executor, local_num_tokens, to
     results = list(
         mpi_pool_executor.map(
             _worker_all_active_matches_no_mask,
-            *zip(*[args] * ep_size),
+            *zip(*[args] * ep_size, strict=True),
         )
     )
 
@@ -329,11 +323,7 @@ def test_one_rank_masked_completes(mpi_pool_executor, dead_rank, local_num_token
       * Slots whose expert mapped to a surviving rank are unchanged from what
         the contiguous-partition routing rule predicts.
     """
-    try:
-        MnnvlMemory.initialize()
-        assert MnnvlMemory.supports_mnnvl()
-    except Exception:
-        pytest.skip("MNNVL not supported on this system")
+    _skip_if_mnnvl_unsupported()
 
     ep_size = mpi_pool_executor.num_workers
     if ep_size > torch.cuda.device_count():
@@ -358,7 +348,7 @@ def test_one_rank_masked_completes(mpi_pool_executor, dead_rank, local_num_token
     results = list(
         mpi_pool_executor.map(
             _worker_one_rank_masked,
-            *zip(*[args] * ep_size),
+            *zip(*[args] * ep_size, strict=True),
         )
     )
 

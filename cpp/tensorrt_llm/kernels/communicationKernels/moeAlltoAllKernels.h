@@ -142,7 +142,7 @@ struct MoeA2ADispatchParams
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
     // copies these words into the kernel pointers struct. Defaults to all-ones for
     // backwards-compatible "no masking" behavior.
-    uint64_t active_rank_mask[kRankMaskWords];
+    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // CUDA stream
     cudaStream_t stream;
@@ -192,7 +192,7 @@ struct MoeA2ACombineParams
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
     // copies these words into the kernel pointers struct. Defaults to all-ones for
     // backwards-compatible "no masking" behavior.
-    uint64_t active_rank_mask[kRankMaskWords];
+    uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // CUDA stream
     cudaStream_t stream;

@@ -52,6 +52,9 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
     uint64_t (&out)[tensorrt_llm::kernels::moe_comm::kRankMaskWords])
 {
     using tensorrt_llm::kernels::moe_comm::kRankMaskWords;
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
+    TORCH_CHECK(
+        epRank >= 0 && epRank < kMaxRanks, "epRank must be in the range [0, ", kMaxRanks, ") for active_rank_mask");
     if (!maskTensor.has_value() || !maskTensor.value().defined())
     {
         for (int w = 0; w < kRankMaskWords; ++w)
@@ -151,11 +154,14 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
     torch::optional<int64_t> eplbStatsNumExperts)
 {
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
+
     // Validate inputs
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, torch::kUInt8);
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
     TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
 
     // Initialize workspace to zero
@@ -223,6 +229,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     using tensorrt_llm::kernels::moe_comm::moe_a2a_dispatch_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
     using tensorrt_llm::kernels::moe_comm::kMaxPayloads;
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
     // Validate inputs
     CHECK_INPUT(tokenSelectedExperts, torch::kInt32);
@@ -238,6 +245,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     int64_t localNumTokens = tokenSelectedExperts.size(0);
     TORCH_CHECK(runtimeMaxTokensPerRank > 0, "runtimeMaxTokensPerRank must be positive");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
     TORCH_CHECK(!inputPayloads.empty(), "inputPayloads must not be empty");
@@ -458,6 +466,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
     // Validate inputs
     CHECK_TH_CUDA(payload);
@@ -471,6 +480,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     TORCH_CHECK(reinterpret_cast<uintptr_t>(payload.data_ptr()) % 16 == 0, "payload must be 16-byte aligned");
     int64_t elementsPerToken = payload.size(2);
     TORCH_CHECK(elementsPerToken > 0, "elementsPerToken must be positive");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
     TORCH_CHECK(topK > 0 && topK <= kMaxTopK, "topK must be in the range (0, kMaxTopK]");
 

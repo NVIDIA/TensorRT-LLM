@@ -424,7 +424,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         int* smem_topk_target_ranks = smem;
         int* smem_topk_send_indices = smem + TOP_K;
 
-        uint64_t already_copied = 0;
+        uint64_t already_copied[kRankMaskWords] = {};
         // Precompute the ceil/floor partition parameters once per thread, outside the
         // per-token TOP_K loop. The fast path (remainder == 0) then collapses to a single
         // integer divide per call, matching the pre-PR uniform-partition cost exactly.
@@ -444,8 +444,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // checks via topk_send_indices[k] < 0. A token whose only target is dead is dropped
             // from this collective; higher-layer logic (EPLB redistribution) is responsible
             // for re-routing such tokens on subsequent iterations.
+            int const mask_word = target_rank >> 6;
+            uint64_t const mask_bit = 1ULL << (target_rank & 63);
+            bool const target_already_copied = already_copied[mask_word] & mask_bit;
             bool const target_dead = !is_rank_active(ptrs.active_rank_mask, target_rank);
-            if ((already_copied & (1ULL << target_rank)) || target_dead)
+            if (target_already_copied || target_dead)
             {
                 if (thread_idx == 0)
                 {
@@ -470,7 +473,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 smem_topk_target_ranks[k] = target_rank;
                 smem_topk_send_indices[k] = dst_token_idx;
             }
-            already_copied |= 1ULL << target_rank;
+            already_copied[mask_word] |= mask_bit;
         }
         // Sync before dispatching data
         ThreadingPolicy::sync();
@@ -630,6 +633,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
+    TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
     // The local rank must always be marked active in its own view of the mask;
@@ -1316,6 +1320,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
+    TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
     // The local rank must always be marked active in its own view of the mask;
