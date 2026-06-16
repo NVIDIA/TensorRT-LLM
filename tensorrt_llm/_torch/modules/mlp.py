@@ -136,8 +136,6 @@ class MLP(nn.Module):
         # Fuse up_proj GEMM + bias + GELU(tanh) (+ NVFP4-quant) into the GEMM
         # epilogue (mirrors GatedMLP's SwiGLU paths) when eligible.
         if self._use_fused_gelu_fp4out:
-            # fp4-out when M is large enough; otherwise the (still fused) bf16-out
-            # path, after which down_proj re-quantizes.
             m = self._token_count(x)
             return self.down_proj(
                 self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
