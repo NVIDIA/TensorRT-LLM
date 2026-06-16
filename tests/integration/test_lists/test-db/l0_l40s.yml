@@ -29,7 +29,8 @@ l0_l40s:
   - unittest/llmapi/apps/_test_openai_chat_multimodal.py::test_single_chat_session_image_embeds -m needs_l40s
   # Encoder-only /v1/embeddings dynamic batching (BERT classifier + PRM-7B reward + Qwen3-Embedding)
   - unittest/llmapi/apps/_test_openai_embeddings.py
-  # Qwen3-Embedding text-embedding accuracy vs HuggingFace (8B until 0.6B is synced to CI)
+  # Qwen3-Embedding text-embedding accuracy vs HuggingFace (0.6B small/fast + 8B large)
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-0.6b]
   - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
   # MMMU sanity check
   - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
