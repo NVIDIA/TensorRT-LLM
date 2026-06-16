@@ -322,6 +322,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         )
         assert not metadata.is_cross, "Star Attention does not support cross attention yet."
 
+        if forward_args.multi_item_part_lens is not None:
+            raise ValueError(
+                "Star Attention does not support multi-item scoring")
+
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
