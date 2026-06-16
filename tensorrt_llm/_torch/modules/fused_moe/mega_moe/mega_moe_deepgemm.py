@@ -103,6 +103,22 @@ def _dg_use_fp4_acts() -> bool:
     return os.environ.get("DG_USE_FP4_ACTS", "0").lower() not in ("0", "", "false", "off")
 
 
+def _dg_use_mxf4_kind() -> bool:
+    """Whether DeepGEMM uses the dense ``kind::mxf4`` mainloop (``DG_USE_MXF4_KIND``).
+
+    Consumed by the rebuilt DG host layer (``csrc/apis/mega.hpp``): when set, the
+    L1/L2 GEMM mainloops run the dense FP4 ``kind::mxf4`` instruction (``UMMA_K=64``,
+    2-CTA, ``scale_vec::2X``) instead of ``kind::mxf8f6f4`` (``UMMA_K=32``). It is the
+    faster W4A4 (MXFP4xMXFP4) path and is only valid together with FP4 activations
+    -- DG asserts ``not use_mxf4_kind or use_fp4_acts`` host-side. Like
+    ``DG_USE_FP4_ACTS`` it is read from the process env by the DG kernel itself (no
+    Python kwarg); this mirror exists so the integration can surface the knob in
+    diagnostics and reject the invalid mxf4-without-fp4-acts combo early with a
+    clear message instead of a deep C++ host assert.
+    """
+    return os.environ.get("DG_USE_MXF4_KIND", "0").lower() not in ("0", "", "false", "off")
+
+
 def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (x_fp8, x_sf) in DG mega_moe's expected layout (packed int32)."""
     m, n = x.shape
@@ -307,6 +323,19 @@ class MegaMoEDeepGemm(MoE):
         self.activation = activation
         self.swiglu_limit_scalar = swiglu_limit_scalar
         self.fast_math = fast_math
+
+        # Fail fast on the invalid mxf4-without-fp4-acts combo. DG's host layer
+        # asserts ``not use_mxf4_kind or use_fp4_acts`` (csrc/apis/mega.hpp); the
+        # dense kind::mxf4 mainloop is a W4A4 (MXFP4xMXFP4) path and requires FP4
+        # activations. Surface it here with an actionable message rather than a
+        # deep C++ host assert mid-forward.
+        if _dg_use_mxf4_kind() and not _dg_use_fp4_acts():
+            raise ValueError(
+                "DG_USE_MXF4_KIND=1 requires DG_USE_FP4_ACTS=1 "
+                "(kind::mxf4 is the dense MXFP4xMXFP4/W4A4 path and only runs "
+                "with FP4 activations). Set DG_USE_FP4_ACTS=1 or unset "
+                "DG_USE_MXF4_KIND."
+            )
 
         # Buffer sizing. MoE layers execute serially per forward; a single
         # process-level pool sized to worst-case per-rank tokens serves all.
@@ -597,7 +626,8 @@ class MegaMoEDeepGemm(MoE):
             log_fn(
                 f"[MegaMoE] layer={self.layer_idx} allocated DG "
                 f"SymmBuffer: {cached.buffer.nbytes / 2**30:.2f} GiB "
-                f"(fp4_acts={_dg_use_fp4_acts()}, x.dtype={cached.x.dtype}, "
+                f"(fp4_acts={_dg_use_fp4_acts()}, "
+                f"mxf4_kind={_dg_use_mxf4_kind()}, x.dtype={cached.x.dtype}, "
                 f"x.shape={tuple(cached.x.shape)})"
             )
         self._symm_buffer = cached

@@ -3805,6 +3805,30 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              eplb_config)
 
     @pytest.mark.skip_less_mpi_world_size(4)
+    def test_mxfp4_acts_4gpus_static_eplb(self, monkeypatch):
+        # MXFP4-activation MegaMoE (W4A4): same TP=4 / EP=4 / attention-DP
+        # static-EPLB layout and DeepGEMM fp8_fp4_mega_moe backend as
+        # test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM], but two
+        # env vars flip the kernel from the default MXFP8 x MXFP4 (FP8 acts)
+        # path to MXFP4 x MXFP4:
+        #   - DG_USE_FP4_ACTS=1  -> MegaMoEDeepGemm feeds FP4 activations via
+        #       dg.mega_moe_pre_dispatch(use_fp4_acts=True) instead of FP8.
+        #   - DG_USE_MXF4_KIND=1 -> DeepGEMM selects the dense mxf4 (UMMA_K=64)
+        #       2-CTA kernel.
+        # Each MPI rank runs this body, so monkeypatch sets the env on every
+        # rank before the LLM is built; it must be set pre-construction so the
+        # per-forward acts path and the JIT kernel selection pick it up.
+        # Requires a DeepGEMM pin that includes the mxf4 swizzle-atom-loop fix
+        # (otherwise the kernel deadlocks at small per-expert token tiles).
+        monkeypatch.setenv("DG_USE_FP4_ACTS", "1")
+        monkeypatch.setenv("DG_USE_MXF4_KIND", "1")
+        eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
+                                                   layer_updates_per_iter=0,
+                                                   ep_size=4)
+        _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH,
+                             "MEGAMOE_DEEPGEMM", eplb_config)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", [
         pytest.param(
             "WIDEEP",
