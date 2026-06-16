@@ -17,9 +17,9 @@ from tensorrt_llm.bindings.executor import DecodingMode
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
-    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
+    SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -47,8 +47,9 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -1523,6 +1524,25 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
+def create_kv_cache_compression_manager(
+    config: KvCacheCompressionConfig,
+    kv_cache_manager: KVCacheManagerV2,
+) -> Optional[BaseKVCacheCompressionManager]:
+    """Build the KV-cache compression manager for ``config.algorithm``, or return
+    None if no algorithm matches.
+
+    Called from ``create_py_executor`` and registered as a resource manager,
+    like the KV cache manager itself. Concrete algorithms add a dispatch branch
+    here; the framework ships none.
+    """
+    logger.warning(
+        "KV-cache compression algorithm '%s' is not registered; running without "
+        "a compression manager.",
+        config.algorithm,
+    )
+    return None
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -1722,7 +1742,6 @@ def create_py_executor_instance(
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.
     if llm_args.kv_cache_compression_config is not None:
-        from .resource_manager import create_kv_cache_compression_manager
         compression_manager = create_kv_cache_compression_manager(
             llm_args.kv_cache_compression_config, kv_cache_manager)
         if compression_manager is not None:

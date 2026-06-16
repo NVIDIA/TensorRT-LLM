@@ -17,19 +17,20 @@ Covers:
   iteration; ``free_resources`` fires ``on_request_finish``.
 - :func:`create_kv_cache_compression_manager` factory.
 
-The framework lives in ``resource_manager.py`` (it is a resource manager, not a
-sparse-attention backend), so these imports come from there.
+The base class lives in ``resource_manager.py`` (it is a resource manager, not a
+sparse-attention backend); the ``create_kv_cache_compression_manager`` factory
+lives in ``_util.py`` next to ``_create_kv_cache_manager``.
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import resource_manager as rm_mod
+from tensorrt_llm._torch.pyexecutor import _util as util_mod
+from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
     BaseResourceManager,
-    create_kv_cache_compression_manager,
 )
 
 # ---------------------------------------------------------------------- #
@@ -180,7 +181,7 @@ class TestFactory:
     def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        with patch.object(rm_mod, "logger") as mock_logger:
+        with patch.object(util_mod, "logger") as mock_logger:
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
             mock_logger.warning.assert_called_once()
 
@@ -191,11 +192,13 @@ class TestFactory:
 
 
 class TestCanonicalImports:
-    def test_names_importable_from_resource_manager(self):
-        from tensorrt_llm._torch.pyexecutor import resource_manager
+    def test_names_importable_from_canonical_modules(self):
+        from tensorrt_llm._torch.pyexecutor import _util, resource_manager
 
+        # Base class stays in resource_manager (it IS a resource manager); the
+        # factory lives in _util next to _create_kv_cache_manager.
         assert hasattr(resource_manager, "BaseKVCacheCompressionManager")
-        assert hasattr(resource_manager, "create_kv_cache_compression_manager")
+        assert hasattr(_util, "create_kv_cache_compression_manager")
 
     def test_names_not_in_sparse_module(self):
         # The framework moved out of attention_backend/sparse/ (it is not a

@@ -53,8 +53,7 @@ WorldConfig = tensorrt_llm.bindings.WorldConfig
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
-                                              KvCacheCompressionConfig)
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -2277,25 +2276,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     def free_resources(self, request: "LlmRequest") -> None:
         """Fire :meth:`on_request_finish`."""
         self.on_request_finish(request)
-
-
-def create_kv_cache_compression_manager(
-    config: "KvCacheCompressionConfig",
-    kv_cache_manager: "KVCacheManagerV2",
-) -> Optional[BaseKVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
-
-    Called from ``create_py_executor`` (``_util.py``) and registered as a
-    resource manager, like the KV cache manager itself. Concrete algorithms add
-    a dispatch branch here; the framework ships none.
-    """
-    logger.warning(
-        "KV-cache compression algorithm '%s' is not registered; running without "
-        "a compression manager.",
-        config.algorithm,
-    )
-    return None
 
 
 class ResourceManager:
