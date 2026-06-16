@@ -115,9 +115,17 @@ model emits, serialized into the OpenAI embeddings schema.
 
 - **Classifier / reward models** (e.g. a BERT sequence classifier): the returned
   vector is the model's class-logit / score vector (`[num_labels]`).
-- **Text-embedding models**: returning a pooled sentence-embedding vector
-  (`[hidden_size]`) with a configurable pooling method (CLS / mean) is planned as a
-  follow-up; today the endpoint returns the raw vector the model's forward produces.
+- **Text-embedding models** — the **Qwen3-Embedding family** (`Qwen3-Embedding-0.6B`,
+  `-4B`, `-8B`) is supported. These ship as a `Qwen3ForCausalLM` decoder plus a
+  sentence-transformers pooling pipeline; the embeddings server detects this and serves
+  the **L2-normalized last-token hidden state** (a `[hidden_size]` sentence-embedding
+  vector — 1024 / 2560 / 4096 respectively), with no extra flags. A configurable pooling
+  method (CLS / mean) for other sentence-transformers backbones remains a follow-up.
+
+  > **Instruction prefix:** Qwen3-Embedding's `config_sentence_transformers.json` defines
+  > a query instruction (`"Instruct: ...\nQuery:"`). This is a *client-side* convention —
+  > the server embeds the input text verbatim, so prepend the instruction in your request
+  > when the model card calls for it.
 
 Notes:
 
