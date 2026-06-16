@@ -1394,9 +1394,6 @@ class NVFP4LinearMethod(LinearMethodBase):
             input = input.reshape(-1, input.shape[-1])
         elif isinstance(input,
                         Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
-            # Pre-quantized 3D input (e.g. from a fused activation+quant epilogue):
-            # flatten the packed fp4 tensor; output is unflattened below via
-            # original_shape (mirrors the plain-tensor path).
             original_shape = input.fp4_tensor.shape
             input = Fp4QuantizedTensor(
                 fp4_tensor=input.fp4_tensor.reshape(-1,
