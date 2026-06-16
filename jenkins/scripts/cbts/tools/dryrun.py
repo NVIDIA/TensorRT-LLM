@@ -186,6 +186,7 @@ def _fmt_summary(
         return "\n".join(lines) + "\n"
     scope = result.get("scope")
     lines.append(f"scope:                {scope!r}")
+    lines.append(f"scopes:               {result.get('scopes', [])}")
     lines.append(f"sanity_required:      {result.get('sanity_required')}")
     lines.append(f"perfsanity_required:  {result.get('perfsanity_required')}")
     override = result.get("test_db_dir_override")

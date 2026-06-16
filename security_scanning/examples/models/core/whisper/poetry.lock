@@ -712,14 +712,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.29.3"
+version = "3.29.4"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.29.3-py3-none-any.whl", hash = "sha256:e58333029cc9b925f39aad59b1d8f0a1ad836af4e60d7217f4a4dba87461261d"},
-    {file = "filelock-3.29.3.tar.gz", hash = "sha256:7fc1b3f39cf172fd8203812043c57b8a65aef9969f38b6704f628b881f761a84"},
+    {file = "filelock-3.29.4-py3-none-any.whl", hash = "sha256:dac1648087d5115554850d113e7dd8c83ab2d38e3435dde2d4f163847e57b767"},
+    {file = "filelock-3.29.4.tar.gz", hash = "sha256:10cdb3656fc44541cdf30652a93fb10ec6b05325620eb316bd26893e4201538a"},
 ]
 
 [[package]]
@@ -1005,21 +1005,21 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.18.0"
+version = "1.19.0"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.18.0-py3-none-any.whl", hash = "sha256:729be4a976fb706dcc02d176bcda8a3f32bdf21a294e8f4b3dda6fbcbc9c1ab1"},
-    {file = "huggingface_hub-1.18.0.tar.gz", hash = "sha256:f0c5ecd1ef8c6a60f86f61ee278f2c1570ba9e279c9f54de9094210723b3613b"},
+    {file = "huggingface_hub-1.19.0-py3-none-any.whl", hash = "sha256:1dc72e1f6b4d6df6b30eb72e57d00514ef453d660f04af2b87f0e67267f31ee0"},
+    {file = "huggingface_hub-1.19.0.tar.gz", hash = "sha256:fd771622182d40977272a923953ee3b1b13538f9f8a7f5d78398f10af0f1c0bd"},
 ]
 
 [package.dependencies]
 click = ">=8.4.0"
 filelock = ">=3.10.0"
 fsspec = ">=2023.5.0"
-hf-xet = {version = ">=1.4.3,<2.0.0", markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""}
+hf-xet = {version = ">=1.5.1,<2.0.0", markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""}
 httpx = ">=0.23.0,<1"
 packaging = ">=20.9"
 pyyaml = ">=5.1"
@@ -1032,7 +1032,7 @@ all = ["Jinja2", "Pillow", "authlib (>=1.3.2)", "duckdb", "fastapi", "fastapi", 
 dev = ["Jinja2", "Pillow", "authlib (>=1.3.2)", "duckdb", "fastapi", "fastapi", "httpx", "itsdangerous", "jedi", "libcst (>=1.4.0)", "mypy (==1.15.0)", "numpy", "pytest (>=8.4.2)", "pytest-asyncio", "pytest-cov", "pytest-env", "pytest-mock", "pytest-rerunfailures (<16.0)", "pytest-vcr", "pytest-xdist", "ruff (>=0.9.0)", "soundfile", "ty", "types-PyYAML", "types-simplejson", "types-toml", "types-tqdm", "types-urllib3", "typing-extensions (>=4.8.0)", "urllib3 (<2.0)"]
 fastai = ["fastai (>=2.4)", "fastcore (>=1.3.27)", "toml"]
 gradio = ["gradio (>=5.0.0)", "requests"]
-hf-xet = ["hf-xet (>=1.4.3,<2.0.0)"]
+hf-xet = ["hf-xet (>=1.5.1,<2.0.0)"]
 mcp = ["mcp (>=1.8.0)"]
 oauth = ["authlib (>=1.3.2)", "fastapi", "httpx", "itsdangerous"]
 quality = ["libcst (>=1.4.0)", "mypy (==1.15.0)", "ruff (>=0.9.0)", "ty"]
@@ -1099,33 +1099,38 @@ files = [
 
 [[package]]
 name = "kaldialign"
-version = "0.10.0"
+version = "0.11.0"
 description = "Kaldi alignment methods wrapped into Python"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "kaldialign-0.10.0-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2a453b779c04b4cc6005fd0616da06d9edef86bd213795773177ae232ff8a39a"},
-    {file = "kaldialign-0.10.0-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e0b72b9eea05247c59912288dbfa1cc6e8ada89cf0d069b6c13c8021d03db852"},
-    {file = "kaldialign-0.10.0-cp310-cp310-win32.whl", hash = "sha256:5b027d1961836c8513e17aa261720f5f7c053fb5685f5210e47724750aa1a3d0"},
-    {file = "kaldialign-0.10.0-cp310-cp310-win_amd64.whl", hash = "sha256:94157238f605dd01703004ce4e7b5a36cd60ceb3a0b72587b01938fd53cbd331"},
-    {file = "kaldialign-0.10.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9bfb49ac9db43ff96db3602e283e6c1f25844767cf23ea304234f53e91b303b1"},
-    {file = "kaldialign-0.10.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c15d291a9ef3816d8a4e001a3363d633bb5184350a2b698f2b68f7e863ed2f1c"},
-    {file = "kaldialign-0.10.0-cp311-cp311-win32.whl", hash = "sha256:662b880f683909d782e1b4e8203f202a6d746ae3f7b7af7f072cae42cd7c4291"},
-    {file = "kaldialign-0.10.0-cp311-cp311-win_amd64.whl", hash = "sha256:8b4cdf0ea28c70791adaa32b6d5da5335f0564a6fd2c897389526e3ee4408411"},
-    {file = "kaldialign-0.10.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b0fcaf8b63514b9dd0575aeeab27cdf81fb0d805d43cb77e9df2a34e24cd06c6"},
-    {file = "kaldialign-0.10.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f2e82df9da3a4b5820abcaab10c57326dbc71c904e71973d749bc33281f0df06"},
-    {file = "kaldialign-0.10.0-cp312-cp312-win32.whl", hash = "sha256:2ddf5cccc115c13d15ac1ef50b78a6b5b21fd96ae07eb8db2d2448c40181385a"},
-    {file = "kaldialign-0.10.0-cp312-cp312-win_amd64.whl", hash = "sha256:83eaccf65e728bb2caf5ae015670b3e7984e08b0f3e264704f7531b47b7087a7"},
-    {file = "kaldialign-0.10.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:99ae4eb5b9279fd8cb69c552c4ced8962a6aa65ed9b18982536e2b530c7b16ed"},
-    {file = "kaldialign-0.10.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bd1d314783ddf641702839684db9ff1dc9b29f23f44b35105cc581eb816e8173"},
-    {file = "kaldialign-0.10.0-cp313-cp313-win32.whl", hash = "sha256:0635d3db9954039558d0deaaa9b7d4053a1180054ea5fb706c74d05403414159"},
-    {file = "kaldialign-0.10.0-cp313-cp313-win_amd64.whl", hash = "sha256:587a13f71256270c05435e6487e3283270096b1593230578c4e450b684315ee5"},
-    {file = "kaldialign-0.10.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:daa02a6a678bcc23771a5a67b1a5422accd852e8571120e0fa8c91c4a6de30ba"},
-    {file = "kaldialign-0.10.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ecb105a93cdacd9930b9932347d470ae1752e4d601755336925a4a4ad1d16470"},
-    {file = "kaldialign-0.10.0-cp314-cp314-win32.whl", hash = "sha256:4a9f180b1cfaaa592f665528e8c96368796b9aeccac666873f614d5c64256ee2"},
-    {file = "kaldialign-0.10.0-cp314-cp314-win_amd64.whl", hash = "sha256:74d35a5e99892de18bed24730ee2aa6509a022946053a4a4b763536e847799c0"},
-    {file = "kaldialign-0.10.0.tar.gz", hash = "sha256:f0b1bcfd0f0bf121798d8c44d4ed9842e46bff6cf79fd7686b328bdfe6fa116d"},
+    {file = "kaldialign-0.11.0-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:309c634fabd9e9fb64ec01d96e2bae9a647a64672e5760fd68fbf0836165a42b"},
+    {file = "kaldialign-0.11.0-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8008920b73d966f24e7ba780962e576ad658a5b9ef32b520e088f5f45ee3bbca"},
+    {file = "kaldialign-0.11.0-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:166893220f29c711a5407fdda684b91606cac801933fac45e5940d2414fd92d0"},
+    {file = "kaldialign-0.11.0-cp310-cp310-win32.whl", hash = "sha256:0f5f656c8f5ef1edf052d0bd7736e5a373eca96d6af689c6b378d96e3312e19c"},
+    {file = "kaldialign-0.11.0-cp310-cp310-win_amd64.whl", hash = "sha256:95042c1e9536cbf1ca6067d099439332ac5c1be042ac128849fd7a0c6fb4cd34"},
+    {file = "kaldialign-0.11.0-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:ee8d21d014b30d2da0853954dac64ba713379221e844d769751900790e62876b"},
+    {file = "kaldialign-0.11.0-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:97b570444192e0ad30236649cd5346b7fa7494f37f66d5cb6f6ce46a80c914c5"},
+    {file = "kaldialign-0.11.0-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:293db3edc76dc3751523543d42381604011dfee4f35e95ebc170021fea1b7b97"},
+    {file = "kaldialign-0.11.0-cp311-cp311-win32.whl", hash = "sha256:84dd611cd548d3ad4a2c741cbe09b7a84f909e5f3c9071be6528803db1a4f1aa"},
+    {file = "kaldialign-0.11.0-cp311-cp311-win_amd64.whl", hash = "sha256:6675f492b4a050b6ad6f79c1b604364b20e49a6c616f6edc821e14483f12715a"},
+    {file = "kaldialign-0.11.0-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:574cc18ce81c756d7a9323a59f5416203776cdf8b385b275baeb66179b902981"},
+    {file = "kaldialign-0.11.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:43255bab1beec3f5d07d88937135b1dfe8e31d0a107a0f3e23f4ba44eb414cf5"},
+    {file = "kaldialign-0.11.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fcde09d68882e83bcf8852ff13cb9ab4a33d4020a2ef0ef1e5917b37e95254fe"},
+    {file = "kaldialign-0.11.0-cp312-cp312-win32.whl", hash = "sha256:1acc7b632907634add22689f766a8d98dde702407f24cbbfeddd5f2f7209cfb7"},
+    {file = "kaldialign-0.11.0-cp312-cp312-win_amd64.whl", hash = "sha256:5d92ecbfc403a6a6bb5c3dd7d7ef4fdccad4e37b81a3a50af133464af538474a"},
+    {file = "kaldialign-0.11.0-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:7e4a5c6385261fc4143c0bf7c4988f93cfb1155394cefcc4c9fa47ab83dc2ba8"},
+    {file = "kaldialign-0.11.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:398eeb045c4f69682568d296de04c378cc05609b07c68a122d981653a97d2187"},
+    {file = "kaldialign-0.11.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5ed9e2e2fcd3db3c97ddf223319a470ab67579278376a48bc4d2a4096fa2b5fe"},
+    {file = "kaldialign-0.11.0-cp313-cp313-win32.whl", hash = "sha256:4daa86dba218b79f920326403bef40a371d3956f4a9ec9b1fc7961d97a6900c0"},
+    {file = "kaldialign-0.11.0-cp313-cp313-win_amd64.whl", hash = "sha256:39ea4ce22f07bac0d9ad63b83de686a3a1e9643feecdf8baa2e7b7a9ed21fb13"},
+    {file = "kaldialign-0.11.0-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:7ffb48635ed052b1db6a1ba7c28e054911eb19b96f4e7cbd7cd5e98f5fcdf571"},
+    {file = "kaldialign-0.11.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0d0fb4d496e329fc6efc21270b9e542a288c8d9f654b29fcb0176f1b7301c3cd"},
+    {file = "kaldialign-0.11.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:814bcc5825a709e7a319ab381ad7c2a87f27a16266c3ad8446c9756db81a55a8"},
+    {file = "kaldialign-0.11.0-cp314-cp314-win32.whl", hash = "sha256:bada55377a665c72a905f56d51dfecb0b8982609ccc9c89cfa8a5b5887d78eec"},
+    {file = "kaldialign-0.11.0-cp314-cp314-win_amd64.whl", hash = "sha256:d4132748e659b2b2547d4c10876bf52859e95a094ab0d398cbebebbf65d6c387"},
+    {file = "kaldialign-0.11.0.tar.gz", hash = "sha256:1b6590e31bff5cb87368a1e1f724df5db1a7682519482eb64d31a2c10fd5e771"},
 ]
 
 [package.extras]
@@ -3523,14 +3528,14 @@ telegram = ["envwrap", "requests"]
 
 [[package]]
 name = "transformers"
-version = "5.11.0"
+version = "5.12.0"
 description = "Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training."
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "transformers-5.11.0-py3-none-any.whl", hash = "sha256:06d0a34eab529955f8e704b530663c7d6bd6f9c7a9e47a05cddb4a44e7b6566b"},
-    {file = "transformers-5.11.0.tar.gz", hash = "sha256:1dbecade5b8a09bdf3e9e8fdfc9d312cb9eccf5a201080dc894b373f0f3eb5f4"},
+    {file = "transformers-5.12.0-py3-none-any.whl", hash = "sha256:500be9eb644ede81c3103eee7687fc36d05dd75d1c76686c3820b26396fe7c7c"},
+    {file = "transformers-5.12.0.tar.gz", hash = "sha256:f0cf42ae1464c2eb41e7e0e66d7fd4b66145f48af17093b4cc0b2e9781faa7f4"},
 ]
 
 [package.dependencies]
@@ -3985,4 +3990,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "635a45254197c9187e61df85c71e2f708340173321f8d3cc2028dfa46772e759"
+content-hash = "2ba5d3d4d9f0baa12e00f52530cf9e4ab003ef88e3fb1b2039c0fc2e0df59fef"
