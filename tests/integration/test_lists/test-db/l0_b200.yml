@@ -149,11 +149,11 @@ l0_b200:
   # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
-  # test_speculative_d2h_parity_real_predictor[no_stop_token] is a HW-agnostic
-  # sampler D2H-parity invariant (plain CUDA stream/event, no SM gating), covered
-  # on A30 pre-merge; drop the Blackwell copy of just that leaf, keep the rest of
-  # the sampler dir (incl. the [stop_token_15] parametrize).
-  - unittest/_torch/sampler -k "not (test_speculative_d2h_parity_real_predictor and no_stop_token)"
+  # test_speculative_d2h_parity_real_predictor (both no_stop_token and
+  # stop_token_15) is a HW-agnostic sampler D2H-parity invariant (plain CUDA
+  # stream/event, no SM gating), covered on A30 pre-merge; drop that whole
+  # function's leaves on Blackwell, keep the rest of the sampler dir.
+  - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
