@@ -102,34 +102,31 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
         "Dropped tokens have to be defined for all beams.");
 
     auto const fragmentSize = llmReq.getGenerationLogitsFragmentsSize();
+    auto const& fragments = llmReq.getGenerationLogitsFragments();
 
-    // Merge logits fragments on device
-    auto const& transposeBufferPtr = generationLogitsCache.transposedLogits;
-    auto const& cachePointerDevice = generationLogitsCache.fragmentPointerDevice;
-    auto const& cachePointerHost = generationLogitsCache.getFragmentPointerHost();
-    tensorrt_llm::runtime::kernels::mergeLogitsFragments(bufferManager, *transposeBufferPtr,
-        llmReq.getGenerationLogitsFragments(), *cachePointerDevice, *cachePointerHost, 0, 1, reqBeamWidth,
-        bufferManager.getStream(), 0);
-    llmReq.clearGenerationLogitsFragments();
-
-    // Copy logits to host
+    // Bypass mergeLogitsFragmentsKernel: copy each beam's logits directly from fragment GPU memory
+    // to the host, step by step. Each fragment has shape [1, beamWidth, vocabSizePadded] after
+    // unsqueeze(0) in HandleGenerationLogits; beam b's data starts at offset b*vocab from the
+    // fragment's base pointer. This avoids a kernel+pointer-indirection pattern that causes
+    // intermittent token corruption in gather_generation_logits+concurrent-beam-width scenarios.
     for (SizeType32 beam = 0; beam < reqBeamWidth; beam++)
     {
         auto const droppedSize = !numDroppedTokens.empty() ? numDroppedTokens.at(beam) : 0;
-        // Ignore logits of dropped tokens
         auto const beamFragmentSize = fragmentSize - droppedSize;
-        // If this function is called before the decoder, the request does not contain the generated token of the
-        // current iteration, so we add 1 to the number of tokens.
         auto const numGenerationToken
             = static_cast<SizeType32>(beforeDecoder) + llmReq.getNumTokens(beam) - llmReq.mPromptLen;
         auto const hostOffset = numGenerationToken - beamFragmentSize;
 
-        // [beamWidth, GENERATION_LOGITS_BUFFER_LENGTH, vocabSizePadded] -> [beamFragmentSize, vocabSizePadded]
-        auto beamDeviceTensorPtr = ITensor::slice(transposeBufferPtr, {beam, 0}, beamFragmentSize);
-        // [beamWidth, mMaxNewTokens, vocabSizePadded] -> [beamFragmentSize, vocabSizePadded]
-        auto beamHostTensorPtr = ITensor::slice(llmReq.getGenerationLogitsHost(), {beam, hostOffset}, beamFragmentSize);
-        bufferManager.copy(*beamDeviceTensorPtr, *beamHostTensorPtr);
+        for (SizeType32 stepIdx = 0; stepIdx < static_cast<SizeType32>(beamFragmentSize); ++stepIdx)
+        {
+            // frag shape: [1, beamWidth, vocabSizePadded]. Beam b starts at offset b*vocab.
+            auto fragBeamSlice = ITensor::slice(fragments.at(stepIdx), {0, beam}, 1);
+            // host shape: [beamWidth, mMaxNewTokens, vocabSizePadded]. Target: [beam, hostOffset+stepIdx, :].
+            auto hostStepSlice = ITensor::slice(llmReq.getGenerationLogitsHost(), {beam, hostOffset + stepIdx}, 1);
+            bufferManager.copy(*fragBeamSlice, *hostStepSlice);
+        }
     }
+    llmReq.clearGenerationLogitsFragments();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
