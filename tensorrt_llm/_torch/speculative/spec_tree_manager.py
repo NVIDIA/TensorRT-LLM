@@ -43,6 +43,8 @@ class DynamicTreeSlotStorage:
         _w = 2**torch.arange(32, dtype=torch.int64, device='cuda')
         self.packed_mask = (_causal.to(torch.int64) * _w).sum(-1).to(
             torch.int32).unsqueeze(0).repeat(S, 1, 1).contiguous()
+        self._no_tree_position_offsets = self.position_offsets[0].clone()
+        self._no_tree_packed_mask = self.packed_mask[0].clone()
 
         # Override ONLY the reserved CUDA-graph/warmup dummy slot with a
         # bounded-depth K-ary tree (parent[i] = (i-1)//topK).  Unlike a real
@@ -136,12 +138,12 @@ class DynamicTreeSlotStorage:
         self.has_tree.narrow(0, self.dummy_slot_id, 1).fill_(False)
 
     def mark_invalid(self, slot_id):
-        """Clear validity and reset slot data."""
+        """Clear validity and restore valid no-tree metadata."""
         self.has_tree[slot_id] = False
-        self.packed_mask[slot_id] = 0
-        self.position_offsets[slot_id] = 0
+        self.packed_mask[slot_id] = self._no_tree_packed_mask
+        self.position_offsets[slot_id] = self._no_tree_position_offsets
         self.retrieve_index[slot_id] = 0
-        self.retrieve_next_token[slot_id] = -1
+        self.retrieve_next_token[slot_id] = self._no_tree_next_token
         self.retrieve_next_sibling[slot_id] = -1
 
     def pack_retrieve_from_slots(self, slot_ids, count):
