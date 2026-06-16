@@ -24,7 +24,7 @@ from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V2
+from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -906,35 +906,33 @@ def test_expected_kv_cache_events():
 
 
 def test_expected_v2_kv_cache_events():
-    llm = create_v2_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = list(range(127))
+    with create_v2_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = list(range(127))
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
-    assert events and len(events) >= 2
-    assert all(event["hash_algo"] == KV_CACHE_HASH_ALGO_V2 for event in events
-               if event)
+        events = llm.get_kv_cache_events(5)
+        assert events and len(events) >= 2
+        assert all(event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+                   for event in events if event)
 
-    created_events = [
-        event for event in events if event["data"]["type"] == "created"
-    ]
-    stored_events = [
-        event for event in events if event["data"]["type"] == "stored"
-    ]
-    assert created_events
-    assert stored_events
-    assert created_events[0]["event_id"] == 0
+        created_events = [
+            event for event in events if event["data"]["type"] == "created"
+        ]
+        stored_events = [
+            event for event in events if event["data"]["type"] == "stored"
+        ]
+        assert created_events
+        assert stored_events
+        assert created_events[0]["event_id"] == 0
 
-    block_hashes = [
-        block["block_hash"] for event in stored_events
-        for block in event["data"]["blocks"]
-    ]
-    assert block_hashes
-    assert all(
-        isinstance(block_hash, str) and len(block_hash) == 64
-        for block_hash in block_hashes)
+        block_hashes = [
+            block["block_hash"] for event in stored_events
+            for block in event["data"]["blocks"]
+        ]
+        assert block_hashes
+        assert all(isinstance(block_hash, int) for block_hash in block_hashes)
 
 
 def test_kv_cache_event_async_api():

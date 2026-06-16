@@ -131,11 +131,20 @@ Child = TypeVar("Child", bound="Block | RootBlock")
 Children = dict[BlockKey, Child]
 
 
-def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+def try_get_tree(block: "RootBlock | Block") -> "BlockRadixTree | None":
     node = block
     while not isinstance(node, BlockRadixTree):
-        node = node.prev
+        node = node._prev()
+        if node is None:
+            return None
     return node
+
+
+def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+    tree = try_get_tree(block)
+    if tree is None:
+        raise ValueError("Dereferencing a dangling rawref")
+    return tree
 
 
 def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
@@ -143,7 +152,8 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
     # remove leaf blocks one by one, in post-order
     ret: list[rawref.ref["CommittedPage"]] = []
     removed_block_hashes: list[BlockKey] = []
-    event_manager = get_tree(root).event_manager
+    tree = try_get_tree(root)
+    event_manager = tree.event_manager if tree is not None else None
     block: "RootBlock | Block" = root
     while True:
         if block.next:
@@ -282,9 +292,7 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(reuse_scope: ReuseScope | None) -> BlockKey:
-        if reuse_scope is None:
-            reuse_scope = ReuseScope()
+    def make_key(reuse_scope: ReuseScope) -> BlockKey:
         return Hasher(reuse_scope.to_bytes()).digest
 
 
@@ -372,9 +380,10 @@ class Block:
     def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
         if self.storage[lc_idx] is None:
             return
-        event_manager = get_tree(self).event_manager
         ordinal = self.ordinal
         self.storage[lc_idx] = None
+        tree = try_get_tree(self)
+        event_manager = tree.event_manager if tree is not None else None
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
             pages = remove_subtree(self)
             for r in pages:

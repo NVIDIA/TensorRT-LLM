@@ -282,12 +282,13 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
         if kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None
-                    and self._max_beam_width > 1
-            ) or kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+            unsupported_v2_features = (
+                self._kv_connector_manager is not None or
+                (self._max_beam_width is not None and self._max_beam_width > 1)
+                or kv_cache_config.event_buffer_max_size > 0
+                or (self._cache_transceiver_config is not None
+                    and self._cache_transceiver_config.backend is not None))
+            if unsupported_v2_features:
                 # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
                 # split-pool layout. KVCacheManager (V1) coerces head_dim list
                 # to max(head_dim), changing per-layer KV byte sizes — which
