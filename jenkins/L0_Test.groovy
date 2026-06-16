@@ -539,6 +539,10 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
 
         def cleanupCommands = [
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            // Fat sqsh files are shared across jobs (keyed by commit/tarfile), so age-prune
+            // rather than delete per-job; recent fat sqsh files survive via mtime refresh.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
             "rm -rf ${jobWorkspace} || true",
         ].join(" ; ")
         Utils.exec(
@@ -578,6 +582,8 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -1098,6 +1104,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
+            def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
+            def scriptFatBuildPathNode = "${jobWorkspace}/${jobUID}-fat_build_inline.sh"
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
@@ -1135,6 +1143,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     remote,
                     scriptInstallLocalPath,
                     scriptInstallPathNode,
+                    true
+                )
+                Utils.exec(pipeline, script: "echo \"Script to build fat sqsh inline: \" && cat ${scriptFatBuildLocalPath}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptFatBuildLocalPath,
+                    scriptFatBuildPathNode,
                     true
                 )
                 Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
@@ -1238,37 +1254,82 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
-                    containerImageArg = enrootImagePath
+                    // containerImageArg is resolved at bash runtime via $enrootImagePath,
+                    // which srunPrologue sets to the fat sqsh (pre-built) or base sqsh (fallback).
+                    containerImageArg = "\${enrootImagePath}"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
-                    importContainerWithRetries() {
-                        local docker_uri=\$1
-                        local output_path=\$2
-                        local max_attempts=\${3:-3}
-                        local delay=\${4:-60}
-                        local attempt=1
+                    # Fat sqsh: reuse pre-built container image with trtllm already installed.
+                    # Hash key = sha256(llmTarfile)[:16] — encodes commit + platform.
+                    fatSqshDir="$fatSqshDir"
+                    mkdir -p "\$fatSqshDir"
+                    fatHash=\$(printf '%s' "$llmTarfile" | sha256sum | cut -d' ' -f1 | head -c 16)
+                    fatSqshPath="\$fatSqshDir/fat-\${fatHash}.sqsh"
 
-                        rm -f "\$output_path"
+                    if [ -f "\$fatSqshPath" ]; then
+                        echo "Reusing fat sqsh: \$fatSqshPath (SKIP_INSTALL=1)"
+                        export enrootImagePath="\$fatSqshPath"
+                        export SKIP_INSTALL=1
+                        touch "\$fatSqshPath" || true
+                    else
+                        # Import base container per-job (original fallback behavior).
+                        baseSqshPath="$containerDir/container-\${SLURM_JOB_ID}.sqsh"
 
-                        until enroot import -o "\$output_path" -- "docker://\$docker_uri"
-                        do
-                            if ((attempt >= max_attempts))
-                            then
-                                echo "enroot import failed after \$max_attempts attempts"
-                                return 1
-                            fi
+                        importContainerWithRetries() {
+                            local docker_uri=\$1
+                            local output_path=\$2
+                            local max_attempts=\${3:-3}
+                            local delay=\${4:-60}
+                            local attempt=1
 
-                            echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
                             rm -f "\$output_path"
-                            sleep \$delay
-                            ((attempt++))
-                        done
-                    }
 
-                    importContainerWithRetries "$container" "$enrootImagePath"
+                            until enroot import -o "\$output_path" -- "docker://\$docker_uri"
+                            do
+                                if ((attempt >= max_attempts))
+                                then
+                                    echo "enroot import failed after \$max_attempts attempts"
+                                    return 1
+                                fi
+
+                                echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                                rm -f "\$output_path"
+                                sleep \$delay
+                                ((attempt++))
+                            done
+                        }
+
+                        importContainerWithRetries "$container" "\$baseSqshPath"
+                        export enrootImagePath="\$baseSqshPath"
+
+                        # Build fat sqsh for future job reuse. Best-effort flock so
+                        # only one concurrent job builds while others use base sqsh.
+                        # The current job also benefits if the build succeeds.
+                        exec 8>"\${fatSqshPath}.lock" || true
+                        if flock -n 8 2>/dev/null; then
+                            if [ ! -f "\$fatSqshPath" ]; then
+                                echo "Building fat sqsh: \$fatSqshPath"
+                                if bash "$scriptFatBuildPathNode" "\$fatSqshPath" "\$baseSqshPath" "$llmTarfile" "$tarName"; then
+                                    export enrootImagePath="\$fatSqshPath"
+                                    export SKIP_INSTALL=1
+                                    echo "Fat sqsh ready, switching to it (SKIP_INSTALL=1)"
+                                else
+                                    echo "Fat sqsh build failed (non-fatal), using base sqsh for this job"
+                                fi
+                            else
+                                echo "Fat sqsh appeared while waiting for lock: \$fatSqshPath"
+                                export enrootImagePath="\$fatSqshPath"
+                                export SKIP_INSTALL=1
+                            fi
+                            flock -u 8 || true
+                        else
+                            echo "Another job is building fat sqsh, using base sqsh for this job"
+                        fi
+                    fi
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -1293,7 +1354,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
-                    "--container-env=NVIDIA_IMEX_CHANNELS"
+                    "--container-env=NVIDIA_IMEX_CHANNELS",
+                    "--container-env=SKIP_INSTALL"
                 ]
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
@@ -1400,6 +1462,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def filesToKeepWhenRetry = [
                     scriptRunPathNode,
                     scriptInstallPathNode,
+                    scriptFatBuildPathNode,
                     scriptBashUtilsPathNode,
                     scriptLaunchPathNode,
                     scriptSubmitPathNode,
