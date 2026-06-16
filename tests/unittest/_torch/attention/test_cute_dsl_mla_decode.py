@@ -181,3 +181,66 @@ def test_cute_dsl_mla_decode(
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "
         f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
     )
+
+
+# E2E-reproduction case: a SHORT prompt decoded for MANY steps. The real
+# DeepSeek-V3 run feeds a ~6-token prompt and generates ~64 tokens; its output
+# is correct on the first (prefill) token and then degenerates on every CuteDSL
+# decode step. The parametrized ``test_cute_dsl_mla_decode`` above keeps decode
+# to 4 steps and so, even with a long context, never allocates a fresh paged-KV
+# block *during* generation. Here the KV length grows from a short context
+# across the page_size==32 block boundaries (at lengths 32 and 64) *mid-decode*,
+# allocating new blocks and extending the per-request page_table on the fly —
+# the exact paged-KV path the short-decode test never exercises. fp8 +
+# seq_len_q==1 only (the configuration that degenerates E2E).
+_LONG_DECODE_CONTEXT_LENGTHS = [5, 8, 3, 11]
+_LONG_DECODE_NUM_STEPS = 64
+
+
+@pytest.mark.parametrize("kernel", list(_KERNEL_DTYPES))
+@pytest.mark.parametrize("num_layers", _DECODE_NUM_LAYERS, ids=lambda x: f"num_layers={x}")
+@pytest.mark.parametrize("v2_kv_cache", [True, False], ids=lambda x: f"v2_kv_cache={x}")
+def test_cute_dsl_mla_decode_long_decode(
+    v2_kv_cache, num_layers, kernel, cute_dsl_decode_counter
+):
+    """Long decode-only MLA run that crosses paged-KV block boundaries mid-decode.
+
+    Reproduction for the DeepSeek-V3 E2E degeneration: short prompt, long
+    generation, ``seq_len_q == 1``. The real run uses the v1 ``KVCacheManager``
+    (``use_kv_cache_manager_v2=False``); the rest of this file only exercised the
+    v2 manager, so ``v2_kv_cache`` is parametrized here to cover the v1 paged-KV
+    block-offset layout that the dispatch resolves in
+    ``_dispatch_cute_dsl_mla_decode``.
+    """
+    dtype, kv_cache_dtype = _KERNEL_DTYPES[kernel]
+
+    scenario = Scenario(dtype=dtype, kv_cache_dtype=kv_cache_dtype, num_layers=num_layers)
+    rope_config = _build_rope_config(scenario)
+
+    _run_test_for_backend(
+        "CUTEDSL",
+        num_heads=scenario.num_heads,
+        num_kv_heads=scenario.num_kv_heads,
+        num_layers=scenario.num_layers,
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=scenario.kv_lora_rank,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        rope_config=rope_config,
+        kv_cache_tokens_per_block=scenario.kv_cache_tokens_per_block,
+        device=torch.device("cuda"),
+        dtype=scenario.dtype,
+        kv_cache_dtype=scenario.kv_cache_dtype,
+        context_sequence_lengths=_LONG_DECODE_CONTEXT_LENGTHS,
+        generation_seq_len_q=1,
+        num_generation_steps=_LONG_DECODE_NUM_STEPS,
+        v2_kv_cache=v2_kv_cache,
+        skip_context_assert=True,
+    )
+
+    expected = scenario.num_layers * _LONG_DECODE_NUM_STEPS
+    assert cute_dsl_decode_counter["calls"] == expected, (
+        f"Expected {expected} CuTe DSL MLA decode dispatches, got "
+        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+    )

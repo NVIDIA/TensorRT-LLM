@@ -28,6 +28,7 @@ default context path. This mirrors the MoE CuTeDSL integration
 """
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -173,6 +174,37 @@ class CuteDslAttention(TrtllmAttention):
                 f"CuteDslAttention MLA decode {kernel_dtype} fast path requires "
                 f"matching KV cache dtype, got {kv_pool.dtype}"
             )
+
+        # Paged-pool layout normalization (v1 vs v2 KV cache manager).
+        # ``get_buffers`` returns a per-layer view of shape
+        # [num_blocks, kv_factor, page_size, num_kv_heads, head_dim]. The v2
+        # manager gives each layer its own densely-packed pool, so the block
+        # (dim-0) stride equals the packed block size. The v1 manager stores all
+        # layers interleaved in ONE pool, so the per-layer view's block stride is
+        # ``layers_in_pool * packed_block`` (non-packed) with a per-layer
+        # ``storage_offset``. The CuTe DSL paged TMA addresses pages with the
+        # packed block stride and does not honor a non-packed one, so for v1 it
+        # would read the wrong (interleaved) layer's memory. Re-expose the
+        # underlying pool as a packed ``[num_blocks * layers_in_pool, ...]`` view
+        # (copy-free) and fold the layer offset into the page table below:
+        #   combined_block = block * layers_in_pool + layer_in_pool
+        # For v2 ``layers_in_pool == 1`` and this is a no-op.
+        packed_block = 1
+        for s in kv_pool.shape[1:]:
+            packed_block *= s
+        block_stride = kv_pool.stride(0)
+        layers_in_pool = block_stride // packed_block if packed_block else 1
+        layer_in_pool = 0
+        if layers_in_pool > 1 and block_stride == layers_in_pool * packed_block:
+            layer_in_pool = kv_pool.storage_offset() // packed_block
+            kv_pool = kv_pool.as_strided(
+                (kv_pool.shape[0] * layers_in_pool, ) + tuple(kv_pool.shape[1:]),
+                (packed_block, ) + tuple(kv_pool.stride()[1:]),
+                0,
+            )
+        else:
+            layers_in_pool = 1
+
         kv_pool_typed = kv_pool.view(kernel_dtype)
         c_pool_latent = kv_pool_typed[..., :d_latent]
         c_pool_rope = kv_pool_typed[..., d_latent : d_latent + d_rope]
@@ -197,7 +229,44 @@ class CuteDslAttention(TrtllmAttention):
         # would move stride 1 to B and violate the kernel's layout contract.
         page_table = page_table_layer.transpose(0, 1).to(torch.int32)
 
+        # Fold the interleaved-pool layer offset into the page table so it
+        # indexes the packed combined-slot view built above. The v1 block
+        # offsets are already in combined-slot units (block * layers_in_pool),
+        # so only the per-layer offset has to be added. No-op for v2
+        # (layers_in_pool == 1, layer_in_pool == 0).
+        if layers_in_pool > 1:
+            page_table = page_table + layer_in_pool
+
         cache_seqs = metadata.kv_lens_cuda_runtime.to(torch.int32)
+
+        if os.environ.get("TLLM_CUTE_DSL_DUMP"):
+            print(
+                "[CUTEDSL_DUMP] layer=%d kv_pool.shape=%s kv_pool.stride=%s "
+                "contiguous=%s block_offsets.shape=%s page_table.shape=%s "
+                "page_table=%s cache_seqs=%s" % (
+                    self.layer_idx,
+                    tuple(kv_pool.shape),
+                    tuple(kv_pool.stride()),
+                    kv_pool.is_contiguous(),
+                    tuple(block_offsets.shape),
+                    tuple(page_table.shape),
+                    page_table.t().tolist() if page_table.numel() < 64 else "(big)",
+                    cache_seqs[:8].tolist(),
+                ),
+                flush=True,
+            )
+            _pm = getattr(metadata, "host_kv_cache_pool_mapping", None)
+            print(
+                "[CUTEDSL_DUMP2] layer=%d pool_mapping=%s "
+                "raw_block_offsets[...,0,:]=%s" % (
+                    self.layer_idx,
+                    _pm.tolist() if _pm is not None else None,
+                    block_offsets[..., 0, :].tolist()
+                    if block_offsets.dim() == 4 and block_offsets.numel() < 128
+                    else "(big/other)",
+                ),
+                flush=True,
+            )
 
         split_kv = 1
         workspace = torch.empty(0, dtype=torch.float32, device=q.device)
@@ -255,8 +324,48 @@ class CuteDslAttention(TrtllmAttention):
             # PRE-folded (its softmax uses exp2). The CuTe DSL kernel folds
             # log2(e) AGAIN internally (softmax_scale_log2 = softmax_scale *
             # LOG2_E), so pass the de-folded value to avoid applying it twice.
-            softmax_scale = float(forward_args.mla_bmm1_scale[1].item()) / _LOG2_E
-            output_scale = float(forward_args.mla_bmm2_scale[0].item())
+            #
+            # CUDA-graph safety: ``.item()`` is a device->host copy + sync, which
+            # is illegal while a CUDA graph stream is capturing. These fp8
+            # dequant scales are STATIC per layer — ``mla_rope_generation``
+            # derives them from static quantization state (kv_scale_quant_orig,
+            # q_scaling, quant_mode), not from per-step activations — so we read
+            # them once (eagerly) and cache the host float on this per-layer
+            # backend instance. The generation CUDA-graph capture runs
+            # ``WARMUP_STEPS`` eager decode passes over every layer first
+            # (cuda_graph_runner.capture), so the cache is always populated
+            # before capture and the ``.item()`` never runs under capture.
+            cached = getattr(self, "_cute_dsl_fp8_scale", None)
+            if cached is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "CuteDslAttention: fp8 MLA decode scale not cached for "
+                        f"layer {self.layer_idx} before CUDA graph capture; "
+                        "reading it via .item() during capture is illegal. The "
+                        "eager warmup should have populated the cache.")
+                softmax_scale = float(
+                    forward_args.mla_bmm1_scale[1].item()) / _LOG2_E
+                output_scale = float(forward_args.mla_bmm2_scale[0].item())
+                self._cute_dsl_fp8_scale = (softmax_scale, output_scale)
+            else:
+                softmax_scale, output_scale = cached
+                # Optional staticness check: re-read the live scale eagerly and
+                # warn if it ever drifts from the cached value (would mean the
+                # static-scale assumption — and thus the cache — is wrong).
+                if (os.environ.get("TLLM_CUTE_DSL_SCALE_DUMP")
+                        and not torch.cuda.is_current_stream_capturing()):
+                    live_sm = float(
+                        forward_args.mla_bmm1_scale[1].item()) / _LOG2_E
+                    live_os = float(forward_args.mla_bmm2_scale[0].item())
+                    print(
+                        "[CUTEDSL_SCALE] layer=%d cached=(%.8f,%.8f) "
+                        "live=(%.8f,%.8f) drift=%s" % (
+                            self.layer_idx, softmax_scale, output_scale,
+                            live_sm, live_os,
+                            abs(live_sm - softmax_scale) > 1e-6
+                            or abs(live_os - output_scale) > 1e-6),
+                        flush=True,
+                    )
 
         # Paged cache layout for the kernel is logical [page_size, D, num_pages]
         # with the D axis contiguous (leading_dim=1) — see the kernel reference
