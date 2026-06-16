@@ -402,7 +402,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_autodeploy.py::TestGPTOSS::test_mxfp4_gsm8k[120b]
   - accuracy/test_llm_api_autodeploy.py::TestGPTOSS::test_mxfp4_gsm8k[120b-ep2]
   # ------------- AutoDeploy Perf Sanity ---------------
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws4_1k1k] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_mtp_ad_blackwell-super_mtp_ad_ws4_1k1k] TIMEOUT (120)
 # ------------- AutoDeploy Post Merge 8 GPU tests ---------------
 - condition:
