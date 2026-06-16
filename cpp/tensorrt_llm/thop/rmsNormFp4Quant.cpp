@@ -85,15 +85,21 @@ std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_
     void* norm_out_ptr = nullptr;
     if (return_norm_out)
     {
-        norm_out = torch::empty_like(hidden_states);
+        norm_out = at::detail::empty_cuda(
+            input_shape.vec(), hidden_states.scalar_type(), hidden_states.device(), std::nullopt);
         norm_out_ptr = norm_out.mutable_data_ptr();
     }
 
-    // The kernel reads hidden_states (intermediate_buffer) and residual, adds
-    // them, and writes the sum to a distinct residual_out_buffer — hidden_states
-    // is never mutated, so the op is functionalizable under torch.compile (no
-    // output aliases an input) with no extra pre-kernel copy.
-    at::Tensor residual_out = torch::empty_like(hidden_states);
+    // Freshly allocate residual_out (input + residual is written here by the
+    // kernel) the same way as quant_out/scale_out and the ws op
+    // (fusedAddRMSNormQuant.cpp): empty_cuda, not empty_like. empty_cuda is a
+    // plain allocation, whereas empty_like carries the input's layout and can be
+    // lowered to a separate node in the torch.compile trace. The kernel reads
+    // hidden_states (intermediate_buffer) read-only and writes the sum into this
+    // distinct buffer, so hidden_states is never mutated and no output aliases an
+    // input (the op stays functionalizable) -- with no pre-kernel copy.
+    at::Tensor residual_out
+        = at::detail::empty_cuda(input_shape.vec(), hidden_states.scalar_type(), hidden_states.device(), std::nullopt);
 
     tensorrt_llm::kernels::RmsNormFp4QuantParams params{};
     params.bias_buffer = nullptr;
