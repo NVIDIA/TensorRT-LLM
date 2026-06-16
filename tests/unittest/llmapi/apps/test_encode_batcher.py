@@ -254,6 +254,40 @@ async def test_submit_rejects_input_longer_than_max_seq_len():
         await batcher.shutdown()
 
 
+async def test_submit_rejects_single_input_over_token_budget():
+    """A lone input larger than max_num_tokens is rejected at submission.
+
+    A single request that exceeds the per-batch token budget can never form a
+    valid batch, so submit raises InputTooLongError (HTTP 400) up front rather
+    than letting encode_fn reject the batch later. validate_input() exposes the
+    same check for callers that want to pre-validate before enqueueing.
+    """
+    from tensorrt_llm.serve.encode_batcher import InputTooLongError
+
+    def encode_fn(batch):
+        return [0] * len(batch)
+
+    batcher = EncodeBatcher(
+        encode_fn,
+        max_batch_size=8,
+        max_queue_delay=0.01,
+        max_queue_size=100,
+        max_num_tokens=4,  # smaller than the oversize input below
+        max_seq_len=100,  # not the limiting factor here
+    )
+    await batcher.start()
+    try:
+        # 5 tokens > max_num_tokens=4, even alone.
+        with pytest.raises(InputTooLongError):
+            batcher.validate_input([1, 2, 3, 4, 5])
+        with pytest.raises(InputTooLongError):
+            await batcher.submit([1, 2, 3, 4, 5])
+        # A within-budget request still succeeds.
+        assert await batcher.submit([1, 2, 3, 4]) == 0
+    finally:
+        await batcher.shutdown()
+
+
 async def test_full_batch_flushes_immediately_without_waiting_window():
     """A batch that reaches max_batch_size is dispatched immediately.
 

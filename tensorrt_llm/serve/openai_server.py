@@ -66,6 +66,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 EmbeddingRequest,
                                                 EmbeddingResponse,
                                                 EmbeddingResponseData,
+                                                EmbeddingUsageInfo,
                                                 ErrorResponse,
                                                 ImageGenerationRequest,
                                                 ImageGenerationResponse,
@@ -804,20 +805,26 @@ class OpenAIServer(_VideoRoutesMixin):
         ``llm.encode()`` call. ``encode()`` is synchronous; the batcher runs it in
         the default executor so the event loop stays responsive.
         """
-        args = self.generator.args
 
         def encode_fn(token_ids_batch):
             # token_ids_batch: list of pre-tokenized token-id lists. encode()
             # returns one EncoderOutput per item, in input order.
             return self.generator.encode(token_ids_batch)
 
+        # Source the batch limits from the resolved encoder engine — the same
+        # attributes encode() validates against (llm.py: engine.max_seq_len /
+        # max_num_tokens / batch_size). LlmArgs.max_seq_len/max_num_tokens default
+        # to None and are not written back to args, so reading them from args
+        # would leave the batcher's seq-len/token-budget guards inert (typed 400s
+        # would never fire) and could let it form a batch encode() then rejects.
+        engine = self.generator._encoder_executor.model_engine
         self.embedding_batcher = EncodeBatcher(
             encode_fn,
-            max_batch_size=args.max_batch_size,
+            max_batch_size=engine.batch_size,
             max_queue_delay=self._embedding_max_queue_delay,
             max_queue_size=self._embedding_max_queue_size,
-            max_num_tokens=getattr(args, "max_num_tokens", None),
-            max_seq_len=getattr(args, "max_seq_len", None),
+            max_num_tokens=engine.max_num_tokens,
+            max_seq_len=engine.max_seq_len,
         )
 
     def register_embedding_routes(self):
@@ -849,13 +856,25 @@ class OpenAIServer(_VideoRoutesMixin):
     async def openai_embedding(self, request: EmbeddingRequest,
                                raw_request: Request) -> Response:
         try:
+            # `dimensions` is a Matryoshka-embedding knob (truncate-then-renormalize
+            # a sentence-embedding vector), matching vLLM, which rejects it for
+            # non-Matryoshka models. The encoder/classifier/reward models served
+            # here emit raw [num_labels] / [seq_len, num_labels] tensors, not pooled
+            # Matryoshka embeddings, so blindly slicing them is meaningless. Reject
+            # until a pooled text-embedding model is supported (fast-follow).
+            if request.dimensions is not None:
+                return self.create_error_response(
+                    "`dimensions` is only supported by Matryoshka-trained "
+                    "text-embedding models, which are not currently served by "
+                    "this endpoint.",
+                    status_code=HTTPStatus.BAD_REQUEST)
+
             items = self._normalize_embedding_input(request.input)
             if not items:
                 return self.create_error_response("`input` must not be empty.")
 
             # Tokenize strings via the same input processor used by /v1/completions,
-            # honoring add_special_tokens. Pre-tokenized inputs are used as-is. The
-            # batcher enforces seq-len / token-budget limits on the token ids.
+            # honoring add_special_tokens. Pre-tokenized inputs are used as-is.
             sampling_params = SamplingParams(
                 add_special_tokens=request.add_special_tokens)
             token_ids_list = []
@@ -869,6 +888,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 token_ids_list.append(token_ids)
 
             try:
+                # Validate every input's length up front so an oversize item fails
+                # the whole request before any item is enqueued — otherwise gather()
+                # cancels the awaiters but their already-queued inputs still run
+                # encode() (wasted GPU work).
+                for token_ids in token_ids_list:
+                    self.embedding_batcher.validate_input(token_ids)
                 results = await asyncio.gather(*[
                     self.embedding_batcher.submit(token_ids)
                     for token_ids in token_ids_list
@@ -885,8 +910,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Model-agnostic: serialize whatever per-request tensor encode()
                 # emits (classification logits, reward score, pooled vector, ...).
                 embedding = encoder_output.logits.flatten().tolist()
-                if request.dimensions is not None:
-                    embedding = embedding[:request.dimensions]
                 if request.encoding_format == "base64":
                     embedding = base64.b64encode(
                         array.array("f", embedding).tobytes()).decode("utf-8")
@@ -894,16 +917,19 @@ class OpenAIServer(_VideoRoutesMixin):
                     EmbeddingResponseData(index=idx, embedding=embedding))
 
             num_prompt_tokens = sum(len(t) for t in token_ids_list)
-            usage = UsageInfo(prompt_tokens=num_prompt_tokens,
-                              total_tokens=num_prompt_tokens,
-                              completion_tokens=None)
-            response = EmbeddingResponse(model=self.model,
+            usage = EmbeddingUsageInfo(prompt_tokens=num_prompt_tokens,
+                                       total_tokens=num_prompt_tokens)
+            response = EmbeddingResponse(model=request.model,
                                          data=data,
                                          usage=usage)
             return JSONResponse(content=response.model_dump())
         except Exception as e:
+            # Unexpected fault (not a client error): surface as 500, not 400.
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""

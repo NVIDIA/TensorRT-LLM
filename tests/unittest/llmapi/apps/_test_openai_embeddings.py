@@ -124,13 +124,57 @@ def test_float_matches_base64(server: RemoteEmbeddingServer):
         assert a == pytest.approx(b, rel=1e-5, abs=1e-5)
 
 
-def test_dimensions_truncation(server: RemoteEmbeddingServer):
+def test_dimensions_rejected_for_non_matryoshka_model(server: RemoteEmbeddingServer):
+    # `dimensions` is a Matryoshka-embedding knob; for a classifier/reward model
+    # (raw [num_labels] logits, not a pooled embedding) it is meaningless, so the
+    # server rejects it with 400 — matching vLLM's behavior for non-Matryoshka
+    # models, rather than silently slicing the logit vector.
     resp = requests.post(
         server.url_for("v1", "embeddings"),
         json={"model": BERT_MODEL, "input": "truncate me", "dimensions": 1},
     )
+    assert resp.status_code == 400
+
+
+def test_dimensions_must_be_positive(server: RemoteEmbeddingServer):
+    # Pydantic PositiveInt constraint: a non-positive `dimensions` is a 422
+    # validation error (FastAPI request-model validation).
+    resp = requests.post(
+        server.url_for("v1", "embeddings"),
+        json={"model": BERT_MODEL, "input": "x", "dimensions": 0},
+    )
+    assert resp.status_code == 422
+
+
+def test_empty_input_returns_400(server: RemoteEmbeddingServer):
+    resp = requests.post(
+        server.url_for("v1", "embeddings"),
+        json={"model": BERT_MODEL, "input": []},
+    )
+    assert resp.status_code == 400
+
+
+def test_oversized_input_returns_400(server: RemoteEmbeddingServer):
+    # A pre-tokenized input far longer than any encoder's max_seq_len must be
+    # rejected with 400 (InputTooLongError) rather than crashing the forward.
+    resp = requests.post(
+        server.url_for("v1", "embeddings"),
+        json={"model": BERT_MODEL, "input": list(range(100000))},
+    )
+    assert resp.status_code == 400
+
+
+def test_usage_has_no_completion_tokens(server: RemoteEmbeddingServer):
+    # OpenAI's embeddings usage object carries only prompt_tokens/total_tokens.
+    resp = requests.post(
+        server.url_for("v1", "embeddings"),
+        json={"model": BERT_MODEL, "input": "count my tokens"},
+    )
     assert resp.status_code == 200
-    assert len(resp.json()["data"][0]["embedding"]) == 1
+    usage = resp.json()["usage"]
+    assert usage["prompt_tokens"] > 0
+    assert usage["total_tokens"] == usage["prompt_tokens"]
+    assert "completion_tokens" not in usage
 
 
 @pytest.mark.asyncio

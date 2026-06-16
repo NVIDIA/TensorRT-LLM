@@ -82,16 +82,31 @@ class EncodeBatcher:
     async def start(self) -> None:
         self._worker = asyncio.create_task(self._run())
 
-    async def submit(self, token_ids: List[int]) -> Any:
-        """Enqueue one input and await its encoded result.
+    def validate_input(self, token_ids: List[int]) -> None:
+        """Validate a single input against the model's capacity.
 
-        Raises InputTooLongError (HTTP 400) if the input exceeds max_seq_len, and
-        QueueFullError (HTTP 429) if the queue is full.
+        Raises InputTooLongError (HTTP 400) if the input exceeds ``max_seq_len``
+        (the model's positional limit) or, on its own, exceeds ``max_num_tokens``
+        (the engine's per-batch token budget) — either of which would make
+        ``encode_fn`` reject the formed batch. Callers may invoke this before
+        submitting a group of inputs so an oversize item fails fast.
         """
         if self._max_seq_len is not None and len(token_ids) > self._max_seq_len:
             raise InputTooLongError(
                 f"Input length ({len(token_ids)}) exceeds max_seq_len ({self._max_seq_len})."
             )
+        if self._max_num_tokens is not None and len(token_ids) > self._max_num_tokens:
+            raise InputTooLongError(
+                f"Input length ({len(token_ids)}) exceeds max_num_tokens ({self._max_num_tokens})."
+            )
+
+    async def submit(self, token_ids: List[int]) -> Any:
+        """Enqueue one input and await its encoded result.
+
+        Raises InputTooLongError (HTTP 400) if the input exceeds the model's
+        capacity, and QueueFullError (HTTP 429) if the queue is full.
+        """
+        self.validate_input(token_ids)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         request = _QueuedRequest(token_ids=token_ids, future=future)
         try:
