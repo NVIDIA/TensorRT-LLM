@@ -1,6 +1,6 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
-# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy of
@@ -27,9 +27,12 @@ set_property(TARGET mhcKernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_compile_options(mhcKernels_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 
-# Expose DeepGEMM helper headers (sm100_utils.cuh, utils.cuh, tma_utils.cuh,
-# reduction.cuh) Used by the tcgen05.mma-based fused post-mapping + GEMM kernel
-# on SM100.
-target_include_directories(
-  mhcKernels_src
-  PRIVATE ${CMAKE_BINARY_DIR}/_deps/deepgemm-src/deep_gemm/include)
+if(BUILD_DEEP_GEMM)
+  # Expose DeepGEMM helper headers (sm100_utils.cuh, utils.cuh, tma_utils.cuh,
+  # reduction.cuh) used by the tcgen05.mma-based fused post-mapping + GEMM
+  # kernel on SM100.
+  target_include_directories(
+    mhcKernels_src
+    PRIVATE ${CMAKE_BINARY_DIR}/_deps/deepgemm-src/deep_gemm/include)
+  target_compile_definitions(mhcKernels_src PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+endif()

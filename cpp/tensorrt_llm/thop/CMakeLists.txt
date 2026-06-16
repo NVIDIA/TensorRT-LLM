@@ -131,6 +131,10 @@ target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
 
+if(BUILD_DEEP_GEMM)
+  target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+endif()
+
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")

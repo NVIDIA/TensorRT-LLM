@@ -37,15 +37,15 @@ from tensorrt_llm._utils import get_sm_version
 def _fused_hc_mma_supported() -> bool:
     """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require SM100.
 
-    Match the C++ compile guard for the tcgen05 kernels:
-    __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100. On other GPU generations,
-    only the FMA paths (Path E / Path F, "fused_*_fma") are safe to run.
-    Called lazily so the module can still be imported on a host without a CUDA
-    device (e.g. CPU-only lint / typecheck).
+    They also require BUILD_DEEP_GEMM=ON so the C++ extension compiles the
+    DeepGEMM-backed TF32 kernels. On unsupported builds or GPU generations, only
+    the FMA paths (Path E / Path F, "fused_*_fma") are emitted.
     """
     try:
         sm_version = get_sm_version()
-        return 100 <= sm_version < 110
+        if not (100 <= sm_version < 110):
+            return False
+        return bool(torch.ops.trtllm.mhc_fused_hc_mma_enabled())
     except Exception:
         return False
 

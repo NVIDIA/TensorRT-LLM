@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
 
@@ -15,6 +16,15 @@ BENCH_WARMUP = 50
 BENCH_ITERS = 200
 
 timing_stats = defaultdict(dict)
+
+
+def _mhc_fused_hc_mma_available() -> bool:
+    try:
+        from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_mma_supported
+
+        return _fused_hc_mma_supported()
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +624,7 @@ def test_mhc_fused_hc_fused_norm(n: int, hidden_size: int, hc_mult: int):
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
+@skip_pre_blackwell
 def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
     """Every wired fused_hc backend sees bit-identical input and is checked
     against one shared torch reference and one golden backend output.
@@ -691,8 +702,15 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
             cur_module.base.detach().clone(),
         ]
 
+    mma_available = _mhc_fused_hc_mma_available()
+    tactics = [
+        tactic
+        for tactic in _BACKEND_TACTICS_BY_M[n]
+        if mma_available or not tactic[0].endswith("_mma")
+    ]
+
     tactic_outputs = {}
-    for tactic in _BACKEND_TACTICS_BY_M[n]:
+    for tactic in tactics:
         residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = runner(
             inputs=make_runner_inputs(), tactic=tactic
         )
@@ -788,9 +806,9 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
 @pytest.mark.parametrize(
     "tactic",
     [
-        ("fused_half_mma", 0, 1, 256, 1),
+        pytest.param(("fused_half_mma", 0, 1, 256, 1), marks=skip_pre_blackwell),
         ("fused_half_fma", 2, 1, 256, 1),
-        ("fused_all_mma", 0, 1, 0, 1),
+        pytest.param(("fused_all_mma", 0, 1, 0, 1), marks=skip_pre_blackwell),
         ("fused_all_fma", 2, 1, 0, 1),
     ],
 )
@@ -798,6 +816,9 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
 def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
     """Real-scale mHC data catches fused_hc RMS normalization regressions."""
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    if tactic[0].endswith("_mma") and not _mhc_fused_hc_mma_available():
+        pytest.skip("mHC fused-HC MMA kernels require SM100 and BUILD_DEEP_GEMM=ON")
 
     n = 16
     hc_mult = 4
@@ -862,6 +883,7 @@ def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
 @pytest.mark.parametrize("n", [128, 2048])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
+@skip_pre_blackwell
 def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     """CUDA-graph capture/replay of mHC.fused_hc.
 
@@ -879,6 +901,9 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     replays).
     """
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    if not _mhc_fused_hc_mma_available():
+        pytest.skip("mHC fused-HC MMA kernels require SM100 and BUILD_DEEP_GEMM=ON")
 
     pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
 

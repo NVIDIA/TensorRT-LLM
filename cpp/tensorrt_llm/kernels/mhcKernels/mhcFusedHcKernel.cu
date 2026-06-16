@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,9 @@
 //
 // but exposed as a single entry point.
 
+#ifdef TRTLLM_MHC_ENABLE_FUSED_HC
 #include "fused_tf32_pmap_gemm.cuh"
+#endif
 #include "mhcKernels.h"
 #include "mhc_fused_fma.cuh"
 
@@ -97,11 +99,13 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
 // HC_MULT * (2 + HC_MULT) = 4 * 6 = 24.
 static constexpr uint32_t FHC_SHAPE_N = 24;
 static constexpr uint32_t FHC_HC_MULT = 4;
+static constexpr uint32_t FHC_BLOCK_K = 64;
+
+#ifdef TRTLLM_MHC_ENABLE_FUSED_HC
 static constexpr uint32_t FHC_HIDDEN_FLASH = 4096;
 static constexpr uint32_t FHC_HIDDEN_PRO = 7168;
 static constexpr uint32_t FHC_BLOCK_M = 64;
 static constexpr uint32_t FHC_BLOCK_N = 32;
-static constexpr uint32_t FHC_BLOCK_K = 64;
 static constexpr uint32_t FHC_SWIZZLE_CD = 128;
 // Rebalanced from N_B=12 / N_INPUT=2: SASS PC-sampling on M=4096 KS=2 showed
 // ~25% of all stalls landed on a single NANOSLEEP.SYNCS (mbarrier wait) — the
@@ -469,6 +473,8 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     }
 }
 
+#endif // TRTLLM_MHC_ENABLE_FUSED_HC
+
 // ===================================================================
 // FMA-path fused hyper-connection boundary launcher.
 //
@@ -558,6 +564,8 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 // all fused into one kernel.  Phase 3 elects last-home CTA per m-block via
 // atomic done_counter; Phase 4 runs bigfuse inline on the elected CTA.
 // ===================================================================
+
+#ifdef TRTLLM_MHC_ENABLE_FUSED_HC
 
 // Path D (all-in-one) reuses Path B's SMEM layout: CD + B stages + res/x
 // stages + post + comb + rc (HC_MULT slices) + barriers. The inline bigfuse
@@ -718,6 +726,33 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     default: return;
     }
 }
+
+#else
+
+void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
+    float const* comb_mix_prev, float const* w_t, float const* hc_scale, float const* hc_base,
+    __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
+    float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
+    int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(
+        false, "mhcFusedHcLaunch requires BUILD_DEEP_GEMM=ON to compile the TF32 MMA fused-HC backend");
+}
+
+void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
+    float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
+    float const* hc_base, __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur,
+    __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
+    int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+    float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
+    cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(
+        false, "mhcFusedHcAllInOneLaunch requires BUILD_DEEP_GEMM=ON to compile the TF32 MMA fused-HC backend");
+}
+
+#endif // TRTLLM_MHC_ENABLE_FUSED_HC
 
 // ===================================================================
 // All-in-one single-kernel fused hyper-connection launcher (FMA).

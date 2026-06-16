@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,6 +73,15 @@ void mhcPostMappingOp(torch::Tensor residual, torch::Tensor x, torch::Tensor pos
         reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr<at::BFloat16>()), post_mix.data_ptr<float>(),
         comb_mix.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), static_cast<int>(B),
         static_cast<int>(hidden_size), stream);
+}
+
+bool mhcFusedHcMmaEnabledOp()
+{
+#ifdef TRTLLM_MHC_ENABLE_FUSED_HC
+    return true;
+#else
+    return false;
+#endif
 }
 
 void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tensor post_mix_prev,
@@ -197,6 +206,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor post_mix, Tensor comb_mix, Tensor(a!) out, "
         "int B, int hidden_size) -> ()");
 
+    m.def("mhc_fused_hc_mma_enabled() -> bool");
+
     m.def(
         "mhc_fused_hc("
         "Tensor x_prev, Tensor residual_prev, "
@@ -220,4 +231,9 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("mhc_hc_head_apply", &mhcHcHeadApplyOp);
     m.impl("mhc_post_mapping", &mhcPostMappingOp);
     m.impl("mhc_fused_hc", &mhcFusedHcOp);
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("mhc_fused_hc_mma_enabled", &mhcFusedHcMmaEnabledOp);
 }
