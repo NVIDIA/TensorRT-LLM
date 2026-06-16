@@ -35,6 +35,7 @@ The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Trans
 - [Serving with trtllm-serve](#serving-with-trtllm-serve)  
 - [Quality Evaluation](#quality-evaluation)  
 - [Conclusion](#conclusion)  
+- [Picking the Right Configuration](#picking-the-right-configuration)  
 - [Limitations and Future Work](#limitations-and-future-work)  
 - [References](#references)
 - [Acknowledgement](#acknowledgement)
@@ -454,6 +455,10 @@ Against that band, parallelism is essentially free. Every parallel configuration
 Serving Diffusion Transformers for video generation is a different scaling problem from LLM serving: a single latency-bound request, no KV cache, and full bi-directional attention over a 70–150k-token sequence that dominates all of the tens of denoising steps. The `VisualGen` runtime in TensorRT-LLM attacks that cost by unifying four parallelism axes — CFG, Ulysses, Attention2D context parallelism, and parallel VAE — under a single PyTorch `DeviceMesh`, exposed as declarative knobs on `ParallelConfig`. All four axes work together to compress the latency: CFG splits the two guidance streams, halving per-rank compute across the CFG group (2 GPUs, ~2×). Ulysses then shards the sequence until it hits each model's head-count wall (`ulysses ≤ 8` for Wan and Cosmos3), taking the first 16 GPUs to ~14×. Context parallelism carries the DiT the rest of the way to the full rack: we use Attention2D rather than Ring Attention because its 2D row/column groups and `O(N/√P)` collectives hold near-linear scaling at 72 GPUs — where Ring Attention's `O(N)` cost caps out around 64 — reaching ~49× on the denoise loop. Finally, parallel VAE scales out the decode, which becomes the bottleneck at NVL72 scale once the DiT is this small.
 
 The result is near-ideal scaling of the DiT denoising steps. On Wan 2.2 T2V-A14B, the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoise loop ~53× from a single B200 to a full GB200 NVL72 rack (~41× end-to-end), and the *same* recipe applies unchanged to the 64B Cosmos3-Super (~49× denoise), confirming that the sequence-length sharding pattern generalizes across very different model sizes and sequence lengths. Concretely, a video clip that once took over five minutes to generate now finishes in ~9 seconds on the full GB200 NVL72 rack — and we expect the same approach to carry over to the next generation of longer, higher-resolution video models.
+
+## Picking the Right Configuration
+
+We allocate GPUs in order of how cleanly each axis scales. **CFG** comes first: it splits the two guidance streams, halving per-rank compute for a roughly 2× gain. **Ulysses** follows, sharding the sequence until it saturates the model's head count. The remaining GPUs go to **Attention2D**, kept as a symmetric grid so neither axis becomes the bottleneck. Finding the right balance between Ulysses and Attention2D is a matter of tuning: going from 64 to 72 GPUs, for instance, Ulysses drops from 8 to 4 and Attention2D widens to keep the grid square. Finally, VAE decode is tuned separately and scaled out only once it surfaces as the end-to-end bottleneck — a degree of 4 or 8 usually gives the best scaling.
 
 ## Limitations and Future Work
 
