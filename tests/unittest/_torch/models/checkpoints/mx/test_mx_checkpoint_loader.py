@@ -17,6 +17,7 @@ about *our* fallback behavior, not about the upstream API.
 import os
 import sys
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,10 +30,40 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
 )
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
+    _MX_SOURCE_IDENTITY_METADATA_KEY,
+    _MX_STAGED_TRANSFORM_PROTOCOL_VERSION,
+    _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY,
+    _MX_WEIGHT_LAYOUT_METADATA_KEY,
+    _MX_WEIGHT_LAYOUT_POST_TRANSFORM,
     MXCheckpointLoader,
+    _build_mx_source_metadata,
     _normalize_model_identity,
     _resolve_mx_model_name,
 )
+from tensorrt_llm._torch.weight_sharing import SourceIdentity
+
+_MISSING = object()
+
+
+def _identity(rank: int = 0) -> SourceIdentity:
+    return SourceIdentity(
+        format_version=1,
+        model_fingerprint="model",
+        quant_fingerprint="quant",
+        backend_fingerprint="backend",
+        parallel_fingerprint="parallel",
+        rank=rank,
+        shard_fingerprint=f"shard-{rank}",
+        model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    )
+
+
+def _source_instance(identity: SourceIdentity, *, post_transform: bool = True):
+    metadata = _build_mx_source_metadata(identity)
+    if not post_transform:
+        metadata[_MX_WEIGHT_LAYOUT_METADATA_KEY] = "pre_transform"
+    return SimpleNamespace(metadata=metadata)
+
 
 # ---------------------------------------------------------------------------
 # Construction & static properties
@@ -158,11 +189,14 @@ class TestLoadWeightsFallback:
 
     @staticmethod
     def _upstream_raises(stack):
+        identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        fake_mx = _build_fake_modelexpress(load_weights_side_effect=RuntimeError("boom"))
+        fake_mx = _build_fake_modelexpress(
+            load_weights_side_effect=RuntimeError("boom"),
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
         stack.enter_context(_install_fake_modelexpress(fake_mx))
-        return (loader, {"model": MagicMock()})
+        return (loader, {"model": MagicMock(), "source_identity": identity})
 
     @pytest.mark.parametrize(
         "trigger_id, setup",
@@ -210,14 +244,22 @@ class TestLoadWeightsMxPath:
         # params; ``ModelLoader`` interprets the empty dict + the
         # ``is_weights_preloaded()`` signal as "skip the standard
         # weight-mapping pipeline".
+        identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        fake_mx = _build_fake_modelexpress(load_weights_return={})
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
         mapping = MagicMock(name="mapping")
         model = MagicMock(name="model")
 
         with _install_fake_modelexpress(fake_mx):
-            result = loader.load_weights("/nonexistent", mapping=mapping, model=model)
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=mapping,
+                model=model,
+                source_identity=identity,
+            )
 
         assert result == {}
         assert loader.is_weights_preloaded() is True
@@ -238,20 +280,150 @@ class TestLoadWeightsMxPath:
         # When MX returns a non-empty fallback dict (size-mismatched
         # tensors), keep the P2P transfer and let ModelLoader merge these
         # tensors through the standard disk pipeline.
+        identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fallback = {"some.weight": MagicMock()}
-        fake_mx = _build_fake_modelexpress(load_weights_return=fallback)
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return=fallback,
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
 
         with (
             _install_fake_modelexpress(fake_mx),
             patch.object(HfCheckpointLoader, "load_weights") as mock_super_load,
         ):
-            result = loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+            )
 
         assert loader.is_weights_preloaded() is True
         assert loader.is_post_transform_weights_preloaded() is False
         assert result is fallback
+        mock_super_load.assert_not_called()
+
+    def test_post_transform_full_success_sets_skip_signal_when_allowlisted(self):
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[_source_instance(identity)],
+        )
+
+        with _install_fake_modelexpress(fake_mx):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+            )
+
+        assert result == {}
+        assert loader.is_weights_preloaded() is True
+        assert loader.is_post_transform_weights_preloaded() is True
+
+    def test_post_transform_source_falls_back_before_p2p_when_not_allowlisted(self):
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        disk_weights = {"disk.weight": MagicMock()}
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[_source_instance(identity)],
+        )
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=False,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
+        mx_loader.load_weights.assert_not_called()
+        mock_super_load.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "protocol_value",
+        ["2", "not-an-int", _MISSING],
+        ids=["newer-protocol", "invalid-protocol", "missing-protocol"],
+    )
+    def test_post_transform_source_with_unsupported_protocol_falls_back_before_p2p(
+        self, protocol_value
+    ):
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        disk_weights = {"disk.weight": MagicMock()}
+        source_instance = _source_instance(identity)
+        if protocol_value is _MISSING:
+            source_instance.metadata.pop(_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY)
+        else:
+            source_instance.metadata[_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY] = protocol_value
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[source_instance],
+        )
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
+        mx_loader.load_weights.assert_not_called()
+        mock_super_load.assert_called_once()
+
+    def test_selects_matching_source_metadata_from_multiple_instances(self):
+        rank0_identity = _identity(rank=0)
+        rank1_identity = _identity(rank=1)
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[
+                _source_instance(rank0_identity),
+                _source_instance(rank1_identity),
+            ],
+        )
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(HfCheckpointLoader, "load_weights") as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=rank1_identity,
+                allow_post_transform_weights=True,
+            )
+
+        assert result == {}
+        assert loader.is_weights_preloaded() is True
+        assert loader.is_post_transform_weights_preloaded() is True
         mock_super_load.assert_not_called()
 
     def test_post_transform_mixed_success_falls_back_to_full_disk_load(self):
@@ -260,12 +432,14 @@ class TestLoadWeightsMxPath:
         # force ModelLoader onto the full post-load path and double-transform
         # the P2P subset. Lock the safer behavior now: abandon the partial
         # post-transform transfer and return a full disk load instead.
+        identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        loader._source_metadata_is_post_transform = MagicMock(return_value=True)
         fallback = {"some.weight": MagicMock(numel=lambda: 1, element_size=lambda: 4)}
         disk_weights = {"disk.weight": MagicMock()}
-        fake_mx = _build_fake_modelexpress(load_weights_return=fallback)
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return=fallback,
+            source_instances=[_source_instance(identity)],
+        )
 
         with (
             _install_fake_modelexpress(fake_mx),
@@ -273,7 +447,13 @@ class TestLoadWeightsMxPath:
                 HfCheckpointLoader, "load_weights", return_value=disk_weights
             ) as mock_super_load,
         ):
-            result = loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+            )
 
         assert result is disk_weights
         assert loader.is_weights_preloaded() is False
@@ -327,23 +507,54 @@ class TestPublishAsSource:
     def test_modelexpress_unavailable_is_noop(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         with _block_modelexpress():
-            loader.publish_as_source(MagicMock())  # must not raise
+            loader.publish_as_source(MagicMock(), source_identity=_identity())  # must not raise
 
     def test_publish_called_with_model(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        identity = _identity()
         fake_mx = _build_fake_modelexpress()
         model = MagicMock(name="model")
 
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(model)
+            loader.publish_as_source(model, source_identity=identity)
 
-        fake_mx.trtllm_live_transfer.publish_model_params.assert_called_once_with(model)
+        fake_mx.trtllm_live_transfer.publish_model_params.assert_called_once()
+        args, kwargs = fake_mx.trtllm_live_transfer.publish_model_params.call_args
+        assert args == (model,)
+        metadata = kwargs["metadata"]
+        assert metadata[_MX_WEIGHT_LAYOUT_METADATA_KEY] == _MX_WEIGHT_LAYOUT_POST_TRANSFORM
+        assert metadata[_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY] == str(
+            _MX_STAGED_TRANSFORM_PROTOCOL_VERSION
+        )
+        assert _MX_SOURCE_IDENTITY_METADATA_KEY in metadata
+
+    def test_source_identity_required_for_post_transform_publish(self):
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress()
+
+        with _install_fake_modelexpress(fake_mx):
+            loader.publish_as_source(MagicMock())
+
+        fake_mx.trtllm_live_transfer.publish_model_params.assert_not_called()
+
+    def test_publish_skipped_when_metadata_unsupported(self):
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        calls = []
+
+        def _publish_without_metadata(model):
+            calls.append(model)
+
+        fake_mx = _build_fake_modelexpress(publish_model_params=_publish_without_metadata)
+        with _install_fake_modelexpress(fake_mx):
+            loader.publish_as_source(MagicMock(), source_identity=_identity())
+
+        assert calls == []
 
     def test_env_var_set_during_publish_then_restored(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx-instance:9999")
         captured_env = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured_env["MODEL_EXPRESS_URL"] = os.environ.get("MODEL_EXPRESS_URL")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
@@ -351,7 +562,7 @@ class TestPublishAsSource:
         prior = os.environ.pop("MODEL_EXPRESS_URL", None)
         try:
             with _install_fake_modelexpress(fake_mx):
-                loader.publish_as_source(MagicMock())
+                loader.publish_as_source(MagicMock(), source_identity=_identity())
         finally:
             if prior is not None:
                 os.environ["MODEL_EXPRESS_URL"] = prior
@@ -368,7 +579,7 @@ class TestPublishAsSource:
         os.environ["MODEL_EXPRESS_URL"] = "http://prior-value:1234"
         try:
             with _install_fake_modelexpress(fake_mx):
-                loader.publish_as_source(MagicMock())
+                loader.publish_as_source(MagicMock(), source_identity=_identity())
             assert os.environ["MODEL_EXPRESS_URL"] == "http://prior-value:1234"
         finally:
             if prior is None:
@@ -383,7 +594,7 @@ class TestPublishAsSource:
         fake_mx = _build_fake_modelexpress(publish_side_effect=RuntimeError("upstream went away"))
 
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock())  # must not raise
+            loader.publish_as_source(MagicMock(), source_identity=_identity())  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +636,9 @@ def _build_fake_modelexpress(
     load_weights_return=None,
     load_weights_side_effect=None,
     publish_side_effect=None,
+    publish_model_params=None,
     source_instances=None,
+    source_metadata=None,
 ):
     """Build a fake modelexpress module tree mimicking the symbols we use."""
     fake_pkg = MagicMock(name="modelexpress")
@@ -443,11 +656,15 @@ def _build_fake_modelexpress(
     fake_trtllm_live.MxLiveWeightLoader = MagicMock(return_value=weight_loader_instance)
     client_instance = MagicMock(name="MxClient instance")
     client_instance.list_sources.return_value = MagicMock(instances=source_instances or [])
+    if source_metadata is not None:
+        client_instance.get_source_metadata.return_value = source_metadata
     fake_trtllm_live.MxClient = MagicMock(return_value=client_instance)
     fake_trtllm_live._build_trtllm_identity = MagicMock(return_value=MagicMock())
 
     # publish_model_params(model)
-    if publish_side_effect is not None:
+    if publish_model_params is not None:
+        fake_trtllm_live.publish_model_params = publish_model_params
+    elif publish_side_effect is not None:
         fake_trtllm_live.publish_model_params = MagicMock(side_effect=publish_side_effect)
     else:
         fake_trtllm_live.publish_model_params = MagicMock()
@@ -498,33 +715,51 @@ class TestMxSourceQueryTimeoutDefault:
         yield
 
     def test_no_registered_source_gets_short_default_during_load(self):
+        identity = _identity()
+        source_metadata = _build_mx_source_metadata(identity)
+        source_metadata[_MX_WEIGHT_LAYOUT_METADATA_KEY] = "pre_transform"
+
         def _assert_timeout(*args, **kwargs):
             assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "30"
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        fake_mx = _build_fake_modelexpress(load_weights_side_effect=_assert_timeout)
+        fake_mx = _build_fake_modelexpress(
+            load_weights_side_effect=_assert_timeout,
+            source_metadata=source_metadata,
+        )
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+            )
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
     def test_existing_source_keeps_upstream_default_when_unset(self):
+        identity = _identity()
+
         def _assert_no_timeout(*args, **kwargs):
             assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(
             load_weights_side_effect=_assert_no_timeout,
-            source_instances=[MagicMock()],
+            source_instances=[_source_instance(identity, post_transform=False)],
         )
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+            )
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
     def test_env_value_preserved(self, monkeypatch):
+        identity = _identity()
         # If the user/orchestrator already set a value, our defensive
         # default must not stomp it.
         monkeypatch.setenv("MX_SOURCE_QUERY_TIMEOUT", "120")
@@ -534,22 +769,38 @@ class TestMxSourceQueryTimeoutDefault:
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        fake_mx = _build_fake_modelexpress(load_weights_side_effect=_assert_env_timeout)
+        fake_mx = _build_fake_modelexpress(
+            load_weights_side_effect=_assert_env_timeout,
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+            )
         assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "120"
 
     def test_configured_timeout_applies_during_load_and_restores_env(self):
+        identity = _identity()
+
         def _assert_config_timeout(*args, **kwargs):
             assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "900"
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001", query_timeout_s=900)
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        fake_mx = _build_fake_modelexpress(load_weights_side_effect=_assert_config_timeout)
+        fake_mx = _build_fake_modelexpress(
+            load_weights_side_effect=_assert_config_timeout,
+            source_instances=[_source_instance(identity, post_transform=False)],
+        )
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+            )
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
     def test_no_mx_url_does_not_touch_env(self):
@@ -684,13 +935,13 @@ class TestPublishAsSourceModelName:
         )
         captured = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured["MODEL_NAME"] = os.environ.get("MODEL_NAME")
             captured["MODEL_EXPRESS_URL"] = os.environ.get("MODEL_EXPRESS_URL")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock())
+            loader.publish_as_source(MagicMock(), source_identity=_identity())
 
         assert captured["MODEL_NAME"] == "Qwen/Qwen2.5-72B-Instruct"
         assert captured["MODEL_EXPRESS_URL"] == "http://mx:8001"
@@ -703,12 +954,16 @@ class TestPublishAsSourceModelName:
         # No constructor model_name, no MODEL_NAME env → use basename.
         captured = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured["MODEL_NAME"] = os.environ.get("MODEL_NAME")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock(), checkpoint_dir="/scratch/local-model")
+            loader.publish_as_source(
+                MagicMock(),
+                checkpoint_dir="/scratch/local-model",
+                source_identity=_identity(),
+            )
 
         assert captured["MODEL_NAME"] == "local-model"
 
@@ -719,12 +974,16 @@ class TestPublishAsSourceModelName:
         )
         captured = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured["MODEL_NAME"] = os.environ.get("MODEL_NAME")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock(), checkpoint_dir=snapshot)
+            loader.publish_as_source(
+                MagicMock(),
+                checkpoint_dir=snapshot,
+                source_identity=_identity(),
+            )
 
         # Critical: NOT the commit hash, the human-readable Hub-ID form.
         assert captured["MODEL_NAME"] == "Qwen/Qwen2.5-72B-Instruct"
@@ -739,12 +998,12 @@ class TestPublishAsSourceModelName:
         )
         captured = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured["MODEL_NAME"] = os.environ.get("MODEL_NAME")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock())
+            loader.publish_as_source(MagicMock(), source_identity=_identity())
 
         assert captured["MODEL_NAME"] == "explicit"
         # Restored to the prior env value, not unset.
@@ -755,12 +1014,12 @@ class TestPublishAsSourceModelName:
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         captured = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured["MODEL_NAME"] = os.environ.get("MODEL_NAME")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock())
+            loader.publish_as_source(MagicMock(), source_identity=_identity())
 
         assert captured["MODEL_NAME"] == "from-env-only"
         assert os.environ.get("MODEL_NAME") == "from-env-only"
@@ -770,11 +1029,11 @@ class TestPublishAsSourceModelName:
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         captured = {}
 
-        def _capture(model):
+        def _capture(model, **_kwargs):
             captured["MODEL_NAME"] = os.environ.get("MODEL_NAME")
 
         fake_mx = _build_fake_modelexpress(publish_side_effect=_capture)
         with _install_fake_modelexpress(fake_mx):
-            loader.publish_as_source(MagicMock())
+            loader.publish_as_source(MagicMock(), source_identity=_identity())
 
         assert captured["MODEL_NAME"] == "unknown"

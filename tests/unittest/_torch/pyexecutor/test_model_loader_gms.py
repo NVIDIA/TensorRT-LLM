@@ -293,9 +293,9 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
         "to",
         "load_weights",
         "post_load_apply",
-        "post_load_publish",
         "post_load_weights",
         "move_untracked_params",
+        "post_load_publish",
         "pool_exit",
         "finalize_write",
     ]
