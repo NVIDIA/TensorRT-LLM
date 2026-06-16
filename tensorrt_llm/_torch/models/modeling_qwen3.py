@@ -315,15 +315,26 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     ``lm_head`` is intentionally not allocated: like ``Qwen2ForRewardModel`` we call
     ``nn.Module.__init__`` directly instead of ``DecoderModelForCausalLM.__init__``,
     which avoids a vocab x hidden parameter we never use and sidesteps tied-embedding
-    checkpoint handling (0.6B/4B tie word embeddings). Weight loading uses the
-    inherited ``load_weights`` (it iterates the model's own params, so the absent
-    ``lm_head`` is a non-issue).
+    checkpoint handling (0.6B/4B tie word embeddings).
     """
 
     def __init__(self, model_config: ModelConfig[Qwen3Config]):
         nn.Module.__init__(self)
         self.model_config = model_config
         self.model = Qwen3Model(model_config)
+
+    def load_weights(self, weights: dict, **kwargs):
+        # Qwen3-Embedding ships a sentence-transformers export of the *bare* Qwen3
+        # backbone: checkpoint keys are prefix-less ("layers.N...", "embed_tokens.*",
+        # "norm.*") with no "model." prefix and no lm_head. Our backbone is nested
+        # under self.model, so prepend "model." to match the module names. Keys that
+        # already carry the prefix (a plain Qwen3ForCausalLM checkpoint) are left
+        # as-is, and the inherited loader ignores any unmatched (e.g. lm_head) keys.
+        weights = {
+            (k if k.startswith("model.") else f"model.{k}"): v
+            for k, v in weights.items()
+        }
+        super().load_weights(weights, **kwargs)
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
