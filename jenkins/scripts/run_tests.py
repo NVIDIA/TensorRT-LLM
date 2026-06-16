@@ -70,7 +70,7 @@ def format_duration(seconds):
 # ---------------------------------------------------------------------------
 # render_test_list: replaces Groovy processShardTestList()
 # ---------------------------------------------------------------------------
-def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
+def render_test_list(test_db_list, working_dir, splits, group, perf_mode, durations_path=None):
     """Parse test-db list, split into shards, separate regular and isolated tests.
 
     Args:
@@ -79,6 +79,9 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
         splits: Total number of shards.
         group: This shard's group number (1-based).
         perf_mode: If True, skip pytest collection and use all tests as regular.
+        durations_path: Optional path to per-cluster .test_durations file for
+            least_duration splitting. Falls back to the default .test_durations
+            when None.
 
     Returns:
         Tuple of (regular_list_path, isolate_list_path, regular_count, isolate_count).
@@ -126,11 +129,13 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode):
         }
         collect_output_dir = os.path.join(os.path.dirname(test_db_list), "collect_output")
         os.makedirs(collect_output_dir, exist_ok=True)
+        durations_arg = f" --durations-path={durations_path}" if durations_path else ""
         collect_cmd = (
             f"pytest --collect-only --splitting-algorithm least_duration "
             f"--test-list={cleaned_file} --quiet "
             f"--splits {splits} --group {group} "
             f"--output-dir={collect_output_dir}"
+            f"{durations_arg}"
         )
         print(f"Running: {collect_cmd}")
         try:
@@ -725,6 +730,12 @@ def parse_args():
     parser.add_argument(
         "--max-rerun-tests", type=int, default=5, help="Max failed tests to trigger rerun"
     )
+    parser.add_argument(
+        "--durations-path",
+        default=None,
+        help="Path to per-cluster .test_durations file for least_duration splitting. "
+        "Overrides the default .test_durations when set.",
+    )
 
     return parser.parse_args()
 
@@ -751,7 +762,12 @@ def main():
             print("Error: --test-db-list is required when using --render")
             sys.exit(1)
         regular_list, isolate_list, regular_count, isolate_count = render_test_list(
-            args.test_db_list, working_dir, args.splits, args.group, args.perf_mode
+            args.test_db_list,
+            working_dir,
+            args.splits,
+            args.group,
+            args.perf_mode,
+            args.durations_path,
         )
     else:
         if regular_list and os.path.exists(regular_list):

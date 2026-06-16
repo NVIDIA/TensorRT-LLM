@@ -133,6 +133,7 @@ runTestsArgs=(
     --working-dir "$llmSrcNode/tests/integration/defs"
     --fail-signatures "${failSignaturesList:-}"
     --max-rerun-tests 5
+    ${testDurationsPath:+--durations-path "$testDurationsPath"}
 )
 if [ "$perfMode" = "true" ]; then
     runTestsArgs+=(--perf-mode)

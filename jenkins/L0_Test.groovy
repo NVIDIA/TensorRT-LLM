@@ -1250,11 +1250,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
 
-                def clusterDurationsArgsNode = []
+                def clusterDurationsPathNode = ""
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
-                    def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
-                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                    clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -1433,6 +1432,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export testGroup="$splitId"
                     export failSignaturesList="$failSignaturesList"
                     export pytestUtil="$pytestUtil"
+                    export testDurationsPath="$clusterDurationsPathNode"
                     export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
@@ -3585,12 +3585,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        // When useClusterDurations is set, pass the cluster name to renderTestDB so
-        // it can select the per-cluster durations file for test-list rendering.
+        // When useClusterDurations is set, use a per-cluster durations file keyed on
+        // partition.clusterName (e.g. "aws-dfw", "dlcluster").  This lets each cluster
+        // build its own timing baseline so sharding is not skewed by timings collected
+        // on different hardware.  Falls back to the shared .test_durations when unset.
         String clusterNameForDurations = null
+        def clusterDurationsPath = ""
         if (useClusterDurations) {
             def partition = SlurmConfig.resolvePlatform(platform)
-            clusterNameForDurations = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+            def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
+            clusterNameForDurations = clusterKey
+            clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
         }
 
         def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
@@ -3674,7 +3679,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         --output-dir ${WORKSPACE}/${stageName} \
                         --working-dir ${llmSrc}/tests/integration/defs \
                         --fail-signatures '${failSignaturesList}' \
-                        --max-rerun-tests 5
+                        --max-rerun-tests 5 \
+                        ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
                 """
             }
         }
