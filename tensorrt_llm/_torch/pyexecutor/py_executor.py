@@ -2195,8 +2195,9 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
-                self._terminate_recompute_paused_requests(scheduled_batch)
-                self._pause_recompute_paused_requests(scheduled_batch)
+                if self._is_kv_manager_v2:
+                    self._terminate_recompute_paused_requests(scheduled_batch)
+                    self._pause_recompute_paused_requests(scheduled_batch)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
@@ -3159,10 +3160,10 @@ class PyExecutor:
                                 req)
                     continue
 
-                self._terminate_recompute_paused_requests(scheduled_batch)
-                self._pause_recompute_paused_requests(scheduled_batch)
-
-                if not self._is_kv_manager_v2:
+                if self._is_kv_manager_v2:
+                    self._terminate_recompute_paused_requests(scheduled_batch)
+                    self._pause_recompute_paused_requests(scheduled_batch)
+                else:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
 
@@ -3587,9 +3588,9 @@ class PyExecutor:
                                 req)
                     continue
 
-                self._terminate_recompute_paused_requests(scheduled_batch)
-
-                if not self._is_kv_manager_v2:
+                if self._is_kv_manager_v2:
+                    self._terminate_recompute_paused_requests(scheduled_batch)
+                else:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
@@ -3737,9 +3738,10 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                if not self._is_kv_manager_v2:
+                if self._is_kv_manager_v2:
+                    self._pause_recompute_paused_requests(scheduled_batch)
+                else:
                     self._pause_requests(scheduled_batch.paused_requests)
-                self._pause_recompute_paused_requests(scheduled_batch)
 
                 if can_queue:
                     guided_decoder_failed_requests = None

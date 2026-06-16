@@ -1050,10 +1050,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         victims from the unprocessed tail.
         """
         if self.kv_cache_manager.has_host_cache_tier:
+            # Treat ``evicted`` as a FIFO work queue here.  _try_evict_for_gen
+            # may append newly suspended victims; they are either consumed by
+            # this loop for recompute pause or left in ``evicted`` as ordinary
+            # paused requests when allocation succeeds.
             while evicted:
                 victim = evicted.pop(0)
-                if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
-                    continue
+                assert self._is_recompute_pause_candidate(victim, inflight_request_ids), (
+                    "Evicted requests must remain eligible for recompute pause "
+                    f"after suspension, got request {victim.py_request_id}."
+                )
                 logger.debug(
                     f"[V2Scheduler] Recompute-pausing suspended request {victim.py_request_id} "
                     f"before evicting more requests for request {req.py_request_id}"
