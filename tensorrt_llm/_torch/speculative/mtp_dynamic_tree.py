@@ -604,15 +604,29 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     tree_valid=tree_valid,
                 )
             )
-            accepted_draft_count = accept_token_num[:num_gens]
+            tree_valid_i = tree_valid[:num_gens]
+            accepted_draft_count = torch.where(
+                tree_valid_i,
+                accept_token_num[:num_gens],
+                torch.zeros_like(accept_token_num[:num_gens]),
+            )
             num_accepted_tokens[num_contexts:batch_size] = (accepted_draft_count + 1).to(
                 torch.int32
             )
-            accepted_tokens[num_contexts:batch_size] = accept_token[:num_gens].to(torch.int32)
+
+            gen_accepted_tokens = accept_token[:num_gens].to(torch.int32)
+            bootstrap_accepted_tokens = torch.zeros_like(gen_accepted_tokens)
+            bootstrap_accepted_tokens[:, 0] = target_predict[:, 0]
+            accepted_tokens[num_contexts:batch_size] = torch.where(
+                tree_valid_i.unsqueeze(1), gen_accepted_tokens, bootstrap_accepted_tokens
+            )
             # accept_index stores root at slot 0; subtract 1 so root/padding 0
             # becomes the sentinel -1 (tree node index into the draft tokens).
-            self._accepted_draft_indices_tensor[num_contexts:batch_size] = (
-                accept_index[:num_gens, 1:max_path_len] - 1
+            gen_accepted_indices = (accept_index[:num_gens, 1:max_path_len] - 1).to(torch.int32)
+            self._accepted_draft_indices_tensor[num_contexts:batch_size] = torch.where(
+                tree_valid_i.unsqueeze(1),
+                gen_accepted_indices,
+                torch.full_like(gen_accepted_indices, -1),
             ).to(torch.int32)
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
@@ -635,10 +649,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens].to(torch.int64)
         # Column of the deepest accepted draft node, clamped to >=0 for the
         # golden-only case (its value is ignored via the mask below).
-        last_col = (accepted - 2).clamp_(min=0)
         draft_idx = self._accepted_draft_indices_tensor[num_contexts : num_contexts + num_gens].to(
             torch.int64
         )
+        last_col = (accepted - 2).clamp_(min=0, max=draft_idx.shape[1] - 1)
         leaf = torch.gather(draft_idx, 1, last_col.unsqueeze(1)).squeeze(1) + 1
         # Golden-only requests (num_accepted == 1) take the root at position 0.
         return torch.where(accepted > 1, leaf, torch.zeros_like(leaf))
