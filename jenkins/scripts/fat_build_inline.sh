@@ -1,4 +1,19 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Build a "fat" enroot sqsh (base image + trtllm pre-installed) on the compute node.
 # Called from srunPrologue when the fat sqsh for this commit is not yet cached.
 #
@@ -29,7 +44,7 @@ trap cleanup EXIT
 
 echo "[fat_build] Starting: $FAT_SQSH_PATH"
 echo "[fat_build] Base sqsh: $BASE_SQSH_PATH"
-echo "[fat_build] LLM tarfile: $LLM_TARFILE_URL"
+echo "[fat_build] LLM tarfile: ${LLM_TARFILE_URL%%\?*}"
 
 # Write the install script to WORK_DIR (mounted into container as /work).
 # Variable expansion happens here in the outer shell; the container sees

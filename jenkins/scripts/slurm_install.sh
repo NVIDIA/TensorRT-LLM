@@ -28,7 +28,7 @@ slurm_install_setup() {
         if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
             echo "SKIP_INSTALL=1: skipping pip installs (packages pre-installed in fat sqsh)"
         else
-            if [[ $pytestCommand == *--run-ray* ]]; then
+            if [[ ${pytestCommand:-} == *--run-ray* ]]; then
                 retry_command pip3 install --retries 10 "ray[default]==2.54.1"
             fi
             retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"

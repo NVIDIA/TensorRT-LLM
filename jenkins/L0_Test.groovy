@@ -1264,10 +1264,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
                     # Fat sqsh: reuse pre-built container image with trtllm already installed.
-                    # Hash key = sha256(llmTarfile)[:16] — encodes commit + platform.
+                    # Hash key = sha256(llmTarfile|LLM_DOCKER_IMAGE)[:16] — encodes commit, platform, and base image.
                     fatSqshDir="$fatSqshDir"
                     mkdir -p "\$fatSqshDir"
-                    fatHash=\$(printf '%s' "$llmTarfile" | sha256sum | cut -d' ' -f1 | head -c 16)
+                    fatHash=\$(printf '%s' "$llmTarfile|$LLM_DOCKER_IMAGE" | sha256sum | cut -d' ' -f1 | head -c 16)
                     fatSqshPath="\$fatSqshDir/fat-\${fatHash}.sqsh"
 
                     if [ -f "\$fatSqshPath" ]; then
