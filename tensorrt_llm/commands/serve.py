@@ -546,6 +546,9 @@ def launch_mm_encoder_server(
 # HF causal-LM architecture -> TRT-LLM text-embedding architecture. The embeddings
 # subcommand declares embedding intent (cf. SGLang --is-embedding); this maps known
 # sentence-transformers decoder backbones onto their pooling+normalize wrapper class.
+# To support another decoder embedder, add its HF architecture here and a matching
+# `*ForTextEmbedding` model class (see Qwen3ForTextEmbedding in modeling_qwen3.py).
+# Architectures absent from this map are left as declared (the model self-routes).
 _EMBEDDING_ARCH_MAP = {
     "Qwen3ForCausalLM": "Qwen3ForTextEmbedding",
 }
@@ -613,7 +616,15 @@ def launch_embedding_server(
         model, llm_args.get("trust_remote_code", False))
     if override is not None:
         model_kwargs = dict(llm_args.get("model_kwargs") or {})
-        model_kwargs.setdefault("architectures", override["architectures"])
+        if "architectures" in model_kwargs:
+            # A user-supplied model_kwargs.architectures (e.g. via --config) wins;
+            # log so the suppressed auto-remap isn't a silent surprise.
+            logger.info(
+                "Embedding routing: keeping user-supplied model_kwargs "
+                f"architectures={model_kwargs['architectures']} (auto-remap to "
+                f"{override['architectures']} suppressed).")
+        else:
+            model_kwargs["architectures"] = override["architectures"]
         llm_args["model_kwargs"] = model_kwargs
 
     # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path

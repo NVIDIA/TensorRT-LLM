@@ -62,7 +62,7 @@ The endpoint accepts the standard OpenAI `/v1/embeddings` fields:
 | `model` | str | Model name. |
 | `input` | str \| list[str] \| list[int] \| list[list[int]] | Text(s) or pre-tokenized token-id list(s). |
 | `encoding_format` | `"float"` (default) \| `"base64"` | `base64` packs little-endian float32 values. |
-| `dimensions` | int (optional) | Matryoshka output size. Only supported by Matryoshka-trained text-embedding models; rejected with `400` otherwise (the encoder/classifier/reward models served today emit raw label/score tensors, not pooled embeddings). |
+| `dimensions` | int (optional) | Matryoshka output size. Only supported by Matryoshka-trained text-embedding models; rejected with `400` otherwise. None of the served models are Matryoshka-trained (BERT classifiers / reward models emit label/score tensors; Qwen3-Embedding emits a fixed-width pooled vector), so this is currently always rejected. |
 | `user` | str (optional) | Ignored; accepted for compatibility. |
 | `add_special_tokens` | bool (default `true`) | TRT-LLM extension. Encoder models such as BERT generally need their special tokens (e.g. `[CLS]`/`[SEP]`) added during tokenization. |
 

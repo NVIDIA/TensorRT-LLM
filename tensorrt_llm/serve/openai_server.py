@@ -858,15 +858,17 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             # `dimensions` is a Matryoshka-embedding knob (truncate-then-renormalize
             # a sentence-embedding vector), matching vLLM, which rejects it for
-            # non-Matryoshka models. The encoder/classifier/reward models served
-            # here emit raw [num_labels] / [seq_len, num_labels] tensors, not pooled
-            # Matryoshka embeddings, so blindly slicing them is meaningless. Reject
-            # until a pooled text-embedding model is supported (fast-follow).
+            # non-Matryoshka models. None of the models served here are
+            # Matryoshka-trained: BERT classifiers / reward models emit raw
+            # [num_labels] / [seq_len, num_labels] tensors, and Qwen3-Embedding emits
+            # a fixed-width pooled vector with no nested sub-dimensions. Truncating
+            # any of these is meaningless, so reject. (Honoring `dimensions` for a
+            # genuinely Matryoshka model would be a fast-follow.)
             if request.dimensions is not None:
                 return self.create_error_response(
                     "`dimensions` is only supported by Matryoshka-trained "
-                    "text-embedding models, which are not currently served by "
-                    "this endpoint.",
+                    "text-embedding models; none of the models served by this "
+                    "endpoint are Matryoshka-trained.",
                     status_code=HTTPStatus.BAD_REQUEST)
 
             items = self._normalize_embedding_input(request.input)

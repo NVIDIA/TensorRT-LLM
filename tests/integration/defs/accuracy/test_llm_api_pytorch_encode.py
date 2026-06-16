@@ -121,7 +121,10 @@ PER_TOKEN_REWARD_MODELS = [
 
 # Qwen3-Embedding family. All variants are Qwen3ForCausalLM + a sentence-transformers
 # last-token-pool + L2-normalize pipeline; one wrapper class (Qwen3ForTextEmbedding)
-# serves all sizes. CI uses 8B until 0.6B is synced — swap the single entry below.
+# serves all sizes. CI uses 8B until 0.6B is synced. To swap to 0.6B, edit this
+# param (model id + path + the `id=`/`skip_less_device_memory` marks) AND the
+# matching `[qwen3-embedding-8b]` id in tests/integration/test_lists/test-db/l0_l40s.yml
+# (the two must stay in sync or CI silently drops the test).
 TEXT_EMBEDDING_MODELS = [
     pytest.param(
         "Qwen/Qwen3-Embedding-8B",

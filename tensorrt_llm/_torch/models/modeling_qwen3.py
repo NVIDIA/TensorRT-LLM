@@ -322,6 +322,12 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         nn.Module.__init__(self)
         self.model_config = model_config
         self.model = Qwen3Model(model_config)
+        # Pipeline-parallel init (DecoderModelForCausalLM.__pp_init__) reads these;
+        # we never run them (encode is single-GPU, the embeddings command rejects
+        # PP), but define them empty so the class can't trip an AttributeError if a
+        # future multi-GPU encode path constructs it.
+        self.prologue = []
+        self.epilogue = []
 
     def load_weights(self, weights: dict, **kwargs):
         # Qwen3-Embedding ships a sentence-transformers export of the *bare* Qwen3
@@ -352,6 +358,9 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
         # Last-token pooling + L2 normalization (sentence-transformers
         # Pooling[pooling_mode_lasttoken=true] -> Normalize). hidden_states is the
         # packed [total_tokens, hidden] tensor; take each sequence's final token.
+        # Normalize in fp32 (matching sentence-transformers / the HF reference)
+        # then cast back, so the unit-norm is precise even for bf16/fp16 weights.
         end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
         pooled = hidden_states[end_indices]
-        return torch.nn.functional.normalize(pooled, p=2, dim=-1)
+        normalized = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)
+        return normalized.to(pooled.dtype)

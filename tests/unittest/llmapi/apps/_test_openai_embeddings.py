@@ -283,7 +283,8 @@ async def test_prm_concurrent_requests_are_batched(prm_async_client: openai.Asyn
 # sentence-embedding model. A separate, opt-in server (loads a
 # multi-GB checkpoint). The embeddings launch path auto-remaps Qwen3ForCausalLM
 # -> Qwen3ForTextEmbedding, so no special flags are needed. CI uses 8B until
-# 0.6B is synced — swap QWEN3_EMB_MODEL / QWEN3_EMB_DIM below.
+# 0.6B is synced; to swap, edit BOTH QWEN3_EMB_MODEL and QWEN3_EMB_DIM below
+# (hidden_size differs per variant, so they must be changed together).
 # --------------------------------------------------------------------------- #
 
 QWEN3_EMB_MODEL = "Qwen3/Qwen3-Embedding-8B"
