@@ -26,12 +26,13 @@ Pipeline (single CUDA Graph capture):
      sum, then writes:
        order_row[max_batch_size] : long request_ids first, then short ones
        counters[2]               : [n_long_req, n_short_req]
-  2. ``GvrTopKLBKernel.main_kernel`` — single launch with
-     ``cluster_size=4``; each cluster reads counters + order_row to map
-     bidx -> (row_id, branch). Long clusters delegate to a cs=4
-     ``GvrTopKKernel`` instance's ``run_one_row``; short clusters
-     delegate to a cs=1 instance's ``run_one_row`` with 4 CTAs each
-     handling a different row.
+  2. ``GvrTopKLBKernel.main_kernel`` — single launch with a configurable
+     ``cluster_size`` (default 4, also supports 2/8); each cluster reads
+     counters + order_row to map bidx -> (row_id, branch). Long clusters
+     delegate to a cs=cluster_size ``GvrTopKKernel`` instance's
+     ``run_one_row``; short clusters delegate to a cs=1 instance's
+     ``run_one_row`` with ``cluster_size`` CTAs each handling a
+     different row.
 
 The two ``GvrTopKKernel`` instances share the per-row body (see
 ``run_one_row`` extracted in the parent file) so this file does not
@@ -143,6 +144,10 @@ class GvrTopKLBPrepareKernel:
         # warp-sums i.e. n_long_total. Publish to all threads via SMEM scalar.
         if tidx == cutlass.Int32(0):
             s_n_long_total[0] = s_warp_sums[num_warps - 1]
+        # barrier_id 0 (default) here, vs barrier_id=1 above inside
+        # block_prefix_sum_kernel. Distinct IDs is intentional — the two
+        # barriers protect independent SMEM regions and the named-bar
+        # hardware can pipeline them.
         cute.arch.barrier()
         n_long_total = s_n_long_total[0]
 
@@ -244,6 +249,11 @@ class GvrTopKLBKernel:
             f"max_batch_size must be a power of 2 in [64, 1024] "
             f"(block_prefix_sum_kernel constraint); got {max_batch_size}"
         )
+        # Sanity-check downstream-shared args up-front so a bogus value
+        # surfaces here instead of inside the child ``GvrTopKKernel``
+        # construction or the JIT trace.
+        assert top_k > 0, f"top_k must be > 0; got {top_k}"
+        assert next_n > 0, f"next_n must be > 0; got {next_n}"
 
         # Two underlying GvrTopKKernel instances. Each gets its own
         # compile-time cluster_size; SMEM / mbarrier layouts differ
@@ -346,7 +356,7 @@ class GvrTopKLBKernel:
                     output_indices,
                 )
             else:
-                # Short branch: cluster's 4 CTAs each handle 1 short row.
+                # Short branch: cluster's cluster_size CTAs each handle 1 short row.
                 short_cluster_id = cluster_id - n_long_clusters
                 short_row_idx = short_cluster_id * cutlass.Int32(cluster_size) + pos_in_cluster
                 # Short cluster tail (last cluster's trailing CTAs when

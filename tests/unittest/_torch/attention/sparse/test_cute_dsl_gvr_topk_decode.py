@@ -395,13 +395,20 @@ def test_lb_prepare_partition(B, ratio):
     ],
 )
 @pytest.mark.parametrize("batch_size", [4, 32])
-def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size):
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_n):
     """Each LB branch (all_long / all_short / mixed) produces correct top-K.
 
     For ``mixed_half`` half the rows are forced to be short (seq_len < threshold)
     and half long, exercising both branches inside the same launch.
+
+    ``next_n>1`` exercises the request-level → row-level expansion
+    (``order_row[req] * next_n + nn``) in both branches: long branch's
+    cluster CTAs all read the same request and slice it, while short
+    branch's CTAs each handle a different (req, nn) row pair. A
+    mis-indexed expansion would show up as out-of-range writes caught
+    by ``_tie_aware_check``.
     """
-    next_n = 1
     num_rows = batch_size * next_n
     logits, pre_idx, seq_lens = _make_inputs(
         num_rows,
