@@ -11,7 +11,7 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-"""GVR Top-K load-balance variant (Idea C).
+"""GVR Top-K hybrid multi-CTA and single-CTA load-balance variant.
 
 Targets large-BS varlen workloads where the single-CTA-per-row mapping in
 ``gvr_topk_decode.py`` leaves the wall time bound by the longest row
@@ -128,9 +128,11 @@ class GvrTopKLBPrepareKernel:
                 is_long_val = cutlass.Int32(1)
 
         # Step 2: block prefix sum over is_long_val -> position within long group.
-        # ``need_total_sum=True`` makes warp_sums[num_warps-1] hold n_long_total
-        # AFTER the cross-warp scan; capture it from thread 0 before warp_sums
-        # gets reused below.
+        # ``block_prefix_sum_kernel`` always writes the cross-warp scan into
+        # ``warp_sums`` (its Step 3, regardless of ``need_total_sum``), so
+        # ``warp_sums[num_warps - 1]`` holds n_long_total after the call.
+        # We read it directly from SMEM below, hence ``need_total_sum=False``
+        # (skip the redundant return-value plumbing).
         pos_long, _ = block_prefix_sum_kernel(
             is_long_val,
             s_warp_sums,
@@ -140,8 +142,9 @@ class GvrTopKLBPrepareKernel:
             barrier_id=1,
             need_total_sum=False,
         )
-        # warp_sums[num_warps-1] now contains the inclusive prefix sum of all
-        # warp-sums i.e. n_long_total. Publish to all threads via SMEM scalar.
+        # Publish n_long_total (= warp_sums[num_warps-1]) to all threads via
+        # an SMEM scalar so the step-3 scatter and step-4 counters write can
+        # use it without re-reading warp_sums.
         if tidx == cutlass.Int32(0):
             s_n_long_total[0] = s_warp_sums[num_warps - 1]
         # barrier_id 0 (default) here, vs barrier_id=1 above inside
@@ -190,7 +193,7 @@ class GvrTopKLBPrepareKernel:
 
 
 class GvrTopKLBKernel:
-    """Idea C top-level kernel: prepare + heterogeneous main launch.
+    """Hybrid multi-CTA + single-CTA top-level kernel: prepare + main launch.
 
     Holds two ``GvrTopKKernel`` instances with different compile-time
     ``cluster_size`` to reuse the per-row body (``run_one_row``):
@@ -219,9 +222,6 @@ class GvrTopKLBKernel:
         # value is used as the hardware cluster shape at launch (and
         # is exposed via ``self.cluster_size`` to the main kernel).
         cluster_size: int = 4,
-        # Cluster cs=4 break-even ≈ T_row > 3.2us ≈ 64K elements on B200.
-        # See ``gvr-topk-load-balance/design/idea_c_design.md`` §3.
-        long_threshold: int = 64 * 1024,
         # Worst-case batch size this kernel will ever see at runtime.
         # The grid is fixed at ``max_batch_size * next_n * cluster_size``
         # CTAs so CUDA Graph capture sees a single shape; the runtime
@@ -286,7 +286,6 @@ class GvrTopKLBKernel:
         self.num_threads = num_threads
         self.return_output_values = return_output_values
         self.cluster_size = cluster_size
-        self.long_threshold = long_threshold
         self.max_batch_size = max_batch_size
 
         # Grid is FIXED at the worst-case ``max_batch_size * next_n``

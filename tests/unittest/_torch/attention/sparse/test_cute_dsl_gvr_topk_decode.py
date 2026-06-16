@@ -314,7 +314,7 @@ def test_cute_dsl_gvr_topk_decode(
 
 
 # ===========================================================================
-# Load-Balance (Idea C) tests.
+# Load-Balance (hybrid multi-CTA + single-CTA) tests.
 #
 # The LB kernel adds a prepare step that classifies requests as long
 # (seq_len > long_threshold) vs short and dispatches each cluster
@@ -438,7 +438,6 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_
         top_k,
         next_n,
         max_batch_size=max_batch_size,
-        long_threshold=long_threshold,
     )
     torch.cuda.synchronize()
 
@@ -511,7 +510,6 @@ def test_lb_vs_reference(
         next_n,
         compress_ratio=compress_ratio,
         max_batch_size=max_batch_size,
-        long_threshold=long_threshold,
     )
     torch.cuda.synchronize()
     _tie_aware_check(

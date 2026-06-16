@@ -326,7 +326,7 @@ def gvr_topk_sort_prepare(seq_lens: torch.Tensor) -> torch.Tensor:
     return torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
 
 
-# ---- Load-Balance (Idea C) wrappers ----------------------------------------
+# ---- Load-Balance (hybrid multi-CTA + single-CTA) wrappers ------------------
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import (
         GvrTopKLBKernel,
@@ -424,7 +424,6 @@ def _compile_lb(
     N: int,
     compress_ratio: int,
     max_batch_size: int,
-    long_threshold: int,
     num_threads: int,
     cluster_size: int,
     return_output_values: bool,
@@ -445,7 +444,6 @@ def _compile_lb(
         compress_ratio=compress_ratio,
         return_output_values=return_output_values,
         cluster_size=cluster_size,
-        long_threshold=long_threshold,
         max_batch_size=max_batch_size,
     )
     n_groups = num_rows // next_n
@@ -495,14 +493,13 @@ def gvr_topk_lb_decode(
     next_n: int = 1,
     compress_ratio: int = 1,
     cluster_size: int = 4,
-    long_threshold: int = 64 * 1024,
     max_batch_size: int = 1024,
     num_threads: int = 512,
     return_output_values: bool = False,
     out_values: Optional[torch.Tensor] = None,
     out_indices: Optional[torch.Tensor] = None,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
-    """Run the LB (Idea C) main kernel.
+    """Run the LB (hybrid multi-CTA + single-CTA) main kernel.
 
     ``order_row`` and ``counters`` MUST already be populated by a prior
     call to :func:`gvr_topk_lb_prepare` for the current ``seq_lens``
@@ -534,7 +531,6 @@ def gvr_topk_lb_decode(
         N,
         compress_ratio,
         max_batch_size,
-        long_threshold,
         num_threads,
         cluster_size,
         return_output_values,
