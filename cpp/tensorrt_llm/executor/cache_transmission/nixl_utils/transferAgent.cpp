@@ -332,7 +332,8 @@ NixlTransferStatus::~NixlTransferStatus() noexcept
     {
         if (!release())
         {
-            TLLM_LOG_WARNING("NIXL transfer handle release failed during destruction; backend handle may remain active");
+            TLLM_LOG_WARNING(
+                "NIXL transfer handle release failed during destruction; backend handle may remain active");
         }
     }
     catch (std::exception const& e)
