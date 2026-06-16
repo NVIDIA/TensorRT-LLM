@@ -28,6 +28,10 @@ _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
 
 
 class _LinearStub(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._weights_transformed = False
+
     def post_load_weights(self):
         pass
 
@@ -41,6 +45,7 @@ class _DraftModel(nn.Module):
 class _TinyModel(nn.Module):
     def __init__(self, events):
         super().__init__()
+        self._weights_transformed = False
         self.linear = _LinearStub()
         self.draft_model = _DraftModel()
         self.draft_config = SimpleNamespace(
@@ -60,6 +65,12 @@ class _TinyModel(nn.Module):
 
     def load_draft_weights(self, weights, mapper):
         self._events.append("load_draft_weights")
+
+    def setup_aliases(self):
+        self._events.append("setup_aliases")
+
+    def cache_derived_state(self):
+        self._events.append("cache_derived_state")
 
     def post_load_weights(self):
         self._events.append("post_load_weights")
@@ -182,6 +193,56 @@ def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
     )
 
 
+class _PostTransformMxLoader:
+    checkpoint_format = "MX"
+
+    def __init__(self, *, post_transform: bool) -> None:
+        self._post_transform = post_transform
+        self.load_weights = MagicMock(return_value={})
+        self.is_weights_preloaded = MagicMock(return_value=True)
+        self.get_initialized_weight_mapper = MagicMock(return_value=MagicMock())
+        self.post_load_apply = MagicMock()
+        self.post_load_publish = MagicMock()
+
+    def is_post_transform_weights_preloaded(self) -> bool:
+        return self._post_transform
+
+
+def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    monkeypatch.setattr(
+        ModelLoader,
+        "_MX_STAGED_RECEIVER_ALLOWLIST",
+        frozenset({(_TinyModel, ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION)}),
+    )
+    checkpoint_loader = _PostTransformMxLoader(post_transform=True)
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    loader._call_load_weights.assert_not_called()
+    checkpoint_loader.post_load_publish.assert_called_once_with(
+        model, checkpoint_dir="/ckpt", weights_preloaded=True
+    )
+    # Post-transform receivers skip transform_weights(), but the accepted
+    # tensors are already in final layout. Keep the transform guard in sync so
+    # future reload/refactor paths do not accidentally treat them as raw bytes.
+    assert model._weights_transformed is True
+    assert model.linear._weights_transformed is True
+    assert model.draft_model.linear._weights_transformed is True
+    assert events == ["setup_aliases", "cache_derived_state"]
+
+
+def test_mx_post_transform_receiver_falls_back_when_allowlist_empty(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    checkpoint_loader = _PostTransformMxLoader(post_transform=True)
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert events == ["post_load_weights"]
+
+
 def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
@@ -284,6 +345,20 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     assert model._weights_transformed is False
     assert model.child._weights_transformed is False
     assert model.transformed_child._weights_transformed is False
+    assert not hasattr(model.removed_child, "_weights_transformed")
+
+
+def test_mark_weights_transformed_only_sets_existing_flags():
+    events = []
+    model = _HookModel(events)
+    model._weights_transformed = False
+    model.child._weights_transformed = False
+
+    ModelLoader._mark_weights_transformed(model)
+
+    assert model._weights_transformed is True
+    assert model.child._weights_transformed is True
+    assert model.transformed_child._weights_transformed is True
     assert not hasattr(model.removed_child, "_weights_transformed")
 
 

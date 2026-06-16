@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import inspect
 import os
@@ -264,6 +267,8 @@ class ModelLoader:
     Handles the loading, configuration, and weight initialization of a PyTorch model.
     This class isolates model loading logic from the main execution engine.
     """
+    _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
+    _MX_STAGED_RECEIVER_ALLOWLIST = frozenset()
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -782,12 +787,20 @@ class ModelLoader:
             if not gms_post_load_handled:
                 checkpoint_loader.post_load_apply(
                     model, weights_preloaded=weights_preloaded)
+                mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
+                    checkpoint_loader,
+                    model,
+                    weights_preloaded=weights_preloaded)
+                if mx_staged_receiver_path:
+                    self._setup_aliases(model)
+                    self._mark_weights_transformed(model)
+                    self._walk_cache_state(model)
                 checkpoint_loader.post_load_publish(
                     model,
                     checkpoint_dir=checkpoint_dir,
                     weights_preloaded=weights_preloaded)
-
-                self._walk_full_post_load(model)
+                if not mx_staged_receiver_path:
+                    self._walk_full_post_load(model)
 
             # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # `register_weight_slots_after_to_cuda` and `finalize_model`
@@ -829,6 +842,67 @@ class ModelLoader:
             gms_backend.get_source_identity(),
             IdentityCheckPolicy.STRICT,
         )
+
+    @classmethod
+    def _should_run_mx_staged_receiver_path(
+            cls, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *, weights_preloaded: bool) -> bool:
+        """Whether an MX receiver can skip one-shot weight transforms.
+
+        The Wave 4 path is intentionally dormant for production: the allow-list
+        is empty, and MX still reports raw pre-transform bytes. Tests can opt in
+        a synthetic model by patching the allow-list and checkpoint-loader
+        signal, proving the staged receiver branch without enabling real models.
+        """
+        if checkpoint_loader.checkpoint_format != "MX" or not weights_preloaded:
+            return False
+
+        method = getattr(type(checkpoint_loader),
+                         'is_post_transform_weights_preloaded', None)
+        if method is None or not checkpoint_loader.is_post_transform_weights_preloaded(
+        ):
+            return False
+
+        allowlist_key = (
+            type(model),
+            cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        )
+        if allowlist_key in cls._MX_STAGED_RECEIVER_ALLOWLIST:
+            logger.info(
+                "MX receiver using staged post-load path for %s "
+                "(transform protocol v%d).",
+                type(model).__name__,
+                cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            )
+            return True
+
+        # WAVE 5 NOTE: once MX can publish real post-transform bytes, this
+        # fallthrough must not run the full post_load_weights() path on those
+        # bytes for a non-allow-listed model. Wave 5 should either fail/fallback
+        # before accepting the transfer or allow-list the model after validation.
+        logger.info(
+            "MX receiver got post-transform weights for %s, but the model is "
+            "not allow-listed for staged post-load transform protocol v%d. "
+            "Running the full post-load path.",
+            type(model).__name__,
+            cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        )
+        return False
+
+    @staticmethod
+    def _mark_weights_transformed(model: DecoderModelForCausalLM) -> None:
+        """Mark modules with transform guards as already transformed.
+
+        Post-transform sharing paths skip ``transform_weights()`` because the
+        incoming bytes already use the final runtime layout. Preserve that
+        lifecycle state on modules that participate in the transform guard
+        protocol so a later orchestrator/refactor does not treat them as raw
+        checkpoint bytes.
+        """
+        for module in model.modules():
+            if hasattr(module, '_weights_transformed') and not getattr(
+                    module, '_weights_removed', False):
+                module._weights_transformed = True
 
     @staticmethod
     def _setup_aliases(model: DecoderModelForCausalLM) -> None:
