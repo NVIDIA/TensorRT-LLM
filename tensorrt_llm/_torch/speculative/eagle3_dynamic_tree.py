@@ -242,6 +242,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self.tree_mask_init_buffer = (
             torch.eye(K, dtype=torch.int32, device="cuda").unsqueeze(0).repeat(max_batch_size, 1, 1)
         )
+        history_size = K + K * K * (max_draft_len - 1)
+        self._history_child_indices = torch.arange(
+            K, history_size, dtype=torch.int64, device="cuda"
+        )
+        self._history_child_parent_slots = self._history_child_indices // K
         self.tree_ops_converter = DynamicTreeOpsConverter(
             dynamic_tree_max_topK=K,
             max_draft_len=max_draft_len,
@@ -1109,11 +1114,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
             num_tokens_previous_layer = cur_draft_idx * self.K
             num_tokens_current_layer = (cur_draft_idx + 1) * self.K
+            write_history_start_offset = self.K + (cur_draft_idx - 1) * self.K * self.K
             self.draft_tokens_buffer[
                 :batch_size, num_tokens_previous_layer:num_tokens_current_layer
             ] = real_draft_tokens
 
-            write_history_start_offset = self.K + (cur_draft_idx - 1) * self.K * self.K
             write_history_end_offset = write_history_start_offset + self.K * self.K
             self.history_draft_tokens_buffer[
                 :batch_size, write_history_start_offset:write_history_end_offset
@@ -1139,9 +1144,26 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             return topk_values
 
     def resampling_final_draft_tokens(self, batch_size: int):
-        """Reconstruct the tree based on history buffers."""
+        """Resample high-score draft nodes while preserving ancestor closure."""
+        adjusted_scores = self.history_score_buffer[:batch_size, :].clone()
+        child_indices = self._history_child_indices
+        child_indices_2d = child_indices.unsqueeze(0).expand(batch_size, -1)
+        parent_indices = self.history_draft_tokens_parent_buffer[
+            :batch_size, self._history_child_parent_slots
+        ]
+
+        for _ in range(self.max_draft_len - 1):
+            child_scores = adjusted_scores.gather(1, child_indices_2d)
+            adjusted_scores.scatter_reduce_(
+                1,
+                parent_indices,
+                child_scores + 1e-6,
+                reduce="amax",
+                include_self=True,
+            )
+
         return _resample_final_tokens(
-            self.history_score_buffer[:batch_size, :],
+            adjusted_scores,
             self.history_draft_tokens_buffer[:batch_size, :],
             self.max_total_draft_tokens,
         )

@@ -947,7 +947,7 @@ def test_eagle3_lora(use_cuda_graph: bool):
     llm_spec.shutdown()
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [False])
+@pytest.mark.parametrize("disable_overlap_scheduler", [True])
 @pytest.mark.parametrize("use_cuda_graph", [True])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
@@ -965,7 +965,7 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     max_batch_size = 4
     max_draft_len = 6
     dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 30
+    max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     max_tokens=2048,
                                     free_gpu_memory_fraction=0.5)
@@ -992,45 +992,47 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
         max_total_draft_tokens=max_total_draft_tokens,
     )
 
-    # Create the LLM instance
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
-    # Acceptance rate tests
-    prompts = [
-        "The capital of France is",
-        "The president of the United States is",
-    ]
-    tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
+    try:
+        prompts = [
+            "The capital of France is",
+            "The president of the United States is",
+        ]
+        tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
 
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
+        sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
-    for i in range(len(tok_ids)):
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
+        for i in range(len(tok_ids)):
+            num_tokens = 0
+            num_drafted = 0
+            num_accepted = 0
 
-        for output in llm_spec.generate_async(tok_ids[i],
-                                              sampling_params,
-                                              streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_drafted += max_draft_len
-            num_accepted += len(new_tokens) - num_tokens - 1
-            num_tokens = len(new_tokens)
+            for output in llm_spec.generate_async(tok_ids[i],
+                                                  sampling_params,
+                                                  streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_drafted += max_draft_len
+                num_accepted += len(new_tokens) - num_tokens - 1
+                num_tokens = len(new_tokens)
 
-        accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.10
+            accept_rate = num_accepted / num_drafted
+            assert accept_rate > 0.10
 
-    # Output tests: verify spec decode matches reference
-    sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
-    results_spec = llm_spec.generate(prompts, sampling_params)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
-    llm_spec.shutdown()
+        sampling_params = SamplingParams(max_tokens=10, temperature=0)
+        results_spec = llm_spec.generate(prompts, sampling_params)
+        generated_text_spec = [
+            result.outputs[0].text for result in results_spec
+        ]
+    finally:
+        llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
+    try:
+        results_ref = llm_ref.generate(prompts, sampling_params)
+        generated_text_ref = [result.outputs[0].text for result in results_ref]
+    finally:
+        llm_ref.shutdown()
 
     def assert_meaningful_text(text: str) -> None:
         stripped = text.strip()

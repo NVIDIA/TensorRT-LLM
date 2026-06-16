@@ -63,10 +63,14 @@ def ASSERT_DRV(err):
 def getSMVersion():
     # Init
     err, = cuda.cuInit(0)
+    if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        return 0
     ASSERT_DRV(err)
 
     # Device
     err, cuDevice = cuda.cuDeviceGet(0)
+    if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        return 0
     ASSERT_DRV(err)
 
     # Get target architecture
@@ -202,7 +206,13 @@ pytest.mark.gpu4 = compose_decorator(skip_num_gpus_less_than(4),
 
 
 def skip_gpu_memory_less_than(required_memory: int):
-    memory = get_total_gpu_memory(0)
+    if torch.cuda.is_available():
+        try:
+            memory = get_total_gpu_memory(0)
+        except RuntimeError:
+            memory = 0
+    else:
+        memory = 0
     return pytest.mark.skipif(
         required_memory > memory,
         reason=
