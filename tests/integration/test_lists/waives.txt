@@ -5,6 +5,7 @@ accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_mo
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar] SKIP (https://nvbugs/5346443)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-attn_dp_off-trtllm] SKIP (https://nvbugs/6367792)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-attn_dp_off-trtllm] SKIP (https://nvbugs/6367792)
+accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm] SKIP (temporary ToT main waive; B200 AutoDeploy NVFP4 GSM8K accuracy below threshold)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-4-attn_dp_off-trtllm] SKIP (https://nvbugs/6367792)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/6281818)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp_trtllm] SKIP (https://nvbugs/6281818)
