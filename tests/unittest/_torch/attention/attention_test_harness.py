@@ -78,6 +78,11 @@ class BackendCase:
     # Number of context-phase requests (the rest are generation-phase).
     num_contexts: int
 
+    # Cross-attention: new KV (encoder) tokens per request. None => self-attention
+    # (KV tokens == seq_lens). When set, the case is cross-attention (must be
+    # non-causal); TRTLLM is skipped (it asserts no cross), FlashInfer/Vanilla run.
+    seq_lens_kv: Optional[List[int]] = None
+
     dtype: str = "float16"
     # KV cache dtype. None mirrors the compute dtype (the realistic default);
     # set explicitly only to quantize the cache ("float8_e4m3fn" / "nvfp4").
@@ -90,7 +95,23 @@ class BackendCase:
     sparse: str = "off"  # "off" | "degenerate"
     # RoPE config: RopeParams kwargs (+ optional "is_neox"), or None to disable.
     rope: Optional[dict] = None
+    # When True (and rope set), exercise TRTLLM's in-kernel fused RoPE: TRTLLM
+    # receives pre-RoPE q/k + pos_embd_params and rotates internally, while the
+    # Vanilla golden / FlashInfer get harness-applied RoPE. Only affects TRTLLM.
+    fused_rope: bool = False
     is_mla: bool = False
+    # MLA latent dims (only meaningful when is_mla). Carried for capture/replay
+    # schema completeness so captured MLA cases round-trip. MLA *numerical*
+    # validation lives in test_attention_mla.py: the MLA backend's latent
+    # interface (compressed_kv / k_pe / fused_q / latent_cache, with separate
+    # ctx/gen references) does not fit run_backend's standard q/k/v path, so the
+    # unified harness does not execute MLA cases (run_case is never given one;
+    # the replay suite skips is_mla).
+    v_head_dim: Optional[int] = None
+    q_lora_rank: Optional[int] = None
+    kv_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
     use_kv_cache_manager_v2: bool = False
 
     @property
@@ -102,8 +123,22 @@ class BackendCase:
         return sum(self.seq_lens)
 
     @property
+    def is_cross(self) -> bool:
+        return self.seq_lens_kv is not None
+
+    @property
+    def kv_new_lens(self) -> List[int]:
+        """New KV tokens per request (encoder side for cross; == seq_lens for self)."""
+        return self.seq_lens_kv if self.seq_lens_kv is not None else self.seq_lens
+
+    @property
+    def nnz_kv(self) -> int:
+        return sum(self.kv_new_lens)
+
+    @property
     def token_nums(self) -> List[int]:
-        return [c + s for c, s in zip(self.num_cached_tokens, self.seq_lens)]
+        # Total KV tokens per request after the backend appends the new KV.
+        return [c + s for c, s in zip(self.num_cached_tokens, self.kv_new_lens)]
 
     @property
     def compute_dtype(self) -> torch.dtype:
@@ -152,8 +187,9 @@ def generate_inputs(case: BackendCase, seed: int) -> Dict[str, object]:
         return torch.randn(*shape, generator=gen, device="cuda").to(cdt)
 
     q = randn(case.nnz_q, H * D)
-    new_k = randn(case.nnz_q, Hkv * D)
-    new_v = randn(case.nnz_q, Hkv * D)
+    # New KV tokens: == q tokens for self-attention, encoder length for cross.
+    new_k = randn(case.nnz_kv, Hkv * D)
+    new_v = randn(case.nnz_kv, Hkv * D)
     cached_k = [randn(c, Hkv, D) for c in case.num_cached_tokens]
     cached_v = [randn(c, Hkv, D) for c in case.num_cached_tokens]
     return dict(q=q, new_k=new_k, new_v=new_v, cached_k=cached_k, cached_v=cached_v)
@@ -178,7 +214,8 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
         bindings_dtype = _BINDINGS_DTYPE[kv_dtype]
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+    cache_types = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    cache_type = cache_types.CROSS if case.is_cross else cache_types.SELF
     cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
 
     mgr = cls(
@@ -311,12 +348,14 @@ def run_backend(
         # The cached prefix must be filled in the layout the backend reads.
         layout = "NHD" if backend == "VANILLA" else "HND"
         fill_kv_cache_logical(mgr, 0, request_ids, cached_k, cached_v, kv_layout=layout)
+        seq_lens_kv = torch.tensor(case.seq_lens_kv, dtype=torch.int) if case.is_cross else None
         metadata = AttentionCls.Metadata(
             num_contexts=case.num_contexts,
             kv_cache_params=KVCacheParams(
                 use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
             ),
             seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+            seq_lens_kv=seq_lens_kv,
             max_num_requests=case.num_seqs,
             max_num_tokens=8192,
             kv_cache_manager=mgr,
@@ -358,7 +397,9 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         if backend == "FLASHINFER" and not IS_FLASHINFER_AVAILABLE:
             continue
         kv_dtype = case.compute_dtype if case.cache == "none" else case.kv_torch_dtype
-        out = run_backend(case, backend, inputs, kv_dtype=kv_dtype)
+        # Fused RoPE only applies to TRTLLM (the sole support_fused_rope backend).
+        fuse_rope = case.fused_rope and backend == "TRTLLM"
+        out = run_backend(case, backend, inputs, kv_dtype=kv_dtype, fuse_rope=fuse_rope)
         results[backend] = out
 
         atol, rtol = _tolerances(case, kv_dtype)

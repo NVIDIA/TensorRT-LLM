@@ -81,6 +81,20 @@ def _window_size(forward_args, kwargs):
     return kwargs.get("attention_window_size")
 
 
+def _mla_dims(backend) -> dict:
+    """MLA latent dims from the backend (only when MLA is enabled)."""
+    if not getattr(backend, "is_mla_enable", False):
+        return {}
+    mla = getattr(backend, "mla_params", None)
+    return dict(
+        v_head_dim=getattr(backend, "v_head_dim", None),
+        q_lora_rank=getattr(mla, "q_lora_rank", None),
+        kv_lora_rank=getattr(mla, "kv_lora_rank", None),
+        qk_nope_head_dim=getattr(mla, "qk_nope_head_dim", None),
+        qk_rope_head_dim=getattr(mla, "qk_rope_head_dim", None),
+    )
+
+
 def _build_case_dict(backend, backend_name, q, metadata, forward_args, kwargs):
     mgr = getattr(metadata, "kv_cache_manager", None)
     seq_lens = metadata.seq_lens.tolist() if metadata.seq_lens is not None else []
@@ -96,11 +110,24 @@ def _build_case_dict(backend, backend_name, q, metadata, forward_args, kwargs):
     sparse_cfg = getattr(backend, "sparse_attention_config", None)
     page_size = getattr(mgr, "tokens_per_block", None) or 64
 
+    # Cross-attention: record encoder KV lengths when seq_lens_kv differs.
+    seq_lens_kv = None
+    try:
+        if getattr(metadata, "is_cross", False) and metadata.seq_lens_kv is not None:
+            seq_lens_kv = metadata.seq_lens_kv.tolist()
+    except Exception:
+        pass
+
+    rope = _rope_dict(backend)
+    # TRTLLM (and other support_fused_rope backends) rotate q/k in-kernel.
+    fused_rope = bool(rope) and bool(type(backend).support_fused_rope())
+
     return dict(
         num_heads=backend.num_heads,
         num_kv_heads=backend.num_kv_heads,
         head_dim=backend.head_dim,
         seq_lens=seq_lens,
+        seq_lens_kv=seq_lens_kv,
         num_cached_tokens=num_cached,
         num_contexts=metadata.num_contexts,
         dtype=compute_dtype,
@@ -111,9 +138,11 @@ def _build_case_dict(backend, backend_name, q, metadata, forward_args, kwargs):
         page_size=int(page_size),
         cache="none" if mgr is None else "paged",
         sparse="off" if sparse_cfg is None else "degenerate",
-        rope=_rope_dict(backend),
+        rope=rope,
+        fused_rope=fused_rope,
         is_mla=bool(getattr(backend, "is_mla_enable", False)),
         use_kv_cache_manager_v2=type(mgr).__name__ == "KVCacheManagerV2",
+        **_mla_dims(backend),
     )
 
 

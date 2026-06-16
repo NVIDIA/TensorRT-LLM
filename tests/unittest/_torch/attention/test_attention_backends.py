@@ -120,6 +120,24 @@ def _core_cases():
         num_contexts=0,
         rope=_rope_for(128),
     )
+    # Fused RoPE: TRTLLM rotates q/k in-kernel (pre-RoPE inputs + pos_embd_params)
+    # vs the Vanilla golden's harness-applied RoPE.
+    add(
+        "fused_rope_ctx",
+        seq_lens=[24, 16],
+        num_cached_tokens=[0, 0],
+        num_contexts=2,
+        rope=_rope_for(128),
+        fused_rope=True,
+    )
+    add(
+        "fused_rope_decode",
+        seq_lens=[1, 1],
+        num_cached_tokens=[40, 90],
+        num_contexts=0,
+        rope=_rope_for(128),
+        fused_rope=True,
+    )
     # No KV cache (ragged prefill).
     add(
         "no_cache_causal",
@@ -134,6 +152,24 @@ def _core_cases():
         seq_lens=[16, 24, 5],
         num_cached_tokens=[0, 0, 0],
         num_contexts=3,
+        causal=False,
+    )
+    # Cross-attention (encoder-decoder): decoder query attends to encoder KV.
+    # Non-causal; TRTLLM skipped (asserts no cross), FlashInfer vs Vanilla golden.
+    add(
+        "cross_prefill",
+        seq_lens=[16, 24],
+        seq_lens_kv=[16, 24],
+        num_cached_tokens=[0, 0],
+        num_contexts=2,
+        causal=False,
+    )
+    add(
+        "cross_diff_kv",
+        seq_lens=[16, 8],
+        seq_lens_kv=[32, 40],
+        num_cached_tokens=[0, 0],
+        num_contexts=2,
         causal=False,
     )
     # KVCacheManagerV2.

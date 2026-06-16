@@ -21,6 +21,7 @@ from typing import Optional
 #   no_cache       - ragged/prefill forward with kv_cache_manager=None
 #   sparse         - sparse-attention forward plumbing (degenerate regime here)
 #   mla            - multi-head latent attention
+#   cross_attn     - cross-attention (encoder-decoder; seq_lens_kv != seq_lens)
 BACKEND_CAPS = {
     # NOTE on fp4_kv=False: NVFP4 KV cache cannot be exercised in this standalone
     # backend harness. (1) The NVFP4 attention op aborts without the per-tensor /
@@ -37,6 +38,7 @@ BACKEND_CAPS = {
         no_cache=True,
         sparse=True,
         mla=True,
+        cross_attn=False,  # TrtllmAttention asserts not is_cross
     ),
     "FLASHINFER": dict(
         paged=True,
@@ -46,6 +48,7 @@ BACKEND_CAPS = {
         no_cache=True,
         sparse=False,
         mla=True,
+        cross_attn=True,
     ),
     "VANILLA": dict(
         paged=False,
@@ -55,6 +58,7 @@ BACKEND_CAPS = {
         no_cache=True,
         sparse=False,
         mla=False,
+        cross_attn=True,
     ),
 }
 
@@ -76,6 +80,8 @@ def required_features(case) -> set:
         feats.add("sparse")
     if getattr(case, "is_mla", False):
         feats.add("mla")
+    if getattr(case, "is_cross", False):
+        feats.add("cross_attn")
     return feats
 
 
