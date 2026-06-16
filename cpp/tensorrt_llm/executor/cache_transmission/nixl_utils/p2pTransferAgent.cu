@@ -124,10 +124,13 @@ int createUdsServer(char const* path)
 {
     ::unlink(path);
 
-    // Restrict the socket file to owner-only BEFORE bind by setting a tight umask. We
-    // can't rely on the process-wide umask (it may be looser, and changing it racily
-    // affects other threads), but `bind` honors the calling thread's umask when it
-    // creates the inode. Save/restore so we don't perturb other code in this thread.
+    // Tighten the umask BEFORE bind so the AF_UNIX inode is created without world/group
+    // perms. NOTE: `umask(2)` is process-wide (not per-thread on POSIX or glibc; Linux
+    // per-thread umask only takes effect after `unshare(CLONE_FS)`), so this briefly
+    // affects file-creation perms in any concurrent thread for the save → bind → restore
+    // window. The real owner-only guarantee comes from the chmod 0600 below; the umask
+    // is just best-effort to avoid a window where the inode exists with looser perms.
+    // Save/restore so we don't perturb the rest of the process.
     mode_t prevUmask = ::umask(0177);
 
     int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1978,31 +1981,13 @@ std::shared_ptr<P2pTransferContextPool> P2pTransferContextPool::create(CUdevice 
     std::shared_ptr<CudaEventPool> eventPool, int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy,
     std::shared_ptr<P2pAgentCounters> counters)
 {
-    // make_shared can't reach the private ctor, so route through new + a non-deleting
-    // shared_ptr deleter? Simpler: use a friend struct trick. Cleanest: make_shared via
-    // a tiny helper struct that inherits and exposes the ctor.
-    struct Maker : public P2pTransferContextPool
-    {
-        Maker(CUdevice d, std::shared_ptr<CudaEventPool> ep, int bct, size_t mtmo, bool czc,
-            std::shared_ptr<P2pAgentCounters> c)
-            : P2pTransferContextPool(d, std::move(ep), bct, mtmo, czc, std::move(c))
-        {
-        }
-    };
-
-    return std::make_shared<Maker>(
-        localDevice, std::move(eventPool), batchCopyThreads, multiThreadMinOps, cubZeroCopy, std::move(counters));
+    return std::shared_ptr<P2pTransferContextPool>(new P2pTransferContextPool(
+        localDevice, std::move(eventPool), batchCopyThreads, multiThreadMinOps, cubZeroCopy, std::move(counters)));
 }
 
 namespace
 {
 
-/// @brief Thread-local guard. One instance per (thread × pool). Captures a weak_ptr to
-/// the pool so that if the pool is destroyed before the thread exits, the destructor
-/// safely no-ops. Each thread owns a thread_local map keyed by pool*; the map's value
-/// is this guard. When the thread exits, the map is destroyed in reverse insertion
-/// order, which destructs each guard, which (if its weak_ptr is still alive) calls
-/// eraseForCurrentThread() to drop that thread's Context from the pool.
 struct PoolThreadExitGuard
 {
     std::weak_ptr<P2pTransferContextPool> weakPool;
@@ -2019,10 +2004,14 @@ struct PoolThreadExitGuard
     }
 };
 
-/// One map per OS thread; survives across pool instances as long as the thread lives.
-/// Keyed by raw pool pointer because guards differ per-pool. Using `unique_ptr` so each
-/// guard's destructor runs at thread exit (or at erase) without re-running.
-thread_local std::unordered_map<P2pTransferContextPool*, std::unique_ptr<PoolThreadExitGuard>> tlsExitGuards;
+// One guard map per OS thread. The raw pointer key distinguishes multiple pools
+// touched by the same thread; the weak_ptr inside each value handles pool teardown
+// and address reuse safely.
+std::unordered_map<P2pTransferContextPool*, PoolThreadExitGuard>& getTlsExitGuards()
+{
+    thread_local std::unordered_map<P2pTransferContextPool*, PoolThreadExitGuard> guards;
+    return guards;
+}
 
 } // namespace
 
@@ -2041,17 +2030,11 @@ P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
     mContexts[tid] = std::move(ctx);
     lock.unlock();
 
-    // Install (once per thread × pool) a thread-exit guard that will erase this thread's
-    // Context when the calling thread terminates. weak_from_this() is safe here because
-    // the public factory `create()` always wraps the object in a shared_ptr.
-    auto& guardSlot = tlsExitGuards[this];
-    // Recreate the guard if missing or if its weakPool is expired (the previous pool that
-    // lived at this address has been destroyed and a new one reused the slot).
-    if (!guardSlot || guardSlot->weakPool.expired())
+    // Install one guard per thread and pool. It clears this thread's context on thread exit.
+    auto& guard = getTlsExitGuards()[this];
+    if (guard.weakPool.expired())
     {
-        auto guard = std::make_unique<PoolThreadExitGuard>();
-        guard->weakPool = weak_from_this();
-        guardSlot = std::move(guard);
+        guard.weakPool = weak_from_this();
     }
     return *raw;
 }

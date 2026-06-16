@@ -257,8 +257,9 @@ private:
 /// some segments' remote addresses had a valid P2P mapping and others did not.
 /// Either child may be null (all-mapped or none-mapped cases go straight to the
 /// corresponding single-path status and don't need this composite).
-/// FAILURE of either child is reported as FAILURE; TIMEOUT of the first child
-/// short-circuits without polling the second.
+/// FAILURE of either child is reported as FAILURE; if the first child returns
+/// IN_PROGRESS (its wait timed out before completion), short-circuit without polling
+/// the second. (TransferState has no separate TIMEOUT — timeouts surface as IN_PROGRESS.)
 ///
 /// Lives in p2pTransferAgent.h (and not in nixl_utils/transferAgent.h) so that
 /// unit tests can compose it without pulling in nixl.h.
@@ -458,9 +459,16 @@ private:
     // that actually needs the multi-thread path (numOps >= mMultiThreadMinOps).
     // Owning the pool per-Context (i.e. per caller thread) eliminates cross-caller queue
     // contention — each caller drives its own N workers independently.
+    //
+    // DESTRUCTION ORDER MATTERS: mBatchCopyStreams MUST be declared AFTER mWorkerPool so
+    // that ~P2pTransferContext destroys members in reverse declaration order — i.e.
+    // mWorkerPool first (joining workers, which may still be draining tasks that hold raw
+    // cudaStream_t handles from mBatchCopyStreams), then mBatchCopyStreams. Reversing this
+    // would let streams die while workers still touch them. mWorkerPoolInit has no
+    // resources of its own and can sit anywhere relative to the others.
     std::once_flag mWorkerPoolInit;
-    std::unique_ptr<BatchCopyWorkerPool> mWorkerPool;
     std::vector<std::shared_ptr<runtime::CudaStream>> mBatchCopyStreams;
+    std::unique_ptr<BatchCopyWorkerPool> mWorkerPool;
 
     // Prealloc buffers (this thread exclusive — no lock needed)
     runtime::IBuffer::UniquePtr mCombinedGpu;
@@ -474,18 +482,14 @@ private:
 // P2pTransferContextPool — one context per caller thread
 // ============================================================================
 //
-// Lifetime model: a per-caller-thread Context is auto-erased when the caller thread
-// exits. contextForCurrentThread() registers a thread_local guard that, on thread
-// destruction, calls eraseForCurrentThread() on this pool. Without this, a long-lived
-// process whose callers are transient threads would leak Contexts (each holds a CUDA
-// stream + ~64 MB cubTempStorage + an N-thread worker pool); even worse, the OS may
-// reuse a thread::id from an exited thread, handing the new thread a stale Context
-// created in a different CUDA context.
+// One P2pTransferContext per caller thread. Each context owns reusable CUDA streams,
+// buffers, and optional batch-copy worker threads, so it must not be shared across
+// concurrent submitters.
 //
-// MUST be held by std::shared_ptr — the thread_local guard captures a weak_ptr so it
-// can decline to call back into a pool that has already been destroyed. The private
-// ctor + static `create()` enforces this at the type level.
-
+// The pool erases a thread's Context when that caller thread exits. Without that,
+// transient caller threads would leak CUDA buffers / worker pools, and a later thread
+// could reuse the same std::thread::id and pick up a stale Context. The exit guard
+// holds a weak_ptr so it can safely no-op if the pool is destroyed first.
 class P2pTransferContextPool : public std::enable_shared_from_this<P2pTransferContextPool>
 {
 public:
@@ -496,19 +500,15 @@ public:
     P2pTransferContextPool(P2pTransferContextPool const&) = delete;
     P2pTransferContextPool& operator=(P2pTransferContextPool const&) = delete;
 
-    /// @brief Get (or lazily create) the context for the calling thread.
-    /// First call from a given thread also installs a thread-exit guard that will
-    /// call eraseForCurrentThread() on this pool when the thread terminates.
+    /// @brief Get or lazily create the context for the calling thread.
+    /// Installs the thread-exit cleanup guard on first use by this thread.
     P2pTransferContext& contextForCurrentThread();
 
-    /// @brief Drop this thread's context. Called automatically on thread exit by the
-    /// installed guard, but also safe to call manually. No-op if there is no entry.
-    /// Marked noexcept because it runs from a thread_local destructor where exceptions
-    /// would terminate.
+    /// @brief Drop this thread's context. Called by the thread-local exit guard.
+    /// No-op if this thread has no context; noexcept because it may run during TLS destruction.
     void eraseForCurrentThread() noexcept;
 
-    /// @brief Test-only: number of per-thread Contexts currently held. Used by the
-    /// thread-exit-guard regression test to assert that exited callers don't leak.
+    /// @brief Test-only: number of per-thread contexts currently held.
     [[nodiscard]] size_t numContexts() const;
 
 private:
