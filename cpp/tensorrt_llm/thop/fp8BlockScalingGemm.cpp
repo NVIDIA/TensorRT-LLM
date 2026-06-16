@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -525,6 +525,47 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     }
 }
 
+// Internal forced-backend entry points used by the shape-gated dispatcher in the Python
+// runner. They select the backend deterministically per call, bypassing the
+// TRTLLM_FP8_BLOCK_SCALING_GEMM_BACKEND environment variable. Per-call selection is safe
+// under concurrency and CUDA graph capture/replay, unlike the process-global env var. The
+// public env-var-driven op (fp8_block_scaling_gemm_impl) is intentionally left unchanged.
+
+// Force the TRT-LLM default kernel for the current architecture (never DeepGEMM).
+torch::Tensor fp8_block_scaling_gemm_trtllm(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
+{
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    switch (sm)
+    {
+    case 103:
+    case 100: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
+    case 90: return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
+    case 89: return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
+    case 120: return fp8_block_scale_gemm_blackwell_geforce(mat1, mat2, mat1Scale, mat2Scale);
+    default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling GEMM");
+    }
+}
+
+// Force the Direct DeepGEMM kernel. Only SM90/Hopper is wired today; other architectures
+// raise rather than silently running another kernel (the SM100/Blackwell 1d1d path is
+// added separately). Raising here backs the dispatcher's hard guard: a DeepGEMM choice is
+// only ever cached for an architecture whose DeepGEMM path actually exists.
+torch::Tensor fp8_block_scaling_gemm_deep_gemm(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
+{
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    TORCH_CHECK(sm == 90,
+        "Direct DeepGEMM FP8 block scaling backend is currently wired only for SM90/Hopper (got SM ", sm, ").");
+#if defined(TRTLLM_ENABLE_DEEP_GEMM_THOP)
+    return fp8_block_scaling_gemm_hopper_deep_gemm(mat1, mat2, mat1Scale, mat2Scale);
+#else
+    TORCH_CHECK(false,
+        "Direct DeepGEMM backend requested but TensorRT-LLM was built without BUILD_DEEP_GEMM support in th_common.");
+    return {};
+#endif
+}
+
 torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
 {
@@ -724,6 +765,9 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("fp8_block_scaling_gemm_impl(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
+    // Internal forced-backend ops for the shape-gated dispatcher (deterministic, env-var-free).
+    m.def("fp8_block_scaling_gemm_trtllm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
+    m.def("fp8_block_scaling_gemm_deep_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
     m.def(
         "fp8_block_scaling_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, ScalarType? "
         "out_dtype=None) -> Tensor");
@@ -738,6 +782,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp8_block_scaling_gemm_impl", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm);
+    m.impl("fp8_block_scaling_gemm_trtllm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_trtllm);
+    m.impl("fp8_block_scaling_gemm_deep_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_gemm_deep_gemm);
     m.impl("fp8_block_scaling_bmm", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm);
     m.impl("fp8_block_scaling_bmm_out", &tensorrt_llm::torch_ext::fp8_block_scaling_bmm_out);
     m.impl("fp8_block_scaling_moe_gemm", &tensorrt_llm::torch_ext::fp8_block_scaling_moe_gemm);
