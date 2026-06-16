@@ -4550,7 +4550,7 @@ class PyTorchModelEngine(ModelEngine):
         # CUDA graph hit path.
         assert self.encoder_cuda_graph_runner.enabled, "Encoder CUDA graph runner is not enabled"
 
-        # NB: As of 06/10/2026, the multi-item scoring arguments lacked '_buf' counterparts (cf., e.g.,
+        # NB: The multi-item scoring arguments lack '_buf' counterparts (cf., e.g.,
         #     https://github.com/flashinfer-ai/flashinfer/blob/2aa1d49cf140d73ccdd3761051c5f2944406cb83/flashinfer/prefill.py#L1622 ).
         assert multi_item_part_lens is None, "multi-item scoring with CUDA graph not implemented"
 
