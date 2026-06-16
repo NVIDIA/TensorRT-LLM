@@ -28,7 +28,7 @@ Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
 ## Output
 
 - Per-process `.coverage.<stage>.<host>.pid<N>.X<rand>` files ride back in the standard `results-<stage>.tar.gz` under `cbts/`.
-- `L0_MergeRequest.groovy`'s Test Coverage stage combines all stages' files and uploads the merged DB to `${UPLOAD_PATH}/cbts-coverage/coverage.sqlite`.
+- `L0_MergeRequest.groovy`'s Test Coverage stage combines all stages' files and uploads the merged DB to `${UPLOAD_PATH}/cbts-coverage/coverage.sqlite`, plus the rendered HTML report (compressed) to `${UPLOAD_PATH}/cbts-coverage/coverage-report.tar.gz`.
 - Each stage logs `CBTS coverage [<stage>]: <covered>/<ran> test cases ...`.
 
 ## Query the merged DB

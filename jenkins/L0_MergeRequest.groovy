@@ -1218,7 +1218,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
         }
         parallelTasks["Test Coverage"] = {
             try {
-            timeout(time: 10, unit: 'MINUTES') {
+            timeout(time: 30, unit: 'MINUTES') {
             try {
                 stage("Test Coverage") {
                     sh "ls"
@@ -1253,9 +1253,15 @@ EOF
 
                     sh "cd cov && coverage combine"
                     sh "cd cov && find . -type f"
-                    // Rename to coverage.sqlite so the dotfile is visible in Artifactory's web UI.
+                    // Render the HTML report from the combined data (default .coverage) before renaming.
+                    sh "cd cov && coverage report -i || true"
+                    sh "cd cov && coverage html -d test_coverage_html -i"
+                    // The HTML report is a directory of many files; compress it into a single tarball before upload.
+                    sh "cd cov && tar czf coverage-report.tar.gz test_coverage_html"
+                    trtllm_utils.uploadArtifacts("cov/coverage-report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "Test coverage HTML report (tar.gz): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/coverage-report.tar.gz"
+                    // Upload the merged DB as a single uncompressed file; rename so the dotfile is visible in Artifactory's web UI.
                     sh "cd cov && mv .coverage coverage.sqlite"
-                    // Upload the merged DB; HTML is rendered on demand by consumers (see jenkins/scripts/cbts/coverage_utils/README.md).
                     trtllm_utils.uploadArtifacts("cov/coverage.sqlite", "${UPLOAD_PATH}/cbts-coverage/")
                     echo "Merged coverage DB: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/coverage.sqlite"
                 } // Test coverage
@@ -1268,7 +1274,7 @@ EOF
             {
                 pipeline.echo("Test coverage failed execution.")
             }
-            } // timeout 10 min
+            } // timeout 30 min
             } catch (Exception e) {
                 echo "Test Coverage failed or timed out: ${e.toString()}"
             }
