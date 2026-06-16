@@ -19,9 +19,13 @@ This module implements the ``apply_sharding_hints`` and ``strip_sharding_hints``
 transforms, which apply deterministic, node-local sharding based on explicit
 hint kwargs on custom ops and a runtime ``DistConfig``.
 
-This is the replacement for the legacy heuristic-based sharding pipeline in
-``sharding.py``.  See the design documents in ``sharding_architecture_documents/``
-for background.
+This is the default AutoDeploy sharding pipeline. ``is_shardingIR_enabled``
+auto-detects whether the exported FX graph carries the IR's ``all_reduce``
+markers; ``apply_sharding_hints`` consumes them and short-circuits the
+heuristic-detection fallback in ``sharding.py``. Both stay registered in
+``default.yaml`` so the long-tail of modeling files not yet ported to IR
+keeps working transparently. See the design documents in
+``sharding_architecture_documents/`` for background.
 """
 
 import operator
@@ -48,6 +52,7 @@ from ...utils.node_utils import (
     extract_weight_nodes,
     invalidate_weight_node_cache,
     is_any_lin_op,
+    is_op,
     set_op_args,
     shape,
 )
@@ -60,8 +65,9 @@ from ..interface import (
     TransformRegistry,
 )
 
-# NOTE: sharding.py module will be deprecated in the future. The following
-# imports will move into sharding_ir.py when legacy sharding is removed.
+# Shared helpers used by both sharding pipelines. Lives in ``sharding.py`` for
+# now; will fold into ``sharding_ir.py`` if/when the heuristic-detection
+# fallback is retired (i.e. once every modeling file is IR-ported).
 from .sharding import (
     SplitDimension,
     _get_dist_ops,
@@ -352,7 +358,6 @@ class LinearShardableNode(ShardableNode):
         )
         if tp_mode == "none":
             return 0
-
         split_dim = SplitDimension.COLUMN if tp_mode == "colwise" else SplitDimension.ROW
         fused = tuple(output_sizes) if output_sizes else None
         min_shape = tp_min_local_shape if tp_min_local_shape else 1
@@ -589,13 +594,24 @@ class Conv1dShardableNode(ShardableNode):
     torch.ops.auto_deploy.torch_ssm,
     torch.ops.auto_deploy.torch_gated_delta_rule,
     torch.ops.auto_deploy.torch_mla,
+    torch.ops.auto_deploy.torch_attention,
 )
 class WeightedParamShardableNode(ShardableNode):
     """Ops whose weight parameters are sharded along dim 0 (head dimension).
 
-    Covers SSM (A, D, dt_bias), GatedDeltaNet (A_log, dt_bias), and MLA
-    (kv_b_proj).  All share identical sharding logic: when ``enable_sharding``
-    is ``True``, every discovered weight parameter is split along dim 0.
+    Covers SSM (A, D, dt_bias), GatedDeltaNet (A_log, dt_bias), MLA
+    (kv_b_proj), and ``torch_attention`` (per-head free Parameters such as
+    GPT-OSS's ``sinks``). All share identical sharding logic: when
+    ``enable_sharding`` is ``True``, every discovered weight parameter is
+    split along dim 0.
+
+    For ``torch_attention``: q/k/v projection weights belong to the preceding
+    ``torch_linear_simple`` nodes and are sharded by ``LinearShardableNode``;
+    only direct ``get_attr`` args of the ``torch_attention`` node itself
+    (e.g. ``sinks``) are sliced here. Models that pass no head-wise Parameter
+    to ``torch_attention`` (qwen3, llama, smollm3, ...) leave
+    ``enable_sharding`` at its default ``False`` and this handler no-ops for
+    them.
     """
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
@@ -779,10 +795,24 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
     """NVFP4 SwiGLU: shards cutlass-format ``weight_scale`` buffers."""
 
     def _shard_scales(self, gm, dc, weight_nodes):
-        weight_shape = weight_nodes.weights[0].tensor.shape if weight_nodes.weights else None
-        if weight_shape is None:
+        if not weight_nodes.weights:
             return
+
+        # Each NVFP4 weight_scale must be de-swizzled with ITS OWN weight's uint8
+        # shape. The fused SwiGLU carries gate/up/down weights whose shapes differ
+        # (down_proj's in/out are transposed vs gate/up), so using weights[0] for
+        # every scale corrupts the down_proj scale -> garbage MLP output. Pair each
+        # scale with its weight by module prefix (strip the trailing ``.weight`` /
+        # ``.weight_scale`` leaf).
+        def _module_prefix(node_key: str) -> str:
+            return node_key.rsplit(".", 1)[0]
+
+        shape_by_prefix = {
+            _module_prefix(wn.node_key): wn.tensor.shape for wn in weight_nodes.weights
+        }
+        fallback_shape = weight_nodes.weights[0].tensor.shape
         for sn in weight_nodes.scales:
+            weight_shape = shape_by_prefix.get(_module_prefix(sn.node_key), fallback_shape)
             dim = self._dim_for_key(sn.node_key)
             f_split = partial(
                 _shard_fp4_weight_scale,
@@ -1033,6 +1063,104 @@ except AttributeError:
     pass
 
 
+@ShardableNode.register(torch.ops.auto_deploy.torch_moe_dense_mlp)
+class DenseMLPMoEShardableNode(ShardableNode):
+    """EP sharding for ``torch_moe_dense_mlp`` (stacked-tensor dense MoE).
+
+    The op signature (see ``custom_ops/fused_moe/torch_moe.py``) is::
+
+        torch_moe_dense_mlp(
+            hidden_states,    # [B, S, H]
+            routing_weights,  # [B*S, E]
+            gate_up_w,        # [E, H, 2I]
+            gate_up_b,        # [E, 2I]
+            down_w,           # [E, I, H]
+            down_b,           # [E, H]
+            alpha,            # float
+            limit,            # float
+        ) -> [B, S, H]
+
+    The op is additive over experts (``next_states.sum(dim=0)`` at the end), so
+    EP sharding is just "give each rank a slice of experts and ``all_reduce`` at
+    the end". We slice the four stacked expert tensors at dim 0 plus the
+    routing_weights at dim 1 (matching ``num_experts``, which the op reads from
+    ``routing_weights.shape[1]``), then insert an ``all_reduce`` after the op
+    so partial per-rank sums combine into the full expert sum.
+
+    Slicing is graph-level (``aten.slice``), mirroring
+    :class:`StackedMoEShardableNode` for ``triton_mxfp4_moe``. Parameters stay
+    full-size on every rank; only the runtime forward uses the rank's slice.
+    Memory-wise not optimal, but the math is bit-correct for the equivalence
+    test and matches the existing stacked-MoE precedent. A follow-up could
+    replace this with true per-rank param slicing via load hooks.
+    """
+
+    _IDX_ROUTING_WEIGHTS = 1
+    _IDX_GATE_UP_W = 2
+    _IDX_GATE_UP_B = 3
+    _IDX_DOWN_W = 4
+    _IDX_DOWN_B = 5
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        ep_size = dc.moe_ep_size
+        ep_rank = dc.moe_ep_rank
+
+        if ep_size <= 1:
+            return 0
+
+        expert_shape = shape(self.node.args[self._IDX_GATE_UP_W])
+        assert expert_shape is not None, (
+            f"Cannot determine num_experts: gate_up_w arg has no shape metadata "
+            f"(node: {self.node.name})"
+        )
+        num_experts = expert_shape[0]
+        assert num_experts % ep_size == 0, (
+            f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
+        )
+        per = num_experts // ep_size
+        lo = per * ep_rank
+        hi = num_experts if ep_rank == ep_size - 1 else lo + per
+
+        # Graph-level slice of every expert-stacked arg along the expert dim.
+        args = list(self.node.args)
+        for idx in (
+            self._IDX_GATE_UP_W,
+            self._IDX_GATE_UP_B,
+            self._IDX_DOWN_W,
+            self._IDX_DOWN_B,
+        ):
+            with gm.graph.inserting_after(args[idx]):
+                args[idx] = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(args[idx], 0, lo, hi, 1),
+                )
+        # routing_weights is sliced along the expert column (dim 1) so the op's
+        # internal ``num_experts = routing_weights.shape[1]`` matches the sliced
+        # weight stacks.
+        with gm.graph.inserting_before(self.node):
+            args[self._IDX_ROUTING_WEIGHTS] = gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(args[self._IDX_ROUTING_WEIGHTS], 1, lo, hi, 1),
+            )
+        self.node.args = tuple(args)
+
+        # Sum the per-rank partial (over local experts) into the full expert sum.
+        _, all_reduce_op = _get_dist_ops("auto")
+        with gm.graph.inserting_after(self.node):
+            red = gm.graph.call_function(
+                all_reduce_op,
+                args=(self.node, dc.allreduce_strategy),
+            )
+            self.node.replace_all_uses_with(red)
+            red.replace_input_with(red, self.node)
+
+        ad_logger.debug(
+            f"  sharded torch_moe_dense_mlp: {num_experts} experts, "
+            f"ep={ep_size}, rank slice [{lo}:{hi}]"
+        )
+        return 1
+
+
 # =============================================================================
 # IR sharding config
 # =============================================================================
@@ -1041,10 +1169,9 @@ except AttributeError:
 class IRShardingConfig(TransformConfig):
     """Minimal configuration for the hint-driven IR sharding transform.
 
-    This replaces the legacy ``ShardingTransformConfig`` for
-    ``ApplyShardingHints``, carrying only the fields that the IR path actually
-    reads.  When the legacy sharding path is removed, this is the only sharding
-    config class.
+    Carries only the fields the IR pipeline reads. ``ShardingTransformConfig``
+    in ``sharding.py`` is the parallel config used by the heuristic-detection
+    fallback for modeling files not yet ported to IR.
     """
 
     allreduce_strategy: AllReduceStrategy = Field(
@@ -1220,6 +1347,27 @@ class StripShardingHints(BaseTransform):
         )
 
 
+def is_shardingIR_enabled(gm: GraphModule) -> bool:
+    """Whether the FX graph contains sharding-IR marker nodes.
+
+    The sharding-IR pipeline inserts ``torch.ops.auto_deploy.all_reduce`` nodes
+    in the modeling source (per ad-sharding-ir-port skill rule A3) to mark
+    rowwise-projection / MoE-merge points. Legacy ``detect_sharding`` never
+    emits this op (it inserts ``dist.all_reduce`` later), so the presence of
+    any such node is a sufficient signal that the modeling file was authored
+    against the sharding IR.
+
+    This is the marker the default-sharding dispatcher uses to decide between
+    the IR pipeline (``apply_sharding_hints``) and the legacy pipeline
+    (``detect_sharding`` + ``sharding_transform_executor``).
+    """
+    target = torch.ops.auto_deploy.all_reduce
+    for node in gm.graph.nodes:
+        if is_op(node, target):
+            return True
+    return False
+
+
 @TransformRegistry.register("apply_sharding_hints")
 class ApplyShardingHints(BaseTransform):
     """Deterministic, node-local sharding transform driven by hint kwargs.
@@ -1227,6 +1375,12 @@ class ApplyShardingHints(BaseTransform):
     Iterates graph nodes and applies sharding based on explicit hint arguments
     (tp_mode, tp_scaled_dim, tp_scale_sizes, etc.) together with the runtime
     DistConfig.  No cross-node propagation, no topology inference.
+
+    When the FX graph contains no sharding-IR markers (no
+    ``torch.ops.auto_deploy.all_reduce`` node), this transform is a no-op and
+    leaves the graph for the legacy ``detect_sharding`` pipeline. Otherwise it
+    sets ``gm.meta["sharding_ir_applied"] = True`` after applying, which
+    ``Sharding`` / ``ShardingTransformExecutor`` read to skip themselves.
     """
 
     config: IRShardingConfig
@@ -1261,6 +1415,19 @@ class ApplyShardingHints(BaseTransform):
         _log_sharding_prelude(dc)
 
         if shared_config.world_size < 2:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Auto-detect dispatcher: if the FX graph contains no sharding-IR markers,
+        # this modeling file was not authored against the sharding IR. Skip and
+        # let the legacy detect_sharding pipeline handle it.
+        if not is_shardingIR_enabled(gm):
+            ad_logger.info(
+                "apply_sharding_hints: no sharding-IR markers in graph "
+                "(no torch.ops.auto_deploy.all_reduce node); deferring to legacy "
+                "detect_sharding pipeline."
+            )
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -1323,6 +1490,12 @@ class ApplyShardingHints(BaseTransform):
                         pass
 
             _log_sharding_result(dc, num_updates, num_skipped, shard_layers=shard_layers)
+
+        # Signal to the legacy detect_sharding pipeline that IR has handled this
+        # graph. Sharding (detect_sharding) and ShardingTransformExecutor read
+        # this flag and short-circuit themselves; without it they would re-shard
+        # the same nodes via the heuristic path.
+        gm.meta["sharding_ir_applied"] = True
 
         return gm, TransformInfo(
             skipped=False,

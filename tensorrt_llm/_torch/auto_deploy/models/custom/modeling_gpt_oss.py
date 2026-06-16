@@ -424,6 +424,9 @@ class GptOssAttention(nn.Module):
 
         # ``torch_attention`` handles GQA natively; sinks / sliding_window are
         # per-call kwargs. Causal mask is applied internally for prefill.
+        # ``enable_sharding=True`` triggers ``WeightedParamShardableNode`` to slice
+        # the per-head ``sinks`` Parameter along dim 0 (head dim) per rank,
+        # matching the post-shard head count from Q/K/V's colwise sharding.
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
             k,
@@ -435,6 +438,8 @@ class GptOssAttention(nn.Module):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             layout="bsnd",
+            layer_type="mha",
+            enable_sharding=True,
         )
 
         # [B, S, N, D] -> [B, S, N*D]
