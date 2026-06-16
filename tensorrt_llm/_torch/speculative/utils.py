@@ -309,7 +309,10 @@ def get_spec_decoder(
         # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
     if spec_config.spec_dec_mode.is_mtp_vanilla():
-        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
+        nextn = spec_config.max_draft_len
+        if getattr(spec_config, "use_dynamic_tree", False):
+            nextn = spec_config.max_total_draft_tokens
+        return MTPSampler(sampler_args, nextn=nextn)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process

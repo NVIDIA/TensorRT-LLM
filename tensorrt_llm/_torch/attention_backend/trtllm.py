@@ -1001,10 +1001,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
                     pos_src = torch.index_select(slot_storage.position_offsets,
                                                  0, slot_ids)[:, :n_dt]
-                    compact_total = num_gens * n_dt
-                    compact_offsets = self.spec_decoding_position_offsets[:
-                                                                          compact_total]
-                    pos_dst = compact_offsets.view(num_gens, n_dt)
+                    pos_dst = self.spec_decoding_position_offsets[:num_gens *
+                                                                  n_dt].view(
+                                                                      num_gens,
+                                                                      n_dt)
                     pos_dst.copy_(pos_src, non_blocking=True)
 
                     actual_mask_width = math.ceil(n_dt / 32)
