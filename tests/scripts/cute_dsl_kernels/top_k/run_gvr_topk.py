@@ -386,6 +386,14 @@ def gvr_topk_lb_prepare(
     call within the same decode step.
     """
     assert seq_lens.is_cuda and seq_lens.dtype == torch.int32
+    # block_prefix_sum_kernel (used inside LB prepare) constraints:
+    # num_warps = max_batch_size / 32 must be > 1 and a power of 2 →
+    # max_batch_size ∈ {64, 128, 256, 512, 1024}.
+    if not (64 <= max_batch_size <= 1024) or (max_batch_size & (max_batch_size - 1)) != 0:
+        raise ValueError(
+            f"max_batch_size must be a power of 2 in [64, 1024] "
+            f"(block_prefix_sum_kernel constraint); got {max_batch_size}"
+        )
     batch_size = seq_lens.shape[0]
     if batch_size > max_batch_size:
         raise ValueError(

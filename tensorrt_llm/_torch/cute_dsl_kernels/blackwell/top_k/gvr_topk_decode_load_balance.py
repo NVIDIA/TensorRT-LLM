@@ -72,11 +72,17 @@ class GvrTopKLBPrepareKernel:
         # scan caps num_warps at 32).
         num_threads: int = 1024,
     ):
-        assert num_threads % 32 == 0
-        # block_prefix_sum_kernel needs num_warps > 1 (its cross-warp scan
-        # uses one warp scanning across num_warps lanes), and tops out at
-        # 32 warps == 1024 threads.
+        # block_prefix_sum_kernel constraints (see block_scan.py:75-79):
+        #   - num_threads % 32 == 0           (divisible by warp size)
+        #   - num_warps > 1                   (cross-warp scan needs ≥ 2)
+        #   - num_warps is a power of 2       (warp-scan iteration count)
+        # Combined: num_threads ∈ {64, 128, 256, 512, 1024}.
+        assert num_threads % 32 == 0, f"num_threads must be a multiple of 32; got {num_threads}"
         assert 64 <= num_threads <= 1024, f"num_threads must be in [64, 1024]; got {num_threads}"
+        assert (num_threads & (num_threads - 1)) == 0, (
+            f"num_threads must be a power of 2 (so num_warps is a power of "
+            f"2 per block_prefix_sum_kernel); got {num_threads}"
+        )
         self.long_threshold = long_threshold
         self.num_threads = num_threads
         self.num_warps = num_threads // 32
@@ -233,6 +239,15 @@ class GvrTopKLBKernel:
     ):
         assert cluster_size in (2, 4, 8), (
             f"cluster_size must be 2, 4, or 8 (GPC-bound); got {cluster_size}"
+        )
+        # ``max_batch_size`` is shared with ``GvrTopKLBPrepareKernel`` (it is
+        # the prepare kernel's ``num_threads``), so the same
+        # block_prefix_sum_kernel constraints apply: power of 2 in
+        # [64, 1024]. Validate here so callers that don't go through the
+        # prepare wrapper still get a clear error.
+        assert 64 <= max_batch_size <= 1024 and (max_batch_size & (max_batch_size - 1)) == 0, (
+            f"max_batch_size must be a power of 2 in [64, 1024] "
+            f"(block_prefix_sum_kernel constraint); got {max_batch_size}"
         )
 
         # Two underlying GvrTopKKernel instances. Each gets its own
