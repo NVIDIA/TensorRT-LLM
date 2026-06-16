@@ -356,8 +356,7 @@ def parse_chat_messages_coroutines(
     """
     conversation = []
     mm_placeholder_counts = []
-    model_type = model_type_override or resolve_top_level_model_type(
-        model_config)
+    model_type = resolve_top_level_model_type(model_config)
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,

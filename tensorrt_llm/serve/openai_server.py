@@ -358,13 +358,18 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.tokenizer.tokenizer, "name_or_path", None) or getattr(
                     self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
-        try:
-            self.processor = AutoProcessor.from_pretrained(
-                hf_tokenizer_path, trust_remote_code=trust_remote_code)
-        except Exception:
-            logger.debug("Failed to load AutoProcessor or AutoConfig for %s",
-                         hf_tokenizer_path)
+        checkpoint_format = self.generator.args.checkpoint_format
+        if checkpoint_format in ("mistral", "mistral_large_3"):
             self.processor = None
+        else:
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    hf_tokenizer_path, trust_remote_code=trust_remote_code)
+            except Exception:
+                logger.debug(
+                    "Failed to load AutoProcessor or AutoConfig for %s",
+                    hf_tokenizer_path)
+                self.processor = None
 
         # load model config
         try:
@@ -380,15 +385,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model_config = None
 
         self.chat_template = load_chat_template(chat_template)
-
-        # When an explicit input_processor override is active,
-        # use its registered model_type for all chat-template
-        # and placeholder-registry lookups
-        _input_proc = getattr(self.generator, 'input_processor', None)
-        _registered = getattr(_input_proc, '_registered_model_type', None)
-        self.effective_model_type = _registered or resolve_top_level_model_type(
-            self.model_config) if self.model_config is not None else (
-                _registered or "")
 
         # Enable response storage for Responses API
         self.enable_store = (len(
@@ -1233,7 +1229,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
-                    model_type_override=self.effective_model_type or None)
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1243,13 +1239,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
-                    model_type_override=self.effective_model_type or None)
+                )
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.effective_model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1392,7 +1388,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
-                    model_type_override=self.effective_model_type or None)
+                )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
@@ -1402,13 +1398,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
-                    model_type_override=self.effective_model_type or None)
+                )
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.effective_model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,

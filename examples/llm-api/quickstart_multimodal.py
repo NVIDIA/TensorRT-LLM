@@ -193,8 +193,6 @@ def main():
     image_format = args.image_format
     if args.model_type is not None:
         model_type = args.model_type
-    elif hasattr(llm.input_processor, '_registered_model_type'):
-        model_type = llm.input_processor._registered_model_type
     else:
         model_type = json.load(
             open(os.path.join(str(llm._hf_model_dir),

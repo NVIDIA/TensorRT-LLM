@@ -338,8 +338,11 @@ class MistralCommonImageProcessor:
         encoded = self.tokenizer.transformers_tokenizer.apply_chat_template(
             conversation, tokenize=True, return_dict=True, return_tensors='pt')
 
-        processed = {"input_ids": encoded.input_ids}
+        processed = {
+            "input_ids": encoded.input_ids,
+        }
 
+        # text-only mode for VLM
         if "pixel_values" in encoded:
             processed.update({
                 "pixel_values":
@@ -403,22 +406,6 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_vocab_size(self) -> int:
-        return self.config.text_config.vocab_size
-
-    def get_mm_token_ids(self) -> torch.Tensor:
-        return torch.tensor([
-            self.processor.image_token_id,
-            self.processor.image_break_token_id,
-            self.processor.image_end_token_id,
-        ])
-
-    def get_mm_special_token_ids(self) -> torch.Tensor:
-        return torch.tensor([
-            self.processor.image_break_token_id,
-            self.processor.image_end_token_id,
-        ])
-
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -427,8 +414,8 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         do_rescale = getattr(self.processor.image_processor, "do_rescale",
                              False)
         if images is not None and isinstance(images[0], torch.Tensor):
-            # The default multimodal input loader normalises images to [0, 1]
-            # for "pt" tensors but not for PIL images.
+            # The default multimodal input loader will normalize images to [0, 1] when the requested
+            # format is "pt" (pytorch tensors), but not for "pil" (PIL images).
             do_rescale = False
 
         prompt = inputs["prompt"]
@@ -436,13 +423,22 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
                                    images=images,
                                    do_rescale=do_rescale)
         input_ids = processed.pop("input_ids").tolist()[0]
+        # Remaining in `processed`:
+        # * "attention_mask": [B, num_input_tokens]
+        # * "pixel_values": [B, C, H, W]
+        # * "image_sizes": [B, 2]
         extra_processed_inputs = None
         pixel_values = processed.get("pixel_values")
         if pixel_values is not None:
+            # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
-            # Keep as list to avoid a D2H copy when the tensor would otherwise
-            # be moved to GPU before the model forward.
+            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
+            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
+            # reaching the model forward. Since its values are used to infer the amount of padding
+            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
+            # list here to avoid this.
             processed["image_sizes"] = processed["image_sizes"].tolist()
+            # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
                     "image": {
@@ -452,6 +448,29 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             }
 
         return input_ids, extra_processed_inputs
+
+    def get_vocab_size(self) -> int:
+        """Return the vocab size of the model."""
+        # Unlike some other VLMs, mistral3's vocab size is stored in its `text_config`, not the top-level
+        # config.
+        return self.config.text_config.vocab_size
+
+    def get_mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            # This is the `[IMG]` token id inserted into the prompt that should be replaced with image
+            # embeddings.
+            self.processor.image_token_id,
+            # This is the `[IMG_BREAK]` token id at the end of every "row".
+            self.processor.image_break_token_id,
+            # This is the `[IMG_END]` token id to signify the end of an image.
+            self.processor.image_end_token_id,
+        ])
+
+    def get_mm_special_token_ids(self) -> torch.Tensor:
+        return torch.tensor([
+            self.processor.image_break_token_id,
+            self.processor.image_end_token_id,
+        ])
 
 
 class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
@@ -569,6 +588,7 @@ MistralNativeInputProcessor._registered_model_type = "mistral_common"
     MistralHFInputProcessor,
     model_type="mistral_large_3",
     placeholder_metadata=MultimodalPlaceholderMetadata(
+        # NOTE: mistral-common uses the tokenizer to set placeholders, this will be ignored
         placeholder_map={"image": "[IMG]"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.STRING,
