@@ -32,8 +32,8 @@ def is_disagg_inflight_cancel_enabled() -> bool:
         if _disagg_inflight_cancel_enabled_cache:
             logger.warning(
                 f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1: disagg KV "
-                "transfer in-flight cancellation and fail-closed transfer "
-                "buffer quarantine are enabled.")
+                "transfer in-flight cancellation was requested. It is active "
+                "only for cache transceivers that advertise support.")
     return _disagg_inflight_cancel_enabled_cache
 
 
@@ -91,6 +91,11 @@ def create_kv_cache_transceiver(
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
     if cache_transceiver_config.transceiver_runtime == "PYTHON":
+        if is_disagg_inflight_cancel_enabled():
+            logger.warning(
+                f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is currently scoped "
+                "to the C++ cache transceiver. Python transceiver keeps its "
+                "existing timeout and cancellation behavior.")
         # Python transceiver currently only supports NIXL and DEFAULT backend
         if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
             raise ValueError(
@@ -139,6 +144,9 @@ class KvCacheTransceiver(ABC):
     @abstractmethod
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
+
+    def supports_inflight_request_cancellation(self) -> bool:
+        return False
 
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
@@ -247,6 +255,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def supports_inflight_request_cancellation(self) -> bool:
+        return True
 
     def has_poisoned_transfer_buffer(self) -> bool:
         if not is_disagg_inflight_cancel_enabled():

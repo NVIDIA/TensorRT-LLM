@@ -684,6 +684,7 @@ class PyExecutor:
         self._error_budget = ErrorBudget()
         self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
         self._disagg_timed_out_gen_cancelled_ids: set[int] = set()
+        self._disagg_inflight_cancel_unsupported_logged = False
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
@@ -4510,6 +4511,149 @@ class PyExecutor:
         # an empty ready set.
         self._check_disagg_gen_cache_transfer_status(0)
 
+        if self._is_disagg_inflight_cancel_active():
+            self._cancel_timed_out_gen_transfers()
+            self._check_gen_cache_transfer_errors_consensus()
+
+        return
+
+    def _is_disagg_inflight_cancel_active(self) -> bool:
+        if not is_disagg_inflight_cancel_enabled():
+            return False
+
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        if transceiver is None:
+            return False
+
+        supports = getattr(transceiver,
+                           "supports_inflight_request_cancellation", None)
+        if callable(supports) and supports() is True:
+            return True
+
+        if not getattr(self, "_disagg_inflight_cancel_unsupported_logged",
+                       False):
+            logger.warning(
+                "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 was requested, but "
+                f"{type(transceiver).__name__} does not advertise in-flight "
+                "request cancellation support. This PR scopes cancellation "
+                "and transfer-buffer quarantine to the C++ cache transceiver; "
+                "using the existing timeout and cancellation behavior for this "
+                "transceiver.")
+            self._disagg_inflight_cancel_unsupported_logged = True
+        return False
+
+    @nvtx_range("_cancel_timed_out_gen_transfers")
+    def _cancel_timed_out_gen_transfers(self) -> None:
+        """Request cancellation for timed-out generation transfers.
+
+        This path is deliberately rank-synchronized. Under attention-DP, each
+        TP rank can own a different request subset, but later error responses
+        still pass through a TP collective. The timeout/cancel decision must
+        therefore be based on the TP-wide request-id union rather than a
+        rank-local timeout observation.
+        """
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+
+        requests_in_transfer = {
+            req.py_request_id: req
+            for req in self.active_requests
+            if req.is_disagg_generation_transmission_in_progress
+        }
+        current_time = time.time()
+        for request in requests_in_transfer.values():
+            if request.py_kv_transfer_start_time is None:
+                continue
+            elapsed_time = ((current_time - request.py_kv_transfer_start_time) *
+                            1000)
+            if (elapsed_time > timeout_ms
+                    and not request.py_kv_transfer_timed_out):
+                logger.warning(
+                    f"Requesting cancellation for generation request "
+                    f"{request.py_request_id} due to KV cache transfer timeout")
+                request.py_kv_transfer_timed_out = True
+
+        user_canceled_ids = set(self.canceled_req_ids)
+        local_timed_out_ids = sorted(
+            request_id for request_id, request in requests_in_transfer.items()
+            if request.py_kv_transfer_timed_out
+            and request_id not in user_canceled_ids
+            and request_id not in self._disagg_timed_out_gen_cancelled_ids)
+
+        if self.dist.tp_size > 1:
+            any_timed_out = self.dist.tp_allreduce(int(
+                bool(local_timed_out_ids)),
+                                                   op=ReduceOp.MAX)
+        else:
+            any_timed_out = int(bool(local_timed_out_ids))
+        if not any_timed_out:
+            return
+
+        if self.dist.tp_size > 1:
+            gathered_timed_out_ids = self.dist.tp_allgather(local_timed_out_ids)
+            timed_out_ids = sorted(set().union(*gathered_timed_out_ids))
+        else:
+            timed_out_ids = local_timed_out_ids
+
+        for request_id in timed_out_ids:
+            request = requests_in_transfer.get(request_id)
+            if request is None:
+                continue
+
+            # A peer rank may have crossed the timeout first.  Mirror the
+            # TP-wide decision locally so a failed cancel attempt keeps
+            # retrying even if this rank's wall clock had not yet expired.
+            request.py_kv_transfer_timed_out = True
+
+            if request_id in self._disagg_timed_out_gen_cancelled_ids:
+                continue
+
+            is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+            if is_cancelled:
+                self._disagg_timed_out_gen_cancelled_ids.add(request_id)
+                logger.warning(
+                    f"Cancelled timed-out generation KV transfer for request "
+                    f"{request.py_request_id}; waiting for C++ transfer "
+                    "status to report final cleanup")
+
+    @nvtx_range("_check_gen_cache_transfer_errors_consensus")
+    def _check_gen_cache_transfer_errors_consensus(self) -> None:
+        """Flush generation transfer errors through a TP-uniform path."""
+        error_requests = [
+            req for req in self._get_disagg_reqs_in_error_state()
+            if req.is_generation_only_request()
+        ]
+        poisoned_transfer_buffer = (
+            self.kv_cache_transceiver is not None
+            and self.kv_cache_transceiver.has_poisoned_transfer_buffer())
+        local_needs_flush = bool(error_requests) or poisoned_transfer_buffer
+
+        if self.dist.tp_size > 1:
+            any_needs_flush = self.dist.tp_allreduce(int(local_needs_flush),
+                                                     op=ReduceOp.MAX)
+        else:
+            any_needs_flush = int(local_needs_flush)
+        if not any_needs_flush:
+            return
+
+        if self.dist.tp_size > 1:
+            any_poisoned_transfer_buffer = self.dist.tp_allreduce(
+                int(poisoned_transfer_buffer), op=ReduceOp.MAX)
+        else:
+            any_poisoned_transfer_buffer = int(poisoned_transfer_buffer)
+
+        error_msg = "Error in kv cache transfer for generation requests"
+        if any_poisoned_transfer_buffer:
+            error_msg += "; poisoned transfer buffer requires process restart"
+            self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+            self.is_shutdown = True
+
+        self._handle_errors(
+            error_msg,
+            requests=None if any_poisoned_transfer_buffer else error_requests,
+            charge_budget=False)
+
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
@@ -4525,7 +4669,7 @@ class PyExecutor:
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 verb = ("Requesting cancellation for"
-                        if is_disagg_inflight_cancel_enabled() else
+                        if self._is_disagg_inflight_cancel_active() else
                         "Observed timeout on")
                 logger.warning(
                     f"{verb} {type} request {req.py_request_id} due to KV cache transfer timeout"
@@ -4996,7 +5140,7 @@ class PyExecutor:
             if not is_cancelled:
                 continue
 
-            if is_disagg_inflight_cancel_enabled():
+            if self._is_disagg_inflight_cancel_active():
                 self._disagg_timed_out_ctx_cancelled_ids.add(request_id)
                 logger.warning(f"Cancelled timed-out context KV transfer for "
                                f"request {request.py_request_id}; waiting for "
@@ -5021,21 +5165,8 @@ class PyExecutor:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
-        for request in self.active_requests:
-            if (is_disagg_inflight_cancel_enabled()
-                    and request.is_disagg_generation_transmission_in_progress
-                    and request.py_kv_transfer_timed_out
-                    and request.py_request_id
-                    not in self._disagg_timed_out_gen_cancelled_ids):
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                if is_cancelled:
-                    self._disagg_timed_out_gen_cancelled_ids.add(
-                        request.py_request_id)
-                    logger.warning(
-                        f"Cancelled timed-out generation KV transfer for "
-                        f"request {request.py_request_id}; waiting for "
-                        "C++ transfer status to report final cleanup")
-        self._check_cache_transfer_errors("generation requests")
+        if not self._is_disagg_inflight_cancel_active():
+            self._check_cache_transfer_errors("generation requests")
 
     def _maybe_prefetch_next_iter_mm_encoders(
             self, scheduled_batch: ScheduledRequests) -> None:
@@ -5433,7 +5564,7 @@ class PyExecutor:
         if not self._is_request_in_transmission(request):
             return True
 
-        if is_disagg_inflight_cancel_enabled():
+        if self._is_disagg_inflight_cancel_active():
             self.kv_cache_transceiver.cancel_request(request)
             return False
 
@@ -5610,8 +5741,9 @@ class PyExecutor:
             # Check if a generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
                 defer_timeout_cleanup = (
-                    is_disagg_inflight_cancel_enabled()
-                    and request.is_disagg_generation_transmission_in_progress)
+                    self._is_disagg_inflight_cancel_active() and
+                    (request.is_disagg_generation_transmission_in_progress
+                     or request.state == LlmRequestState.DISAGG_TRANS_ERROR))
                 if not defer_timeout_cleanup:
                     is_cancelled = self.kv_cache_transceiver.cancel_request(
                         request)
@@ -5623,17 +5755,6 @@ class PyExecutor:
                             charge_budget=False)
                     continue
 
-                if (request.py_request_id
-                        not in self._disagg_timed_out_gen_cancelled_ids):
-                    is_cancelled = self.kv_cache_transceiver.cancel_request(
-                        request)
-                    if is_cancelled:
-                        self._disagg_timed_out_gen_cancelled_ids.add(
-                            request.py_request_id)
-                        logger.warning(
-                            f"Cancelled timed-out generation KV transfer for "
-                            f"request {request.py_request_id}; waiting for "
-                            "C++ transfer status to report final cleanup")
                 new_active_requests.append(request)
                 continue
 
