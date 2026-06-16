@@ -52,6 +52,14 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4] TIMEOUT (60)
   # ------------- NVBug 6025177: trtllm-serve cross-request KV contamination (OpenAI) ---------------
   - test_e2e.py::test_openai_kv_cache_contamination TIMEOUT (120)
+  # ------------- DSA FP4 indexer (Blackwell-only) ---------------
+  - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm
+  - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_shape_dispatch
+  - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_noncontiguous_split
+  - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_dsv32_prefill_shape
+  - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_indexer_k_cache_gather_contiguous_fp4
+  - unittest/_torch/attention/sparse/dsa/test_dsa_fp4_indexer.py
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_fp4_indexer.py
 - condition:
     ranges:
       system_gpu_count:
@@ -166,6 +174,10 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=True] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=3-block_reuse=True-use_py_transceiver=False] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=False] TIMEOUT (60)
+  # DeepSeek-V4 EPLB pre-merge sanity (uncomment once DeepSeek-V4-Flash/Flash-Base
+  # checkpoints are staged under llm_models_root()).
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_8gpus_static_eplb[moe_backend=WIDEEP] TIMEOUT (120)
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_8gpus_static_eplb[moe_backend=WIDEEP] TIMEOUT (120)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4 TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False] TIMEOUT (60)
