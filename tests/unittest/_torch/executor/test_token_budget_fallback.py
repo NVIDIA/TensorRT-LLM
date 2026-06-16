@@ -153,6 +153,36 @@ class TestFitTokenBudget(unittest.TestCase):
         self.assertIn(ctx, batch.context_requests_chunking)
         self.assertNotIn(ctx, batch.context_requests_last_chunk)
 
+    def test_rechunk_drops_last_chunk_draft_tokens(self):
+        # Same re-chunk regression as above, but with draft tokens, which are
+        # appended only on the *last* chunk (see _request_forward_tokens). If a
+        # re-chunked request were left on the last-chunk path, its draft tokens
+        # would still be counted/materialized and re-introduce the overshoot
+        # this guard prevents. After re-chunking, the request must be a non-last
+        # chunk and its forward-token cost must no longer include the draft.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        # 64-token last chunk + 2 draft tokens; a 28-token budget cannot fit
+        # 64 (+2), but the chunk re-chunks to a block-aligned 16.
+        ctx = _FakeRequest(context_chunk_size=64, prompt_len=64, py_draft_tokens=[1, 2])
+        self.assertTrue(ctx.is_last_context_chunk)
+        gen = _FakeRequest(py_beam_width=100)  # remaining = 28
+        batch = _make_batch([ctx], [gen])
+
+        mgr._fit_token_budget(batch)
+
+        # Re-chunked to (28 // 16) * 16 == 16 and flipped to a non-last chunk.
+        self.assertEqual(ctx.context_chunk_size, 16)
+        self.assertFalse(ctx.is_last_context_chunk)
+        self.assertIn(ctx, batch.context_requests_chunking)
+        self.assertNotIn(ctx, batch.context_requests_last_chunk)
+        # Cost is now the chunk size alone -- the 2 draft tokens are dropped
+        # because the request is no longer the last chunk.
+        self.assertEqual(mgr._request_forward_tokens(ctx, is_context=True), 16)
+        total = mgr._request_forward_tokens(ctx, is_context=True) + mgr._request_forward_tokens(
+            gen, is_context=False
+        )
+        self.assertLessEqual(total, mgr.max_num_tokens)
+
     def test_overshoot_defers_when_chunked_prefill_disabled(self):
         # Regression for the CI failures (q.numel()==0 / "Separate quantized
         # buffer is not provided" / cudaErrorInvalidValue) seen in PR #15187:

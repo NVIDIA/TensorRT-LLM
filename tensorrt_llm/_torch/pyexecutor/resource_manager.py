@@ -762,8 +762,16 @@ class KVCacheManager(BaseResourceManager):
         modified = False
         for req in scheduled_batch.context_requests:
             # Disagg generation-init requests only allocate/transfer KV cache
-            # and contribute no compute tokens, so never shed them.
-            if deferring and not req.is_disagg_generation_init_state:
+            # and contribute no compute tokens. The capacity scheduler already
+            # partitions them into a separate fitting_disagg_gen_init_requests
+            # list (capacityScheduler.cpp) handled by _prepare_disagg_gen_init,
+            # so they should never appear in context_requests here -- but if one
+            # ever does, keep it unconditionally and cost-free rather than
+            # accounting, re-chunking, or deferring (shedding) it.
+            if req.is_disagg_generation_init_state:
+                kept.append(req)
+                continue
+            if deferring:
                 modified = True
                 continue
             cost = self._request_forward_tokens(req, is_context=True)
