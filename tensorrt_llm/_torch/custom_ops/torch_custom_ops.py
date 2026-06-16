@@ -1707,7 +1707,7 @@ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
         a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
             a_sf.transpose(0, 1))
         return a, a_sf
-    if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() in (100, 103):
+    if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() >= 100:
         a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
         return a, a_sf
     a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
