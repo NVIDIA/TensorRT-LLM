@@ -328,7 +328,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        self.hidden_states = torch.empty(
+        # FIX (disagg+reuse+Eagle3 repetition bug):
+        #   * torch.zeros (not empty): guarantee neutral init
+        #   * track _hs_prev_write_max so we can zero shrinking gap in prepare()
+        self._hs_prev_write_max = 0
+        self.hidden_states = torch.zeros(
             (self.max_num_tokens,
              self.hidden_size * len(self.layers_to_capture)),
             dtype=self.dtype,
@@ -350,6 +354,16 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
+        # FIX (disagg+reuse+Eagle3 repetition bug):
+        # When this iter's num_tokens < the historical max written, the rows in
+        # [num_tokens : prev_max] are NOT overwritten by this iter's target
+        # captures but were written by an earlier iter. A future iter with
+        # num_tokens inside that gap will read stale data, biasing Eagle3 draft.
+        # Zeroing the shrinking gap restores neutral state for those rows.
+        if self.num_tokens < self._hs_prev_write_max:
+            self.hidden_states[self.num_tokens:self._hs_prev_write_max].zero_()
+        if self.num_tokens > self._hs_prev_write_max:
+            self._hs_prev_write_max = self.num_tokens
         # update batch indices
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(num_seqs,
