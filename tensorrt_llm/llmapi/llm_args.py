@@ -2908,7 +2908,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "(experimental).")
 
     disk_prefetch_num_reqs: int = Field(
-        default=4,
+        default=0,
         ge=0,
         description=
         "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
