@@ -101,15 +101,12 @@ class GvrTopKLBPrepareKernel:
         num_warps = cutlass.const_expr(self.num_warps)
         long_threshold = cutlass.const_expr(self.long_threshold)
 
-        # SMEM: per-thread is_long flag (used twice — for the prefix scan
-        # input and again at scatter time to choose the long vs short
-        # slot — so cache it) + warp_sums scratch for block_prefix_sum.
+        # SMEM: warp_sums scratch for the block prefix sum + single-int
+        # scratch to broadcast n_long_total across threads. The per-thread
+        # is_long flag is kept purely in a register (``is_long_val`` below)
+        # — both consumers (block_prefix_sum input + the step-3 long/short
+        # branch) read it directly without going through SMEM.
         smem = SmemAllocator()
-        s_is_long = smem.allocate_tensor(
-            element_type=cutlass.Int32,
-            layout=cute.make_ordered_layout((num_threads,), order=(0,)),
-            byte_alignment=128,
-        )
         s_warp_sums = smem.allocate_tensor(
             element_type=cutlass.Int32,
             layout=cute.make_ordered_layout((num_warps,), order=(0,)),
@@ -128,10 +125,8 @@ class GvrTopKLBPrepareKernel:
             seq = seq_lens[tidx]
             if seq > cutlass.Int32(long_threshold):
                 is_long_val = cutlass.Int32(1)
-        s_is_long[tidx] = is_long_val
-        cute.arch.barrier()
 
-        # Step 2: block prefix sum over s_is_long -> position within long group.
+        # Step 2: block prefix sum over is_long_val -> position within long group.
         # ``need_total_sum=True`` makes warp_sums[num_warps-1] hold n_long_total
         # AFTER the cross-warp scan; capture it from thread 0 before warp_sums
         # gets reused below.

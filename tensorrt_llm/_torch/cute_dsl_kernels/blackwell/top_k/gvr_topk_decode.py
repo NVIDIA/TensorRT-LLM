@@ -508,7 +508,7 @@ class GvrTopKKernel:
         smem_wsum_f32,  # cute.Tensor [NUM_WARPS] float32
         smem_wcnt_i32,  # cute.Tensor [NUM_WARPS] int32
         s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi]
-        s_iscalars,  # cute.Tensor [5] int32: [cand_count, done, cnt_lo, cnt_hi, out_count]
+        s_iscalars,  # cute.Tensor [6] int32: [cand_count, done, cnt_lo, cnt_hi, out_count, local_cand_count]
         tidx,
         warp_id,
         lane,
@@ -676,7 +676,7 @@ class GvrTopKKernel:
         threshold,  # cutlass.Float32 scalar
         smem_ptcnt,  # cute.Tensor [BLOCK_SIZE] int32 (P3 cache)
         smem_wcnt,  # cute.Tensor [NUM_WARPS] int32 (block reduce scratch)
-        s_iscalars,  # cute.Tensor [5] int32 (writes [0] = cand_count)
+        s_iscalars,  # cute.Tensor [6] int32 (writes [0] = cand_count)
         s_cluster_partial,  # cute.Tensor [1] int32 (per-CTA partial scratch for DSMEM)
         tidx,
         warp_id,

@@ -5827,6 +5827,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> None:
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
+            # Cross-tensor shape contract: ``seq_lens`` is request-level
+            # (one entry per request), ``logits`` is row-level
+            # (``next_n`` rows per request). Enforce this here so a
+            # mis-sized ``seq_lens`` doesn't silently mis-index into the
+            # kernel's per-row ``actual_kv_len`` formula
+            # ``seq_lens[row_idx // next_n] - next_n + ...``.
+            assert num_rows % next_n == 0 and seq_lens.shape[
+                0] == num_rows // next_n, (
+                    f"shape contract: seq_lens.shape[0] (={seq_lens.shape[0]}) "
+                    f"must equal logits.shape[0] / next_n "
+                    f"(={num_rows} / {next_n} = {num_rows // next_n})")
             # Op-level hardcodes return_output_values=False — the DSA indexer
             # pipeline only consumes indices, mirroring CUDA's
             # ``indexer_topk_decode`` (which also doesn't expose value
