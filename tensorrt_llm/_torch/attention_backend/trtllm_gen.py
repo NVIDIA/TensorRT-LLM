@@ -597,6 +597,8 @@ class FlashInferTrtllmGenAttention:
             attn.skip_softmax_threshold_scale_factor_prefill is not None
             or attn.skip_softmax_threshold_scale_factor_decode is not None
         )
+        if meta.is_cross:
+            return False, "trtllm-gen does not support cross attention."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
