@@ -161,7 +161,7 @@ class MoERunner(TunableRunner):
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
                     use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                    use_fused_finalize, use_mxfp8_weight_scaling)
+                    use_mxfp8_weight_scaling, use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],

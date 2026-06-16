@@ -212,7 +212,7 @@ public:
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
         bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_int8_woq_per_channel,
-        bool use_mxfp8_act_scaling, bool use_fused_finalize, bool use_mxfp8_weight_scaling)
+        bool use_mxfp8_act_scaling, bool use_mxfp8_weight_scaling, bool use_fused_finalize)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
@@ -221,9 +221,18 @@ public:
         mUseW4GroupScaling = use_w4_group_scaling;
         mUseINT8WoqPerChannel = use_int8_woq_per_channel;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
-        mUseFusedFinalize = use_fused_finalize;
         mUseMxfp8WeightScaling = use_mxfp8_weight_scaling;
+        mUseFusedFinalize = use_fused_finalize;
         mInnerDimMultiplier = 1;
+
+        // MXFP8xMXFP8 grouped MoE is only meaningful for the <e4m3, e4m3>
+        // template instantiation. Reject other (act, weight) dtype pairs at
+        // construction time so the downstream kernel runner never sees a
+        // mismatched configuration.
+        TORCH_CHECK(!mUseMxfp8WeightScaling
+                || (mActivationDtype == c10::ScalarType::Float8_e4m3fn
+                    && mWeightDtype == c10::ScalarType::Float8_e4m3fn),
+            "use_mxfp8_weight_scaling requires both activation and weight dtypes to be Float8_e4m3fn.");
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
         if (mActivationDtype == c10::ScalarType::Half && mWeightDtype == c10::ScalarType::Half)
@@ -244,11 +253,8 @@ public:
 #endif
 
 #ifdef ENABLE_FP8
-        // <e4m3, e4m3> serves both per-tensor FP8 (isFp8Quant) and MXFP8xMXFP8
-        // (isWMxfp8AMxfp8Quant). Both share the same CutlassMoeFCRunner<e4m3,
-        // e4m3> template instantiation -- the kernel selects between the two
-        // paths via use_mxfp8_weight_scaling_, which we set after constructing
-        // the runner.
+        // Per-tensor FP8 and MXFP8xMXFP8 share the <e4m3, e4m3> instantiation;
+        // use_mxfp8_weight_scaling_ selects between them at runtime.
         if (isFp8Quant() || isWMxfp8AMxfp8Quant())
         {
             mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
@@ -974,7 +980,7 @@ public:
                 tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                 hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size, inter_size, group_size,
                 activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                /*need_weights*/ false, parallelism_config, enable_alltoall);
+                /*need_weights*/ false, parallelism_config, enable_alltoall, mUseMxfp8WeightScaling);
 #else
             mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                 tensorrt_llm::runtime::TorchUtils::dataType(activation_dtype),
@@ -2243,18 +2249,8 @@ private:
         }
         else if (isWMxfp8AMxfp8Quant())
         {
-            // <e4m3 weight, e4m3 activation> with MXFP8 1x32 UE8M0 block scales
-            // on both sides. The block-scale storage convention matches MXFP4
-            // MoE (int32-packed UE8M0); no separate global / per-tensor alpha
-            // is required (block scales determine output magnitude on their
-            // own), so global_scale pointers are nullptr. Reuses the
-            // qp.mxfp8_mxfp4.* slot so the existing
-            //   setupIfSelected(MXFPXBlockScaledConfig{}, qp.mxfp8_mxfp4)
-            // call site in moe_kernels.cu picks up the SF descriptors
-            // correctly. Without this branch, no entry of QuantParams would
-            // hold our weight scales, layout_info.fpX_block_scaling_factors_*
-            // would be left nullptr, and the kernel TMA would dereference
-            // garbage -> cudaErrorIllegalInstruction inside tcgen05.mma.
+            // <e4m3, e4m3> with MXFP8 1x32 UE8M0 block scales on both sides;
+            // SF storage is int32-packed UE8M0 (same convention as MXFP4 MoE).
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for MXFP8 x MXFP8 quantization");
             TORCH_CHECK(quant_scales.value().size() == 2,
                 "Expecting 2 quant scales (fc1_weight_block, fc2_weight_block) for MXFP8 x MXFP8 quantization");
@@ -2262,19 +2258,14 @@ private:
             auto const fc1_weight_block = quant_scales.value()[0];
             auto const fc2_weight_block = quant_scales.value()[1];
 
-            // SF storage is int32-packed UE8M0 (4 uint8 per int32 along K),
-            // matching what the MXFP4 MoE path emits and what the Mxf8f6f4
-            // grouped-GEMM mainloop's TMA descriptor expects.
             CHECK_INPUT(fc1_weight_block, c10::ScalarType::Int);
             CHECK_INPUT(fc2_weight_block, c10::ScalarType::Int);
             TORCH_CHECK(fc1_weight_block.dim() == 3, "fc1 weight block must be 3D");
             TORCH_CHECK(fc2_weight_block.dim() == 3, "fc2 weight block must be 3D");
 
-            return kernels::QuantParams::MXFP8MXFP4(
+            return kernels::QuantParams::MXFP8MXFP8(
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
-                /*fc1_global_scale=*/nullptr,
-                static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-                /*fc2_global_scale=*/nullptr);
+                static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()));
         }
         else if (isNvfp4Quant())
         {
@@ -2413,19 +2404,14 @@ private:
 
     bool isFp8Quant() const
     {
-        // <e4m3, e4m3> per-tensor FP8. Exclude DeepSeek block-scale FP8 (which
-        // is handled separately) AND MXFP8xMXFP8 (which shares the same dtype
-        // pair but has its own block-scaled kernel path).
+        // <e4m3, e4m3> per-tensor FP8; excludes DeepSeek block-scale FP8 and MXFP8xMXFP8.
         return !mUseDeepSeekFP8BlockScaling && !mUseMxfp8WeightScaling
             && mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
     }
 
     bool isWMxfp8AMxfp8Quant() const
     {
-        // <e4m3, e4m3> with MXFP8 1x32 block-scaled weights + dynamic MXFP8
-        // activations. Same dtype pair as plain FP8 -- the discriminator is
-        // the runtime use_mxfp8_weight_scaling flag, which propagates to the
-        // kernel runner's getScalingType() to pick the MXFPX kernel path.
+        // <e4m3, e4m3> with MXFP8 block-scaled weights + dynamic MXFP8 acts.
         return mUseMxfp8WeightScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
             && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
     }

@@ -3,7 +3,13 @@ import enum
 import os
 from itertools import chain, product
 
+# Explicit re-imports for names used in MXFP8 / W4A8_MXFP4_MXFP8 paths so they
+# are not flagged as F405 "may be undefined from star import". This is purely
+# for the legacy lint baseline gate; functionally identical to picking them up
+# from the star import.
 from cutlass_library import *
+from cutlass_library import EpilogueScheduleType  # noqa: F401, F811
+from cutlass_library import DataType, GemmKind, KernelScheduleType
 
 
 ################################################################################
@@ -381,19 +387,9 @@ def is_gemm_op_valid_sm100(op):
         if op.arch == 100 and op.epi_schedule == EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm:
             return False
 
-    # MXFP8xMXFP8 grouped GEMM uses the Mxf8f6f4 block-scaled tensor-op
-    # family, which on SM100 imposes:
-    #   - TileShape_M must be 128 AND cluster_M must be 2 (2SM mode), giving
-    #     MMA M-mode == 256. Verified against CUTLASS's own unit test
-    #     sm100_gemm_mxf8_mxf8_mxf8_tensor_op_f32_group_gemm.cu, which uses
-    #     MmaTileShape<256, 128, 128>. The 1SM (cluster_M=1, MMA M=128)
-    #     variant is rejected by the tensor-op at runtime
-    #     (cudaErrorIllegalInstruction).
-    #   - TileShape_N in {64,128,192,256}
-    #   - TMA epilogue only (no NoSmem variant)
     # MXFP8xMXFP8 uses the Mxf8f6f4 block-scaled tensor-op. Mirror the FP4
-    # block-scaled path's shape constraints: tile_m=128, tile_n in
-    # {64,128,192,256}, TMA epilogue only.
+    # block-scaled path's shape constraints (kept in sync with the IsMXFPX
+    # branch in are_tile_shapes_supported_sm100 in moe_gemm_template_dispatch_tma_ws.h).
     if op.is_mx_fpx and op.act_type == DataType.e4m3 and op.weight_type == DataType.e4m3:
         if tile_m != 128:
             return False
@@ -806,10 +802,9 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
         if dtype in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
-        # `<e4m3, e4m3>` is a special case: it serves BOTH per-tensor FP8 MoE
-        # (is_mx_fpx=False, existing behavior) and MXFP8xMXFP8 block-scaled
-        # MoE (is_mx_fpx=True, M3.2). Runtime dispatcher selects between
-        # them via TmaWarpSpecializedGroupedGemmInput::fpX_block_scaling_type.
+        # `<e4m3, e4m3>` serves BOTH per-tensor FP8 MoE (is_mx_fpx=False) and
+        # MXFP8xMXFP8 block-scaled MoE (is_mx_fpx=True). Runtime dispatcher
+        # selects between them via TmaWarpSpecializedGroupedGemmInput::fpX_block_scaling_type.
         is_wmxfp8amxfp8_eligible = (dtype == DataType.e4m3
                                     and weight_type == DataType.e4m3)
         if is_wmxfp8amxfp8_eligible:

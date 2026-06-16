@@ -26,9 +26,9 @@ from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
-    W4A16NVFP4CutlassFusedMoEMethod,
-    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
+    W4A16NVFP4CutlassFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 

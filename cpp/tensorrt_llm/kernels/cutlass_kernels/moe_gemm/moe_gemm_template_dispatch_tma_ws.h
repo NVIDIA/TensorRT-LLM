@@ -73,16 +73,10 @@ namespace kernels::cutlass_kernels_oss
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
-// `IsMXFPX` selects the Mxf8f6f4 block-scaled tensor-op path. This template
-// parameter is set:
-//   - true  for WFP4AFP8 (e4m3 act x fp4 weight, MXFP4 block scaling),
-//   - true  for WMXFP8AMXFP8 (e4m3 act x e4m3 weight, MXFP8 block scaling
-//     -- the case added by M3.2: same Mxf8f6f4 tensor-op family, just
-//     widens the B element type),
-//   - false otherwise (per-tensor FP8, NVFP4, BF16/FP16, etc.).
-// `is_block_scaled` extends the legacy "contains FP4 element" check to also
-// cover the MXFP8xMXFP8 case so that the block-scaled epilogue constraint
-// (TMA epilogue required) applies to the new path.
+// `IsMXFPX` selects the Mxf8f6f4 block-scaled tensor-op path: true for
+// WFP4AFP8 and WMXFP8AMXFP8, false for per-tensor FP8 / NVFP4 / BF16 / FP16.
+// `is_block_scaled` extends the FP4 check to MXFP8xMXFP8 so the TMA-epilogue
+// constraint applies to the new path.
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
     EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool IsMXFPX>
 auto getDispatchFunctionForSM100(
@@ -134,7 +128,7 @@ auto getDispatchFunctionForSM100(
 }
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
-    EpilogueFusion FUSION, typename TileShape, typename ClusterShape>
+    EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool IsMXFPX>
 void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmInput hopper_input, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream, int* occupancy,
     size_t* workspace_size)
@@ -180,20 +174,32 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
     {
         constexpr static bool is_wfp4afp8
             = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
-        // W8A8 MXFP8 x MXFP8: both A and B are e4m3 with UE8M0 1x32 block scales.
-        // The runtime opts into this by passing fpX_block_scaling_type = MXFPX.
         constexpr static bool is_wfp8afp8
             = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+        // Compile-time consistency: WFP4AFP8 is always block-scaled (IsMXFPX=true);
+        // non-(wfp4afp8|wfp8afp8) types must never be instantiated with IsMXFPX=true.
+        static_assert(!is_wfp4afp8 || IsMXFPX, "WFP4AFP8 must be instantiated with IsMXFPX=true");
+        static_assert(
+            IsMXFPX == false || is_wfp4afp8 || is_wfp8afp8, "IsMXFPX=true is only valid for WFP4AFP8 or WMXFP8AMXFP8");
         if constexpr (is_wfp4afp8)
         {
             TLLM_CHECK_WITH_INFO(
                 hopper_input.fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
                 "MXFPX is the only supported scaling type for WFP4AFP8");
         }
+        else if constexpr (is_wfp8afp8 && IsMXFPX)
+        {
+            TLLM_CHECK_WITH_INFO(
+                hopper_input.fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                "WMXFP8AMXFP8 dispatch requires fpX_block_scaling_type=MXFPX");
+        }
         else if constexpr (is_wfp8afp8)
         {
-            // For W8A8 e4m3xe4m3 we accept either NONE (per-tensor FP8 path) or MXFPX (MXFP8 block scaled).
-            // No additional check needed -- the launcher selects the right collective via IsMXFPX.
+            TLLM_CHECK_WITH_INFO(
+                hopper_input.fpX_block_scaling_type != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                    && hopper_input.fpX_block_scaling_type
+                        != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
+                "Per-tensor FP8 e4m3xe4m3 dispatch requires fpX_block_scaling_type=NONE");
         }
         else
         {
@@ -213,56 +219,10 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
             auto cluster_shape_cute_fallback = cute::Shape<int32_t, int32_t, cute::_1>{
                 std::get<0>(cluster_shape_fallback), std::get<1>(cluster_shape_fallback), cute::_1{}};
 
-            // <e4m3, e4m3> compiles BOTH the per-tensor FP8 (IsMXFPX=false) and
-            // the MXFP8 block-scaled (IsMXFPX=true) launchers, then selects at
-            // runtime based on hopper_input.fpX_block_scaling_type. All other
-            // type combinations have a single compile-time-fixed IsMXFPX.
-            //
-            // The IsMXFPX=true launcher is only instantiated for shapes
-            // legal for the Mxf8f6f4 block-scaled tensor-op: TileM=128 and
-            // TileN in {64,128,192,256}. Mirror the FP4 block-scaled shape
-            // constraints. The compile-time guard below matches the filter
-            // in generate_kernels.py::is_gemm_op_valid_sm100 so the
-            // dispatcher never emits a call to a non-existent launcher.
-            constexpr int kTileM_mx = cute::size<0>(TileShape{});
-            constexpr int kTileN_mx = cute::size<1>(TileShape{});
-            constexpr bool is_mxfp8_shape_supported
-                = (kTileM_mx == 128) && (kTileN_mx == 64 || kTileN_mx == 128 || kTileN_mx == 192 || kTileN_mx == 256);
-            if constexpr (is_wfp8afp8)
-            {
-                bool const use_mxfp8 = hopper_input.fpX_block_scaling_type
-                    == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-                if (use_mxfp8)
-                {
-                    if constexpr (is_mxfp8_shape_supported)
-                    {
-                        auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag,
-                            FUSION, TileShape, ClusterShape, true>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
-                        selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
-                            workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
-                    }
-                    else
-                    {
-                        TLLM_THROW(
-                            "MXFP8xMXFP8 MoE only supports TileShape M=128 with N in {64,128,192,256}. "
-                            "Requested tile is not a valid MXFP8 block-scaled grouped GEMM shape.");
-                    }
-                }
-                else
-                {
-                    auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag,
-                        FUSION, TileShape, ClusterShape, false>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
-                    selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
-                        cluster_shape_cute, cluster_shape_cute_fallback);
-                }
-            }
-            else
-            {
-                auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
-                    TileShape, ClusterShape, is_wfp4afp8>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
-                selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
-                    cluster_shape_cute, cluster_shape_cute_fallback);
-            }
+            auto selected_func = getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                TileShape, ClusterShape, IsMXFPX>(gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
+            selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
+                cluster_shape_cute, cluster_shape_cute_fallback);
         }
         else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90)
         {
@@ -270,10 +230,10 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
             constexpr bool dynamic_cga = false;
             auto selected_func = hopper_input.swap_ab
                 ? kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                    WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION, TileShape, ClusterShape, is_wfp4afp8,
+                    WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX,
                     dynamic_cga, false, true>
                 : kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                    WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION, TileShape, ClusterShape, is_wfp4afp8,
+                    WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX,
                     dynamic_cga, false, false>;
 
             selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size, {}, {});
@@ -281,7 +241,8 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
     }
 }
 
-template <typename Arch, typename CtaShape, typename ClusterShape, typename DataType, typename WeightType>
+template <typename Arch, typename CtaShape, typename ClusterShape, typename DataType, typename WeightType,
+    bool IsMXFPX = false>
 constexpr bool are_tile_shapes_supported_sm100()
 {
     // We use a runtime cluster shape for SM100, so we only support 1x1x1 and 2x1x1 cluster shapes.
@@ -319,6 +280,21 @@ constexpr bool are_tile_shapes_supported_sm100()
         }
     }
 #endif
+
+    // MXFP8xMXFP8 uses the Mxf8f6f4 block-scaled tensor-op: TileM=128 and
+    // TileN in {64,128,192,256}. Keep in sync with is_gemm_op_valid_sm100 in
+    // generate_kernels.py so the dispatcher and kernel-emission list agree.
+    if constexpr (IsMXFPX && std::is_same_v<DataType, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>)
+    {
+        if (TileM != 128)
+        {
+            return false;
+        }
+        if (TileN != 64 && TileN != 128 && TileN != 192 && TileN != 256)
+        {
+            return false;
+        }
+    }
 
     if constexpr (std::is_same_v<DataType, __nv_fp8_e4m3>)
     {
@@ -372,12 +348,13 @@ constexpr bool are_tile_shapes_supported_sm120()
     We make the above restrictions are to improve compilation speed in TRT-LLM by pruning kernels
     that may not be very useful in practice.
  */
-template <typename Arch, typename CTAShape, typename ClusterShape, typename DataType, typename WeightType>
+template <typename Arch, typename CTAShape, typename ClusterShape, typename DataType, typename WeightType,
+    bool IsMXFPX = false>
 constexpr bool are_tile_shapes_supported()
 {
     if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
-        return are_tile_shapes_supported_sm100<Arch, CTAShape, ClusterShape, DataType, WeightType>();
+        return are_tile_shapes_supported_sm100<Arch, CTAShape, ClusterShape, DataType, WeightType, IsMXFPX>();
     }
     else if constexpr (Arch::kMinComputeCapability == 120 || Arch::kMinComputeCapability == 121)
     {
@@ -413,7 +390,7 @@ constexpr bool are_tile_shapes_supported()
 }
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
-    EpilogueFusion FUSION, typename TileShape>
+    EpilogueFusion FUSION, typename TileShape, bool IsMXFPX = false>
 void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmInput hopper_input,
     int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream,
     int* occupancy, size_t* workspace_size)
@@ -426,10 +403,10 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
     case cutlass_extensions::ClusterShape::ClusterShape_##M##x##N##x##K:                                               \
     {                                                                                                                  \
         using ClusterShape = Shape<_##M, _##N, _##K>;                                                                  \
-        if constexpr (are_tile_shapes_supported<Arch, TileShape, ClusterShape, T, WeightType>())                       \
+        if constexpr (are_tile_shapes_supported<Arch, TileShape, ClusterShape, T, WeightType, IsMXFPX>())              \
         {                                                                                                              \
             dispatchMoeGemmFinalDispatchTmaWarpSpecialized<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,       \
-                TileShape, ClusterShape>(                                                                              \
+                TileShape, ClusterShape, IsMXFPX>(                                                                     \
                 hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);     \
             break;                                                                                                     \
         }                                                                                                              \
@@ -455,7 +432,8 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
     }
 }
 
-template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION>
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION,
+    bool IsMXFPX = false>
 void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmInput hopper_input, int num_experts,
     cutlass_extensions::CutlassGemmConfig gemm_config, int multi_processor_count, cudaStream_t stream, int* occupancy,
     size_t* workspace_size)
@@ -470,7 +448,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
         using KTileDim = Int<KtileBytes>;                                                                              \
         using TileShape = Shape<_##M, _##N, KTileDim>;                                                                 \
         dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized<cutlass::arch::Sm##SMVERSION, T, WeightType, OutputType,   \
-            EpilogueTag, FUSION, TileShape>(                                                                           \
+            EpilogueTag, FUSION, TileShape, IsMXFPX>(                                                                  \
             hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);         \
         break;                                                                                                         \
     }
@@ -576,9 +554,38 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
     size_t count = 0;
     TmaWarpSpecializedGroupedGemmInput input{};
     input.fpX_block_scaling_type = fpX_block_scaling_type;
-    // Most of the values are ignored for WS size calculation. We reuse the function to reduce the template bloat
-    dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType, cutlass_extensions::EpilogueOpDefault,
-        FUSION>(input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+    // Most of the values are ignored for WS size calculation. We reuse the function to reduce the template bloat.
+    // <e4m3, e4m3> needs the IsMXFPX template to match what the runtime dispatch will pick.
+    constexpr bool is_wfp4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    constexpr bool is_wfp8afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+    if constexpr (is_wfp4afp8)
+    {
+        dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+            cutlass_extensions::EpilogueOpDefault, FUSION, true>(
+            input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+    }
+    else if constexpr (is_wfp8afp8)
+    {
+        bool const use_mxfp8 = fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+        if (use_mxfp8)
+        {
+            dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+                cutlass_extensions::EpilogueOpDefault, FUSION, true>(
+                input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+        }
+        else
+        {
+            dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+                cutlass_extensions::EpilogueOpDefault, FUSION, false>(
+                input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+        }
+    }
+    else
+    {
+        dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+            cutlass_extensions::EpilogueOpDefault, FUSION, false>(
+            input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+    }
     return count;
 }
 

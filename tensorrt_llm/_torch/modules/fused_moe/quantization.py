@@ -5491,7 +5491,7 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
     `FusedMoEQuantScalesMXFP8` tuple but the forward will raise a clear
     NotImplementedError pointing at the follow-up.
     """
-    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
     weight_alignment = 128
     BLOCK_SIZE = 32
     # Match the MXFP4 MoE storage convention: scales are stored as int32 with

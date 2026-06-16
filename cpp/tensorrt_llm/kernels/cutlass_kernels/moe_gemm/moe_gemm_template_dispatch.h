@@ -760,17 +760,64 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                 TLLM_CHECK_WITH_INFO(
                     hopper_inputs.isValid(), "Calling TMA warp specialized configuration with invalid hopper config");
 
-                // Select the appropriate fusion function
+                // Select the appropriate fusion function. For <e4m3, e4m3> we
+                // pick IsMXFPX at runtime from fpX_block_scaling_type so the
+                // dispatcher chain stays a single, type-driven template chain.
+                constexpr bool is_wfp4afp8
+                    = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+                constexpr bool is_wfp8afp8
+                    = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+                bool const use_mxfp8 = is_wfp8afp8
+                    && hopper_inputs.fpX_block_scaling_type
+                        == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
                 auto select_function = [&]()
                 {
                     switch (hopper_inputs.fusion)
                     {
                     case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE:
-                        return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
-                            OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE>;
+                        if constexpr (is_wfp4afp8)
+                        {
+                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
+                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE,
+                                true>;
+                        }
+                        else if constexpr (is_wfp8afp8)
+                        {
+                            return use_mxfp8 ? &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
+                                       WeightType, OutputType, EpilogueTag,
+                                       TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, true>
+                                             : &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
+                                                 WeightType, OutputType, EpilogueTag,
+                                                 TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, false>;
+                        }
+                        else
+                        {
+                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
+                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE,
+                                false>;
+                        }
                     case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE:
-                        return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
-                            OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>;
+                        if constexpr (is_wfp4afp8)
+                        {
+                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
+                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                                true>;
+                        }
+                        else if constexpr (is_wfp8afp8)
+                        {
+                            return use_mxfp8 ? &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
+                                       WeightType, OutputType, EpilogueTag,
+                                       TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, true>
+                                             : &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
+                                                 WeightType, OutputType, EpilogueTag,
+                                                 TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, false>;
+                        }
+                        else
+                        {
+                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
+                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
+                                false>;
+                        }
                     case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION:
                     case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION:
                     default: TLLM_THROW("Unimplemented fusion %d requested", (int) hopper_inputs.fusion);
@@ -873,19 +920,21 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(int num_experts) const
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
+    int num_experts, bool use_mxfp8_weight_scaling) const
 {
     if (num_experts != num_experts_)
     {
         TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts, num_experts_);
         num_experts_ = num_experts;
-        gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts);
+        gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts, use_mxfp8_weight_scaling);
     }
     return gemm_workspace_size_;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(int num_experts) const
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
+    int num_experts, bool use_mxfp8_weight_scaling) const
 {
     if constexpr (use_w4_groupwise)
     {
@@ -902,38 +951,29 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         // Finalize fusion may not actually be supported by the kernel,
         // if they are not we will catch the error and skip them
         auto configs = getTmaWarpSpecializedConfigs(sm_, true);
-        // <e4m3, e4m3> compiles both per-tensor FP8 (NONE) and MXFP8 block-
-        // scaled (MXFPX) kernel variants in the same template instantiation,
-        // selected at runtime via use_mxfp8_weight_scaling_. The MXFP8 path
-        // typically needs a larger workspace, so we estimate workspace size
-        // for both variants and take the maximum to guarantee enough memory
-        // regardless of which path runs.
-        constexpr bool is_wmxfp8amxfp8_eligible
-            = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
-        std::vector<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType> scaling_variants;
+        // For <e4m3, e4m3> the same template compiles both per-tensor FP8
+        // (NONE) and MXFP8 block-scaled (MXFPX) variants; the caller passes
+        // `use_mxfp8_weight_scaling` so we size workspace for exactly the
+        // variant that will run.
+        auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
         if constexpr (use_wfp4afp8)
         {
-            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+            fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
         }
         else if (use_fp4)
         {
-            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+            fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
         }
-        else if constexpr (is_wmxfp8amxfp8_eligible)
+        else if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>)
         {
-            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE);
-            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
-        }
-        else
-        {
-            scaling_variants.push_back(TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE);
+            fpX_block_scaling_type = use_mxfp8_weight_scaling
+                ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
         }
         size_t max_size = 0;
         bool has_config = false;
         for (auto conf : configs)
         {
-            for (auto fpX_block_scaling_type : scaling_variants)
-            {
 #define CALC_SIZE_FUSION(FUSION)                                                                                       \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -951,14 +991,13 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         }                                                                                                              \
     } while (0)
 
-                CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
-                if (sm_ == 90)
-                {
-                    CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
-                }
+            CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE);
+            if (sm_ == 90)
+            {
+                CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
+            }
 
 #undef CALC_SIZE_FUSION
-            }
         }
         TLLM_CHECK_WITH_INFO(has_config, "Could not find valid config when calculating workspace size");
         return max_size;
