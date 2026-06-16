@@ -467,7 +467,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             // HMMA spec-dec gridDim is {multiBlock, nbKVHeads * nbTokenBlocksPerGrp, batchSize};
             // mirror the GMMA spec-dec wave-count tuning by passing nbTokenBlocksPerGrp where the GMMA
             // path passes specDecBlocks (singleBlockCount factor along the head/q-token axis).
-            multiBlock = computeMultiBlockCountSpecDecGMMA(
+            multiBlock = computeMultiBlockCountSpecDec(
                 xqaParams, xqaParams.batch_size, multiprocessorCount, nbTokenBlocksPerGrp);
         }
         auto const gridDim = (dim3{multiBlock, xqaParams.num_kv_heads * nbTokenBlocksPerGrp, xqaParams.batch_size});
@@ -540,7 +540,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
         {
             if (isSpecDec && isGMMAKernel)
             {
-                multiBlock = computeMultiBlockCountSpecDecGMMA(
+                multiBlock = computeMultiBlockCountSpecDec(
                     xqaParams, xqaParams.batch_size, multiprocessorCount, specDecBlocks);
             }
             else if (!isSpecDec)
