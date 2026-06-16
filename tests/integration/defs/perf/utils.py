@@ -804,9 +804,9 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
     """
 
     # Create the parent Item node.
-    # Pytest 8.x upgrade compatibility.
-    # We should never import Pytest internals within test-definitions.
-    # TODO: TRT-23565
+    # Pytest 9 needs generated items under a node that can see fixtures.
+    collection_parent = _get_fixture_parent_node(session, test_func)
+    test_path = Path(test_func.__code__.co_filename).resolve()
     parent = None
     if hasattr(Item, "from_parent"):
 
@@ -818,15 +818,17 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
             def runtest(self):
                 return test_func()
 
-        parent = TrtexecItem.from_parent(session,
+        parent = TrtexecItem.from_parent(collection_parent,
                                          name=domain_name,
-                                         nodeid=domain_name)
+                                         nodeid=domain_name,
+                                         path=test_path)
     else:
         parent = Item(name=domain_name,
-                      parent=session,
+                      parent=collection_parent,
                       config=config,
                       session=session,
-                      nodeid=domain_name)
+                      nodeid=domain_name,
+                      path=test_path)
 
     parent.obj = None
 
@@ -845,8 +847,8 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
 
     item.obj = test_func
 
-    # This has to be set but can be random as it isn't used.
-    item.path = Path(os.getcwd())
+    # Keep the generated function path aligned with its source file.
+    item.path = test_path
 
     return item
 
@@ -886,3 +888,17 @@ def generate_test_nodes(session, config, items, valid_prefixes: List[str],
             print(f"Dynamically generated test node: {test_name}")
 
     return items
+
+
+def _get_fixture_parent_node(session, test_func):
+    # Keep synthetic perf tests under a node that can resolve declared fixtures.
+    fixture_manager = session._fixturemanager
+    fixturedefs_by_arg = getattr(fixture_manager, "_arg2fixturedefs", {})
+    code = test_func.__code__
+    arg_count = code.co_argcount + code.co_kwonlyargcount
+    for arg_name in code.co_varnames[:arg_count]:
+        for fixturedef in reversed(fixturedefs_by_arg.get(arg_name, ())):
+            fixture_node = getattr(fixturedef, "node", None)
+            if fixture_node is not None:
+                return fixture_node
+    return session
