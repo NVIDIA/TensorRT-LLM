@@ -299,8 +299,6 @@ class KvCacheCreator:
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
-            if self._max_beam_width is not None and self._max_beam_width > 1:
-                incompat.append("beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall

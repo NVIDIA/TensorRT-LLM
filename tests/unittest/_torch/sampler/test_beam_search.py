@@ -42,7 +42,7 @@ from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import (CompletionOutput, GenerationResult,
                                           Logprob)
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
-                                 KvCacheConfig)
+                                 KvCacheConfig, SchedulerConfig)
 
 
 @pytest.fixture(scope="module")
@@ -101,7 +101,9 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
         )
     return LLM(
         **llm_kwargs,
-        kv_cache_config=kv_cache_config,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=10000,  # pyright: ignore
+        ),
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
     )
@@ -541,6 +543,49 @@ def test_beam_search_disagg_e2e(
     finally:
         ctx_llm.shutdown()
         gen_llm.shutdown()
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_cache_indirection_kv_cache_manager_v2(
+    fixed_params,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gc.collect(2)
+    input_prompts = [[1, 2, 3], [4, 5], [6, 7, 8, 9]]
+    llm_kwargs: dict[str, Any] = dict(
+        model=_pl.Path("dummy_path"),
+        checkpoint_loader=HfCheckpointLoader(
+            weight_loader=DummyWeightLoader(),
+            config_loader=DummyConfigLoader(),
+        ),
+        sampler_type="TorchSampler",
+        disable_flashinfer_sampling=False,
+        disable_overlap_scheduler=False,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                          enable_padding=True),
+        kv_cache_config=KvCacheConfig(
+            max_tokens=10000,  # pyright: ignore
+            use_kv_cache_manager_v2=True,
+        ),
+        scheduler_config=SchedulerConfig(
+            capacity_scheduler_policy="MAX_UTILIZATION"),
+    )
+    with _build_llm(fixed_params, input_prompts, llm_kwargs=llm_kwargs) as llm:
+        sampling_params = SamplingParams(
+            max_tokens=fixed_params["max_tokens"],
+            n=fixed_params["max_beam_width"],
+            best_of=fixed_params["max_beam_width"],
+            use_beam_search=True,
+            end_id=-1,
+            additional_model_outputs=["cache_indirection"],
+        )
+        validate_outputs(
+            llm,
+            input_prompts,
+            sampling_params,
+            check_no_sync=False,
+            monkeypatch=monkeypatch,
+        )
 
 
 ###########################################################################
@@ -1318,35 +1363,6 @@ class TestParameterValidation:
                                  max_tokens=fixed_params["max_tokens"],
                                  n=1,
                                  best_of=fixed_params["max_beam_width"],
-                                 end_id=-1,
-                             ))
-        self._check_engine_responds(llm, input_prompts, fixed_params)
-
-    @pytest.mark.timeout(120)
-    @pytest.mark.threadleak(enabled=False)
-    def test_smaller_beam_width(
-        self,
-        llm: LLM,
-        input_prompts: list[str],
-        fixed_params: dict[str, Any],
-        batch_size: int,
-        sampler_type: str,
-    ):
-        if batch_size == 1:
-            pytest.skip("Test does not depend on batch size")
-        if sampler_type == "TorchSampler":
-            pytest.skip("Test does not depend on sampler_type")
-        assert fixed_params["max_beam_width"] > 2
-        with pytest.raises(
-                RequestError,
-                match=".*Request beam width 2 is not equal to max_beam_width 4.*"
-        ):
-            _ = llm.generate(input_prompts,
-                             sampling_params=SamplingParams(
-                                 max_tokens=fixed_params["max_tokens"],
-                                 n=1,
-                                 best_of=2,
-                                 use_beam_search=True,
                                  end_id=-1,
                              ))
         self._check_engine_responds(llm, input_prompts, fixed_params)

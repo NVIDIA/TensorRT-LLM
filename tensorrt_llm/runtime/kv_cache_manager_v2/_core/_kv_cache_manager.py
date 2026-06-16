@@ -410,7 +410,7 @@ class KVCacheManager:
             reuse_match,
             id,
             custom_priority_callback,
-            expected_prompt_length,
+            expected_prompt_length=expected_prompt_length,
         )
 
     def _match_reuse(
@@ -546,7 +546,11 @@ class KVCacheManager:
 
     @property
     def enable_partial_match(self) -> bool:
-        return self._init_config.enable_partial_reuse
+        return self._init_config.enable_partial_match
+
+    @property
+    def enable_partial_commit(self) -> bool:
+        return self._init_config.enable_partial_commit
 
     @property
     def ssm_reuse_interval(self) -> int:

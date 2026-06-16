@@ -26,7 +26,10 @@ def create_llm(model_dir,
                disable_overlap_scheduler,
                sampler_type,
                scheduler_config=None,
-               enable_block_reuse=False):
+               enable_block_reuse=False,
+               use_kv_cache_manager_v2=False,
+               max_beam_width=1,
+               max_batch_size=None):
     """Create LLM with specific overlap scheduler setting"""
     if scheduler_config is None:
         scheduler_config = SchedulerConfig()
@@ -34,7 +37,12 @@ def create_llm(model_dir,
                           sampler_type=sampler_type)
 
     trt_kv_cache_config = TRT_KvCacheConfig(
-        enable_block_reuse=enable_block_reuse)
+        enable_block_reuse=enable_block_reuse,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+    )
+    llm_kwargs = dict(max_beam_width=max_beam_width)
+    if max_batch_size is not None:
+        llm_kwargs["max_batch_size"] = max_batch_size
 
     return LLM(
         model=str(model_dir),
@@ -47,6 +55,7 @@ def create_llm(model_dir,
         max_num_tokens=
         128,  # Only one request longer than max_num_tokens is required to test chunked prefill
         scheduler_config=scheduler_config,
+        **llm_kwargs,
     )
 
 
@@ -135,6 +144,53 @@ def test_overlap_scheduler_block_reuse_cache_hit(model_path, test_case,
                     disable_overlap_scheduler=False,
                     sampler_type=sampler_type,
                     enable_block_reuse=True) as llm:
+        output_first = llm.generate([prompt],
+                                    sampling_params=sampling_config,
+                                    use_tqdm=True)[0]
+        assert output_first.cached_tokens == 0, (
+            "First pass should have no cached tokens (cold cache)")
+
+        output_second = llm.generate([prompt],
+                                     sampling_params=sampling_config,
+                                     use_tqdm=True)[0]
+        assert output_second.cached_tokens > 0, (
+            "Second pass should reuse cached blocks")
+
+
+@pytest.mark.high_cuda_memory
+@pytest.mark.mpi_ray_parity
+def test_overlap_scheduler_v2_beam_search_block_reuse_cache_hit(
+        model_path, test_case):
+    """Verify that V2 KV cache manager can reuse blocks with real beam search
+    and the overlap scheduler enabled."""
+    # Use a prompt longer than one KV block so a second request can report a
+    # real cache hit.
+    prompt = test_case["prompts"][2]
+    max_new_tokens = test_case["max_new_tokens"]
+    temperature = test_case["temperature"]
+    top_p = test_case["top_p"]
+    stop_words = test_case["stop_words"]
+    max_beam_width = 2
+
+    sampling_config = SamplingParams(max_tokens=max_new_tokens,
+                                     stop=stop_words,
+                                     temperature=temperature,
+                                     top_p=top_p,
+                                     n=max_beam_width,
+                                     best_of=max_beam_width,
+                                     use_beam_search=True)
+
+    with create_llm(
+            model_path,
+            disable_overlap_scheduler=False,
+            sampler_type="TorchSampler",
+            scheduler_config=SchedulerConfig(
+                capacity_scheduler_policy="MAX_UTILIZATION"),
+            enable_block_reuse=True,
+            use_kv_cache_manager_v2=True,
+            max_beam_width=max_beam_width,
+            max_batch_size=max_beam_width,
+    ) as llm:
         output_first = llm.generate([prompt],
                                     sampling_params=sampling_config,
                                     use_tqdm=True)[0]
