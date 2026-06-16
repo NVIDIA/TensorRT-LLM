@@ -206,6 +206,61 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         sm = get_sm_version()
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
+
+        batch_size = attn_metadata.num_seqs
+        if hasattr(attn_metadata, "kv_lens_cuda"):
+            # Keep kv_lens_cuda itself alive because TRTLLM attention holds a
+            # runtime view into it.
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:batch_size].clone()
+        else:
+            self._saved_kv_lens_cuda = None
+
+        # The draft loop overwrites the target verify tree mask/positions with
+        # draft-layer causal/growing-tree masks. Restore them before the next
+        # target forward.
+        if attn_metadata.spec_decoding_packed_mask is not None:
+            self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:batch_size].clone()
+        else:
+            self._saved_packed_mask = None
+        if attn_metadata.spec_decoding_position_offsets is not None:
+            self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone()
+            self._saved_position_offsets_cpp = attn_metadata.spec_decoding_position_offsets_cpp
+        else:
+            self._saved_position_offsets = None
+            self._saved_position_offsets_cpp = None
+        if attn_metadata.spec_decoding_generation_lengths is not None:
+            self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[
+                :batch_size
+            ].clone()
+        else:
+            self._saved_generation_lengths = None
+
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
+
+        if self._saved_packed_mask is not None:
+            batch_size = self._saved_packed_mask.shape[0]
+            attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(self._saved_packed_mask)
+            self._saved_packed_mask = None
+        if self._saved_position_offsets is not None:
+            attn_metadata.spec_decoding_position_offsets.copy_(self._saved_position_offsets)
+            attn_metadata.spec_decoding_position_offsets_cpp = self._saved_position_offsets_cpp
+            self._saved_position_offsets = None
+            self._saved_position_offsets_cpp = None
+        if self._saved_generation_lengths is not None:
+            batch_size = self._saved_generation_lengths.shape[0]
+            attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
+                self._saved_generation_lengths
+            )
+            self._saved_generation_lengths = None
+
     # ------------------------------------------------------------------ #
     # Helpers (mirroring eagle3 dynamic-tree worker, drafter-agnostic)    #
     # ------------------------------------------------------------------ #
@@ -213,6 +268,22 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         """Set spec-dec gen lengths and refresh the C++ position-offset view."""
         attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
         attn_metadata.update_position_offsets_for_cpp(query_len)
+
+    def _refresh_blackwell_tree_mask_metadata(self, attn_metadata):
+        if not getattr(attn_metadata, "use_spec_decoding", False):
+            return
+        if not getattr(attn_metadata, "is_spec_dec_dynamic_tree", False):
+            return
+
+        first_sparse = getattr(attn_metadata, "spec_bl_tree_first_sparse_mask_offset_kv", None)
+        bl_tree_mask = getattr(attn_metadata, "spec_decoding_bl_tree_mask", None)
+        if first_sparse is None and bl_tree_mask is None:
+            return
+
+        if bl_tree_mask is not None:
+            bl_tree_mask.zero_()
+        if first_sparse is not None:
+            attn_metadata.update_blackwell_first_sparse_mask_offset()
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
         """Compact the padded [n_req, buf_dim, ceil(buf_dim/32)] mask into the
@@ -533,7 +604,6 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     tree_valid=tree_valid,
                 )
             )
-
             accepted_draft_count = accept_token_num[:num_gens]
             num_accepted_tokens[num_contexts:batch_size] = (accepted_draft_count + 1).to(
                 torch.int32
@@ -708,6 +778,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             )
 
         # Save attn/spec metadata before the draft loop mutates it.
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
         # (c) Run the MTP draft tree loop -> build + store the next tree.
@@ -729,6 +800,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Restore attn metadata to support cuda graph.
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
         attn_metadata.use_spec_decoding = True
 
         # (d) Prepare next_new_tokens for overlap scheduler.
@@ -936,6 +1008,12 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         attn_metadata.use_spec_decoding = num_gens > 0
         if num_gens > 0 and hasattr(attn_metadata, "kv_lens_cuda"):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
+        self._refresh_blackwell_tree_mask_metadata(attn_metadata)
+        if spec_metadata.all_rank_num_tokens is not None:
+            # Step-0 draft repacks gen requests to max_path_len tokens. Attention
+            # reads rank token counts from attn_metadata, while MoE also gets
+            # the same counts via the explicit all_rank_num_tokens argument.
+            attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_tokens
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             hidden_states = draft_model.mtp_layers[0](
@@ -985,6 +1063,16 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             for layer_idx in range(1, self.max_draft_len):
                 num_tokens_per_req = layer_idx * self.K
                 num_infer_tokens = batch_size * num_tokens_per_req
+                subseq_all_rank_num_tokens = None
+                if spec_metadata.all_rank_num_seqs is not None:
+                    # Subsequent dynamic-tree draft forwards process the full
+                    # growing tree context, not one token per request. Attention
+                    # DP/MoE communication sizes must therefore scale with the
+                    # current per-request tree width.
+                    subseq_all_rank_num_tokens = [
+                        n * num_tokens_per_req for n in spec_metadata.all_rank_num_seqs
+                    ]
+                    attn_metadata.all_rank_num_tokens = subseq_all_rank_num_tokens
 
                 inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
                     num_infer_tokens, -1
@@ -997,10 +1085,10 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     "hidden_states": inp_hs,
                     "attn_metadata": attn_metadata,
                 }
-
                 hidden_states = draft_model.mtp_layers[0](
                     embed_tokens=draft_model.embed_tokens,
-                    all_rank_num_tokens=spec_metadata.subseq_all_rank_num_tokens,
+                    all_rank_num_tokens=subseq_all_rank_num_tokens
+                    or spec_metadata.subseq_all_rank_num_tokens,
                     **layer_inputs,
                 )
 
@@ -1086,15 +1174,19 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 attn_metadata.num_contexts = 0
 
             if hasattr(attn_metadata, "kv_lens_cuda"):
-                # KV rewind: remove unaccepted draft-path tokens, then add the K
-                # new depth-0 tokens.
+                # Match linear MTPEagleWorker's first-step cache-len semantics:
+                # generation rows only rewind unaccepted verify tokens here. The
+                # K depth-0 draft tokens are added after their forward writes KV;
+                # otherwise attention can read unwritten draft KV slots.
                 if num_gens > 0:
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                         self._max_path_len
                     ) - num_accepted_tokens[num_contexts:batch_size]
-                attn_metadata.kv_lens_cuda[:batch_size] += self.K
+                if num_contexts > 0:
+                    attn_metadata.kv_lens_cuda[:num_contexts] += self.K
             attn_metadata.use_spec_decoding = True
             attn_metadata.update_for_spec_dec()
+            self._refresh_blackwell_tree_mask_metadata(attn_metadata)
         else:
             num_tokens_previous_layer = cur_draft_idx * self.K
             num_tokens_current_layer = self.K * (cur_draft_idx + 1)
@@ -1108,6 +1200,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             if hasattr(attn_metadata, "kv_lens_cuda"):
                 attn_metadata.kv_lens_cuda[:batch_size] += self.K
             attn_metadata.update_for_spec_dec()
+            self._refresh_blackwell_tree_mask_metadata(attn_metadata)
 
 
 class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
