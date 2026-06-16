@@ -1310,9 +1310,13 @@ def _register_fake():
         quant_out = hidden_states.new_empty(quant_shape, dtype=torch.uint8)
         sf_out = hidden_states.new_empty((_swizzled_sf_size(m, k), ),
                                          dtype=torch.uint8)
-        residual_out = torch.empty_like(hidden_states)
+        # Fresh allocations (new_empty), matching the real op's empty_cuda; not
+        # empty_like, which would carry the input's layout in the trace.
+        residual_out = hidden_states.new_empty(tuple(hidden_states.shape),
+                                               dtype=hidden_states.dtype)
         if return_norm_out:
-            norm_out = torch.empty_like(hidden_states)
+            norm_out = hidden_states.new_empty(tuple(hidden_states.shape),
+                                               dtype=hidden_states.dtype)
             return [norm_out, quant_out, sf_out, residual_out]
         return [quant_out, sf_out, residual_out]
 
