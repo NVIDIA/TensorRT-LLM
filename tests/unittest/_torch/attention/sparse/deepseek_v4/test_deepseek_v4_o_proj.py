@@ -148,6 +148,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         pretrained_config=pretrained_config,
         sparse_attention_config=sparse_config,
         quant_config=quant_config,
+        use_cute_dsl_blockscaling_mm=dtype_str == "fp8",
     )
 
     # Setup positional embedding params

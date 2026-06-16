@@ -858,7 +858,6 @@ def _run_test_for_backend(
                     latent_cache=latent_cache,
                     q_pe=q_pe,
                     topk_indices=topk_indices,
-                    is_generation=False,
                 )
                 k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_sequence_lengths)
                 latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
@@ -948,7 +947,6 @@ def _run_test_for_backend(
                     mla_bmm2_scale=mla_bmm2_scale,
                     quant_q_buffer=quant_q_buffer,
                     topk_indices=topk_indices,
-                    is_generation=True,
                 )
                 ref_result, latent_cache_ref = calculate_ref_result_gen(
                     fused_q,
