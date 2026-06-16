@@ -1641,8 +1641,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_seq_len=metadata.max_seq_len,
                 trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
                 is_cross=metadata.is_cross,
-                spec_decoding_target_max_draft_tokens=metadata.
-                max_total_draft_tokens,
 
                 # --- Per-call (AttentionForwardArgs) ---
                 out_scale=forward_args.out_scale,
@@ -1722,6 +1720,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_mla_topk_lens=forward_args.sparse.sparse_mla_topk_lens,
                 compressed_kv_cache_pool_ptr=forward_args.sparse.
                 compressed_kv_cache_pool_ptr,
+                spec_decoding_target_max_draft_tokens=getattr(
+                    metadata, 'max_total_draft_tokens', None),
 
                 # --- Literals intentionally in _THOP_LITERALS ---
             )
