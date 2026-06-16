@@ -380,10 +380,15 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     std::vector<CutlassGemmConfig> candidate_configs;
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
     {
-        if (sm == 100)
+        if (sm == 100 || sm == 103)
         {
             if (schedule != EpilogueScheduleType::TMA)
+            {
                 return {};
+            }
+        }
+        if (sm == 100)
+        {
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x64x128B,
                 MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape, sm});
             if (supports_2sm)

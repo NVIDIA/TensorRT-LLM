@@ -85,6 +85,7 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
+  moeGateOp.cpp
   moeCommOp.cpp
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
