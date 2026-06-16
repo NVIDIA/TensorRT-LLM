@@ -16,7 +16,6 @@
  */
 
 #include "inflightBatchingUtils.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 
 namespace tensorrt_llm::batch_manager::utils
 {

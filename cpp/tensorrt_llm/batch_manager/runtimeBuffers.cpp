@@ -146,16 +146,9 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
         auto const logitsType = engine.getTensorDataType(batch_manager::RuntimeBuffers::kLogitsTensorName);
 
-        generationLogitsCache.transposedLogits = manager.gpu(
-            ITensor::makeShape({maxBeamWidth, GenerationLogitsCache::kCACHE_LENGTH, vocabSizePadded}), logitsType);
         generationLogitsCache.logits = manager.gpu(
             ITensor::makeShape({GenerationLogitsCache::kCACHE_LENGTH, maxBatchSize * maxBeamWidth, vocabSizePadded}),
             logitsType);
-
-        generationLogitsCache.fragmentPointerDevice
-            = manager.gpu(ITensor::makeShape({GenerationLogitsCache::kCACHE_LENGTH}), nvinfer1::DataType::kINT64);
-        generationLogitsCache.fragmentPointerHost = tensorrt_llm::runtime::BufferManager::pinnedPool(
-            ITensor::makeShape({maxBatchSize, GenerationLogitsCache::kCACHE_LENGTH}), nvinfer1::DataType::kINT64);
     }
 
     if (modelConfig.useCrossAttention())

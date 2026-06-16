@@ -232,75 +232,6 @@ void invokeTileTensor(ITensor& output, ITensor const& input, SizeType32 const be
         inputRowSize, outputRowSize, static_cast<uint32_t>(beamWidth));
 }
 
-// In the following kernel, we launch a grid with (microBatchSize * beamWidth, outputLen) blocks of threads. Each thread
-// block copies a `vocabSizePadded` length logits tensor from the "inputLogits (microBatchSize, beamWidth,
-// vocabSizePadded)" to the "outputGenerationLogits (batchSize, beamWidth, outputLen, vocabSizePadded)"
-template <typename T>
-__global__ void mergeLogitsFragmentsKernel(T* output, T** fragmentsVector, int const outputLen, int firstBatchSlotIdx,
-    int beamWidth, int vocabSizePadded, int stepOffset)
-{
-    // output: shape: [batchSize, beamWidth, outputLen, vocabSize]
-    // inputVecor.at(i): shape: [microBatchSize, beamWidth, vocabSize]
-
-    // Current step
-    int const curStep = blockIdx.y;
-
-    // The relatively batch slot index that this thread block in microBatchSize.
-    int const relativeBatchSlotIdx = blockIdx.x / beamWidth;
-
-    // The Absolute batch slot index in batchSize.
-    int const absoluteBatchSlotIdx = firstBatchSlotIdx + relativeBatchSlotIdx;
-
-    // The beam index that this thread block process
-    int const mbeamIdx = blockIdx.x % beamWidth;
-
-    // The output pointer
-    unsigned int const outputOffset
-        = (absoluteBatchSlotIdx * beamWidth * outputLen + mbeamIdx * outputLen + curStep + stepOffset)
-        * vocabSizePadded;
-
-    T* outputPtr = &output[outputOffset];
-
-    unsigned int const inputOffset = (relativeBatchSlotIdx * beamWidth + mbeamIdx) * vocabSizePadded;
-    // The input pointer.
-    T const* inputPtr = &fragmentsVector[curStep][inputOffset];
-
-    // The threads in the block collaborate to copy the logits.
-    for (int idx = threadIdx.x; idx < vocabSizePadded; idx += blockDim.x)
-    {
-        outputPtr[idx] = inputPtr[idx];
-    }
-}
-
-template <typename T>
-void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
-    std::vector<TensorPtr> const& fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
-    SizeType32 firstBatchSlotIdx, SizeType32 microBatchSize, SizeType32 beamWidth, CudaStream const& stream,
-    int stepOffset)
-{
-    size_t const fragmentsVectorSize = fragmentsVector.size();
-
-    auto cachePointerHostPtr = bufferCast<T*>(cachePointerHost);
-
-    for (int i = 0; i < fragmentsVectorSize; i++)
-    {
-        cachePointerHostPtr[i] = bufferCast<T>(*fragmentsVector.at(i));
-    }
-    bufferManager.copy(cachePointerHost, cachePointerDevice);
-
-    dim3 const blockSize(256);
-    dim3 const gridSize{(unsigned int) (microBatchSize * beamWidth), (unsigned int) (fragmentsVectorSize)};
-
-    auto const& outputShape = output.getShape();
-    auto const vocabSizePadded = static_cast<SizeType32>(outputShape.d[outputShape.nbDims - 1]);
-    auto const outputLen = static_cast<SizeType32>(outputShape.d[outputShape.nbDims - 2]);
-
-    TLLM_CHECK_WITH_INFO(outputLen >= fragmentsVectorSize, "Fragments size does not match outputLen size");
-
-    mergeLogitsFragmentsKernel<T><<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<T>(output),
-        bufferCast<T*>(cachePointerDevice), outputLen, firstBatchSlotIdx, beamWidth, vocabSizePadded, stepOffset);
-}
-
 } // namespace
 
 template <typename T>
@@ -432,37 +363,6 @@ void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, Cud
     case nvinfer1::DataType::kINT8: invokeTileTensor<int8_t>(output, input, beamWidth, stream); break;
 #ifdef ENABLE_FP8
     case nvinfer1::DataType::kFP8: invokeTileTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
-#endif // ENABLE_FP8
-    default: TLLM_THROW("data type not supported");
-    }
-}
-
-void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
-    std::vector<TensorPtr> const& fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
-    SizeType32 firstBatchSlotIdx, SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream,
-    int stepOffset)
-{
-    switch (output.getDataType())
-    {
-    case nvinfer1::DataType::kFLOAT:
-        invokeMergeLogitsFragments<float>(bufferManager, output, fragmentsVector, cachePointerDevice, cachePointerHost,
-            firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
-        break;
-    case nvinfer1::DataType::kHALF:
-        invokeMergeLogitsFragments<half>(bufferManager, output, fragmentsVector, cachePointerDevice, cachePointerHost,
-            firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
-        break;
-#ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
-        invokeMergeLogitsFragments<__nv_bfloat16>(bufferManager, output, fragmentsVector, cachePointerDevice,
-            cachePointerHost, firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
-        break;
-#endif // ENABLE_BF16
-#ifdef ENABLE_FP8
-    case nvinfer1::DataType::kFP8:
-        invokeMergeLogitsFragments<__nv_fp8_e4m3>(bufferManager, output, fragmentsVector, cachePointerDevice,
-            cachePointerHost, firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
-        break;
 #endif // ENABLE_FP8
     default: TLLM_THROW("data type not supported");
     }

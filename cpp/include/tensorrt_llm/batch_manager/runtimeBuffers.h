@@ -204,30 +204,6 @@ public:
         TensorPtr logits;
         //! Record the usage offset of the cacheGenerationLogits buffer
         SizeType32 offset{0};
-
-        //! Temporarily store the transposed results of multiple fragment logits, [maxBeamWidth, kCACHE_LENGTH]
-        TensorPtr transposedLogits;
-
-        //! Temporarily store logits buffer address during the transposing, [kCACHE_LENGTH]
-        TensorPtr fragmentPointerDevice;
-
-        //! Temporarily store logits buffer address during the transposing, [maxBatchSize, kCACHE_LENGTH]
-        TensorPtr fragmentPointerHost;
-
-        //! Cycling index for workspace
-        size_t workIdx{0};
-
-        void cycleWorkIdx()
-        {
-            workIdx = (workIdx + 1) % (fragmentPointerHost->getShape().d[0]);
-        }
-
-        [[nodiscard]] TensorPtr getFragmentPointerHost()
-        {
-            TensorPtr slice = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
-            cycleWorkIdx();
-            return slice;
-        };
     };
 
     GenerationLogitsCache generationLogitsCache;
