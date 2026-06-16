@@ -35,11 +35,10 @@ from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 from torch.types import Number
 
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import REPLAY_WORK_ITEM_WIDTH
-
 from .._compat import KvCacheConfig, nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
+from .mamba.replay_metadata import REPLAY_WORK_ITEM_WIDTH
 
 Constant = Union[int, float, str, None]
 

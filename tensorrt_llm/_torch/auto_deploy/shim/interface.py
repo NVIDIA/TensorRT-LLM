@@ -48,14 +48,6 @@ else:
     Mapping = None
     torch_dtype_to_binding = None
 
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
-    REPLAY_WORK_CACHE_BUF_IDX,
-    REPLAY_WORK_CACHE_SLOT,
-    REPLAY_WORK_ITEM_WIDTH,
-    REPLAY_WORK_PNAT,
-    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
-)
-
 from ..custom_ops.attention_interface import (
     AttentionType,
     CausalConvResourceHandler,
@@ -76,6 +68,13 @@ from ..custom_ops.attention_interface import (
     SequenceInfo,
     SSMResourceHandler,
     StateResourceHandler,
+)
+from ..custom_ops.mamba.replay_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
 )
 from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
