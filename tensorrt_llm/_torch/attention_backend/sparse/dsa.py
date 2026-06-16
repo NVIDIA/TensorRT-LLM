@@ -2336,15 +2336,13 @@ class Indexer(nn.Module):
         """
         if self.use_fp4:
             return torch.ops.trtllm.fused_cat_fp4(qk_pe, qk_nope)
-        from tensorrt_llm.quantization.utils.fp8_utils import (
-            fp8_quantize_1x128_sf_transpose,
-        )
+        from tensorrt_llm.quantization.utils.fp8_utils import \
+            fp8_quantize_1x128_sf_transpose
         combined = torch.cat([qk_pe, qk_nope], dim=-1)
         combined = rotate_activation(combined)
         combined_2d = combined.view(-1, combined.shape[-1])
         return fp8_quantize_1x128_sf_transpose(
-            combined_2d, use_ue8m0=self.scale_fmt == "ue8m0"
-        )
+            combined_2d, use_ue8m0=self.scale_fmt == "ue8m0")
 
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
