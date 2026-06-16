@@ -337,6 +337,7 @@ class TestModelDefaults:
 
 def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig().use_kv_cache_manager_v2 is True
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
