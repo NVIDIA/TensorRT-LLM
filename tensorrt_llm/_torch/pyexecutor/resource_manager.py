@@ -188,9 +188,8 @@ _MROPE_NUM_AXES = 3
 
 def _make_warmup_mrope_position_ids(token_num: int) -> torch.Tensor:
     """Build (_MROPE_NUM_AXES, 1, token_num) mrope_position_ids for warmup."""
-    return (torch.arange(0, token_num,
-                         dtype=torch.int32).expand(_MROPE_NUM_AXES, 1,
-                                                   -1).clone())
+    return (torch.arange(0, token_num, dtype=torch.int32,
+                         device="cuda").expand(_MROPE_NUM_AXES, 1, -1).clone())
 
 
 def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
@@ -209,7 +208,7 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
     }
     if is_gen:
         mrope_config["mrope_position_deltas"] = torch.zeros(
-            1, dtype=torch.int32).unsqueeze(0)
+            1, dtype=torch.int32, device="cuda").unsqueeze(0)
     if req.py_multimodal_data is None:
         req.py_multimodal_data = {}
     req.py_multimodal_data["mrope_config"] = mrope_config
@@ -554,6 +553,8 @@ class KVCacheManager(BaseResourceManager):
             'chunk_size': min(max_num_tokens, self.max_seq_len),
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'cache_type': kv_cache_type,
+            'secondary_offload_min_priority':
+            kv_cache_config.secondary_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,

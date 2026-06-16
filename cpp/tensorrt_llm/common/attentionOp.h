@@ -57,7 +57,7 @@ public:
     [[nodiscard]] int getHeadSize(bool checkInit = true) const;
     [[nodiscard]] int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     [[nodiscard]] size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0) const noexcept;
+        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0, int32_t total_kv_len = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;
@@ -153,6 +153,12 @@ public:
         int32_t const* helix_position_offsets = nullptr;
         bool const* helix_is_inactive_rank = nullptr;
 
+        // Optional packed-varlen boundaries for context attention. When set,
+        // these describe attention sequences/segments and are used directly by
+        // FMHA instead of the workspace boundaries rebuilt from context_lengths.
+        int32_t const* cu_q_seqlens = nullptr;
+        int32_t const* cu_kv_seqlens = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -211,6 +217,8 @@ public:
             ss << "softmaxStatsPtr: " << this->softmax_stats << std::endl;
             ss << "k_ptr: " << this->k_ptr << std::endl;
             ss << "v_ptr: " << this->v_ptr << std::endl;
+            ss << "cu_q_seqlens: " << this->cu_q_seqlens << std::endl;
+            ss << "cu_kv_seqlens: " << this->cu_kv_seqlens << std::endl;
             return ss.str();
         }
     };
