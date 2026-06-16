@@ -472,56 +472,8 @@ class ModelLoader:
                     'embedding', 'unembedding'
                 ]
             elif hf_quant_config.get("quant_method") == "mxfp8":
-                # MiniMax-M3 MXFP8 (and any other MXFP8 ckpt that follows the
-                # OCP MX format with [1, 32] block scales). The checkpoint
-                # stores ``*.weight`` as ``F8_E4M3`` and ``*.weight_scale_inv``
-                # as ``uint8`` (E8M0 biased exponent), with one scale per
-                # 32-element block along the input axis. The full MXFP8
-                # runtime / linear / MoE plumbing (a native ``QuantAlgo.MXFP8``
-                # path with a per-[1,32] tiled GEMM) is **Goal 2.2** in
-                # ``plan.md``. Stage 2 Goal 2.1 needs the model to *construct*
-                # and *decode* end-to-end first, so this branch accepts the
-                # MXFP8 config without setting a ``quant_algo`` (i.e. the
-                # downstream loader sees a no-quant model). The per-model
-                # weight loader is then responsible for dequantizing the
-                # ``F8_E4M3`` weights to the model's native dtype using the
-                # paired ``weight_scale_inv`` before the linear / MoE modules
-                # consume them. This matches ``plan.md``'s explicit
-                # "stage quantization" decision: first prove a dequantized
-                # reference path, then add the native MXFP8 GEMM in a
-                # follow-up.
-                weight_block_size = hf_quant_config.get("weight_block_size")
-                if weight_block_size is not None and tuple(
-                        weight_block_size) != (1, 32):
-                    raise NotImplementedError(
-                        f"Unsupported MXFP8 weight_block_size: "
-                        f"{weight_block_size}. Supported: [1, 32]. "
-                        "MXFP8 with other block geometries needs a different "
-                        "dequantize-on-load path; the [1, 32] path matches "
-                        "the OCP MX format used by the MiniMax-M3 checkpoint.")
-                # quant_algo stays as the default (NO_QUANT). Downstream
-                # weight loaders dequantize the F8_E4M3 weights to the
-                # model's native dtype using the paired E8M0 scales before
-                # the linear / MoE modules see them, so from the runtime's
-                # perspective this is an effective BF16 (or model-dtype)
-                # model.
-                ignored_layers = hf_quant_config.get("ignored_layers")
-                if ignored_layers:
-                    # ``ignored_layers`` enumerates *un*-quantized modules
-                    # (lm_head, embedding, routing gates, the BF16 index_k_proj
-                    # on sparse layers, multimodal/vision/MTP modules). The
-                    # downstream dequantize-on-load path can use this list to
-                    # short-circuit: any module whose key prefix matches an
-                    # entry is already BF16 in the checkpoint and does not
-                    # need scale-based dequantization.
-                    quant_config.exclude_modules = list(ignored_layers)
-                logger.info(
-                    "MXFP8 quantization_config recognised; runtime treats the "
-                    "model as effectively unquantized and relies on the model "
-                    "weight loader to dequantize F8_E4M3 weights with the "
-                    "paired E8M0 (weight_scale_inv) scales. "
-                    f"exclude_modules has {len(quant_config.exclude_modules or [])} entries."
-                )
+                raise NotImplementedError(
+                    "MXFP8 quantization is not supported yet.")
             # NOTE: This is for llm-compressor's quantized checkpoints.
             elif hf_quant_config.get("quant_method") == "compressed-tensors":
                 update_quant_config_from_compressed_tensors(
