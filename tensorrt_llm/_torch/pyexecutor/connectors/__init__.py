@@ -14,5 +14,16 @@
 # limitations under the License.
 
 from tensorrt_llm._torch.pyexecutor.connectors.registry import CONNECTOR_REGISTRY
+from tensorrt_llm._torch.pyexecutor.connectors.semantic_kv_cache import (
+    LocalSemanticKvProvider, SemanticKvDonor, SemanticKvLookupRequest,
+    SemanticKvLookupResult, SemanticKvMaterializationKind, SemanticKvProvider)
 
-__all__ = ["CONNECTOR_REGISTRY"]
+__all__ = [
+    "CONNECTOR_REGISTRY",
+    "LocalSemanticKvProvider",
+    "SemanticKvDonor",
+    "SemanticKvLookupRequest",
+    "SemanticKvLookupResult",
+    "SemanticKvMaterializationKind",
+    "SemanticKvProvider",
+]

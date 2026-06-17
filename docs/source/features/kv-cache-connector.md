@@ -11,6 +11,7 @@ The KV Cache Connector is designed to support a variety of advanced serving scen
 1. **KV Cache Offloading**: Move KV cache blocks from GPU memory to cheaper/larger storage (CPU RAM, NVMe SSD, or network storage) when they are not immediately needed, and reload them when required.
 2. **Custom Disaggregated Serving**: Separate the prefill (context processing) and decode (token generation) phases onto different instances or machines. The connector can be used to transmit the KV cache generated during prefill to the decode instances.
 3. **KV Cache Sharing / P2P Transfer**: Share KV cache states between different model instances or across peer-to-peer connections.
+4. **Semantic Donor Discovery**: Ask an external provider for semantically related donors, then materialize KV only when the connector has an engine-valid load plan.
 
 ## Architecture
 
@@ -95,6 +96,25 @@ This example illustrates the API mechanics but has several limitations that make
 1. **Blocking I/O**: The example uses `torch.load` and `torch.save` synchronously. In a real implementation, these should be offloaded to a background thread or asynchronous I/O handler to avoid stalling the GPU.
 2. **Simplified Block Matching**: The `get_num_new_matched_tokens` implementation in the example only matches full blocks. It does not handle partial cache hits.
 3. **FileSystem Latency**: Storing one file per block can create high filesystem overhead.
+
+## Semantic Donor Discovery Pattern
+
+Semantic KV reuse should be implemented as a two-step decision:
+
+1. **Discovery**: A semantic provider searches its donor index and returns evidence such as donor ID, similarity, reuse estimate, and whether the match is safe to materialize.
+2. **Materialization**: The connector reports matched tokens only if it can load the corresponding KV blocks into TensorRT-LLM-owned cache blocks before the forward pass.
+
+This distinction is important because `get_num_new_matched_tokens()` is a materialization promise. Returning a positive token count tells TensorRT-LLM that those tokens do not need normal prefill computation. Providers may return non-identical semantic hits for telemetry or routing, but those hits should remain discovery-only unless the connector and backend can preserve request-local approximate reuse semantics.
+
+For a conservative first integration, a semantic connector can:
+
+* keep exact KV cache reuse semantics unchanged;
+* index completed requests as semantic donors;
+* query a provider only after exact prefix coverage is insufficient;
+* return `0` matched tokens for non-identical semantic hits;
+* return positive matched tokens only for exact-equivalent, block-aligned donors whose KV blocks are available to load.
+
+The file `examples/llm-api/llm_semantic_kv_cache_connector.py` demonstrates this pattern. It uses a deterministic local semantic provider for donor discovery and a persistent block store for materialization. Non-identical donor hits are logged as discovery-only; exact-equivalent donor hits load real KV blocks through the connector worker.
 
 ### Usage
 
