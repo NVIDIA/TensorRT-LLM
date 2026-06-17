@@ -296,16 +296,16 @@ public:
         }
     }
 
-    [[nodiscard]] std::future<void> sendAsync(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest)
     {
+        TLLM_CHECK(llmRequest != nullptr);
         std::promise<void> promise;
         auto future = promise.get_future();
-        llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
-                mReadyResponses.emplace(
-                    llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -477,7 +477,9 @@ public:
 private:
     struct Response
     {
-        LlmRequest* mRequest;
+        // shared_ptr so this struct co-owns the request until the promise resolves;
+        // protects worker-side dereferences and the promise itself from premature destruction.
+        std::shared_ptr<LlmRequest> mRequest;
         std::promise<void> mPromise;
     };
 
@@ -511,7 +513,12 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));
+            // Sequence the read before the move: argument initializations
+            // are indeterminately sequenced, so inlining resp.mRequest->...
+            // alongside std::move(resp) is UB once mRequest is a shared_ptr.
+            TLLM_CHECK(resp.mRequest != nullptr);
+            auto const reqId = resp.mRequest->mRequestId;
+            sendAndRemoveResponse(reqId, std::move(resp));
         }
     }
 
@@ -584,14 +591,23 @@ private:
             {
                 // TODO: if the generation does not require the kv cache, the request will
                 // not be removed from mCancelledRequests. This should be handled by timeout.
-                auto it = mReadyResponses.find(mCurrentRequest.value());
-                TLLM_CHECK(it != mReadyResponses.end());
+                auto const cancelledReqId = mCurrentRequest.value();
+                Response cancelledResponse;
                 {
                     std::scoped_lock lkResp(mSenderMutex);
+                    auto it = mReadyResponses.find(cancelledReqId);
+                    TLLM_CHECK(it != mReadyResponses.end());
+                    // Move out before erasing so the promise survives the
+                    // map cleanup and can be resolved (vs. destroyed unfulfilled,
+                    // which would surface as std::future_error: Broken promise).
+                    cancelledResponse = std::move(it->second);
                     mReadyResponses.erase(it);
-                    mCancelledRequests.erase(mCurrentRequest.value());
-                    mRemainSendCount.erase(mCurrentRequest.value());
+                    mCancelledRequests.erase(cancelledReqId);
+                    mRemainSendCount.erase(cancelledReqId);
                 }
+                cancelledResponse.mPromise.set_exception(std::make_exception_ptr(
+                    TLLM_REQUEST_EXCEPTION(cancelledReqId, common::RequestErrorCode::kNETWORK_ERROR,
+                        "KV cache transfer for request %zu was cancelled", cancelledReqId)));
                 mCurrentRequest = std::nullopt;
 
                 if (mReadyResponses.empty())
@@ -762,23 +778,27 @@ public:
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     }
 
-    [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest)
     {
+        TLLM_CHECK(llmRequest != nullptr);
         // TODO: Modify the implementation here to avoid frequent thread creation.
-        return std::async(std::launch::async, &CacheReceiver::Impl::requestSync, this, std::ref(llmRequest));
+        // Capture by value so the async task owns a strong reference for its lifetime.
+        auto llmRequestCopy = llmRequest;
+        return std::async(std::launch::async, [this, llmRequestCopy]() { requestSync(*llmRequestCopy); });
     }
 
-    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(std::shared_ptr<LlmRequest> const& llmRequest)
     {
+        TLLM_CHECK(llmRequest != nullptr);
         try
         {
             auto promise = std::make_unique<std::promise<void>>();
             auto future = promise->get_future();
-            TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
+            TLLM_CHECK(llmRequest->getDataTransceiverState().getCommState().has_value());
             std::string processInfo = kDefaultProcessInfo;
             if (common::getEnvRequestKVCacheConcurrent())
             {
-                processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
+                processInfo = llmRequest->getDataTransceiverState().getCommState()->toString();
             }
             if (mInstanceToAsyncResource.find(processInfo) == mInstanceToAsyncResource.end())
             {
@@ -791,7 +811,7 @@ public:
             auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
             {
                 std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
-                asyncResource->mRequestsQueue.emplace_back(std::addressof(llmRequest), std::move(promise));
+                asyncResource->mRequestsQueue.emplace_back(llmRequest, std::move(promise));
             }
             asyncResource->mCVforQueue.notify_all();
             return future;
@@ -1003,6 +1023,23 @@ public:
                 { return requestAndPromise.mRequest->mRequestId == llmRequest.mRequestId; });
             if (it != asyncResource->mRequestsQueue.end())
             {
+                // Resolve the promise before erasing so the future returned by
+                // receiveAsync surfaces a structured cancellation error rather
+                // than std::future_error: Broken promise from the destroyed promise.
+                if (it->mPromise)
+                {
+                    try
+                    {
+                        it->mPromise->set_exception(std::make_exception_ptr(
+                            TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
+                                "Generation KV cache request cancelled before send for request %zu",
+                                llmRequest.mRequestId)));
+                    }
+                    catch (std::future_error const&)
+                    {
+                        // Promise already satisfied; nothing to do.
+                    }
+                }
                 asyncResource->mRequestsQueue.erase(it);
                 isCancelled = true;
             }
@@ -1083,7 +1120,9 @@ private:
 
     struct RequestAndPromise
     {
-        LlmRequest* mRequest;
+        // shared_ptr so this struct co-owns the request until the promise resolves;
+        // protects worker-side dereferences and the promise itself from premature destruction.
+        std::shared_ptr<LlmRequest> mRequest;
         std::unique_ptr<std::promise<void>> mPromise;
 
         RequestAndPromise()
@@ -1092,8 +1131,8 @@ private:
         {
         }
 
-        RequestAndPromise(LlmRequest* request, std::unique_ptr<std::promise<void>>&& promise)
-            : mRequest(request)
+        RequestAndPromise(std::shared_ptr<LlmRequest> request, std::unique_ptr<std::promise<void>>&& promise)
+            : mRequest(std::move(request))
             , mPromise(std::move(promise))
         {
         }
@@ -1101,26 +1140,23 @@ private:
         RequestAndPromise(RequestAndPromise const&) = delete;
 
         RequestAndPromise(RequestAndPromise&& other) noexcept
-            : mRequest(other.mRequest)
+            : mRequest(std::move(other.mRequest))
             , mPromise(std::move(other.mPromise))
         {
-            other.mRequest = nullptr;
         }
 
         RequestAndPromise& operator=(RequestAndPromise&& other) noexcept
         {
             if (this != &other)
             {
-                mRequest = nullptr;
+                mRequest.reset();
                 if (mPromise)
                 {
                     mPromise.reset();
                 }
 
-                mRequest = other.mRequest;
+                mRequest = std::move(other.mRequest);
                 mPromise = std::move(other.mPromise);
-
-                other.mRequest = nullptr;
             }
             return *this;
         }
@@ -1228,7 +1264,7 @@ CacheSender::CacheSender(
 {
 }
 
-std::future<void> CacheSender::sendAsync(LlmRequest& llmRequest) const
+std::future<void> CacheSender::sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const
 {
     return mImpl->sendAsync(llmRequest);
 }
@@ -1277,7 +1313,7 @@ CacheReceiver::CacheReceiver(
 {
 }
 
-std::future<void> CacheReceiver::receiveAsync(LlmRequest& llmRequest) const
+std::future<void> CacheReceiver::receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const
 {
     return mImpl->requestAndReceiveAsyncMultiThreads(llmRequest);
 }

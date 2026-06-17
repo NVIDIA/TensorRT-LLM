@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Selects the KV-cache transport used to move cache blocks between disaggregated workers.
+# DEFAULT lets TensorRT-LLM choose; explicit backend values include UCX and NIXL.
+# See examples/disaggregated/README.md for backend details.
+cache_transceiver_config:
+  backend: DEFAULT

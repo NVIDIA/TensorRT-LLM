@@ -13,18 +13,15 @@ models:
 - name: Qwen/Qwen3-0.6B
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-270M-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-1_1B-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-3B-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-270M-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-1_1B-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-3B-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
 # ImportError: cannot import name 'LossKwargs' from 'transformers.utils' (/usr/local/lib/python3.12/dist-packages/transformers/utils/__init__.py)
 # - name: microsoft/Phi-4-mini-instruct
 #   config_id: default_ws_1
@@ -532,18 +529,16 @@ models:
 #   config_id: multimodal
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Gemma 4 (2026) - MoE with K=V attention ---
-# Error querying confidential compute state: Function Not Found
-# - name: google/gemma-4-E2B-it
-#   config_id: gemma4_e2b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_e2b.yaml']
+- name: google/gemma-4-E2B-it
+  config_id: gemma4_e2b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_e2b.yaml']
 # AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
 # - name: google/gemma-4-26B-A4B
 #   config_id: gemma4_moe_base
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe_base.yaml']
-# AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
-# - name: google/gemma-4-26B-A4B-it
-#   config_id: gemma4_moe
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
+- name: google/gemma-4-26B-A4B-it
+  config_id: gemma4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
 # --- Gemma 4 (2026) - Dense 31B ---
 # AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
 # - name: google/gemma-4-31B-it
@@ -583,10 +578,9 @@ models:
 #   config_id: multimodal
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 # --- MiniMax M2 (2025) ---
-# RuntimeError: NVRTC compilation failed. See https://github.com/NVIDIA/TensorRT-LLM/issues/14676
-# - name: MiniMaxAI/MiniMax-M2
-#   config_id: minimax_m2
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
+- name: MiniMaxAI/MiniMax-M2
+  config_id: minimax_m2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- Tencent Hunyuan small (2025) ---
 - name: tencent/Hunyuan-1.8B-Instruct
   config_id: default_ws_1

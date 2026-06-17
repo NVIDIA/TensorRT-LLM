@@ -593,9 +593,10 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
+                encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
+                cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs

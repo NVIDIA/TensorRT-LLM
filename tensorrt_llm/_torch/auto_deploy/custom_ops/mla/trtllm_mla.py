@@ -76,6 +76,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -2206,15 +2207,15 @@ class TrtllmMLAAttention(AttentionDescriptor):
 
         cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
 
-        return {
-            "kv_cache": KVPagedResourceHandler(
-                num_kv_heads=1,
-                head_dim=kv_lora_rank + qk_rope_head_dim,
-                dtype=cache_dtype,
-                kv_factor=1,
-                kv_layout="HND",
-            )
-        }
+        kv_handler = KVPagedResourceHandler(
+            num_kv_heads=1,
+            head_dim=kv_lora_rank + qk_rope_head_dim,
+            dtype=cache_dtype,
+            kv_factor=1,
+            kv_layout="HND",
+            attention_type=AttentionType.mla,
+        )
+        return {"kv_cache": kv_handler}
 
     @classmethod
     def get_host_prepare_metadata_function(

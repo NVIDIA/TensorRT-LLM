@@ -38,6 +38,11 @@ from ...utils.quantization_utils import ensure_tma_col_major
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
+def _extract_fusable_weight_names(linear_nodes: List[Node]) -> List[str]:
+    keys = [extract_weight_name(n) for n in linear_nodes]
+    return [key for key in keys if isinstance(key, str)]
+
+
 def _insert_fused_gemm(
     gm: GraphModule,
     idx: int,
@@ -72,7 +77,10 @@ def _insert_fused_gemm(
         Each bias must be 1D per-channel matching its weight's out_features.
         Stacked bias is the dim=0 concatenation, mirroring weight stacking.
     """
-    keys_unfused = [extract_weight_name(n) for n in linear_nodes]
+    keys_unfused = _extract_fusable_weight_names(linear_nodes)
+    if len(keys_unfused) != len(linear_nodes):
+        ad_logger.warning("Skipping GEMM fusion because at least one weight is not a parameter.")
+        return False
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
     sizes_unfused = [p.size(0) for p in params_unfused]
 
@@ -240,7 +248,12 @@ class QuantizationFusionMixin(ABC):
             allow_not_contigous: If True, split output via torch.narrow (zero-copy view).
                 If False, split via torch.narrow + .contiguous() (independent contiguous copies).
         """
-        keys_unfused = [extract_weight_name(n) for n in linear_nodes]
+        keys_unfused = _extract_fusable_weight_names(linear_nodes)
+        if len(keys_unfused) != len(linear_nodes):
+            ad_logger.warning(
+                "Skipping quantized GEMM fusion because at least one weight is not a parameter."
+            )
+            return False
         params_unfused = [gm.get_parameter(k) for k in keys_unfused]
         sizes_unfused = [p.size(0) for p in params_unfused]
         key_fused = f"fused_weight_{idx}"
@@ -477,11 +490,14 @@ class FuseGemmsMixedChildren(BaseTransform):
         grouped_nodes: Dict[tuple, List[Node]] = defaultdict(list)
         for node in gm.graph.nodes:
             if (is_linear_op(node) or is_fake_quantized_linear_op(node)) and node.args[2] is None:
+                weight_name = extract_weight_name(node)
+                if not isinstance(weight_name, str):
+                    continue
                 # Skip linears with a unit dimension (e.g., [1, H] scalar gates).
                 # A weight with dim=1 is effectively a lower-order tensor and
                 # should not be fused with proper matrix projections.
                 try:
-                    w = gm.get_parameter(extract_weight_name(node))
+                    w = gm.get_parameter(weight_name)
                     if any(d == 1 for d in w.shape):
                         continue
                 except (AttributeError, KeyError):

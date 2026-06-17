@@ -597,6 +597,8 @@ class FlashInferTrtllmGenAttention:
             attn.skip_softmax_threshold_scale_factor_prefill is not None
             or attn.skip_softmax_threshold_scale_factor_decode is not None
         )
+        if meta.is_cross:
+            return False, "trtllm-gen does not support cross attention."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
@@ -1301,11 +1303,15 @@ class FlashInferTrtllmGenAttention:
         query = params.qkv_input.view(batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk)
 
         bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
+        workspace_buffer = params.workspace.view(-1, 4)
+        _clear_multi_ctas_kv_counter_workspace(
+            workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
+        )
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
             kv_cache,  # kv_cache
-            params.workspace.view(-1, 4),  # workspace_buffer
+            workspace_buffer,  # workspace_buffer
             qk_nope_head_dim,  # qk_nope_head_dim
             kv_lora_rank,  # kv_lora_rank
             qk_rope_head_dim,  # qk_rope_head_dim

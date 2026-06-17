@@ -142,6 +142,10 @@ transforms:
     stage: sharding
     run_shape_prop: true
     allreduce_strategy: NCCL
+  pipeline_cache:
+    stage: sharding
+    enabled: true
+    root: null
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
@@ -329,5 +333,5 @@ transforms:
     expect_mem_change: true
     run_per_gm: false
     backend: torch-cudagraph
-    piecewise_enabled: false
+    piecewise_enabled: true
     piecewise_num_tokens: null
