@@ -168,6 +168,7 @@ async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
         def __init__(self) -> None:
             self.outputs = []
             self.prompt_token_ids = prompt_token_ids
+            self.error = None
 
         async def aresult(self):
             return self
