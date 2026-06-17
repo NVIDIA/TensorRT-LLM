@@ -89,9 +89,9 @@ def get_kv_cache_manager_cls(
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
-    sparse_attn_config = model_config.sparse_attention_config
-    if sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    sparse_attention_config = model_config.sparse_attention_config
+    if sparse_attention_config is not None:
+        return get_sparse_attn_kv_cache_manager(sparse_attention_config)
     elif is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
@@ -796,7 +796,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=self._sparse_attention_config,
+            sparse_attention_config=self._sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
@@ -935,7 +935,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=sparse_attn_config,
+            sparse_attention_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
@@ -1473,7 +1473,7 @@ def _create_kv_cache_manager(
         max_seq_len: int,
         max_batch_size: int,
         spec_config: Optional[SpeculativeConfig],
-        sparse_attn_config: Optional[SparseAttentionConfig],
+        sparse_attention_config: Optional[SparseAttentionConfig],
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -1622,7 +1622,8 @@ def _create_kv_cache_manager(
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
-            sparse_attn_config=sparse_attn_config,
+            sparse_attention_config=sparse_attention_config,
+            pretrained_config=config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
@@ -1808,7 +1809,8 @@ def _create_kv_cache_manager(
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
-            sparse_attn_config=sparse_attn_config,
+            sparse_attention_config=sparse_attention_config,
+            pretrained_config=config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
@@ -2038,8 +2040,8 @@ def create_py_executor_instance(
     # Register the compression manager (if one is configured) with the other
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.
-    kv_cache_compression_config = getattr(llm_args, "kv_cache_compression_config",
-                                          None)
+    kv_cache_compression_config = getattr(llm_args,
+                                          "kv_cache_compression_config", None)
     if kv_cache_compression_config is not None:
         compression_manager = create_kv_cache_compression_manager(
             kv_cache_compression_config, kv_cache_manager)

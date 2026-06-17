@@ -65,7 +65,7 @@ def _get_free_tcp_port() -> int:
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
     """Initialize the torch.distributed NCCL ProcessGroup for MegaMoE."""
-    if moe_backend.upper() != MoeBackendType.MEGAMOE.value:
+    if moe_backend.upper() != MoeBackendType.MEGAMOE_DEEPGEMM.value:
         return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for MegaMoE backend")

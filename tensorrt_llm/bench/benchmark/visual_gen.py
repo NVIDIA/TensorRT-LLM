@@ -57,8 +57,6 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 @click.command(name="visual-gen", context_settings={"show_default": True})
 @click.option(
     "--visual_gen_args",
-    "--extra_visual_gen_options",
-    "visual_gen_args",
     type=str,
     default=None,
     help="Path to a YAML file with VisualGen engine args "

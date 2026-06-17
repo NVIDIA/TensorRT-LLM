@@ -15,6 +15,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs, AttentionMask,
                         AttentionMetadata, PredefinedAttentionMask,
                         merge_attention_forward_args)
 from .sparse.kernel import triton_index_gather
+from .sparse.params import SparseParams
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -86,6 +87,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
+        sparse_params: Optional[SparseParams] = None,
         **kwargs,
     ):
         super().__init__(layer_idx,
@@ -94,6 +96,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                          num_kv_heads=num_kv_heads,
                          quant_config=quant_config,
                          **kwargs)
+        self.sparse_params = sparse_params
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.q_scaling = q_scaling
 
@@ -276,7 +279,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         # predict sparse kv indices
         sparse_kv_indices = None
-        if self.sparse_attention_config is not None:
+        if self.sparse_params is not None:
             sparse_kv_indices, kv_len = self._single_request_sparse_kv_predict(
                 q, k, v, metadata, past_seen_token, sample_idx)
 
@@ -287,7 +290,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         # predict sparse attn indices
         sparse_indices = None
-        if self.sparse_attention_config is not None:
+        if self.sparse_params is not None:
             sparse_indices, kv_len = self._single_request_sparse_attn_predict(
                 q, k, v, kv_cache_tensor, metadata, past_seen_token, sample_idx)
 
