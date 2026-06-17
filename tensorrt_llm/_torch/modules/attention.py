@@ -102,6 +102,8 @@ def attn_custom_op_inplace(
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
+    relative_attention_bias: Optional[torch.Tensor],
+    relative_attention_max_distance: int,
     layer_idx: str,
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
@@ -112,18 +114,22 @@ def attn_custom_op_inplace(
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
         attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(q,
-                          k,
-                          v,
-                          metadata,
-                          mask,
-                          mrope_rotary_cos_sin,
-                          mrope_position_deltas,
-                          attention_window_size,
-                          attention_mask_data,
-                          output=output,
-                          output_sf=output_sf,
-                          attention_sinks=attention_sinks)
+    attn_layer._attn_impl(
+        q,
+        k,
+        v,
+        metadata,
+        mask,
+        mrope_rotary_cos_sin,
+        mrope_position_deltas,
+        attention_window_size,
+        attention_mask_data,
+        output=output,
+        output_sf=output_sf,
+        attention_sinks=attention_sinks,
+        relative_attention_bias=relative_attention_bias,
+        relative_attention_max_distance=relative_attention_max_distance,
+    )
 
 
 def _helix_post_process(
@@ -608,7 +614,10 @@ class Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params if self.rope_fusion else None,
+            pos_embd_params=(self.pos_embd_params if self.rope_fusion or
+                             (self.pos_embd_params is not None
+                              and not self.pos_embd_params.type.is_rope()) else
+                             None),
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -698,6 +707,8 @@ class Attention(nn.Module):
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
         multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
@@ -736,6 +747,9 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
+                    relative_attention_bias=relative_attention_bias,
+                    relative_attention_max_distance=
+                    relative_attention_max_distance,
                     multi_item_part_lens=multi_item_part_lens,
                 ))
             if isinstance(attn_output, tuple):
@@ -783,6 +797,8 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
                 multi_item_part_lens=multi_item_part_lens,
             ))
         if isinstance(attn_output, tuple):
@@ -803,6 +819,8 @@ class Attention(nn.Module):
         attention_mask_data: Optional[torch.Tensor],
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
         multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
@@ -836,6 +854,8 @@ class Attention(nn.Module):
                 attention_window_size,
                 attention_mask_data,
                 attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
                 self.layer_idx_str,
                 output,
                 output_sf,
@@ -852,6 +872,8 @@ class Attention(nn.Module):
                 attention_window_size,
                 attention_mask_data,
                 attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
                 multi_item_part_lens=multi_item_part_lens,
             )
@@ -872,6 +894,8 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         multi_item_part_lens: Optional[list[list[int]]] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -956,6 +980,8 @@ class Attention(nn.Module):
             assert self.attn_backend == "TRTLLM", (
                 f"Attention sinks are only supported with attn_backend='TRTLLM'. "
                 f"Current backend: {self.attn_backend}.")
+        if relative_attention_bias is not None:
+            assert self.attn_backend == "TRTLLM", "Relative attention bias is only supported for TRTLLM backend."
 
         attn_output = self.forward_impl(
             q,
@@ -967,6 +993,8 @@ class Attention(nn.Module):
             attention_mask_data,
             mrope_config=mrope_config,
             attention_sinks=attention_sinks,
+            relative_attention_bias=relative_attention_bias,
+            relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
             multi_item_part_lens=multi_item_part_lens,
         )

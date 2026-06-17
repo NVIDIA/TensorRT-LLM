@@ -22,9 +22,9 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        AttentionSparseArgs, KVCacheParams, MLAParams,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, merge_attention_forward_args)
+                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams,
+                        merge_attention_forward_args)
 
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
@@ -44,10 +44,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
 # ``thop.attention`` kwargs hard-wired to a literal at the call site (no
 # rich object owns them). Sync test enforces both the kwarg name and the
 # literal value.
-_THOP_LITERALS: dict = {
-    "sparse_mla_topk_lens": None,
-    "compressed_kv_cache_pool_ptr": None,
-}
+_THOP_LITERALS: dict = {}
 
 
 @functools.cache
@@ -114,6 +111,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_dec_dynamic_tree: bool = False
 
     # parameters required for spec-dec mode
+    max_total_draft_tokens: Optional[int] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
     # C++ attention op requires a 2-D position_offsets tensor and reads
     # sizes()[1] as the generation length / packed-mask row stride.
@@ -1631,6 +1629,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 spec_decoding_bl_tree_mask_offset=metadata.
                 spec_decoding_bl_tree_mask_offset,
                 spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
+                spec_decoding_target_max_draft_tokens=metadata.
+                max_total_draft_tokens,
                 spec_bl_tree_first_sparse_mask_offset_kv=metadata.
                 spec_bl_tree_first_sparse_mask_offset_kv,
                 num_sparse_topk=metadata.num_sparse_topk,
@@ -1676,9 +1676,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 update_kv_cache=forward_args.update_kv_cache,
                 cross_kv=forward_args.cross_kv,
                 relative_attention_bias=forward_args.relative_attention_bias,
-                relative_attention_max_distance=(
-                    forward_args.relative_attention_max_distance),
-
+                relative_attention_max_distance=forward_args.
+                relative_attention_max_distance,
+                position_embedding_type=self.position_embedding_type,
                 # --- Module config (TrtllmAttention) ---
                 rotary_inv_freq=self.rotary_inv_freq,
                 rotary_cos_sin=self.rotary_cos_sin,
@@ -1689,7 +1689,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 head_size=self.head_dim,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=self.position_embedding_type,
                 rope_dim=self.rope_dim,
                 rope_base=self.rope_base,
                 rope_scale_type=self.rope_scale_type,
@@ -1719,14 +1718,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_offsets=forward_args.sparse.sparse_attn_offsets,
                 sparse_attn_indices_block_size=forward_args.sparse.
                 sparse_attn_indices_block_size,
+                sparse_mla_topk_lens=forward_args.sparse.sparse_mla_topk_lens,
+                compressed_kv_cache_pool_ptr=forward_args.sparse.
+                compressed_kv_cache_pool_ptr,
 
-                # --- Literals intentionally None (see _THOP_LITERALS) ---
-                # ``sparse_mla_topk_lens`` and ``compressed_kv_cache_pool_ptr``
-                # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
-                sparse_mla_topk_lens=None,
-                compressed_kv_cache_pool_ptr=None,
-                spec_decoding_target_max_draft_tokens=getattr(
-                    metadata, 'max_total_draft_tokens', None),
+                # --- Literals intentionally in _THOP_LITERALS ---
             )
 
         if self.print_skip_softmax_stat:
@@ -1811,14 +1807,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
                                                       forward_args)
-            forward_args.sparse = AttentionSparseArgs(
-                sparse_kv_indices=kv_idx,
-                sparse_kv_offsets=kv_off,
-                sparse_attn_indices=at_idx,
-                sparse_attn_offsets=at_off,
-                sparse_attn_indices_block_size=self.sparse_attention_config.
-                get_indices_block_size(),
-            )
+            sparse_args = forward_args.sparse
+            sparse_args.sparse_kv_indices = kv_idx
+            sparse_args.sparse_kv_offsets = kv_off
+            sparse_args.sparse_attn_indices = at_idx
+            sparse_args.sparse_attn_offsets = at_off
+            sparse_args.sparse_attn_indices_block_size = (
+                self.sparse_attention_config.get_indices_block_size())
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
