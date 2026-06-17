@@ -5996,7 +5996,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - (None, None)   single-CTA.
             - (None, tensor) single-CTA + sort indirect; ``order_row`` is a
               descending argsort of ``seq_lens`` (shape == seq_lens.shape).
-            - (tensor, ts)   LB; ``order_row`` is the long-first partition
+            - (tensor, tensor) LB; ``order_row`` is the long-first partition
               from ``cute_dsl_gvr_topk_lb_prepare`` (shape == max_batch_size;
               valid prefix in ``counters`` = [n_long, n_short]).
 
