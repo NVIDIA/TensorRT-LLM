@@ -1579,7 +1579,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """
 
             self._temp_data.max_lens.append(
-                min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+                min(self._max_seq_len, request.py_orig_prompt_len + request.py_max_new_tokens)
             )
             self._temp_data.end_ids.append(
                 end_id if (end_id := request.py_end_id) is not None else -1
@@ -3050,8 +3050,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #        filtering of vocab_size logits, out of vocab_size in
         #        total. The 'sample' below should generally be avoided
         #        by retaining the draft_probs during drafting (TRTLLM-7772).
-        draft_sampling_strategy = (
-            ("greedy", None)
+        draft_sampling_strategy: Strategy = (
+            GREEDY
             if request.py_draft_use_greedy_sampling
             else _request_strategy(request, vocab_size=2**31)
         )
