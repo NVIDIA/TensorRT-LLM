@@ -872,6 +872,17 @@ class ChoiceWithAlias(click.Choice):
         "used as the model name. This is useful when the model path is long or "
         "when you want to expose a custom name to clients.", "prototype"))
 @click.option(
+    "--enable_visual_gen",
+    is_flag=True,
+    default=False,
+    help=help_info_with_stability_tag(
+        "Enable VisualGen runtime for model checkpoints that support both LLM "
+        "and Visual Generation. Not required if --visual_gen_args specified "
+        "or the model supports Visual Generation only.",
+        "prototype",
+    ),
+)
+@click.option(
     "--visual_gen_args",
     "--extra_visual_gen_options",
     "visual_gen_args",
@@ -914,7 +925,8 @@ def serve(
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
-        served_model_name: Optional[str], visual_gen_args: Optional[str]):
+        served_model_name: Optional[str], enable_visual_gen: bool,
+        visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1094,8 +1106,8 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = visual_gen_args is not None or get_is_diffusion_only_model(
-        model)
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
     if is_visual_gen:
         _serve_visual_gen()
     else:
