@@ -49,6 +49,7 @@ l0_a10:
   - unittest/inputs/test_content_format.py
   - unittest/inputs/test_url_validation.py
   - unittest/inputs/test_multimodal.py
+  - unittest/inputs/test_multimodal_input_processor.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py

@@ -1,10 +1,11 @@
-"""Unit tests for the deterministic math hooks on `BaseMultimodalInputProcessor`.
+"""Unit tests for the base multimodal input-processor mixins.
 
-`get_num_mm_tokens` (pre-merger encoder attention tokens) and
-`spatial_merge_unit` are the single source of truth for the encoder-side
-math used by both the hashing path (`get_num_tokens_per_image` /
-`get_num_tokens_per_video`) and the dummy-sizing path (the
-`BaseMultimodalDummyInputsBuilder` mixin). These tests pin the contract:
+A concrete multimodal input processor inherits both
+:class:`BaseMultimodalInputProcessor` (the token-counting math) and
+:class:`BaseMultimodalDummyInputsBuilder` (the KV-cache profiling dummy
+contract); these tests pin the default behavior of both.
+
+Token-counting (`BaseMultimodalInputProcessor`):
 
 * Defaults — ``get_num_mm_tokens`` raises ``NotImplementedError``,
   ``spatial_merge_unit`` is 1.
@@ -15,6 +16,15 @@ math used by both the hashing path (`get_num_tokens_per_image` /
   ``get_num_mm_tokens``, ``get_num_tokens_per_image`` delegates to the
   HF processor's ``_get_num_multimodal_tokens`` as before (preserving
   behavior for non-migrated models).
+
+Dummy contract (`BaseMultimodalDummyInputsBuilder`):
+
+* Defaults — the modality-agnostic profiler hooks
+  ``get_mm_max_tokens_per_item`` (returns ``{}``) and
+  ``get_dummy_mm_data_for_tokens`` (raises ``NotImplementedError``) mean
+  "no direct encoder profiling" (text-only dummy fallback) until a subclass
+  opts in. Modality-specific helpers (vision's ``get_size_for_max_tokens`` /
+  ``get_dummy_mm_data_for_size``) live on the concrete processor.
 """
 
 from types import SimpleNamespace
@@ -23,7 +33,10 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.inputs.registry import (
+    BaseMultimodalDummyInputsBuilder,
+    BaseMultimodalInputProcessor,
+)
 
 
 def _make_subclass(
@@ -60,6 +73,9 @@ def _make_subclass(
             return None
 
         def __call__(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def call_with_text_prompt(self, *args, **kwargs):
             raise NotImplementedError
 
         @property
@@ -137,3 +153,36 @@ def test_get_num_tokens_per_video_falls_back_to_hf_processor():
     frames = [Image.new("RGB", (8, 6)) for _ in range(3)]
     assert sub.get_num_tokens_per_video(video=frames) == 777
     sub._processor._get_num_multimodal_tokens.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Dummy contract defaults (BaseMultimodalDummyInputsBuilder).
+# ---------------------------------------------------------------------------
+class _StubBuilder(BaseMultimodalDummyInputsBuilder):
+    """Minimal concrete builder that satisfies the abstract properties.
+
+    Doesn't run any real processor / tokenizer — these tests only exercise the
+    default base-class behavior, never a deterministic-sizing implementation.
+    """
+
+    @property
+    def tokenizer(self):
+        return None
+
+    @property
+    def config(self):
+        return None
+
+    @property
+    def model_path(self):
+        return ""
+
+
+def test_get_mm_max_tokens_per_item_default_empty():
+    assert _StubBuilder().get_mm_max_tokens_per_item() == {}
+
+
+def test_get_dummy_mm_data_for_tokens_default_raises_not_implemented():
+    builder = _StubBuilder()
+    with pytest.raises(NotImplementedError):
+        builder.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"image": 1024})
