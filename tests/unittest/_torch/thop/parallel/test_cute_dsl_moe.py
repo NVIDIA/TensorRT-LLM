@@ -61,40 +61,55 @@ def test_ghost_token_zero_allocation():
     num_local_experts = num_experts // ep_size
 
     helper = GroupedGemmInputsHelper(num_experts, top_k, num_local_experts, 0, 128)
-    num_tokens_per_expert = helper.generate_num_tokens_per_expert(
-        1, approx_max_load=True)
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(1, approx_max_load=True)
     result = helper.generate_token_selected_experts(1, num_tokens_per_expert)
 
     assigned_experts = result[result >= 0].tolist()
     for j, count in enumerate(num_tokens_per_expert):
         if count == 0:
             assert j not in assigned_experts, (
-                f"Expert {j} has 0 allocated tokens but was assigned to a token")
+                f"Expert {j} has 0 allocated tokens but was assigned to a token"
+            )
 
 
-def test_prioritization_uses_global_index():
-    """Bug 2: prioritization must use global expert index, not local."""
-    num_experts = 256
-    top_k = 8
-    ep_size = 16
-    num_local_experts = num_experts // ep_size
-    local_expert_offset = num_local_experts
+def test_prioritization_rescues_at_risk_tokens():
+    """Bug 2: the at-risk-token prioritization must use the GLOBAL expert index.
+
+    With the local index ``j``, the threshold ``top_k - (num_experts - j)`` stays
+    negative on any rank where ``num_local_experts < num_experts``, so
+    ``prioritized`` is always empty and the prioritization is dead code. On this
+    last rank (offset == num_experts - num_local_experts) the global-index fix
+    lets prioritization rescue at-risk tokens, so more of them reach ``top_k``:
+    here 3 tokens fill to top_k instead of 2. Reverting ``global_j`` back to ``j``
+    regresses fully-filled from 3 to 2, so this asserts the global-index behavior
+    rather than only the (offset-invariant) expert-id range.
+    """
+    num_experts = 4
+    top_k = 2
+    num_local_experts = 2
+    local_expert_offset = num_experts - num_local_experts  # last rank of ep=2
+    num_tokens = 4
 
     helper = GroupedGemmInputsHelper(
-        num_experts, top_k, num_local_experts, local_expert_offset, 128)
-    num_tokens_per_expert = helper.generate_num_tokens_per_expert(
-        1, approx_max_load=True)
-    result = helper.generate_token_selected_experts(1, num_tokens_per_expert)
+        num_experts, top_k, num_local_experts, local_expert_offset, 128
+    )
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_tokens, approx_max_load=True)
+    result = helper.generate_token_selected_experts(num_tokens, num_tokens_per_expert)
 
-    assigned = set(result[result >= 0].tolist())
-    expected = {
-        local_expert_offset + j
-        for j, count in enumerate(num_tokens_per_expert)
-        if int(count) > 0
-    }
-    assert assigned.issubset(expected), (
-        f"Assigned experts {sorted(assigned)} are not a subset of expected "
-        f"global experts {sorted(expected)}"
+    # Assigned experts must stay within this rank's global expert range.
+    assigned = result[result >= 0].tolist()
+    assert all(local_expert_offset <= e < num_experts for e in assigned), (
+        f"Assigned experts {sorted(set(assigned))} fall outside this rank's "
+        f"global range [{local_expert_offset}, {num_experts})"
+    )
+
+    # Global-index prioritization fills more tokens to top_k than the local-index
+    # bug, which leaves prioritization dead and strands an at-risk token.
+    num_selected = (result >= 0).sum(dim=-1)
+    fully_filled = int((num_selected == top_k).sum())
+    assert fully_filled == 3, (
+        f"expected 3 tokens filled to top_k via global-index prioritization, "
+        f"got {fully_filled} (local-index regression yields 2)"
     )
 
 
