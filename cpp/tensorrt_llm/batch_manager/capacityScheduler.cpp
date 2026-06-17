@@ -384,8 +384,12 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     std::unordered_set<uint64_t> seenTaskIds;
 
     // Keep track of blocks contributed by requests in context phase
-    auto [newlyContributedContextBlocks, newlyContributedCrossContextBlocks]
-        = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager);
+    std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks, newlyContributedCrossContextBlocks;
+    if (skippingIsRelevant)
+    {
+        std::tie(newlyContributedContextBlocks, newlyContributedCrossContextBlocks)
+            = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager);
+    }
 
     // Find last active in case we need to evict
     auto startedReqLambda = [this](std::shared_ptr<LlmRequest> const& req)
