@@ -793,7 +793,9 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
         # Save attn/spec metadata before the draft loop mutates it.
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        original_force_prepare_spec_dec_tree_mask = attn_metadata.force_prepare_spec_dec_tree_mask
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        attn_metadata.force_prepare_spec_dec_tree_mask = True
 
         # (c) Run the MTP draft tree loop -> build + store the next tree.
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
@@ -815,6 +817,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         # Restore attn metadata to support cuda graph.
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+        attn_metadata.force_prepare_spec_dec_tree_mask = original_force_prepare_spec_dec_tree_mask
         attn_metadata.use_spec_decoding = True
 
         # (d) Prepare next_new_tokens for overlap scheduler.

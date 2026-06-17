@@ -501,6 +501,7 @@ public:
     int32_t mSpecDecodingMaxGenerationLength = 1;
     // Static spec-dec tree length used by FMHA autotuning.
     int32_t mSpecDecodingTargetMaxGenLen = 0;
+    bool mForcePrepareSpecDecTreeMask = false;
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;

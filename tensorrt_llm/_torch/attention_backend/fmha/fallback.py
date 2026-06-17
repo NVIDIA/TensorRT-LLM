@@ -107,6 +107,7 @@ class FallbackFmha(Fmha):
             spec_decoding_bl_tree_mask_offset=metadata.spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
             spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
+            force_prepare_spec_dec_tree_mask=metadata.force_prepare_spec_dec_tree_mask,
             spec_bl_tree_first_sparse_mask_offset_kv=metadata.spec_bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=metadata.num_sparse_topk,
             flash_mla_tile_scheduler_metadata=metadata.flash_mla_tile_scheduler_metadata,

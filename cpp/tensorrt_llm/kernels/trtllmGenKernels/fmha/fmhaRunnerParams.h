@@ -343,6 +343,7 @@ struct TllmGenFmhaRunnerParams
     // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
     int32_t mPackedMaskMaxSeqLenQ = 0;
     int32_t mSpecDecodingTargetMaxGenLen = 0;
+    bool mForcePrepareSpecDecTreeMask = false;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

@@ -63,6 +63,7 @@ struct XQAParams
     int64_t* spec_decoding_bl_tree_mask_offset;        // for blackwell spec-dec tree mask offset
     uint32_t* spec_decoding_bl_tree_mask;              // for blackwell spec-dec tree mask
     int32_t* spec_bl_tree_first_sparse_mask_offset_kv; // for blackwell spec-dec tree first sparse mask offset kv
+    bool force_prepare_spec_dec_tree_mask = false;
     int32_t const* mrope_position_deltas = nullptr;
     // Helix parallelism params.
     int32_t const* helix_position_offsets = nullptr;

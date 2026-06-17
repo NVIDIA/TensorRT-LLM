@@ -497,7 +497,7 @@ public:
 
         // Prepare custom mask for spec-decoding generation kernels if needed.
         bool const prepareSpecDecTreeMask = params.mIsSpecDecTree
-            && (params.mLayerIdx == 0
+            && (params.mForcePrepareSpecDecTreeMask || params.mLayerIdx == 0
                 || (params.mSpecDecodingTargetMaxGenLen > 0
                     && params.mMaxSeqLenQ != params.mSpecDecodingTargetMaxGenLen));
         if (prepareSpecDecTreeMask)

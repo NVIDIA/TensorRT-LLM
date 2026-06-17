@@ -106,6 +106,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
+    force_prepare_spec_dec_tree_mask: bool = False
 
     # parameters required for spec-dec mode
     max_total_draft_tokens: Optional[int] = None
