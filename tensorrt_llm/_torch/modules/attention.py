@@ -614,8 +614,8 @@ class Attention(nn.Module):
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 
-        attn_cls = get_attention_backend(
-            self.attn_backend, sparse_attention_config=sparse_attn_cfg)
+        attn_cls = get_attention_backend(self.attn_backend,
+                                         sparse_params=sparse_params)
 
         self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
 
@@ -686,7 +686,6 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
-            attn_cls=attn_cls,
             sparse_params=sparse_params,
         )
 

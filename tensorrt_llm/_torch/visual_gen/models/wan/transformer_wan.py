@@ -670,7 +670,6 @@ class WanTransformer3DModel(BaseDiffusionModel):
         Args:
             timestep: Normalized scheduler timestep tensor in [0, 1].
         """
-        del kwargs  # Kept for diffusers API compatibility.
         original_shape = hidden_states.shape
         B, C, T, H, W = original_shape
         pt, ph, pw = self.config.patch_size

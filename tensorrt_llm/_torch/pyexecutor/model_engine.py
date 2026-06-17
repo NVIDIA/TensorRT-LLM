@@ -504,9 +504,11 @@ class PyTorchModelEngine(ModelEngine):
                                                          dtype=torch.int,
                                                          device='cuda')
 
-        self.attn_backend = get_attention_backend(
-            self.llm_args.attn_backend,
-            sparse_attention_config=self.sparse_attention_config)
+        sparse_params = (self.sparse_attention_config.to_sparse_params(
+            pretrained_config=self.model.model_config.pretrained_config)
+                         if self.sparse_attention_config is not None else None)
+        self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
+                                                  sparse_params=sparse_params)
 
         self.spec_metadata = None
         if self.is_spec_decode:
@@ -1839,7 +1841,7 @@ class PyTorchModelEngine(ModelEngine):
             # Cache the no-cache metadata.
             if self.encoder_attn_metadata is not None:
                 return self.encoder_attn_metadata
-            metadata_kwargs = dict(
+            self.encoder_attn_metadata = metadata_cls(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
@@ -1852,7 +1854,6 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection=cache_indirection,
                 num_heads_per_kv=num_heads_per_kv,
                 sparse_metadata_params=sparse_metadata_params)
-            self.encoder_attn_metadata = metadata_cls(**metadata_kwargs)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -1863,7 +1864,7 @@ class PyTorchModelEngine(ModelEngine):
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        metadata_kwargs = dict(
+        self.attn_metadata = metadata_cls(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
@@ -1877,7 +1878,6 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
-        self.attn_metadata = metadata_cls(**metadata_kwargs)
 
         return self.attn_metadata
 
