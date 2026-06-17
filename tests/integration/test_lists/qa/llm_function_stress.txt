@@ -5,6 +5,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-outp
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_eagle_trtllm_stress]
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_triton_stress]
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_5_4b_fp8_stress]
+disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-glm5_nvfp4_tp4_ep4_dp_stress]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_fp8_8gpus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1LongBenchV2::test_nvfp4_4gpus
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4_longseq_trtllm_moe_stress

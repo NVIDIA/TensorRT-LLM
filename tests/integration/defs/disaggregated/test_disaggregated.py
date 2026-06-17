@@ -308,6 +308,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_triton.yaml",
         "qwen3_5_4b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
+        "glm5_nvfp4_tp4_ep4_dp_stress":
+        f"{test_configs_root}/disagg_config_ctxtp4ep4_gentp4ep4_glm5_nvfp4_dp_tllm.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
@@ -2349,6 +2351,13 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             cancellation_rate=10,
                             cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
+    pytest.param(TestConfig(model_path='GLM-5-NVFP4',
+                            test_desc='glm5_nvfp4_tp4_ep4_dp_stress',
+                            request_count=35000,
+                            accuracy_threshold=0.90,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
 ],
                          ids=lambda x: x.test_desc)
 @pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
