@@ -60,6 +60,9 @@ l0_dgx_b300_ds:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] TIMEOUT (120)
   # Same TP=4 EP=4 ADP layout with DG's fused fp8_fp4_mega_moe backend.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM] TIMEOUT (120)
+  # DG W4A4 / MXFP4-activation MegaMoE path. Isolate because it flips DG env
+  # knobs that affect process-global JIT selection and SymmBuffer layout.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mxfp4_acts_4gpus_static_eplb TIMEOUT (120) ISOLATION
   # Known issues (uncomment when unblocked):
   # * V4-Flash-Base FP8 + EPLB hits CUBLAS_STATUS_EXECUTION_FAILED in
   #   forward pass with WIDEEP backend (memory pressure aside).
