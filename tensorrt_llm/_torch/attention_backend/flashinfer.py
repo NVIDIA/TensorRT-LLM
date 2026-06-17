@@ -1,10 +1,15 @@
 import functools
 import math
 import os
+import sys
 import weakref
 from dataclasses import dataclass, field
-from typing import (Any, Dict, Literal, NewType, Optional, TypeAlias, cast,
-                    override)
+from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 import flashinfer
 import torch
