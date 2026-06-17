@@ -2327,15 +2327,12 @@ class Indexer(nn.Module):
         return q_pe, q_nope, k_pe, k_nope
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate, rotate, and FP8 quantize for Q or K.
-
-        The FP8 path is intentionally unfused (cat -> rotate -> quantize) so the
-        Hadamard rotate_activation is applied. The fused_cat_fp8 kernel added in
-        #11899 omits the rotation, which is the regression tracked by #13061.
-        FP4 keeps the fused cat+quantize (rotation TODO).
-        """
+        """Concatenate, rotate, and FP8 quantize for Q or K."""
         if self.use_fp4:
+            # FP4 stays fused; Hadamard rotation not applied here yet (follow-up).
             return torch.ops.trtllm.fused_cat_fp4(qk_pe, qk_nope)
+        # Unfused so the Hadamard rotation runs between cat and quantize;
+        # the fused_cat_fp8 kernel skips it (see #13061).
         q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
         q_or_k = rotate_activation(q_or_k)
         q_or_k = q_or_k.view(-1, self.head_dim)
