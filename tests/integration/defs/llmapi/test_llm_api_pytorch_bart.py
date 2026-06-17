@@ -27,7 +27,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig,
 )
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import llm_models_root
 
 _SOURCE_TEXT = (
     "Summarize: NVIDIA builds fast inference software for large language models. "
@@ -122,40 +122,6 @@ _TEST_CASES = [
     ),
 ]
 
-_TRTLLM_GEN_TEST_CASES = [
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-greedy",
-        marks=skip_pre_blackwell,
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        feature_id="trtllm-gen-bf16-kv-v1-cuda-graph-off-beam2",
-        marks=skip_pre_blackwell,
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        kv_cache_dtype="fp8",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=False,
-        feature_id="trtllm-gen-bf16-fp8kv-kv-v1-cuda-graph-off-greedy",
-        marks=skip_pre_blackwell,
-    ),
-]
-
 
 def _mixed_batch_test_case(
     torch_dtype: str,
@@ -231,14 +197,6 @@ def _cuda_graph_config(
     batch_sizes: list[int] | None = None,
 ) -> CudaGraphConfig | None:
     return CudaGraphConfig(batch_sizes=batch_sizes or [1]) if enabled else None
-
-
-def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1")
-
-    from tensorrt_llm._torch.attention_backend import trtllm
-
-    monkeypatch.setattr(trtllm, "_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", True)
 
 
 def _assert_bart_response(
@@ -372,36 +330,6 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     exact_match: bool,
     kv_cache_dtype: str,
 ) -> None:
-    _run_bart_pytorch_generate_encoder_decoder(
-        monkeypatch,
-        expected_output_token_ids_by_output,
-        torch_dtype,
-        use_kv_cache_manager_v2,
-        enable_cuda_graph,
-        num_beams,
-        num_return_sequences,
-        exact_match,
-        kv_cache_dtype,
-    )
-
-
-@pytest.mark.parametrize(
-    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,kv_cache_dtype",
-    _TRTLLM_GEN_TEST_CASES,
-)
-def test_bart_pytorch_generate_encoder_decoder_trtllm_gen_attention(
-    monkeypatch: pytest.MonkeyPatch,
-    expected_output_token_ids_by_output: list[list[int]] | None,
-    torch_dtype: str,
-    use_kv_cache_manager_v2: bool,
-    enable_cuda_graph: bool,
-    num_beams: int,
-    num_return_sequences: int,
-    exact_match: bool,
-    kv_cache_dtype: str,
-) -> None:
-    _enable_trtllm_gen_attention(monkeypatch)
     _run_bart_pytorch_generate_encoder_decoder(
         monkeypatch,
         expected_output_token_ids_by_output,
