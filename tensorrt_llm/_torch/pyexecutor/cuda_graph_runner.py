@@ -8,7 +8,8 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
-                                          DecodingBaseConfig)
+                                          DecodingBaseConfig,
+                                          SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -150,8 +151,8 @@ class CUDAGraphRunner:
             self,
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None):
-        if self.sparse_config is not None and self.sparse_config.needs_separate_short_long_cuda_graphs(
-        ):
+        if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
+                and self.sparse_config.needs_separate_short_long_cuda_graphs()):
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
             # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
             # computational overhead. To support this feature, we need to capture separate CUDA graphs for short

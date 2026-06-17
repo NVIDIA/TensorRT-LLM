@@ -593,10 +593,9 @@ class FlashInferTrtllmGenAttention:
         fwd: AttentionForwardArgs,
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
-        has_skip_softmax = (
-            attn.skip_softmax_threshold_scale_factor_prefill is not None
-            or attn.skip_softmax_threshold_scale_factor_decode is not None
-        )
+        sparse_params = attn.sparse_params
+        has_skip_softmax = getattr(sparse_params, "algorithm", None) == "skip_softmax"
+        has_sparse_attention = sparse_params is not None and not has_skip_softmax
         if meta.is_cross:
             return False, "trtllm-gen does not support cross attention."
         if (
@@ -607,12 +606,13 @@ class FlashInferTrtllmGenAttention:
             return False, "trtllm-gen does not support sage attention."
         if meta.helix_position_offsets is not None:
             return False, "trtllm-gen does not support helix parallelism."
-        sparse_kv_indices = fwd.sparse.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse.sparse_attn_indices
+        sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
+        sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
         if (
             (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
             or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
             or meta.num_sparse_topk > 0
+            or has_sparse_attention
         ):
             return False, "trtllm-gen does not support sparse attention."
         if has_skip_softmax:

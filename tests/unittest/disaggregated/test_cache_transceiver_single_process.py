@@ -105,6 +105,7 @@ class KvCacheConfigV2:
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
+    disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
 
 
@@ -1041,14 +1042,6 @@ def test_cache_transceiver(
             "V1 KVCacheManager + MLA + sliding window: "
             "blocks_per_window key mismatch for non-SELF cache types"
         )
-
-    # # V2 + sliding window causes infinite loop in
-    # # KVCacheManagerV2.get_num_available_tokens -> clamp_max_seq_len_for_mem
-    # if use_v2 and max_attention_window_vec is not None:
-    #     pytest.skip(
-    #         "KVCacheManagerV2 + sliding window: infinite loop in "
-    #         "clamp_max_seq_len_for_mem (known issue)"
-    #     )
 
     print(
         f"\nRunning transfer test: "
