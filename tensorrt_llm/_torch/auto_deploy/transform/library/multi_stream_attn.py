@@ -170,6 +170,25 @@ def _get_output_feature_dim(node: Node) -> int:
     return 0
 
 
+def _build_aux_stream_all_gather_args(kv_ag: Node, new_input: Node) -> tuple:
+    """Build all_gather args for the aux-stream KV path, backend-aware.
+
+    ``trtllm_dist_all_gather`` signature:
+        (tensor, strategy, dim=0, sizes=None, workspace_id=0)
+
+    ``torch_dist_all_gather`` signature:
+        (tensor, dim=0, sizes=None)
+    """
+    if is_op(kv_ag, torch.ops.auto_deploy.trtllm_dist_all_gather):
+        ag_strategy = kv_ag.args[1] if len(kv_ag.args) > 1 else "AUTO"
+        ag_dim = kv_ag.args[2] if len(kv_ag.args) > 2 else -1
+        ag_sizes = kv_ag.args[3] if len(kv_ag.args) > 3 else None
+        return (new_input, ag_strategy, ag_dim, ag_sizes, _AUX_WORKSPACE_ID)
+
+    # torch_dist_all_gather — preserve dim/sizes, no strategy or workspace_id.
+    return (new_input,) + tuple(kv_ag.args[1:])
+
+
 def _find_downstream_node(
     start: Node, predicate: Callable[[Node], bool], max_depth: int = 2
 ) -> Optional[Node]:
@@ -255,8 +274,6 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
             ad_logger.warning(f"No AllGather found downstream of {kv_linear.name}, skipping")
             continue
 
-        ag_dim = kv_ag.args[1] if len(kv_ag.args) > 1 else -1
-
         ad_logger.info(
             f"Multi-stream MLA pattern 0 (unfused): "
             f"Q={q_linear.name} (dim={_get_output_feature_dim(q_linear)}), "
@@ -293,11 +310,9 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
             for k, v in kv_linear.meta.items():
                 new_kv_gemm.meta[k] = v
 
-            ag_sizes = kv_ag.args[2] if len(kv_ag.args) > 2 else None
-            ag_strategy = kv_ag.args[3] if len(kv_ag.args) > 3 else "AUTO"
             new_kv_ag = graph.call_function(
                 kv_ag.target,
-                args=(new_kv_gemm, ag_dim, ag_sizes, ag_strategy, _AUX_WORKSPACE_ID),
+                args=_build_aux_stream_all_gather_args(kv_ag, new_kv_gemm),
             )
             for k, v in kv_ag.meta.items():
                 new_kv_ag.meta[k] = v
