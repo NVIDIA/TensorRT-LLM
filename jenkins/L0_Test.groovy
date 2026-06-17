@@ -3491,12 +3491,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 }
             }
             stage("Create Perf Report") {
-                sh """
-                    python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
-                    --output_path ${stageName}/report.pdf \
-                    --files ${stageName}/perf_script_test_results.csv \
-                    ${basePerfPath}
-                """
+                if (fileExists("${stageName}/perf_script_test_results.csv")) {
+                    sh """
+                        python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
+                        --output_path ${stageName}/report.pdf \
+                        --files ${stageName}/perf_script_test_results.csv \
+                        ${basePerfPath}
+                    """
+                } else {
+                    echo "No perf script test results to create report"
+                }
             }
         }
     }
