@@ -379,8 +379,9 @@ class MegaMoEDeepGemm(MoE):
         ``__init__`` synchronously during model build. Rank 0 picks a
         free port and bcasts (host, port) so single- and multi-node both
         work; the retry on RuntimeError absorbs the close()→bind() race
-        on busy hosts. ``device_id`` uses intra-node local rank because
-        ``global_rank % device_count`` is wrong on multi-node launches.
+        on busy hosts. The current CUDA device is set from intra-node
+        local rank because ``global_rank % device_count`` is wrong on
+        multi-node launches.
         """
         try:
             from mpi4py import MPI
@@ -395,6 +396,7 @@ class MegaMoEDeepGemm(MoE):
         try:
             local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
             local_rank = local_comm.Get_rank()
+            local_world_size = local_comm.Get_size()
         except Exception:
             local_rank = int(
                 os.environ.get(
@@ -404,13 +406,42 @@ class MegaMoEDeepGemm(MoE):
                     ),
                 )
             )
+            local_world_size = int(
+                os.environ.get(
+                    "OMPI_COMM_WORLD_LOCAL_SIZE",
+                    os.environ.get("MV2_COMM_WORLD_LOCAL_SIZE", world_size),
+                )
+            )
+
+        def _resolve_rendezvous_host() -> str:
+            if local_world_size == world_size:
+                return "127.0.0.1"
+
+            hostname = socket.gethostname()
+            try:
+                return socket.gethostbyname(hostname)
+            except socket.gaierror:
+                pass
+
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.connect(("8.8.8.8", 80))
+                    return sock.getsockname()[0]
+            except OSError:
+                logger.warning(
+                    "[MegaMoE] Could not resolve hostname %s for MPI "
+                    "rendezvous; falling back to 127.0.0.1. Multi-node "
+                    "launches should set MASTER_ADDR explicitly.",
+                    hostname,
+                )
+                return "127.0.0.1"
 
         def _pick_rendezvous():
             if rank == 0:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     sock.bind(("", 0))
                     port = sock.getsockname()[1]
-                host = socket.gethostbyname(socket.gethostname())
+                host = _resolve_rendezvous_host()
                 return (host, port)
             return None
 
@@ -425,15 +456,15 @@ class MegaMoEDeepGemm(MoE):
             host = os.environ["MASTER_ADDR"]
             port = int(os.environ["MASTER_PORT"])
 
-        device_id = None
+        init_method = f"tcp://{host}:{port}"
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            device_id = torch.device("cuda", local_rank % torch.cuda.device_count())
+            torch.cuda.set_device(local_rank % torch.cuda.device_count())
         try:
             dist.init_process_group(
                 backend="nccl",
+                init_method=init_method,
                 rank=rank,
                 world_size=world_size,
-                device_id=device_id,
             )
         except RuntimeError:
             # close()→bind() race: redraw a port and retry once.
@@ -443,9 +474,9 @@ class MegaMoEDeepGemm(MoE):
             host, port = new_host, new_port
             dist.init_process_group(
                 backend="nccl",
+                init_method=f"tcp://{host}:{port}",
                 rank=rank,
                 world_size=world_size,
-                device_id=device_id,
             )
         logger.info(
             f"[MegaMoE] Initialized torch.distributed from mpi4py "
