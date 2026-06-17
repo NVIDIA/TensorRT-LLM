@@ -174,6 +174,13 @@ class AttentionMetadata:
     # The number of heads per kv head.
     num_heads_per_kv: Optional[int] = 1
 
+    multi_item_part_lens: Optional[list[list[int]]] = None
+    """Additional token layout information for multi-item scoring.
+
+    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
+    see `TokensPrompt` for details.
+    """
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
@@ -307,23 +314,6 @@ class AttentionMetadata:
     @property
     def num_tokens(self) -> int:
         return self._num_tokens
-
-    @property
-    def multi_item_part_lens(self) -> Optional[list[list[int]]]:
-        """Additional token layout information for multi-item scoring.
-
-        Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
-        see `TokensPrompt` for details.
-        """
-        return None
-
-    @multi_item_part_lens.setter
-    def multi_item_part_lens(self,
-                             multi_item_part_lens: Optional[list[list[int]]]):
-        if multi_item_part_lens is not None:
-            raise ValueError(
-                "The selected attention backend does not support multi-item scoring."
-            )
 
     def prepare(self):
         """
@@ -992,6 +982,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_multi_item_scoring(cls) -> bool:
         return False
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:

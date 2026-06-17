@@ -3,7 +3,8 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
+from typing import (Any, Dict, Literal, NewType, Optional, TypeAlias, cast,
+                    override)
 
 import flashinfer
 import torch
@@ -158,8 +159,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
                                                         default=None)
 
-    _multi_item_part_lens: Optional[list[list[int]]] = field(init=False,
-                                                             default=None)
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
 
@@ -601,7 +600,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._mla_ragged_planned = False
         self._mla_context_planned = False
         self._mla_decode_planned = False
-        self._multi_item_part_lens = None
         self._multi_item_params = None
 
     def create_cuda_graph_metadata(self,
@@ -825,15 +823,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
-    @property
-    def multi_item_part_lens(self) -> Optional[list[list[int]]]:
-        return self._multi_item_part_lens
-
-    @multi_item_part_lens.setter
-    def multi_item_part_lens(self,
-                             multi_item_part_lens: Optional[list[list[int]]]):
-        self._multi_item_part_lens = multi_item_part_lens
-
     def prepare(self) -> None:
         super().prepare()
         extra_attrs = get_model_extra_attrs()
@@ -846,9 +835,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
 
-        if self._multi_item_part_lens is not None:
+        if self.multi_item_part_lens is not None:
             self._multi_item_params = self._process_multi_item_part_lens(
-                self._multi_item_part_lens, device=self.seq_lens_cuda.device)
+                self.multi_item_part_lens, device=self.seq_lens_cuda.device)
         else:
             self._multi_item_params = None
 
@@ -1322,6 +1311,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return True
+
+    @override
+    @classmethod
+    def support_multi_item_scoring(cls) -> bool:
         return True
 
     def __init__(

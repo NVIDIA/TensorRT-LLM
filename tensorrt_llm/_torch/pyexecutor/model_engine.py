@@ -4566,6 +4566,11 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.num_contexts = batch_size
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = list(range(batch_size))
+            if multi_item_part_lens is not None and not self.attn_backend.support_multi_item_scoring(
+            ):
+                raise ValueError(
+                    "The selected attention backend does not support multi-item scoring."
+                )
             attn_metadata.multi_item_part_lens = multi_item_part_lens
             if hasattr(attn_metadata, 'prepare_encoder_only'):
                 attn_metadata.prepare_encoder_only()
