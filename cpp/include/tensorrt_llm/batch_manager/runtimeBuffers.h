@@ -208,7 +208,9 @@ public:
         //! Temporarily store the transposed results of multiple fragment logits, [maxBeamWidth, kCACHE_LENGTH]
         TensorPtr transposedLogits;
 
-        //! Temporarily store logits buffer address during the transposing, [kCACHE_LENGTH]
+        //! Temporarily store logits buffer address during the transposing, [maxBatchSize, kCACHE_LENGTH]
+        //! One row per batch slot (same layout as fragmentPointerHost) so concurrent flushes for
+        //! different requests in the same batch never clobber each other's pointer arrays.
         TensorPtr fragmentPointerDevice;
 
         //! Temporarily store logits buffer address during the transposing, [maxBatchSize, kCACHE_LENGTH]
@@ -227,6 +229,12 @@ public:
             TensorPtr slice = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
             cycleWorkIdx();
             return slice;
+        }
+
+        //! Returns the device pointer row for the current workIdx (called before cycleWorkIdx).
+        [[nodiscard]] TensorPtr getFragmentPointerDevice()
+        {
+            return runtime::ITensor::slice(fragmentPointerDevice, workIdx, 1);
         };
     };
 
