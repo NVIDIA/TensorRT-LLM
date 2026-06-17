@@ -184,8 +184,12 @@ def _make_llm_args():
     )
 
 
-def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
-    """Execute create_py_executor with mocked dependencies and return cache reuse flags.
+def _run_create_py_executor(monkeypatch,
+                            *,
+                            sm_version,
+                            kv_cache_quant_algo,
+                            enable_chunked_prefill=False):
+    """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
     Mocks all external dependencies (model engine, resource managers, etc.) to isolate
     executor creation logic and verify that KV cache reuse configuration is synchronized
@@ -195,11 +199,14 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        enable_chunked_prefill: Whether to request MLA chunked prefill support.
 
     Returns:
-        Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag) from created executor.
+        Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
+        runtime_chunked_prefill_flag) from created executor.
     """
     llm_args = _make_llm_args()
+    llm_args.enable_chunked_prefill = enable_chunked_prefill
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
@@ -275,6 +282,7 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
     return (
         kv_cache_manager.enable_block_reuse,
         py_executor.model_engine.attn_runtime_features.cache_reuse,
+        py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
 
 
@@ -287,7 +295,7 @@ def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
 
     This test ensures invariant synchronization is maintained across the fallback.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=89,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
@@ -307,7 +315,7 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
 
     This test ensures invariant synchronization is maintained across the fallback.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
         kv_cache_quant_algo=QuantAlgo.INT8,
@@ -327,7 +335,7 @@ def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch):
 
     This positive test ensures the default path does not regress.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
@@ -348,7 +356,7 @@ def test_mla_sm121_supported_configuration_preserves_cache_reuse(monkeypatch):
     This regression test protects the SM121 allowlist expansion added for MLA
     cache reuse support.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=121,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
@@ -356,3 +364,19 @@ def test_mla_sm121_supported_configuration_preserves_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
+
+
+def test_mla_sm121_supported_configuration_preserves_chunked_prefill(monkeypatch):
+    """Verify MLA support on SM121 preserves chunked prefill when it is requested.
+
+    When SM121 is treated as a supported MLA architecture and chunked prefill is
+    enabled, the unsupported-SM fallback should not disable the runtime feature.
+    """
+    _, _, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=121,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        enable_chunked_prefill=True,
+    )
+
+    assert runtime_chunked_prefill is True
