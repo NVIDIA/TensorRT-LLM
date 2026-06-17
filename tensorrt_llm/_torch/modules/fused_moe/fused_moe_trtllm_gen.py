@@ -45,8 +45,7 @@ from .quantization import (
     W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
-                      DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
-                      MiniMaxM2MoeRoutingMethod)
+                      DefaultMoeRoutingMethod, MiniMaxM2MoeRoutingMethod)
 
 
 @dataclass
@@ -100,10 +99,7 @@ class TRTLLMGenFusedMoE(MoE):
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
 
-    # Quantization algorithms that support full swiglu_gptoss_style.
-    # FP8_BLOCK_SCALES supports the DSV4-style uniform swiglu_limit_scalar
-    # through the DeepSeek FP8 separate-activation path, but not bias or
-    # swiglu_alpha/beta.
+    # Quantization algorithms that support swiglu_gptoss_style
     _GPTOSS_SUPPORTED_ALGOS = {
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
@@ -207,7 +203,6 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
-        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
@@ -226,7 +221,6 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
@@ -463,19 +457,8 @@ class TRTLLMGenFusedMoE(MoE):
             assert not self.bias and self.swiglu_alpha is None and self.swiglu_beta is None and self.swiglu_limit is None, \
                 "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
 
-        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
-            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, \
-                "TRTLLMGenFusedMoE supports bias/swiglu_alpha/swiglu_beta only for nvfp4 and mxfp4 variants."
-        if self.swiglu_limit is not None or self.swiglu_limit_scalar is not None:
-            # swiglu_limit additionally goes through the DeepSeek FP8
-            # separate-activation path
-            # (DevKernel.cu::activationDeepSeekKernel) when
-            # has_deepseek_fp8_block_scales. The FP8 path consumes the scalar
-            # variant (uniform across experts); NVFP4/MXFP4 fused-activation
-            # cubins consume the per-expert tensor.
-            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 \
-                or self.has_w4a8_mxfp4_mxfp8 or self.has_deepseek_fp8_block_scales, \
-                "TRTLLMGenFusedMoE supports swiglu_limit only for nvfp4, mxfp4, and fp8_block_scale variants."
+        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -597,7 +580,7 @@ class TRTLLMGenFusedMoE(MoE):
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = self.op_backend.mxfp8_quantize(
                 x, False, alignment=self.quant_method.input_hidden_alignment)
-            x_row = x.shape[0]
+            x_row, x_col = x.shape[0], x.shape[1]
         elif self.has_deepseek_fp8_block_scales:
             # For SM100+, fp8_quantize_1x128 returns x_sf with shape (blocked_n, num_tokens),
             # but moe_a2a_dispatch requires all payloads to have first dim = num_tokens.
@@ -641,14 +624,6 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group=None,
                 topk_group=None,
                 routed_scaling_factor=None,
-            )
-        elif isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod):
-            return RoutingParams(
-                top_k=self.routing_method.top_k,
-                routing_bias=self.routing_method.e_score_correction_bias,
-                n_group=self.routing_method.n_group,
-                topk_group=self.routing_method.topk_group,
-                routed_scaling_factor=self.routing_method.routed_scaling_factor,
             )
         else:
             return RoutingParams(
@@ -769,7 +744,6 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
-                gemm1_clamp_limit=self.swiglu_limit_scalar,
                 output=moe_output,
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
@@ -935,7 +909,6 @@ class TRTLLMGenFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
-        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -948,7 +921,6 @@ class TRTLLMGenFusedMoE(MoE):
         run_post_quant_allgather = (self.use_dp and self.parallel_size > 1
                                     and not self.enable_alltoall)
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
-        requires_separated_routing = self.routing_method.requires_separated_routing
 
         x_sf = None
         token_selected_experts = None
@@ -959,11 +931,11 @@ class TRTLLMGenFusedMoE(MoE):
         is_first_call = self.repeat_idx == 0
         is_last_call = self.repeat_idx == self.repeat_count - 1
 
-        if post_quant_comm or requires_separated_routing:
+        if post_quant_comm:
             self._load_balancer_start_wait_gpu_stage(is_first_call)
 
             token_selected_experts, token_final_scales = self.routing_method.apply(
-                router_logits, input_ids)
+                router_logits)
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
@@ -991,7 +963,6 @@ class TRTLLMGenFusedMoE(MoE):
             # Use routed slots for subsequent processing
             token_selected_experts = token_selected_slots
 
-        if post_quant_comm:
             x, x_sf = self.quantize_input(x)
 
         if self.enable_alltoall:
@@ -1132,8 +1103,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Call the extracted run_moe interface
         # Determine router_logits based on post_quant_comm
-        router_logits_arg = None if (
-            post_quant_comm or requires_separated_routing) else router_logits
+        router_logits_arg = None if post_quant_comm else router_logits
 
         final_hidden_states = self.run_moe(
             x=x,

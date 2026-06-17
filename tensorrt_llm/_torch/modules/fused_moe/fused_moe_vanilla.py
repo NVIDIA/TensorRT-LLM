@@ -535,7 +535,6 @@ class VanillaMoE(nn.ModuleList):
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        input_ids: Optional[torch.IntTensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
@@ -544,7 +543,7 @@ class VanillaMoE(nn.ModuleList):
         x = x.view(-1, self.hidden_size)
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits, input_ids)
+            router_logits)
 
         if self.use_dp and self.parallel_size > 1:
             x, token_selected_experts, token_final_scales = allgather(

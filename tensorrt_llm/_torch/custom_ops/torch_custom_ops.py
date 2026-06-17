@@ -109,26 +109,6 @@ def _init_gb10_nccl_symmetric_workaround() -> bool:
     return True
 
 
-def _init_deep_gemm_pdl() -> None:
-    try:
-        cuda_available = torch.cuda.is_available()
-    except RuntimeError as err:
-        logger.warning(
-            f"Failed to query CUDA availability for DeepGEMM PDL: {err}")
-        return
-
-    if not cuda_available:
-        return
-
-    try:
-        deep_gemm.set_pdl(get_env_enable_pdl())
-    except RuntimeError as err:
-        logger.warning(f"Failed to initialize DeepGEMM PDL: {err}")
-
-
-_init_deep_gemm_pdl()
-
-
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
@@ -1950,8 +1930,7 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
-                 dtype: Optional[torch.dtype] = None,
-                 swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -1970,10 +1949,8 @@ def silu_and_mul(x: torch.Tensor,
         x_ptr=x,
         x_stride=x.stride(0),
         d=d,
-        swiglu_limit=swiglu_limit or 0.0,
         BLOCK_SIZE=1024,
         HAS_O_SCALE=scale is not None,
-        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
     )
 
     return o
@@ -1984,7 +1961,6 @@ def _(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
-    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     b, n = x.shape
 

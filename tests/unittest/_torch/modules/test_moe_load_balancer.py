@@ -4,15 +4,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from mpi4py import MPI
-from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
-    get_moe_load_balancer, maybe_create_moe_load_balancer,
-    moe_load_balancer_add_single_layer)
-from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
-from tensorrt_llm.mapping import Mapping
+    get_moe_load_balancer, moe_load_balancer_add_single_layer)
 
 
 class TestMoeLoadBalancer(unittest.TestCase):
@@ -162,26 +157,6 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
         # Verify
         self.assertIsNone(result)
-
-    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
-    def test_kimi_k25_creates_moe_load_balancer(self, mock_load_balancer_impl):
-        """Kimi-K2.5 wraps a DeepSeek MoE text model and must setup EPLB."""
-
-        mapping = Mapping(world_size=4, rank=0, tp_size=4, moe_ep_size=4)
-        pretrained_config = PretrainedConfig()
-        pretrained_config.architectures = ['KimiK25ForConditionalGeneration']
-        model_config = ModelConfig(pretrained_config=pretrained_config,
-                                   mapping=mapping,
-                                   moe_load_balancer=MoeLoadBalancerConfig(
-                                       num_slots=416, layer_updates_per_iter=2))
-
-        with maybe_create_moe_load_balancer(model_config, mapping) as balancer:
-            self.assertIsInstance(balancer, MoeLoadBalancer)
-            self.assertEqual(model_config.moe_load_balancer.num_local_slots,
-                             104)
-            self.assertEqual(get_moe_load_balancer(), balancer)
-
-        mock_load_balancer_impl.assert_called_once_with(0, 4, 2)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_exception_in_context(self, mock_load_balancer_impl):

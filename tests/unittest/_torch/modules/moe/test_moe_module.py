@@ -1412,20 +1412,6 @@ BASE_TEST_PARAMS = generate_base_test_params(
 )
 
 
-def _skip_cutlass_nvfp4_sm120(
-    backend_type: MoeBackendType, quant_algo: Optional[QuantAlgo]
-) -> None:
-    if (
-        backend_type == MoeBackendType.CUTLASS
-        and quant_algo == QuantAlgo.NVFP4
-        and get_sm_version() == 120
-    ):
-        pytest.skip(
-            "CutlassFusedMoE NVFP4 runner is not available on SM120 in this branch; "
-            "it fails during FP4 GEMM runner initialization."
-        )
-
-
 @pytest.mark.parametrize(
     "dtype,moe_backend,quant_algo,seq_len,model_config,routing_method_cls,"
     "swiglu_alpha,swiglu_beta,swiglu_limit",
@@ -1454,7 +1440,6 @@ def test_configurable_moe_single_gpu(
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
     skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
-    _skip_cutlass_nvfp4_sm120(backend_type, quant_algo)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -1652,7 +1637,6 @@ def test_configurable_moe_multi_gpu(
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
     skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
-    _skip_cutlass_nvfp4_sm120(backend_type, quant_algo)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -2047,9 +2031,7 @@ def test_configurable_moe_multi_gpu_eplb(
     num_slots,
     routing_method_cls,
 ):
-    backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
-    _skip_cutlass_nvfp4_sm120(backend_type, quant_algo)
+    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
 
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
