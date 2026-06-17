@@ -1223,8 +1223,11 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             }
             // Force buffer/decoder reset to clean up any partial state from the aborted batch
             // (e.g. partially-filled cross-KV block offsets from mid-context-chunk processing).
-            // This prevents subsequent requests from reusing stale RuntimeBuffers.
-            if (mWorldConfig.isLastPipelineParallelRank())
+            // Guard on mInflightReqIds.empty(): in pipeline-parallel multi-micro-batch mode,
+            // other micro-batches may still have requests tracked here; changeBeamWidth asserts
+            // emptiness so we skip the reset and let the next successful forwardAsync iteration
+            // perform it when the set is clear.
+            if (mWorldConfig.isLastPipelineParallelRank() && mInflightReqIds.empty())
             {
                 changeBeamWidth(mOperatingBeamWidth);
             }
