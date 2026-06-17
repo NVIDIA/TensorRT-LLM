@@ -28,14 +28,12 @@ from tensorrt_llm.llmapi.disagg_utils import (
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import ClusterStorage, WatchEventType
-from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
-    ConversationParams,
     DisaggregatedParams,
     DisaggScheduleStyle,
     PromptTokensDetails,
@@ -308,17 +306,9 @@ class OpenAIDisaggregatedService(OpenAIService):
             return False
         return True
 
-    @staticmethod
-    def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
-        return get_request_conversation_id(request)
-
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
-        conversation_id = self._get_conversation_id(request)
-        conversation_params = None
-        if conversation_id is not None:
-            conversation_params = ConversationParams(conversation_id=conversation_id)
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
@@ -326,7 +316,6 @@ class OpenAIDisaggregatedService(OpenAIService):
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
                 ),
-                "conversation_params": conversation_params,
                 "stream": False,
                 "stream_options": None,
             }
@@ -340,11 +329,6 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id: Optional[int],
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
-        conversation_id = self._get_conversation_id(request)
-        if conversation_id is None:
-            request.conversation_params = None
-        else:
-            request.conversation_params = ConversationParams(conversation_id=conversation_id)
         if ctx_response:
             request.disaggregated_params = ctx_response.choices[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
