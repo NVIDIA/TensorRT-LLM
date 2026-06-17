@@ -26,6 +26,7 @@ from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
 from utils.cpp_paths import llm_root  # noqa: F401
 
+from tensorrt_llm._torch.auto_deploy._compat import AllReduceStrategy
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     AllGatherStrategy,
@@ -38,7 +39,6 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 from tensorrt_llm._torch.auto_deploy.utils._graph import recompile
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.commands.bench import main
-from tensorrt_llm.functional import AllReduceStrategy
 
 # needed since LLM API uses MPI executor pool internally for TP>1, which leaks a thread on shutdown
 pytestmark = pytest.mark.threadleak(enabled=False)
