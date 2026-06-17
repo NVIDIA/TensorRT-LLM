@@ -12,7 +12,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
-from tensorrt_llm._utils import local_mpi_rank
+from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -914,6 +914,10 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+# Per-rank weight-load pool size; small to cap simultaneous (multi-GB) transforms.
+_DEFAULT_LOAD_WORKERS = 4
+
+
 def run_concurrently(func,
                      args_list,
                      reduce_func=None,
@@ -925,29 +929,62 @@ def run_concurrently(func,
     args_list: a list of tuples of arguments for the function.
     reduce_func: an optional function to reduce the results.
     pbar: an optional tqdm progress bar.
+    num_workers: thread-pool size; when None, derived from this rank's core share.
+
+    Weight-load tasks run OpenMP-parallel ATen ops (e.g. .contiguous() on fused
+    MoE tensors); with several ranks per node, an unbounded pool x all-core
+    intra-op threads oversubscribes the CPU and can stall loading / exhaust host
+    RAM. Bound both to this rank's share (cores // local_ranks).
     """
     from concurrent import futures
-    with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks
-        future_to_result = {
-            executor.submit(func, *arg): arg
-            for arg in args_list
-        }
 
-        # Process completed tasks as they finish
-        for result in futures.as_completed(future_to_result):
-            arg = future_to_result[result]
-            try:
-                part_weights = result.result()
-                if reduce_func:
-                    reduce_func(part_weights)
-                if pbar:
-                    pbar.update(1)
-            except Exception as e:
-                logger.error(
-                    f"Error executing {func.__name__} with args {arg}: {str(e)}"
-                )
-                raise
+    # This rank's fair share of cores (honors cgroup/affinity).
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available_cpus = os.cpu_count() or 1
+    local_ranks = max(1, local_mpi_size())
+    per_rank_cores = max(1, available_cpus // local_ranks)
+
+    if num_workers is None:
+        num_workers = min(_DEFAULT_LOAD_WORKERS, per_rank_cores)
+    if num_workers < 1:
+        raise ValueError(
+            f"num_workers must be a positive integer, got {num_workers}")
+
+    # Split that budget across workers; honor user OMP_NUM_THREADS, restore after.
+    restore_num_threads = None
+    if "OMP_NUM_THREADS" not in os.environ:
+        intra_op_threads = max(1, per_rank_cores // num_workers)
+        if intra_op_threads != torch.get_num_threads():
+            restore_num_threads = torch.get_num_threads()
+            torch.set_num_threads(intra_op_threads)
+
+    try:
+        with futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_result = {
+                executor.submit(func, *arg): arg
+                for arg in args_list
+            }
+
+            # Process completed tasks as they finish
+            for result in futures.as_completed(future_to_result):
+                arg = future_to_result[result]
+                try:
+                    part_weights = result.result()
+                    if reduce_func:
+                        reduce_func(part_weights)
+                    if pbar:
+                        pbar.update(1)
+                except Exception as e:
+                    logger.error(
+                        f"Error executing {func.__name__} with args {arg}: {e!s}"
+                    )
+                    raise
+    finally:
+        if restore_num_threads is not None:
+            torch.set_num_threads(restore_num_threads)
 
 
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
