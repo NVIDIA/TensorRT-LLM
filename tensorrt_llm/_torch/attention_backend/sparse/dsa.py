@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -38,6 +38,7 @@ from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.utils import fp8_utils
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -2326,23 +2327,20 @@ class Indexer(nn.Module):
         return q_pe, q_nope, k_pe, k_nope
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate, rotate, and quantize for Q or K.
+        """Concatenate, rotate, and FP8 quantize for Q or K.
 
-        Applies Hadamard rotation (rotate_activation) between concatenation
-        and quantization — required for DSA sparse attention correctness.
-
-        FP8 mode: cat → rotate → FP8 quantize (unfused to allow rotation).
-        FP4 mode: fused cat + FP4 quantize (TODO: add rotation).
+        The FP8 path is intentionally unfused (cat -> rotate -> quantize) so the
+        Hadamard rotate_activation is applied. The fused_cat_fp8 kernel added in
+        #11899 omits the rotation, which is the regression tracked by #13061.
+        FP4 keeps the fused cat+quantize (rotation TODO).
         """
         if self.use_fp4:
             return torch.ops.trtllm.fused_cat_fp4(qk_pe, qk_nope)
-        from tensorrt_llm.quantization.utils.fp8_utils import \
-            fp8_quantize_1x128_sf_transpose
-        combined = torch.cat([qk_pe, qk_nope], dim=-1)
-        combined = rotate_activation(combined)
-        combined_2d = combined.view(-1, combined.shape[-1])
-        return fp8_quantize_1x128_sf_transpose(
-            combined_2d, use_ue8m0=self.scale_fmt == "ue8m0")
+        q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
+        q_or_k = rotate_activation(q_or_k)
+        q_or_k = q_or_k.view(-1, self.head_dim)
+        return fp8_utils.fp8_quantize_1x128_sf_transpose(
+            q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
 
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
