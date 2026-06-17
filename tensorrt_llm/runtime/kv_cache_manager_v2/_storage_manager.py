@@ -222,8 +222,17 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
+        # Synthesize a constraint from typical_batch so windowed pool groups
+        # (window_size < tokens_per_block) don't collapse to min_slots = 1 and
+        # deadlock the scheduler at concurrency > 1. KVCacheDesc(tokens_per_block,
+        # tokens_per_block - 1) yields non_stale = 1 per request in every pool
+        # group, floor-ing min_slots at the concurrency level.
+        effective_constraints = list(constraints or [])
+        if typical_batch is not None and typical_batch.kv_caches:
+            one_decode = KVCacheDesc(capacity=tokens_per_block, history_length=tokens_per_block - 1)
+            effective_constraints.append(BatchDesc([one_decode] * len(typical_batch.kv_caches)))
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints or [], tokens_per_block, swa_scratch_reuse
+            effective_constraints, tokens_per_block, swa_scratch_reuse
         )
 
         # Compute init_ratio from typical_batch, constraints, or fallback.
