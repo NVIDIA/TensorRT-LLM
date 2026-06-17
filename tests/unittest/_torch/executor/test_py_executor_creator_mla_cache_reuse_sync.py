@@ -185,11 +185,9 @@ def _make_llm_args():
     )
 
 
-def _run_create_py_executor(monkeypatch,
-                            *,
-                            sm_version,
-                            kv_cache_quant_algo,
-                            enable_chunked_prefill=False):
+def _run_create_py_executor(
+    monkeypatch, *, sm_version, kv_cache_quant_algo, enable_chunked_prefill=False
+):
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
     Mocks all external dependencies (model engine, resource managers, etc.) to isolate
