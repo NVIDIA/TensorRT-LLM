@@ -15,6 +15,7 @@
 """Internal VisualGen pipeline and model configuration helpers."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,16 +40,6 @@ from tensorrt_llm.visual_gen.args import (
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
-)
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig
-from tensorrt_llm.visual_gen.sparse_attention import (
-    auto_detect_sparse_attention_config as _auto_detect_sparse_attention_config,
-)
-from tensorrt_llm.visual_gen.sparse_attention import (
-    auto_detect_sparse_yaml as _auto_detect_sparse_yaml,
-)
-from tensorrt_llm.visual_gen.sparse_attention import (
-    load_sparse_config_from_yaml as _load_sparse_config_from_yaml,
 )
 
 # =============================================================================
@@ -83,6 +74,17 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 def create_attention_metadata_state() -> Dict[str, Any]:
     """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
     return {"metadata": None, "capacity": (0, 0)}
+
+
+def _model_config_value(value: Any, *, deep_copy: bool = True) -> Any:
+    """Return a value for a per-component DiffusionModelConfig."""
+    if value is None:
+        return None
+    if not deep_copy:
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    return deepcopy(value)
 
 
 class _VisualGenConfigBase(BaseModel):
@@ -228,25 +230,27 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         model_pretrained_config: Any,
     ) -> DiffusionModelConfig:
         return DiffusionModelConfig(
-            component_name=component_name,
-            pretrained_config=model_pretrained_config,
-            mapping=self.mapping,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-            allreduce_strategy=self.allreduce_strategy,
-            extra_attrs=self.extra_attrs,
-            visual_gen_mapping=self.visual_gen_mapping,
-            dynamic_weight_quant=self.dynamic_weight_quant,
-            quant_config=self.quant_config,
-            quant_config_dict=self.quant_config_dict,
-            compilation=self.compilation,
-            torch_compile=self.torch_compile,
-            cuda_graph=self.cuda_graph,
-            attention=self.attention,
-            attention_metadata_state=self.attention_metadata_state,
-            parallel=self.parallel,
-            cache=self.cache,
-            enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
+            component_name=_model_config_value(component_name),
+            pretrained_config=_model_config_value(model_pretrained_config),
+            # Topology mappings carry distributed process-group handles.
+            mapping=_model_config_value(self.mapping, deep_copy=False),
+            skip_create_weights_in_init=_model_config_value(self.skip_create_weights_in_init),
+            force_dynamic_quantization=_model_config_value(self.force_dynamic_quantization),
+            allreduce_strategy=_model_config_value(self.allreduce_strategy),
+            extra_attrs=_model_config_value(self.extra_attrs),
+            # Topology mappings carry distributed process-group handles.
+            visual_gen_mapping=_model_config_value(self.visual_gen_mapping, deep_copy=False),
+            dynamic_weight_quant=_model_config_value(self.dynamic_weight_quant),
+            quant_config=_model_config_value(self.quant_config),
+            quant_config_dict=_model_config_value(self.quant_config_dict),
+            compilation=_model_config_value(self.compilation),
+            torch_compile=_model_config_value(self.torch_compile),
+            cuda_graph=_model_config_value(self.cuda_graph),
+            attention=_model_config_value(self.attention),
+            attention_metadata_state=_model_config_value(self.attention_metadata_state),
+            parallel=_model_config_value(self.parallel),
+            cache=_model_config_value(self.cache),
+            enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
         )
 
     @staticmethod
@@ -570,45 +574,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                     f"Config not found at {checkpoint_dir}. "
                     "Expected model_index.json (diffusers) or "
                     "safetensors with embedded config metadata."
-                )
-
-        # Load sparse attention calibration. ModelOpt artifacts carry the
-        # calibration formula and disabled-layer/component map; user config
-        # contributes only public knobs such as target_sparsity.
-        yaml_sparse = None
-        yaml_path = attention_cfg.sparse_config_path
-        if yaml_path is not None:
-            yaml_sparse = _load_sparse_config_from_yaml(yaml_path)
-            if yaml_sparse is not None:
-                logger.info(f"Loaded sparse config from {yaml_path}")
-
-        if yaml_sparse is None:
-            yaml_sparse = _auto_detect_sparse_yaml(str(checkpoint_path))
-            if yaml_sparse is not None:
-                logger.info("Auto-detected sparse config YAML from checkpoint")
-
-        if yaml_sparse is None:
-            ckpt_dict = vars(pretrained_config) if pretrained_config else {}
-            yaml_sparse = _auto_detect_sparse_attention_config(ckpt_dict)
-            if yaml_sparse is not None:
-                formula = yaml_sparse._formula
-                if formula is not None:
-                    logger.info(
-                        "Auto-detected sparse config from config.json "
-                        f"(formula: log_a={formula.log_a:.2f}, b={formula.b:.2f})"
-                    )
-                else:
-                    logger.info("Auto-detected sparse config from config.json")
-
-        if yaml_sparse is not None:
-            user_cfg = attention_cfg.sparse_attention_config
-            if user_cfg is not None and isinstance(user_cfg, SkipSoftmaxConfig):
-                attention_cfg = attention_cfg.model_copy(
-                    update={"sparse_attention_config": yaml_sparse._with_public_overrides(user_cfg)}
-                )
-            else:
-                attention_cfg = attention_cfg.model_copy(
-                    update={"sparse_attention_config": yaml_sparse}
                 )
 
         # Resolve quant_config. A user dict containing ``quant_algo``

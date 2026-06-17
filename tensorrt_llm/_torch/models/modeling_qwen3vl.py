@@ -228,6 +228,49 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             second_per_grid_ts,
         )
 
+    def _preprocess(
+        self,
+        text: Dict[str, Any],
+        mm_data: Dict[str, Any],
+        mm_processor_kwargs: Dict[str, Any],
+    ):
+        images = mm_data.get("image")
+        video_datas = mm_data.get("video")
+        if video_datas is not None:
+            videos = [video_data.frames for video_data in video_datas]
+        else:
+            videos = None
+        do_rescale = True
+        if images and isinstance(images[0], torch.Tensor):
+            do_rescale = False
+        if videos and isinstance(videos[0][0], torch.Tensor):
+            do_rescale = False
+
+        # Forward video metadata only when the caller opts into per-request kwargs;
+        # the default path pre-samples frames in the IO loader, so unconditional
+        # metadata triggers IndexError in HF's _decode_and_sample_videos.
+        video_metadata = (
+            [vd.metadata for vd in video_datas] if video_datas and mm_processor_kwargs else None
+        )
+
+        # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
+        # If the caller set num_frames without fps, null fps explicitly so the class-level
+        # default fps=2 does not interfere.
+        proc_kwargs = dict(mm_processor_kwargs)
+        if "num_frames" in proc_kwargs and "fps" not in proc_kwargs:
+            proc_kwargs["fps"] = None
+
+        return self.processor(
+            text=[text],
+            images=images,
+            videos=videos,
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            video_metadata=video_metadata,
+            **proc_kwargs,
+        )
+
     def get_num_tokens_per_video(
         self,
         *,
