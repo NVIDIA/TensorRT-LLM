@@ -1415,13 +1415,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
 
-
     def create_fmha_libs(self) -> None:
         self.fmha_libs = []
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
-
 
     def forward(
         self,
