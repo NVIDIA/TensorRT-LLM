@@ -154,12 +154,16 @@ examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5
 examples/test_visual_gen.py::test_flux1_lpips_against_golden SKIP (https://nvbugs/6215688)
 examples/test_visual_gen.py::test_flux2_lpips_against_golden SKIP (https://nvbugs/6215688)
 examples/test_visual_gen.py::test_ltx2_lpips_against_golden SKIP (https://nvbugs/6215688)
+examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4 SKIP (https://nvbugs/6310230)
 examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden SKIP (https://nvbugs/6215688)
 examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden SKIP (https://nvbugs/6215688)
 examples/test_visual_gen.py::test_wan_t2v_example SKIP (https://nvbugs/6215688)
 examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2] SKIP (https://nvbugs/6272644)
 examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2] SKIP (https://nvbugs/6272644)
 examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4] SKIP (https://nvbugs/6272644)
+examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[cfg2_tp2] SKIP (https://nvbugs/6329227)
+examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2] SKIP (https://nvbugs/6329227)
+examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2_ulysses2] SKIP (https://nvbugs/6329227)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS] SKIP (https://nvbugs/6273850)
 full:A100/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp[mtp_off] SKIP (https://nvbugs/6273850)
@@ -271,6 +275,8 @@ perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20
 perf/test_perf.py::test_perf[flan_t5_large-bench-float16-maxbs:1-input_output_len:128,20-gpus:2] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8] SKIP
+perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128-reqs:8192] SKIP (https://nvbugs/6329256)
+perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-float16-input_output_len:128,128-reqs:8192] SKIP (https://nvbugs/6329256)
 perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:128,128] SKIP
 perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:512,32] SKIP
 perf/test_perf.py::test_perf[mamba_370m-bench-float16-input_output_len:128,128] SKIP
@@ -286,6 +292,8 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_v32_fp4_grace_blackwell-v32_fp4_tep4_mtp3_8k1k] SKIP (https://nvbugs/6280721)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_2_nodes_grace_blackwell-glm5_fp4_dep8_mtp1_8k1k] SKIP (https://nvbugs/6324131)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_2_nodes_grace_blackwell-glm5_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugs/6324131)
+perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_dep8_mtp1_8k1k] SKIP (https://nvbugs/6329155)
+perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugs/6329155)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] SKIP (https://nvbugs/6153575)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6215844)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_deepseek-r1-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6302903)
@@ -299,6 +307,7 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_kimi-k25-thinking-fp4
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_128k8k_con64_ctx1_pp8_gen1_dep32_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6302903)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_1k1k_con1024_ctx1_dep4_gen1_dep32_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6302903)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_1k1k_con1024_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6323889)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_1k1k_con2048_ctx2_dep4_gen1_dep16_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6323889)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_1k1k_con2048_ctx2_dep4_gen1_dep16_eplb288_mtp3_ccb-NIXL] SKIP (https://nvbugs/6323889)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_1k1k_con3072_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6323889)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp1_ccb-NIXL] SKIP (https://nvbugs/6302903)
@@ -312,6 +321,7 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-v32-fp4
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-v32-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6280721)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-v32-fp4_8k1k_con4096_ctx1_dep4_gen1_dep32_eplb256_mtp0_ccb-NIXL] SKIP (https://nvbugs/6302903)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con2048_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6324123)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con512_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6324123)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_1k1k_con64_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6287834)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_kimi-k25-thinking-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6323074)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-NIXL] SKIP (https://nvbugs/6323074)
