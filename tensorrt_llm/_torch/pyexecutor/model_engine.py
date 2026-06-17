@@ -1359,8 +1359,17 @@ class PyTorchModelEngine(ModelEngine):
                     resource_manager, bs, draft_len, max_seq_len)
                 with self._release_batch_context(warmup_request,
                                                  resource_manager) as batch:
-                    if batch is None:
+                    if batch is None and self.mapping.tp_size <= 1:
                         # No KV cache space, cannot continue capturing graphs
+                        continue
+                    # Under attention-DP, KV cache capacity can differ per rank,
+                    # causing _create_cuda_graph_warmup_request to return None on
+                    # some ranks but not others.  If we let those ranks silently
+                    # skip while the others call forward() with tp_comm collectives,
+                    # the job deadlocks.  Detect the asymmetry and fail fast.
+                    self._assert_all_tp_ranks_have_warmup_batch(batch, bs)
+                    if batch is None:
+                        # All ranks agree: not enough KV cache space for this BS.
                         continue
                     logger.info(
                         f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
