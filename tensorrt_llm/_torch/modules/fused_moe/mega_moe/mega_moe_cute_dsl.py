@@ -68,6 +68,7 @@ non-1 scales compute correctly.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -549,11 +550,13 @@ class MegaMoECuteDsl(MoE):
         # cache in ``cute_dsl_megamoe_custom_op.py``. ``None`` for the
         # single-rank degenerate path.
         self._symm_provider = None
-        # Symmetric scratch regions used ONLY for AutoTuner profiling (one
-        # buffer shared across same-shape MoE layers). Allocated alongside
-        # ``_symm_provider`` and released after warmup via
-        # ``release_megamoe_profiling_scratch()``. ``None`` for single-rank.
-        self._profiling_scratch_regions = None
+        # WEAK reference to the symmetric scratch provider used ONLY for
+        # AutoTuner profiling (one buffer shared across same-shape MoE layers).
+        # The process-global ``_MEGAMOE_PROFILING_SCRATCH_CACHE`` is the SOLE
+        # strong owner, so once ``release_megamoe_profiling_scratch()`` clears
+        # that cache after warmup the buffer is reclaimed and this weakref goes
+        # dead -- no per-module teardown needed. ``None`` for single-rank.
+        self._profiling_scratch_provider_ref = None
         self._weights_loaded = False
         self._weights_created = False
         self._post_load_done = False
@@ -801,7 +804,10 @@ class MegaMoECuteDsl(MoE):
             shared_workspace_bytes=shared_workspace_bytes,
             in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
         )
-        self._profiling_scratch_regions = scratch.get_regions() if scratch is not None else None
+        # Hold only a weakref: the global scratch cache owns the buffer, so it
+        # is freed by ``release_megamoe_profiling_scratch()`` after warmup
+        # without this module pinning it for the process lifetime.
+        self._profiling_scratch_provider_ref = weakref.ref(scratch) if scratch is not None else None
         return staging
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
@@ -1245,11 +1251,21 @@ class MegaMoECuteDsl(MoE):
         # Hand the symmetric profiling scratch to the op so AutoTuner profiling
         # keeps the cross-rank inputs symmetric without touching this staging
         # buffer. Cleared right after so a later same-process op call for a
-        # different shape never reuses a stale scratch.
+        # different shape never reuses a stale scratch. The provider is held via
+        # a weakref: after warmup ``release_megamoe_profiling_scratch()`` drops
+        # the global cache (sole owner), the weakref goes dead, and this resolves
+        # to ``None`` so steady-state forwards use the staging buffer.
         from ....custom_ops.cute_dsl_megamoe_custom_op import set_active_megamoe_profiling_scratch
 
+        scratch_provider = (
+            self._profiling_scratch_provider_ref()
+            if self._profiling_scratch_provider_ref is not None
+            else None
+        )
         set_active_megamoe_profiling_scratch(
-            self._profiling_scratch_regions if world_size > 1 else None
+            scratch_provider.get_regions()
+            if (scratch_provider is not None and world_size > 1)
+            else None
         )
         torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
             activation=_as_nvfp4(activation),

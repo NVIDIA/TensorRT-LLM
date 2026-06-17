@@ -215,22 +215,25 @@ _GEOMETRIES_REDUCED: Tuple[Tuple[Tuple[int, int, int], Tuple[int, int, int]], ..
 # The 15 legal geometries: M128/1-CTA with
 # cluster_m in {1,2,4}, and M256/2-CTA with cluster_m in {2,4} (use_2cta even
 # divisibility), each crossed with N in {64,128,256}.
+# Defined as ``_GEOMETRIES_REDUCED`` plus the extra geometries so the reduced
+# set stays a guaranteed subset of the full set (no manual drift between them).
 _GEOMETRIES_FULL: Tuple[Tuple[Tuple[int, int, int], Tuple[int, int, int]], ...] = (
-    ((128, 64, 256), (1, 1, 1)),
-    ((128, 128, 256), (1, 1, 1)),
-    ((128, 256, 256), (1, 1, 1)),
-    ((128, 64, 256), (2, 1, 1)),
-    ((128, 128, 256), (2, 1, 1)),
-    ((128, 256, 256), (2, 1, 1)),
-    ((128, 64, 256), (4, 1, 1)),
-    ((128, 128, 256), (4, 1, 1)),
-    ((128, 256, 256), (4, 1, 1)),
-    ((256, 64, 256), (2, 1, 1)),
-    ((256, 128, 256), (2, 1, 1)),
-    ((256, 256, 256), (2, 1, 1)),
-    ((256, 64, 256), (4, 1, 1)),
-    ((256, 128, 256), (4, 1, 1)),
-    ((256, 256, 256), (4, 1, 1)),
+    _GEOMETRIES_REDUCED
+    + (
+        ((128, 64, 256), (1, 1, 1)),
+        ((128, 128, 256), (1, 1, 1)),
+        ((128, 256, 256), (1, 1, 1)),
+        ((128, 64, 256), (2, 1, 1)),
+        ((128, 128, 256), (2, 1, 1)),
+        ((128, 256, 256), (2, 1, 1)),
+        ((128, 64, 256), (4, 1, 1)),
+        ((128, 128, 256), (4, 1, 1)),
+        ((128, 256, 256), (4, 1, 1)),
+        ((256, 64, 256), (2, 1, 1)),
+        ((256, 64, 256), (4, 1, 1)),
+        ((256, 128, 256), (4, 1, 1)),
+        ((256, 256, 256), (4, 1, 1)),
+    )
 )
 
 # token_back modes scanned. BEST=0 drops standalone (never a sole winner).
