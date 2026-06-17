@@ -505,11 +505,12 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
         max_batch_size=batch_spec.batch_size,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(cache_dtype)),
-        sparse_attn_config=sparse_config,
+        sparse_attention_config=sparse_config,
         model_config=model_config,
     )
 
-    AttentionCls = get_attention_backend("TRTLLM", sparse_config)
+    AttentionCls = get_attention_backend("TRTLLM",
+                                         sparse_attention_config=sparse_config)
 
     # Allocate and pre-populate KV cache in batch order [context...][generation...]
     all_cached_compressed_kv = {}
@@ -571,6 +572,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             offset += cached_len
 
         # Single batched metadata for all generation cache population
+        sparse_metadata_params = (sparse_config.to_sparse_metadata_params())
         cached_metadata = AttentionCls.Metadata(
             seq_lens=torch.tensor(gen_cached_lens, dtype=torch.int),
             request_ids=gen_with_cache,
@@ -583,7 +585,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
                                           num_cached_tokens_per_seq=[0] *
                                           len(gen_with_cache)),
             mapping=mapping,
-            sparse_attention_config=sparse_config,
+            sparse_metadata_params=sparse_metadata_params,
         )
         cached_metadata.prepare()
 
@@ -648,6 +650,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
                          num_heads * v_head_dim,
                          dtype=dtype,
                          device=device)
+    sparse_metadata_params = (sparse_config.to_sparse_metadata_params())
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(batch_query_lens, dtype=torch.int),
@@ -665,7 +668,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str):
             num_cached_tokens_per_seq=[cached_lens[i] for i in batch_order],
         ),
         mapping=mapping,
-        sparse_attention_config=sparse_config,
+        sparse_metadata_params=sparse_metadata_params,
     )
     attn_metadata.prepare()
 

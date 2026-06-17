@@ -109,6 +109,8 @@ class GenerationRequest:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
+        encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                                list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
         if isinstance(prompt_token_ids, list):
@@ -152,10 +154,27 @@ class GenerationRequest:
                     f"({self.MAX_CACHE_SALT_LEN}).")
         self.cache_salt = cache_salt
         self.arrival_time = arrival_time
+        self.encoder_input_token_ids = self._normalize_optional_token_ids(
+            encoder_input_token_ids, "encoder_input_token_ids")
         if not (0.0 <= priority <= 1.0):
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")
         self.priority = priority
+
+    @staticmethod
+    def _normalize_optional_token_ids(token_ids: Optional[Union[torch.Tensor,
+                                                                np.ndarray,
+                                                                list]],
+                                      name: str) -> Optional[list]:
+        if token_ids is None:
+            return None
+        if isinstance(token_ids, list):
+            return token_ids
+        if isinstance(token_ids, (torch.Tensor, np.ndarray)):
+            return token_ids.tolist()
+        raise TypeError(
+            f"{name} ({token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+        )
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

@@ -438,7 +438,12 @@ class Flux2Pipeline(BasePipeline):
 
         # Denoising loop using forward_fn callback (WAN pattern)
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for FLUX.2 transformer."""
             return self.transformer(
