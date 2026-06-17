@@ -38,12 +38,14 @@ from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     AttentionLayerConfig,
+    BatchDesc,
     BufferConfig,
     CacheTierConfig,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheIterationStatsDelta,
+    KVCacheDesc,
     LayerId,
     ReuseScope,
     TokenIdExt,
@@ -1047,6 +1049,15 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
+            constraints=[
+                self._build_concurrent_decode_constraint(
+                    max_batch_size=self.max_batch_size,
+                    tokens_per_block=tokens_per_block,
+                )
+            ],
+            # Preserve StorageManager's historical fallback ratio while using
+            # constraints only as a min-slot floor.
+            typical_step=BatchDesc([KVCacheDesc(capacity=2049, history_length=2048)]),
             layers=layer_configs,
         )
 
@@ -1066,6 +1077,19 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    @staticmethod
+    def _build_concurrent_decode_constraint(
+        *, max_batch_size: int, tokens_per_block: int
+    ) -> BatchDesc:
+        assert max_batch_size > 0
+        assert tokens_per_block > 0
+        return BatchDesc(
+            [
+                KVCacheDesc(capacity=tokens_per_block, history_length=tokens_per_block - 1)
+                for _ in range(max_batch_size)
+            ]
+        )
 
     @property
     def blocks_in_primary_pool(self) -> int:

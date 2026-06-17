@@ -22,6 +22,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -63,6 +64,39 @@ def _create_kv_cache_manager_v2(
 
 class TestPerLayerHeadDimBasic(unittest.TestCase):
     """Tests that don't allocate GPU memory or use uniform buffer sizes."""
+
+    def test_build_cache_config_reserves_concurrent_decode_slots(self):
+        mgr = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        mgr.kv_cache_type = CacheType.SELF
+        mgr.dtype = DataType.HALF
+        mgr.kv_factor = 2
+        mgr.max_batch_size = 4
+        mgr.max_attention_window_vec = [4, None]
+        mgr.num_local_layers = 2
+        mgr.pp_layers = [0, 1]
+        mgr.num_kv_heads_per_layer = [1, 1]
+        mgr.head_dim_per_layer = [8, 8]
+
+        config = mgr._build_cache_config(
+            KvCacheConfigV2(max_tokens=128, enable_block_reuse=False),
+            tokens_per_block=8,
+            vocab_size=32000,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        )
+
+        self.assertEqual(len(config.constraints), 1)
+        decode_constraint = config.constraints[0]
+        self.assertEqual(len(decode_constraint.kv_caches), mgr.max_batch_size)
+        for kv_cache in decode_constraint.kv_caches:
+            self.assertEqual(kv_cache.capacity, 8)
+            self.assertEqual(kv_cache.history_length, 7)
+
+        # Keep the previous StorageManager fallback ratio basis so adding the
+        # constraint only floors min slots and does not change ratio selection.
+        self.assertIsNotNone(config.typical_step)
+        self.assertEqual(len(config.typical_step.kv_caches), 1)
+        self.assertEqual(config.typical_step.kv_caches[0].capacity, 2049)
+        self.assertEqual(config.typical_step.kv_caches[0].history_length, 2048)
 
     def test_per_layer_head_dim_wrong_length(self):
         """Test that mismatched list length raises assertion."""
