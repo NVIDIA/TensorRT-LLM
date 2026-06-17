@@ -16,7 +16,7 @@ context_servers:
     free_gpu_memory_fraction: 0.8
     dtype: fp8
   moe_config:
-    backend: DEEPGEMM
+    backend: TRTLLM
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
@@ -37,7 +37,7 @@ generation_servers:
     free_gpu_memory_fraction: 0.8
     dtype: fp8
   moe_config:
-    backend: DEEPGEMM
+    backend: TRTLLM
   cuda_graph_config:
     enable_padding: true
     batch_sizes:
