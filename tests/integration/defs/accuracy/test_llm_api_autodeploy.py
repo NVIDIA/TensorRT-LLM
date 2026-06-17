@@ -168,6 +168,14 @@ def low_memory_overrides(config,
     return config
 
 
+def disable_piecewise_cuda_graph_for_speculation(config: dict) -> dict:
+    """Disable piecewise CUDA graph capture for speculative AutoDeploy tests."""
+    config.setdefault("transforms",
+                      {}).setdefault("compile_model",
+                                     {})["piecewise_enabled"] = False
+    return config
+
+
 def reduced_model_kwargs(num_hidden_layers: int,
                          model_path: str | None = None) -> dict:
     """Return model_kwargs to cap a model at ``num_hidden_layers`` layers.
@@ -370,9 +378,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16"
             },
         }
-        kwargs.setdefault("transforms",
-                          {}).setdefault("compile_model",
-                                         {})["piecewise_enabled"] = False
+        disable_piecewise_cuda_graph_for_speculation(kwargs)
 
         return kwargs
 

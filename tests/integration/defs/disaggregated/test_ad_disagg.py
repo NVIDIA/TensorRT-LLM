@@ -153,6 +153,12 @@ def seed_disagg():
         torch.cuda.manual_seed_all(AUTODEPLOY_DISAGG_SEED)
 
 
+def disable_piecewise_cuda_graph_for_speculation(config: dict) -> dict:
+    """Disable piecewise CUDA graph capture for speculative AutoDeploy tests."""
+    config.setdefault("transforms", {}).setdefault("compile_model", {})["piecewise_enabled"] = False
+    return config
+
+
 def base_config(extra_config=None):
     common_config = dict(
         runtime="trtllm",
@@ -167,6 +173,8 @@ def base_config(extra_config=None):
     )
     if extra_config:
         common_config.update(extra_config)
+    if common_config.get("speculative_config") is not None:
+        disable_piecewise_cuda_graph_for_speculation(common_config)
 
     return common_config
 
