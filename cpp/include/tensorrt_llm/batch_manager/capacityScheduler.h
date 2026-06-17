@@ -87,7 +87,11 @@ private:
 
 /// @brief   Schedule requests using the MAX_UTILIZATION policy
 /// @details Try reserving resources to advance requests by one step,
-///          may pause previously started requests.
+///          may pause previously started requests.  When a
+///          ``crossKvCacheManager`` is supplied, requests in the
+///          ``ENCODER_INIT`` state may be admitted for encoder compute
+///          without consuming self- or cross-KV blocks; the later
+///          ``CONTEXT_INIT`` decoder admission owns cross-pool budgeting.
 class MaxUtilizationScheduler : public BaseCapacityScheduler
 {
 public:
@@ -96,8 +100,9 @@ public:
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
-        kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
-        RequestList const& activeRequests) const;
+        kv_cache_manager::BaseKVCacheManager& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+        OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 private:
     SizeType32 mMaxNumRequests;
@@ -106,6 +111,10 @@ private:
 };
 
 /// @brief Schedule requests using the GUARANTEED_NO_EVICT policy
+/// @details When a ``crossKvCacheManager`` is supplied, requests in the
+///          ``ENCODER_INIT`` state may be admitted for encoder compute
+///          without consuming self- or cross-KV blocks.  The later
+///          ``CONTEXT_INIT`` decoder admission owns cross-pool budgeting.
 class GuaranteedNoEvictScheduler : public BaseCapacityScheduler
 {
 public:
@@ -158,7 +167,11 @@ public:
      *
      * @param kvCacheManager Required in MaxUtilizationScheduler (as a ref) and in GuaranteedNoEvictScheduler and
      * StaticBatchScheduler (as a const ref).
-     * @param crossKvCacheManager Optional used in GuaranteedNoEvictScheduler and StaticBatchScheduler.
+     * @param crossKvCacheManager Optional cross-attention KV cache manager.  Used by
+     * MaxUtilizationScheduler (mutates: ``startScheduling`` / ``schedulingRemoveSequence``)
+     * and GuaranteedNoEvictScheduler / StaticBatchScheduler (read-only).  Required for
+     * encoder-decoder admission. Encoder-init requests only require this pool
+     * to be configured; decoder context admission budgets blocks from it.
      * @param peftCacheManager Optional used in MaxUtilizationScheduler, GuaranteedNoEvictScheduler and
      * StaticBatchScheduler.
      * @param activeRequests
@@ -168,7 +181,7 @@ public:
     [[nodiscard]] std::tuple<RequestVector, RequestVector, RequestVector> operator()(RequestList const& activeRequests,
         OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
-        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager = std::nullopt) const;
 
     /// @brief Sets the reorder policy to use AgentTreePolicy with the given configuration.
     /// @param agentPercentage The ratio of agent requests to schedule (0.0-1.0, -1.0 for random).
