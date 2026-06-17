@@ -11,6 +11,7 @@ set(SRCS
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
+    batch_manager/kvCacheManagerV2.cpp
     batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
@@ -31,12 +32,27 @@ set(SRCS
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
+# KV Cache Manager V2 include directory (global, needed during compilation of
+# SRCS) NOTE: PROJECT_SOURCE_DIR = cpp/ (build_wheel.py passes cpp/ as -S), so
+# batch_manager is one level down and blake3 is at ../3rdparty/blake3 (repo
+# root).
+set(KV_CACHE_MANAGER_V2_INCLUDE
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+include_directories(${KV_CACHE_MANAGER_V2_INCLUDE}
+                    ${PROJECT_SOURCE_DIR}/../3rdparty/blake3)
+
 # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
 if(ENABLE_BOLT_COMPATIBLE)
   nanobind_add_module(${TRTLLM_NB_MODULE} NOSTRIP ${SRCS})
 else()
   nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
 endif()
+
+# BLAKE3 symbols are provided by tensorrt_llm_batch_manager_static (via the
+# shared lib). Only add the include directory so headers resolve during
+# compilation of kvCacheManagerV2.cpp.
+target_include_directories(${TRTLLM_NB_MODULE}
+                           PRIVATE ${PROJECT_SOURCE_DIR}/../3rdparty/blake3)
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 

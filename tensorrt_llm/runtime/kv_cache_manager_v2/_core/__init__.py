@@ -15,7 +15,15 @@
 
 from .._common import DEFAULT_BEAM_INDEX, BeamIndex
 from ._kv_cache import _KVCache
-from ._kv_cache_manager import AggregatedPageDesc, KVCacheManager, PageIndexConverter, ScratchDesc
+from ._kv_cache_manager import (
+    AggregatedPageDesc,
+    ExpandedBuffer,
+    KVCacheManager,
+    PageIndexConverter,
+    PoolDesc,
+    PoolGroupDesc,
+    ScratchDesc,
+)
 
 __all__ = [
     "KVCacheManager",
@@ -23,6 +31,9 @@ __all__ = [
     "BeamIndex",
     "DEFAULT_BEAM_INDEX",
     "AggregatedPageDesc",
+    "ExpandedBuffer",
     "PageIndexConverter",
+    "PoolDesc",
+    "PoolGroupDesc",
     "ScratchDesc",
 ]

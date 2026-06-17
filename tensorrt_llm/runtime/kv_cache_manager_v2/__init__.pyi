@@ -62,6 +62,7 @@ BeamIndex = NewType("BeamIndex", int)
 MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
+PoolIndex = NewType("PoolIndex", int)
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -140,7 +141,6 @@ class SwaScratchReuseConfig:
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
-    vocab_size: int
     cache_tiers: list[CacheTierConfig]
     layers: list[LayerConfig]
     max_util_for_resume: float = ...
@@ -223,6 +223,10 @@ class _KVCache:
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]: ...
+    @property
+    def reuse_scope(self) -> ReuseScope: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
     def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
@@ -243,14 +247,10 @@ class _KVCache:
     def tokens_per_block(self) -> int: ...
 
 @dataclass(slots=True, frozen=True)
-class MemoryPoolDesc:
-    base: MemAddress
-    page_size: int
-
-@dataclass(slots=True, frozen=True)
-class MemoryPoolGroupDesc:
-    num_pages: int
-    pools: Sequence[MemoryPoolDesc]
+class PoolDesc:
+    pool_index: PoolIndex
+    base_address: MemAddress
+    slot_bytes: int
 
 class BufferId(NamedTuple):
     layer_id: LayerId
@@ -273,6 +273,36 @@ class AggregatedPageDesc:
     stride: int
     layer_group_id: LayerGroupId
     buffers: Sequence[ExpandedBuffer]
+
+@dataclass(slots=True, frozen=True)
+class CoalescedBuffer:
+    single_buffer_size: int
+    buffer_ids: Sequence[BufferId]
+    @property
+    def size(self) -> int: ...
+    @property
+    def num_buffers(self) -> int: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDescVariant:
+    coalesced_buffers: Sequence[CoalescedBuffer]
+    @property
+    def layer_group_id(self) -> LayerGroupId: ...
+    @property
+    def slot_size_list(self) -> Sequence[int]: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDesc:
+    variants: Sequence[SlotDescVariant]
+    @property
+    def slot_size_list(self) -> Sequence[int]: ...
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupDesc:
+    pool_group_index: PoolGroupIndex
+    num_slots: int
+    slot_desc: SlotDesc
+    pools: Sequence[PoolDesc]
 
 # From _core/_kv_cache_manager.py
 @dataclass(slots=True, frozen=True)
@@ -327,6 +357,8 @@ class KVCacheManager:
     @property
     def tokens_per_block(self) -> int: ...
     @property
+    def init_config(self) -> KVCacheManagerConfig: ...
+    @property
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
@@ -341,6 +373,8 @@ class KVCacheManager:
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
+    @property
+    def pool_group_descs(self) -> Sequence[PoolGroupDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
     def adjust(self) -> None: ...
     @property

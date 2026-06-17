@@ -195,8 +195,6 @@ class KVCacheManagerConfig:
     """
 
     tokens_per_block: int
-    # if you have p-tuning tokens, include them. Only needed for multi-modal.
-    vocab_size: int
     # cache tiers are sorted from warm to cold. The first one must be GPU memory.
     cache_tiers: list[CacheTierConfig]
 
