@@ -188,6 +188,24 @@ def parse_args() -> argparse.Namespace:
         help="DeepSeek-style number of routing groups kept per token.",
     )
     model_group.add_argument(
+        "--n_shared_experts",
+        type=int,
+        default=None,
+        help="Number of shared experts to fuse into the routed-expert grouped "
+        "GEMM (DeepSeek-style). Only takes effect on the TRTLLM backend with "
+        "FP8_BLOCK_SCALES and dp_size==1; ignored by other backends. Default 0.",
+    )
+    model_group.add_argument(
+        "--shared_expert_mode",
+        type=lambda s: str(s).lower(),
+        default="fused",
+        choices=["fused", "unfused"],
+        help="How shared experts (n_shared_experts>0) are realized: 'fused' folds "
+        "them into the routed grouped GEMM (PR #11143); 'unfused' runs the routed "
+        "MoE plus a separate shared GatedMLP and sums them (pre-fusion baseline, "
+        "for measuring fusion's net benefit). Default fused.",
+    )
+    model_group.add_argument(
         "--quant",
         type=lambda s: QuantAlgo[str(s).upper()] if s is not None else None,
         default=None,
@@ -509,6 +527,8 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
             routing_method=routing,
             n_group=args.n_group,
             topk_group=args.topk_group,
+            n_shared_experts=int(args.n_shared_experts) if args.n_shared_experts is not None else 0,
+            shared_expert_mode=args.shared_expert_mode,
         )
 
     # Built-in model with optional per-field overrides.
@@ -532,6 +552,10 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
         routing_method=routing,
         n_group=args.n_group if args.n_group is not None else base.n_group,
         topk_group=args.topk_group if args.topk_group is not None else base.topk_group,
+        n_shared_experts=int(args.n_shared_experts)
+        if args.n_shared_experts is not None
+        else base.n_shared_experts,
+        shared_expert_mode=args.shared_expert_mode,
         swiglu_alpha=base.swiglu_alpha,
         swiglu_beta=base.swiglu_beta,
         swiglu_limit=base.swiglu_limit,

@@ -108,6 +108,12 @@ class ModelSpec:
     routing_method: str
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
+    n_shared_experts: int = 0
+    # How shared experts are realized when n_shared_experts > 0:
+    #   "fused"   -> fold them into the routed-expert grouped GEMM (PR #11143).
+    #   "unfused" -> routed MoE (no fusion) + a separate shared GatedMLP, summed
+    #                (the pre-fusion baseline, for measuring fusion's net benefit).
+    shared_expert_mode: str = "fused"
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
