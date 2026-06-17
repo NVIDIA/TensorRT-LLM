@@ -123,8 +123,11 @@ backend code directly.
 
 ### 2.1 Backend selection
 
-The backend is chosen from `config.attn_backend`, optional
-`sparse_attention_config`, and optional MLA parameters.
+`config.attn_backend` selects the base backend family. If
+`ModelConfig.sparse_attention_config` is set, the backend class is selected
+from that user-facing config's algorithm. The attention module separately
+lowers the config to `SparseParams` and passes those params to the constructed
+backend instance. MLA parameters can further affect backend construction.
 
 Base backend families:
 
@@ -136,9 +139,13 @@ Base backend families:
 
 ### 2.2 Sparse backend families
 
-Sparse attention is not selected by a separate top-level module. It is resolved
-through `sparse_attention_config` on top of a base backend family. Sparse
-selection can change the backend class, metadata subtype, and KV-cache manager.
+Sparse attention is not selected by a separate top-level module. User-facing
+`SparseAttentionConfig` objects live in LLM / VisualGen args and `ModelConfig`.
+Attention modules use those configs to select sparse backend classes, then
+lower the configs into `SparseParams` for backend construction. KV-cache
+managers stay model-scope and consume the user-facing config directly.
+Sparse metadata consumes `SparseMetadataParams`, derived independently from the
+same user-facing config.
 
 Sparse registrations are defined in `attention_backend/sparse/utils.py`. Check
 that file for the current supported combinations, as they may change over time.
@@ -181,8 +188,9 @@ metadata and cache behavior.
 
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
-parameters, runtime feature flags, optional sparse state, and optional
-CUDA-graph buffer management.
+parameters, runtime feature flags, and optional CUDA-graph buffer management.
+Sparse metadata subtypes consume only `SparseMetadataParams`, not
+backend-owned `SparseParams`.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
 block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix

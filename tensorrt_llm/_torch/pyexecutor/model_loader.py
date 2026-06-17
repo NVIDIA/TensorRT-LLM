@@ -13,7 +13,8 @@ from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy, SourceIdentity, check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
-                                          ModelExpressConfig, TorchLlmArgs)
+                                          ModelExpressConfig,
+                                          SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
