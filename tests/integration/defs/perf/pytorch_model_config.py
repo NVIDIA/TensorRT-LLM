@@ -526,7 +526,6 @@ def get_model_yaml_config(model_label: str,
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3,
-                    'allow_advanced_sampling': True,
                 },
             }
         },
@@ -583,6 +582,28 @@ def get_model_yaml_config(model_label: str,
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3,
                     'allow_advanced_sampling': True,
+                },
+            }
+        },
+        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (served from HF).
+        {
+            'patterns': ['nemotron_3_ultra_550b_nvfp4-serve-pytorch-'],
+            'config': {
+                'enable_attention_dp': True,
+                'stream_interval': 10,
+                'num_postprocess_workers': 4,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
                 },
             }
         },
