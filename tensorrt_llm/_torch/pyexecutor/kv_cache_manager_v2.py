@@ -799,8 +799,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
-        self.enable_block_reuse = kv_cache_config.enable_block_reuse
-        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        self.enable_block_reuse = kv_cache_config.enable_block_reuse and max_beam_width == 1
+        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse and max_beam_width == 1
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
 
         # With pipeline parallelism, multiple microbatches can be in-flight

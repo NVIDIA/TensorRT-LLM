@@ -411,6 +411,10 @@ class TestNoBatching(TestKVCacheManagerV2):
         prompt: list[TokenIdExt]
         decode_len: int
 
+    def disable_partial_commit(self) -> None:
+        self.manager._init_config.enable_partial_commit = False
+        assert not self.manager.enable_partial_commit
+
     def check_block_token_sources(
         self,
         kv_cache: _KVCache,
@@ -504,6 +508,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 tokens_per_block=tokens_per_block,
                 stream=cuda_stream,
             )
+            self.disable_partial_commit()
 
             kv_cache.beam_width = BeamIndex(2)
 
@@ -544,6 +549,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 tokens_per_block=tokens_per_block,
                 stream=cuda_stream,
             )
+            self.disable_partial_commit()
 
             kv_cache.beam_width = BeamIndex(2)
 
@@ -572,6 +578,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 tokens_per_block=tokens_per_block,
                 stream=cuda_stream,
             )
+            self.disable_partial_commit()
 
             kv_cache.beam_width = BeamIndex(2)
 
@@ -617,6 +624,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             assert kv_cache.resize(None, len(history))
             assert kv_cache.resize(len(history) + len(input_tokens))
             self.engine.execute([Step(kv_cache, input_tokens, history)], cuda_stream)
+            self.disable_partial_commit()
 
             kv_cache.beam_width = BeamIndex(2)
 
@@ -649,6 +657,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 tokens_per_block=tokens_per_block,
                 stream=cuda_stream,
             )
+            self.disable_partial_commit()
 
             kv_cache.beam_width = BeamIndex(2)
 
@@ -750,6 +759,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 tokens_per_block=tokens_per_block,
                 stream=cuda_stream,
             )
+            self.disable_partial_commit()
             kv_cache.beam_width = BeamIndex(2)
 
             with self.assertRaises(AssertionError):
@@ -779,6 +789,7 @@ class TestNoBatching(TestKVCacheManagerV2):
             self.engine.execute([Step(kv_cache, prompt, [])], cuda_stream)
             kv_cache.commit(prompt[:tokens_per_block])
             assert kv_cache.resize(None, len(prompt))
+            self.disable_partial_commit()
             kv_cache.beam_width = BeamIndex(2)
 
             kv_cache.close()
