@@ -164,6 +164,24 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
+// Print the last `lines` lines of the remote Slurm job log file to the console when the Slurm job fails.
+// If the log file does not exist, print a message to the console.
+def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 200) {
+    try {
+        def tailOut = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(remote,
+                "\"if [ -f ${remotePath} ]; then tail -n ${lines} ${remotePath}; " +
+                "else echo '[log not found: ${remotePath}]'; fi\""),
+            returnStdout: true,
+            numRetries: 1,
+        )?.trim()
+        pipeline.echo("===== Last ${lines} lines of ${remotePath} on ${remote.host} =====\n${tailOut}")
+    } catch (Exception tailEx) {
+        pipeline.echo("Ignorable warning: could not tail ${remotePath} on ${remote.host}: ${tailEx.message}")
+    }
+}
+
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
@@ -709,9 +727,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         throw e
                     } catch (Exception e) {
                         if (e.message?.contains("is no longer active")) {
+                            def slurmLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                            echoRemoteLogTail(pipeline, remote, slurmLogPath)
                             throw new InfraFailure(
-                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
-                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
+                                "${e.message}. Check SLURM logs at ${slurmLogPath} on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>"
+                            )
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
