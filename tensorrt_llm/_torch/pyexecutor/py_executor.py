@@ -2476,11 +2476,20 @@ class PyExecutor:
         Safety notes:
         - ``_sleep_wakeup_comm`` is a dedicated duplicated MPI communicator, isolated
           from all regular executor MPI traffic.
-        - ``torch.cuda.synchronize()`` is called before each VMM operation so
-          that in-flight CUDA kernels from the event-loop thread complete before
-          memory mappings are changed.  The event-loop thread is effectively
-          idle at this point (it is blocked in a collective waiting for rank-0,
-          whose event loop is paused via ``control_action()``).
+        - The ``CONTROL_REQUEST_ID`` sentinel is broadcast to all ranks via the
+          normal request-broadcaster path, so each non-rank-0 executor loop also
+          enters ``_handle_control_request()`` and blocks on ``control_action_done``.
+          This listener thread owns the ``control_action_done`` / ``control_request_barrier``
+          lifecycle on non-rank-0 ranks:
+            1. Wait on ``control_request_barrier`` to confirm the executor loop has
+               drained all in-flight work (mirroring rank-0's ``control_action()``
+               barrier handshake).
+            2. Perform the VMM operation with ``torch.cuda.synchronize()`` guards.
+            3. Clear ``control_request_barrier`` (reset for the next cycle) then set
+               ``control_action_done`` to unblock the executor loop.
+            4. Send the ACK to rank-0 only *after* step 3, so rank-0 cannot exit
+               ``control_action()`` and resume broadcasting new requests before this
+               rank's executor loop is guaranteed to have cleared the control barrier.
         - ``gc.collect()`` and ``torch.cuda.empty_cache()`` are safe to call
           from a non-main thread.
         """
@@ -2514,6 +2523,13 @@ class PyExecutor:
                     # a malformed message still results in an error ACK being
                     # sent via the finally below, rather than deadlocking rank-0.
                     tags = [ExecutorMemoryType(t) for t in msg["tags"]]
+                    # Wait for the executor loop to drain all active requests and
+                    # enter _handle_control_request().  It signals readiness by
+                    # setting control_request_barrier (the same event rank-0's
+                    # control_action() waits on locally).  This guarantees no
+                    # in-flight CUDA kernels from the executor are still running
+                    # on this rank when the VMM mapping is changed below.
+                    self.control_request_barrier.wait()
                     torch.cuda.synchronize()
                     if action == _SleepWakeupAction.SLEEP:
                         release_with_tag(*tags)
@@ -2553,6 +2569,18 @@ class PyExecutor:
                             action,
                             exc_info=True,
                         )
+                    # Unblock the executor loop that is waiting in
+                    # _handle_control_request().  Clear control_request_barrier
+                    # first so that it is clean for the next sleep/wakeup cycle
+                    # before the executor loop resumes and could potentially
+                    # set it again.  Only then signal control_action_done.
+                    self.control_request_barrier.clear()
+                    self.control_action_done.set()
+                    # Send the ACK to rank-0 only after the executor loop on
+                    # this rank has been unblocked.  This prevents rank-0 from
+                    # exiting control_action() and broadcasting new requests
+                    # before our executor loop has cleared its control barrier
+                    # and is ready to participate in the next collective.
                     self._sleep_wakeup_comm.send(
                         {
                             "status": "ok" if error_msg is None else "error",
