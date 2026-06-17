@@ -336,3 +336,24 @@ def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
+
+
+def test_mla_sm121_supported_configuration_preserves_cache_reuse(monkeypatch):
+    """Verify MLA support on SM121 preserves cache reuse in both config and runtime.
+
+    When SM121 is treated as a supported MLA architecture and KV quantization is
+    NO_QUANT, no unsupported-SM fallback should occur and:
+    - kv_cache_config.enable_block_reuse remains True
+    - model_engine.attn_runtime_features.cache_reuse remains True
+
+    This regression test protects the SM121 allowlist expansion added for MLA
+    cache reuse support.
+    """
+    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+        monkeypatch,
+        sm_version=121,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+    )
+
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
