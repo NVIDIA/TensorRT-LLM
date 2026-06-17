@@ -44,18 +44,18 @@ import triton.language as tl
 
 @triton.jit
 def _block_max_score_kernel(
-    qk_ptr,
-    score_ptr,
-    total_q,
-    num_heads,
-    max_k,
-    n_blocks,
-    stride_qk_q,
-    stride_qk_h,
-    stride_qk_k,
-    stride_score_q,
-    stride_score_h,
-    stride_score_b,
+    qk_ptr,  # *fp32
+    score_ptr,  # *fp32
+    total_q: tl.int32,
+    num_heads: tl.int32,
+    max_k: tl.int32,
+    n_blocks: tl.int32,
+    stride_qk_q: tl.int64,
+    stride_qk_h: tl.int64,
+    stride_qk_k: tl.int64,
+    stride_score_q: tl.int64,
+    stride_score_h: tl.int64,
+    stride_score_b: tl.int64,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Per-block max-score reduction.
@@ -87,24 +87,24 @@ def _block_max_score_kernel(
 
 @triton.jit
 def _sparse_softmax_kernel(
-    qk_ptr,
-    attended_ptr,
-    attn_ptr,
-    total_q,
-    num_kv_heads,
-    g,
-    max_k,
-    stride_qk_q,
-    stride_qk_h,
-    stride_qk_g,
-    stride_qk_k,
-    stride_att_q,
-    stride_att_h,
-    stride_att_k,
-    stride_o_q,
-    stride_o_h,
-    stride_o_g,
-    stride_o_k,
+    qk_ptr,  # *fp32
+    attended_ptr,  # *uint8
+    attn_ptr,  # *fp32
+    total_q: tl.int32,
+    num_kv_heads: tl.int32,
+    g: tl.int32,
+    max_k: tl.int32,
+    stride_qk_q: tl.int64,
+    stride_qk_h: tl.int64,
+    stride_qk_g: tl.int64,
+    stride_qk_k: tl.int64,
+    stride_att_q: tl.int64,
+    stride_att_h: tl.int64,
+    stride_att_k: tl.int64,
+    stride_o_q: tl.int64,
+    stride_o_h: tl.int64,
+    stride_o_g: tl.int64,
+    stride_o_k: tl.int64,
     BLOCK_K: tl.constexpr,
 ):
     """Masked softmax for sparse GQA.

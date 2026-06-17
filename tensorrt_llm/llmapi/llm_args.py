@@ -579,6 +579,21 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     def get_indices_block_size(self) -> int:
         return self.sparse_block_size
 
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
+            MiniMaxM3SparseParams
+
+        return MiniMaxM3SparseParams(
+            num_index_heads=self.sparse_num_index_heads,
+            sparse_index_dim=self.sparse_index_dim,
+            block_size=self.sparse_block_size,
+            topk=self.sparse_topk_blocks,
+            init_blocks=self.sparse_init_blocks,
+            local_blocks=self.sparse_local_blocks,
+            score_type=self.sparse_score_type,
+            disable_index_value=self.sparse_disable_index_value,
+        )
+
 
 class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""

@@ -23,12 +23,26 @@ from __future__ import annotations
 import dataclasses
 import functools
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+from ..params import SparseParams
+
+
+@dataclass(frozen=True)
+class MiniMaxM3SparseParams(SparseParams):
+    """Lowered runtime parameters for the MiniMax-M3 sparse backend."""
+
+    algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
+    num_index_heads: int = 4
+    sparse_index_dim: int = 128
+    block_size: int = 128
+    topk: int = 16
+    init_blocks: int = 0
+    local_blocks: int = 1
+    score_type: str = "max"
+    disable_index_value: bool = True
 
 
 @dataclass(frozen=True)
@@ -39,10 +53,10 @@ class MiniMaxM3SparseConfig:
     :class:`tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig`
     for that). It is the layer-invariant, post-TP-shard parameter bundle
     that backend kernels and reference helpers consume. The user knobs
-    come from the Pydantic config; ``num_q_heads`` / ``num_kv_heads`` /
-    ``head_dim`` come from the per-rank model geometry and must be
-    supplied by the caller (typically via
-    :meth:`from_sparse_attention_config`).
+    come from :class:`MiniMaxM3SparseParams`; ``num_q_heads`` /
+    ``num_kv_heads`` / ``head_dim`` come from the per-rank model
+    geometry and must be supplied by the caller (typically via
+    :meth:`from_sparse_params`).
     """
 
     num_q_heads: int
@@ -85,36 +99,28 @@ class MiniMaxM3SparseConfig:
             )
 
     @classmethod
-    def from_sparse_attention_config(
+    def from_sparse_params(
         cls,
-        sparse_attention_config: "MiniMaxM3SparseAttentionConfig",
+        sparse_params: "MiniMaxM3SparseParams",
         *,
         num_q_heads: int,
         num_kv_heads: int,
         head_dim: int,
     ) -> "MiniMaxM3SparseConfig":
-        """Build a kernel param bundle from the user-facing Pydantic config.
-
-        The Pydantic config supplies the algorithm knobs; the per-rank
-        model geometry (``num_q_heads``, ``num_kv_heads``, ``head_dim``)
-        is supplied separately by the caller because it is not part of
-        the user-facing config — it is derived from the model and the TP
-        mapping. This mirrors the DSA pattern where the
-        :class:`Indexer` reads the Pydantic config plus its own
-        constructor-provided geometry.
+        """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
+        and the per-rank model geometry.
         """
-        cfg = sparse_attention_config
         return cls(
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
             head_dim=int(head_dim),
-            num_index_heads=int(cfg.sparse_num_index_heads),
-            sparse_index_dim=int(cfg.sparse_index_dim),
-            block_size=int(cfg.sparse_block_size),
-            topk=int(cfg.sparse_topk_blocks),
-            init_blocks=int(cfg.sparse_init_blocks),
-            local_blocks=int(cfg.sparse_local_blocks),
-            score_type=str(cfg.sparse_score_type),
+            num_index_heads=int(sparse_params.num_index_heads),
+            sparse_index_dim=int(sparse_params.sparse_index_dim),
+            block_size=int(sparse_params.block_size),
+            topk=int(sparse_params.topk),
+            init_blocks=int(sparse_params.init_blocks),
+            local_blocks=int(sparse_params.local_blocks),
+            score_type=str(sparse_params.score_type),
         )
 
 
@@ -133,9 +139,16 @@ class MiniMaxM3SparseAttentionMetadata:
     Fields
     ------
     is_prefill : bool
-        ``True`` if this metadata describes a prefill / extend forward
-        (multiple Q tokens per sequence). ``False`` for decode (1 Q
-        token per sequence).
+        ``True`` routes through the *extend* kernel
+        (``minimax_m3_sparse_prefill``), which handles both pure
+        prefill AND mixed prefill+decode batches — decode rows in a
+        mixed batch appear as 1-slot extends (``extend_seq_len=1``,
+        ``prefix_len=num_cached``).
+        ``False`` is a perf-only specialization for pure-decode
+        batches (``num_contexts == 0``); it is mathematically
+        equivalent to the ``True`` path with
+        ``extend_seq_len=[1]*batch``. See
+        ``test_iter131_metadata_prepare_mixed_batch_uses_extend_path``.
     req_to_token : torch.Tensor
         Paged ``[max_reqs, max_kv_len]`` int32 mapping from
         ``(req_idx, pos)`` to slot index. Shared across layers.
@@ -843,6 +856,13 @@ def get_minimax_m3_attention_metadata_cls():
             # entry. Pure-decode batches (``num_contexts == 0``) still
             # take the decode optimization for CUDA-graph warmup
             # geometry.
+            #
+            # Mixed prefill+decode batches always take the extend path:
+            # the prefill kernel handles decode rows as 1-slot extends.
+            # The decode branch below is a pure-decode-only perf
+            # specialization. (iter-131 regression: previously a wrong
+            # predicate routed mixed batches into the decode branch and
+            # crashed in index_copy_.)
             is_extend = num_contexts > 0
             if is_extend:
                 prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]

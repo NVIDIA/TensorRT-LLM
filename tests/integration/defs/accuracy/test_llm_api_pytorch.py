@@ -7580,15 +7580,15 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_blackwell
 class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     # MiniMax-M3 is a block-sparse MoE model whose checkpoint is published with
     # the multimodal architecture (``MiniMaxM3SparseForConditionalGeneration``);
     # text-only GSM8K / MMLU exercise the text-decoder path. The custom HF
     # config requires ``trust_remote_code`` and the runtime requires the
     # MiniMax-M3 sparse attention backend + matching KV-cache manager v2
-    # (selected by ``sparse_attention_config``). The MXFP8 checkpoint is
-    # dequantized on load, so the runtime sees an effectively BF16 model
-    # (no ``quant_algo`` is set).
+    # (selected by ``sparse_attention_config``). Blackwell-only (SM100+);
+    # BF16 checkpoint only.
     MODEL_NAME = "MiniMaxAI/MiniMax-M3"
     MODEL_PATH = f"{llm_models_root()}/MiniMax-M3"
 

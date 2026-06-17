@@ -21,18 +21,22 @@ import torch.nn.functional as F
 from torch import nn
 
 # ---------------------------------------------------------------------------
-# MiniMax-M3 VL canonical special-token ids (from the checkpoint's
-# ``added_tokens.json`` + tokenizer).
+# MiniMax-M3 VL special tokens.
+#
+# The image / video placeholder token IDs live on the HF model config as
+# ``image_token_index`` / ``video_token_index`` — read those directly.
+# The vision-start / vision-end markers are not exposed on the config; they
+# are resolved through ``tokenizer.convert_tokens_to_ids`` using the textual
+# tokens below, which are the canonical strings carried by the checkpoint's
+# ``tokenizer_config.json`` ``added_tokens_decoder``. The checkpoint
+# processor (``processing_minimax.py``) wraps BOTH images and videos with
+# the *image* start/end markers; separate video start/end markers exist in
+# the tokenizer but are intentionally unused by the serving path.
 # ---------------------------------------------------------------------------
 
 
-MINIMAX_M3_VL_IMAGE_TOKEN_ID = 200025
-MINIMAX_M3_VL_VIDEO_TOKEN_ID = 200026
-# The checkpoint processor (``processing_minimax.py``) wraps BOTH images and
-# videos with the *image* start/end markers. Separate video start/end markers
-# exist in the tokenizer but are intentionally unused by the serving path.
-MINIMAX_M3_VL_VISION_START_TOKEN_ID = 200029
-MINIMAX_M3_VL_VISION_END_TOKEN_ID = 200030
+MINIMAX_M3_VL_VISION_START_TOKEN = "]<]start of image[>["  # nosec B105 - vision delimiter token, not a password
+MINIMAX_M3_VL_VISION_END_TOKEN = "]<]end of image[>["  # nosec B105 - vision delimiter token, not a password
 
 
 # ---------------------------------------------------------------------------
@@ -556,12 +560,12 @@ def prepare_multimodal_inputs_embeds(
     input_ids: torch.Tensor,
     embed_tokens: nn.Module,
     vision_tower: Optional[nn.Module],
+    image_token_id: int,
+    video_token_id: int,
     image_pixel_values: Optional[torch.Tensor] = None,
     image_grid_thws: Optional[Sequence[Sequence[int]]] = None,
     video_pixel_values: Optional[torch.Tensor] = None,
     video_grid_thws: Optional[Sequence[Sequence[int]]] = None,
-    image_token_id: int = MINIMAX_M3_VL_IMAGE_TOKEN_ID,
-    video_token_id: int = MINIMAX_M3_VL_VIDEO_TOKEN_ID,
     mm_token_indices: Optional[torch.Tensor] = None,
     mm_modality_order: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
@@ -1707,8 +1711,8 @@ class MiniMaxM3VLInputProcessor:
 
     The processor honours the checkpoint contract that BOTH image and
     video placeholders are framed by the image start/end tokens
-    (``MINIMAX_M3_VL_VISION_START_TOKEN_ID`` /
-    ``MINIMAX_M3_VL_VISION_END_TOKEN_ID`` above).
+    (``MINIMAX_M3_VL_VISION_START_TOKEN`` /
+    ``MINIMAX_M3_VL_VISION_END_TOKEN`` above, resolved via the tokenizer).
     """
 
     def __init__(
@@ -1753,6 +1757,40 @@ class MiniMaxM3VLInputProcessor:
             )
         if not isinstance(self._dtype, torch.dtype):
             self._dtype = getattr(torch, str(self._dtype).split(".")[-1], torch.bfloat16)
+
+        # Resolve special token ids strictly:
+        #   * image / video placeholder ids come from the model config
+        #     (``image_token_index`` / ``video_token_index``); missing
+        #     fields are a checkpoint contract violation.
+        #   * vision-start / vision-end marker ids come from the tokenizer
+        #     via ``convert_tokens_to_ids`` on the canonical token strings;
+        #     an unresolved lookup is a tokenizer contract violation.
+        if not hasattr(config, "image_token_index"):
+            raise ValueError("MiniMax-M3 VL config is missing required field 'image_token_index'")
+        if not hasattr(config, "video_token_index"):
+            raise ValueError("MiniMax-M3 VL config is missing required field 'video_token_index'")
+        self._image_token_id = int(config.image_token_index)
+        self._video_token_id = int(config.video_token_index)
+        self._vision_start_token_id = self._resolve_token_id(MINIMAX_M3_VL_VISION_START_TOKEN)
+        self._vision_end_token_id = self._resolve_token_id(MINIMAX_M3_VL_VISION_END_TOKEN)
+
+    def _resolve_token_id(self, token: str) -> int:
+        """Look ``token`` up via the tokenizer. Raise if the tokenizer has
+        no ``convert_tokens_to_ids`` or maps the token to its unk id."""
+        convert = getattr(self._tokenizer, "convert_tokens_to_ids", None)
+        if convert is None:
+            raise ValueError(
+                f"MiniMax-M3 VL tokenizer has no convert_tokens_to_ids; "
+                f"cannot resolve special token {token!r}"
+            )
+        resolved = convert(token)
+        unk = getattr(self._tokenizer, "unk_token_id", None)
+        if resolved is None or (unk is not None and resolved == unk):
+            raise ValueError(
+                f"MiniMax-M3 VL tokenizer cannot resolve special token {token!r}; "
+                f"got {resolved!r} (unk_token_id={unk!r})"
+            )
+        return int(resolved)
 
     # ----- registry contract properties -----------------------------------
     @property
@@ -1804,16 +1842,14 @@ class MiniMaxM3VLInputProcessor:
         return int(vocab) if vocab is not None else None
 
     def get_mm_token_ids(self) -> torch.Tensor:
-        return torch.tensor(
-            [MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID], dtype=torch.int32
-        )
+        return torch.tensor([self._image_token_id, self._video_token_id], dtype=torch.int32)
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         # VISION_START / VISION_END frame each MM span; declared as
         # specials so they're counted in num_mm_tokens_per_placeholder
         # but excluded from the embed-mask.
         return torch.tensor(
-            [MINIMAX_M3_VL_VISION_START_TOKEN_ID, MINIMAX_M3_VL_VISION_END_TOKEN_ID],
+            [self._vision_start_token_id, self._vision_end_token_id],
             dtype=torch.int32,
         )
 
@@ -1886,7 +1922,7 @@ class MiniMaxM3VLInputProcessor:
             )
         if not (has_image or has_video):
             return list(prompt_token_ids), None
-        placeholder_id = MINIMAX_M3_VL_IMAGE_TOKEN_ID if has_image else MINIMAX_M3_VL_VIDEO_TOKEN_ID
+        placeholder_id = self._image_token_id if has_image else self._video_token_id
         expected = len(num_mm_tokens_per_placeholder)
         expanded: List[int] = []
         consumed = 0
@@ -1905,9 +1941,9 @@ class MiniMaxM3VLInputProcessor:
                     f"MiniMaxM3VL fast path: num_mm_tokens[{consumed}]={inner + 2} "
                     "must be >= 3 (VISION_START + >=1 placeholder + VISION_END)."
                 )
-            expanded.append(MINIMAX_M3_VL_VISION_START_TOKEN_ID)
+            expanded.append(self._vision_start_token_id)
             expanded.extend([placeholder_id] * inner)
-            expanded.append(MINIMAX_M3_VL_VISION_END_TOKEN_ID)
+            expanded.append(self._vision_end_token_id)
             consumed += 1
         if consumed != expected:
             raise ValueError(

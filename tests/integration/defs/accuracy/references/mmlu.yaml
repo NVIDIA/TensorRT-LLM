@@ -291,10 +291,6 @@ Qwen/Qwen3.5-397B-A17B:
     accuracy: 85.0
 MiniMaxAI/MiniMax-M2:
   - accuracy: 83.82
-# MiniMax-M3 text decoder (block-sparse MoE) MMLU full 14042-sample split. The
-# MXFP8 checkpoint is dequantized on load, so runtime sees an effectively BF16
-# model (no quant_algo). Threshold is set ~1pp below the SGLang reference
-# (~81.45 on the same fixture) to absorb normal eval noise.
 MiniMaxAI/MiniMax-M3:
   - accuracy: 80
 moonshotai/Kimi-K2-Instruct:

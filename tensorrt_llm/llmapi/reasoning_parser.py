@@ -259,6 +259,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "gemma4": "gemma4",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
+    "minimax_m3": "minimax_m3",
     "minimax_m3_vl": "minimax_m3",
 }
 

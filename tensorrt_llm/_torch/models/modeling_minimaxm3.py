@@ -52,14 +52,7 @@ from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, 
 
 
 def is_minimax_m3_vl_config(pretrained_config: PretrainedConfig) -> bool:
-    """Return True if ``pretrained_config`` is the M3 VL (multimodal) wrapper.
-
-    The VL config has ``model_type='minimax_m3_vl'`` and exposes the
-    language model under a ``text_config`` sub-attribute. The text-only
-    config has ``model_type='minimax_m3'`` (or, when loaded as a generic
-    ``PretrainedConfig``, the ``architectures`` field contains
-    ``MiniMaxM3SparseForCausalLM`` directly).
-    """
+    """Return True if ``pretrained_config`` is a MiniMax-M3 VL config."""
     model_type = getattr(pretrained_config, "model_type", None)
     if model_type == "minimax_m3_vl":
         return True
@@ -183,15 +176,11 @@ _VL_PREFIXES = ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
 
 
 def _minimax_m3_swiglu_oai(gate_up: torch.Tensor, *, alpha: float, limit: float) -> torch.Tensor:
-    """SGLang's ``swiglu_no_interleaved_with_alpha_and_limit``.
-
-    Gate is clamped only on the upper side (``min=None``); ``up`` is
-    clamped on both sides. The asymmetric gate clamp is part of the
-    checkpoint contract — clamping ``gate`` below ``-limit`` would change
-    outputs for large-negative gate values and cause silent parity drift
-    vs SGLang.
-    """
+    """SwiGLU with asymmetric gate clamp + alpha scaling (SGLang's
+    ``swiglu_no_interleaved_with_alpha_and_limit``)."""
     gate, up = gate_up.chunk(2, dim=-1)
+    # Gate clamp is upper-side only (checkpoint contract — clamping
+    # below -limit drifts vs SGLang for large-negative gates).
     gate = gate.clamp(max=limit)
     up = up.clamp(min=-limit, max=limit)
     return gate * torch.sigmoid(alpha * gate) * (up + 1.0)
@@ -252,39 +241,21 @@ def _resolve_minimax_m3_expert_size_per_partition(
 ) -> int:
     """Compute the local expert/slot count the MoE module will resolve.
 
-    Mirrors :meth:`FusedMoE._init_load_balancer` and
-    :meth:`FusedMoE._init_dwdp_expert_layout` so the per-expert SwiGLU
-    parameter tensors we hand to ``create_moe`` are sized to the same
-    value the backend will see. Some backends (Triton, TRTLLM-Gen)
-    assert ``swiglu_alpha.shape == (expert_size_per_partition,)`` at
-    construction time, and quietly mismatching here surfaces as an
-    opaque CUDA-side shape failure deep inside the kernel dispatch.
+    Sizes the per-expert SwiGLU parameter tensors we hand to
+    ``create_moe`` to match what the backend sees. Some backends assert
+    ``swiglu_alpha.shape == (expert_size_per_partition,)`` at construct
+    time; a mismatch surfaces as an opaque CUDA-side shape failure.
 
-    Priority matches the MoE module itself:
-      1. DWDP manager → ``num_experts_per_worker``.
-      2. EPLB config  → ``num_slots // moe_ep_size``.
-      3. Plain EP     → ``num_experts // moe_ep_size`` (with a defensive
-                         ``max(1, ...)`` for tiny test configs where
-                         ``num_experts < ep_size``).
+    Priority:
+      1. EPLB config → ``num_slots // moe_ep_size``.
+      2. Plain EP    → ``num_experts // moe_ep_size`` (with ``max(1, ...)``
+                        for tiny test configs).
     """
-    # Local import: ``pyexecutor.dwdp`` pulls in CUDA driver/runtime
-    # bindings that are not always available at module import time on
-    # CPU-only environments. Matches ``FusedMoE`` (``interface.py``,
-    # ``configurable_moe.py``) which import ``get_global_dwdp_manager``
-    # from the same canonical location.
-    from ..pyexecutor.dwdp import get_global_dwdp_manager
-
-    dwdp_manager = get_global_dwdp_manager()
-    if dwdp_manager is not None:
-        return dwdp_manager.num_experts_per_worker
-
     ep_size = mapping.moe_ep_size
     if moe_load_balancer_config is not None and moe_load_balancer_config.num_slots:
-        # Mirror ``MoeLoadBalancerConfig.num_local_slots``'s math
-        # without depending on ``.setup(ep_rank, ep_size)`` having been
-        # called: that bootstrap (``maybe_create_moe_load_balancer``)
-        # only fires for archs in ``moe_model_arch_list`` and the
-        # ``num_local_slots`` property raises otherwise.
+        # Mirror ``MoeLoadBalancerConfig.num_local_slots`` without
+        # requiring ``.setup(ep_rank, ep_size)`` to have been called
+        # (the ``num_local_slots`` property raises otherwise).
         return moe_load_balancer_config.num_slots // ep_size
 
     return max(1, num_experts // ep_size)
@@ -294,24 +265,8 @@ class MiniMaxM3Gate(nn.Module):
     """MiniMax-M3 router gate: float32 sigmoid scoring + per-expert bias correction.
 
     Owns the router projection ``weight`` and the per-expert
-    ``e_score_correction_bias``. Matches the DeepSeekV3 / Laguna /
-    Qwen3 gate convention so that:
-
-      * generic DWDP / gate-aware tooling can locate
-        ``gate.e_score_correction_bias`` directly without knowing about
-        any model-specific holder module;
-      * ``create_moe`` receives the routing method via
-        ``gate.routing_method`` rather than from an inline lambda;
-      * the loader's ``mark_consumed`` cleanly removes
-        ``block_sparse_moe.gate.*`` after the gate finishes loading
-        without disturbing the sibling ``block_sparse_moe.experts.*``
-        backend subtree (the original concern that motivated the
-        ``_EScoreCorrectionBiasHolder`` workaround).
-
-    The router runs in float32 to match SGLang's reference shape; the
-    bias is invoked by the routing method via a callable so any later
-    parameter update (e.g. DWDP redistribution, post-load adjustment)
-    is picked up at runtime.
+    ``e_score_correction_bias``, matching the DeepSeekV3 / Laguna /
+    Qwen3 gate convention.
     """
 
     def __init__(
@@ -339,9 +294,7 @@ class MiniMaxM3Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in float32 (matches SGLang). Promote ``hidden_states``
-        # from bf16 inside the gate so callers don't need to handle the
-        # precision contract.
+        # Router runs in fp32 to match SGLang.
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
@@ -664,17 +617,6 @@ class MiniMaxM3Attention(Attention):
             use_gemma=self.use_gemma_norm,
         )
 
-        # Sparse index branch (layers 3-59 in the M3 checkpoint).
-        # Per the SGLang reference (and confirmed by checkpoint tensor shapes):
-        #   * ``index_q_proj`` is column-parallel and projects to
-        #     ``num_index_heads * sparse_index_dim`` (one Q vector per index
-        #     head per token).
-        #   * ``index_k_proj`` is **replicated** (no TP sharding) and projects
-        #     to **only** ``sparse_index_dim`` — a single K vector per token
-        #     that is broadcast across all index heads when scoring blocks.
-        # The base ``apply_qk_norm`` reshape pattern still applies to the
-        # index branch via :meth:`apply_index_qk_norm`, which reshapes to
-        # ``sparse_index_dim``-sized rows.
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
         self.disable_index_value = bool(disable_index_value)
         if self.is_sparse_attention_layer:
@@ -687,30 +629,10 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # index_q_proj is **replicated** across TP ranks
-            # (``tp_mode=None``). The downstream sparse forward consumes
-            # ``idx_q`` as the full ``[num_tokens, num_index_heads,
-            # sparse_index_dim]`` tensor (the registered
-            # :class:`MiniMaxM3SparseRuntimeBackend` reshapes it via
-            # ``idx_q.view(num_tokens, num_index_heads,
-            # sparse_index_dim)`` inside ``forward_sparse``) and dispatches
-            # per-KV-head top-k block selection from there. Two practical
-            # constraints rule out column-parallel sharding here:
-            #   1. The forward reshape ``idx_q.view(num_tokens,
-            #      sparse_num_index_heads, sparse_index_dim)`` requires
-            #      the rank-local ``idx_q`` to carry **all**
-            #      ``sparse_num_index_heads`` heads' Q vectors. A
-            #      column-parallel split would slice the head dimension
-            #      and break the reshape (e.g. at TP=8 with 4 index
-            #      heads, a per-rank 64-channel slice cannot reshape to
-            #      ``[-1, 128]``).
-            #   2. The index-K branch is already replicated, so the
-            #      symmetric treatment for index-Q keeps both halves of
-            #      the block-selection branch on the same TP axis.
-            # The replicated index_q_proj weight is small
-            # (``hidden_size * num_index_heads * sparse_index_dim`` =
-            # 6144 * 4 * 128 ≈ 3.1M params, ~3 MiB BF16), so the extra
-            # per-rank memory is negligible.
+            # index_q_proj is **replicated** across TP ranks. The sparse
+            # forward reshapes idx_q to
+            # ``[num_tokens, sparse_num_index_heads, sparse_index_dim]``,
+            # which requires the rank-local idx_q to carry all heads.
             index_q_total = self.sparse_num_index_heads * self.sparse_index_dim
             self.index_q_proj = Linear(
                 config.hidden_size,
@@ -722,9 +644,10 @@ class MiniMaxM3Attention(Attention):
                 quant_config=None,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
-            # index_k_proj is REPLICATED across TP ranks (``tp_mode=None``)
-            # and outputs only ``sparse_index_dim`` channels — a single K
-            # per token (not per-head).
+            # index_k_proj is also replicated across TP ranks and
+            # outputs ``sparse_index_dim`` channels — a single K per
+            # token (not per-head), broadcast across index heads when
+            # scoring blocks.
             self.index_k_proj = Linear(
                 config.hidden_size,
                 self.sparse_index_dim,
@@ -1523,15 +1446,19 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         # ``input_ids`` via ``getattr(self.model, "mm_token_ids", None)``.
         # MiniMax-M3's image/video tokens are in-vocab so the engine's
         # OOV fallback (``input_ids >= vocab_size``) does not find them.
-        from .modeling_minimaxm3_vl import (
-            MINIMAX_M3_VL_IMAGE_TOKEN_ID,
-            MINIMAX_M3_VL_VIDEO_TOKEN_ID,
-        )
-
+        # The HF config carries ``image_token_index`` / ``video_token_index``
+        # — read them directly; a missing field is a checkpoint contract
+        # violation.
+        if not hasattr(raw_pretrained, "image_token_index"):
+            raise ValueError("MiniMax-M3 VL config is missing required field 'image_token_index'")
+        if not hasattr(raw_pretrained, "video_token_index"):
+            raise ValueError("MiniMax-M3 VL config is missing required field 'video_token_index'")
+        image_token_id = int(raw_pretrained.image_token_index)
+        video_token_id = int(raw_pretrained.video_token_index)
         self.register_buffer(
             "mm_token_ids",
             torch.tensor(
-                [MINIMAX_M3_VL_IMAGE_TOKEN_ID, MINIMAX_M3_VL_VIDEO_TOKEN_ID],
+                [image_token_id, video_token_id],
                 dtype=torch.int32,
             ),
             persistent=False,

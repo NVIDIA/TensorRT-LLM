@@ -2,19 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Focused regression tests for the KVCacheManagerV2 per-layer extra-buffer
-# registration hook introduced for MiniMax-M3 sparse index-K support
-# (Stage 14 Goal 14.1 in workspace/hidden-trail).
-#
-# Goal 14.1 scope:
-#   * Add ``Role.INDEX_KEY`` to the V2 role surface as an opaque DataRole.
-#   * Let subclasses register additional per-layer ``BufferConfig`` entries
-#     alongside the standard K/V/NVFP4 scale buffers via the
-#     ``_extra_buffers_per_layer`` hook on ``KVCacheManagerV2``.
-#   * Preserve the existing K/V/NVFP4 scale wiring and lifecycle.
+# registration hook used by MiniMax-M3 sparse index-K support. The hook lets
+# subclasses register additional per-layer ``BufferConfig`` entries (e.g.
+# ``Role.INDEX_KEY``) alongside the standard K/V/NVFP4 scale buffers without
+# disturbing the existing K/V wiring or lifecycle.
 #
 # These tests run on CUDA/GPU because ``KVCacheManagerV2`` constructs real
-# device memory pools and the goal explicitly requires GPU evidence
-# (Stage 14 acceptance criteria item 1).
+# device memory pools.
 
 import gc
 import unittest
@@ -242,24 +236,13 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
 
 
 class TestIndexKeyBufferAccessor(unittest.TestCase):
-    """Focused CUDA/GPU regressions for the
-    :meth:`KVCacheManagerV2.get_index_k_buffer` paged accessor introduced
-    for MiniMax-M3 sparse index-K support (Stage 14 Goal 14.2 in
-    workspace/hidden-trail).
+    """CUDA/GPU regressions for :meth:`KVCacheManagerV2.get_index_k_buffer`.
 
-    Goal 14.2 scope:
-      * Add a V2 paged accessor that returns a torch view over the
-        managed ``Role.INDEX_KEY`` pool for local sparse layers.
-      * Shape the view as ``[num_pages, tokens_per_block, num_heads,
-        head_dim]`` so sparse modeling code can index by page,
-        token-within-block, head, and index dimension.
-      * Return ``None`` when the layer has no INDEX_KEY buffer
-        registered (e.g. dense layers).
-      * Reject wiring mismatch between the caller's
-        ``num_heads * head_dim * dtype_bytes * tokens_per_block`` and
-        the V2-reported page stride.
-      * Provide a zero-copy view (writes propagate; data_ptr stable
-        across calls).
+    The accessor returns a paged torch view shaped
+    ``[num_pages, tokens_per_block, num_heads, head_dim]`` over the
+    managed ``Role.INDEX_KEY`` pool, returns ``None`` for dense layers,
+    rejects wiring mismatches against the V2-reported page stride, and
+    is zero-copy (writes propagate; ``data_ptr`` stable across calls).
     """
 
     NUM_HEADS = 1

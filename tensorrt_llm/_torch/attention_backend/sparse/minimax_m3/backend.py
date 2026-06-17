@@ -73,6 +73,7 @@ from .metadata import (
 
 if TYPE_CHECKING:
     from .cache_manager import MiniMaxM3SparseIndexCache
+    from .metadata import MiniMaxM3SparseParams
 
 # Sentinel block score for blocks that init / local priority forces into
 # the top-k regardless of their numerical score.
@@ -1034,27 +1035,27 @@ def get_minimax_m3_attention_backend_cls():
             head_dim: int,
             num_kv_heads: Optional[int] = None,
             quant_config=None,
-            sparse_attention_config=None,
+            sparse_params: Optional["MiniMaxM3SparseParams"] = None,
             **kwargs,
         ):
+            if sparse_params is None:
+                raise ValueError("sparse_params is required for MiniMaxM3SparseRuntimeBackend")
             super().__init__(
                 layer_idx,
                 num_heads,
                 head_dim,
                 num_kv_heads=num_kv_heads,
                 quant_config=quant_config,
-                sparse_attention_config=sparse_attention_config,
+                sparse_params=sparse_params,
                 **kwargs,
             )
-            if sparse_attention_config is None:
-                raise ValueError("MiniMaxM3SparseRuntimeBackend requires a sparse_attention_config")
-            self.m3_config = MiniMaxM3SparseConfig.from_sparse_attention_config(
-                sparse_attention_config,
+            self.m3_config = MiniMaxM3SparseConfig.from_sparse_params(
+                sparse_params,
                 num_q_heads=num_heads,
                 num_kv_heads=num_kv_heads or num_heads,
                 head_dim=head_dim,
             )
-            self.disable_index_value = bool(sparse_attention_config.sparse_disable_index_value)
+            self.disable_index_value = bool(sparse_params.disable_index_value)
 
         @staticmethod
         def support_fused_rope() -> bool:

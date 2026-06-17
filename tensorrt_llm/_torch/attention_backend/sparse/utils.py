@@ -20,7 +20,7 @@ def get_sparse_attn_kv_cache_manager(
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .dsa import DSACacheManager
-    from .minimax_m3 import get_minimax_m3_kv_cache_manager_cls
+    from .minimax_m3 import MiniMaxM3KVCacheManagerV2
     from .rocket import RocketKVCacheManager
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
@@ -29,7 +29,7 @@ def get_sparse_attn_kv_cache_manager(
     elif sparse_attention_config.algorithm == "skip_softmax":
         return KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
-        return get_minimax_m3_kv_cache_manager_cls()
+        return MiniMaxM3KVCacheManagerV2
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm: {sparse_attention_config.algorithm}"

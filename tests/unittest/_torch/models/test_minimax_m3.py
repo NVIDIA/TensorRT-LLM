@@ -8,16 +8,14 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 """Unit and integration tests for the MiniMax-M3 text bring-up.
 
-The CPU-only tests exercise the Goal 1.1 helpers (config normalization,
-layer scheduling, routing-method scaling) without requiring CUDA or the
-TensorRT-LLM C++ extension. ``test_text_checkpoint_loading`` is the
-Stage 1 / item 1 acceptance gate: it loads the real MiniMax-M3
-checkpoint config / tokenizer / chat template, runs the static keyspace
-coverage classifier on every key in the checkpoint's safetensors index,
-and confirms that each ``language_model.*`` weight is either mapped to a
-TRT-LLM text parameter (loaded) or intentionally ignored with a
-documented reason. CUDA-side execution of the model is the responsibility
-of subsequent Stage 1 goals (1.2-1.7).
+Helper tests exercise config normalization, layer scheduling, and
+routing-method scaling. ``test_text_checkpoint_loading`` loads the real
+MiniMax-M3 checkpoint config / tokenizer / chat template, runs the
+static keyspace coverage classifier on every key in the checkpoint's
+safetensors index, and confirms that each ``language_model.*`` weight
+is either mapped to a TRT-LLM text parameter (loaded) or intentionally
+ignored with a documented reason. CUDA tests exercise attention module
+construction and the multi-rank ADP negative-control path.
 """
 
 from __future__ import annotations
@@ -25,9 +23,33 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
-from typing import Dict
 
 import pytest
+import torch
+from safetensors import safe_open
+from torch import nn
+from transformers import AutoConfig
+from utils.llm_data import llm_models_root
+
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_minimaxm3 import (
+    MiniMaxM3Attention,
+    _build_swiglu_oai_dense_mlp,
+    _strip_language_model_prefix,
+    _wrap_dict_as_config,
+    get_moe_layer_ids,
+    get_sparse_disable_index_value_layer_ids,
+    get_sparse_layer_ids,
+    get_text_config,
+    is_minimax_m3_vl_config,
+)
+from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
+from tensorrt_llm._torch.modules.fused_moe.routing import (
+    MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
+)
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -113,42 +135,34 @@ def _make_vl_config():
 # ---------------------------------------------------------------------------
 
 
-_CHECKPOINT_PATH_ENV = "MINIMAX_M3_CHECKPOINT_PATH"
-_DEFAULT_CHECKPOINT_PATH = "/home/scratch.fredw_sw/workspace/hidden_trail/minimax-m3-preview_vv1"
+_DEFAULT_CHECKPOINT_PATH = f"{llm_models_root()}/MiniMax-M3"
 
 
 def _checkpoint_path() -> str:
-    return os.environ.get(_CHECKPOINT_PATH_ENV, _DEFAULT_CHECKPOINT_PATH)
+    return _DEFAULT_CHECKPOINT_PATH
 
 
 def _has_cuda() -> bool:
     try:
-        import torch
+        return torch.cuda.is_available()
     except Exception:
         return False
-    return torch.cuda.is_available()
 
 
 # ---------------------------------------------------------------------------
-# Goal 1.1 CPU-only unit tests
+# CPU-only unit tests
 # ---------------------------------------------------------------------------
 
 
 def test_is_minimax_m3_vl_config_detects_vl():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import is_minimax_m3_vl_config
-
     assert is_minimax_m3_vl_config(_make_vl_config()) is True
 
 
 def test_is_minimax_m3_vl_config_detects_text_only():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import is_minimax_m3_vl_config
-
     assert is_minimax_m3_vl_config(_make_text_config()) is False
 
 
 def test_is_minimax_m3_vl_config_falls_back_to_architectures():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import is_minimax_m3_vl_config
-
     cfg = SimpleNamespace(
         model_type="custom",
         architectures=["MiniMaxM3SparseForConditionalGeneration"],
@@ -157,8 +171,6 @@ def test_is_minimax_m3_vl_config_falls_back_to_architectures():
 
 
 def test_get_text_config_returns_text_subconfig():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
-
     vl_cfg = _make_vl_config()
     text_cfg = get_text_config(vl_cfg)
     assert text_cfg is vl_cfg.text_config
@@ -166,15 +178,11 @@ def test_get_text_config_returns_text_subconfig():
 
 
 def test_get_text_config_passthrough_for_text_only():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
-
     text_cfg = _make_text_config()
     assert get_text_config(text_cfg) is text_cfg
 
 
 def test_get_text_config_propagates_dtype_when_missing():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
-
     vl_cfg = _make_vl_config()
     vl_cfg.text_config.torch_dtype = None
     out = get_text_config(vl_cfg)
@@ -182,24 +190,18 @@ def test_get_text_config_propagates_dtype_when_missing():
 
 
 def test_get_text_config_missing_text_attribute_raises():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
-
     bad = SimpleNamespace(model_type="minimax_m3_vl")
     with pytest.raises(ValueError, match="text_config"):
         get_text_config(bad)
 
 
 def test_get_sparse_layer_ids_splits_dense_and_sparse():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_sparse_layer_ids
-
     dense, sparse = get_sparse_layer_ids(_make_text_config())
     assert dense == [0, 1, 2]
     assert sparse == [3, 4, 5, 6]
 
 
 def test_get_sparse_layer_ids_falls_back_when_disabled():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_sparse_layer_ids
-
     cfg = _make_text_config()
     cfg.sparse_attention_config["use_sparse_attention"] = False
     dense, sparse = get_sparse_layer_ids(cfg)
@@ -208,8 +210,6 @@ def test_get_sparse_layer_ids_falls_back_when_disabled():
 
 
 def test_get_sparse_layer_ids_falls_back_without_config():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_sparse_layer_ids
-
     cfg = _make_text_config()
     cfg.sparse_attention_config = None
     dense, sparse = get_sparse_layer_ids(cfg)
@@ -218,8 +218,6 @@ def test_get_sparse_layer_ids_falls_back_without_config():
 
 
 def test_get_sparse_layer_ids_length_mismatch_raises():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_sparse_layer_ids
-
     cfg = _make_text_config()
     cfg.sparse_attention_config["sparse_attention_freq"] = [0] * (_NUM_HIDDEN_LAYERS + 1)
     with pytest.raises(ValueError, match="sparse_attention_freq length"):
@@ -227,35 +225,23 @@ def test_get_sparse_layer_ids_length_mismatch_raises():
 
 
 def test_get_sparse_disable_index_value_layer_ids_matches_sparse():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        get_sparse_disable_index_value_layer_ids,
-    )
-
     ids = get_sparse_disable_index_value_layer_ids(_make_text_config())
     assert ids == [3, 4, 5, 6]
 
 
 def test_get_sparse_disable_index_value_no_config():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        get_sparse_disable_index_value_layer_ids,
-    )
-
     cfg = _make_text_config()
     cfg.sparse_attention_config = None
     assert get_sparse_disable_index_value_layer_ids(cfg) == []
 
 
 def test_get_moe_layer_ids_splits_dense_and_moe():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_moe_layer_ids
-
     dense, moe = get_moe_layer_ids(_make_text_config())
     assert dense == [0, 1, 2]
     assert moe == [3, 4, 5, 6]
 
 
 def test_get_moe_layer_ids_all_moe_without_freq():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_moe_layer_ids
-
     cfg = _make_text_config()
     cfg.moe_layer_freq = None
     dense, moe = get_moe_layer_ids(cfg)
@@ -264,8 +250,6 @@ def test_get_moe_layer_ids_all_moe_without_freq():
 
 
 def test_get_moe_layer_ids_length_mismatch_raises():
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import get_moe_layer_ids
-
     cfg = _make_text_config()
     cfg.moe_layer_freq = [0] * (_NUM_HIDDEN_LAYERS - 1)
     with pytest.raises(ValueError, match="moe_layer_freq length"):
@@ -273,7 +257,7 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 
 
 # ---------------------------------------------------------------------------
-# Goal 1.3 — attention module transforms
+# attention module transforms
 # ---------------------------------------------------------------------------
 #
 # These tests construct :class:`MiniMaxM3Attention` with a tiny synthetic
@@ -306,7 +290,7 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 
 
 def _make_attention_test_config():
-    """Return ``(text_config, ModelConfig)`` for the Goal 1.3 attention tests.
+    """Return ``(text_config, ModelConfig)`` for the attention tests.
 
     Geometry is a scaled-down M3-shaped config: hidden_size=128, head_dim=32,
     num_heads=4, num_kv_heads=2, num_index_heads=2, sparse_index_dim=32,
@@ -314,12 +298,6 @@ def _make_attention_test_config():
     layers. With ``skip_create_weights_in_init=True`` no Linear weight
     tensors are allocated, only metadata.
     """
-    import torch
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import _wrap_dict_as_config
-    from tensorrt_llm.mapping import Mapping
-
     n_layers = 4
     sparse_cfg = {
         "use_sparse_attention": True,
@@ -371,8 +349,6 @@ def _per_head_gemma_rms_norm_reference(x, weight, eps):
     ``(weight + 1)``. The per-head structure comes from reshaping the
     input to ``(-1, head_dim)`` before applying this function.
     """
-    import torch
-
     input_dtype = x.dtype
     x_f32 = x.to(torch.float32)
     variance = x_f32.pow(2).mean(-1, keepdim=True)
@@ -384,8 +360,6 @@ def _per_head_gemma_rms_norm_reference(x, weight, eps):
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_dense_construction_matches_config():
     """Dense layer's QKV/O projection and per-head Q/K norm match config."""
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
-
     text_cfg, model_cfg = _make_attention_test_config()
     attn = MiniMaxM3Attention(
         model_config=model_cfg,
@@ -437,8 +411,6 @@ def test_minimax_m3_attention_dense_construction_matches_config():
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_partial_rope_dim_is_rotary_dim():
     """Partial RoPE rotates only ``rotary_dim`` of ``head_dim`` channels."""
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
-
     text_cfg, model_cfg = _make_attention_test_config()
     attn = MiniMaxM3Attention(
         model_config=model_cfg,
@@ -462,10 +434,6 @@ def test_minimax_m3_attention_partial_rope_dim_is_rotary_dim():
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_apply_qk_norm_matches_reference():
     """Verify ``apply_qk_norm`` does per-head Gemma RMSNorm and reshape-back."""
-    import torch
-
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
-
     text_cfg, model_cfg = _make_attention_test_config()
     attn = MiniMaxM3Attention(
         model_config=model_cfg,
@@ -512,7 +480,7 @@ def test_minimax_m3_attention_apply_qk_norm_matches_reference():
 def test_minimax_m3_attention_sparse_construction_matches_config():
     """Sparse layer adds index branch with the SGLang-correct shapes.
 
-    Verifies the **bug fix** from the iter-4 Goal 1.3 work:
+    Verifies the **bug fix** from the iter-4 work:
       * ``index_q_proj`` is column-parallel and projects to
         ``num_index_heads * sparse_index_dim``.
       * ``index_k_proj`` is replicated (``tp_mode is None``) and projects
@@ -523,8 +491,6 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
       * ``index_q_norm`` / ``index_k_norm`` are per-head Gemma RMSNorm
         of width ``sparse_index_dim``.
     """
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
-
     text_cfg, model_cfg = _make_attention_test_config()
     sparse_cfg = text_cfg.sparse_attention_config
     num_index_heads = int(sparse_cfg["sparse_num_index_heads"])
@@ -599,10 +565,6 @@ def test_minimax_m3_attention_apply_index_qk_norm_matches_reference():
     non-zero norm weights, drives synthetic input, and compares against
     the same pure-torch reference used for the main Q/K norm.
     """
-    import torch
-
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
-
     text_cfg, model_cfg = _make_attention_test_config()
     sparse_cfg = text_cfg.sparse_attention_config
     num_index_heads = int(sparse_cfg["sparse_num_index_heads"])
@@ -646,10 +608,6 @@ def test_minimax_m3_attention_apply_index_qk_norm_matches_reference():
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_dense_apply_index_qk_norm_raises():
     """Dense layers must reject ``apply_index_qk_norm`` calls."""
-    import torch
-
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
-
     _, model_cfg = _make_attention_test_config()
     attn = MiniMaxM3Attention(
         model_config=model_cfg,
@@ -664,17 +622,10 @@ def test_minimax_m3_attention_dense_apply_index_qk_norm_raises():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
-@pytest.mark.skipif(
-    not os.path.exists(_checkpoint_path()),
-    reason=(
-        "MiniMax-M3 checkpoint not mounted; set "
-        f"{_CHECKPOINT_PATH_ENV} to a path containing config.json"
-    ),
-)
 def test_minimax_m3_attention_real_config_index_branch_shapes():
     """Real M3 config → sparse-layer index branch has the checkpoint's shapes.
 
-    Asserts the iter-4 Goal 1.3 fix in numbers:
+    Asserts the iter-4 fix in numbers:
       * ``index_q_proj.out_features == 512`` (= 4 * 128
         = ``num_index_heads * sparse_index_dim``).
       * ``index_k_proj.out_features == 128`` (= ``sparse_index_dim``)
@@ -686,15 +637,7 @@ def test_minimax_m3_attention_real_config_index_branch_shapes():
       * ``index_q_norm.weight.shape == (128,)`` and
         ``index_k_norm.weight.shape == (128,)``.
     """
-    import torch
-
     pytest.importorskip("transformers")
-    from transformers import AutoConfig
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention, get_text_config
-    from tensorrt_llm.mapping import Mapping
-
     cfg = AutoConfig.from_pretrained(_checkpoint_path(), trust_remote_code=True)
     text_cfg = get_text_config(cfg)
     # ``MiniMaxM3Model.__init__`` normalises ``torch_dtype`` to a real
@@ -765,13 +708,6 @@ def test_minimax_m3_attention_real_config_index_branch_shapes():
 
 def test_minimax_m3_routing_method_applies_routed_scaling_factor():
     """MiniMaxM3MoeRoutingMethod multiplies renormalized weights by scaling."""
-    import torch
-
-    from tensorrt_llm._torch.modules.fused_moe.routing import (
-        MiniMaxM2MoeRoutingMethod,
-        MiniMaxM3MoeRoutingMethod,
-    )
-
     num_experts = 8
     top_k = 2
     bias = torch.zeros(num_experts, dtype=torch.float32)
@@ -802,13 +738,6 @@ def test_minimax_m3_routing_method_applies_routed_scaling_factor():
 
 
 def test_minimax_m3_routing_method_default_scale_is_identity():
-    import torch
-
-    from tensorrt_llm._torch.modules.fused_moe.routing import (
-        MiniMaxM2MoeRoutingMethod,
-        MiniMaxM3MoeRoutingMethod,
-    )
-
     num_experts = 8
     top_k = 2
     bias = torch.zeros(num_experts, dtype=torch.float32)
@@ -834,15 +763,8 @@ def test_minimax_m3_routing_method_default_scale_is_identity():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
-@pytest.mark.skipif(
-    not os.path.exists(_checkpoint_path()),
-    reason=(
-        "MiniMax-M3 checkpoint not mounted; set "
-        f"{_CHECKPOINT_PATH_ENV} to a path containing config.json"
-    ),
-)
 def test_text_norm_weights_real_loader_smoke():
-    """Goal 1.2 gate: real ``_load_weights_impl`` populates norm parameters.
+    """real ``_load_weights_impl`` populates norm parameters.
 
     Constructs a memory-safe stub containing the top-level ``model.norm``
     and the first decoder layer's ``input_layernorm`` and
@@ -857,26 +779,10 @@ def test_text_norm_weights_real_loader_smoke():
 
     Why this slice: ``input_layernorm`` / ``post_attention_layernorm`` /
     ``model.norm`` exercise the loader's ``filter_weights`` + per-module
-    copy path on real tensor handles. Surfacing every required text-path
-    parameter under the state-dict-coverage report is the static half of
-    Goal 1.2.
+    copy path on real tensor handles.
     """
     pytest.importorskip("safetensors")
     pytest.importorskip("transformers")
-
-    import torch
-    from safetensors import safe_open
-    from torch import nn
-    from transformers import AutoConfig
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        _strip_language_model_prefix,
-        get_text_config,
-    )
-    from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-    from tensorrt_llm.mapping import Mapping
 
     checkpoint = _checkpoint_path()
     cfg = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
@@ -1025,15 +931,6 @@ def test_minimax_m3_swiglu_oai_dense_mlp_under_adp_is_replicated():
     all-reduce across ADP ranks and mix outputs from independent
     rank-local token sets.
     """
-    import torch  # noqa: F401
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-        _build_swiglu_oai_dense_mlp,
-        _wrap_dict_as_config,
-    )
-    from tensorrt_llm.mapping import Mapping
-
     text_cfg = _wrap_dict_as_config(
         {
             "hidden_size": 128,
@@ -1074,384 +971,3 @@ def test_minimax_m3_swiglu_oai_dense_mlp_under_adp_is_replicated():
         "ADP down_proj must skip the cross-rank all-reduce; otherwise it "
         "mixes outputs across independent rank-local token sets"
     )
-
-
-def _mpi_world_size() -> int:
-    """Best-effort MPI world size lookup for tests that need to know
-    whether the current process is a multi-rank Slurm/MPI launch or a
-    single-process unit run. Returns 1 when MPI is not available or
-    cannot be initialized.
-    """
-    try:
-        from mpi4py import MPI
-
-        return int(MPI.COMM_WORLD.Get_size())
-    except Exception:
-        # Fall back to SLURM_NTASKS when MPI4py is unavailable / not
-        # initialized. Single-process unit runs return 1.
-        import os
-
-        try:
-            return int(os.environ.get("SLURM_NTASKS", "1"))
-        except (TypeError, ValueError):
-            return 1
-
-
-# ---------------------------------------------------------------------------
-# Multi-rank ADP negative-control / mutation tests
-# ---------------------------------------------------------------------------
-#
-# Real multi-rank MPI job via the ``mpi_pool_executor`` fixture so the
-# AllReduce workspace allocator actually runs. The test constructs both
-# the ADP-safe (replicated, ``reduce_output=False``, no AllReduce) and
-# the non-ADP (ROW-sharded, ``reduce_output=True``, AllReduce active)
-# ``GatedMLP`` produced by ``_build_swiglu_oai_dense_mlp``, and a
-# mutation that reproduces the pre-fix broken state.
-#
-# The mutation/negative control inside this job is layered:
-#
-#   * Negative control A — the non-ADP path actually allocates the
-#     AllReduce workspace and constructs the ROW-sharded Linear with
-#     ``reduce_output=True``. Proof that the all-reduce path is alive
-#     under regular TP, so a regression that disables the all-reduce
-#     for every path (not just ADP) would fail this assertion.
-#   * Negative control B — under ADP the same builder constructs a
-#     replicated Linear with ``reduce_output=False`` and **no**
-#     AllReduce module, proving the ADP-safe construction is active.
-#   * Mutation — the test simulates the fix being reverted by building
-#     ``GatedMLP`` directly with ``overridden_tp_size=None`` and
-#     ``reduce_output=True`` against an ADP mapping (the pre-fix code
-#     path). The mutated ``GatedMLP`` then has ``reduce_output=True``,
-#     ``tp_size==world_size``, and an AllReduce module attached —
-#     proving the test would catch the regression.
-#
-# The MPI fixture spawns 2 worker processes (one per rank) and each
-# worker independently exercises all three layers. The test exits 0
-# only when every rank passes; an asymmetric failure on a single rank
-# (the exact symptom a cross-rank mixing bug would produce) propagates
-# back through ``MPIPoolExecutor`` as an exception on rank 0.
-
-
-def _swiglu_dense_mlp_adp_negative_control_worker(world_size: int, rank: int) -> Dict:
-    """Per-rank worker for the multi-rank ADP negative-control test.
-
-    Runs on each MPI worker independently. Each worker constructs
-    three variants of the M3 dense MLP (non-ADP, ADP, and a mutated
-    ADP path) and verifies the ADP-safe construction invariants.
-    Returns a structured dict of evidence that the controller (rank 0)
-    can aggregate and assert across ranks.
-    """
-    import importlib
-    from functools import partial
-
-    import torch as _torch
-
-    # Pin this worker process to its rank-local GPU. The mpi_pool_executor
-    # fixture spawns local worker processes that share the host's CUDA
-    # context space, so we explicitly bind each rank's tensors to the
-    # rank-numbered device. The number of visible CUDA devices on the
-    # host is the upper bound; if there are fewer visible devices than
-    # ranks the worker falls back to device 0 (the workers will still
-    # share the same device but the construction-time invariants do not
-    # depend on rank-distinct devices).
-    cuda_dev = rank
-    try:
-        n_devs = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
-    except Exception:
-        n_devs = 0
-    if n_devs > 0:
-        cuda_dev = rank % n_devs
-        _torch.cuda.set_device(cuda_dev)
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-
-    minimaxm3_module = importlib.import_module("tensorrt_llm._torch.models.modeling_minimaxm3")
-    _build_swiglu_oai_dense_mlp = minimaxm3_module._build_swiglu_oai_dense_mlp
-    _minimax_m3_swiglu_oai = minimaxm3_module._minimax_m3_swiglu_oai
-    _wrap_dict_as_config = minimaxm3_module._wrap_dict_as_config
-    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-    from tensorrt_llm.mapping import Mapping
-
-    text_cfg = _wrap_dict_as_config(
-        {
-            "hidden_size": 128,
-            "intermediate_size": 64,
-            "swiglu_alpha": 1.702,
-            "swiglu_limit": 7.0,
-            "torch_dtype": _torch.bfloat16,
-        }
-    )
-    hidden = int(text_cfg.hidden_size)
-    intermediate = 64
-
-    # ------------------------------------------------------------------
-    # Negative control A — non-ADP path: ROW-sharded down_proj with
-    # active AllReduce.
-    # ------------------------------------------------------------------
-    non_adp_mapping = Mapping(
-        world_size=world_size,
-        tp_size=world_size,
-        pp_size=1,
-        rank=rank,
-        enable_attention_dp=False,
-    )
-    non_adp_cfg = ModelConfig(
-        pretrained_config=text_cfg,
-        mapping=non_adp_mapping,
-        skip_create_weights_in_init=True,
-    )
-    mlp_non_adp = _build_swiglu_oai_dense_mlp(
-        model_config=non_adp_cfg,
-        intermediate_size=intermediate,
-    )
-    non_adp_evidence = {
-        "gate_up_proj_in_features": int(mlp_non_adp.gate_up_proj.in_features),
-        "gate_up_proj_out_features": int(mlp_non_adp.gate_up_proj.out_features),
-        "gate_up_proj_tp_size": int(mlp_non_adp.gate_up_proj.tp_size),
-        "down_proj_in_features": int(mlp_non_adp.down_proj.in_features),
-        "down_proj_out_features": int(mlp_non_adp.down_proj.out_features),
-        "down_proj_tp_size": int(mlp_non_adp.down_proj.tp_size),
-        "down_proj_reduce_output": bool(mlp_non_adp.down_proj.reduce_output),
-        "down_proj_all_reduce_is_none": (mlp_non_adp.down_proj.all_reduce is None),
-    }
-    # Negative control A assertions.
-    assert non_adp_evidence["gate_up_proj_in_features"] == hidden, non_adp_evidence
-    assert non_adp_evidence["gate_up_proj_out_features"] == 2 * intermediate // world_size, (
-        non_adp_evidence
-    )
-    assert non_adp_evidence["gate_up_proj_tp_size"] == world_size, non_adp_evidence
-    assert non_adp_evidence["down_proj_in_features"] == intermediate // world_size, non_adp_evidence
-    assert non_adp_evidence["down_proj_out_features"] == hidden, non_adp_evidence
-    assert non_adp_evidence["down_proj_tp_size"] == world_size, non_adp_evidence
-    assert non_adp_evidence["down_proj_reduce_output"] is True, non_adp_evidence
-    assert not non_adp_evidence["down_proj_all_reduce_is_none"], (
-        "Non-ADP dense MLP must have an active AllReduce module on "
-        f"down_proj; got all_reduce=None. {non_adp_evidence!r}"
-    )
-
-    # ------------------------------------------------------------------
-    # Negative control B — ADP path: replicated down_proj, no AllReduce.
-    # ------------------------------------------------------------------
-    adp_mapping = Mapping(
-        world_size=world_size,
-        tp_size=world_size,
-        pp_size=1,
-        rank=rank,
-        enable_attention_dp=True,
-    )
-    adp_cfg = ModelConfig(
-        pretrained_config=text_cfg,
-        mapping=adp_mapping,
-        skip_create_weights_in_init=True,
-    )
-    mlp_adp = _build_swiglu_oai_dense_mlp(
-        model_config=adp_cfg,
-        intermediate_size=intermediate,
-    )
-    adp_evidence = {
-        "gate_up_proj_in_features": int(mlp_adp.gate_up_proj.in_features),
-        "gate_up_proj_out_features": int(mlp_adp.gate_up_proj.out_features),
-        "gate_up_proj_tp_size": int(mlp_adp.gate_up_proj.tp_size),
-        "down_proj_in_features": int(mlp_adp.down_proj.in_features),
-        "down_proj_out_features": int(mlp_adp.down_proj.out_features),
-        "down_proj_tp_size": int(mlp_adp.down_proj.tp_size),
-        "down_proj_reduce_output": bool(mlp_adp.down_proj.reduce_output),
-        "down_proj_all_reduce_is_none": (mlp_adp.down_proj.all_reduce is None),
-    }
-    # Negative control B assertions.
-    assert adp_evidence["gate_up_proj_in_features"] == hidden, adp_evidence
-    assert adp_evidence["gate_up_proj_out_features"] == 2 * intermediate, adp_evidence
-    assert adp_evidence["gate_up_proj_tp_size"] == 1, adp_evidence
-    assert adp_evidence["down_proj_in_features"] == intermediate, adp_evidence
-    assert adp_evidence["down_proj_out_features"] == hidden, adp_evidence
-    assert adp_evidence["down_proj_tp_size"] == 1, adp_evidence
-    assert adp_evidence["down_proj_reduce_output"] is False, adp_evidence
-    assert adp_evidence["down_proj_all_reduce_is_none"] is True, (
-        "ADP dense MLP must have NO AllReduce module on down_proj; "
-        f"got all_reduce non-None. {adp_evidence!r}"
-    )
-
-    # ------------------------------------------------------------------
-    # Mutation simulation — construct ``GatedMLP`` directly with the
-    # ADP mapping but *without* the ``_build_swiglu_oai_dense_mlp``
-    # builder's ``overridden_tp_size=1`` / ``reduce_output=False``
-    # plumbing, exactly reproducing the pre-fix code path. This path
-    # has both the wrong shape (ROW-sharded across the global TP group)
-    # AND an active AllReduce module on down_proj — under ADP this
-    # would all-reduce across rank-local-token sets and mix the
-    # outputs. The mutation is the *executed* negative control: it
-    # actually constructs the broken state on each rank, proving the
-    # ADP-safe builder is required and that this test discriminates
-    # the broken state from the fixed state via observable Linear
-    # shape + ``all_reduce is not None``.
-    # ------------------------------------------------------------------
-    mutated_mlp = GatedMLP(
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        bias=False,
-        activation=partial(_minimax_m3_swiglu_oai, alpha=1.702, limit=7.0),
-        dtype=text_cfg.torch_dtype,
-        config=adp_cfg,
-        # No ``overridden_tp_size`` collapse — keeps the global TP
-        # mapping under ADP. ``reduce_output=True`` keeps the
-        # cross-rank AllReduce alive on the ROW down_proj. The Linear's
-        # ADP shortcut at modules/linear.py:2818 only fires for COLUMN,
-        # so this ROW mode keeps reduce_output=True even with
-        # enable_attention_dp=True.
-        overridden_tp_size=None,
-        reduce_output=True,
-    )
-    mutated_evidence = {
-        "gate_up_proj_tp_size": int(mutated_mlp.gate_up_proj.tp_size),
-        "down_proj_in_features": int(mutated_mlp.down_proj.in_features),
-        "down_proj_out_features": int(mutated_mlp.down_proj.out_features),
-        "down_proj_tp_size": int(mutated_mlp.down_proj.tp_size),
-        "down_proj_reduce_output": bool(mutated_mlp.down_proj.reduce_output),
-        "down_proj_all_reduce_is_none": (mutated_mlp.down_proj.all_reduce is None),
-    }
-    # Mutation must reproduce the broken state: ROW-sharded down_proj
-    # with an active AllReduce — i.e. the pre-fix behavior under an
-    # ADP mapping that ought to be replicated.
-    assert mutated_evidence["down_proj_tp_size"] == world_size, (
-        f"Mutation simulation expected down_proj.tp_size={world_size} "
-        f"(ROW-sharded across the global TP group, the broken pre-fix "
-        f"behavior); got {mutated_evidence!r}."
-    )
-    assert mutated_evidence["down_proj_in_features"] == intermediate // world_size, (
-        f"Mutation simulation expected down_proj.in_features="
-        f"{intermediate // world_size}; got {mutated_evidence!r}."
-    )
-    assert mutated_evidence["down_proj_reduce_output"] is True, (
-        f"Mutation simulation must keep reduce_output=True (the pre-"
-        f"fix bug); got {mutated_evidence!r}. The Linear's ADP shortcut "
-        f"at modules/linear.py:2818 only fires for COLUMN; ROW mode keeps "
-        f"reduce_output=True even when the mapping has "
-        f"enable_attention_dp=True."
-    )
-    assert mutated_evidence["down_proj_all_reduce_is_none"] is False, (
-        f"Mutation simulation must produce an active AllReduce module on "
-        f"down_proj (the pre-fix cross-rank reduction); got "
-        f"all_reduce_is_none={mutated_evidence['down_proj_all_reduce_is_none']}."
-        " A regression that fails to install AllReduce in the broken "
-        "state would silently weaken this test's discriminator."
-    )
-    # Cross-check: the fixed ADP path has down_proj.tp_size==1 and
-    # all_reduce is None; the mutation has tp_size==world_size and
-    # all_reduce non-None. The shape AND the AllReduce module are
-    # observably different — the test discriminates both axes.
-    assert mutated_evidence["down_proj_tp_size"] != adp_evidence["down_proj_tp_size"], (
-        "Mutation simulation produced the same down_proj.tp_size as "
-        "the fixed ADP path; the test cannot distinguish the regression "
-        "from the fix. This is a test-quality bug."
-    )
-    assert (
-        mutated_evidence["down_proj_all_reduce_is_none"]
-        != adp_evidence["down_proj_all_reduce_is_none"]
-    ), (
-        "Mutation simulation produced the same all_reduce_is_none as "
-        "the fixed ADP path; the test cannot distinguish the regression."
-    )
-
-    return {
-        "rank": rank,
-        "world_size": world_size,
-        "cuda_device": cuda_dev,
-        "non_adp": non_adp_evidence,
-        "adp": adp_evidence,
-        "mutated": mutated_evidence,
-    }
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_minimax_m3_swiglu_oai_dense_mlp_adp_negative_control_mpi(mpi_pool_executor):
-    """Multi-rank executed ADP negative-control / mutation test.
-
-    Runs the construction-time invariant + mutation check inside a
-    real 2-process MPI pool. Each rank constructs the M3 dense MLP
-    three times via ``_build_swiglu_oai_dense_mlp`` (non-ADP, ADP) and
-    once via ``GatedMLP`` directly (mutated pre-fix path), asserts the
-    ADP-safe invariants survive the mutation, then returns structured
-    evidence the controller cross-checks across ranks.
-
-    The fixture-supplied ``mpi_pool_executor`` (via
-    ``tests/unittest/conftest.py``) spawns local MPI worker processes
-    so the AllReduce workspace allocator inside the non-ADP path
-    actually runs (no SKIP). The mutation simulates the ADP-safe
-    builder being reverted and verifies the test would catch that
-    regression.
-    """
-    import torch  # noqa: F401
-
-    if not _has_cuda():
-        pytest.skip(
-            "ADP negative-control mutation test needs CUDA for the "
-            "AllReduce workspace allocator and Linear weight materialization."
-        )
-
-    tp_size = mpi_pool_executor.num_workers
-    assert tp_size == 2, (
-        f"ADP negative-control test parametrize fixture must be [2]; got num_workers={tp_size}"
-    )
-
-    # Dispatch the worker function across ranks 0..tp_size-1. The
-    # MPIPoolExecutor.map(...) call sends one invocation per rank and
-    # blocks until all complete.
-    results = list(
-        mpi_pool_executor.map(
-            _swiglu_dense_mlp_adp_negative_control_worker,
-            [tp_size] * tp_size,
-            list(range(tp_size)),
-        )
-    )
-
-    assert len(results) == tp_size, (
-        f"Expected {tp_size} per-rank evidence dicts; got {len(results)}: {results!r}"
-    )
-    seen_ranks = {r["rank"] for r in results}
-    assert seen_ranks == set(range(tp_size)), (
-        f"Expected ranks 0..{tp_size - 1}; got {sorted(seen_ranks)!r}: {results!r}"
-    )
-
-    # Cross-rank invariants:
-    #   * Every rank's non-ADP down_proj has the same TP-sharded shape
-    #     (rank-local in_features=intermediate//tp_size). Different
-    #     in_features across ranks would indicate broken TP setup.
-    #   * Every rank's ADP down_proj is replicated (tp_size=1).
-    #   * Every rank's mutated down_proj is ROW-sharded again.
-    for r in results:
-        rank_idx = r["rank"]
-        non_adp = r["non_adp"]
-        adp = r["adp"]
-        mutated = r["mutated"]
-        # Non-ADP shape and AllReduce.
-        assert non_adp["down_proj_tp_size"] == tp_size, r
-        assert non_adp["down_proj_reduce_output"] is True, r
-        assert non_adp["down_proj_all_reduce_is_none"] is False, r
-        # ADP shape and AllReduce.
-        assert adp["down_proj_tp_size"] == 1, r
-        assert adp["down_proj_reduce_output"] is False, r
-        assert adp["down_proj_all_reduce_is_none"] is True, r
-        # Mutation shape and AllReduce — the pre-fix broken state.
-        assert mutated["down_proj_tp_size"] == tp_size, r
-        assert mutated["down_proj_reduce_output"] is True, r
-        assert mutated["down_proj_all_reduce_is_none"] is False, r
-        # The fixed-vs-mutated discriminator: both shape AND AllReduce
-        # presence differ.
-        assert mutated["down_proj_tp_size"] != adp["down_proj_tp_size"], r
-        assert mutated["down_proj_all_reduce_is_none"] != adp["down_proj_all_reduce_is_none"], r
-        # Emit a per-rank evidence marker that an sbatch run can grep
-        # for.
-        print(
-            f"[M3-ADP-NEG-CTRL] rank={rank_idx} world_size={r['world_size']} "
-            f"cuda_device={r['cuda_device']} "
-            f"non_adp_down_proj_tp_size={non_adp['down_proj_tp_size']} "
-            f"non_adp_down_proj_reduce_output={non_adp['down_proj_reduce_output']} "
-            f"non_adp_down_proj_all_reduce_is_none={non_adp['down_proj_all_reduce_is_none']} "
-            f"adp_down_proj_tp_size={adp['down_proj_tp_size']} "
-            f"adp_down_proj_reduce_output={adp['down_proj_reduce_output']} "
-            f"adp_down_proj_all_reduce_is_none={adp['down_proj_all_reduce_is_none']} "
-            f"mutated_down_proj_tp_size={mutated['down_proj_tp_size']} "
-            f"mutated_down_proj_reduce_output={mutated['down_proj_reduce_output']} "
-            f"mutated_down_proj_all_reduce_is_none={mutated['down_proj_all_reduce_is_none']}"
-        )

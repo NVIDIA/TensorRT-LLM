@@ -45,7 +45,11 @@ from .backend import (  # noqa: F401
     minimax_m3_sparse_decode,
     minimax_m3_sparse_prefill,
 )
-from .cache_manager import MiniMaxM3SparseIndexCache, get_minimax_m3_kv_cache_manager_cls
+from .cache_manager import (
+    MiniMaxM3KVCacheManagerV2,
+    MiniMaxM3SparseIndexCache,
+    get_minimax_m3_kv_cache_manager_cls,
+)
 from .metadata import (
     MiniMaxM3SparseAttentionMetadata,
     MiniMaxM3SparseConfig,
@@ -56,6 +60,7 @@ from .metadata import (
 )
 
 __all__ = [
+    "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3SparseAttention",
     "MiniMaxM3SparseAttentionMetadata",
     "MiniMaxM3SparseConfig",
