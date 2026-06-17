@@ -43,6 +43,15 @@ ACCURACY_CONFIG = {
     'gemma3': (5e-1, 5e-1),
 }
 
+# Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
+# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``max_batch_size`` / ``max_num_tokens``). The encoder ``AttentionMetadata`` is
+# sized once at load to this max budget; each forward re-preps it with the real
+# per-image seq lens. Two distinct axes: requests = image/sequence count budget,
+# tokens = total patch budget.
+_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
+
 
 @dataclass(repr=False)
 class Scenario:
@@ -109,8 +118,9 @@ class TestSiglipVisionModel(unittest.TestCase):
         tllm_model = SiglipVisionModel(
             model_config, use_post_layernorm=True).to(dtype).to(device)
         # Engine normally calls this after model load; standalone tests must do it themselves.
-        tllm_model.setup_attn_metadata(max_num_requests=8192,
-                                       max_num_tokens=8192)
+        tllm_model.setup_attn_metadata(
+            max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS,
+            max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
         tllm_model.load_weights(hf_model.state_dict())
 
         # Prepare inputs - create random pixel values for images

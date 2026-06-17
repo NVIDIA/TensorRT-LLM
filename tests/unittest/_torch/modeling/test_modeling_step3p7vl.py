@@ -87,6 +87,13 @@ def _load_config(checkpoint_dir: str) -> dict:
 # in bf16. The CPU component tests construct their modules directly in float32.
 _GPU_DTYPE = torch.bfloat16
 
+# Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
+# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``max_batch_size`` / ``max_num_tokens``). Two distinct axes: requests =
+# image/sequence count budget, tokens = total patch budget.
+_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
+
 
 def _make_tiny_vision_config(
     width: int = 64,
@@ -164,8 +171,10 @@ def _vision_attn_metadata(seq_lens):
     from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 
     md = get_attention_backend("TRTLLM").Metadata(
-        max_num_requests=64,
-        max_num_tokens=max(8192, int(sum(seq_lens))),
+        # Non-fan-out: one attention sequence per image, so the request count is
+        # exactly len(seq_lens) and the token count the actual sum.
+        max_num_requests=len(seq_lens),
+        max_num_tokens=int(sum(seq_lens)),
         kv_cache_manager=None,
     )
     md.num_contexts = len(seq_lens)
@@ -177,7 +186,7 @@ def _vision_attn_metadata(seq_lens):
     return md
 
 
-def _setup_encoder_attn_metadata(module, max_num_tokens: int = 8192):
+def _setup_encoder_attn_metadata(module, max_num_tokens: int = _ENCODER_TEST_MAX_NUM_TOKENS):
     """Mirror the engine's ``_set_up_multimodal_encoder_attn_metadata`` walk.
 
     The encoder builds its ``AttentionMetadata`` via the engine-driven
@@ -189,7 +198,9 @@ def _setup_encoder_attn_metadata(module, max_num_tokens: int = 8192):
 
     for m in module.modules():
         if isinstance(m, MultimodalEncoderMixin):
-            m.setup_attn_metadata(max_num_requests=max_num_tokens, max_num_tokens=max_num_tokens)
+            m.setup_attn_metadata(
+                max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=max_num_tokens
+            )
     return module
 
 
