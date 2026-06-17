@@ -693,11 +693,23 @@ def _run_one_candidate(
                 mapping=mapping,
                 moe_backend=config.backend,
                 use_cuda_graph=bool(config.cuda_graph),
-                # Symmetric-memory comm backends (e.g. NVLINK_ONE_SIDED) size their
-                # workspace from max_num_tokens and require every rank to allocate the
-                # same size, so use the global per-rank maximum rather than this rank's
-                # local token count (which differs under uneven attention-DP shards).
-                max_num_tokens=max(int(max(per_rank)) if per_rank else 0, 1),
+                # Under CUDA graph, capture cannot cross the multi-chunk MoE scheduler
+                # path (`_forward_multiple_chunks` does a host `if` on a CUDA
+                # `chunked_used` tensor -> D2H sync, and overlaps chunks on an aux stream
+                # -- both illegal during capture). Production only captures the
+                # single-chunk path (num_chunks==1); calculate_num_chunks sums all ranks
+                # (num_rows=sum(all_rank_num_tokens)), so size max_num_tokens to the
+                # global token count under CUDA graph to force num_chunks==1.
+                # Otherwise use the global per-rank maximum: symmetric-memory comm
+                # backends (e.g. NVLINK_ONE_SIDED) size their workspace from
+                # max_num_tokens and require every rank to allocate the same size, so
+                # this rank's local token count (which differs under uneven
+                # attention-DP shards) must not be used.
+                max_num_tokens=(
+                    max(sum(all_rank_num_tokens), 1)
+                    if config.cuda_graph
+                    else max(int(max(per_rank)) if per_rank else 0, 1)
+                ),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
                 enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,
