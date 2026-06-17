@@ -17,7 +17,8 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalParams)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -34,11 +35,11 @@ from ..executor.postproc_worker import PostprocParams
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import (PromptInputs, create_input_processor,
-                      create_input_processor_with_hash, get_cache_salt_id,
+from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
+                      create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
-from ..sampling_params import SamplingParams
+from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
@@ -118,6 +119,82 @@ class EncoderOutput:
     prompt: Optional[str] = None
 
 
+class _BartForcedTokensLogitsProcessor(LogitsProcessor):
+    """Apply BART forced BOS/EOS tokens from Hugging Face generation config."""
+
+    _DECODER_PROMPT_LEN = 1
+
+    def __init__(
+        self,
+        *,
+        forced_bos_token_id: Optional[int],
+        forced_eos_token_id: Optional[int],
+        max_tokens: int,
+    ) -> None:
+        self.forced_bos_token_id = forced_bos_token_id
+        self.forced_eos_token_id = forced_eos_token_id
+        self.max_tokens = max_tokens
+
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: List[List[int]],
+        stream_ptr: Optional[int],
+        client_id: Optional[int],
+    ) -> None:
+        del req_id, client_id
+        if stream_ptr is None:
+            self._apply(token_ids, logits)
+            return
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            self._apply(token_ids, logits)
+
+    def _apply(self, token_ids: List[List[int]], logits: torch.Tensor) -> None:
+        for beam_idx, beam_token_ids in enumerate(token_ids):
+            forced_token_id = self._forced_token_id(beam_token_ids)
+            if forced_token_id is not None:
+                self._force_token(logits, beam_idx, len(token_ids),
+                                  forced_token_id)
+
+    def _forced_token_id(self, token_ids: List[int]) -> Optional[int]:
+        generated_len = max(len(token_ids) - self._DECODER_PROMPT_LEN, 0)
+        if generated_len == 0:
+            return self.forced_bos_token_id
+        if (self.max_tokens > 0 and generated_len == self.max_tokens - 1):
+            return self.forced_eos_token_id
+        return None
+
+    @staticmethod
+    def _force_token(logits: torch.Tensor, beam_idx: int, beam_count: int,
+                     token_id: int) -> None:
+        if token_id < 0 or token_id >= logits.shape[-1]:
+            raise ValueError(
+                f"Forced BART token id {token_id} is outside the logits "
+                f"vocabulary dimension {logits.shape[-1]}")
+
+        target = logits
+        if logits.dim() > 1 and logits.shape[0] == beam_count:
+            target = logits[beam_idx]
+        target[:] = float("-inf")
+        target[..., token_id] = 0
+
+
+def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
+    if isinstance(processor, _BartForcedTokensLogitsProcessor):
+        return True
+    if isinstance(processor, list):
+        return any(
+            _contains_bart_forced_tokens_logits_processor(item)
+            for item in processor)
+    processors = getattr(processor, "processors", None)
+    if isinstance(processors, list):
+        return any(
+            _contains_bart_forced_tokens_logits_processor(item)
+            for item in processors)
+    return False
+
+
 TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
 
     Attributes:
@@ -146,6 +223,7 @@ class PreprocessedInputs:
     prompt_token_ids: List[int]
     query_token_ids: Optional[List[int]] = None
     multimodal_params: Optional[MultimodalParams] = None
+    encoder_input_token_ids: Optional[List[int]] = None
 
 
 class BaseLLM:
@@ -325,6 +403,76 @@ class BaseLLM:
             ) if self._executor else {}
         return self._disaggregated_params
 
+    @staticmethod
+    def _is_token_id_list(value: Any) -> bool:
+        return isinstance(value, list) and all(
+            isinstance(token, int) for token in value)
+
+    @classmethod
+    def _is_unbatched_inputs(cls, inputs: Any) -> bool:
+        if inputs is None:
+            return False
+        if isinstance(inputs, str) or isinstance(inputs, dict):
+            return True
+        if cls._is_token_id_list(inputs):
+            return True
+        return False
+
+    @classmethod
+    def _is_unbatched_optional_inputs(cls, *values: Any) -> bool:
+        for value in values:
+            if value is None:
+                continue
+            return cls._is_unbatched_inputs(value)
+        return True
+
+    @classmethod
+    def _item_at(cls,
+                 maybe_batched: Any,
+                 pos: int,
+                 *,
+                 token_ids_are_scalar: bool = False) -> Any:
+        if maybe_batched is None:
+            return None
+        if token_ids_are_scalar and cls._is_token_id_list(maybe_batched):
+            return maybe_batched
+        if isinstance(maybe_batched, list):
+            return maybe_batched[pos]
+        return maybe_batched
+
+    @staticmethod
+    def _copy_prompt_inputs(inputs: PromptInputs) -> PromptInputs:
+        if isinstance(inputs, dict):
+            return dict(inputs)
+        return inputs
+
+    @classmethod
+    def _normalize_token_ids(cls, token_ids: Any, name: str) -> List[int]:
+        if cls._is_token_id_list(token_ids):
+            return list(token_ids)
+        if hasattr(token_ids, "tolist"):
+            normalized = token_ids.tolist()
+            if cls._is_token_id_list(normalized):
+                return normalized
+        raise TypeError(f"{name} must be a list of token ids.")
+
+    def _is_encoder_decoder_model(self) -> bool:
+        return bool(getattr(self._hf_model_config, "is_encoder_decoder", False))
+
+    def _get_decoder_start_token_id(self) -> int:
+        configs = [
+            self._generation_config,
+            self._hf_model_config,
+            getattr(self._hf_model_config, "text_config", None),
+        ]
+        for attr_name in ("decoder_start_token_id", "bos_token_id"):
+            for config in configs:
+                token_id = getattr(config, attr_name, None)
+                if token_id is not None:
+                    return int(token_id)
+        raise ValueError(
+            "decoder_start_token_id is required for encoder-decoder models.")
+
     def generate(
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
@@ -369,21 +517,24 @@ class BaseLLM:
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
-        unbatched = not isinstance(inputs, list)
-        if not unbatched:
+        unbatched = self._is_unbatched_optional_inputs(inputs)
+        if inputs is not None and not unbatched:
             if isinstance(inputs[0], int):
                 unbatched = True
 
-        if unbatched:
+        if unbatched and inputs is not None:
             inputs = [inputs]
 
-        inputs = [prompt_inputs(i) for i in inputs]
+        if inputs is None:
+            request_inputs_list = [None]
+        else:
+            request_inputs_list = [prompt_inputs(i) for i in inputs]
 
         if isinstance(priority, list):
-            if len(priority) != len(inputs):
+            if len(priority) != len(request_inputs_list):
                 raise ValueError(
                     f"priority list length ({len(priority)}) does not match "
-                    f"number of prompts ({len(inputs)})")
+                    f"number of prompts ({len(request_inputs_list)})")
             for p in priority:
                 if not (0.0 <= p <= 1.0):
                     raise ValueError(
@@ -393,25 +544,19 @@ class BaseLLM:
                 raise ValueError(
                     f"priority must be a float in [0.0, 1.0], got {priority}")
 
-        def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
-            if isinstance(maybe_batched, list):
-                return maybe_batched[pos]
-            else:
-                return maybe_batched
-
         futures = []
-        for i, request_inputs in enumerate(inputs):
+        for i, request_input in enumerate(request_inputs_list):
             future = self.generate_async(
-                request_inputs,
-                sampling_params=_item_at(sampling_params, i),
-                lora_request=_item_at(lora_request, i),
-                prompt_adapter_request=_item_at(prompt_adapter_request, i),
-                kv_cache_retention_config=_item_at(kv_cache_retention_config,
-                                                   i),
-                disaggregated_params=_item_at(disaggregated_params, i),
-                scheduling_params=_item_at(scheduling_params, i),
-                cache_salt=_item_at(cache_salt, i),
-                priority=_item_at(priority, i),
+                request_input,
+                sampling_params=self._item_at(sampling_params, i),
+                lora_request=self._item_at(lora_request, i),
+                prompt_adapter_request=self._item_at(prompt_adapter_request, i),
+                kv_cache_retention_config=self._item_at(
+                    kv_cache_retention_config, i),
+                disaggregated_params=self._item_at(disaggregated_params, i),
+                scheduling_params=self._item_at(scheduling_params, i),
+                cache_salt=self._item_at(cache_salt, i),
+                priority=self._item_at(priority, i),
                 streaming=False,
             )
             futures.append(future)
@@ -463,7 +608,6 @@ class BaseLLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
-
         if self._encode_only:
             raise RuntimeError(
                 "generate_async() is not available when encode_only=True. "
@@ -475,8 +619,6 @@ class BaseLLM:
 
         sampling_params = self._prepare_sampling_params(sampling_params)
 
-        cache_salt_id = get_cache_salt_id(
-            cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
@@ -491,9 +633,19 @@ class BaseLLM:
             prompt = None
             query_token_ids = inputs.query_token_ids
             multimodal_params = inputs.multimodal_params
+            preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
+            if preprocessed_encoder_input_token_ids is not None:
+                preprocessed_encoder_input_token_ids = self._normalize_token_ids(
+                    preprocessed_encoder_input_token_ids,
+                    "inputs.encoder_input_token_ids")
+            encoder_input_token_ids = preprocessed_encoder_input_token_ids
         else:
-            prompt_token_ids, prompt, query_token_ids, multimodal_params = (
-                self._preprocess(inputs, sampling_params, disaggregated_params))
+            (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+             encoder_input_token_ids) = self._preprocess(
+                 inputs,
+                 sampling_params,
+                 disaggregated_params,
+             )
 
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
@@ -519,8 +671,9 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
+            encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
         )
 
@@ -533,20 +686,46 @@ class BaseLLM:
 
     def _preprocess(
         self,
-        inputs: PromptInputs,
+        inputs: Optional[PromptInputs],
         sampling_params: SamplingParams,
         disaggregated_params: Optional[DisaggregatedParams] = None,
     ) -> Tuple[List[int], Optional[str], Optional[List[int]],
-               Optional[MultimodalParams]]:
+               Optional[MultimodalParams], Optional[List[int]]]:
         """Preprocess raw prompts into token IDs and multimodal params.
 
         This is the CPU-heavy portion of generate_async (tokenization,
         multimodal processing, hash computation).
 
         Returns:
-            `(prompt_token_ids, prompt, query_token_ids, multimodal_params)`
+            `(prompt_token_ids, prompt, query_token_ids, multimodal_params, encoder_input_token_ids)`
         """
+        if isinstance(inputs, dict):
+            inputs = self._copy_prompt_inputs(inputs)
+            if "encoder_inputs" in inputs:
+                raise ValueError(
+                    "encoder_inputs is not supported. Pass encoder input as "
+                    "inputs.")
+            if "encoder_input_token_ids" in inputs:
+                raise ValueError(
+                    "encoder_input_token_ids is not supported. Pass encoder "
+                    "token IDs as inputs.")
+            if "decoder_input_token_ids" in inputs:
+                raise ValueError(
+                    "decoder_input_token_ids is not supported. Pass decoder "
+                    "token IDs as inputs.")
+
+        if inputs is None or (isinstance(inputs, dict)
+                              and "prompt" not in inputs
+                              and "prompt_token_ids" not in inputs):
+            raise TypeError(
+                f"The inputs must be type str or list of int, but got {type(inputs)}"
+            )
+
         inputs = prompt_inputs(inputs)
+
+        if "multi_item_part_lens" in inputs:
+            raise ValueError(
+                "Multi-item scoring is only supported via LLM.encode().")
 
         # Detokenization for non-fast-path VLMs (prompt_token_ids + MM payload,
         # no prompt) is handled inside BaseMultimodalInputProcessor.__call__
@@ -566,13 +745,29 @@ class BaseLLM:
         # This branch is applicable for Encode --> Prefill handoff scenario,
         # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
         if is_mm_disagg:
+            if self.args.backend == "_autodeploy":
+                raise ValueError(
+                    "Multimodal disaggregated inference (encode -> prefill "
+                    "embedding handoff) is not supported with the AutoDeploy "
+                    "backend. AutoDeploy runs the multimodal encoder in-prefill "
+                    "on raw inputs and does not consume precomputed multimodal "
+                    "embeddings.")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
-                inputs, mm_handles)
+            # TODO(TRTLLM-12869): Pass encoder-side MM layout through
+            # DisaggregatedParams so prefill does not rebuild prompt tokens,
+            # positions, lengths, runs, special offsets, and cumsum here.
+            disagg_mm_inputs = (
+                self.input_processor.build_disagg_prefill_multimodal_inputs(
+                    inputs, mm_handles))
+            if not isinstance(disagg_mm_inputs, DisaggPrefillMultimodalInputs):
+                raise TypeError(
+                    "build_disagg_prefill_multimodal_inputs must return "
+                    "DisaggPrefillMultimodalInputs")
+            prompt_token_ids = disagg_mm_inputs.prompt_token_ids
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -581,9 +776,25 @@ class BaseLLM:
                 )
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
-                multimodal_input = MultimodalInput.from_components(
-                    mm_hashes, mm_token_positions, mm_token_length)
-                multimodal_data = {"multimodal_embedding": mm_handles}
+                multimodal_input = disagg_mm_inputs.to_multimodal_input(
+                    mm_hashes)
+                # E/P handoff carries SharedTensorContainer dicts. Park them under the
+                # embedding key so BaseWorker's recursive to_tensor("multimodal_data")
+                # restores local tensor views before PyTorch forward. Until then this
+                # key holds handles, not tensors.
+                multimodal_data = {
+                    "multimodal_embedding":
+                    mm_handles,
+                    "multimodal_embedding_lengths":
+                    (disagg_mm_inputs.multimodal_embedding_lengths),
+                }
+                if disagg_mm_inputs.special_token_offsets is not None:
+                    multimodal_data["special_token_offsets"] = (
+                        disagg_mm_inputs.special_token_offsets)
+                if disagg_mm_inputs.item_types is not None:
+                    multimodal_data["layout_metadata"] = {
+                        "item_types": disagg_mm_inputs.item_types
+                    }
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
@@ -693,7 +904,13 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        return prompt_token_ids, prompt, query_token_ids, multimodal_params
+        normalized_encoder_input_token_ids = None
+        if self._is_encoder_decoder_model():
+            normalized_encoder_input_token_ids = prompt_token_ids
+            prompt_token_ids = [self._get_decoder_start_token_id()]
+
+        return (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+                normalized_encoder_input_token_ids)
 
     @set_api_status("prototype")
     def preprocess(
@@ -715,13 +932,18 @@ class BaseLLM:
                 passed directly to :meth:`generate_async` as `inputs`.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
-        prompt_token_ids, _prompt, query_token_ids, multimodal_params = (
-            self._preprocess(inputs, sampling_params, disaggregated_params))
+        (prompt_token_ids, _prompt, query_token_ids, multimodal_params,
+         encoder_input_token_ids) = self._preprocess(
+             inputs,
+             sampling_params,
+             disaggregated_params,
+         )
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,
             query_token_ids=query_token_ids,
             multimodal_params=multimodal_params,
+            encoder_input_token_ids=encoder_input_token_ids,
         )
 
     @set_api_status("prototype")
@@ -729,6 +951,8 @@ class BaseLLM:
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
         add_special_tokens: bool = True,
+        batch_indexed_model_output: bool = True,
+        copy_logits_to_host: bool = True,
         return_raw_logits: bool = False,
         **model_kwargs: Any,
     ) -> Union[EncoderOutput, List[EncoderOutput], torch.Tensor]:
@@ -740,6 +964,8 @@ class BaseLLM:
             inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
                 It can be a single prompt or batched prompts.
             add_special_tokens (bool): Whether to add special tokens (e.g., [CLS]/[SEP]) during tokenization. Defaults to True.
+            batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
+            copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
             model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
                 inputs_embeds (reward models).
@@ -783,12 +1009,23 @@ class BaseLLM:
         sequence_lengths = []
         prompts = []
         sampling_params = SamplingParams(add_special_tokens=add_special_tokens)
-
+        batch_multi_item_part_lens = []
         for inp in inputs:
             inp = prompt_inputs(inp)
             if "prompt_token_ids" in inp:
-                token_ids_list.append(inp["prompt_token_ids"])
-                sequence_lengths.append(len(inp["prompt_token_ids"]))
+                inp_tok = cast(TokensPrompt, inp)
+                multi_item_part_lens = inp_tok.get("multi_item_part_lens")
+                prompt_token_ids = inp_tok["prompt_token_ids"]
+                if multi_item_part_lens is not None:
+                    # validate lengths
+                    if sum(multi_item_part_lens) + len(
+                            multi_item_part_lens) != len(prompt_token_ids):
+                        raise ValueError(
+                            "\"multi_item_part_lens\" inconsistent with prompt length"
+                        )
+                    batch_multi_item_part_lens.append(multi_item_part_lens)
+                token_ids_list.append(prompt_token_ids)
+                sequence_lengths.append(len(prompt_token_ids))
                 prompts.append(None)
             elif "prompt" in inp:
                 token_ids, _ = self.input_processor(inp, sampling_params)
@@ -839,25 +1076,50 @@ class BaseLLM:
             **filtered_kwargs,
         }
 
-        # Single forward pass
-        outputs = self._encoder_executor.batch_forward(forward_inputs)
-        logits = outputs['logits'].cpu()
+        forward_kwargs = {
+            "gather_context_logits": not batch_indexed_model_output,
+        }
+        if batch_multi_item_part_lens:
+            if len(batch_multi_item_part_lens) != len(inputs):
+                raise ValueError(
+                    "\"multi_item_part_lens\" must either be provided for all prompts or for none"
+                )
+            forward_inputs["multi_item_part_lens"] = batch_multi_item_part_lens
 
-        if return_raw_logits:
-            return logits
+        # Single forward pass
+        outputs = self._encoder_executor.batch_forward(forward_inputs,
+                                                       **forward_kwargs)
 
         # Package as EncoderOutput.
-        # NOTE: logits[i] assumes batch-indexed output (e.g., BERT classification
-        # returns [batch_size, num_classes]). Per-token models that return packed
-        # [total_tokens, hidden_size] would need cumulative-sum slicing instead.
+        logits = outputs['logits']
+        if copy_logits_to_host:
+            logits = logits.cpu()
+        if return_raw_logits:
+            return logits
         results = []
-        for i in range(len(token_ids_list)):
-            results.append(
-                EncoderOutput(
-                    logits=logits[i] if logits.dim() > 1 else logits,
-                    prompt_token_ids=token_ids_list[i],
-                    prompt=prompts[i],
-                ))
+        if batch_indexed_model_output:
+            # NOTE: logits[i] assumes batch-indexed output (e.g., BERT classification
+            # returns [batch_size, num_classes]). Per-token models that return packed
+            # [total_tokens, hidden_size] use cumulative-sum slicing instead (cf. else).
+            for i in range(len(token_ids_list)):
+                results.append(
+                    EncoderOutput(
+                        logits=(logits[i] if len(token_ids_list) > 1
+                                or logits.dim() > 1 else logits),
+                        prompt_token_ids=token_ids_list[i],
+                        prompt=prompts[i],
+                    ))
+        else:
+            start_idx = 0
+            for i, seq_len in enumerate(sequence_lengths):
+                end_idx = start_idx + seq_len
+                results.append(
+                    EncoderOutput(
+                        logits=logits[start_idx:end_idx],
+                        prompt_token_ids=token_ids_list[i],
+                        prompt=prompts[i],
+                    ))
+                start_idx = end_idx
 
         return results[0] if unbatched else results
 
@@ -982,6 +1244,7 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            self._add_bart_forced_tokens_logits_processor(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
@@ -1006,6 +1269,38 @@ class BaseLLM:
                                                        "stream_interval", 1)
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
+
+    def _add_bart_forced_tokens_logits_processor(
+            self, sampling_params: SamplingParams) -> None:
+        if self.args.backend != "pytorch":
+            return
+        if getattr(self._hf_model_config, "model_type", None) != "bart":
+            return
+        if self._generation_config is None:
+            return
+
+        forced_bos_token_id = getattr(self._generation_config,
+                                      "forced_bos_token_id", None)
+        forced_eos_token_id = getattr(self._generation_config,
+                                      "forced_eos_token_id", None)
+        if forced_bos_token_id is None and forced_eos_token_id is None:
+            return
+
+        existing = sampling_params.logits_processor
+        if _contains_bart_forced_tokens_logits_processor(existing):
+            return
+
+        processor = _BartForcedTokensLogitsProcessor(
+            forced_bos_token_id=forced_bos_token_id,
+            forced_eos_token_id=forced_eos_token_id,
+            max_tokens=sampling_params.max_tokens,
+        )
+        if existing is None:
+            sampling_params.logits_processor = processor
+        elif isinstance(existing, list):
+            existing.append(processor)
+        else:
+            sampling_params.logits_processor = [existing, processor]
 
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams,

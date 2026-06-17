@@ -70,6 +70,10 @@ MODEL_INFO = {
         "display_name": "Qwen3-Next-80B",
         "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
     },
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": {
+        "display_name": "Qwen3.5-397B-A17B (NVFP4)",
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",
+    },
     "Qwen/Qwen3-30B-A3B": {
         "display_name": "Qwen3-30B-A3B",
         "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B",

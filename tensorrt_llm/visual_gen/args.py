@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxConfig
+from .sparse_attention import SkipSoftmaxAttentionConfig
 
 # =============================================================================
 # Type aliases
@@ -86,7 +86,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxConfig],
+    Union[SkipSoftmaxAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -112,14 +112,6 @@ class AttentionConfig(StrictBaseModel):
         None,
         status="prototype",
         description="Sparse attention configuration. Currently supports: skip_softmax.",
-    )
-    sparse_config_path: Optional[str] = Field(
-        None,
-        status="prototype",
-        description=(
-            "Path to a ModelOpt sparse attention YAML config file. "
-            "Overrides auto-detection from the checkpoint directory."
-        ),
     )
 
     @model_validator(mode="after")
@@ -205,6 +197,15 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Ulysses head-sharding degree. Heads are sharded across ulysses_size GPUs."),
     )
+    async_ulysses: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Enable the async Ulysses A2A pipeline: overlap per-rank V/Q/K projection compute "
+            "with cross-rank symm-mem all-to-all on a dedicated side stream. "
+            "Requires ulysses_size > 1. Defaults to False."
+        ),
+    )
     ring_size: int = Field(
         1,
         ge=1,
@@ -257,6 +258,23 @@ class ParallelConfig(StrictBaseModel):
     @property
     def total_parallel_size(self) -> int:
         return self.cfg_size * self.seq_parallel_size
+
+    @model_validator(mode="after")
+    def _validate_async_ulysses(self) -> "ParallelConfig":
+        if self.async_ulysses:
+            if self.ulysses_size == 1:
+                raise ValueError(
+                    "async_ulysses=True requires ulysses_size > 1; got "
+                    f"ulysses_size={self.ulysses_size}."
+                )
+            if self.ring_size > 1:
+                raise ValueError(
+                    "async_ulysses=True is incompatible with ring_size > 1: "
+                    "async_ulysses forces SEPARATE_QKV which bypasses the "
+                    "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
+                    f"(got ring_size={self.ring_size})."
+                )
+        return self
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:
@@ -481,7 +499,7 @@ class VisualGenArgs(StrictBaseModel):
             "Quantization config — accepts either a QuantConfig instance "
             "or a ModelOpt-format dict (e.g. ``{'quant_algo': 'FP8', "
             "'dynamic': True}``). Dict-form parsing happens lazily in "
-            "DiffusionModelConfig.from_pretrained."
+            "DiffusionPipelineConfig.from_pretrained."
         ),
     )
     compilation_config: CompilationConfig = Field(
@@ -586,7 +604,7 @@ class VisualGenArgs(StrictBaseModel):
 __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
-    "SkipSoftmaxConfig",
+    "SkipSoftmaxAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",

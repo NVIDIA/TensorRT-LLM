@@ -4,13 +4,14 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig, SkipSoftmaxConfig
+from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
 
 
@@ -52,7 +53,9 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
+        async_ulysses: bool = False,
     ):
         super().__init__()
 
@@ -103,6 +106,7 @@ class Attention(nn.Module):
         self.qk_norm = qk_norm
         self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
+        self.module_name = self._qualified_module_name(config.component_name, module_name)
         self.eps = eps
 
         self.q_dim = self.num_attention_heads * self.head_dim
@@ -114,6 +118,20 @@ class Attention(nn.Module):
         self.local_kv_dim = self.local_num_key_value_heads * self.head_dim
 
         self._init_qkv_proj()
+
+        # Structural eligibility for SEPARATE_QKV self-attn quantize dedup.
+        # When True, get_qkv() may pre-quantize hidden_states once and pass the
+        # shared Fp4QuantizedTensor to to_q/to_k/to_v (relies on Linear's
+        # Fp4QuantizedTensor shortcut). Numerical equality of the per-tensor
+        # input_scales is an invariant of modelopt's self-attn calibration
+        # (q/k/v share the same input distribution -> same calibrated scale).
+        self._maybe_share_qkv_quantize = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and self.quant_config is not None
+            and getattr(self.quant_config, "layer_quant_mode", None) is not None
+            and self.quant_config.layer_quant_mode.has_nvfp4()
+            and not self.force_dynamic_quantization
+        )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
 
@@ -160,9 +178,19 @@ class Attention(nn.Module):
             ]
         )
 
-        # Ulysses shards heads across workers; inner backend sees sharded head count.
-        # Attention2D gathers sequence (not heads); see wrap_parallel_attention for nesting.
-        use_ulysses = ulysses_size > 1 and enable_sequence_parallel
+        # Ulysses auto-wrap normally skips SEPARATE_QKV (cross-attention).
+        # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
+        # V/Q/K projections AND still needs the head-sharding wrap — opt in
+        # via async_ulysses=True.
+        use_ulysses = (
+            ulysses_size > 1
+            and enable_sequence_parallel
+            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses)
+        )
+
+        # Compute head counts for the backend
+        # Ulysses shards heads across workers; inner backend sees sharded count
+        # Attention2D gathers sequence (not heads); inner backend sees full count
         if use_ulysses:
             backend_num_heads = self.local_num_attention_heads // ulysses_size
             backend_num_kv_heads = self.local_num_key_value_heads // ulysses_size
@@ -170,21 +198,15 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Resolve sparse attention config for TRTLLM backend
-        sparse_attention_config = None
+        # Resolve sparse attention params for TRTLLM backend
+        sparse_params = None
         ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
-            # Cache the resolved scalar on a private attr (idempotent across
-            # all Attention modules); does NOT mutate the source-of-truth
-            # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
-            # callers — including `apply_skip_softmax_overrides` — read the
-            # cached value via `resolve_threshold(module_name)`.
-            threshold = ss_cfg.get_or_resolve_threshold()
-
-            if threshold is not None and threshold > 0:
-                sparse_attention_config = SkipSoftmaxAttentionConfig(
-                    threshold_scale_factor={"prefill": threshold, "decode": 0}
-                )
+        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
+            sparse_params = ss_cfg.to_sparse_params(
+                module_name=self.module_name,
+                pretrained_config=config.pretrained_config,
+            )
+        self.sparse_params = sparse_params
 
         # Create compute backend
         self.attn = create_attention(
@@ -197,24 +219,35 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
-            sparse_attention_config=sparse_attention_config,
+            sparse_params=sparse_params,
         )
 
         if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
             ring_size = vgm.ring_size
-            attn2d_size = vgm.attn2d_row_size * vgm.attn2d_col_size
-            if ring_size > 1 or attn2d_size > 1:
+            if ring_size > 1:
                 raise ValueError(
-                    "SEPARATE_QKV cross-attention does not support Ring or Attention2D "
-                    "sequence parallelism; use enable_sequence_parallel=False or Ulysses-only "
-                    f"(ring_size={ring_size}, attn2d_size={attn2d_size})."
+                    "SEPARATE_QKV cross-attention does not support Ring sequence "
+                    "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
                 )
 
         self.attn = wrap_parallel_attention(
             self.attn,
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
+            async_ulysses=use_ulysses and async_ulysses,
         )
+
+    @staticmethod
+    def _qualified_module_name(
+        component_name: Optional[str],
+        module_name: Optional[str],
+    ) -> Optional[str]:
+        if module_name is None:
+            return None
+        if component_name is None:
+            return module_name
+        prefix = f"{component_name}."
+        return module_name if module_name.startswith(prefix) else f"{prefix}{module_name}"
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
@@ -480,6 +513,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
@@ -498,7 +532,7 @@ class Attention(nn.Module):
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v)
+            out = self._attn_impl(q, k, v, timestep=timestep)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
@@ -517,6 +551,108 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v)
+        out = self._attn_impl(q, k, v, timestep=timestep)
         out = self.to_out[0](out)
         return out
+
+    def forward_async(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
+        each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
+        default stream while the previous tensor's peer push runs on a side
+        stream, so V/Q/K projections overlap with the all-to-all.
+
+        Fused path: ``apply_split_norm_rope`` (SEPARATE_QKV analog of
+        ``apply_packed_qk_norm_rope``) does in-place RMSNorm + RoPE in one
+        kernel launch per Q/K. Same math as the packed kernel, just split
+        across two launches instead of one packed launch.
+
+        Unfused path: naive ``norm_q`` + ``apply_rotary_emb``, mirroring
+        ``forward``'s unfused branch.
+
+        Precondition: caller gates on ``_use_async_ulysses`` so ``self.attn``
+        is a ``UlyssesAttention`` with ``async_ulysses=True``.
+
+        Returns 3D ``[B, S, H*D]`` matching ``forward``'s output contract.
+
+        TODO (kernel follow-up): the fused split kernel below writes Q/K to an
+        intermediate tensor, then ``UlyssesAttention._issue_async`` permutes
+        and scatters that tensor into the symm-mem slot. Folding the
+        permute+scatter into a "ulyssesPermuteScatter" epilogue inside the
+        fused norm+RoPE kernel would let it write directly into the slot,
+        saving one alloc + one copy + one kernel launch per Q/K closure.
+        """
+        # Runtime precondition guard. Without async_ulysses=True at init,
+        # `self.attn` is the bare backend (e.g. TrtllmAttention) which has
+        # no `forward_async` method — the inner call below would otherwise
+        # crash with a non-prescriptive AttributeError deep in the function.
+        if not hasattr(self.attn, "forward_async"):
+            raise ValueError(
+                "Attention.forward_async() requires the inner attention to be a "
+                "UlyssesAttention with async_ulysses=True. Build the Attention with "
+                "ParallelConfig(ulysses_size > 1, async_ulysses=True), or use "
+                "forward() for sync execution."
+            )
+
+        B, S, _ = hidden_states.shape
+        H = self.num_attention_heads
+        KV = self.num_key_value_heads
+        D = self.head_dim
+        # Mirrors forward()'s fused gate. qkv_mode is implicitly SEPARATE_QKV
+        # under async (caller-enforced), so the FUSE_QKV check in forward()
+        # has no async analog here.
+        use_fused = self.fuse_qk_norm_rope and freqs is not None and self.qk_norm
+
+        # SEPARATE_QKV self-attn 3x fp4_quantize dedup: pre-quantize hidden_states
+        # once and pass the shared Fp4QuantizedTensor to to_q/to_k/to_v via Linear's
+        # Fp4QuantizedTensor shortcut. Saves 2 of 3 fp4_quantize launches per layer.
+        # Eligibility is structural (set in __init__); runtime gate checks that the
+        # checkpoint loaded an input_scale (some attn Linears can be excluded from
+        # NVFP4 per checkpoint config — e.g. LTX-2 transformer_blocks.10.attn1).
+        if self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+            x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+            fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
+                x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False
+            )
+            qkv_input = Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=False)
+        else:
+            qkv_input = hidden_states
+
+        def compute_q():
+            q = self.to_q(qkv_input)
+            if q.dim() == 2:
+                q = q.view(B, S, -1)
+            if use_fused:
+                self.apply_split_norm_rope(q, self.norm_q.weight, H, freqs[0], freqs[1])
+                return q.view(B, S, H, D)
+            if self.qk_norm:
+                q = self.norm_q(q)
+            q = q.view(B, S, H, D)
+            if freqs is not None:
+                q = apply_rotary_emb(q, freqs[0], freqs[1])
+            return q
+
+        def compute_k():
+            k = self.to_k(qkv_input)
+            if k.dim() == 2:
+                k = k.view(B, S, -1)
+            if use_fused:
+                self.apply_split_norm_rope(k, self.norm_k.weight, KV, freqs[0], freqs[1])
+                return k.view(B, S, KV, D)
+            if self.qk_norm:
+                k = self.norm_k(k)
+            k = k.view(B, S, KV, D)
+            if freqs is not None:
+                k = apply_rotary_emb(k, freqs[0], freqs[1])
+            return k
+
+        def compute_v():
+            return self.to_v(qkv_input).view(B, S, KV, D)
+
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
+        b, t = out_4d.shape[:2]
+        return self.to_out[0](out_4d.reshape(b, t, H * D))

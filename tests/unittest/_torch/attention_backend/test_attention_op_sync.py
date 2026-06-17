@@ -24,7 +24,7 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
-   nested dataclass sub-bags like ``AttentionSparseArgs``) is consumed at
+   nested dataclass sub-bags like ``SparsePrediction``) is consumed at
    the call site — directly, transitively via a @property of the
    containing class, or listed in ``_THOP_EXCLUDED_FIELDS``.
 4. Every kwarg passed as a literal constant matches an entry in
@@ -43,6 +43,7 @@ import typing
 from dataclasses import fields
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
 from tensorrt_llm._torch.attention_backend.trtllm import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
@@ -56,6 +57,21 @@ _SOURCE_CLASSES = {
     "self": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
+    "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
+}
+
+_THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
+    "head_size": ("self", ("head_dim",)),
+    "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
+    "host_past_key_value_lengths": ("metadata", ("kv_lens_runtime",)),
+    "host_request_types": ("metadata", ("host_request_types_runtime",)),
+    "sequence_length": ("metadata", ("kv_lens_cuda_runtime",)),
+    "spec_decoding_target_max_draft_tokens": (
+        "metadata",
+        ("max_total_draft_tokens",),
+    ),
+    "workspace_": ("metadata", ("effective_workspace",)),
 }
 
 # The C++ attention() declaration is the single source of truth for kwarg
@@ -214,13 +230,39 @@ def _attribute_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
     return current.id, tuple(reversed(attrs))
 
 
+def _getattr_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
+    """If ``node`` is ``getattr(Name.attr..., "leaf", <default>)``, return
+    ``(root_name_id, (attr1, ..., leaf))``. Otherwise return ``None``.
+    """
+    if (
+        not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Name)
+        or node.func.id != "getattr"
+        or len(node.args) not in (2, 3)
+        or not isinstance(node.args[1], ast.Constant)
+        or not isinstance(node.args[1].value, str)
+    ):
+        return None
+    root_path: tuple[str, tuple[str, ...]]
+    if isinstance(node.args[0], ast.Name):
+        root_path = (node.args[0].id, ())
+    else:
+        path = _attribute_path(node.args[0])
+        if path is None:
+            return None
+        root_path = path
+    root, attrs = root_path
+    return root, (*attrs, node.args[1].value)
+
+
 def _classify_kwargs() -> tuple[
     dict[str, tuple[str, tuple[str, ...]]], dict[str, object], set[str]
 ]:
     """Split the call site's kwargs into three buckets:
 
-    - ``attr_kwargs``: ``kwarg=source.attr[...]`` (or
-      ``kwarg=int(source.attr)``) → ``{kwarg: (root, path)}``.
+    - ``attr_kwargs``: ``kwarg=source.attr[...]``,
+      ``kwarg=int(source.attr)``, or ``kwarg=getattr(source, "attr", ...)``
+      → ``{kwarg: (root, path)}``.
     - ``literal_kwargs``: ``kwarg=<constant>`` → ``{kwarg: value}``.
     - ``other_kwargs``: kwargs whose value is anything else (e.g. a bare
       Name like ``q``).
@@ -246,6 +288,10 @@ def _classify_kwargs() -> tuple[
             continue
         if isinstance(v, ast.Constant):
             literal_kwargs[kw.arg] = v.value
+            continue
+        path = _getattr_path(v)
+        if path is not None:
+            attr_kwargs[kw.arg] = path
             continue
         path = _attribute_path(v)
         if path is not None:
@@ -408,6 +454,20 @@ def test_each_source_attr_kwarg_resolves_uniquely():
                 )
 
 
+def test_attr_kwarg_names_match_source_leaf_attrs_except_allowlisted_aliases():
+    """Most ``thop.attention`` kwargs should bind to a source attribute with
+    the same name. Existing aliases must stay explicit so new semantic
+    mismatches cannot slip in under a broad type-compatible mapping.
+    """
+    attr_kwargs, _, _ = _classify_kwargs()
+    aliases = {kwarg: source for kwarg, source in attr_kwargs.items() if kwarg != source[1][-1]}
+    assert aliases == _THOP_KWARG_SOURCE_ALIASES, (
+        "Unexpected thop kwarg/source attribute aliases.\n"
+        f"new or changed aliases: {aliases.items() - _THOP_KWARG_SOURCE_ALIASES.items()}\n"
+        f"stale allowlist entries: {_THOP_KWARG_SOURCE_ALIASES.items() - aliases.items()}"
+    )
+
+
 def test_literal_kwargs_match_allowlist():
     """Every literal-constant kwarg at the call site must appear in
     ``_THOP_LITERALS`` with the matching value, and every entry in
@@ -496,7 +556,7 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
 def test_every_forward_args_field_is_consumed():
     """Recursively check that every dataclass field reachable from
     ``AttentionForwardArgs`` (including nested sub-bags such as
-    ``AttentionSparseArgs``) is consumed at the call site, transitively
+    ``SparsePrediction``) is consumed at the call site, transitively
     via @property where applicable, or listed in ``_THOP_EXCLUDED_FIELDS``.
     """
     _verify_consumed(

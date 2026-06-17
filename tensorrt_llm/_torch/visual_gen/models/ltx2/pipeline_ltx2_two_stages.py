@@ -662,9 +662,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             **kwargs,
         )
 
-        dtype = self.model_config.torch_dtype
-        spatial_upsampler_path = self.model_config.extra_attrs.get("spatial_upsampler_path", "")
-        distilled_lora_path = self.model_config.extra_attrs.get("distilled_lora_path", "")
+        dtype = self.pipeline_config.torch_dtype
+        spatial_upsampler_path = self.pipeline_config.extra_attrs.get("spatial_upsampler_path", "")
+        distilled_lora_path = self.pipeline_config.extra_attrs.get("distilled_lora_path", "")
 
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
@@ -735,7 +735,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
             image=req.params.image,
-            image_cond_strength=req.params.image_cond_strength,
+            image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -752,6 +752,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -760,7 +761,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 3.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,
@@ -1165,6 +1165,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     video=video_mod,
                     audio=audio_mod,
                     text_cache=_s2_static,
+                    step_index=i,
                 )
 
                 # Video: velocity → x0 → post-process → Euler step

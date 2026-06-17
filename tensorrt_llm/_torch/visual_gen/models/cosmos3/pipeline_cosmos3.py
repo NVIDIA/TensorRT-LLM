@@ -57,18 +57,18 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
     hf_ids=[
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Super",
-        "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Image2Video",
+        "nvidia/Cosmos3-Super-Text2Image",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
-    def __init__(self, model_config):
-        super().__init__(model_config)
+    def __init__(self, pipeline_config):
+        super().__init__(pipeline_config)
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
-        self.transformer = Cosmos3VFMTransformer(self.model_config)
+        self.transformer = Cosmos3VFMTransformer(self.pipeline_config.model_configs["transformer"])
 
     def load_weights(self, weights: dict) -> None:
         if self.transformer is not None and hasattr(self.transformer, "load_weights"):
@@ -443,6 +443,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
         height: int = COSMOS3_720P_PARAMS["height"],
@@ -450,7 +451,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
         num_inference_steps: int = COSMOS3_720P_PARAMS["num_inference_steps"],
         guidance_scale: float = COSMOS3_720P_PARAMS["guidance_scale"],
-        seed: int = 42,
         max_sequence_length: int = COSMOS3_720P_PARAMS["max_sequence_length"],
         frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
@@ -572,7 +572,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
-            latent_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latent_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Cosmos3 forward function for BasePipeline.denoise().
 
@@ -581,7 +586,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             """
             noise_pred = self.transformer(
                 hidden_states=latent_input,
-                timestep=timestep,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
                 text_ids=extra_tensors["text_ids"],
                 text_mask=extra_tensors["text_mask"],
                 video_shape=video_shape,

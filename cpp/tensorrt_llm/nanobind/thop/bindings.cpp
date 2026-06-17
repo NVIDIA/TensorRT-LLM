@@ -34,11 +34,12 @@ namespace tensorrt_llm::nanobind::thop
 namespace
 {
 
-nb::object optionalTensorToObject(std::optional<at::Tensor> const& tensor)
+template <typename T>
+nb::object optionalToObject(std::optional<T> const& value)
 {
-    if (tensor.has_value())
+    if (value.has_value())
     {
-        return nb::cast(*tensor);
+        return nb::cast(*value);
     }
     return nb::none();
 }
@@ -72,9 +73,9 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
             total_num_blocks, kv_factor, need_build_kv_cache_metadata);
     }();
 
-    return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)),
-        optionalTensorToObject(std::get<4>(result)), optionalTensorToObject(std::get<5>(result)), std::get<6>(result),
+    return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
+        optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)),
+        optionalToObject(std::get<4>(result)), optionalToObject(std::get<5>(result)), std::get<6>(result),
         std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
@@ -108,9 +109,9 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
             need_build_kv_cache_metadata);
     }();
 
-    return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)), std::get<4>(result),
-        std::get<5>(result), std::get<6>(result), optionalTensorToObject(std::get<7>(result)), std::get<8>(result),
+    return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
+        optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)), std::get<4>(result),
+        std::get<5>(result), std::get<6>(result), optionalToObject(std::get<7>(result)), std::get<8>(result),
         std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
@@ -173,7 +174,10 @@ void initBindings(nb::module_& m)
         nb::arg("sage_attn_num_elts_per_blk_k") = 0, nb::arg("sage_attn_num_elts_per_blk_v") = 0,
         nb::arg("sage_attn_qk_int8") = false, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
         nb::arg("trtllm_gen_jit_warmup") = false, nb::arg("compressed_kv_cache_pool_ptr") = std::nullopt,
-        "Multi-head attention operation", nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("is_cross") = false, nb::arg("cross_kv") = std::nullopt,
+        nb::arg("relative_attention_bias") = std::nullopt, nb::arg("relative_attention_max_distance") = 0,
+        nb::arg("spec_decoding_target_max_draft_tokens") = std::nullopt, "Multi-head attention operation",
+        nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "get_helix_workspace_size_per_rank",
@@ -305,7 +309,7 @@ void initBindings(nb::module_& m)
                 auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
                 blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
             }
-            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables), optionalTensorToObject(kvScalePool));
+            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables), optionalToObject(kvScalePool));
         },
         nb::arg("host_kv_cache_pool_pointers"), nb::arg("host_kv_cache_pool_mapping"),
         nb::arg("kv_cache_block_offsets"), nb::arg("layer_idx"), nb::arg("num_kv_heads"), nb::arg("tokens_per_block"),

@@ -267,6 +267,23 @@ def extract_mamba_kv_cache_params(
     )
 
 
+class _Qwen35MoeVLMConfig(transformers.Qwen3NextConfig):
+    """Thin subclass that restores the top-level model_type for Qwen3.5 MoE.
+
+    ``_Qwen35ConfigCompat`` normalizes the HF config into Qwen3NextConfig
+    (needed by the PyTorch backend model), but that loses the original
+    ``model_type``.  The serving layer needs ``model_type = "qwen3_5_moe"``
+    for ``MULTIMODAL_PLACEHOLDER_REGISTRY`` lookup; without it,
+    ``resolve_top_level_model_type`` returns ``"qwen3_next"`` and multimodal
+    requests fail with "Unknown modality".
+
+    To remove: when ``_Qwen35ConfigCompat`` is removed and the PyTorch backend
+    consumes ``Qwen3_5MoeConfig`` directly.
+    """
+
+    model_type = "qwen3_5_moe"
+
+
 class _Qwen35ConfigCompat:
     """Temporary shim that normalizes Qwen3.5 HF configs into Qwen3NextConfig.
 
@@ -460,8 +477,11 @@ def load_pretrained_config(model_name_or_path: str,
                                 "Qwen3_5ForCausalLM",
                                 "Qwen3_5ForConditionalGeneration",
                             )):
-        model_config = transformers.Qwen3NextConfig.from_dict(
-            _Qwen35ConfigCompat.normalize(config_dict))
+        normalized = _Qwen35ConfigCompat.normalize(config_dict)
+        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_config = _Qwen35MoeVLMConfig.from_dict(normalized)
+        else:
+            model_config = transformers.Qwen3NextConfig.from_dict(normalized)
     elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
           and config_dict.get("layer_types") is None):
         # transformers 5.5.x Exaone4Config.__post_init__ first forces

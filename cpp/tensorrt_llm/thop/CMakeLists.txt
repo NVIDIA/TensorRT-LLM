@@ -41,6 +41,7 @@ add_library(
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
+  asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
@@ -65,10 +66,13 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekV4QNormOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
+  ulyssesPostUnscatterOp.cpp
+  ulyssesPermuteScatterOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
@@ -96,6 +100,7 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp

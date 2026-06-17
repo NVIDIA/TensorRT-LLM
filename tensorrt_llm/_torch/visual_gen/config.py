@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Internal DiffusionModelConfig and loading helpers."""
+"""Internal VisualGen pipeline and model configuration helpers."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,16 +40,6 @@ from tensorrt_llm.visual_gen.args import (
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
-)
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig
-from tensorrt_llm.visual_gen.sparse_attention import (
-    auto_detect_sparse_attention_config as _auto_detect_sparse_attention_config,
-)
-from tensorrt_llm.visual_gen.sparse_attention import (
-    auto_detect_sparse_yaml as _auto_detect_sparse_yaml,
-)
-from tensorrt_llm.visual_gen.sparse_attention import (
-    load_sparse_config_from_yaml as _load_sparse_config_from_yaml,
 )
 
 # =============================================================================
@@ -85,24 +76,29 @@ def create_attention_metadata_state() -> Dict[str, Any]:
     return {"metadata": None, "capacity": (0, 0)}
 
 
-# =============================================================================
-# DiffusionModelConfig - Internal configuration (merged/parsed)
-# =============================================================================
+def _model_config_value(value: Any, *, deep_copy: bool = True) -> Any:
+    """Return a value for a per-component DiffusionModelConfig."""
+    if value is None:
+        return None
+    if not deep_copy:
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    return deepcopy(value)
 
 
-class DiffusionModelConfig(BaseModel):
-    """Internal ModelConfig for diffusion models.
+class _VisualGenConfigBase(BaseModel):
+    """Base for internal VisualGen configs that carry runtime objects."""
 
-    This is created by PipelineLoader from VisualGenArgs + checkpoint.
-    Contains merged/parsed config from:
-    - pretrained_config: From checkpoint/config.json
-    - quant_config: From checkpoint or user quant config
-    - Sub-configs: From VisualGenArgs (pipeline, attention, teacache)
-    - visual_gen_mapping: Populated by setup_visual_gen_mapping() from ParallelConfig
-    """
-
+    # Pydantic reserves `model_config` for class-level settings. This is not
+    # a VisualGen model config; it lets fields hold objects such as Mapping.
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+
+class DiffusionModelConfig(_VisualGenConfigBase):
+    """Internal config for one TRT-LLM VisualGen model component."""
+
+    component_name: Optional[str] = None
     pretrained_config: Optional[Any] = None
     mapping: Mapping = PydanticField(default_factory=Mapping)
     skip_create_weights_in_init: bool = False
@@ -110,12 +106,12 @@ class DiffusionModelConfig(BaseModel):
     allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.NCCL)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
-    # Unified parallelism mapping (populated by setup_visual_gen_mapping)
+    # Unified parallelism mapping copied from the owning pipeline config.
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
 
     dynamic_weight_quant: bool = False
 
-    # Sub-configs from VisualGenArgs (merged during from_pretrained)
+    # Shared runtime configs copied from the owning pipeline config.
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
@@ -126,12 +122,6 @@ class DiffusionModelConfig(BaseModel):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
-
-    # Merged per-family pipeline_config: registry-entry defaults overlaid
-    # with the user-supplied VisualGenArgs.pipeline_config dict (user
-    # values win). Validated against the registry entry's `defaults`
-    # before assignment, so unknown keys never reach here.
-    pipeline_config: Dict[str, Any] = PydanticField(default_factory=dict)
 
     # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
     enable_layerwise_nvtx_marker: bool = False
@@ -160,6 +150,108 @@ class DiffusionModelConfig(BaseModel):
         if name in self.quant_config_dict:
             return self.quant_config_dict[name]
         return self.quant_config
+
+
+# =============================================================================
+# DiffusionPipelineConfig - Internal pipeline configuration (merged/parsed)
+# =============================================================================
+
+
+class DiffusionPipelineConfig(_VisualGenConfigBase):
+    """Internal config for an entire VisualGen pipeline.
+
+    This is created by PipelineLoader from VisualGenArgs + checkpoint and owns
+    pipeline/runtime state plus one DiffusionModelConfig per model component.
+    """
+
+    model_configs: Dict[str, DiffusionModelConfig] = PydanticField(default_factory=dict)
+    mapping: Mapping = PydanticField(default_factory=Mapping)
+    skip_create_weights_in_init: bool = False
+    force_dynamic_quantization: bool = False
+    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.NCCL)
+    extra_attrs: Dict = PydanticField(default_factory=dict)
+
+    # Unified parallelism mapping (populated by setup_visual_gen_mapping)
+    visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+
+    dynamic_weight_quant: bool = False
+
+    # Sub-configs from VisualGenArgs (merged during from_pretrained)
+    quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
+    # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
+    quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
+    torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
+    cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
+    attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
+    attention_metadata_state: Optional[Dict[str, Any]] = None
+    parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
+    cache: Optional[CacheConfig] = None
+
+    # Observability — flat field mirrors VisualGenArgs.enable_layerwise_nvtx_marker.
+    enable_layerwise_nvtx_marker: bool = False
+
+    @property
+    def primary_model_config(self) -> DiffusionModelConfig:
+        return self.model_configs["transformer"]
+
+    @property
+    def primary_pretrained_config(self) -> Any:
+        return self.primary_model_config.pretrained_config
+
+    @property
+    def cache_backend(self) -> Optional[CacheBackendName]:
+        return self.cache.cache_backend if self.cache is not None else None  # type: ignore[return-value]
+
+    @property
+    def teacache(self) -> Optional[TeaCacheConfig]:
+        return self.cache if isinstance(self.cache, TeaCacheConfig) else None
+
+    @property
+    def cache_dit(self) -> Optional[CacheDiTConfig]:
+        return self.cache if isinstance(self.cache, CacheDiTConfig) else None
+
+    @property
+    def torch_dtype(self) -> "torch.dtype":
+        """Get the torch dtype of the model (default: bfloat16)."""
+        return torch.bfloat16
+
+    def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
+        """Get quantization config for a layer or global. Resembles LLM ModelConfig.get_quant_config."""
+        if name is None or self.quant_config_dict is None:
+            return self.quant_config
+        if name in self.quant_config_dict:
+            return self.quant_config_dict[name]
+        return self.quant_config
+
+    def _make_model_config(
+        self,
+        component_name: str,
+        model_pretrained_config: Any,
+    ) -> DiffusionModelConfig:
+        return DiffusionModelConfig(
+            component_name=_model_config_value(component_name),
+            pretrained_config=_model_config_value(model_pretrained_config),
+            # Topology mappings carry distributed process-group handles.
+            mapping=_model_config_value(self.mapping, deep_copy=False),
+            skip_create_weights_in_init=_model_config_value(self.skip_create_weights_in_init),
+            force_dynamic_quantization=_model_config_value(self.force_dynamic_quantization),
+            allreduce_strategy=_model_config_value(self.allreduce_strategy),
+            extra_attrs=_model_config_value(self.extra_attrs),
+            # Topology mappings carry distributed process-group handles.
+            visual_gen_mapping=_model_config_value(self.visual_gen_mapping, deep_copy=False),
+            dynamic_weight_quant=_model_config_value(self.dynamic_weight_quant),
+            quant_config=_model_config_value(self.quant_config),
+            quant_config_dict=_model_config_value(self.quant_config_dict),
+            compilation=_model_config_value(self.compilation),
+            torch_compile=_model_config_value(self.torch_compile),
+            cuda_graph=_model_config_value(self.cuda_graph),
+            attention=_model_config_value(self.attention),
+            attention_metadata_state=_model_config_value(self.attention_metadata_state),
+            parallel=_model_config_value(self.parallel),
+            cache=_model_config_value(self.cache),
+            enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
+        )
 
     @staticmethod
     def load_diffusion_quant_config(
@@ -346,12 +438,12 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_dir: str,
         args: Optional["VisualGenArgs"] = None,
         **kwargs,
-    ) -> "DiffusionModelConfig":
+    ) -> "DiffusionPipelineConfig":
         """
         Load config from pretrained checkpoint.
 
         Called by PipelineLoader with VisualGenArgs:
-            config = DiffusionModelConfig.from_pretrained(
+            config = DiffusionPipelineConfig.from_pretrained(
                 checkpoint_dir=args.model,
                 args=args,
             )
@@ -404,6 +496,7 @@ class DiffusionModelConfig(BaseModel):
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
+        component_config_dicts: Dict[str, Dict[str, Any]] = {}
 
         if components:
             # ---------- Diffusers directory layout ----------
@@ -415,8 +508,11 @@ class DiffusionModelConfig(BaseModel):
             if not config_path.exists():
                 raise ValueError(f"Config not found at {config_path}")
 
-            with open(config_path) as f:
-                config_dict = json.load(f)
+            for component_name, component_config_path in components.items():
+                with open(component_config_path) as f:
+                    component_config_dicts[component_name] = json.load(f)
+
+            config_dict = component_config_dicts[component]
             pretrained_config = SimpleNamespace(**config_dict)
 
             # Ensure _name_or_path is set so TeaCache coefficient matching works.
@@ -439,6 +535,10 @@ class DiffusionModelConfig(BaseModel):
 
             if native_config is not None:
                 transformer_dict = native_config.get("transformer", {})
+                component_config_dicts["transformer"] = transformer_dict
+                transformer_2_dict = native_config.get("transformer_2")
+                if isinstance(transformer_2_dict, dict):
+                    component_config_dicts["transformer_2"] = transformer_2_dict
                 pretrained_config = SimpleNamespace(**transformer_dict)
                 if not getattr(pretrained_config, "_name_or_path", None):
                     pretrained_config._name_or_path = str(checkpoint_path)
@@ -474,45 +574,6 @@ class DiffusionModelConfig(BaseModel):
                     f"Config not found at {checkpoint_dir}. "
                     "Expected model_index.json (diffusers) or "
                     "safetensors with embedded config metadata."
-                )
-
-        # Load sparse attention calibration. ModelOpt artifacts carry the
-        # calibration formula and disabled-layer/component map; user config
-        # contributes only public knobs such as target_sparsity.
-        yaml_sparse = None
-        yaml_path = attention_cfg.sparse_config_path
-        if yaml_path is not None:
-            yaml_sparse = _load_sparse_config_from_yaml(yaml_path)
-            if yaml_sparse is not None:
-                logger.info(f"Loaded sparse config from {yaml_path}")
-
-        if yaml_sparse is None:
-            yaml_sparse = _auto_detect_sparse_yaml(str(checkpoint_path))
-            if yaml_sparse is not None:
-                logger.info("Auto-detected sparse config YAML from checkpoint")
-
-        if yaml_sparse is None:
-            ckpt_dict = vars(pretrained_config) if pretrained_config else {}
-            yaml_sparse = _auto_detect_sparse_attention_config(ckpt_dict)
-            if yaml_sparse is not None:
-                formula = yaml_sparse._formula
-                if formula is not None:
-                    logger.info(
-                        "Auto-detected sparse config from config.json "
-                        f"(formula: log_a={formula.log_a:.2f}, b={formula.b:.2f})"
-                    )
-                else:
-                    logger.info("Auto-detected sparse config from config.json")
-
-        if yaml_sparse is not None:
-            user_cfg = attention_cfg.sparse_attention_config
-            if user_cfg is not None and isinstance(user_cfg, SkipSoftmaxConfig):
-                attention_cfg = attention_cfg.model_copy(
-                    update={"sparse_attention_config": yaml_sparse._with_public_overrides(user_cfg)}
-                )
-            else:
-                attention_cfg = attention_cfg.model_copy(
-                    update={"sparse_attention_config": yaml_sparse}
                 )
 
         # Resolve quant_config. A user dict containing ``quant_algo``
@@ -551,8 +612,7 @@ class DiffusionModelConfig(BaseModel):
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
         )
 
-        return cls(
-            pretrained_config=pretrained_config,
+        pipeline_config = cls(
             quant_config=quant_config,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
@@ -566,8 +626,29 @@ class DiffusionModelConfig(BaseModel):
             parallel=parallel_cfg,
             cache=cache_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
-            pipeline_config=resolved_pipeline_config,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,
         )
+
+        for component_name, config_dict in component_config_dicts.items():
+            if component_name == component:
+                component_pretrained_config = pretrained_config
+            else:
+                component_pretrained_config = SimpleNamespace(**config_dict)
+                if not getattr(component_pretrained_config, "_name_or_path", None):
+                    component_pretrained_config._name_or_path = getattr(
+                        pretrained_config, "_name_or_path", ""
+                    )
+            pipeline_config.model_configs[component_name] = pipeline_config._make_model_config(
+                component_name,
+                component_pretrained_config,
+            )
+
+        if not pipeline_config.model_configs:
+            pipeline_config.model_configs["transformer"] = pipeline_config._make_model_config(
+                "transformer",
+                pretrained_config,
+            )
+
+        return pipeline_config

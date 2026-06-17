@@ -183,6 +183,25 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_ssm_replay_requires_spec(self):
+        """Reject the replay SSM kernel when speculative decoding is off.
+
+        ``ssm_replay`` makes the SSM backend emit per-layer replay state buffers (``Replay*``
+        handlers), which are read only on the speculative extend (draft-verification) path.
+        Those handlers carry the ``SpeculativeOnly`` trait, so without ``speculative_config``
+        the kvcache insert transform drops them entirely and the ``ssm_replay`` flag becomes a
+        no-op. Reject the contradictory config here rather than silently ignoring the flag.
+        """
+        ssm_cfg = self.transforms.get("insert_cached_ssm_attention", {})
+        if ssm_cfg.get("ssm_replay", False) and self.speculative_config is None:
+            raise ValueError(
+                "transforms.insert_cached_ssm_attention.ssm_replay=True requires speculative "
+                "decoding (speculative_config must be set). Replay buffers are only used on the "
+                "speculative extend path."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_parallel_config(self):
         """Setup parallel config according to world_size.
 
@@ -412,18 +431,23 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def disable_cudagraph_for_speculative_flashinfer(self):
+    def reject_cudagraph_for_speculative_flashinfer(self):
         if (
             self.speculative_config is not None
             and self.attn_backend == "flashinfer"
             and self.is_cuda_graph_enabled()
         ):
-            ad_logger.warning(
+            raise ValueError(
                 "Speculative decoding with FlashInfer attention does not currently support CUDA "
-                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+                "graph replay in AutoDeploy. Use compile_backend='torch-simple' instead."
             )
-            self.compile_backend = "torch-simple"
-            self.update_transforms_with_shortcuts()
+        return self
+
+    @model_validator(mode="after")
+    def disable_piecewise_for_non_piecewise_backend(self):
+        compile_model = self.transforms.get("compile_model")
+        if compile_model is not None and not self.is_cuda_graph_enabled():
+            compile_model["piecewise_enabled"] = False
         return self
 
     ### UTILITY METHODS ############################################################################
@@ -441,6 +465,14 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         need it.
         """
         return False
+
+    @property
+    def reject_unmanaged_persistent_caches(self) -> bool:
+        """Whether unmanaged persistent cache resources should be rejected."""
+        return (
+            self.cache_transceiver_config is not None
+            and self.cache_transceiver_config.backend is not None
+        )
 
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
@@ -472,7 +504,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return factory
 
     def is_cuda_graph_enabled(self) -> bool:
-        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+        cuda_graph_backends = {"torch-cudagraph", "torch-opt"}
+        return self.compile_backend in cuda_graph_backends
 
     def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
         """Build DistConfig from YAML transform config and runtime MPI info.

@@ -110,6 +110,7 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(attn_backend: str, compile_
         speculative_model_kwargs={"torch_dtype": "bfloat16"},
         compile_backend=compile_backend,
         attn_backend=attn_backend,
+        transforms={"compile_model": {"piecewise_enabled": False}},
         max_num_tokens=512,
         # max_batch_size must leave room for an extend-only sample batch during
         # resize_kv_cache, i.e. max_num_tokens // max_batch_size >= 1 + max_draft_len.

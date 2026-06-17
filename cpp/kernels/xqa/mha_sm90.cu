@@ -500,32 +500,44 @@ __device__ void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst, Shared
     uint32_t nbKHeads /* only for final result in spec dec. set to 1 for workspace*/, uint32_t ctaNbValidTokens);
 #endif
 
-inline constexpr uint32_t ropeNbPairsPerThrdImpl(uint32_t nbThrds)
+// nbElems is the number of head elements processed as pairs. The RoPE'd q/k path uses the rope region
+// (validRopeElemsPerHead); the V path and non-RoPE q/k path use the full head (validElemsPerHead).
+inline constexpr uint32_t ropeNbPairsPerThrdImpl(uint32_t nbThrds, uint32_t nbElems)
 {
-    auto const val = divUp(exactDiv(validElemsPerHead, 2), nbThrds);
+    auto const val = divUp(exactDiv(nbElems, 2), nbThrds);
     assert(val <= 32);
     return val <= 2 ? val : (val <= 4 ? 4 : (val <= 8 ? 8 : (val <= 16 ? 16 : 32)));
 }
 
-template <uint32_t nbThrds>
-inline constexpr uint32_t ropeNbPairsPerThrd = ropeNbPairsPerThrdImpl(nbThrds);
+template <uint32_t nbThrds, uint32_t nbElems = validElemsPerHead>
+inline constexpr uint32_t ropeNbPairsPerThrd = ropeNbPairsPerThrdImpl(nbThrds, nbElems);
 
-template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem = float>
-__device__ Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds>> loadHead(
-    Vec<SrcElem, validElemsPerHead> const& head, uint32_t tid);
+// nbElems selects how many leading head elements are processed (default: the full head). srcElems is
+// deduced from the argument: the q/k path passes a full head and only the first nbElems are read; the
+// cos/sin path passes an nbElems-sized buffer.
+template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem = float,
+    uint32_t nbElems = validElemsPerHead, uint32_t srcElems = validElemsPerHead>
+__device__ Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>> loadHead(
+    Vec<SrcElem, srcElems> const& head, uint32_t tid);
 template <bool forNeox, uint32_t nbPairsPerThrd>
 __device__ mha::conditional_t<forNeox, Vec<Vec<CacheElem, nbPairsPerThrd>, 2>, Vec<Vec<CacheElem, 2>, nbPairsPerThrd>>
 applyRoPE(Vec<Vec<float, 2>, nbPairsPerThrd> const& data, Vec<Vec<float, 2>, nbPairsPerThrd> const& ropeCosSin);
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems = validElemsPerHead>
 __device__ void storeRotatedPairsForKV(GMemCacheHead& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t tid);
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems = validElemsPerHead>
 __device__ void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t row, uint32_t tid);
+// Partial-rotary helpers: copy the unrotated tail [validRopeElemsPerHead, validElemsPerHead) of a head
+// (no-ops when validRopeElemsPerHead == validElemsPerHead).
+template <uint32_t nbThrds>
+__device__ void storeUnrotatedTailForKV(GMemCacheHead& dst, InputHead const& src, float scale, uint32_t tid);
+template <uint32_t nbThrds>
+__device__ void storeUnrotatedTailForQ(SharedMem::QBuffer& dst, InputHead const& src, uint32_t row, uint32_t tid);
 
 class ScratchMem
 {
@@ -682,7 +694,7 @@ CUBIN_EXPORT __global__
 #if USE_INPUT_KV
             IOHead const* __restrict__ const qkv, // [nbReq][beamWidth][nbQHeads+nbKHeads+nbVHeads],
 #if ROPE_STYLE != 0
-            Vec<float, validElemsPerHead> const* __restrict__ const ropeCosSin, // [maxNbPosEmb]
+            Vec<float, validRopeElemsPerHead> const* __restrict__ const ropeCosSin, // [maxNbPosEmb]
 #endif
 #else
             IOHead const* __restrict__ const q, // [nbReq][beamWidth][nbQHeads],
@@ -1457,8 +1469,9 @@ CUBIN_EXPORT __global__
             smem.qBar.consumed.arrive_and_wait();
 #if ROPE_STYLE != 0
             auto const& ropeCosSinHead
-                = reinterpret_cast<Vec<float, validElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
-            auto const cosSinPairs = loadHead<float, false, thrdsPerHead>(ropeCosSinHead, tid);
+                = reinterpret_cast<Vec<float, validRopeElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
+            auto const cosSinPairs
+                = loadHead<float, false, thrdsPerHead, float, validRopeElemsPerHead>(ropeCosSinHead, tid);
 #endif
 #if ENABLE_PDL == 2
             acqBulk();
@@ -1474,10 +1487,17 @@ CUBIN_EXPORT __global__
 #if ROPE_STYLE == 0
                 auto const rotatedPairs = loadHead<InputElem, isNeox, thrdsPerHead, MathElem>(qData[idxHead], tid);
 #else
-                auto const pairs = loadHead<InputElem, isNeox, thrdsPerHead>(qData[idxHead], tid);
+                auto const pairs
+                    = loadHead<InputElem, isNeox, thrdsPerHead, float, validRopeElemsPerHead>(qData[idxHead], tid);
                 auto const rotatedPairs = applyRoPE<isNeox>(pairs, cosSinPairs);
 #endif
-                storeRotatedPairsForQ<isNeox, thrdsPerHead>(smem.q, rotatedPairs, idxHead, tid);
+                // nbElems == validRopeElemsPerHead for the rope region; for ROPE_STYLE == 0 this equals
+                // validElemsPerHead (full head), matching the loadHead above.
+                storeRotatedPairsForQ<isNeox, thrdsPerHead, validRopeElemsPerHead>(smem.q, rotatedPairs, idxHead, tid);
+#if ROPE_STYLE != 0
+                // Partial rotary: copy the unrotated tail of the head (no-op for full rotary).
+                storeUnrotatedTailForQ<thrdsPerHead>(smem.q, qData[idxHead], idxHead, tid);
+#endif
             }
 #else
             TinyPtr<IOHead const> const qData{q, headGrpSize * (nbKHeads * (beamWidth * ctaInputTokBeg) + idxHeadGrp)};
@@ -1543,12 +1563,18 @@ CUBIN_EXPORT __global__
                         kTilePartLoader.getHead(newTokenPos), convertedPairs, lane);
 #else
                     constexpr bool isNeox = (ROPE_STYLE == 1);
-                    auto const pairs = loadHead<InputElem, isNeox, warp_size>(inKHead, lane) * rcpKScale;
+                    auto const pairs
+                        = loadHead<InputElem, isNeox, warp_size, float, validRopeElemsPerHead>(inKHead, lane)
+                        * rcpKScale;
                     auto const& ropeCosSinHead
-                        = reinterpret_cast<Vec<float, validElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
-                    auto const cosSinPairs = loadHead<float, false, warp_size>(ropeCosSinHead, lane);
+                        = reinterpret_cast<Vec<float, validRopeElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
+                    auto const cosSinPairs
+                        = loadHead<float, false, warp_size, float, validRopeElemsPerHead>(ropeCosSinHead, lane);
                     auto const rotatedPairs = applyRoPE<isNeox>(pairs, cosSinPairs);
-                    storeRotatedPairsForKV<isNeox, warp_size>(kTilePartLoader.getHead(newTokenPos), rotatedPairs, lane);
+                    storeRotatedPairsForKV<isNeox, warp_size, validRopeElemsPerHead>(
+                        kTilePartLoader.getHead(newTokenPos), rotatedPairs, lane);
+                    // Partial rotary: copy the unrotated tail of the head (no-op for full rotary).
+                    storeUnrotatedTailForKV<warp_size>(kTilePartLoader.getHead(newTokenPos), inKHead, rcpKScale, lane);
 #endif
                     static_assert(inputSeqLen == 1);
                     __syncwarp();
@@ -3265,12 +3291,15 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst,
 }
 #endif
 
-template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem>
-__device__ inline Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds>> loadHead(
-    Vec<SrcElem, validElemsPerHead> const& head, uint32_t tid)
+template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem, uint32_t nbElems, uint32_t srcElems>
+__device__ inline Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>> loadHead(
+    Vec<SrcElem, srcElems> const& head, uint32_t tid)
 {
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds>;
+    // Only the first nbElems elements are loaded; for NEOX the two halves sit at [0, nbElems/2) and
+    // [nbElems/2, nbElems). For the RoPE'd path nbElems == validRopeElemsPerHead (the rope region).
+    constexpr uint32_t nbPairs = exactDiv(nbElems, 2);
+    static_assert(srcElems >= nbElems);
+    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds, nbElems>;
     constexpr uint32_t nbWorkingThrds = exactDiv(nbPairs, nbPairsPerThrd);
     bool const isWorkingThrd = (nbWorkingThrds == nbThrds || tid < nbWorkingThrds);
     static_assert(nbPairs % nbPairsPerThrd == 0);
@@ -3339,14 +3368,14 @@ applyRoPE(Vec<Vec<float, 2>, nbPairsPerThrd> const& data, Vec<Vec<float, 2>, nbP
     }
 }
 
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems>
 __device__ inline void storeRotatedPairsForKV(GMemCacheHead& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t tid)
 {
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds>;
+    constexpr uint32_t nbPairs = exactDiv(nbElems, 2);
+    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds, nbElems>;
     constexpr uint32_t nbWorkingThrds = exactDiv(nbPairs, nbPairsPerThrd);
     bool const isWorkingThrd = (nbWorkingThrds == nbThrds || tid < nbWorkingThrds);
     static_assert(nbPairs % nbPairsPerThrd == 0);
@@ -3366,14 +3395,14 @@ __device__ inline void storeRotatedPairsForKV(GMemCacheHead& dst,
     }
 }
 
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems>
 __device__ inline void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t row, uint32_t tid)
 {
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds>;
+    constexpr uint32_t nbPairs = exactDiv(nbElems, 2);
+    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds, nbElems>;
     constexpr uint32_t nbWorkingThrds = exactDiv(nbPairs, nbPairsPerThrd);
     bool const isWorkingThrd = (nbWorkingThrds == nbThrds || tid < nbWorkingThrds);
     static_assert(nbPairs % nbPairsPerThrd == 0);
@@ -3436,6 +3465,58 @@ __device__ inline void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
     }
 }
 
+// Copy the unrotated tail [validRopeElemsPerHead, validElemsPerHead) of a head into the (linear) K
+// cache, converting InputElem -> CacheElem and applying the kv-cache scale. No-op for full rotary.
+template <uint32_t nbThrds>
+__device__ inline void storeUnrotatedTailForKV(GMemCacheHead& dst, InputHead const& src, float scale, uint32_t tid)
+{
+    if constexpr (validRopeElemsPerHead < validElemsPerHead)
+    {
+        constexpr uint32_t tailElems = validElemsPerHead - validRopeElemsPerHead;
+        constexpr uint32_t nbIters = divUp(tailElems, nbThrds);
+#pragma unroll
+        for (uint32_t iter = 0; iter < nbIters; iter++)
+        {
+            uint32_t const e = validRopeElemsPerHead + tid + iter * nbThrds;
+            if (e >= validElemsPerHead)
+            {
+                break;
+            }
+            dst[e] = convert<CacheElem>(Vec<float, 1>{float(src[e]) * scale})[0];
+        }
+    }
+}
+
+// Copy the unrotated tail [validRopeElemsPerHead, validElemsPerHead) of a head into the swizzled Q
+// shared-memory buffer, converting InputElem -> CacheElem. Mirrors the byte->(part,grain) mapping in
+// storeRotatedPairsForQ so the GMMA sees a contiguous head. No-op for full rotary.
+template <uint32_t nbThrds>
+__device__ inline void storeUnrotatedTailForQ(SharedMem::QBuffer& dst, InputHead const& src, uint32_t row, uint32_t tid)
+{
+    if constexpr (validRopeElemsPerHead < validElemsPerHead)
+    {
+        constexpr uint32_t tailElems = validElemsPerHead - validRopeElemsPerHead;
+        constexpr uint32_t nbIters = divUp(tailElems, nbThrds);
+#pragma unroll
+        for (uint32_t iter = 0; iter < nbIters; iter++)
+        {
+            uint32_t const e = validRopeElemsPerHead + tid + iter * nbThrds;
+            if (e >= validElemsPerHead)
+            {
+                break;
+            }
+            CacheElem const val = convert<CacheElem>(Vec<float, 1>{float(src[e])})[0];
+            auto const byteOffset = BoundedVal<mathHeadBytes>{cacheElemSize * e};
+            uint32_t const idxPart = byteOffset.template divBy<qPartBytes>().get();
+            auto const byteOffsetInsidePart = byteOffset.template mod<qPartBytes>();
+            uint32_t const idxGrain = byteOffsetInsidePart.template divBy<grainBytes>().get();
+            uint32_t const byteOffsetInsideGrain = byteOffsetInsidePart.template mod<grainBytes>().get();
+            LdGrain& grain = dst[idxPart].template at<true>(row, idxGrain);
+            reinterpret_cast<CacheElem*>(reinterpret_cast<mha::byte*>(&grain) + byteOffsetInsideGrain)[0] = val;
+        }
+    }
+}
+
 #ifndef GENERATE_CUBIN
 uint32_t computeNbSubSeqPerSeqHopperF8MHA(
     cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen)
@@ -3466,7 +3547,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if USE_INPUT_KV
     InputHead const* qkv,
 #if ROPE_STYLE != 0
-    Vec<float, validElemsPerHead> const* ropeCosSin,
+    Vec<float, validRopeElemsPerHead> const* ropeCosSin,
 #endif
 #else
     InputHead const* q,

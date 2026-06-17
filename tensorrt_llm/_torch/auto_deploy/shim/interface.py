@@ -49,7 +49,11 @@ else:
     torch_dtype_to_binding = None
 
 from ..custom_ops.attention_interface import (
+    AttentionType,
     CausalConvResourceHandler,
+    EphemeralResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     ReplayCacheBufIdxHandler,
     ReplayOldBHandler,
@@ -60,8 +64,6 @@ from ..custom_ops.attention_interface import (
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
 )
@@ -101,6 +103,7 @@ class CachedSequenceInterface:
         vocab_size_padded: Optional[int] = None,
         spec_config=None,
         requires_uniform_kv_caches: bool = False,
+        reject_unmanaged_persistent_caches: bool = False,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -117,6 +120,8 @@ class CachedSequenceInterface:
                 cache mapping. When True, KV layers incompatible with the managed KV cache
                 reference raise during initialization, and managed KV layers must share a
                 single page-stride multiplier.
+            reject_unmanaged_persistent_caches: Whether to reject non-ephemeral cache resources
+                that are not managed by cache managers.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -157,6 +162,7 @@ class CachedSequenceInterface:
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
         self._requires_uniform_kv_caches = requires_uniform_kv_caches
+        self._reject_unmanaged_persistent_caches = reject_unmanaged_persistent_caches
 
         # Propagate spec-dec config into BatchInfo so attention backends can read it
         # via the per-forward batch_info_host tensor without needing the Python config.
@@ -350,6 +356,7 @@ class CachedSequenceInterface:
         pool_by_window: Dict[int, PoolConfiguration] = {}
 
         max_seq_len = self.info.max_seq_len
+        attention_type: Optional[AttentionType] = None
 
         for name, handler in self._resource_lookup.items():
             if not isinstance(handler, KVPagedResourceHandler):
@@ -357,6 +364,15 @@ class CachedSequenceInterface:
             # Effective window: full-attention layers (sliding_window == 0) use
             # max_seq_len so the C++ side gets a single concrete window key.
             effective_window = handler.sliding_window if handler.sliding_window > 0 else max_seq_len
+
+            if attention_type is None:
+                attention_type = handler.attention_type
+            elif handler.attention_type != attention_type:
+                raise RuntimeError(
+                    f"KV layer {name} has attention_type={handler.attention_type!r} but "
+                    f"managed KV resources already use attention_type={attention_type!r}. "
+                    "Disaggregated KV transfer requires a single attention type."
+                )
 
             kv_managed[name] = handler
 
@@ -386,6 +402,7 @@ class CachedSequenceInterface:
                     dtype=handler_dtype,
                 )
 
+        self.info.attention_type = attention_type
         pool_configurations: List[PoolConfiguration] = list(pool_by_window.values())
 
         # If the runtime requires uniform KV caches (e.g. legacy single-pool
@@ -460,8 +477,8 @@ class CachedSequenceInterface:
         ssm_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecSSMResourceHandler)
-            and handler == SpecSSMResourceHandler.from_base(ssm_ref)
+            if isinstance(handler, IntermediateSSMStateHandler)
+            and handler == IntermediateSSMStateHandler.from_base(ssm_ref)
         ]
         conv_managed = [
             (name, handler)
@@ -471,8 +488,8 @@ class CachedSequenceInterface:
         conv_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecCausalConvResourceHandler)
-            and handler == SpecCausalConvResourceHandler.from_base(conv_ref)
+            if isinstance(handler, IntermediateConvStateHandler)
+            and handler == IntermediateConvStateHandler.from_base(conv_ref)
         ]
 
         # Replay SSM buffers — per-layer (old_x, old_B, old_dt, old_dA_cumsum)
@@ -893,6 +910,64 @@ class CachedSequenceInterface:
 
         return block_offset_multiplier
 
+    def _validate_no_unmanaged_persistent_caches(
+        self,
+        kv_managed: ResourceHandlerDict,
+        ssm_managed: list,
+        ssm_spec: list,
+        conv_managed: list,
+        conv_spec: list,
+        replay_old_x: list,
+        replay_old_B: list,
+        replay_old_dt: list,
+        replay_old_dA_cumsum: list,
+        replay_cache_buf_idx: list,
+        replay_prev_num_accepted: list,
+    ) -> None:
+        """Validate persistent cache resources are cache-manager backed.
+
+        Speculative resources (intermediate SSM/conv states and replay buffers) are bound by the
+        cache manager only when speculative decoding is enabled (see _create_and_assign_state_views),
+        so they count as managed only under that condition. When spec decoding is off they are not
+        registered at all (see kvcache._suppress_spec_handlers_maybe), so the loop never encounters
+        them.
+        """
+        if not self._reject_unmanaged_persistent_caches:
+            return
+
+        managed_names = set(kv_managed)
+        managed_names.update(name for name, _ in ssm_managed)
+        managed_names.update(name for name, _ in conv_managed)
+        if self._spec_config is not None:
+            managed_names.update(name for name, _ in ssm_spec)
+            managed_names.update(name for name, _ in conv_spec)
+            for replay_resources in (
+                replay_old_x,
+                replay_old_B,
+                replay_old_dt,
+                replay_old_dA_cumsum,
+                replay_cache_buf_idx,
+                replay_prev_num_accepted,
+            ):
+                managed_names.update(name for name, _ in replay_resources)
+
+        unmanaged_transfer_resources = []
+        for name, handler in self._resource_lookup.items():
+            if isinstance(handler, EphemeralResourceHandler):
+                continue
+            if name in managed_names:
+                continue
+            unmanaged_transfer_resources.append(f"{name} ({type(handler).__name__})")
+
+        if unmanaged_transfer_resources:
+            raise RuntimeError(
+                "Found unmanaged persistent cache resources while "
+                "reject_unmanaged_persistent_caches is enabled: "
+                f"{unmanaged_transfer_resources}. Persistent cache resources must be managed by "
+                "a cache manager for configurations that need cache transfer, such as "
+                "disaggregated serving."
+            )
+
     def _allocate_unmanaged_resources(self) -> None:
         """Allocate resources not managed by cache managers.
 
@@ -998,6 +1073,7 @@ class CachedSequenceInterface:
         - SSMResourceHandler maps to MambaHybridCacheManager's ssm_states buffer
         - CausalConvResourceHandler maps to MambaHybridCacheManager's conv_states buffer
         - Generic StateResourceHandler and incompatible typed handlers are allocated locally
+          unless transfer policy requires persistent cache resources to be managed
         - When both SSM and Conv handlers exist, uses min(ssm_count, conv_count) layers
 
         Args:
@@ -1110,20 +1186,35 @@ class CachedSequenceInterface:
             block_offset_multiplier=block_offset_multiplier,
         )
 
-        # 7. Allocate remaining unmanaged resources
+        # 7. Validate persistent cache resources before allocating local fallbacks
+        self._validate_no_unmanaged_persistent_caches(
+            kv_managed,
+            ssm_managed,
+            ssm_spec,
+            conv_managed,
+            conv_spec,
+            replay_old_x,
+            replay_old_B,
+            replay_old_dt,
+            replay_old_dA_cumsum,
+            replay_cache_buf_idx,
+            replay_prev_num_accepted,
+        )
+
+        # 8. Allocate remaining unmanaged resources
         self._allocate_unmanaged_resources()
 
-        # 8. Patch shutdown
+        # 9. Patch shutdown
         self._kv_cache_manager.shutdown = with_pre_callback(
             self._kv_cache_manager.shutdown,
             self._clear_caches,
         )
 
-        # 8. Compute final token count and cache statistics
+        # 10. Compute final token count and cache statistics
         max_resource_count = self._kv_cache_manager.get_max_resource_count()
         max_tokens_final = max_resource_count * self._kv_cache_manager.tokens_per_block
 
-        # 9. Collect statistics of different types of resources
+        # 11. Collect statistics of different types of resources
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
@@ -1131,16 +1222,14 @@ class CachedSequenceInterface:
             1 for h in self._resource_lookup.values() if isinstance(h, SSMResourceHandler)
         )
         num_ssm_spec_total = sum(
-            1 for h in self._resource_lookup.values() if isinstance(h, SpecSSMResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateSSMStateHandler)
         )
         num_ssm_total = num_ssm_base_total + num_ssm_spec_total
         num_conv_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, CausalConvResourceHandler)
         )
         num_conv_spec_total = sum(
-            1
-            for h in self._resource_lookup.values()
-            if isinstance(h, SpecCausalConvResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateConvStateHandler)
         )
         num_conv_total = num_conv_base_total + num_conv_spec_total
         num_state_other = num_state_total - num_ssm_total - num_conv_total
@@ -1346,6 +1435,10 @@ class CachedSequenceInterface:
     def kv_cache_config(self) -> KvCacheConfig:
         """Return the original KVCacheConfig as passed in."""
         return self._kv_cache_config_original
+
+    @property
+    def attention_type(self) -> Optional[AttentionType]:
+        return self.info.attention_type
 
     def _clear_caches(self) -> None:
         """Clear all caches and views before pool release."""

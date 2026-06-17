@@ -80,14 +80,43 @@ def _register_fake():
 
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
-    def _(input, residual, gamma, epsilon, buffer, buffer_flags,
-          rmsnorm_fusion):
-        output = input.new_empty(input.shape)
-        if rmsnorm_fusion:
-            residual_out = residual.new_empty(residual.shape)
-        else:
-            residual_out = None
-        return [output, residual_out]
+    def _(input,
+          gamma,
+          residual,
+          epsilon,
+          buffer,
+          buffer_flags,
+          rmsnorm_fusion,
+          scale=None,
+          fusion_op: int = 0):
+        from tensorrt_llm.functional import AllReduceFusionOp
+        op = AllReduceFusionOp(fusion_op)
+        if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
+            op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+        if op == AllReduceFusionOp.NONE:
+            return [torch.empty_like(input)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            return [torch.empty_like(input), torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            return [quant_out, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+            norm_out = torch.empty_like(input)
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            return [norm_out, quant_out, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [quant_fp4, scale_fp4, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            norm_out = torch.empty_like(input)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [norm_out, quant_fp4, scale_fp4, torch.empty_like(residual)]
+        return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
@@ -106,6 +135,10 @@ def _register_fake():
     def _(q, k, norm_weight_q, norm_weight_k, workspace, rank, nranks, eps,
           trigger_completion_at_end):
         return [torch.empty_like(q), torch.empty_like(k)]
+
+    @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
+    def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
+        return torch.empty_like(q)
 
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
@@ -635,6 +668,17 @@ def _register_fake():
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
 
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
+    def _(input: torch.Tensor):
+        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
+        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+        m, k = input.shape[0], input.shape[1]
+        num_n_blocks = (k + 127) // 128
+        num_packed_sf_k = (num_n_blocks + 3) // 4
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    (m, num_packed_sf_k), dtype=torch.int32)
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,
@@ -680,6 +724,7 @@ def _register_fake():
         cluster_rank: int,
         min_latency_mode: bool,
         use_fp8_block_scaling: bool,
+        skip_data_expand: bool = False,
     ):
 
         experts_per_token = token_selected_experts.shape[1]
@@ -1012,6 +1057,20 @@ def _register_fake():
     def _(workspace, cp_rank, cp_size):
         # This op initializes workspace in-place and returns nothing
         return None
+
+    @torch.library.register_fake("trtllm::ulysses_post_unscatter_qkv")
+    def _(q_in, k_in, v_in, layout=0):
+        # Storage is always NHD-contig [B, P*Sp, H, D]. HND-shape return is a
+        # transpose-view (HND-shape, NHD-stride, non-contig) so Inductor sees
+        # the same stride pattern as the real op.
+        P, B, Sp, H, D = q_in.shape
+        nhd_shape = (B, P * Sp, H, D)
+
+        def _mk(t):
+            base = t.new_empty(nhd_shape)
+            return base.transpose(1, 2) if layout == 0 else base
+
+        return (_mk(q_in), _mk(k_in), _mk(v_in))
 
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):
