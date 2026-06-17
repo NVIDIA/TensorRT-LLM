@@ -1848,6 +1848,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        constraints.append(
+            self._build_concurrent_decode_constraint(
+                max_batch_size=self.max_batch_size,
+                tokens_per_block=tokens_per_block,
+            )
+        )
+        if typical_step is None:
+            # Preserve StorageManager's historical fallback ratio while using
+            # the concurrent decode constraint only as a min-slot floor.
+            typical_step = BatchDesc(
+                [KVCacheDesc(capacity=2049, history_length=2048)]
+            )
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
@@ -1889,6 +1902,19 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    @staticmethod
+    def _build_concurrent_decode_constraint(
+        *, max_batch_size: int, tokens_per_block: int
+    ) -> BatchDesc:
+        assert max_batch_size > 0
+        assert tokens_per_block > 0
+        return BatchDesc(
+            [
+                KVCacheDesc(capacity=tokens_per_block, history_length=tokens_per_block - 1)
+                for _ in range(max_batch_size)
+            ]
+        )
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
