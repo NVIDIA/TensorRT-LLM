@@ -25,7 +25,6 @@ from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionRemoteClient,
     _detect_external_launch,
-    _IterationStatsTracker,
     run_diffusion_worker,
 )
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output

@@ -11,7 +11,7 @@ from datetime import datetime
 
 import pytest
 
-from tensorrt_llm.visual_gen.visual_gen import _IterationStatsTracker
+from tensorrt_llm._torch.visual_gen.executor import _IterationStatsTracker
 
 # Required snapshot fields per the ticket / docstring.
 _REQUIRED_FIELDS = {

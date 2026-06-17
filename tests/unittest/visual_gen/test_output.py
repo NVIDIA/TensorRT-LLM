@@ -646,7 +646,8 @@ def _make_minimal_client_state():
     """
     import queue
 
-    from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient, _IterationStatsTracker
+    from tensorrt_llm._torch.visual_gen.executor import _IterationStatsTracker
+    from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
 
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client.completed_responses = {}
