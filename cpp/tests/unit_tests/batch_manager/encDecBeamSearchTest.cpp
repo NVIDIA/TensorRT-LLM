@@ -25,12 +25,13 @@
 //   beam when isCrossKv() is true, since the encoder output is identical for
 //   all beams of a request.
 //
-// Fix 3 — copyGenerationLogits direct-copy places each (beam, step) logit at
-//   the correct host offset.
-//   Before: the mergeLogitsFragmentsKernel pointer-indirection caused
-//   intermittent GPU-state corruption when gather_generation_logits=True was
-//   combined with concurrent mixed beam-width requests.
-//   After:  each fragment is copied directly to the host without the kernel.
+// Fix 3 — fragmentPointerDevice is now per-batch-slot ([maxBatchSize, kCACHE_LENGTH]).
+//   Before: fragmentPointerDevice was a single shared row ([kCACHE_LENGTH]); sequential
+//   flushes from different requests in the same batch clobbered each other's GPU pointer
+//   arrays, causing the mergeLogitsFragmentsKernel to read stale fragment addresses and
+//   produce degenerate output with gather_generation_logits=True.
+//   After:  each request gets its own device-side pointer row via getFragmentPointerSlot(),
+//   eliminating cross-request interference.
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"

@@ -224,17 +224,14 @@ public:
             workIdx = (workIdx + 1) % (fragmentPointerHost->getShape().d[0]);
         }
 
-        [[nodiscard]] TensorPtr getFragmentPointerHost()
+        //! Returns matching host and device pointer rows for the current workIdx, then advances
+        //! workIdx.  Always call this instead of the individual getters to avoid ordering bugs.
+        [[nodiscard]] std::pair<TensorPtr, TensorPtr> getFragmentPointerSlot()
         {
-            TensorPtr slice = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
+            TensorPtr host = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
+            TensorPtr device = runtime::ITensor::slice(fragmentPointerDevice, workIdx, 1);
             cycleWorkIdx();
-            return slice;
-        }
-
-        //! Returns the device pointer row for the current workIdx (called before cycleWorkIdx).
-        [[nodiscard]] TensorPtr getFragmentPointerDevice()
-        {
-            return runtime::ITensor::slice(fragmentPointerDevice, workIdx, 1);
+            return {std::move(host), std::move(device)};
         };
     };
 

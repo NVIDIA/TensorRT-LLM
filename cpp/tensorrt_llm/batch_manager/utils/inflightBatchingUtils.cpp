@@ -103,14 +103,11 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
 
     auto const fragmentSize = llmReq.getGenerationLogitsFragmentsSize();
 
-    // Merge logits fragments on device.
-    // getFragmentPointerDevice() reads the current workIdx row; getFragmentPointerHost() reads the
-    // same row then advances workIdx.  Calling device-slot first preserves the pairing so both
-    // host and device pointer arrays use the same per-batch-slot row, preventing concurrent
-    // flushes for different requests from clobbering each other's pointer arrays.
+    // Merge logits fragments on device.  getFragmentPointerSlot() returns the matching host and
+    // device rows for the current workIdx and advances the index atomically, so concurrent flushes
+    // for different requests in the same batch never clobber each other's pointer arrays.
     auto const& transposeBufferPtr = generationLogitsCache.transposedLogits;
-    auto const cachePointerDevice = generationLogitsCache.getFragmentPointerDevice();
-    auto const cachePointerHost = generationLogitsCache.getFragmentPointerHost();
+    auto [cachePointerHost, cachePointerDevice] = generationLogitsCache.getFragmentPointerSlot();
     tensorrt_llm::runtime::kernels::mergeLogitsFragments(bufferManager, *transposeBufferPtr,
         llmReq.getGenerationLogitsFragments(), *cachePointerDevice, *cachePointerHost, 0, 1, reqBeamWidth,
         bufferManager.getStream(), 0);
