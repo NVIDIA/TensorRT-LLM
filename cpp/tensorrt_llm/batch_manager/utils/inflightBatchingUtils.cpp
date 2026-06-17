@@ -116,15 +116,23 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
             = static_cast<SizeType32>(beforeDecoder) + llmReq.getNumTokens(beam) - llmReq.mPromptLen;
         auto const hostOffset = numGenerationToken - beamFragmentSize;
 
+        SizeType32 constexpr kOneStep = 1;
         for (SizeType32 stepIdx = 0; stepIdx < static_cast<SizeType32>(beamFragmentSize); ++stepIdx)
         {
             // frag shape: [1, beamWidth, vocabSizePadded]. Beam b starts at offset b*vocab.
-            auto fragBeamSlice = ITensor::slice(fragments.at(stepIdx), {0, beam}, 1);
+            auto const fragBeamSlice = ITensor::slice(fragments.at(stepIdx), {0, beam}, kOneStep);
             // host shape: [beamWidth, mMaxNewTokens, vocabSizePadded]. Target: [beam, hostOffset+stepIdx, :].
-            auto hostStepSlice = ITensor::slice(llmReq.getGenerationLogitsHost(), {beam, hostOffset + stepIdx}, 1);
+            auto const hostStepSlice
+                = ITensor::slice(llmReq.getGenerationLogitsHost(), {beam, hostOffset + stepIdx}, kOneStep);
             bufferManager.copy(*fragBeamSlice, *hostStepSlice);
         }
     }
+    // Clear the fragment list.  Although BufferManager::copy() enqueues async GPU-to-host
+    // transfers, no explicit stream synchronization is required here: clearing the list
+    // releases the fragment tensor *objects*, not the underlying GPU buffer.  The source
+    // memory lives inside generationLogitsCache.logits which is owned by RuntimeBuffers and
+    // remains valid until the next changeBeamWidth() call.  GPU-side ordering is ensured by
+    // the CUDA event that the decoder stream waits on before reading any shared state.
     llmReq.clearGenerationLogitsFragments();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
