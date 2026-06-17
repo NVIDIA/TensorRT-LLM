@@ -3637,7 +3637,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
-            clusterDurationsArgs,
+            [],  // no extra args; --durations-path is passed directly to run_tests.py below
             containerPortStart,
             containerPortNum
         )
