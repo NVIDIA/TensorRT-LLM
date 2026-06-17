@@ -162,7 +162,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                              default=None)
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
-    _multi_item_params_needs_refresh: bool = field(init=False, default=False)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -604,7 +603,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._mla_decode_planned = False
         self._multi_item_part_lens = None
         self._multi_item_params = None
-        self._multi_item_params_needs_refresh = False
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -835,7 +833,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def multi_item_part_lens(self,
                              multi_item_part_lens: Optional[list[list[int]]]):
         self._multi_item_part_lens = multi_item_part_lens
-        self._multi_item_params_needs_refresh = True
 
     def prepare(self) -> None:
         super().prepare()
@@ -849,14 +846,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
 
-        if self._multi_item_params_needs_refresh:
-            if self._multi_item_part_lens is not None:
-                self._multi_item_params = self._process_multi_item_part_lens(
-                    self._multi_item_part_lens,
-                    device=self.seq_lens_cuda.device)
-            else:
-                self._multi_item_params = None
-            self._multi_item_params_needs_refresh = False
+        if self._multi_item_part_lens is not None:
+            self._multi_item_params = self._process_multi_item_part_lens(
+                self._multi_item_part_lens, device=self.seq_lens_cuda.device)
+        else:
+            self._multi_item_params = None
 
         if self.kv_cache_manager is None:
             assert self.request_ids is not None
