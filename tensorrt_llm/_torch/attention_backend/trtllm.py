@@ -1765,6 +1765,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 self.sparse_params, 'algorithm', None) == 'mqa_gqa'):
             metadata.use_paged_context_fmha = True
 
+        # FP8 KV-cache skip-softmax needs paged context so preprocessing
+        # quantizes context QKV before FMHA dispatch.
+        if (isinstance(self.sparse_params, SkipSoftmaxParams)
+                and self.has_fp8_kv_cache):
+            metadata.use_paged_context_fmha = True
+
         if self.is_mla_enable:
             # Context MLA uses separate qkv instead of paged_context_fmha
             metadata.use_paged_context_fmha = False
