@@ -51,7 +51,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     gen_multimodal_cache_key_tokens,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, CACHE_LEVEL1, GPU_LEVEL
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import exact_div, typed_range
 from tensorrt_llm.sampling_params import SamplingParams
@@ -695,6 +695,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1828,6 +1829,40 @@ class KVCacheManagerV2(BaseResourceManager):
                 ]
                 kv_cache.set_base_page_index_buf(i, pool_idx, memoryview(buffer.numpy()))
         return kv_cache
+
+    def prefetch_for_context_tokens(self, requests: list) -> bool:
+        """Prefetch radix-tree blocks from disk→host for upcoming context requests.
+
+        Returns True if all prefetches succeeded, False if any failed.
+        """
+        if not self.enable_block_reuse:
+            return False
+        # Prefetch via a transient KV cache that holds the reuse-matched blocks,
+        # prefetches disk->host, then closes. Holding blocks costs no GPU space
+        # (never resumed) and close() needs no stream sync. The transient cache
+        # is NOT registered in kv_cache_map / IndexMapper.
+        success = True
+        for req in requests:
+            all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+            tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
+            # Match the ReuseScope salt derivation used in _create_kv_cache so
+            # the transient cache hits the same radix-tree blocks.
+            cache_salt = req.cache_salt
+            salt_int = (
+                int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
+                if cache_salt is not None
+                else None
+            )
+            kv_cache = self.impl.create_kv_cache(
+                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+            )
+            # Prefetch to the first tier below GPU (host if present, otherwise
+            # disk). prefetch() is a best-effort hint either way.
+            if not kv_cache.prefetch(CACHE_LEVEL1):
+                logger.warning("prefetch failed for request %s", req.py_request_id)
+                success = False
+            kv_cache.close()
+        return success
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
