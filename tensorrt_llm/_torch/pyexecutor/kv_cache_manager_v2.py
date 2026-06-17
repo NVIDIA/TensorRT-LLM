@@ -1313,10 +1313,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
-    @staticmethod
-    def _get_cache_salt(req: LlmRequest) -> str | None:
-        return getattr(req, "cache_salt", None)
-
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create _KVCache, handle block reuse, and resume. Does NOT resize.
 
@@ -1341,7 +1337,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.py_request_id,
                     req.lora_task_id,
                     tokens,
-                    cache_salt=self._get_cache_salt(req),
+                    cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
                     expected_prompt_length=req.prompt_len - 1,
                 )
@@ -1474,7 +1470,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.py_request_id,
                         req.lora_task_id,
                         None,
-                        cache_salt=self._get_cache_salt(req),
+                        cache_salt=req.cache_salt,
                         is_dummy=req.is_dummy,
                     )
                     kv_cache.stop_committing()
@@ -2435,7 +2431,7 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
             # Match the ReuseScope salt derivation used in _create_kv_cache so
             # the transient cache hits the same radix-tree blocks.
-            cache_salt = self._get_cache_salt(req)
+            cache_salt = req.cache_salt
             salt_int = (
                 int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
                 if cache_salt is not None

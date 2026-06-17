@@ -43,6 +43,7 @@ class _StatsRequest:
     context_remaining_length: int
     py_request_id: int = field(init=False)
     lora_task_id: int | None = None
+    cache_salt: str | None = None
     cache_salt_id: int | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
