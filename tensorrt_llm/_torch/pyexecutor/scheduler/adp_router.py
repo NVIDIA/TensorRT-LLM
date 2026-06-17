@@ -36,6 +36,12 @@ if TYPE_CHECKING:
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
 
+def _num_input_tokens(request) -> int:
+    """Token count via the cheap num_input_tokens accessor (avoids materializing
+    input_token_ids); 0 when request is None."""
+    return request.num_input_tokens if request is not None else 0
+
+
 @dataclass
 class RankState:
     """Per-rank state information shared via allgather before request assignment.
@@ -369,13 +375,7 @@ class DefaultADPRouter(ADPRouter):
 
         heapq.heapify(all_ranks_new_requests_heap)
 
-        # input_token_ids is a C++ getter that copies the whole token list on every
-        # access, so read it once per request instead of in both the sort key and
-        # the loop below.
-        counted = [
-            (len(req.input_token_ids) if (req := item.request) is not None else 0, item)
-            for item in new_requests
-        ]
+        counted = [(_num_input_tokens(item.request), item) for item in new_requests]
         counted.sort(key=lambda item: item[0], reverse=True)
 
         for token_count, req_item in counted:
@@ -554,12 +554,6 @@ class KVCacheAwareADPRouter(ADPRouter):
             return ()
         return tuple(token_ids[:num_tokens])
 
-    @staticmethod
-    def _req_tokens(req_item) -> int:
-        if req_item.request is None:
-            return 0
-        return len(getattr(req_item.request, "input_token_ids", []))
-
     def _match_len(self, rank: int, req_id: int) -> int:
         matches = self._all_ranks_prefix_matches
         return matches[rank].get(req_id, 0) if rank < len(matches) else 0
@@ -606,7 +600,8 @@ class KVCacheAwareADPRouter(ADPRouter):
                 all_ranks_num_active_requests[target_dp_rank] += 1
                 # Keep token tally in sync with the soft-balancing phase.
                 effective = max(
-                    self._req_tokens(req_item) - self._match_len(target_dp_rank, req_item.id),
+                    _num_input_tokens(req_item.request)
+                    - self._match_len(target_dp_rank, req_item.id),
                     0,
                 )
                 all_ranks_num_active_tokens[target_dp_rank] += effective
@@ -649,7 +644,7 @@ class KVCacheAwareADPRouter(ADPRouter):
             if not eligible_ranks:
                 break
 
-            req_tokens = self._req_tokens(req_item)
+            req_tokens = _num_input_tokens(req_item.request)
             req_id = req_item.id
 
             # Shuffle eligible ranks per decision so score ties fall to a
