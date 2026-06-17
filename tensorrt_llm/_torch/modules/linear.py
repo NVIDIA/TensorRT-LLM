@@ -1116,6 +1116,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     input,
                     module.weight,
                     module.weight_scale,
+                    disable_ue8m0_cast=True,
                 )
         elif get_sm_version() == 120:
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
