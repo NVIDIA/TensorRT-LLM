@@ -6117,11 +6117,18 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
             )
         assert module._t_l2[1].data_ptr() != module.w2_weight_scale.data_ptr(
         ), ("MegaMoE dedup invariant broken: _t_l2[1] aliases w2_weight_scale.")
-        for _redundant in (module.w3_w1_weight, module.w3_w1_weight_scale,
-                           module.w2_weight_scale):
-            _redundant.data = torch.empty(0,
-                                          dtype=_redundant.dtype,
-                                          device=_redundant.device)
+        # Reseat the redundant raw params to empty storage to release HBM, but
+        # route through replace_parameter_and_save_metadata so the original
+        # full-shape meta is recorded in module.rebuild_tensor_metadata. Without
+        # this, pre_reload_weights() (dynamic EPLB reload) cannot rebuild these
+        # parameters to full size before load_weights() copies into them.
+        for _name in ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight_scale"):
+            _redundant = getattr(module, _name)
+            replace_parameter_and_save_metadata(
+                module, _name,
+                torch.empty(0, dtype=_redundant.dtype,
+                            device=_redundant.device),
+                module.rebuild_tensor_metadata)
 
     def _setup_shared_weights_for_eplb(self, module: torch.nn.Module) -> None:
         """Transform & register host-side shared weights for dynamic EPLB.

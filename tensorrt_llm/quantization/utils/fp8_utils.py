@@ -494,7 +494,9 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_NUM_PER_EXPERT,
         expert_num,
     )
-    has_swiglu_limit = swiglu_limit is not None
+    # Gate on > 0 (matching torch.ops.trtllm.silu_and_mul) so a 0.0/negative
+    # limit is a no-op clamp rather than collapsing all activations to 0.
+    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0.0
     swiglu_limit_value = float(swiglu_limit) if has_swiglu_limit else 0.0
     _silu_and_mul_post_quant_kernel[grid](
         input,

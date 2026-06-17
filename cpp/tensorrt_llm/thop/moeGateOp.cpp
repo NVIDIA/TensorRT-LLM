@@ -66,8 +66,8 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "gate_forward(Tensor scores_in, Tensor bias, Tensor input_ids, Tensor tid2eid, Tensor out_weights, "
-        "Tensor out_indices, int topk, float route_scale, bool is_hash) -> ()");
+        "gate_forward(Tensor scores_in, Tensor bias, Tensor input_ids, Tensor tid2eid, Tensor(a!) out_weights, "
+        "Tensor(b!) out_indices, int topk, float route_scale, bool is_hash) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

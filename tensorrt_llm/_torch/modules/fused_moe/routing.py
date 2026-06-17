@@ -552,10 +552,17 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
                                   device=logits.device)
         if self.is_hashed:
             assert input_ids is not None
-            torch.ops.trtllm.gate_forward(
-                logits, self.callable_e_score_correction_bias(), input_ids,
-                self.callable_tid2eid(), out_weights, out_indices, self._top_k,
-                self.routed_scaling_factor, True)
+            # Hash mode does not consume bias (the kernel passes nullptr), but
+            # the op signature requires a Tensor. Hashed gates expose a
+            # None-returning bias callable, so substitute an empty tensor to
+            # avoid a dispatch-time failure on `Tensor bias`.
+            bias = self.callable_e_score_correction_bias()
+            if bias is None:
+                bias = torch.empty(0, dtype=torch.float32, device=logits.device)
+            torch.ops.trtllm.gate_forward(logits, bias, input_ids,
+                                          self.callable_tid2eid(), out_weights,
+                                          out_indices, self._top_k,
+                                          self.routed_scaling_factor, True)
         else:
             input_ids_tensor = torch.empty(0,
                                            dtype=torch.int32,

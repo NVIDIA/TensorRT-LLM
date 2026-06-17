@@ -476,6 +476,13 @@ class TRTLLMGenFusedMoE(MoE):
             assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 \
                 or self.has_w4a8_mxfp4_mxfp8 or self.has_deepseek_fp8_block_scales, \
                 "TRTLLMGenFusedMoE supports swiglu_limit only for nvfp4, mxfp4, and fp8_block_scale variants."
+            # The FP8 block-scale separate-activation kernel only consumes the
+            # uniform scalar (swiglu_limit_scalar); a per-expert swiglu_limit
+            # tensor would be silently ignored, so reject it explicitly.
+            if self.has_deepseek_fp8_block_scales:
+                assert self.swiglu_limit is None, \
+                    "TRTLLMGenFusedMoE FP8 block-scale path only supports the uniform " \
+                    "swiglu_limit_scalar, not a per-expert swiglu_limit tensor."
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
