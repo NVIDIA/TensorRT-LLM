@@ -308,7 +308,24 @@ class AttentionMetadata:
     def num_tokens(self) -> int:
         return self._num_tokens
 
-    def prepare(self, *, multi_item_part_lens: list[list[int]] | None = None):
+    @property
+    def multi_item_part_lens(self) -> Optional[list[list[int]]]:
+        """Additional token layout information for multi-item scoring.
+
+        Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
+        see `TokensPrompt` for details.
+        """
+        return None
+
+    @multi_item_part_lens.setter
+    def multi_item_part_lens(self,
+                             multi_item_part_lens: Optional[list[list[int]]]):
+        if multi_item_part_lens is not None:
+            raise ValueError(
+                "The selected attention backend does not support multi-item scoring."
+            )
+
+    def prepare(self):
         """
         Hook to be called before the forward step of the model.
         """

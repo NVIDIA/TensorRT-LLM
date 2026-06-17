@@ -158,8 +158,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
                                                         default=None)
 
+    _multi_item_part_lens: Optional[list[list[int]]] = field(init=False,
+                                                             default=None)
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
+    _multi_item_params_needs_refresh: bool = field(init=False, default=False)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -599,7 +602,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._mla_ragged_planned = False
         self._mla_context_planned = False
         self._mla_decode_planned = False
+        self._multi_item_part_lens = None
         self._multi_item_params = None
+        self._multi_item_params_needs_refresh = False
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -822,18 +827,36 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
-    def prepare(self,
-                *,
-                multi_item_part_lens: list[list[int]] | None = None) -> None:
-        super().prepare(multi_item_part_lens=multi_item_part_lens)
+    @property
+    def multi_item_part_lens(self) -> Optional[list[list[int]]]:
+        return self._multi_item_part_lens
+
+    @multi_item_part_lens.setter
+    def multi_item_part_lens(self,
+                             multi_item_part_lens: Optional[list[list[int]]]):
+        self._multi_item_part_lens = multi_item_part_lens
+        self._multi_item_params_needs_refresh = True
+
+    def prepare(self) -> None:
+        super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
+        assert self.seq_lens_cuda is not None
         torch.cumsum(self.seq_lens_cuda,
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+
+        if self._multi_item_params_needs_refresh:
+            if self._multi_item_part_lens is not None:
+                self._multi_item_params = self._process_multi_item_part_lens(
+                    self._multi_item_part_lens,
+                    device=self.seq_lens_cuda.device)
+            else:
+                self._multi_item_params = None
+            self._multi_item_params_needs_refresh = False
 
         if self.kv_cache_manager is None:
             assert self.request_ids is not None
@@ -848,15 +871,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
             self.num_ctx_cached_tokens = 0
-            if multi_item_part_lens is not None:
-                self._multi_item_params = self._process_multi_item_part_lens(
-                    multi_item_part_lens, device=self.seq_lens_cuda.device)
-            else:
-                self._multi_item_params = None
             self._clean_cached_plans(defer_plan=False)
             return
 
-        if multi_item_part_lens is not None:
+        if self._multi_item_params is not None:
             raise ValueError(
                 "multi_item_part_lens with KV cache is not supported")
 

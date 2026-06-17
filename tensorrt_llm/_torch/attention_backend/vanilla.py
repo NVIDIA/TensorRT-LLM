@@ -60,13 +60,8 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
-    def prepare(self,
-                *,
-                multi_item_part_lens: list[list[int]] | None = None) -> None:
-        if multi_item_part_lens is not None:
-            raise ValueError(
-                "Vanilla Attention does not support multi-item scoring")
-        super().prepare(multi_item_part_lens=multi_item_part_lens)
+    def prepare(self) -> None:
+        super().prepare()
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(

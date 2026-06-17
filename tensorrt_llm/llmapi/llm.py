@@ -16,7 +16,6 @@ import transformers
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import torch_multi_arange
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
@@ -24,7 +23,7 @@ from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
-from .._utils import nvtx_range_debug, prefer_pinned
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..bindings import steady_clock_now
 from ..builder import EngineConfig
@@ -948,7 +947,6 @@ class BaseLLM:
         )
 
     @set_api_status("prototype")
-    @torch.inference_mode()
     def encode(
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
@@ -1087,36 +1085,6 @@ class BaseLLM:
                     "\"multi_item_part_lens\" must either be provided for all prompts or for none"
                 )
             forward_inputs["multi_item_part_lens"] = batch_multi_item_part_lens
-
-            # Scoring items have overlapping position IDs. Position IDs of delimiters
-            # are irrelevant.
-            starts_cuda = torch.tensor(
-                [
-                    start for multi_item_part_lens in batch_multi_item_part_lens
-                    for start in [0] + [multi_item_part_lens[0]] *
-                    (len(multi_item_part_lens) - 1)
-                ],
-                pin_memory=prefer_pinned(),
-                dtype=torch.int32,
-            ).to("cuda", non_blocking=True)  # uses current device
-            ends_cuda = torch.tensor(
-                [
-                    end + 1
-                    for multi_item_part_lens in batch_multi_item_part_lens
-                    for end in [multi_item_part_lens[0]] + [
-                        multi_item_part_lens[0] + item_len
-                        for item_len in multi_item_part_lens[1:]
-                    ]
-                ],
-                pin_memory=prefer_pinned(),
-                dtype=torch.int32,
-            ).to("cuda", non_blocking=True)
-            position_ids_cuda = torch_multi_arange(
-                starts=starts_cuda,
-                ends=ends_cuda,
-                output_length=len(flat_token_ids),
-            )
-            forward_inputs["position_ids"] = position_ids_cuda
 
         # Single forward pass
         outputs = self._encoder_executor.batch_forward(forward_inputs,
