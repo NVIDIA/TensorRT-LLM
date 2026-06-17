@@ -174,6 +174,11 @@ class MpiPoolSession(MpiSession):
             key: value
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
+            # DeepGEMM (``DG_*``) feature/tuning knobs (e.g. DG_USE_FP4_ACTS,
+            # DG_USE_MXF4_KIND) select kernel variants and SymmBuffer layout;
+            # they must reach the spawned workers, otherwise the workers fall
+            # back to defaults and silently run a different kernel than intended.
+            or key.startswith("DG_")
         }
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
