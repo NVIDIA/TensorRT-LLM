@@ -133,6 +133,12 @@ SLURM_INFRA_RETRY_MAX = 1
 // to avoid nesting with the inner SLURM retry.
 K8S_INFRA_RETRY_MAX = 1
 
+// Fallback discriminator for SLURM timeouts.
+// If we can't reach the SLURM node for an authoritative reason,
+// we apply a heuristic: if the job needed more than this of its budget
+// to fail, we treat it as a timeout.
+SLURM_TIMEOUT_RETRY_FRACTION = 0.9
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -585,6 +591,39 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
+// Authoritative timeout signal: ask the SLURM controller (via sacct on the
+// cluster login node) for a job's terminal state. Returns the uppercased
+// primary state token -- e.g. "TIMEOUT", "COMPLETED", "FAILED", "NODE_FAIL",
+// "OUT_OF_MEMORY", "CANCELLED" -- or null when it can't be determined.
+//
+// Best-effort: any SSH/sacct error returns null so callers fall back to the
+// duration heuristic rather than failing the stage.
+def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
+    if (!slurmJobID || !slurmJobID.toString().isNumber()) {
+        return null
+    }
+    String state = null
+    try {
+        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+            // -X: allocation row only (skip .batch/.extern steps). -Pn:
+            // parsable, no header. First line's first token is the job state;
+            // SLURM renders cancellations as "CANCELLED by <uid>", so we keep
+            // only the leading token.
+            def out = Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(remote, "\"sacct -j ${slurmJobID} --format=State -Pn -X || true\""),
+                returnStdout: true,
+            )?.trim()
+            if (out) {
+                state = out.readLines()[0]?.trim()?.tokenize(' ')?.getAt(0)?.toUpperCase(java.util.Locale.ROOT)
+            }
+        }
+    } catch (Exception e) {
+        pipeline.echo("[INFRA-RETRY] Could not query SLURM job ${slurmJobID} state via sacct: ${e.message}")
+    }
+    return state
+}
+
 def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -652,6 +691,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
             }
         }
+
+        // Wall-clock at which the SLURM job was first observed RUNNING.
+        // Captured locally so it remains usable even when the controller
+        // is later unreachable (the case the fallback exists for). Null until
+        // Phase 1 confirms RUNNING; callers fall back to executeStartMs.
+        def jobRunningStartMs = null
 
         stage('Check If Node Is Online') {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
@@ -723,6 +768,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // Ocean, and probe job status every ~3 min (every 6th iter) to fail fast if the
                 // job dies during bring-up. 120 * 30s = 1h.
                 if (waitRc == 0) {
+                    // Job is RUNNING: stamp the walltime-budget origin for the
+                    // timeout duration fallback (within Phase 1's ~3min poll
+                    // granularity of the true RUNNING transition).
+                    jobRunningStartMs = System.currentTimeMillis()
                     def onlineCounter = 0
                     while (!CloudManager.isNodeOnline(nodeName) && onlineCounter < 120) {
                         Thread.sleep(30L * 1000L)
@@ -804,7 +853,43 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
+        long executeStartMs = System.currentTimeMillis()
+        try {
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            // Decide whether this failure is a SLURM timeout (the test ran to
+            // its partition walltime) rather than a transient infra blip.
+            // Measure elapsed from when the job was first observed RUNNING.
+            // Fall back to executeStartMs if the RUNNING stamp was never set.
+            long timeoutBaselineMs = (jobRunningStartMs ?: executeStartMs) as long
+            long elapsedMin = Math.floorDiv(System.currentTimeMillis() - timeoutBaselineMs, 60000L)
+            Integer walltimeMin = (partition?.time ?: SlurmConfig.DEFAULT_TIMEOUT_SHORT) as Integer
+            def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobID)
+
+            if (slurmState == "TIMEOUT") {
+                throw new UserFailure(
+                    "SLURM job ${slurmJobID} for ${stageName} ended in state TIMEOUT " +
+                    "(hit partition walltime ${walltimeMin}min); treating as a test timeout, not retrying. " +
+                    "Original failure: ${e.message}",
+                    e)
+            }
+
+            if (slurmState == null && walltimeMin != null
+                    && elapsedMin >= (long)(SLURM_TIMEOUT_RETRY_FRACTION * walltimeMin)) {
+                throw new UserFailure(
+                    "SLURM job ${slurmJobID} for ${stageName} ran ${elapsedMin}min " +
+                    "(>= ${(int)(SLURM_TIMEOUT_RETRY_FRACTION * 100)}% of the ${walltimeMin}min walltime) and " +
+                    "the SLURM controller was unreachable for an authoritative state; treating as a likely " +
+                    "timeout, not retrying. Original failure: ${e.message}",
+                    e)
+            }
+
+            echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
+                 "ran ${elapsedMin}min of ${walltimeMin}min walltime; deferring to failure classifier."
+            throw e
+        }
     } finally {
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -1460,15 +1545,40 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Track the Slurm job
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptTrackPathNode
-                    ),
-                    numRetries: 3
-                )
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            scriptTrackPathNode
+                        ),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    // The track script squashes the job's terminal SLURM state to
+                    // exit 0/1, so a walltime kill is indistinguishable here from a
+                    // real test failure. Re-query sacct for the allocation-level
+                    // state (SLURM already aggregates it across nodes; TIMEOUT if
+                    // any node hit the walltime) and, when it is TIMEOUT, raise a
+                    // typed UserFailure so neither the SLURM retry loop nor the
+                    // outer K8s pod retry re-runs a job that would just time out
+                    // again. srun --kill-on-bad-exit=1 means a genuine test failure
+                    // surfaces as FAILED, not TIMEOUT, so this stays unambiguous.
+                    def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                    if (slurmState == "TIMEOUT") {
+                        throw new UserFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
+                            "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
+                            "Original failure: ${e.message}",
+                            e)
+                    }
+                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
+                         "deferring to failure classifier."
+                    throw e
+                }
             }
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmSshCredentials
@@ -3364,7 +3474,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (perfMode) {
-            basePerfFilename = stageName.contains("PyTorch") ? "base_perf_pytorch.csv" : "base_perf.csv"
+            // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
+            basePerfFilename = "base_perf_pytorch.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
             stage("Check Perf Result") {
                 def perfCheckResult = sh(
@@ -3380,12 +3491,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 }
             }
             stage("Create Perf Report") {
-                sh """
-                    python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
-                    --output_path ${stageName}/report.pdf \
-                    --files ${stageName}/perf_script_test_results.csv \
-                    ${basePerfPath}
-                """
+                if (fileExists("${stageName}/perf_script_test_results.csv")) {
+                    sh """
+                        python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
+                        --output_path ${stageName}/report.pdf \
+                        --files ${stageName}/perf_script_test_results.csv \
+                        ${basePerfPath}
+                    """
+                } else {
+                    echo "No perf script test results to create report"
+                }
             }
         }
     }
@@ -4037,7 +4152,6 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         // "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
         // "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
-        "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],

@@ -593,6 +593,7 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
+                encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
                 disagg_request_id=disagg_request_id,
                 cache_salt=request.cache_salt,
@@ -787,16 +788,6 @@ class BaseWorker(GenerationExecutor):
             torch.cuda.synchronize()
             materialize_with_tag(*tags)
             torch.cuda.synchronize()
-
-    def reset_prefix_cache(self) -> None:
-        """Invalidate local KV prefix-cache reuse state on PyTorch engines."""
-        engine = self.engine
-        if engine is None or not hasattr(engine, "reset_prefix_cache"):
-            raise NotImplementedError(
-                "reset_prefix_cache() is only supported by the PyTorch backend."
-            )
-        with engine.control_action():
-            engine.reset_prefix_cache()
 
     def shutdown(self):
         if self.doing_shutdown:

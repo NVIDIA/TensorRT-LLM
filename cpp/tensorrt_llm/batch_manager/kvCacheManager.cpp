@@ -1905,7 +1905,19 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         }
     }
 
-    // Finalize matched token count (purge trailing placeholders for recurrent states)
+    // Finalize matched token count
+
+    // claimResult.totalMatchedTokens > claimResult.numSharedContextBlocks * mTokensPerBlock means that the KV block of
+    // the last matched tokens was not copied we need to regenerate the KV of the last matched tokens, so we round down
+    // the prepopulated prompt length to the last shared context block
+    if (claimResult.totalMatchedTokens > claimResult.numSharedContextBlocks * mTokensPerBlock)
+    {
+        TLLM_LOG_DEBUG("onboardAndAllocateBlocks - rounding down claimResult.totalMatchedTokens to %d",
+            claimResult.totalMatchedTokens);
+        claimResult.totalMatchedTokens = claimResult.numSharedContextBlocks * mTokensPerBlock;
+    }
+
+    // purge trailing placeholders for recurrent states
     auto numMatchedTokens = claimResult.totalMatchedTokens;
     if (isRecurrentState())
     {

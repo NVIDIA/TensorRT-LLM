@@ -1105,14 +1105,15 @@ class FusedCommMoEScheduler(MoEScheduler):
         )
 
         # ----- quantize -----
-        if num_tokens > 0:
-            x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
-        else:
-            device = x.device
-            x_fp8 = torch.empty((0, moe.hidden_size), dtype=torch.float8_e4m3fn, device=device)
-            # Packed-UE8M0 int32 SF: one int32 per 128 input elements per row,
-            # same stride contract as the non-empty runs for run_moe.
-            x_sf = torch.empty((0, moe.hidden_size // 128), dtype=torch.int32, device=device)
+        # Always delegate to ``backend.quantize_input`` so each fused-comm
+        # backend owns its own empty-tensor layout. Both ``MegaMoEDeepGemm``
+        # and ``MegaMoECuteDsl`` short-circuit ``x.shape[0] == 0`` inside
+        # their quantize_input contracts (DG returns FP8 + packed-UE8M0
+        # int32 SF; CuteDSL returns NVFP4 packed bytes + plain K-major FP8
+        # SF). Synthesizing the DG-specific empty layout here would lock
+        # the scheduler to a single backend; the unconditional delegation
+        # keeps it layout-agnostic.
+        x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's

@@ -666,9 +666,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
-        self.app.add_api_route("/reset_prefix_cache",
-                               self.reset_prefix_cache,
-                               methods=["POST"])
         resource_governor_queue = self.generator._executor.resource_governor_queue
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
@@ -1030,27 +1027,6 @@ class OpenAIServer(_VideoRoutesMixin):
             pass
         return JSONResponse(content=events)
 
-    async def reset_prefix_cache(self) -> Response:
-        reset_prefix_cache = getattr(self.generator, "reset_prefix_cache", None)
-        if reset_prefix_cache is None:
-            return self._create_not_supported_error(
-                "reset_prefix_cache() is only supported by the PyTorch backend."
-            )
-
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                None, reset_prefix_cache)
-        except NotImplementedError as e:
-            return self._create_not_supported_error(str(e))
-        except (RuntimeError, ValueError) as e:
-            return self.create_error_response(
-                message=str(e),
-                err_type="InvalidRequestError",
-                status_code=HTTPStatus.CONFLICT,
-            )
-
-        return Response(status_code=200)
-
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
@@ -1288,6 +1264,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
+
+            if request.mm_processor_kwargs:
+                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser

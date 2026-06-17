@@ -358,6 +358,12 @@ methods:
       model_kwargs:
         annotation: Any
         default: inspect._empty
+      batch_indexed_model_output:
+        annotation: bool
+        default: True
+      copy_logits_to_host:
+        annotation: bool
+        default: True
     return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
     status: prototype
   preprocess:
@@ -386,10 +392,6 @@ methods:
         annotation: Optional[float]
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
-    status: beta
-  reset_prefix_cache:
-    parameters: {}
-    return_annotation: None
     status: beta
   get_stats:
     parameters:
