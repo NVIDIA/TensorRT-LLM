@@ -13,25 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
 from tensorrt_llm._utils import get_sm_version
-
-# Standalone LB wrappers live in run_gvr_topk.py alongside the single-CTA
-# wrapper so tests and bench scripts share the same compile-time caching.
-# This test file is at:
-#   <repo>/tests/unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
-# so the repo root is parents[5]; the wrappers live under
-# tests/scripts/cute_dsl_kernels/top_k/.
-_RUN_GVR_DIR = Path(__file__).parents[5] / "tests" / "scripts" / "cute_dsl_kernels" / "top_k"
-if str(_RUN_GVR_DIR) not in sys.path:
-    sys.path.insert(0, str(_RUN_GVR_DIR))
-from run_gvr_topk import gvr_topk_sort_prepare  # noqa: E402
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -255,8 +241,8 @@ def test_cute_dsl_gvr_topk_decode(
     ``varlen=True`` draws per-row seq_lens uniformly in [N/2, N]*cr.
 
     ``seqlen_sorted=True`` exercises the LJF host-side dispatch order:
-    we build ``order_row`` via :func:`gvr_topk_sort_prepare` (descending
-    argsort over ``seq_lens``) and pass it through the custom op. The
+    we build ``order_row`` as a descending argsort over ``seq_lens`` and
+    pass it through the custom op. The
     kernel must produce the same per-row top-K (rows are still written
     back at their original positions, since the kernel uses
     ``row_idx = order_row[req] * next_n + nn`` for both reads and
@@ -283,9 +269,12 @@ def test_cute_dsl_gvr_topk_decode(
 
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
 
-    # LJF dispatch order — request-level (length == batch_size).
-    # gvr_topk_sort_prepare returns int32 on the same device as seq_lens.
-    order_row = gvr_topk_sort_prepare(seq_lens) if seqlen_sorted else None
+    # LJF dispatch order — request-level descending argsort of seq_lens.
+    order_row = (
+        torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
+        if seqlen_sorted
+        else None
+    )
 
     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
