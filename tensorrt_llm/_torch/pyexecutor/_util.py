@@ -2038,9 +2038,11 @@ def create_py_executor_instance(
     # Register the compression manager (if one is configured) with the other
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.
-    if llm_args.kv_cache_compression_config is not None:
+    kv_cache_compression_config = getattr(llm_args, "kv_cache_compression_config",
+                                          None)
+    if kv_cache_compression_config is not None:
         compression_manager = create_kv_cache_compression_manager(
-            llm_args.kv_cache_compression_config, kv_cache_manager)
+            kv_cache_compression_config, kv_cache_manager)
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
