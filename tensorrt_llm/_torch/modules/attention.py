@@ -102,6 +102,8 @@ def attn_custom_op_inplace(
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
+    relative_attention_bias: Optional[torch.Tensor],
+    relative_attention_max_distance: int,
     layer_idx: str,
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
@@ -112,18 +114,22 @@ def attn_custom_op_inplace(
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
         attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(q,
-                          k,
-                          v,
-                          metadata,
-                          mask,
-                          mrope_rotary_cos_sin,
-                          mrope_position_deltas,
-                          attention_window_size,
-                          attention_mask_data,
-                          output=output,
-                          output_sf=output_sf,
-                          attention_sinks=attention_sinks)
+    attn_layer._attn_impl(
+        q,
+        k,
+        v,
+        metadata,
+        mask,
+        mrope_rotary_cos_sin,
+        mrope_position_deltas,
+        attention_window_size,
+        attention_mask_data,
+        output=output,
+        output_sf=output_sf,
+        attention_sinks=attention_sinks,
+        relative_attention_bias=relative_attention_bias,
+        relative_attention_max_distance=relative_attention_max_distance,
+    )
 
 
 def _helix_post_process(
@@ -608,7 +614,10 @@ class Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params if self.rope_fusion else None,
+            pos_embd_params=(self.pos_embd_params if self.rope_fusion or
+                             (self.pos_embd_params is not None
+                              and not self.pos_embd_params.type.is_rope()) else
+                             None),
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
@@ -698,7 +707,10 @@ class Attention(nn.Module):
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -735,6 +747,10 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
+                    relative_attention_bias=relative_attention_bias,
+                    relative_attention_max_distance=
+                    relative_attention_max_distance,
+                    multi_item_part_lens=multi_item_part_lens,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -781,6 +797,9 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
+                multi_item_part_lens=multi_item_part_lens,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -800,7 +819,10 @@ class Attention(nn.Module):
         attention_mask_data: Optional[torch.Tensor],
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -832,22 +854,29 @@ class Attention(nn.Module):
                 attention_window_size,
                 attention_mask_data,
                 attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
                 self.layer_idx_str,
                 output,
                 output_sf,
             )
         else:
-            output, output_sf = self._attn_impl(q,
-                                                k,
-                                                v,
-                                                attn_metadata,
-                                                attention_mask,
-                                                mrope_rotary_cos_sin,
-                                                mrope_position_deltas,
-                                                attention_window_size,
-                                                attention_mask_data,
-                                                attention_sinks=attention_sinks,
-                                                has_lora=has_lora)
+            output, output_sf = self._attn_impl(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                attention_window_size,
+                attention_mask_data,
+                attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
+                has_lora=has_lora,
+                multi_item_part_lens=multi_item_part_lens,
+            )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
 
@@ -865,6 +894,9 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
+        multi_item_part_lens: Optional[list[list[int]]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -924,6 +956,23 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
+        if multi_item_part_lens is not None:
+            # adjust RoPE positions for multi-item scoring
+            current_idx = 0
+            for req_multi_item_part_lens in multi_item_part_lens:
+                req_prefix_len, *req_multi_item_part_lens = req_multi_item_part_lens
+                # RoPE for prefix does not need updating and RoPE for delimiter does not matter
+                current_idx += req_prefix_len + 1
+                for item_len in req_multi_item_part_lens:
+                    next_idx = current_idx + item_len
+                    position_ids[0, current_idx:next_idx].copy_(
+                        torch.arange(req_prefix_len,
+                                     req_prefix_len + item_len,
+                                     dtype=position_ids.dtype,
+                                     device=position_ids.device),
+                        non_blocking=True)
+                    current_idx = next_idx + 1  # RoPE for delimiter does not matter
+
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -931,17 +980,24 @@ class Attention(nn.Module):
             assert self.attn_backend == "TRTLLM", (
                 f"Attention sinks are only supported with attn_backend='TRTLLM'. "
                 f"Current backend: {self.attn_backend}.")
+        if relative_attention_bias is not None:
+            assert self.attn_backend == "TRTLLM", "Relative attention bias is only supported for TRTLLM backend."
 
-        attn_output = self.forward_impl(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        attention_mask,
-                                        attention_window_size,
-                                        attention_mask_data,
-                                        mrope_config=mrope_config,
-                                        attention_sinks=attention_sinks,
-                                        has_lora=bool(lora_params))
+        attn_output = self.forward_impl(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_mask,
+            attention_window_size,
+            attention_mask_data,
+            mrope_config=mrope_config,
+            attention_sinks=attention_sinks,
+            relative_attention_bias=relative_attention_bias,
+            relative_attention_max_distance=relative_attention_max_distance,
+            has_lora=bool(lora_params),
+            multi_item_part_lens=multi_item_part_lens,
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -1658,12 +1714,14 @@ class MLA(nn.Module):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def forward_impl(self,
-                     position_ids: Optional[torch.Tensor],
-                     hidden_states: torch.Tensor,
-                     attn_metadata: AttentionMetadata,
-                     output: torch.Tensor,
-                     latent_cache_gen: Optional[torch.Tensor] = None) -> None:
+    def forward_impl(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+    ) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
 
