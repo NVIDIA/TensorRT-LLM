@@ -790,7 +790,7 @@ class CompressorWrapper:
             dtype=cache_dtype,
             compressor_dtype=DataType.FLOAT,  # State caches always use FP32
             vocab_size=self.VOCAB_SIZE,
-            max_num_tokens=MAX_SEQ + MAX_BATCH,
+            max_num_tokens=MAX_SEQ * MAX_BATCH,
             sparse_attn_config=sparse_attn_config,
         )
 

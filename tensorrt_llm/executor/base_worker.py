@@ -1,4 +1,3 @@
-import copy
 import datetime
 import enum
 import json
@@ -431,7 +430,16 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        # prompt_token_ids stays list[int] for all consumers. If an int32 buffer
+        # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
+        # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
+        # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
+        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        if i32_buf is not None and request.prompt_adapter_request is None:
+            prompt_token_ids = i32_buf
+        else:
+            prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)

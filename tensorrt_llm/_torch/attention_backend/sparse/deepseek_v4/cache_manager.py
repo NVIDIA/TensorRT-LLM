@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -21,6 +20,7 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.resource_manager import GPU_LEVEL, KVCacheManagerV2
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -52,6 +52,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from .compressor import KVCacheDtype
 from .deepseek_v4 import (
+    DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
@@ -61,34 +62,81 @@ from .deepseek_v4 import (
     is_overlap_compressor,
 )
 
-# Keep the env override so per-layer block tables can still be tested
-# without scratch-page remapping when needed.
-DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
 
-
-def _estimate_bytes_per_token(
+def _estimate_non_sliding_attn_size_per_token(
     head_dim: int,
     index_head_dim: int,
     compress_ratios: List[int],
     has_fp8_kv_cache,
-    attn_types: set[DeepseekV4AttentionType] | None = None,
     indexer_k_dtype: str = "fp8",
 ) -> int:
     total_bytes = 0
-    for ratio in compress_ratios:
-        for attn in DeepseekV4AttentionType:
-            if attn_types is not None and attn not in attn_types:
-                continue
-            if compress_ratio_has_attention(ratio, attn):
+    for compress_ratio in compress_ratios:
+        for attn_type in DEEPSEEK_V4_NON_SLIDING_ATTENTION:
+            if compress_ratio_has_attention(compress_ratio, attn_type):
                 total_bytes += _get_attn_bytes_per_token(
                     head_dim,
                     index_head_dim,
-                    ratio,
-                    attn,
+                    compress_ratio,
+                    attn_type,
                     has_fp8_kv_cache,
                     indexer_k_dtype=indexer_k_dtype,
                 )
     return total_bytes
+
+
+def _estimate_swa_cache_size(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratios: List[int],
+    has_fp8_kv_cache,
+    tokens_per_block: int,
+    swa_window_size: int | None,
+    *,
+    context: bool,
+    scratch: bool,
+    indexer_k_dtype: str = "fp8",
+) -> Tuple[int, int]:
+    tokens_per_block = int(tokens_per_block)
+    size_per_token = 0
+    size_per_request = 0
+    scratch_keys = set()
+    for compress_ratio in compress_ratios:
+        for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+            if not compress_ratio_has_attention(compress_ratio, attn_type):
+                continue
+            if attn_type == DeepseekV4AttentionType.SWA:
+                if swa_window_size is None:
+                    continue
+                window_size = swa_window_size
+            else:
+                state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+                window_size = state_factor * compress_ratio
+            if window_size <= 0:
+                continue
+            window_tokens = (
+                (int(window_size) + tokens_per_block - 1) // tokens_per_block
+            ) * tokens_per_block
+            token_bytes = _get_attn_bytes_per_token(
+                head_dim,
+                index_head_dim,
+                compress_ratio,
+                attn_type,
+                has_fp8_kv_cache,
+                indexer_k_dtype=indexer_k_dtype,
+            )
+            if not context:
+                size_per_request += window_tokens * token_bytes
+            elif not scratch:
+                size_per_token += token_bytes
+            else:
+                scratch_key = (attn_type, compress_ratio)
+                if scratch_key in scratch_keys:
+                    size_per_request += window_tokens * token_bytes
+                else:
+                    scratch_keys.add(scratch_key)
+                    size_per_token += token_bytes
+    return size_per_token, size_per_request
 
 
 def _get_attn_bytes_per_token(
@@ -119,9 +167,75 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
         return PageIndexMode.SHARED
 
 
-def _enable_swa_scratch_reuse_from_env() -> bool:
-    value = os.environ.get(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
-    return value.strip() == "1"
+@maybe_compile(options={"max-autotune": True})
+def _compute_sliding_block_tables_compiled(
+    block_offsets: torch.Tensor,
+    copy_idx: torch.Tensor,
+    pool_ids: torch.Tensor,
+    valid_pool: torch.Tensor,
+    scales: torch.Tensor,
+    layer_offsets: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
+    scaled_base = torch.where(
+        (base == BAD_PAGE_INDEX) | ~(valid_pool[:, :, None, None]),
+        BAD_PAGE_INDEX,
+        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
+    )
+    output.copy_(scaled_base)
+
+
+@maybe_compile(options={"max-autotune": True})
+def _compute_sliding_block_tables_with_scratch_compiled(
+    block_offsets: torch.Tensor,
+    copy_idx: torch.Tensor,
+    pool_ids: torch.Tensor,
+    valid_pool: torch.Tensor,
+    scales: torch.Tensor,
+    layer_offsets: torch.Tensor,
+    block_positions: torch.Tensor,
+    scratch_pages: torch.Tensor,
+    scratch_begs: torch.Tensor,
+    scratch_ends: torch.Tensor,
+    scratch_slots: torch.Tensor,
+    num_contexts: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
+    scaled_base = torch.where(
+        (base == BAD_PAGE_INDEX) | ~(valid_pool[:, :, None, None]),
+        BAD_PAGE_INDEX,
+        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
+    )
+    output.copy_(scaled_base)
+
+    context_positions = torch.arange(
+        scratch_begs.shape[1],
+        dtype=torch.int32,
+        device=scratch_begs.device,
+    )
+    active_context = context_positions < num_contexts
+    mask = (
+        (block_positions >= scratch_begs[:, :, None])
+        & (block_positions < scratch_ends[:, :, None])
+        & active_context[None, :, None]
+    )
+    range_index = torch.where(mask, block_positions - scratch_begs[:, :, None], 0)
+    total_offset = range_index[pool_ids] * scratch_pages[:, :, None, None]
+    slot_idx = (total_offset // scales[:, :, None, None]).clamp(
+        max=scratch_slots.shape[-1] - 1,
+    )
+    slot_id = scratch_slots[pool_ids].gather(-1, slot_idx.long())
+    offset = total_offset % scales[:, :, None, None]
+    scratch_index = (
+        slot_id * scales[:, :, None, None]
+        + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
+    )
+    scratch_capacity = scratch_begs.shape[1]
+    scratch_rows = scaled_base[:, :, :scratch_capacity, :]
+    mask = mask[pool_ids] & valid_pool[:, :, None, None]
+    output[:, :, :scratch_capacity, :].copy_(torch.where(mask, scratch_index, scratch_rows))
 
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
@@ -215,7 +329,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             mapping=mapping,
             dtype=dtype,
-            enable_swa_scratch_reuse=_enable_swa_scratch_reuse_from_env(),
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
@@ -512,19 +625,26 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 )
 
         device = torch.device("cuda", torch.cuda.current_device())
-        self._device_swa_block_offsets_input = torch.empty_like(
-            self.host_kv_cache_block_offsets[self._swa_pool_id],
-            device=device,
-        )
         self._device_kv_cache_block_offsets_input = torch.empty_like(
             self.host_kv_cache_block_offsets,
             device=device,
         )
-        self._device_copy_idx_staging = torch.empty(
+        self._precomputed_sliding_block_tables = torch.empty(
+            (
+                self.num_local_layers,
+                len(DEEPSEEK_V4_SLIDING_ATTENTION),
+                self.host_kv_cache_block_offsets.size(1),
+                self.max_blocks_per_seq,
+            ),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._device_copy_idx_staging = torch.zeros(
             self.host_kv_cache_block_offsets.size(1),
             dtype=torch.int32,
             device=device,
         )
+        self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
         self._device_layer_offsets = self._layer_offsets.to(device=device)
         self._device_layer_attn_pool_ids = self._layer_attn_pool_ids.to(
             device=device,
@@ -567,26 +687,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 device="cpu",
             )
             self._host_scratch_slots_staging = torch.empty(
-                scratch_slots_shape,
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-                device="cpu",
-            )
-            self._host_attention_op_scratch_begs_staging = torch.empty(
-                self.num_pools,
-                staging_capacity,
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-                device="cpu",
-            )
-            self._host_attention_op_scratch_ends_staging = torch.empty(
-                self.num_pools,
-                staging_capacity,
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-                device="cpu",
-            )
-            self._host_attention_op_scratch_slots_staging = torch.empty(
                 scratch_slots_shape,
                 dtype=torch.int32,
                 pin_memory=prefer_pinned(),
@@ -662,11 +762,113 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache.get_scratch_desc(pool_id),
         )
 
-    def _get_cache_quota(self, max_tokens: int) -> int:
-        quota = int(max_tokens * self.get_cache_bytes_per_token())
-        # Add extra quota to ensure sufficient space for small max_tokens cases.
-        quota += len(DeepseekV4AttentionType) * (2 << 20)
-        return quota
+    def _get_extra_quota_padding(self) -> int:
+        """Ensure each attention type has minimal space when max_tokens is small."""
+        return len(DeepseekV4AttentionType) * (2 << 20)
+
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        (
+            context_swa_size_per_token,
+            _,
+        ) = _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=True,
+            scratch=self.enable_swa_scratch_reuse,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        (
+            generation_swa_size_per_token,
+            generation_swa_size_per_request,
+        ) = _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=False,
+            scratch=False,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        max_context_tokens = (
+            self._max_num_tokens if self._max_num_tokens is not None else max_tokens
+        )
+        context_tokens = min(max_tokens, max_context_tokens)
+        generation_tokens = max_tokens - context_tokens
+        generation_quota = (
+            max_tokens * non_sliding_attn_size_per_token
+            + generation_tokens * generation_swa_size_per_token
+            + self.max_batch_size * generation_swa_size_per_request
+        )
+        context_extra_quota = context_tokens * context_swa_size_per_token
+        padding = self._get_extra_quota_padding()
+        return int(generation_quota + context_extra_quota + padding)
+
+    def _get_max_tokens_from_quota(self, quota: int) -> float:
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        context_swa_size_per_token, _ = _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=True,
+            scratch=self.enable_swa_scratch_reuse,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        (
+            generation_swa_size_per_token,
+            generation_swa_size_per_request,
+        ) = _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=False,
+            scratch=False,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        padding = self._get_extra_quota_padding()
+        size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
+        if quota < size_per_batch:
+            return 0
+        context_size_per_token = non_sliding_attn_size_per_token + context_swa_size_per_token
+        if self._max_num_tokens is None:
+            return (quota - size_per_batch) / context_size_per_token
+
+        context_limit_quota = self._max_num_tokens * context_size_per_token + size_per_batch
+        if quota <= context_limit_quota:
+            return (quota - size_per_batch) / context_size_per_token
+
+        generation_size_per_token = non_sliding_attn_size_per_token + generation_swa_size_per_token
+        if generation_size_per_token <= 0:
+            return float("inf")
+        return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
     def _build_cache_config(
         self,
@@ -948,7 +1150,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         layer_idx: int,
     ) -> int:
         """
-        Get the cache bytes per token for a specific attention type and layer.
+        Get the cache bytes per block for a specific attention type and layer.
         """
         has_fp8_kv_cache = self.dtype == DataType.FP8
         token_bytes = get_token_bytes(
@@ -973,7 +1175,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Get the average cache bytes per token for DeepSeek-V4."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        return _estimate_bytes_per_token(
+        return _estimate_non_sliding_attn_size_per_token(
             self.head_dim,
             self.index_head_dim,
             compress_ratios,
@@ -1005,33 +1207,39 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _get_context_bytes(self, request: llm_request.LlmRequest) -> int:
         prompt_len = max(0, request.prompt_len)
         total_tokens = prompt_len + self.num_extra_kv_tokens
-        return total_tokens * self.get_cache_bytes_per_token()
+        return self._get_cache_bytes_for_tokens(total_tokens, context=True)
 
     def _get_generation_bytes(self, request: llm_request.LlmRequest) -> int:
         prompt_len = max(0, request.prompt_len)
         max_new_tokens = max(0, request.max_new_tokens)
         total_tokens = prompt_len + max_new_tokens + self.num_extra_kv_tokens
+        return self._get_cache_bytes_for_tokens(total_tokens, context=False)
+
+    def _get_cache_bytes_for_tokens(self, total_tokens: int, *, context: bool) -> int:
         has_fp8_kv_cache = self.dtype == DataType.FP8
-        total_bytes = 0
-        for layer in self.pp_layers:
-            compress_ratio = self._compress_ratios[layer]
-            for attn_type in DeepseekV4AttentionType:
-                if not compress_ratio_has_attention(compress_ratio, attn_type):
-                    continue
-                token_bytes = _get_attn_bytes_per_token(
-                    self.head_dim,
-                    self.index_head_dim,
-                    compress_ratio,
-                    attn_type,
-                    has_fp8_kv_cache,
-                    indexer_k_dtype=self._indexer_k_dtype,
-                )
-                attn_tokens = total_tokens
-                window_size = self._get_window_size(compress_ratio, attn_type)
-                if window_size is not None:
-                    attn_tokens = window_size
-                total_bytes += attn_tokens * token_bytes
-        return total_bytes
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            context=context,
+            scratch=self.enable_swa_scratch_reuse,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        return int(
+            total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
+            + swa_size_per_request
+        )
 
     def get_needed_resource_to_completion(self, request: llm_request.LlmRequest) -> int:
         if self._is_generation_request(request):
@@ -1070,7 +1278,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         num_tables = copy_idx.size(0)
         device_copy_idx = self._device_copy_idx_staging[:num_tables]
         device_copy_idx.copy_(copy_idx, non_blocking=True)
-        return device_copy_idx
+        # Keep the compiled graph independent of the active table count.
+        return self._device_copy_idx_staging
 
     def _copy_scratch_metadata_to_device(
         self,
@@ -1079,7 +1288,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         host_begs_staging: torch.Tensor,
         host_ends_staging: torch.Tensor,
         host_slots_staging: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # shape: [num_pools, num_contexts]
         host_begs = host_begs_staging[:, :num_contexts]
         # shape: [num_pools, num_contexts]
@@ -1090,7 +1299,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         host_ends.zero_()
         host_slots.zero_()
 
-        max_num_slots = 1
         for pool_idx, scratch_descs in enumerate(scratch_descs_by_pool):
             for context_idx, desc in enumerate(scratch_descs):
                 if desc is None:
@@ -1103,119 +1311,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     )
                 host_begs[pool_idx, context_idx] = int(desc.range.beg)
                 host_ends[pool_idx, context_idx] = int(desc.range.end)
-                max_num_slots = max(max_num_slots, len(slot_ids))
                 for slot_idx, slot_id in enumerate(slot_ids):
                     host_slots[pool_idx, context_idx, slot_idx] = int(slot_id)
 
         self._device_scratch_begs_staging.copy_(host_begs_staging, non_blocking=True)
         self._device_scratch_ends_staging.copy_(host_ends_staging, non_blocking=True)
         self._device_scratch_slots_staging.copy_(host_slots_staging, non_blocking=True)
+        # Keep scratch tensor shapes fixed; the device-side mask gates num_contexts.
         return (
-            self._device_scratch_begs_staging[:, :num_contexts],
-            self._device_scratch_ends_staging[:, :num_contexts],
-            self._device_scratch_slots_staging[:, :num_contexts, :max_num_slots],
-            max_num_slots,
+            self._device_scratch_begs_staging,
+            self._device_scratch_ends_staging,
+            self._device_scratch_slots_staging,
         )
 
-    @nvtx_range("dsv4_copy_batch_block_offsets")
-    def copy_batch_block_offsets(
+    @nvtx_range("dsv4_compute_sliding_block_tables")
+    def compute_sliding_block_tables(
         self,
-        dst_tensor: torch.Tensor,
-        request_ids: List[int],
-        beam_width: int,
-        num_contexts: int,
-        num_seqs: int,
-    ) -> None:
-        """For compatibility with AttentionOp, copy only the SWA block offsets."""
-        assert beam_width == 1, "DSV4 only supports beam width 1 now"
-        assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
-        num_tables = copy_idx.size(0)
-        assert num_tables == num_seqs
-
-        scratch_descs_by_pool = None
-        if self.enable_swa_scratch_reuse and num_contexts > 0:
-            scratch_descs_by_pool = [[None] * num_contexts for _ in range(self.num_pools)]
-            # Only context requests have scratch blocks, and they stay in the front of request_ids.
-            scratch_descs_by_pool[self._swa_pool_id] = [
-                self.kv_cache_map[req].get_scratch_desc(self._swa_pool_id)
-                for req in request_ids[:num_contexts]
-            ]
-
-        device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_swa_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets[self._swa_pool_id],
-            non_blocking=True,
-        )
-
-        swa_attn_idx = DeepseekV4AttentionType.SWA.value
-        # shape: [num_local_layers]
-        swa_offsets = self._device_layer_offsets[:, swa_attn_idx]
-        # shape: [num_seqs, max_blocks_per_seq]
-        base = self._device_swa_block_offsets_input[device_copy_idx, 0, :]
-        # shape: [num_local_layers, num_seqs, max_blocks_per_seq]
-        base_per_layer = torch.where(
-            base == BAD_PAGE_INDEX,
-            BAD_PAGE_INDEX,
-            base * self._swa_scale + swa_offsets[:, None, None],
-        )
-        dst_tensor.fill_(BAD_PAGE_INDEX)
-        dst_tensor[:, :num_tables, 0, :] = base_per_layer
-
-        if scratch_descs_by_pool is not None:
-            scratch_begs, scratch_ends, scratch_slots, max_num_slots = (
-                self._copy_scratch_metadata_to_device(
-                    scratch_descs_by_pool,
-                    num_contexts,
-                    self._host_attention_op_scratch_begs_staging,
-                    self._host_attention_op_scratch_ends_staging,
-                    self._host_attention_op_scratch_slots_staging,
-                )
-            )
-            # shape: [num_contexts]
-            scratch_begs = scratch_begs[self._swa_pool_id]
-            # shape: [num_contexts]
-            scratch_ends = scratch_ends[self._swa_pool_id]
-            # shape: [num_contexts, num_slots]
-            scratch_slots = scratch_slots[self._swa_pool_id]
-            # shape: [max_blocks_per_seq]
-            index = self._device_block_positions
-            # shape: [num_contexts, max_blocks_per_seq]
-            mask = (index >= scratch_begs[:, None]) & (index < scratch_ends[:, None])
-            # shape: [num_contexts, max_blocks_per_seq]
-            range_index = torch.where(mask, index - scratch_begs[:, None], 0)
-            # shape: [num_local_layers, num_contexts, max_blocks_per_seq]
-            total_offset = (
-                range_index[None, :, :] * self._device_scratch_pages[:, swa_attn_idx, None, None]
-            )
-            slot_idx = (total_offset // self._swa_scale).clamp(max=max_num_slots - 1)
-            offset = total_offset % self._swa_scale
-            slot_id = scratch_slots.expand(self.num_local_layers, -1, -1).gather(
-                -1,
-                slot_idx.long(),
-            )
-            scratch_index = (
-                slot_id * self._swa_scale + (offset + swa_offsets[:, None, None]) % self._swa_scale
-            )
-
-            mask = mask.expand(self.num_local_layers, -1, -1)
-            dst_tensor[:, :num_contexts, 0, :][mask] = scratch_index[mask]
-
-    @nvtx_range("dsv4_copy_batch_sliding_block_tables")
-    def copy_batch_sliding_block_tables(
-        self,
-        dst_tensor: torch.Tensor,
         request_ids: List[int],
         num_contexts: int,
-        num_seqs: int,
     ) -> None:
-        """
-        Copy the per-layer block tables for attentions managed in sliding-window mode to the GPU tensor.
-        """
-        assert dst_tensor.is_cuda, "copy_batch_sliding_block_tables expects a CUDA destination"
+        """Compute all per-layer sliding-window block tables for this batch."""
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, 1)
         num_tables = copy_idx.size(0)
-        assert num_tables == num_seqs
+        self._num_tables = num_tables
 
         scratch_descs_by_pool = None
         if self.enable_swa_scratch_reuse and num_contexts > 0:
@@ -1233,57 +1351,78 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             non_blocking=True,
         )
 
-        pool_ids = self._device_layer_attn_pool_ids
-        # shape: [num_local_layers, num_sliding_attention_types]
-        valid_pool = self._device_valid_sliding_pool
-        # shape: [num_local_layers, num_sliding_attention_types, num_tables, max_blocks_per_seq]
-        base = self._device_kv_cache_block_offsets_input[
-            pool_ids[:, :, None],
-            device_copy_idx[None, None, :],
-            0,
-            :,
-        ]
-        # shape: [num_local_layers, num_sliding_attention_types, num_tables, max_blocks_per_seq]
-        scaled_base = torch.where(
-            (base == BAD_PAGE_INDEX) | ~(valid_pool[:, :, None, None]),
-            BAD_PAGE_INDEX,
-            base * self._device_layer_attn_scales[:, :, None, None]
-            + self._device_layer_offsets[:, :, None, None],
-        )
-        dst_tensor.fill_(BAD_PAGE_INDEX)
-        dst_tensor[:, :, :num_tables, :] = scaled_base
-
         if scratch_descs_by_pool is not None:
-            scratch_begs, scratch_ends, scratch_slots, max_num_slots = (
-                self._copy_scratch_metadata_to_device(
-                    scratch_descs_by_pool,
-                    num_contexts,
-                    self._host_scratch_begs_staging,
-                    self._host_scratch_ends_staging,
-                    self._host_scratch_slots_staging,
-                )
+            scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
+                scratch_descs_by_pool,
+                num_contexts,
+                self._host_scratch_begs_staging,
+                self._host_scratch_ends_staging,
+                self._host_scratch_slots_staging,
             )
-            # shape: [max_blocks_per_seq]
-            index = self._device_block_positions
-            # shape: [num_pools, num_contexts, max_blocks_per_seq]
-            mask = (index >= scratch_begs[:, :, None]) & (index < scratch_ends[:, :, None])
-            # shape: [num_pools, num_contexts, max_blocks_per_seq]
-            range_index = torch.where(mask, index - scratch_begs[:, :, None], 0)
-            # shape: [num_local_layers, num_sliding_attention_types, num_contexts, max_blocks_per_seq]
-            total_offset = range_index[pool_ids] * self._device_scratch_pages[:, :, None, None]
-            slot_idx = (total_offset // self._device_layer_attn_scales[:, :, None, None]).clamp(
-                max=max_num_slots - 1
+            self._device_num_contexts.fill_(num_contexts)
+            _compute_sliding_block_tables_with_scratch_compiled(
+                self._device_kv_cache_block_offsets_input,
+                device_copy_idx,
+                self._device_layer_attn_pool_ids,
+                self._device_valid_sliding_pool,
+                self._device_layer_attn_scales,
+                self._device_layer_offsets,
+                self._device_block_positions,
+                self._device_scratch_pages,
+                scratch_begs,
+                scratch_ends,
+                scratch_slots,
+                self._device_num_contexts,
+                self._precomputed_sliding_block_tables,
             )
-            slot_id = scratch_slots[pool_ids].gather(-1, slot_idx.long())
-            offset = total_offset % self._device_layer_attn_scales[:, :, None, None]
-            scratch_index = (
-                slot_id * self._device_layer_attn_scales[:, :, None, None]
-                + (offset + self._device_layer_offsets[:, :, None, None])
-                % self._device_layer_attn_scales[:, :, None, None]
+        else:
+            _compute_sliding_block_tables_compiled(
+                self._device_kv_cache_block_offsets_input,
+                device_copy_idx,
+                self._device_layer_attn_pool_ids,
+                self._device_valid_sliding_pool,
+                self._device_layer_attn_scales,
+                self._device_layer_offsets,
+                self._precomputed_sliding_block_tables,
             )
 
-            mask = mask[pool_ids] & valid_pool[:, :, None, None]
-            dst_tensor[:, :, :num_contexts, :][mask] = scratch_index[mask]
+    @nvtx_range("dsv4_copy_batch_block_offsets")
+    def copy_batch_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> None:
+        """For compatibility with AttentionOp, copy only the SWA block offsets."""
+        assert beam_width == 1, "DSV4 only supports beam width 1 now"
+        assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
+        dst_tensor.fill_(BAD_PAGE_INDEX)
+        dst_tensor[:, : self._num_tables, 0, :].copy_(
+            self._precomputed_sliding_block_tables[
+                :, DeepseekV4AttentionType.SWA.value, : self._num_tables, :
+            ],
+            non_blocking=True,
+        )
+
+    @nvtx_range("dsv4_copy_batch_sliding_block_tables")
+    def copy_batch_sliding_block_tables(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        num_contexts: int,
+        num_seqs: int,
+    ) -> None:
+        """
+        Copy the per-layer block tables for attentions managed in sliding-window mode to the GPU tensor.
+        """
+        assert dst_tensor.is_cuda, "copy_batch_sliding_block_tables expects a CUDA destination"
+        dst_tensor.fill_(BAD_PAGE_INDEX)
+        dst_tensor[:, :, : self._num_tables, :].copy_(
+            self._precomputed_sliding_block_tables[:, :, : self._num_tables, :],
+            non_blocking=True,
+        )
 
     @nvtx_range("dsv4_copy_batch_compress_block_tables")
     def copy_batch_compress_block_tables(
@@ -1350,12 +1489,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         else:
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
-        return _estimate_bytes_per_token(
+        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
             head_dim,
             index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=indexer_k_dtype,
+        )
+        swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
+            head_dim,
+            index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            kwargs["tokens_per_block"],
+            model_config.sparse_attention_config.window_size,
+            context=False,
+            scratch=False,
+            indexer_k_dtype=indexer_k_dtype,
+        )
+        max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        return (
+            non_sliding_attn_size_per_token + swa_size_per_token,
+            swa_size_per_request * max_batch_size,
         )
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:

@@ -9,9 +9,6 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV,
-)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
@@ -24,6 +21,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -46,6 +44,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
             index_head_dim=128,
             compress_ratios=[1, 4, 1, 128],
             indexer_k_dtype="fp8",
+            window_size=128,
         )
         pretrained_config = SimpleNamespace(
             kv_lora_rank=512,
@@ -59,10 +58,109 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
         FakeModelConfig(),
         Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        tokens_per_block=128,
         is_disagg=True,
     )
 
-    assert size_per_token > 0
+    cost = CacheCost.from_raw(size_per_token)
+    assert cost.slope > 0
+    assert cost.intercept == 0
+
+
+def test_quota_from_max_tokens_models_context_swa_scratch():
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0, 1]
+    manager._compress_ratios = [4, 4]
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager._swa_window_size = 128
+    manager._max_draft_len = 0
+    manager._max_num_tokens = 1024
+    manager.tokens_per_block = 128
+    manager.max_batch_size = 2
+
+    manager.enable_swa_scratch_reuse = True
+    small_quota = manager._get_quota_from_max_tokens(1)
+    large_quota = manager._get_quota_from_max_tokens(4096)
+    scratch_delta = large_quota - small_quota
+
+    assert small_quota < large_quota
+    assert small_quota > manager._get_extra_quota_padding()
+    assert manager._get_max_tokens_from_quota(small_quota) == 1
+    assert manager._get_max_tokens_from_quota(large_quota) == 4096
+
+    manager.enable_swa_scratch_reuse = False
+    no_scratch_small_quota = manager._get_quota_from_max_tokens(1)
+    no_scratch_large_quota = manager._get_quota_from_max_tokens(4096)
+    no_scratch_delta = no_scratch_large_quota - no_scratch_small_quota
+
+    assert no_scratch_small_quota < no_scratch_large_quota
+    assert no_scratch_delta > scratch_delta
+    assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
+
+
+def test_needed_resource_uses_context_swa_scratch_slope():
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0, 1]
+    manager._compress_ratios = [4, 4]
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager._swa_window_size = 128
+    manager.tokens_per_block = 128
+    manager.num_extra_kv_tokens = 0
+    manager.enable_swa_scratch_reuse = True
+
+    context_request = SimpleNamespace(
+        is_context_init_state=True,
+        is_generation_in_progress_state=False,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        prompt_len=10,
+        max_new_tokens=100,
+    )
+    longer_context_request = SimpleNamespace(
+        is_context_init_state=True,
+        is_generation_in_progress_state=False,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        prompt_len=11,
+        max_new_tokens=100,
+    )
+    generation_request = SimpleNamespace(
+        is_context_init_state=False,
+        is_generation_in_progress_state=True,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        prompt_len=10,
+        max_new_tokens=20,
+    )
+    longer_generation_request = SimpleNamespace(
+        is_context_init_state=False,
+        is_generation_in_progress_state=True,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        prompt_len=10,
+        max_new_tokens=21,
+    )
+
+    non_sliding_attn_size_per_token = manager.get_cache_bytes_per_token()
+    context_bytes = manager.get_needed_resource_to_completion(context_request)
+    longer_context_bytes = manager.get_needed_resource_to_completion(longer_context_request)
+    generation_bytes = manager.get_needed_resource_to_completion(generation_request)
+    longer_generation_bytes = manager.get_needed_resource_to_completion(longer_generation_request)
+
+    assert non_sliding_attn_size_per_token > 0
+    assert context_bytes > context_request.prompt_len * non_sliding_attn_size_per_token
+    assert longer_context_bytes - context_bytes > non_sliding_attn_size_per_token
+    assert longer_generation_bytes - generation_bytes == non_sliding_attn_size_per_token
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
@@ -144,11 +242,7 @@ def test_deepseek_v4_avg_seq_len_must_not_exceed_max_seq_len():
 
 
 @pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
-def scratch_reuse_enabled(request, monkeypatch) -> bool:
-    if request.param:
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
-    else:
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "0")
+def scratch_reuse_enabled(request) -> bool:
     return request.param
 
 
@@ -243,6 +337,7 @@ class TestDeepseekV4CacheManager:
         enable_attention_dp: bool = False,
         spec_config: object | None = None,
         indexer_k_dtype: str | None = None,
+        enable_swa_scratch_reuse: bool = True,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -264,6 +359,7 @@ class TestDeepseekV4CacheManager:
             enable_block_reuse=False,
             max_tokens=max_seq_len * max_batch_size,
             event_buffer_max_size=0,
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         )
 
         # Create mapping (single GPU, no parallelism)
@@ -586,6 +682,10 @@ class TestDeepseekV4CacheManager:
             device="cuda",
         )
         with torch.cuda.stream(cache_manager._stream):
+            cache_manager.compute_sliding_block_tables(
+                [req.py_request_id],
+                num_contexts=num_contexts,
+            )
             cache_manager.copy_batch_sliding_block_tables(
                 sliding_block_tables,
                 [req.py_request_id],
@@ -983,6 +1083,7 @@ class TestDeepseekV4CacheManager:
             dtype=dtype,
             compressor_dtype=compressor_dtype,
             max_input_len=max_input_len,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
         assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
@@ -1206,6 +1307,7 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[4, 4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
         assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
@@ -1238,6 +1340,10 @@ class TestDeepseekV4CacheManager:
                 device="cpu",
             )
             with torch.cuda.stream(cache_manager._stream):
+                cache_manager.compute_sliding_block_tables(
+                    [req.py_request_id],
+                    num_contexts=1,
+                )
                 cache_manager.copy_batch_sliding_block_tables(
                     sliding_block_tables_cuda,
                     [req.py_request_id],
@@ -1320,6 +1426,7 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1, 4, 128, 4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
         assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
@@ -1331,12 +1438,26 @@ class TestDeepseekV4CacheManager:
                 cache_manager._host_attention_op_block_offsets_staging,
                 device="cuda",
             )
+            sliding_block_tables = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                device="cuda",
+            )
 
             with torch.cuda.stream(cache_manager._stream):
+                cache_manager.compute_sliding_block_tables(
+                    request_ids,
+                    num_contexts=num_contexts,
+                )
                 cache_manager.copy_batch_block_offsets(
                     actual,
                     request_ids,
                     beam_width=1,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+                cache_manager.copy_batch_sliding_block_tables(
+                    sliding_block_tables,
+                    request_ids,
                     num_contexts=num_contexts,
                     num_seqs=len(request_ids),
                 )
@@ -1358,7 +1479,20 @@ class TestDeepseekV4CacheManager:
 
             # DSV4 AttentionOp only consumes the key table.
             cache_manager._stream.synchronize()
-            torch.testing.assert_close(actual.cpu()[:, :, 0], expected)
+            actual_cpu = actual.cpu()
+            sliding_block_tables_cpu = sliding_block_tables.cpu()
+            torch.testing.assert_close(
+                actual_cpu[:, : len(request_ids), 0],
+                expected[:, : len(request_ids)],
+            )
+            torch.testing.assert_close(
+                actual_cpu[:, : len(request_ids), 0],
+                sliding_block_tables_cpu[
+                    :,
+                    DeepseekV4AttentionType.SWA.value,
+                    : len(request_ids),
+                ],
+            )
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
@@ -1375,6 +1509,7 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1, 4, 128, 4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
         assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
@@ -1388,6 +1523,10 @@ class TestDeepseekV4CacheManager:
             )
 
             with torch.cuda.stream(cache_manager._stream):
+                cache_manager.compute_sliding_block_tables(
+                    request_ids,
+                    num_contexts=num_contexts,
+                )
                 cache_manager.copy_batch_sliding_block_tables(
                     actual,
                     request_ids,
@@ -1417,7 +1556,10 @@ class TestDeepseekV4CacheManager:
                     )
 
             cache_manager._stream.synchronize()
-            torch.testing.assert_close(actual.cpu(), expected)
+            torch.testing.assert_close(
+                actual.cpu()[:, :, : len(request_ids)],
+                expected[:, :, : len(request_ids)],
+            )
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
@@ -1434,6 +1576,7 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1, 4, 128, 4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
         assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
@@ -1489,6 +1632,7 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1, 4, 128, 4],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
         assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
@@ -1534,8 +1678,7 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_swa_scratch_reuse_enabled_by_default_for_main_manager(self, monkeypatch):
-        monkeypatch.delenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, raising=False)
+    def test_swa_scratch_reuse_enabled_by_default_for_main_manager(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1554,8 +1697,7 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_swa_scratch_reuse_disabled_by_env_for_main_manager(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "0")
+    def test_swa_scratch_reuse_disabled_by_config_for_main_manager(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1563,6 +1705,7 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=False,
         )
 
         try:
@@ -1573,8 +1716,7 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_swa_scratch_reuse_uses_extra_kv_tokens_for_rewind(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    def test_swa_scratch_reuse_uses_extra_kv_tokens_for_rewind(self):
         spec_config = SimpleNamespace(
             max_draft_len=7,
             max_total_draft_tokens=7,
@@ -1601,8 +1743,7 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_draft_cache_manager_disables_swa_scratch_reuse(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    def test_draft_cache_manager_disables_swa_scratch_reuse(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1621,8 +1762,7 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_context_request_enable_scratch_reuse_until_generation(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    def test_context_request_enable_scratch_reuse_until_generation(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1656,8 +1796,7 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_disagg_generation_init_disables_swa_scratch_reuse(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    def test_disagg_generation_init_disables_swa_scratch_reuse(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1682,8 +1821,7 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_disagg_generation_init_rejects_context_apis(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    def test_disagg_generation_init_rejects_context_apis(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1702,8 +1840,7 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
-    def test_dummy_generation_requests_with_swa_scratch_reuse(self, monkeypatch):
-        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    def test_dummy_generation_requests_with_swa_scratch_reuse(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=2,

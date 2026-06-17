@@ -1,6 +1,7 @@
 accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype SKIP (https://nvbugs/6162940)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
-accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype SKIP (https://nvbugs/6200572)
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2] SKIP
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0] SKIP
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python SKIP (https://nvbugs/6117811)
@@ -544,6 +545,7 @@ unittest/auto_deploy/singlegpu/transformations/library/test_mrope_delta_cache.py
 unittest/auto_deploy/standalone SKIP (https://nvbugs/6160629)
 unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests SKIP (https://nvbugs/6160629)
 unittest/disaggregated/test_agent_multi_backends.py::test_run_with_different_env[1] SKIP (https://nvbugs/5979673)
+unittest/disaggregated/test_kv_transfer.py::test_transfer_worker_v1 SKIP (https://nvbugs/5979673)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)

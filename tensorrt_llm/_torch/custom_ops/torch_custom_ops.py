@@ -55,8 +55,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
-deep_gemm.set_pdl(get_env_enable_pdl())
-
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))

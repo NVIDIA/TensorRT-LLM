@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +36,12 @@ TEST(ExecutorConfigTest, ctorValidInputs)
     }
     {
         auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 0);
+    }
+    {
+        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true,
+            ExecutorConfig::kUnlimitedStatsMaxIterations, ExecutorConfig::kUnlimitedStatsMaxIterations);
+        EXPECT_EQ(executorConfig.getIterStatsMaxIterations(), ExecutorConfig::kUnlimitedStatsMaxIterations);
+        EXPECT_EQ(executorConfig.getRequestStatsMaxIterations(), ExecutorConfig::kUnlimitedStatsMaxIterations);
     }
     {
         auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000);
@@ -87,9 +93,24 @@ TEST(ExecutorConfigTest, ctorInvalidInputs)
         FAIL() << "Expected TllmException";
     }
 
-    // iter stats negative
+    // iter stats below the unlimited sentinel
     ParallelConfig parallelConfigValid;
-    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -1, BatchingType::kINFLIGHT, parallelConfigValid);
+    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -2, BatchingType::kINFLIGHT, parallelConfigValid);
+
+    // request stats below the unlimited sentinel
+    try
+    {
+        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000, -2);
+        FAIL() << "Expected TllmException";
+    }
+    catch (TllmException& e)
+    {
+        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
+    }
+    catch (std::exception const& e)
+    {
+        FAIL() << "Expected TllmException";
+    }
 }
 
 TEST(ExecutorConfigTest, extendedRuntimePerfKnobConfigTest)

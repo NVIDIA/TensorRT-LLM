@@ -222,6 +222,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if finish_reason_sent[i]:
             continue
 
+        has_token_delta = bool(output.token_ids_diff)
         delta_text = output.text_diff
 
         delta_text, reasoning_delta_text = apply_reasoning_parser(
@@ -267,7 +268,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
+            # Keep token-bearing chunks visible even when detokenization has no
+            # text to flush yet.
+            if (tool_calls or delta_text or reasoning_delta_text
+                    or output.finish_reason or has_token_delta):
                 delta_message = DeltaMessage(
                     content=delta_text,
                     reasoning_content=reasoning_delta_text,

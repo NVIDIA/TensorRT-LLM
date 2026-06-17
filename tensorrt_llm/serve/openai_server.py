@@ -1,4 +1,18 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import asyncio
 import base64
 import json
@@ -214,6 +228,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.perf_metrics = None
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
+        self._iteration_stats_lock = asyncio.Lock()
+        self._iteration_stats_buffer = deque(
+            maxlen=self._get_iteration_stats_buffer_maxlen())
         self._iteration_stats_wakeup_event = asyncio.Event()
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
@@ -322,6 +339,15 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
+
+    def _get_iteration_stats_buffer_maxlen(self) -> Optional[int]:
+        if isinstance(self.generator, VisualGen):
+            return None
+
+        max_iterations = self.generator.args.iter_stats_max_iterations
+        if max_iterations is None or max_iterations < 0:
+            return None
+        return max_iterations
 
     def _init_visual_gen(self):
         self.processor = None
@@ -822,10 +848,22 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
+        async with self._iteration_stats_lock:
+            await self._drain_iteration_stats_to_sinks_unlocked(timeout=2)
+            stats = list(self._iteration_stats_buffer)
+            self._iteration_stats_buffer.clear()
         return JSONResponse(content=stats)
+
+    async def _drain_iteration_stats_to_sinks_unlocked(self,
+                                                       timeout: float) -> None:
+        async for llm_stat in self.generator.get_stats_async(timeout):
+            if self.metrics_collector:
+                self.metrics_collector.log_iteration_stats(llm_stat)
+            self._iteration_stats_buffer.append(llm_stat)
+
+    async def _drain_iteration_stats_to_sinks(self, timeout: float) -> None:
+        async with self._iteration_stats_lock:
+            await self._drain_iteration_stats_to_sinks_unlocked(timeout)
 
     async def get_energy_metrics(self) -> JSONResponse:
         if self.energy_monitor is None:
@@ -1000,6 +1038,9 @@ class OpenAIServer(_VideoRoutesMixin):
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             chat_response = post_processor(promise, args)
 
+        if disaggregated_params is not None and disaggregated_params.request_type == "context_only":
+            chat_response.prompt_token_ids = promise.prompt_token_ids
+
         if disaggregated_params is not None and chat_response.choices[
                 0].disaggregated_params is None:
             raise ValueError(
@@ -1013,13 +1054,13 @@ class OpenAIServer(_VideoRoutesMixin):
         """Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
-        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
-        overwritten with the latest value, while counters (missed_blocks_total,
-        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
-        to remain accurate.  Logging only the latest stat would drop counter deltas from
-        earlier iterations and could leave gauges unset if the latest iteration had no
-        context-phase activity.
+        stats from the engine's stats queue, logging every stat to Prometheus and buffering
+        it for the /metrics endpoint.  Gauges (kv_cache_hit_rate, kv_cache_utilization,
+        kv_cache_iter_reuse_rate) are naturally overwritten with the latest value, while
+        counters (missed_blocks_total, gen_alloc_blocks_total, etc.) must be incremented by
+        *every* per-iteration delta to remain accurate.  Logging only the latest stat would
+        drop counter deltas from earlier iterations and could leave gauges unset if the
+        latest iteration had no context-phase activity.
 
         The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
         requests complete.
@@ -1035,11 +1076,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
-                # Drain all available iteration stats and log each one to Prometheus.
+                # Drain all available iteration stats once, then fan out to
+                # Prometheus and the /metrics response buffer.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
-                        self.metrics_collector.log_iteration_stats(llm_stat)
+                    await self._drain_iteration_stats_to_sinks(timeout=0.5)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1833,12 +1873,18 @@ class OpenAIServer(_VideoRoutesMixin):
     async def get_server_info(self) -> JSONResponse:
         content = {"disaggregated_params": self.generator.disaggregated_params}
         args = getattr(self.generator, "args", None)
-        kv_cache_config = getattr(args, "kv_cache_config", None)
-        if kv_cache_config is not None:
-            content[
-                "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
-                    kv_cache_config.kv_cache_event_hash_algo,
-                    kv_cache_config.use_kv_cache_manager_v2)
+        if args is not None:
+            if args.max_batch_size is not None:
+                content["max_batch_size"] = args.max_batch_size
+            kv_cache_config = args.kv_cache_config
+            if kv_cache_config is not None:
+                content[
+                    "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
+                        kv_cache_config.kv_cache_event_hash_algo,
+                        kv_cache_config.use_kv_cache_manager_v2)
+                if kv_cache_config.tokens_per_block is not None:
+                    content[
+                        "tokens_per_block"] = kv_cache_config.tokens_per_block
         return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,

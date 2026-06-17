@@ -50,6 +50,7 @@ class _StatsRequest:
     is_dummy_request: bool = False
     is_attention_dp_dummy: bool = False
     is_cuda_graph_dummy: bool = False
+    is_disagg_generation_init_state: bool = False
     is_disagg_generation_transmission_complete: bool = False
     context_phase_params: None = None
     py_draft_tokens: list[int] = field(default_factory=list)
@@ -110,6 +111,7 @@ def _create_manager(
     num_layers: int = 1,
     max_attention_window: list[int] | None = None,
     enable_block_reuse: bool = True,
+    block_reuse_policy: str = "all_reusable",
     enable_stats: bool = True,
 ) -> KVCacheManagerV2:
     return KVCacheManagerV2(
@@ -119,6 +121,7 @@ def _create_manager(
             max_gpu_total_bytes=gpu_bytes,
             max_util_for_resume=1.0,
             max_attention_window=max_attention_window,
+            block_reuse_policy=block_reuse_policy,
         ),
         CacheType.SELF,
         num_layers=num_layers,
@@ -359,7 +362,7 @@ def test_reverted_generation_allocation_does_not_report_stats(resource_guard) ->
     _assert_iteration_delta(stats_report.by_window_size[manager.max_seq_len])
 
 
-def test_reverted_context_allocation_does_not_report_pending_stats(resource_guard) -> None:
+def test_waited_context_allocation_reports_pending_stats_when_scheduled(resource_guard) -> None:
     request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
     manager = resource_guard(_create_manager(gpu_bytes=8 << 20), request)
 
@@ -377,25 +380,23 @@ def test_reverted_context_allocation_does_not_report_pending_stats(resource_guar
     request.is_first_context_chunk = False
     assert manager.prepare_context(request)
     assert manager.resize_context(request, num_tokens=4)
-    manager.revert_allocate_context(request)
-    manager.commit_scheduled_kv_cache_stats(_context_batch(request))
 
-    reverted_stats_report = manager.get_iteration_stats()
-    assert reverted_stats_report is not None
-    _assert_iteration_delta(reverted_stats_report.by_window_size[manager.max_seq_len])
+    second_chunk_stats = _commit_and_get_stats(manager, _context_batch(request))
+    _assert_iteration_delta(second_chunk_stats, alloc_total=1, alloc_new=1, missed=1)
     assert request.kv_cache_perf_metric_calls == [
+        _metric_call(alloc_total=1, alloc_new=1, missed=1),
         _metric_call(alloc_total=1, alloc_new=1, missed=1),
     ]
     kv_stats = manager.get_kv_cache_stats()
-    assert kv_stats.alloc_total_blocks == 1
-    assert kv_stats.alloc_new_blocks == 1
-    assert kv_stats.missed_blocks == 1
+    assert kv_stats.alloc_total_blocks == 2
+    assert kv_stats.alloc_new_blocks == 2
+    assert kv_stats.missed_blocks == 2
 
     assert manager.prepare_context(request)
     assert manager.resize_context(request, num_tokens=4)
     _finish_context(manager, request)
     second_chunk_stats = _commit_and_get_stats(manager, _context_batch(request))
-    _assert_iteration_delta(second_chunk_stats, alloc_total=1, alloc_new=1, missed=1)
+    _assert_iteration_delta(second_chunk_stats)
     assert request.kv_cache_perf_metric_calls == [
         _metric_call(alloc_total=1, alloc_new=1, missed=1),
         _metric_call(alloc_total=1, alloc_new=1, missed=1),
@@ -436,6 +437,50 @@ def test_chunked_context_reports_generation_alloc_only_in_generation(resource_gu
         _metric_call(alloc_total=1, alloc_new=1, missed=1),
         _metric_call(alloc_total=1, alloc_new=1),
     ]
+
+
+def test_all_reusable_policy_commits_each_context_chunk(resource_guard) -> None:
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(
+        _create_manager(gpu_bytes=8 << 20, block_reuse_policy="all_reusable"), request
+    )
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 4
+    request.context_remaining_length = 4
+    manager.update_context_resources(_context_batch(request))
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.num_committed_tokens == 4
+    assert kv_cache.history_length == 4
+
+
+def test_per_request_policy_delays_commit_until_last_context_chunk(resource_guard) -> None:
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(
+        _create_manager(gpu_bytes=8 << 20, block_reuse_policy="per_request"), request
+    )
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 4
+    request.context_remaining_length = 4
+    manager.update_context_resources(_context_batch(request))
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.num_committed_tokens == 0
+    assert kv_cache.history_length == 4
+
+    request.is_first_context_chunk = False
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=4)
+    request.context_current_position = 8
+    request.context_remaining_length = 0
+    manager.update_context_resources(_context_batch(request))
+
+    assert kv_cache.num_committed_tokens == 8
+    assert kv_cache.history_length == 8
 
 
 def test_v2_generation_alloc_updates_request_metrics_unlike_v1(resource_guard) -> None:
