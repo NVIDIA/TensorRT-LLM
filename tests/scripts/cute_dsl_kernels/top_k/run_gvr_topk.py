@@ -315,8 +315,12 @@ def gvr_topk_decode(
 def gvr_topk_sort_prepare(seq_lens: torch.Tensor) -> torch.Tensor:
     """Build the LJF dispatch order for :func:`gvr_topk_decode`.
 
-    Returns ``int32[num_rows]`` whose i-th entry is the original-batch
-    index of the i-th longest row. Run once per decode step; the same
+    Returns ``int32[batch_size]`` (= ``seq_lens.shape[0]`` =
+    ``num_rows // next_n``) whose i-th entry is the original-batch index
+    of the i-th longest request — request-level, NOT row-level. The
+    kernel expands to row level via ``order_row[req] * next_n + nn``
+    inside the const_expr ``seqlen_sorted`` branch. Run once per decode
+    step; the same
     ``order_row`` is reused across all per-layer ``gvr_topk_decode``
     calls with ``seqlen_sorted=True`` (seq_lens is layer-invariant
     within a decode step). For an LB-style two-bucket partition, use
