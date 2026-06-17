@@ -285,7 +285,6 @@ class KvCacheCreator:
             unsupported_v2_features = (
                 self._kv_connector_manager is not None or
                 (self._max_beam_width is not None and self._max_beam_width > 1)
-                or kv_cache_config.event_buffer_max_size > 0
                 or (self._cache_transceiver_config is not None
                     and self._cache_transceiver_config.backend is not None))
             if unsupported_v2_features:
@@ -299,13 +298,11 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Gemma4 hybrid attention requires KVCacheManagerV2, "
                         "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, event_buffer_max_size > 0, or "
-                        "cache_transceiver. Disable these features to run "
-                        "Gemma4 hybrid models.")
+                        "beam_width > 1, or cache_transceiver. Disable these "
+                        "features to run Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
-                )
+                    "or cache transceiver. Falling back to KVCacheManager.")
                 return KVCacheManager
         return kv_cache_manager_cls
 
