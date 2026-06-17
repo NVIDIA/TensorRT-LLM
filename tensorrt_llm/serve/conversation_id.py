@@ -42,12 +42,12 @@ def resolve_request_conversation_id(
     Body ``conversation_params.conversation_id`` is canonical. Headers are used
     only when the body does not provide an id.
     """
-    conversation_id = get_request_conversation_id(request) or extract_conversation_id_from_headers(
-        headers
-    )
-    if conversation_id is None:
-        request.conversation_params = None
-    else:
+    conversation_params = request.conversation_params
+    if conversation_params is not None:
+        return conversation_params.conversation_id
+
+    conversation_id = extract_conversation_id_from_headers(headers)
+    if conversation_id is not None:
         from tensorrt_llm.serve.openai_protocol import ConversationParams
 
         request.conversation_params = ConversationParams(conversation_id=conversation_id)

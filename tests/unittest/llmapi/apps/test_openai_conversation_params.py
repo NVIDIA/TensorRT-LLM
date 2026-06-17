@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.openai_protocol import ConversationParams
 
 
@@ -37,3 +40,22 @@ def test_openai_conversation_params_normalizes_conversation_id():
 def test_openai_conversation_params_rejects_empty_conversation_id():
     with pytest.raises(ValidationError):
         ConversationParams(conversation_id=" ")
+
+
+def test_resolve_request_conversation_id_preserves_body_params():
+    conversation_params = ConversationParams(conversation_id="body-id")
+    request = SimpleNamespace(conversation_params=conversation_params)
+
+    conversation_id = resolve_request_conversation_id(request, {"X-Session-ID": "header-id"})
+
+    assert conversation_id == "body-id"
+    assert request.conversation_params is conversation_params
+
+
+def test_resolve_request_conversation_id_uses_headers_when_body_params_missing():
+    request = SimpleNamespace(conversation_params=None)
+
+    conversation_id = resolve_request_conversation_id(request, {"X-Session-ID": " header-id "})
+
+    assert conversation_id == "header-id"
+    assert request.conversation_params.conversation_id == "header-id"
