@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import dataclasses
 import os
@@ -531,10 +545,25 @@ class KvCacheCreator:
         """
         if self._skip_est:
             return False
-        estimating_kv_cache = False
-        if 'cp_type' not in self._mapping.cp_config:
-            estimating_kv_cache = True
+
+        estimating_kv_cache = True
+        if 'cp_type' in self._mapping.cp_config:
+            estimating_kv_cache = False
+            logger.info(
+                "KV cache size estimation is not supported for context parallelism, disable it."
+            )
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            estimating_kv_cache = False
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+
+        if estimating_kv_cache:
             estimate_max_tokens = self._get_token_num_for_estimation()
+            max_tokens = min(
+                estimate_max_tokens, self._kv_cache_config.max_tokens
+            ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
                 max_gpu_total_bytes = int(
@@ -544,17 +573,9 @@ class KvCacheCreator:
                     max_gpu_total_bytes = min(max_gpu_total_bytes,
                                               self._max_gpu_total_bytes_in)
                 self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
-                self._kv_cache_config.max_tokens = self._max_kv_tokens_in
+                self._kv_cache_config.max_tokens = max_tokens
             else:
-                self._kv_cache_config.max_tokens = min(
-                    estimate_max_tokens, self._kv_cache_config.max_tokens
-                ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
-        model_config = self._model_engine.model.model_config
-        if model_config.attn_backend == "VANILLA":
-            logger.info(
-                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
-            )
-            estimating_kv_cache = False
+                self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self,

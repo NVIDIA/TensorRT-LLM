@@ -331,8 +331,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 2: Apply routing ==========
         requires_separated_routing = (
-            moe.backend._supports_load_balancer()
-            or moe.routing_method.requires_separated_routing
+            moe.backend._supports_load_balancer() or moe.routing_method.requires_separated_routing
         )
         if requires_separated_routing:
             # Separated routing: ConfigurableMoE calls routing_method
@@ -862,6 +861,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
 
     def _strip_adp_padding(
@@ -1118,22 +1119,31 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe.num_slots, token_selected_slots
         )
 
-        # ----- quantize -----
-        if num_tokens > 0:
-            x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
+        # ----- quantize / prepare -----
+        if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
+            # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
+            # topk copies, so keep the original activations and let run_moe
+            # prepare its workspace.
+            moe_input = x_chunk_real
+            x_sf = None
         else:
-            device = x.device
-            x_fp8 = torch.empty((0, moe.hidden_size), dtype=torch.float8_e4m3fn, device=device)
-            # Packed-UE8M0 int32 SF: one int32 per 128 input elements per row,
-            # same stride contract as the non-empty runs for run_moe.
-            x_sf = torch.empty((0, moe.hidden_size // 128), dtype=torch.int32, device=device)
+            # Delegate to ``backend.quantize_input`` so each fused-comm
+            # backend owns its own empty-tensor layout. Both
+            # ``MegaMoEDeepGemm`` and ``MegaMoECuteDsl`` short-circuit
+            # ``x.shape[0] == 0`` inside their quantize_input contracts (DG
+            # returns FP8 + packed-UE8M0 int32 SF; CuteDSL returns NVFP4
+            # packed bytes + plain K-major FP8 SF). Synthesizing the
+            # DG-specific empty layout here would lock the scheduler to a
+            # single backend; the unconditional delegation keeps it
+            # layout-agnostic.
+            moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
         out = moe.backend.run_moe(
-            x=x_fp8,
+            x=moe_input,
             token_selected_experts=token_selected_slots,
             token_final_scales=token_final_scales,
             x_sf=x_sf,

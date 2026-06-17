@@ -335,6 +335,25 @@ class AttentionPolicy:
             local != peer, f"{field} mismatch", field=field, local=local, peer=peer
         )
 
+    def _tpb_check(self, local: int, peer: int) -> bool:
+        if local == peer:
+            return False
+        larger, smaller = max(local, peer), min(local, peer)
+        if larger % smaller != 0:
+            logger.warning(
+                "AttentionPolicy: incompatible: tokens_per_block not divisible; local=%d peer=%d",
+                local,
+                peer,
+            )
+            return True
+        logger.warning(
+            "AttentionPolicy: tokens_per_block mismatch (local=%d, peer=%d); "
+            "KV transfer proceeds — ensure block boundaries align during transfer.",
+            local,
+            peer,
+        )
+        return False
+
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention
         b = peer_ri.attention
@@ -348,7 +367,7 @@ class AttentionPolicy:
                 peer=peer_ri.cp_size,
             )
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
-            or self._mismatch("tokens_per_block", a.tokens_per_block, b.tokens_per_block)
+            or self._tpb_check(a.tokens_per_block, b.tokens_per_block)
             or self._mismatch("dims_per_head", a.dims_per_head, b.dims_per_head)
             or self._fail_if(
                 a.is_mla and (a.kv_heads_per_rank != 1 or b.kv_heads_per_rank != 1),

@@ -225,7 +225,7 @@ class TestOpenAIHttpClient:
             await openai_client.send_request(completion_request)
 
         # Should finish request on error with success=False so the router
-        # doesn't backfill cache state for a request that didn't complete.
+        # doesn't record routed-block cache state for a request that didn't complete.
         mock_router.finish_request.assert_called_once_with(
             completion_request, mock_session, success=False
         )
