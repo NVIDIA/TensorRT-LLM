@@ -4522,9 +4522,9 @@ class PyTorchModelEngine(ModelEngine):
                     starts_cuda = torch.tensor(
                         [
                             start
-                            for multi_item_part_lens in multi_item_part_lens
-                            for start in [0] + [multi_item_part_lens[0]] *
-                            (len(multi_item_part_lens) - 1)
+                            for req_multi_item_part_lens in multi_item_part_lens
+                            for start in [0] + [req_multi_item_part_lens[0]] *
+                            (len(req_multi_item_part_lens) - 1)
                         ],
                         pin_memory=prefer_pinned(),
                         dtype=torch.int32,
@@ -4533,10 +4533,10 @@ class PyTorchModelEngine(ModelEngine):
                     ends_cuda = torch.tensor(
                         [
                             end + 1
-                            for multi_item_part_lens in multi_item_part_lens
-                            for end in [multi_item_part_lens[0]] + [
-                                multi_item_part_lens[0] + item_len
-                                for item_len in multi_item_part_lens[1:]
+                            for req_multi_item_part_lens in multi_item_part_lens
+                            for end in [req_multi_item_part_lens[0]] + [
+                                req_multi_item_part_lens[0] + item_len
+                                for item_len in req_multi_item_part_lens[1:]
                             ]
                         ],
                         pin_memory=prefer_pinned(),
