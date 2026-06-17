@@ -184,6 +184,7 @@ full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos
 full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos3Unit::test_reset_cache SKIP (temporary ToT main waive; Cosmos3 config split fix pending)
 full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos3Unit::test_sanity_forward SKIP (temporary ToT main waive; Cosmos3 config split fix pending)
 full:DGX_B200/unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos3Unit::test_sanity_forward_i2v_mask SKIP (temporary ToT main waive; Cosmos3 config split fix pending)
+full:DGX_H100/accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm] SKIP (https://nvbugs/6336682)
 full:GH200/examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/4731514)
 full:GH200/examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (arm is not supported)
 full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
