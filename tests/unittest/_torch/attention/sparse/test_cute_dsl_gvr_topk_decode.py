@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -24,24 +24,14 @@ from tensorrt_llm._utils import get_sm_version
 
 # Standalone LB wrappers live in run_gvr_topk.py alongside the single-CTA
 # wrapper so tests and bench scripts share the same compile-time caching.
-_RUN_GVR_DIR = os.path.join(
-    os.path.dirname(
-        os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        )
-    ),
-    "tests",
-    "scripts",
-    "cute_dsl_kernels",
-    "top_k",
-)
-if _RUN_GVR_DIR not in sys.path:
-    sys.path.insert(0, _RUN_GVR_DIR)
-from run_gvr_topk import (  # noqa: E402
-    gvr_topk_lb_decode,
-    gvr_topk_lb_prepare,
-    gvr_topk_sort_prepare,
-)
+# This test file is at:
+#   <repo>/tests/unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+# so the repo root is parents[5]; the wrappers live under
+# tests/scripts/cute_dsl_kernels/top_k/.
+_RUN_GVR_DIR = Path(__file__).parents[5] / "tests" / "scripts" / "cute_dsl_kernels" / "top_k"
+if str(_RUN_GVR_DIR) not in sys.path:
+    sys.path.insert(0, str(_RUN_GVR_DIR))
+from run_gvr_topk import gvr_topk_sort_prepare  # noqa: E402
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -360,7 +350,11 @@ def test_lb_prepare_partition(B, ratio):
     ref_n_short = B - ref_n_long
 
     max_batch_size = 1024
-    order_row, counters = gvr_topk_lb_prepare(seq_lens, max_batch_size, long_threshold)
+    order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device="cuda")
+    counters = torch.zeros(2, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_lb_prepare(
+        seq_lens, order_row, counters, max_batch_size, long_threshold
+    )
     n_long = int(counters[0].item())
     n_short = int(counters[1].item())
     assert n_long == ref_n_long, f"n_long mismatch: {n_long} vs {ref_n_long}"
@@ -428,15 +422,21 @@ def test_lb_main_branches(dtype, top_k, scenario, N, override, batch_size, next_
 
     max_batch_size = 1024
     long_threshold = 64 * 1024
-    order_row, counters = gvr_topk_lb_prepare(seq_lens, max_batch_size, long_threshold)
-    _, out_indices = gvr_topk_lb_decode(
+    order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device="cuda")
+    counters = torch.zeros(2, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_lb_prepare(
+        seq_lens, order_row, counters, max_batch_size, long_threshold
+    )
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
         pre_idx,
         seq_lens,
-        order_row,
-        counters,
-        top_k,
-        next_n,
+        out_indices,
+        top_k=top_k,
+        next_n=next_n,
+        order_row=order_row,
+        counters=counters,
         max_batch_size=max_batch_size,
     )
     torch.cuda.synchronize()
@@ -499,16 +499,27 @@ def test_lb_vs_reference(
     )
     max_batch_size = 1024
     long_threshold = 64 * 1024
-    order_row, counters = gvr_topk_lb_prepare(seq_lens, max_batch_size, long_threshold)
-    _, out_indices = gvr_topk_lb_decode(
-        logits,
-        pre_idx,
+    order_row = torch.full((max_batch_size,), -1, dtype=torch.int32, device="cuda")
+    counters = torch.zeros(2, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_lb_prepare(
         seq_lens,
         order_row,
         counters,
-        top_k,
-        next_n,
+        max_batch_size,
+        long_threshold,
+        compress_ratio,
+    )
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=next_n,
         compress_ratio=compress_ratio,
+        order_row=order_row,
+        counters=counters,
         max_batch_size=max_batch_size,
     )
     torch.cuda.synchronize()

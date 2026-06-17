@@ -344,16 +344,27 @@ except (ModuleNotFoundError, ImportError):
 
 
 @functools.cache
-def _compile_lb_prepare(num_threads: int, batch_size: int, long_threshold: int):
-    """JIT-compile the LB prepare kernel for a specific triple.
+def _compile_lb_prepare(
+    num_threads: int, batch_size: int, long_threshold: int, compress_ratio: int
+):
+    """JIT-compile the LB prepare kernel for a specific tuple.
 
-    Specialized over ``(num_threads, batch_size, threshold)``.
+    Specialized over ``(num_threads, batch_size, threshold,
+    compress_ratio)``.
 
     ``num_threads`` = kernel block size + ``order_row`` length.
     ``batch_size``  = compile-time seq_lens shape (must equal runtime
                       ``seq_lens.shape[0]`` for TVM-FFI marshalling).
+    ``compress_ratio`` = KV-indexer compression factor; the classifier
+                      divides ``seq_lens`` by this before comparing
+                      against ``long_threshold`` so the threshold stays
+                      in scan-length (post-compress) space.
     """
-    prep = GvrTopKLBPrepareKernel(long_threshold=long_threshold, num_threads=num_threads)
+    prep = GvrTopKLBPrepareKernel(
+        long_threshold=long_threshold,
+        compress_ratio=compress_ratio,
+        num_threads=num_threads,
+    )
     fake_seq = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (batch_size,), stride_order=(0,)
     )
@@ -377,6 +388,7 @@ def gvr_topk_lb_prepare(
     seq_lens: torch.Tensor,
     max_batch_size: int = 1024,
     long_threshold: int = 64 * 1024,
+    compress_ratio: int = 1,
     order_row: Optional[torch.Tensor] = None,
     counters: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -385,9 +397,15 @@ def gvr_topk_lb_prepare(
     ``seq_lens`` keeps its actual shape ``(batch_size,)`` — the kernel
     is compiled to match that exact shape; ``max_batch_size`` only
     determines the prepare kernel's block size and the ``order_row``
-    buffer length. Returns ``(order_row, counters)`` which the caller
-    feeds into :func:`gvr_topk_lb_decode` for every per-layer Top-K
-    call within the same decode step.
+    buffer length. ``long_threshold`` is in SCAN-LENGTH space
+    (= seq_lens / compress_ratio), matching the GVR kernel's actual
+    work; the classifier inside the prepare kernel divides by
+    ``compress_ratio`` automatically so callers can pass raw
+    ``seq_lens`` regardless of cr.
+
+    Returns ``(order_row, counters)`` which the caller feeds into
+    :func:`gvr_topk_lb_decode` for every per-layer Top-K call within
+    the same decode step.
     """
     assert seq_lens.is_cuda and seq_lens.dtype == torch.int32
     # block_prefix_sum_kernel (used inside LB prepare) constraints:
@@ -414,7 +432,7 @@ def gvr_topk_lb_prepare(
     if counters is None:
         counters = torch.zeros(2, dtype=torch.int32, device=seq_lens.device)
 
-    compiled = _compile_lb_prepare(max_batch_size, batch_size, long_threshold)
+    compiled = _compile_lb_prepare(max_batch_size, batch_size, long_threshold, compress_ratio)
     compiled(seq_lens, order_row, counters, cutlass.Int32(batch_size))
     return order_row, counters
 
