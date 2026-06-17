@@ -412,6 +412,12 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
         yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
+        # Without chunked prefill, max_num_tokens=8192 makes the synthetic
+        # forward profile in resize_kv_cache underestimate runtime peaks
+        # (CUDA-graph capture + fp32 lm_head logits cast), causing OOM on
+        # 48GB cards. Lower the KV-cache fraction in that case to leave
+        # headroom for those post-resize allocations.
+        free_gpu_memory_fraction = 0.7 if enable_chunked_prefill else 0.5
         config = {
             "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
@@ -420,7 +426,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             # SSMs do not support cache reuse.
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.7
+                "free_gpu_memory_fraction": free_gpu_memory_fraction,
             },
             # Keep max_batch_size as in the PyTorch test to avoid OOM
             "max_batch_size": 128,
