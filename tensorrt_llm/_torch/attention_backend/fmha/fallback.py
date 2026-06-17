@@ -18,10 +18,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
-    SkipSoftmaxKernelParams,
-    SkipSoftmaxParams,
-)
 from tensorrt_llm.bindings.internal import thop
 
 from .interface import Fmha
@@ -60,18 +56,11 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
-        sparse_params = attn.sparse_params
-        skip_softmax_kernel_params = (
-            sparse_params.scheduler.get_kernel_params(timestep=forward_args.timestep)
-            if isinstance(sparse_params, SkipSoftmaxParams)
-            else SkipSoftmaxKernelParams()
-        )
 
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_prediction`` for sparse-attn inputs),
-        # ``skip_softmax_kernel_params``, or a literal allowlisted in
-        # ``_THOP_LITERALS``. ``test_attention_op_sync.py`` enforces this
-        # statically.
+        # or a literal allowlisted in ``_THOP_LITERALS``.
+        # ``test_attention_op_sync.py`` enforces this statically.
         thop.attention(
             q=q,
             k=k,
@@ -174,8 +163,8 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
-            skip_softmax_threshold_scale_factor_prefill=skip_softmax_kernel_params.threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=skip_softmax_kernel_params.threshold_scale_factor_decode,
+            skip_softmax_threshold_scale_factor_prefill=forward_args.skip_softmax_kernel_params.threshold_scale_factor_prefill,
+            skip_softmax_threshold_scale_factor_decode=forward_args.skip_softmax_kernel_params.threshold_scale_factor_decode,
             skip_softmax_stat=attn.skip_softmax_stat,
             # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
             sparse_kv_indices=forward_args.sparse_prediction.sparse_kv_indices,

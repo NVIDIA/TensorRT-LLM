@@ -1726,6 +1726,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
 
+        sparse_params = self.sparse_params
+        if isinstance(sparse_params, SkipSoftmaxParams):
+            forward_args.skip_softmax_kernel_params = (
+                sparse_params.scheduler.get_kernel_params(
+                    timestep=forward_args.timestep))
+
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
             assert metadata.is_cuda_graph
