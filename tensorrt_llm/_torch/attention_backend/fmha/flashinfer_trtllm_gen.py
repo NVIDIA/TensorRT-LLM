@@ -50,6 +50,7 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -438,10 +439,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             )
             return False
 
-        has_skip_softmax = (
-            attn.skip_softmax_threshold_scale_factor_prefill is not None
-            or attn.skip_softmax_threshold_scale_factor_decode is not None
-        )
+        has_skip_softmax = isinstance(attn.sparse_params, SkipSoftmaxParams)
         if has_skip_softmax:
             logger.debug(
                 "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-softmax attention is enabled."
