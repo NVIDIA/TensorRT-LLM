@@ -752,7 +752,7 @@ class ConversationAwareADPRouter(ADPRouter):
         req = req_item.request
         if req is None:
             return None
-        conversation_params = getattr(req, "py_conversation_params", None)
+        conversation_params = req.py_conversation_params
         if conversation_params is None:
             return None
         return conversation_params.conversation_id

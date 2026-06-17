@@ -8,13 +8,6 @@ CONVERSATION_ID_HEADERS = (
 )
 
 
-def _normalize_conversation_id(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
-
-
 class RequestWithConversationParams(Protocol):
     conversation_params: Any
 
@@ -23,7 +16,7 @@ def get_request_conversation_id(request: RequestWithConversationParams) -> Optio
     conversation_params = request.conversation_params
     if conversation_params is None:
         return None
-    return _normalize_conversation_id(conversation_params.conversation_id)
+    return conversation_params.conversation_id
 
 
 def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:
@@ -31,8 +24,11 @@ def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -
         return None
     lower_headers = {str(key).lower(): value for key, value in headers.items()}
     for header_name in CONVERSATION_ID_HEADERS:
-        conversation_id = _normalize_conversation_id(lower_headers.get(header_name))
-        if conversation_id is not None:
+        conversation_id = lower_headers.get(header_name)
+        if conversation_id is None:
+            continue
+        conversation_id = str(conversation_id).strip()
+        if conversation_id:
             return conversation_id
     return None
 

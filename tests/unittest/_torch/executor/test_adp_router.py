@@ -57,6 +57,7 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
         mock_request.py_scheduling_params = mock_schedule_params
     else:
         mock_request.py_scheduling_params = None
+    mock_request.py_conversation_params = None
     mock_request.input_token_ids = [1, 2, 3]
     return mock_request
 
@@ -71,6 +72,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
     scheduling_params.attention_dp_relax = attention_dp_relax
     item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
+    item.request.py_conversation_params = None
     item.request.input_token_ids = list(range(num_tokens))
     return item
 

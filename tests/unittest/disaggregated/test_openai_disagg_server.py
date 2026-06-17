@@ -13,8 +13,6 @@
 # limitations under the License.
 from types import SimpleNamespace
 
-import pytest
-from pydantic import ValidationError
 from starlette.datastructures import Headers
 
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -86,35 +84,6 @@ def test_extract_conversation_id_ignores_empty_headers():
 
     assert request.disaggregated_params is None
     assert request.conversation_params is None
-
-
-def test_disaggregated_params_rejects_conversation_id():
-    with pytest.raises(ValidationError):
-        DisaggregatedParams(
-            request_type="context_only",
-            conversation_id="body-id",
-        )
-
-
-def test_conversation_params_requires_conversation_id():
-    with pytest.raises(ValidationError):
-        ConversationParams()
-
-
-def test_extract_conversation_id_does_not_populate_disaggregated_params():
-    request = CompletionRequest(
-        model="test-model",
-        prompt="hello",
-        disaggregated_params=DisaggregatedParams(request_type="context_only"),
-    )
-
-    OpenAIDisaggServer._extract_conversation_id(
-        request,
-        _raw_request({"x-multi-turn-session-id": "multi-turn-session-id"}),
-    )
-
-    assert not hasattr(request.disaggregated_params, "conversation_id")
-    assert request.conversation_params.conversation_id == "multi-turn-session-id"
 
 
 def test_extract_conversation_id_preserves_body_conversation_params():

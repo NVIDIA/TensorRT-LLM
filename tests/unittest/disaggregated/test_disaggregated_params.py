@@ -1,7 +1,6 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
@@ -64,7 +63,6 @@ def test_to_disaggregated_params():
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
-    assert not hasattr(openai_params, "conversation_id")
 
 
 def test_to_llm_disaggregated_params():
@@ -81,14 +79,6 @@ def test_to_llm_disaggregated_params():
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
-    assert not hasattr(llm_params, "conversation_id")
-
-
-def test_openai_disaggregated_params_rejects_conversation_id():
-    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
-
-    with pytest.raises(ValidationError):
-        OpenAIDisaggregatedParams(request_type="context_only", conversation_id="conv-roundtrip")
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")

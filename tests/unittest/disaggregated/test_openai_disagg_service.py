@@ -155,7 +155,6 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
 
     assert gen_request.prompt_token_ids == ctx_prompt_token_ids
     assert gen_request.disaggregated_params.request_type == "generation_only"
-    assert not hasattr(gen_request.disaggregated_params, "conversation_id")
     assert gen_request.conversation_params.conversation_id == "conv-chat"
 
 

@@ -140,8 +140,22 @@ class DisaggregatedParams(OpenAIBaseModel):
 
 
 class ConversationParams(OpenAIBaseModel):
+    model_config = ConfigDict(extra="forbid",
+                              populate_by_name=True,
+                              validate_assignment=True)
+
     conversation_id: str = Field(
         description=("Stable multi-turn conversation id used for routing"), )
+
+    @field_validator("conversation_id", mode="before")
+    @classmethod
+    def validate_conversation_id(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("conversation_id must be non-empty")
+        conversation_id = str(value).strip()
+        if not conversation_id:
+            raise ValueError("conversation_id must be non-empty")
+        return conversation_id
 
 
 class ErrorResponse(OpenAIBaseModel):
