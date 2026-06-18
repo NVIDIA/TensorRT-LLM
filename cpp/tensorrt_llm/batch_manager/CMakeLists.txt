@@ -89,12 +89,18 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+# Include kv_cache_manager_v2 C++ sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
+list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
+
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${xgrammar_source_dir}/3rdparty/picojson
          ${xgrammar_source_dir}/3rdparty/dlpack/include
-         ${xgrammar_source_dir}/include)
+         ${xgrammar_source_dir}/include
+         ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
+         ${PROJECT_SOURCE_DIR}/../3rdparty/blake3)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}

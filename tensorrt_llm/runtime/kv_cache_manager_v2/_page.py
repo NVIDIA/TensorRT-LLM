@@ -203,6 +203,18 @@ class UncommittedPage(Page):
 
 @dataclass(slots=True)
 class CommittedPage(Page):
+    """A committed page is immutable — all access after commit is read-only.
+
+    We intentionally do not add a separate read_event to track read completion.
+    The inherited Slot.ready_event serves double duty: after commit or migration it
+    represents write completion; after _UniqPageLock is destroyed it is set to the
+    merged finish events of all prior readers. This means a new reader may
+    unnecessarily wait for a prior reader (read-after-read on immutable data), but
+    this is functionally correct, only occurs when the lock is fully released between
+    reuses, and saves one event field per committed page — a worthwhile tradeoff given
+    the potentially huge number of committed pages in the system.
+    """
+
     block: rawref.ref["Block"]
     __rawref__: rawref.ref["CommittedPage"]
 
@@ -238,7 +250,9 @@ class CommittedPage(Page):
         # block may be None when rebase happens, i.e. another block with the same key is committed,
         # replacing it, but the page is still used by a _KVCache.
         if block is not None:
-            block.unset_page(
+            block.unlink_page(self.life_cycle)
+            Block.clear_stale_blocks_after_page_unlink(
+                block,
                 self.life_cycle,
                 self.manager._life_cycles.get_life_cycle(self.life_cycle),
             )
@@ -333,6 +347,9 @@ class _UniqPageLock:
         page = self.page
         if not NDEBUG:
             assert_critical(page.cache_level == CacheLevel(0) and not page.scheduled_for_eviction)
+        # Set ready_event to the merged finish events of all readers. For committed (read-only)
+        # pages, this means the next reader will wait for prior reads to complete, which is
+        # unnecessary but correct. See the CommittedPage docstring for rationale.
         page.ready_event = merge_events(self.finish_events)
         assert self.holder is not None
         self.holder._lock = None

@@ -16,6 +16,7 @@
 import hashlib
 import math
 import os
+import sys
 from typing import TYPE_CHECKING, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
@@ -34,10 +35,14 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
+    GPU_LEVEL,
     AttentionLayerConfig,
     BufferConfig,
     CacheTierConfig,
+    DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
@@ -45,15 +50,12 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     TokenIdExt,
     _KVCache,
+    exact_div,
+    gen_multimodal_cache_key_tokens,
+    typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-    gen_multimodal_cache_key_tokens,
-)
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, CACHE_LEVEL1, GPU_LEVEL
-from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import exact_div, typed_range
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import nvtx_range
@@ -555,7 +557,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
-        quota = float("inf")
+        quota = sys.maxsize
         if (
             kv_cache_config.max_gpu_total_bytes is not None
             and kv_cache_config.max_gpu_total_bytes > 0
@@ -576,7 +578,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{quota / (1 << 30)}GiB"
             )
 
-        assert quota != float("inf"), (
+        assert quota < sys.maxsize, (
             "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
         )
 
@@ -593,7 +595,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
-        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
+        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
             host_quota = kv_cache_config.host_cache_size
         else:
@@ -614,7 +616,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if host_quota <= 0:
                 host_quota = quota
         if host_quota > 0:
-            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
+            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
@@ -622,7 +624,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path
             assert disk_cache_path is not None
-            cache_tiers.append(DiskCacheTierConfig(quota=disk_cache_size, path=disk_cache_path))
+            cache_tiers.append(
+                DiskCacheTierConfig(quota=int(disk_cache_size), path=disk_cache_path)
+            )
             logger.info(
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
@@ -632,7 +636,6 @@ class KVCacheManagerV2(BaseResourceManager):
         config = self._build_cache_config(
             kv_cache_config,
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
         )
 
@@ -828,7 +831,6 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_config: KvCacheConfig,
         *,
         tokens_per_block: int,
-        vocab_size: Optional[int],
         cache_tiers: List[CacheTierConfig],
     ) -> KVCacheManagerConfigPy:
         buffer_type = [Role.KEY]
@@ -845,7 +847,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             layers=[

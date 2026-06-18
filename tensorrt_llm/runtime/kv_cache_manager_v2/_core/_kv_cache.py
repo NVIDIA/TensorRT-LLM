@@ -733,6 +733,14 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]:
+        return list(self._committed_tokens)
+
+    @property
+    def reuse_scope(self) -> ReuseScope:
+        return self._reuse_scope
+
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
@@ -832,7 +840,7 @@ class _KVCache:
                 if self._never_resumed and (
                     type(life_cycles[lc_idx]) is SsmLifeCycle or has_partial
                 ):
-                    deferred_slots[lc_idx] = slot_lst.pop(0)
+                    deferred_slots[lc_idx] = slot_lst.pop()
                 scratch_slots_to_add[lc_idx] = slot_lst
 
             stream_wait_events(
@@ -1053,9 +1061,9 @@ class _KVCache:
         ssm_lock = expect_type(_SharedPageLock, self._ssm_blocks[beam_idx][ssm_lc_id])
         src_page = ssm_lock.page
         pg_idx = storage.get_pool_group_index(ssm_lc_id)
-        # Try to find a slot in any cache level, starting from the source page's level
-        for i in range(storage.num_cache_levels):
-            lvl = CacheLevel(i + src_page.cache_level)
+        # Try levels from the source page's level through the coldest level.
+        for lvl_int in range(src_page.cache_level, storage.num_cache_levels):
+            lvl = CacheLevel(lvl_int)
             try:
                 new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
             except OutOfPagesError:

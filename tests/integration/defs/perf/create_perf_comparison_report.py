@@ -130,7 +130,16 @@ def parse_perf_data(
 
 def generate_perf_compare_report(perf_files: list[str],
                                  output_path: str) -> None:
-    name_mapping, merged, suffixes = parse_perf_data(perf_files)
+    # When all perf tests in a stage are skipped/waived (e.g. an nvbugs waive)
+    # or reused from a previous pipeline, no perf CSV is produced. Skip report
+    # generation gracefully instead of raising FileNotFoundError, mirroring the
+    # missing-CSV handling in sanity_perf_check.py.
+    existing_files = [f for f in (perf_files or []) if Path(f).exists()]
+    if not existing_files:
+        print("No perf CSV files found (perf tests skipped/waived); "
+              "skipping perf comparison report generation.")
+        return
+    name_mapping, merged, suffixes = parse_perf_data(existing_files)
     generate_plots(Path(output_path), name_mapping, merged, suffixes)
 
 
