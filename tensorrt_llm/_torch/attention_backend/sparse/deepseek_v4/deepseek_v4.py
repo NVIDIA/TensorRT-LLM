@@ -1174,6 +1174,14 @@ class DeepseekV4Indexer(Indexer):
                 self.k_cache_update_event.record()
         else:
             weights, k_fp8, k_scale = pre_aux
+            # pre_aux tensors were allocated on aux_stream; record on the
+            # consuming stream so the caching allocator can't recycle them mid-use.
+            cur_stream = torch.cuda.current_stream()
+            weights.record_stream(cur_stream)
+            if k_fp8 is not None:
+                k_fp8.record_stream(cur_stream)
+            if k_scale is not None:
+                k_scale.record_stream(cur_stream)
             q = self._qk_projection_and_rope(qr, position_ids)
 
         q_fp8, q_scale = self._quantize_q(q)
