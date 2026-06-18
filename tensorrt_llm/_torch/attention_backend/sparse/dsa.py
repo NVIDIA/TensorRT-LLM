@@ -2396,8 +2396,19 @@ class Indexer(nn.Module):
                         num_k_tokens, gather_head_dim)
 
                     chunk_num_token = chunk.token_end - chunk.token_start
-                    apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
-                    if apply_q_split:
+                    # Always q-split when eligible: redundant per-rank
+                    # `fp8_mqa_logits` / `fp8_fp4_mqa_logits` are not bit-exact
+                    # across launches, so different TP ranks produce different
+                    # topk indices for the same tokens. The downstream MLA
+                    # attention then attends to divergent KV positions on
+                    # different ranks, corrupting KV-cache writes -- invisible
+                    # for short generations (e.g. MMLU's 2-token answers) but
+                    # accumulates into garbage over long ones (GSM8K's 256
+                    # tokens) -> 0% accuracy. The q-split + allgather path
+                    # canonicalizes ownership per-token, so any rank-local
+                    # nondeterminism is erased before downstream layers read
+                    # the indices. q_split_threshold < 0 still fully disables.
+                    if q_split_eligible:
                         chunk_q_start = chunk_num_token * tp_rank // tp_size
                         chunk_q_end = chunk_num_token * (tp_rank + 1) // tp_size
                     else:
@@ -2446,7 +2457,7 @@ class Indexer(nn.Module):
                             global_q_start:global_q_end, :topk_indices.
                             shape[-1]] = topk_indices.to(dtype=torch.int32)
 
-                    if apply_q_split:
+                    if q_split_eligible:
                         q_sizes = [(r + 1) * chunk_num_token // tp_size -
                                    r * chunk_num_token // tp_size
                                    for r in range(tp_size)]
