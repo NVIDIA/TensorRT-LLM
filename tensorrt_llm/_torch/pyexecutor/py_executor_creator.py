@@ -389,6 +389,7 @@ def create_py_executor(
         logger.warning(
             f"Disabling chunked context for {llm_args.attn_backend} backend")
         enable_chunked_context = False
+        llm_args.enable_chunked_prefill = False
 
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
@@ -503,6 +504,18 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    # Must run before validate_feature_combination so feature_status is correct.
+    config = model_engine.model.model_config.pretrained_config
+    if is_mla(config) and enable_chunked_context:
+        sm_version = get_sm_version()
+        if sm_version not in [90, 100, 103, 120]:
+            logger.warning(
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
+                f"disable enable_chunked_context for SM{sm_version}")
+            enable_chunked_context = False
+            llm_args.enable_chunked_prefill = False
+            model_engine.attn_runtime_features.chunked_prefill = False
+
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
 
     calibrator = get_calibrator()
@@ -578,6 +591,8 @@ def create_py_executor(
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
+            if not enable_chunked_context:
+                draft_model_engine.attn_runtime_features.chunked_prefill = False
     else:
         draft_model_engine = None
 
@@ -660,14 +675,6 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
-        if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
-            logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_chunked_context for SM{sm_version}")
-            enable_chunked_context = False
-            model_engine.attn_runtime_features.chunked_prefill = False
-            if draft_model_engine is not None:
-                draft_model_engine.attn_runtime_features.chunked_prefill = False
 
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block
