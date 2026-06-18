@@ -892,12 +892,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if num_prefills > 0:
             # PyExecutor guarantees prefill requests are placed before decode requests
             has_initial_states_p = has_initial_states[:num_prefills]
-            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=ssm_states.dtype, device=ssm_states.device
-            )
-            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=conv_states.dtype, device=conv_states.device
-            )
+            if not mamba_metadata.use_initial_states:
+                # All prefills are fresh — zero every slot unconditionally.
+                for state in (ssm_states, conv_states):
+                    state[state_indices_p] = 0
+            else:
+                # Use torch.where so the output shape is data-independent;
+                # boolean-mask indexing on a CUDA tensor would force a CPU sync.
+                for state in (ssm_states, conv_states):
+                    kept = state[state_indices_p]
+                    mask = has_initial_states_p.view(-1, *([1] * (kept.ndim - 1)))
+                    state.index_copy_(0, state_indices_p, torch.where(mask, kept, 0))
 
         is_target_verify = (
             num_decodes > 0

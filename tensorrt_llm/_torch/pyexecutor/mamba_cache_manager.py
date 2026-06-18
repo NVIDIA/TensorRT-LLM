@@ -1676,6 +1676,16 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
+        # The caller's get_num_free_blocks check sees only the full-attention
+        # window, but the unified C++ pool also holds the recurrent-states
+        # window used by mamba layers. If a CUDA-graph warmup batch exceeds
+        # that smaller window, add_sequence_batch raises "No free block found"
+        # from C++ and deadlocks ranks already past the collective. Return
+        # None so the caller skips this batch (the documented contract).
+        per_window_free = self.impl.get_kv_cache_stats(
+        ).num_free_blocks_per_window_size
+        if per_window_free and len(request_ids) > min(per_window_free.values()):
+            return None
         requests = super().add_dummy_requests(
             request_ids=request_ids,
             token_nums=token_nums,
