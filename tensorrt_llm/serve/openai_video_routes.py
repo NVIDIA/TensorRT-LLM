@@ -164,7 +164,7 @@ class _VideoRoutesMixin:
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
             )
-            if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "0") == "1":
+            if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
                 # Offload the blocking ffmpeg encode to a thread-pool executor so
                 # the event loop can start the next request's diffusion while this
                 # video encodes. Only overlaps when >=2 requests are in flight per
