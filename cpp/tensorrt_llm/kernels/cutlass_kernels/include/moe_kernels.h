@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
 #include <cstdint>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -67,6 +68,14 @@ struct LoraParams
     void* workspace;
 
     cudaEvent_t* memcpy_event_ptr;
+
+    // Device-side capture-safe LoRA path scratch. When device_path.enabled is
+    // true, the kernel uses launchMoeLoraPointerExpand, launchMoeLoraProblemBuilder,
+    // and cudaGraph(SplitK)GroupedGemm instead of the legacy host-pointer
+    // LoraImpl::run path. The pointers refer to persistent allocations owned by
+    // the calling FusedMoeRunner, so their addresses are stable across
+    // CUDA-graph captures and replays.
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePath device_path;
 
     LoraParams() = default;
 
@@ -308,6 +317,17 @@ struct QuantParams
 
         GemmInputs fc1;
         GemmInputs fc2;
+
+        // Dynamic fc2 input scale: compute fc2 input scale from intermediate activation at runtime.
+        // Only used when enabled = true; all pointers are nullptr otherwise.
+        struct DynamicFc2InputScale
+        {
+            bool enabled = false;
+            float* amax = nullptr;                 // [1] global amax output
+            float* alpha = nullptr;                // [num_experts] dynamic alpha output
+            void* bf16_buffer = nullptr;           // bf16 intermediate buffer
+            float const* weight_scale_2 = nullptr; // [num_experts] per-expert weight_scale_2 for fc2
+        } dynamic_fc2_input_scale;
     } fp4;
 
     // GPTQ/AWQ quantization params

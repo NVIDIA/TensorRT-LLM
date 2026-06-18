@@ -6,17 +6,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
-from transformers.modeling_utils import get_parameter_device
 
+from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import get_parameter_device
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -119,6 +129,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
         self.ff_out = Linear(
             in_features,
@@ -133,6 +144,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
 
         self.norm2 = LayerNorm(
@@ -191,6 +203,7 @@ class WanTimeTextImageEmbedding(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
 
@@ -200,8 +213,18 @@ class WanTimeTextImageEmbedding(nn.Module):
                 image_embed_dim, dim, pos_embed_seq_len=pos_embed_seq_len, model_config=model_config
             )
 
-    def forward(self, timestep, encoder_hidden_states, encoder_hidden_states_image=None):
+    def forward(
+        self,
+        timestep,
+        encoder_hidden_states,
+        encoder_hidden_states_image=None,
+        timestep_seq_len=None,
+    ):
         timestep = self.timesteps_proj(timestep)
+
+        # Unflatten timestep if seq_len is provided
+        if timestep_seq_len is not None:
+            timestep = timestep.unflatten(0, (-1, timestep_seq_len))
 
         # Get time_embedder dtype
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
@@ -261,19 +284,37 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV
-        # Default fuse_qk_norm_rope=False: flashinfer QKRMSNorm is faster for WAN's
-        # full-dim norm. User can override via config.attention.fuse_qk_norm_rope=True.
+        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
+        # 14B 40h) fit the default fused_dit_qk_norm_rope op's full-dim
+        # template now that the num_heads cap is 64 (post-survey 2026-05).
+        # However, this kernel does not support TP due to the cross-head
+        # normalization being a collective op. Thus, we must disable it if
+        # using TP.
+        # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
+        # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
+        # the async ulysses A2A path.
+        tp_size = model_config.mapping.tp_size if model_config.mapping else 1
+        vgm_self = model_config.visual_gen_mapping
+        ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
+        _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
+        self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=False,
+            # fuse_qk_norm_rope=True drives the packed kernel on sync (FUSE_QKV)
+            # and the split kernel on async (SEPARATE_QKV via forward_async).
+            # Disabled when TP>1 since the fused kernel lacks cross-rank
+            # all-reduce for the cross-head RMSNorm variance.
+            fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
+            async_ulysses=self._use_async_ulysses,
+            module_name=f"blocks.{_layer_idx}.attn1",
         )
 
         # Cross-attention with separate Q, K, V
@@ -286,6 +327,8 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
+            module_name=f"blocks.{_layer_idx}.attn2",
+            enable_sequence_parallel=False,
         )
 
         if cross_attn_norm:
@@ -310,13 +353,14 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
 
-        # I2V: Additional K/V projections for image embeddings
+        # I2V: Additional K/V projections for image embeddings.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
         if added_kv_proj_dim is not None:
+            tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
             self.add_k_proj = Linear(
                 added_kv_proj_dim,
                 hidden_size,
@@ -325,6 +369,8 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -334,9 +380,16 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
+                reduce_output=False,
             )
-            self.norm_added_k = RMSNorm(
-                hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True
+            self.norm_added_k = RMSNormTPAware(
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=dtype,
+                has_weights=True,
+                enable_tp=(tp_size > 1),
+                mapping=model_config.mapping,
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
@@ -351,10 +404,25 @@ class WanBlock(nn.Module):
         temb,
         freqs_cos,
         freqs_sin,
+        timestep=None,
     ):
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-            self.scale_shift_table.float() + temb.float()
-        ).chunk(6, dim=1)
+        if temb.ndim == 4:
+            # temb: batch_size, seq_len, 6, hidden_size
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.unsqueeze(0).float() + temb.float()
+            ).chunk(6, dim=2)
+            # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
+            shift_msa = shift_msa.squeeze(2)
+            scale_msa = scale_msa.squeeze(2)
+            gate_msa = gate_msa.squeeze(2)
+            c_shift_msa = c_shift_msa.squeeze(2)
+            c_scale_msa = c_scale_msa.squeeze(2)
+            c_gate_msa = c_gate_msa.squeeze(2)
+        else:
+            # temb: batch_size, 6, hidden_size
+            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                self.scale_shift_table.float() + temb.float()
+            ).chunk(6, dim=1)
 
         normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
         normed = normed.to(x.dtype)
@@ -362,15 +430,15 @@ class WanBlock(nn.Module):
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
-        # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        # Self-attention with RoPE. Async-ulysses dispatches to forward_async
+        # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
+        # side stream; both paths return 3D [B, S, H*D].
+        if self._use_async_ulysses:
+            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+        else:
+            attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep)
+
+        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         norm_x = self.norm2(x.float()).to(x.dtype)
 
@@ -393,6 +461,7 @@ class WanBlock(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=encoder_hidden_states_text.shape[1],
+            timestep=timestep,
         )
 
         # I2V: image cross-attention
@@ -407,6 +476,7 @@ class WanBlock(nn.Module):
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=encoder_hidden_states_img.shape[1],
+                timestep=timestep,
             )
             attn2_output = attn2_output + attn_img_output
 
@@ -422,32 +492,19 @@ class WanBlock(nn.Module):
         return x
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
 
     def __init__(
         self,
         model_config: DiffusionModelConfig,
     ):
-        super().__init__()
-
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
-        ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and num_heads % ulysses_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({num_heads}) must be divisible by "
-                f"ulysses_size ({ulysses_size})"
-            )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
+        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
 
         config = model_config.pretrained_config
 
@@ -545,6 +602,7 @@ class WanTransformer3DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
         self.scale_shift_table = nn.Parameter(
@@ -593,21 +651,25 @@ class WanTransformer3DModel(nn.Module):
     def forward(
         self,
         hidden_states,
-        timestep,
-        encoder_hidden_states,
+        timestep=None,
+        encoder_hidden_states=None,
         encoder_hidden_states_image=None,
         **kwargs,
     ):
         """
-        Forward pass with optional Ulysses sequence parallelism.
+        Forward pass with optional sequence parallelism (Ring, Ulysses, or Attention2D).
 
-        With Ulysses enabled (ulysses_size > 1):
-            1. Shard input sequence across ranks: [B, S] -> [B, S/P]
-            2. Each block's attention does internal all-to-all for full sequence
-            3. Gather output sequence: [B, S/P] -> [B, S]
+        When sharder is active:
+            1. Shard input sequence (and matching RoPE) across ranks: [B, S] -> [B, S/P]
+            2. Each block's attention handles cross-rank communication internally
+            3. All-gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
+
+        Args:
+            timestep: Normalized scheduler timestep tensor in [0, 1].
         """
+        del kwargs  # Kept for diffusers API compatibility.
         original_shape = hidden_states.shape
         B, C, T, H, W = original_shape
         pt, ph, pw = self.config.patch_size
@@ -618,33 +680,40 @@ class WanTransformer3DModel(nn.Module):
         # Patchify and flatten: [B, C, T, H, W] -> [B, S, hidden_size]
         x = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
 
-        # Shard sequence for Ulysses parallelism: [B, S] -> [B, S/P]
-        if self.use_ulysses:
-            seq_len = x.shape[1]
-            if seq_len % self.ulysses_size != 0:
-                raise ValueError(
-                    f"Sequence length ({seq_len}) is not divisible by ulysses_size ({self.ulysses_size}). "
-                    f"Adjust video dimensions or use a different ulysses_size."
-                )
+        # Shard sequence + matching RoPE across ranks (no-op when sharder is inactive).
+        seq_len = x.shape[1]
+        x = self.sharder.shard(x, dim=1)
+        rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
+        if rope is not None:
+            freqs_cos, freqs_sin = rope
 
-            chunk_size = seq_len // self.ulysses_size
-            x = x[:, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size, :]
+        # Time and text/image embeddings. WAN timestep embeddings use the
+        # scheduler's 1000-step scale internally.
+        timestep_for_embedding = timestep * 1000
+        # Timestep shape: [batch_size] or [batch_size, seq_len]
+        if timestep_for_embedding.ndim == 2:
+            ts_seq_len = timestep_for_embedding.shape[1]
+            timestep_for_embedding = timestep_for_embedding.flatten()
+        else:
+            ts_seq_len = None
 
-            # Shard RoPE frequencies to match sequence sharding
-            # RoPE freqs shape: [B, S, ...], so shard along dim 1 (sequence dimension)
-            if freqs_cos is not None and freqs_sin is not None:
-                freqs_cos = freqs_cos[
-                    :, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size
-                ]
-                freqs_sin = freqs_sin[
-                    :, self.ulysses_rank * chunk_size : (self.ulysses_rank + 1) * chunk_size
-                ]
-
-        # Time and text/image embeddings
         temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(timestep, encoder_hidden_states, encoder_hidden_states_image)
+            self.condition_embedder(
+                timestep_for_embedding,
+                encoder_hidden_states,
+                encoder_hidden_states_image,
+                timestep_seq_len=ts_seq_len,
+            )
         )
-        temb_proj = temb_proj.view(-1, 6, self.config.hidden_size)
+        # Reshape temb_proj based on whether timesteps were expanded
+        if ts_seq_len is not None:
+            # batch_size, seq_len, 6, hidden_size
+            temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
+            # Shard per-patch temb_proj to match the local sequence chunk
+            temb_proj = self.sharder.shard(temb_proj, dim=1, expected_seq_len=seq_len)
+        else:
+            # batch_size, 6, hidden_size
+            temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -660,7 +729,7 @@ class WanTransformer3DModel(nn.Module):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
-        # Transformer blocks (attention handles all-to-all internally for Ulysses)
+        # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:
             x = block(
                 x,
@@ -668,18 +737,21 @@ class WanTransformer3DModel(nn.Module):
                 temb_proj,
                 freqs_cos,
                 freqs_sin,
+                timestep=timestep,
             )
 
-        # Gather sequence from all ranks: [B, S/P] -> [B, S]
-        if self.use_ulysses:
-            # Ensure tensor is contiguous before all_gather
-            x = x.contiguous()
-            x_list = [torch.zeros_like(x) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(x_list, x, group=self.ulysses_pg)
-            x = torch.cat(x_list, dim=1)
+        # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
+        x = self.sharder.gather(x, dim=1)
 
         # Output projection and unpatchify
-        shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+        if temb.ndim == 3:
+            # batch_size, seq_len, hidden_size
+            shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
+        else:
+            # batch_size, hidden_size
+            shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
         x = self.norm_out(x) * (1 + scale) + shift
         x = x.to(hidden_states.dtype)
 
@@ -739,6 +811,9 @@ class WanTransformer3DModel(nn.Module):
                     loader.load_linear_weights(module, name, weight_dicts)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
+            elif isinstance(module, RMSNormTPAware):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():

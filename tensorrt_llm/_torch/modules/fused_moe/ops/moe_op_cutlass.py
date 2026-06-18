@@ -194,15 +194,72 @@ class CutlassMoEOp(MoEOp):
         unpadded_hidden_size = getattr(module, 'unpadded_hidden_size',
                                        x.shape[1])
 
-        # Run the actual MoE computation
-        output = run_moe(x, token_selected_slots, token_final_scales,
-                         w3_w1_weight.view(weight_dtype), w3_w1_bias,
-                         w2_weight.view(weight_dtype), w2_bias, quant_scales,
-                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
-                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
-                         cluster_size, cluster_rank, use_all_to_all,
-                         min_latency_mode, self.gemm_tactics, activation_type,
-                         unpadded_hidden_size, tuner_num_tokens, None)
+        use_dynamic_fc2_scale = (
+            getattr(module, 'has_nvfp4', False)
+            and getattr(module, 'force_dynamic_quantization', False)
+            and hasattr(module, 'fc2_weight_scale_2'))
+
+        # Ensure quant_scales is a plain list for C++ ArrayRef<Tensor> binding.
+        # NamedTuple (e.g. FusedMoEQuantScalesW4A8) may not convert correctly.
+        if not isinstance(quant_scales, list):
+            quant_scales = list(quant_scales)
+
+        # The C++ run_moe and run_moe_min_latency bindings are TorchBind methods
+        # whose schemas do not honor C++ default arguments, so every positional
+        # argument must be supplied. run_moe has trailing routed-expert LoRA
+        # args; MoE LoRA is fused inside torch.ops.trtllm.fused_moe and never
+        # flows through this op path, so pass None or 0 for them.
+        # run_moe_min_latency takes no use_dynamic_fc2_scale or LoRA args, so its
+        # call stops at out_tensor.
+        if min_latency_mode:
+            output = run_moe(x, token_selected_slots, token_final_scales,
+                             w3_w1_weight.view(weight_dtype), w3_w1_bias,
+                             w2_weight.view(weight_dtype), w2_bias,
+                             quant_scales, input_sf, swizzled_input_sf,
+                             swiglu_alpha, swiglu_beta, swiglu_limit, tp_size,
+                             tp_rank, ep_size, ep_rank, cluster_size,
+                             cluster_rank, use_all_to_all, min_latency_mode,
+                             self.gemm_tactics, activation_type,
+                             unpadded_hidden_size, tuner_num_tokens, None)
+        else:
+            output = run_moe(
+                x,
+                token_selected_slots,
+                token_final_scales,
+                w3_w1_weight.view(weight_dtype),
+                w3_w1_bias,
+                w2_weight.view(weight_dtype),
+                w2_bias,
+                quant_scales,
+                input_sf,
+                swizzled_input_sf,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+                tp_size,
+                tp_rank,
+                ep_size,
+                ep_rank,
+                cluster_size,
+                cluster_rank,
+                use_all_to_all,
+                min_latency_mode,
+                self.gemm_tactics,
+                activation_type,
+                unpadded_hidden_size,
+                tuner_num_tokens,
+                None,
+                use_dynamic_fc2_scale,
+                # Routed-expert LoRA args, unused on this op path.
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0)
 
         # Return output based on latency mode
         return output if min_latency_mode else [output]

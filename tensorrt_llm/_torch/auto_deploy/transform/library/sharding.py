@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Transformations to support graph sharding.
 
 .. deprecated::
@@ -34,13 +48,20 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from ..._compat import AllReduceStrategy
 
-from .....functional import AllReduceStrategy
-from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
+try:
+    from ...custom_ops.distributed.trtllm_dist import is_trtllm_op_available
+except (ModuleNotFoundError, ImportError):
+
+    def is_trtllm_op_available():
+        return False
+
+
 from ...models.factory import ModelFactory, ShardingConfigSource
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
+from ...utils.dist_config import DistConfig
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     LayerSubgraph,
@@ -68,6 +89,7 @@ from ...utils.node_utils import (
     shape,
     subgraph,
 )
+from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     modelopt_fp4_scale_to_cutlass_fp4_scale,
@@ -190,6 +212,18 @@ class DistBackend(Enum):
     TORCH = "torch"
 
 
+class AllGatherStrategy(Enum):
+    """Enum for AllGather strategy.
+
+    AUTO: Use NCCL AllGather (default).
+    SYMM_MEM: Use PyTorch symmetric memory with MULTIMEM hardware instructions.
+              Falls back to NCCL for unsupported cases (variable sizes, dim!=0, large tensors).
+    """
+
+    AUTO = "AUTO"
+    SYMM_MEM = "SYMM_MEM"
+
+
 class MLPType(Enum):
     """Enum for MLP type."""
 
@@ -244,6 +278,13 @@ class ShardingTransformConfig(TransformConfig):
         "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
     )
 
+    allgather_strategy: AllGatherStrategy = Field(
+        default=AllGatherStrategy.AUTO,
+        description="AllGather strategy for distributed operations. "
+        "Options: AUTO (NCCL AllGather), SYMM_MEM (symmetric memory with MULTIMEM, "
+        "falls back to NCCL for unsupported cases).",
+    )
+
     dist_backend: DistBackend = Field(default=DistBackend.AUTO)
 
     enable_attention_dp: bool = Field(
@@ -264,20 +305,18 @@ class ShardingTransformConfig(TransformConfig):
     dist_config: DistConfig = Field(default_factory=DistConfig)
 
     def _init_mapping(self):
-        """Initialize DistConfig from dist_mapping config.
+        """Initialize ``self.dist_config`` from ``dist_mapping`` (test-only fallback).
 
-        NOTE: This method is now primarily a fallback. The preferred flow is:
-        1. DistConfig is constructed in ad_executor.py from the Mapping object
-        2. Passed through SharedConfig.dist_config to the sharding transform
-        3. Only if SharedConfig.dist_config is None, this fallback is used
+        Production path builds ``DistConfig`` in ``LlmArgs.init_dist_config`` and
+        passes it through ``SharedConfig.dist_config``.  This fallback is only
+        entered when ``shared_config.dist_config is None`` (tests constructing
+        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).  Will
+        be removed together with the legacy sharding pipeline.
         """
-        self.dist_config = DistConfig(
-            world_size=self.world_size,
+        self.dist_config = DistConfig.from_sharding_params(
             rank=self.rank,
-            tp_size=self.dist_mapping.get("tp", self.world_size),
-            moe_tp_size=self.dist_mapping.get("moe_tp", 1),
-            moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
-            moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+            world_size=self.world_size,
+            dist_mapping=self.dist_mapping,
             enable_attention_dp=self.enable_attention_dp,
             allreduce_strategy=self.allreduce_strategy.name,
         )
@@ -337,6 +376,22 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+
+    @field_validator("allgather_strategy", mode="before")
+    @classmethod
+    def _validate_allgather_strategy(cls, v):
+        """Convert string names like 'AUTO' or 'SYMM_MEM' to AllGatherStrategy enum."""
+        if isinstance(v, AllGatherStrategy):
+            return v
+        if isinstance(v, str):
+            try:
+                return AllGatherStrategy(v.upper())
+            except (ValueError, KeyError):
+                raise ValueError(
+                    f"Invalid allgather strategy: {v}. "
+                    f"Valid options: {', '.join(s.value for s in AllGatherStrategy)}"
+                )
+        return v
 
 
 class ShardingTransformInfo(BaseModel, ABC):
@@ -534,17 +589,16 @@ class QuantizationShardingMixin(ABC):
         for k, v in sharded_scales.items():
             submod.register_buffer(k, v)
 
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                self.shard_load_hook,
-                weight_name=weight_key,
-                weight_original_shape=weight_original_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-                min_local_shape=min_local_shape,
-            )
+        hook = partial(
+            self.shard_load_hook,
+            weight_name=weight_key,
+            weight_original_shape=weight_original_shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
         )
+        gm._register_load_state_dict_pre_hook(hook)
 
 
 class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
@@ -596,7 +650,9 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         return ["weight_scale_inv"]
 
     @staticmethod
-    def _compute_shard_bounds(weight_original_n: int, rank: int, world_size: int):
+    def _compute_shard_bounds(
+        weight_original_n: int, rank: int, world_size: int
+    ) -> tuple[int, int]:
         """Compute (row_start, n_shard) matching torch.tensor_split semantics."""
         n_big = weight_original_n % world_size
         size_big = weight_original_n // world_size + 1
@@ -646,6 +702,19 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         else:
             return scale[:, scale_indices]
 
+    @classmethod
+    def _get_sharded_scale(
+        cls,
+        scale: torch.Tensor,
+        weight_original_n: int,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> torch.Tensor:
+        """Shard a blocked FineGrained FP8 scale tensor for the local TP rank."""
+        row_start, n_shard = cls._compute_shard_bounds(weight_original_n, rank, world_size)
+        return cls._expand_scale_per_row(scale, dim, row_start, n_shard)
+
     def shard_scales(
         self,
         dim: int,
@@ -658,8 +727,13 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         weight_scale_inv: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         weight_original_n = weight_original_shape[dim]
-        row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
-        sharded_scale = self._expand_scale_per_row(weight_scale_inv, dim, row_start, n_shard)
+        sharded_scale = self._get_sharded_scale(
+            weight_scale_inv,
+            weight_original_n,
+            dim,
+            rank,
+            world_size,
+        )
         return {"weight_scale_inv": sharded_scale}
 
     def shard_load_hook(
@@ -679,8 +753,13 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         if scale_key in state_dict:
             scale = state_dict[scale_key]
             weight_original_n = weight_original_shape[dim]
-            row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
-            state_dict[scale_key] = self._expand_scale_per_row(scale, dim, row_start, n_shard)
+            state_dict[scale_key] = self._get_sharded_scale(
+                scale,
+                weight_original_n,
+                dim,
+                rank,
+                world_size,
+            )
 
 
 def _shard_fp4_weight_scale(
@@ -840,14 +919,13 @@ class BMMShardingInfo(ShardingTransformInfo):
                 gm.get_submodule(modname).register_parameter(param_name, param_new)
 
                 # Register load state dict hook
-                gm._register_load_state_dict_pre_hook(
-                    partial(
-                        _load_hook,
-                        f_split=slice_tensor,
-                        param_key=weight_key,
-                        param_shape=param_new.shape,
-                    )
+                hook = partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
                 )
+                gm._register_load_state_dict_pre_hook(hook)
             else:
                 # Handle dynamic tensor
                 with gm.graph.inserting_before(bmm_node):
@@ -864,7 +942,11 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, lhs_tensor, 0, self.start_idx, self.end_idx)
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
-        # Add all_gather node after BMM to collect results
+        # Add all_gather node after BMM to collect results.
+        # BMM sharding always uses the torch (demollm) backend, which is a
+        # plain torch.distributed all_gather and has no strategy/symm_mem
+        # knobs. Op signature is (tensor, dim=0, sizes=None); `sizes` is
+        # unused on the torch backend (kept only for parity with trtllm).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
@@ -1103,14 +1185,9 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Draft models are not sharded — they run unsharded inside EagleWrapper.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+        _is_draft = getattr(gm, "is_draft", False)
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
         config.rank = local_rank
@@ -1179,6 +1256,12 @@ class Sharding(BaseTransform):
             # they can only apply to yet-unsharded nodes.
             for source in config.sharding_source:
                 if source == ShardingSource.FACTORY:
+                    if _is_draft:
+                        # Factory config contains the *target* model's HF base_tp_plan,
+                        # whose weight name patterns (e.g. "self_attn.q_proj") don't match
+                        # draft model node names. Skip factory for drafters and let
+                        # heuristic-based sharding handle them instead.
+                        continue
                     if len(config.factory_config) == 0:
                         ad_logger.debug(
                             "No factory config found. Skipping sharding from factory config"
@@ -1225,12 +1308,6 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Draft models are not sharded — they run unsharded inside EagleWrapper.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
@@ -1255,6 +1332,18 @@ class ShardingTransformExecutor(BaseTransform):
             f"BMM={len(transforms.bmm_transforms)}, "
             f"RMSNorm={len(transforms.rmsnorm_transforms)}"
         )
+
+        # If there are EP transforms and we have a CachedSequenceInterface, ensure
+        # batch_info_host is added to the graph as a placeholder and activated on
+        # the SequenceInfo so the runtime DP-aware max_num_tokens (slot 14) flows
+        # into the MoE all-to-all op as a kwarg. _add_or_retrieve_input is
+        # idempotent — safe even if another transform (e.g.
+        # gather_logits_before_lm_head) already added the placeholder.
+        # When cm is None (e.g., unit tests that drive the sharding transform
+        # standalone), skip — the MoE op falls back to max_num_tokens.
+        if transforms.ep_transforms and cm is not None:
+            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
+
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
                 if check_and_apply(tp_transform):
@@ -1394,44 +1483,25 @@ def validate_allreduce_strategy(v):
 
 
 def _get_dist_ops(backend: str):
-    """Get the appropriate distributed ops based on backend availability.
+    """Get the (all_gather, all_reduce) op pair for *backend*.
 
-    Args:
-        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
-                 'auto' will automatically select based on availability.
-
-    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    backend may be 'auto', 'trtllm', or 'torch'. 'auto' resolves to TRT-LLM
+    ops when available, else PyTorch distributed ops. Strategies (allgather
+    SYMM_MEM, allreduce NCCL/etc.) are passed as op arguments at the call
+    site, not selected here.
     """
-    # Handle DistBackend enum or string
     if hasattr(backend, "value"):
         backend = backend.value
 
-    if backend == "trtllm":
-        # Force TRT-LLM ops
+    if backend == "trtllm" or is_trtllm_op_available():
         return (
             torch.ops.auto_deploy.trtllm_dist_all_gather.default,
             torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
         )
-    elif backend == "torch":
-        # Force PyTorch distributed ops
-        return (
-            torch.ops.auto_deploy.torch_dist_all_gather.default,
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-        )
-    else:  # auto
-        # Automatically select based on availability
-        if is_trtllm_op_available():
-            # Use TRT-LLM optimized ops in MPI mode
-            return (
-                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-            )
-        else:
-            # Use PyTorch distributed ops in demollm mode
-            return (
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
-                torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            )
+    return (
+        torch.ops.auto_deploy.torch_dist_all_gather.default,
+        torch.ops.auto_deploy.torch_dist_all_reduce.default,
+    )
 
 
 def _validate_sharded_shapes(
@@ -1509,6 +1579,10 @@ TP_SHARDING_RULES = [
     ),
     (
         lambda n: is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear),
+        FineGrainedFP8WeightShardingInfo,
+    ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.trtllm_fp8_deepgemm),
         FineGrainedFP8WeightShardingInfo,
     ),
 ]
@@ -1639,12 +1713,25 @@ def shard_weight_tensor(
     # the state_dict (e.g., unfusing fused MoE checkpoint weights into
     # individual expert keys). With the hook on gm, it would run before
     # unfusing and fail to find the individual expert keys.
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=param_name,
+        param_shape=sharded_shape,
+    )
     submod._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=param_name,
-            param_shape=sharded_shape,
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_tp",
+                "param_key": param_name,
+                "param_shape": list(sharded_shape),
+                "dim": dim,
+                "rank": rank,
+                "world_size": world_size,
+                "min_local_shape": min_local_shape,
+                "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
+            },
         )
     )
     param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
@@ -1760,10 +1847,20 @@ def _shard_parameter_node(
     if not add_dist:
         return
 
-    # figure out the right dist op (backend-aware)
+    # figure out the right dist op (backend-aware) — strategies flow as op args
     all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
+    # Per-backend allgather op signatures:
+    #   trtllm_dist_all_gather(tensor, strategy, dim=0, sizes=None, workspace_id=0)
+    #   torch_dist_all_gather(tensor, dim=0, sizes=None)   # demollm only, no strategy
+    # `strategy` is required on the trtllm op (no default) so the caller cannot
+    # accidentally drop the AD-config-selected strategy. The torch op is a plain
+    # torch.distributed all_gather and intentionally has no strategy/symm_mem.
+    if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
+        allgather_args = (config.allgather_strategy.name, -1, None)
+    else:
+        allgather_args = (-1,)
     dist_lookup = {
-        0: (all_gather_op, -1),
+        0: (all_gather_op, *allgather_args),
         1: (all_reduce_op, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]
@@ -1868,7 +1965,8 @@ def _tp_shard_moe_scale(
         )
     elif scale_name == "weight_scale_inv":
         f_split = partial(
-            FineGrainedFP8WeightShardingInfo._split_scale,
+            FineGrainedFP8WeightShardingInfo._get_sharded_scale,
+            weight_original_n=orig_weight_shape[dim],
             dim=dim,
             rank=rank,
             world_size=world_size,
@@ -1881,14 +1979,13 @@ def _tp_shard_moe_scale(
 
     # Register load hook on the owning submodule so it runs after any
     # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
-    submod._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=attr_name,
-            param_shape=sharded_scale.shape,
-        )
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=attr_name,
+        param_shape=sharded_scale.shape,
     )
+    submod._register_load_state_dict_pre_hook(hook)
 
 
 def _insert_sharded_moe(
@@ -2064,11 +2161,23 @@ def _insert_sharded_moe(
     # (Will be used inside the op to determine enable_alltoall and workspace size)
     mapping_config = config.dist_config.serialize()
 
+    # Look up batch_info_host placeholder if present. ShardingTransformExecutor
+    # ensures it's added/activated when there are EP transforms; if it's missing
+    # (e.g., a different code path bypasses the executor), the MoE op falls back
+    # to max_num_tokens for runtime padding.
+    batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
+    batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+
     # Write back weight/scale list updates (applied above) and inject mapping args.
     # set_op_args uses the op schema to place values into kwargs or the correct
     # positional slot, avoiding manual index arithmetic.
     node.args = tuple(args)
-    set_op_args(node, mapping_config=mapping_config, max_num_tokens=config.max_num_tokens)
+    set_op_args(
+        node,
+        mapping_config=mapping_config,
+        max_num_tokens=config.max_num_tokens,
+        batch_info_host=batch_info_host_node,
+    )
 
     if not enable_alltoall:
         # =====================================================================================

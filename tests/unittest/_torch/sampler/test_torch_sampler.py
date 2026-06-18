@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
+from types import SimpleNamespace
 from typing import (
     Any,
     Callable,
@@ -66,6 +67,58 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+class TestSetupSamplerStepRequestSelection:
+    @staticmethod
+    def _make_request(
+        *,
+        is_attention_dp_dummy: bool = False,
+        is_finished: bool = False,
+        py_is_draft: bool = False,
+    ) -> LlmRequest:
+        return cast(
+            LlmRequest,
+            SimpleNamespace(
+                is_attention_dp_dummy=is_attention_dp_dummy,
+                is_finished=is_finished,
+                py_is_draft=py_is_draft,
+            ),
+        )
+
+    def test_collect_new_requests_for_setup_includes_adp_dummy_generation_requests(self):
+        scheduled_requests = ScheduledRequests()
+
+        context_request = self._make_request()
+        finished_context_request = self._make_request(is_finished=True)
+        draft_context_request = self._make_request(py_is_draft=True)
+        adp_dummy_generation_request = self._make_request(is_attention_dp_dummy=True)
+        regular_generation_request = self._make_request()
+        finished_adp_dummy_generation_request = self._make_request(
+            is_attention_dp_dummy=True, is_finished=True
+        )
+        draft_adp_dummy_generation_request = self._make_request(
+            is_attention_dp_dummy=True, py_is_draft=True
+        )
+
+        scheduled_requests.context_requests_last_chunk = [
+            context_request,
+            finished_context_request,
+            draft_context_request,
+        ]
+        scheduled_requests.generation_requests = [
+            adp_dummy_generation_request,
+            regular_generation_request,
+            finished_adp_dummy_generation_request,
+            draft_adp_dummy_generation_request,
+        ]
+
+        collected = TorchSampler._collect_new_requests_for_setup(scheduled_requests)
+        assert len(collected) == 4
+        assert collected[0] is context_request
+        assert collected[1] is adp_dummy_generation_request
+        assert collected[2] is finished_adp_dummy_generation_request
+        assert collected[3] is draft_adp_dummy_generation_request
 
 
 @force_ampere
@@ -1420,7 +1473,7 @@ class TestBatchedSampling:
             def _mock_filter(self, requests: ScheduledRequests) -> list[LlmRequest]:
                 return requests.all_requests()
 
-            patcher.setattr(TorchSampler, "_filter_new_requests", _mock_filter)
+            patcher.setattr(TorchSampler, "_collect_new_requests_for_setup", _mock_filter)
 
             sample_states = [
                 maybe_check_no_sync(

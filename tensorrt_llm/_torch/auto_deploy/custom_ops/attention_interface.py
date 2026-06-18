@@ -26,6 +26,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
@@ -34,13 +35,17 @@ from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 from torch.types import Number
 
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
-from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
+from .._compat import KvCacheConfig, nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
 
 Constant = Union[int, float, str, None]
+
+
+class AttentionType(Enum):
+    mha = "mha"
+    mla = "mla"
+
 
 # Torch dtype → numpy dtype for fast list-to-tensor conversion.
 # numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
@@ -297,7 +302,7 @@ class InputBuffer:
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
                     trunc_d_buf.copy_(trunc_h_buf, non_blocking=True)
 
-    def copy_to_host(self) -> None:
+    def copy_to_host(self, non_blocking: bool = False) -> None:
         """Copy from device buffer to host buffer.
 
         Mirrors ``copy_to_device``: uses the current length of the truncatable tensor
@@ -308,7 +313,7 @@ class InputBuffer:
             if self._total_bytes > 0:
                 h_buffer = self._host_buffer[: self._total_bytes]
                 d_buffer = self._device_buffer[: self._total_bytes]
-                h_buffer.copy_(d_buffer, non_blocking=True)
+                h_buffer.copy_(d_buffer, non_blocking=non_blocking)
 
             # Copy each truncatable tensor independently, truncated to current length
             for name in self._truncatable_names:
@@ -318,7 +323,7 @@ class InputBuffer:
                     copy_bytes = length * dtype.itemsize
                     trunc_d_buf = self._trunc_device_bufs[name][:copy_bytes]
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
-                    trunc_h_buf.copy_(trunc_d_buf, non_blocking=True)
+                    trunc_h_buf.copy_(trunc_d_buf, non_blocking=non_blocking)
 
     def resize(self, name: str, new_capacity: int) -> None:
         """Resize a truncatable tensor's capacity.
@@ -356,6 +361,29 @@ class InputBuffer:
         self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
         self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
 
+    def add_truncatable_tensor(self, name: str, max_numel: int, dtype: torch.dtype) -> None:
+        """Add a new truncatable tensor after initialization.
+
+        Args:
+            name: Name of the tensor.
+            max_numel: Maximum number of elements.
+            dtype: Data type.
+        """
+        assert name not in self._tensor_specs, f"Tensor '{name}' already registered"
+        self._tensor_specs[name] = (max_numel, dtype)
+        self._tensor_order.append(name)
+        self._truncatable_names.add(name)
+        self._current_lengths[name] = 0
+
+        byte_size = max_numel * dtype.itemsize
+        device = self._device_buffer.device
+        self._trunc_device_bufs[name] = torch.empty(byte_size, dtype=torch.uint8, device=device)
+        self._trunc_host_bufs[name] = torch.empty(
+            byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
+        )
+        self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
+        self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
+
     def to(self, *args, **kwargs) -> None:
         """Move all device buffers to a new device/dtype."""
         old_device = self._device_buffer.device
@@ -381,7 +409,7 @@ class BatchInfo:
     Args:
         batch_info_host: The batch info tensor on the host.
 
-    The information is stored in a 12-element batch_info_host tensor as follows:
+    The information is stored in a 15-element batch_info_host tensor as follows:
 
     Slots 0-5 (batch composition):
     - [0] num_prefill: number of prefill requests
@@ -401,10 +429,23 @@ class BatchInfo:
     - [10] num_tokens_to_gather: number of tokens to gather before LM head
     - [11] gather_required: whether gathering is required (0 or 1)
 
+    Slot 12 (spec-decoding info, set once at runtime init):
+    - [12] max_draft_len: maximum draft length per request (0 when not spec dec)
+
+    Slot 13 (replay mode flag, set once at runtime init):
+    - [13] use_replay: 1 if SSM replay state-update path is active, 0 otherwise
+
+    Slot 14 (DP-aware token info, updated per forward when attention-DP is on):
+    - [14] max_dp_num_tokens: max(total_num_tokens) across all DP ranks for this
+      forward step. Equals local total_num_tokens when attention-DP is off.
+      Used by MoE all-to-all to size dispatch padding without over-padding to the
+      static config max_num_tokens. Mirrors base TRT-LLM's
+      ``runtime_max_tokens_per_rank`` from ``model_engine._get_all_rank_num_tokens``.
+
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 12
+    _NUM_ELEMENTS = 15
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -415,15 +456,30 @@ class BatchInfo:
         # Use the tensor view directly so fake tensors can flow through
         # torch.compile metadata tracing without requiring a real .numpy() view.
         self._batch_info = batch_info_host
+        # Cached zero-copy numpy view for fast scalar/list writes on the host path.
+        # `.numpy()` raises RuntimeError on fake tensors and TypeError on cuda tensors;
+        # both fall back to the slow tensor-write path.
+        try:
+            self._batch_info_np = batch_info_host.numpy()
+        except (RuntimeError, TypeError):
+            self._batch_info_np = None
 
     def serialize(self) -> torch.Tensor:
         return self._batch_info_host
 
     def update(self, batch_info: List[int]) -> None:
-        self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
+        if self._batch_info_np is not None:
+            self._batch_info_np[:6] = batch_info
+        else:
+            self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
 
     def is_generate_only(self) -> bool:
         return self._batch_info[:4].sum().item() == 0
+
+    def is_extend_only(self) -> bool:
+        """True when batch contains only extend requests (no prefill, no decode)."""
+        num_prefill, num_extend, num_decode = self.get_num_sequences()
+        return num_prefill == 0 and num_extend > 0 and num_decode == 0
 
     def get_total_num_sequences(self) -> int:
         return sum(self.get_num_sequences())
@@ -477,6 +533,9 @@ class BatchInfo:
     def get_max_context_length(self) -> int:
         return int(self._batch_info[6])
 
+    def get_max_seq_len(self) -> int:
+        return self.get_max_context_length()
+
     def get_max_blocks_per_seq(self) -> int:
         return int(self._batch_info[7])
 
@@ -501,6 +560,41 @@ class BatchInfo:
 
     def is_gather_required(self) -> bool:
         return bool(self._batch_info[11])
+
+    # --- spec-decoding info (slot 12) writer ---
+
+    def update_max_draft_len(self, max_draft_len: int) -> None:
+        self._batch_info[12] = max_draft_len
+
+    # --- spec-decoding info (slot 12) readers ---
+
+    def get_max_draft_len(self) -> int:
+        return int(self._batch_info[12])
+
+    # --- replay mode flag (slot 13) writer ---
+
+    def update_use_replay(self, use_replay: bool) -> None:
+        self._batch_info[13] = int(use_replay)
+
+    # --- replay mode flag (slot 13) reader ---
+
+    def is_use_replay(self) -> bool:
+        return bool(self._batch_info[13])
+
+    # --- DP-aware token info (slot 14) writer ---
+
+    def update_max_dp_num_tokens(self, max_dp_num_tokens: int) -> None:
+        """Set the max-across-DP-ranks total token count for this forward.
+
+        When attention-DP is off, callers should write the local total_num_tokens
+        so consumers can read this slot uniformly without checking attn-DP state.
+        """
+        self._batch_info[14] = max_dp_num_tokens
+
+    # --- DP-aware token info (slot 14) reader ---
+
+    def get_max_dp_num_tokens(self) -> int:
+        return int(self._batch_info[14])
 
 
 class SequenceInfo:
@@ -545,7 +639,8 @@ class SequenceInfo:
 
     ### BATCH INFO OBJECT ########################################################################
     - batch_info_host: a single host tensor managed by the ``BatchInfo`` class. It consolidates
-      batch composition, max sequence info, and tokens gather info into one 12-element int tensor.
+      batch composition, max sequence info, tokens gather info, spec-dec info, and DP-aware
+      token info into one 14-element int tensor.
       See the ``BatchInfo`` docstring for the full layout. Custom ops receive this tensor as a
       graph input and should wrap it via ``BatchInfo(batch_info_host)`` to extract fields.
 
@@ -618,6 +713,8 @@ class SequenceInfo:
         # will store num_blocks later...
         self._num_blocks = None
 
+        self.attention_type: Optional[AttentionType] = None
+
         # TODO (lucaslie): can we remove this eventually from this i/f?
         self.vocab_size_padded = vocab_size_padded
 
@@ -663,6 +760,7 @@ class SequenceInfo:
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
             ("seq_len", self.max_batch_size, torch.int),
             ("seq_len_with_cache", self.max_batch_size, torch.int),
+            ("prompt_lens", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
@@ -692,6 +790,11 @@ class SequenceInfo:
 
         # EXTRA TENSOR FIELDS ######################################################################
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
+        ############################################################################################
+
+        # VSWA WINDOW GROUPS #######################################################################
+        self._window_groups: List[int] = []
+        self._window_group_map: Dict[int, int] = {}
         ############################################################################################
 
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
@@ -724,8 +827,9 @@ class SequenceInfo:
         # check if we are still running uncached attention in which case we are also still
         # operate on unflattened tensors with explicit [batch_size, seq_len, ...] shape
         # generate-only batches are also formatted like this (i.e. [b, 1])
+        # Extend-only batches are also rectangular by construction.
         total_num_tokens = self.total_num_tokens
-        if not self._use_flattened_layout or self.is_generate_only:
+        if not self._use_flattened_layout or self.is_generate_only or self.is_extend_only:
             bs = self.num_sequences
             sl = total_num_tokens // bs
         # use [1,total_len] shape to indicate non-generate-only batch for cached attention
@@ -818,6 +922,10 @@ class SequenceInfo:
         return self.batch_info.is_generate_only()
 
     @property
+    def is_extend_only(self) -> bool:
+        return self.batch_info.is_extend_only()
+
+    @property
     def num_blocks(self) -> int:
         assert self._num_blocks is not None, "num_blocks not set yet"
         return self._num_blocks
@@ -832,13 +940,20 @@ class SequenceInfo:
         num_blocks_estimate = num_blocks_estimate_per_seq * self.max_batch_size
         return num_blocks_estimate * self.tokens_per_block
 
-    def update_cache_information(self, num_blocks: int, block_offset_multiplier: int = 0) -> None:
+    def update_cache_information(
+        self,
+        num_blocks: int,
+        block_offset_multiplier: int = 0,
+    ) -> None:
         """Update cache information after cache manager creation.
 
         Sets num_blocks and block_offset_multiplier, writes max_seq_info into BatchInfo
         (constant after this call), and resizes cache_loc if needed.
+
+        Args:
+            num_blocks: Number of blocks in the primary pool.
+            block_offset_multiplier: Block offset multiplier derived from kv_cache strides.
         """
-        # set num_blocks and block_offset_multiplier
         self._num_blocks = num_blocks
 
         # write max_seq_info once into BatchInfo (constant after this call)
@@ -859,6 +974,97 @@ class SequenceInfo:
 
         if estimated_capacity > cache_loc_capacity:
             self._input_buffer.resize("cache_loc", estimated_capacity)
+            # Keep per-group cache_loc buffers in sync
+            for group_idx in range(1, self.num_window_groups):
+                self._input_buffer.resize(f"cache_loc_g{group_idx}", estimated_capacity)
+
+    def register_window_groups(self, window_sizes: List[int]) -> None:
+        """Register KV window groups and create per-group cache tensors.
+
+        Group ordering here matches the KV-cache group/pool ordering produced by
+        the kvcache transform — ``window_sizes[g]`` belongs to pool ``g``, so a
+        single ``group_idx`` routes graph metadata, storage pools, and runtime
+        inputs together.
+
+        Group 0 reuses the existing ``cache_loc`` / ``cu_num_pages`` /
+        ``last_page_len`` / ``extra_page_per_seq`` tensors.
+        Groups 1..N-1 get new dedicated tensors (``cache_loc_g{i}``,
+        ``cu_num_pages_g{i}``, ...).  For a single-pool (non-VSWA) model only
+        group 0 is registered and no new tensors are created.
+
+        Args:
+            window_sizes: List of per-group window sizes (one entry per group, in
+                the same order as the KV groups).  Full-attention groups use
+                ``max_seq_len``.
+        """
+        assert len(window_sizes) >= 1, "register_window_groups requires at least 1 window"
+        self._window_groups = list(window_sizes)
+        self._window_group_map = {ws: idx for idx, ws in enumerate(window_sizes)}
+
+        cache_loc_cap = self._input_buffer.get_capacity("cache_loc")
+        for group_idx in range(1, len(window_sizes)):
+            suffix = f"_g{group_idx}"
+            self._input_buffer.add_truncatable_tensor(
+                f"cache_loc{suffix}", cache_loc_cap, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"cu_num_pages{suffix}", self.max_batch_size + 1, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"last_page_len{suffix}", self.max_batch_size, torch.int
+            )
+            self._input_buffer.add_truncatable_tensor(
+                f"extra_page_per_seq{suffix}", self.max_batch_size, torch.int
+            )
+            # Per-group seq_len_with_cache: under SWA front-eviction the window's
+            # live cache length diverges from the global (input_pos + seq_len),
+            # so groups 1..N-1 carry their own window-capped values for both the
+            # kernel's mask math and the prepare-extra-metadata op (which uses
+            # it to compute write positions for new KV tokens).
+            self._input_buffer.add_truncatable_tensor(
+                f"seq_len_with_cache{suffix}", self.max_batch_size, torch.int
+            )
+            # Register as available args (device + host variants)
+            group_names = [
+                f"cache_loc{suffix}",
+                f"cu_num_pages{suffix}",
+                f"last_page_len{suffix}",
+                f"extra_page_per_seq{suffix}",
+                f"seq_len_with_cache{suffix}",
+            ]
+            for base_name in group_names:
+                self._available_args.add(base_name)
+                self._available_args.add(base_name + self._host_suffix)
+
+            # Zero-fill all per-group device buffers so shape-checking forward
+            # passes (resize_kv_cache) that run before nest_sequences don't read
+            # uninitialized data.  With zeros: cache_loc→block 0 (safe),
+            # cu_num_pages→0 pages.
+            for base_name in group_names:
+                self._input_buffer._trunc_device_bufs[base_name].zero_()
+
+    @property
+    def window_groups(self) -> List[int]:
+        """Per-pool window sizes (one entry per registered pool, in pool order)."""
+        return self._window_groups
+
+    @property
+    def window_group_map(self) -> Dict[int, int]:
+        """Map from window_size to group index."""
+        return self._window_group_map
+
+    @property
+    def num_window_groups(self) -> int:
+        """Number of window groups (0 or 1 for non-VSWA, 2+ for VSWA)."""
+        return len(self._window_groups)
+
+    def get_cache_loc_for_group(self, group_idx: int) -> str:
+        """Return the cache_loc tensor name for a given window group."""
+        return "cache_loc" if group_idx == 0 else f"cache_loc_g{group_idx}"
+
+    def get_cu_num_pages_for_group(self, group_idx: int) -> str:
+        """Return the cu_num_pages tensor name for a given window group."""
+        return "cu_num_pages" if group_idx == 0 else f"cu_num_pages_g{group_idx}"
 
     def activate_arg(self, arg_name: str) -> bool:
         """Activate a desired argument.
@@ -914,12 +1120,18 @@ class SequenceInfo:
             slot_idx = torch.arange(bs)
         assert len(slot_idx) >= bs
 
+        # Replicate the vanilla single-pool warm-up data for every registered
+        # pool so VSWA models (num_window_groups >= 2) receive one entry per
+        # pool. Block geometry (tokens_per_block, max_blocks_per_seq) is
+        # uniform across pools, so the same cache_loc / cu_num_pages tensors
+        # are valid metadata for every pool.
+        n_pools = max(1, self.num_window_groups)
         self.nest_sequences(
             input_ids.flatten(),
             cu_seqlen=torch.arange(bs + 1, dtype=torch.int) * seq_len,
             input_pos=0,  # no cache history
-            cache_loc=cache_loc,  # vanilla page assignments
-            cu_num_pages=cu_num_pages,  # vanilla page assignments
+            cache_loc_per_pool=[cache_loc for _ in range(n_pools)],
+            cu_num_pages_per_pool=[cu_num_pages for _ in range(n_pools)],
             slot_idx=slot_idx,  # vanilla slot indices
             **extra_args,
         )
@@ -935,10 +1147,25 @@ class SequenceInfo:
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int)
         self.set_example_sequence(input_ids)
 
-    def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
-        """Set an example sequence for generate-only batch."""
+    def set_capture_batch(self, max_draft_len: int = 0, batch_size: Optional[int] = None) -> None:
+        """Set a synthetic cached-attention batch for cudagraph capture.
+
+        ``max_draft_len == 0`` produces the usual generate-only layout. ``max_draft_len > 0``
+        produces a synthetic extend-only batch with ``1 + max_draft_len`` tokens per sequence.
+        """
         batch_size = batch_size or self.max_batch_size
-        self.set_example_sequence(torch.ones(batch_size, 1, dtype=torch.int))
+        seq_len = 1 + max_draft_len
+
+        if seq_len > 1:
+            # extend-only request
+            batch_info = [0, 0, batch_size, batch_size * seq_len, 0, 0]
+        else:
+            # decode-only request
+            batch_info = [0, 0, 0, 0, batch_size, batch_size]
+
+        self.set_example_sequence(
+            input_ids=torch.ones(batch_size, seq_len, dtype=torch.int), batch_info=batch_info
+        )
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -946,7 +1173,7 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
-        self.set_generate_only_batch()
+        self.set_capture_batch()
 
     @staticmethod
     def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
@@ -982,6 +1209,27 @@ class SequenceInfo:
             host-side prepare function.
         """
         return self._is_active(name, check_both) or self._is_active_host_prep(name, check_both)
+
+    def _active_host_update_args(
+        self, arg_names: Set[str], active_args_override: Optional[Set[str]] = None
+    ) -> List[str]:
+        """Return host args that need mirroring after an in-graph metadata update.
+
+        ``active_args_override`` lets a caller narrow host mirroring to the graph inputs the next
+        consumer actually reads. It is treated as a filter: only active host args whose names appear
+        in the override are mirrored. The override may contain names that are not active graph args
+        (e.g. a submodule's full placeholder set, which also includes inter-module tensors such as
+        ``inputs_embeds``/``hidden_states``); such entries are simply ignored. The caller is
+        responsible for including every host argument the next consumer may read.
+        """
+        needs_d2h_sync = [
+            k + self._host_suffix
+            for k in arg_names
+            if self._is_active(k + self._host_suffix, check_both=False)
+        ]
+        if active_args_override is None:
+            return needs_d2h_sync
+        return [arg_name for arg_name in needs_d2h_sync if arg_name in active_args_override]
 
     def _stage_arg(
         self,
@@ -1024,7 +1272,13 @@ class SequenceInfo:
                         tnsr_like = torch.cat(tnsr_like)
                     else:
                         tnsr_like = tnsr_like[0]
-                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
+                if tnsr_like.device.type == "cpu":
+                    tnsr_like = tnsr_like.contiguous()
+                # Extra args are small model/runtime metadata tensors that currently bypass
+                # the pinned host staging path used by the core attention inputs. Copy them
+                # synchronously so the source tensor lifetime cannot race the next executor
+                # step under overlap scheduling.
+                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=False)
             else:
                 self._extra_args[name] = None
 
@@ -1045,10 +1299,18 @@ class SequenceInfo:
         cu_seqlen: Union[Sequence[int], torch.Tensor],
         input_pos: Union[Sequence[int], int, torch.Tensor],
         batch_info: Union[Sequence[int], torch.Tensor, None] = None,
-        cache_loc: Union[Sequence[int], torch.Tensor, None] = None,
-        cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
-        extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        prompt_lens: Union[Sequence[int], torch.Tensor, None] = None,
+        ### PER-POOL CACHE DATA (pool 0 is the only pool for non-VSWA configurations) #############
+        cache_loc_per_pool: Optional[Sequence[Sequence[int]]] = None,
+        cu_num_pages_per_pool: Optional[Sequence[Sequence[int]]] = None,
+        extra_page_per_seq_per_pool: Optional[Sequence[Sequence[int]]] = None,
+        # Phase 2: per-pool window-capped values used by VSWA front-eviction so
+        # the live cache length / last-page length can diverge from the global
+        # (input_pos + seq_len). When None, non-zero pools replicate the global
+        # value (resp. fall back to ``lpl_host``).
+        seq_len_with_cache_per_pool: Optional[Sequence[Sequence[int]]] = None,
+        last_page_len_per_pool: Optional[Sequence[Sequence[int]]] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1070,12 +1332,21 @@ class SequenceInfo:
                 heuristic is used to compute it from seq_len. NOTE: the heuristic makes potentially
                 incorrect assumptions about the batch composition. batch_info should be provided
                 explicitly to ensure correctness.
-            cache_loc: Flat list of page indices for all sequences. Must be provided together with
-                cu_num_pages.
-            cu_num_pages: Cumulative number of pages for all sequences. Must be provided together with
-                cache_loc.
-            extra_page_per_seq: Extra page per sequence for deferred page insertion.
             slot_idx: State slot index for each sequence in the batch.
+            cache_loc_per_pool: Flat list of page indices for all sequences, per pool. Must be
+                provided together with cu_num_pages_per_pool. Indexed by pool_idx (0-based);
+                pool 0 is the only pool for non-VSWA configurations.
+            cu_num_pages_per_pool: Cumulative number of pages for all sequences, per pool. Must be
+                provided together with cache_loc_per_pool.
+            extra_page_per_seq_per_pool: Extra page per sequence for deferred page insertion,
+                per pool.
+            seq_len_with_cache_per_pool: Per-pool window-capped seq_len_with_cache
+                used by VSWA front-eviction. Pool 0 is unused (it carries the
+                unclamped global value). When None, non-zero pools replicate the
+                global ``input_pos + seq_len``.
+            last_page_len_per_pool: Per-pool window-capped last_page_len used by
+                VSWA front-eviction. Pool 0 is unused. When None, non-zero pools
+                fall back to ``lpl_host`` (the global value).
             gather_context_logits: If True, keep all context logits (no selective gathering).
                 If False (default), only the last token per context sequence is gathered while
                 all extend/decode tokens are kept.
@@ -1110,6 +1381,10 @@ class SequenceInfo:
             num_prefill_tokens = int(sl_host.sum()) - num_decode
             batch_info = [num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode]
         self.batch_info.update(batch_info)
+        # Default slot 14 (max_dp_num_tokens) to local total tokens; the executor
+        # overrides this with the cross-rank max via update_max_dp_num_tokens()
+        # when attention-DP is enabled.
+        self.batch_info.update_max_dp_num_tokens(self.batch_info.get_total_num_tokens())
 
         # check for updated input_pos (i.e. cache start position)
         if isinstance(input_pos, int):
@@ -1121,15 +1396,6 @@ class SequenceInfo:
         # set new input_ids and make sure to flatten it
         self._stage_arg("input_ids", input_ids, reset_val=0)
 
-        # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
-        ip_np = ip_host.numpy()
-        sl_np = sl_host.numpy()
-        base = np.repeat(ip_np, sl_np)
-        group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-        offsets = np.arange(sl_np.sum()) - group_starts
-        position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-        self._stage_arg("position_ids", position_ids)
-
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
         for key, value in extra_args.items():
@@ -1137,17 +1403,68 @@ class SequenceInfo:
 
         ### UPDATE CACHE ASSIGNMENTS (needs to be provided if required!) ###########################
         # check for updated page assignments
-        assert (cache_loc is None) == (cu_num_pages is None), "Both must be provided together!"
-        self._stage_arg("cache_loc", cache_loc)
-        self._stage_arg("cu_num_pages", cu_num_pages)
+        assert (cache_loc_per_pool is None) == (cu_num_pages_per_pool is None), (
+            "cache_loc_per_pool and cu_num_pages_per_pool must be provided together!"
+        )
+        # Global (unclamped) last_page_len, used as the per-pool fallback below
+        # when the caller doesn't supply ``last_page_len_per_pool`` (warmup,
+        # set_example_sequence, CUDA-graph capture).
         lpl_host = (ip_host + sl_host - 1) % self.tokens_per_block + 1
-        self._stage_arg("last_page_len", lpl_host)
 
         # check for updated slot_idx
         self._stage_arg("slot_idx", slot_idx)
 
-        # check for updated extra_page_per_seq
-        self._stage_arg("extra_page_per_seq", extra_page_per_seq)
+        # cu_num_pages from pool 0 is reused below by the pages_per_seq derivative
+        # update; capture it before the per-pool staging loop.
+        cu_num_pages = cu_num_pages_per_pool[0] if cu_num_pages_per_pool is not None else None
+
+        # Guard against partial lists: every registered pool must be present
+        # in each of the per-pool lists, otherwise omitted pools would silently
+        # reuse the previous batch's staged tensors.
+        if cache_loc_per_pool is not None and self.num_window_groups >= 2:
+            for name, seq in (
+                ("cache_loc_per_pool", cache_loc_per_pool),
+                ("cu_num_pages_per_pool", cu_num_pages_per_pool),
+                ("extra_page_per_seq_per_pool", extra_page_per_seq_per_pool),
+                ("seq_len_with_cache_per_pool", seq_len_with_cache_per_pool),
+                ("last_page_len_per_pool", last_page_len_per_pool),
+            ):
+                if seq is None:
+                    continue
+                assert len(seq) == self.num_window_groups, (
+                    f"{name} has {len(seq)} entries, expected {self.num_window_groups}"
+                )
+
+        # Stage per-pool cache data uniformly: pool 0 uses the unsuffixed
+        # base names; pools 1..N-1 use the f"_g{pool_idx}" suffix.  When the
+        # caller doesn't provide per-pool data (warmup, set_example_sequence,
+        # CUDA graph capture), pools 1..N-1 fall back to pool 0's data so every
+        # kernel receives valid metadata.
+        if cache_loc_per_pool is not None:
+            num_pools_provided = len(cache_loc_per_pool)
+            pool0_cache_loc = cache_loc_per_pool[0]
+            pool0_cu_num_pages = (
+                cu_num_pages_per_pool[0] if cu_num_pages_per_pool is not None else None
+            )
+            pool0_extra_page = (
+                extra_page_per_seq_per_pool[0] if extra_page_per_seq_per_pool is not None else None
+            )
+            num_pools_active = max(num_pools_provided, self.num_window_groups)
+            for pool_idx in range(num_pools_active):
+                suffix = "" if pool_idx == 0 else f"_g{pool_idx}"
+                provides_pool = pool_idx < num_pools_provided
+                pool_cache_loc = cache_loc_per_pool[pool_idx] if provides_pool else pool0_cache_loc
+                self._stage_arg(f"cache_loc{suffix}", pool_cache_loc)
+                if cu_num_pages_per_pool is not None:
+                    pool_cu_num_pages = (
+                        cu_num_pages_per_pool[pool_idx] if provides_pool else pool0_cu_num_pages
+                    )
+                    self._stage_arg(f"cu_num_pages{suffix}", pool_cu_num_pages)
+                if extra_page_per_seq_per_pool is not None:
+                    pool_extra_page = (
+                        extra_page_per_seq_per_pool[pool_idx] if provides_pool else pool0_extra_page
+                    )
+                    self._stage_arg(f"extra_page_per_seq{suffix}", pool_extra_page)
 
         ### UPDATE OPTIONAL DERIVATIVE METADATA ####################################################
         if self._is_required("position_ids"):
@@ -1168,9 +1485,35 @@ class SequenceInfo:
             pages_per_seq = cu_num_pages_host[1:] - cu_num_pages_host[:-1]
             self._stage_arg("pages_per_seq", pages_per_seq)
 
-        # update sequence length with cache
+        # Stage seq_len_with_cache and last_page_len per pool through a single
+        # loop.  Pool 0 uses the unsuffixed name; pools 1..N-1 use f"_g{i}".
+        # The unsuffixed name is a wire-level alias for pool 0 -- non-VSWA
+        # graphs, prepare-extra ops, and host-prep functions still reference
+        # it -- not a "full-attention pool" privilege; pool 0 is whichever KV
+        # handler the kvcache transform encountered first, which can be the
+        # SWA pool (Gemma-3n where layer 0 is sliding, or any pure-SWA model
+        # such as Mistral / Phi-3).  When the caller doesn't supply per-pool
+        # values (warmup, set_example_sequence, CUDA-graph capture), every
+        # pool falls back to the global value.  Dropping the unsuffixed alias
+        # entirely is a follow-up refactor that touches the transform,
+        # backend descriptors, and op signatures.
         seq_len_with_cache = ip_host + sl_host
-        self._stage_arg("seq_len_with_cache", seq_len_with_cache)
+        n_pools = max(1, self.num_window_groups)
+        per_pool_swc = seq_len_with_cache_per_pool or [seq_len_with_cache] * n_pools
+        per_pool_lpl = last_page_len_per_pool or [lpl_host] * n_pools
+        for pool_idx in range(n_pools):
+            suffix = "" if pool_idx == 0 else f"_g{pool_idx}"
+            self._stage_arg(f"seq_len_with_cache{suffix}", per_pool_swc[pool_idx])
+            self._stage_arg(f"last_page_len{suffix}", per_pool_lpl[pool_idx])
+
+        # prompt_lens: original context length per sequence, constant across iterations.
+        # Defaults to seq_len when not provided (correct for prefill).
+        if prompt_lens is not None:
+            if isinstance(prompt_lens, (list, tuple)):
+                prompt_lens = torch.tensor(prompt_lens, dtype=torch.int)
+        else:
+            prompt_lens = sl_host
+        self._stage_arg("prompt_lens", prompt_lens)
 
         # check for updated use_initial_states
         use_initial_states = ip_host > 0
@@ -1300,11 +1643,16 @@ class SequenceInfo:
             host_function(**{arg: self.get_arg(arg) for arg in args})
 
     @nvtx_range("ad_offset_pos_and_cache_")
-    def offset_pos_and_cache_(self, offset: torch.Tensor) -> None:
+    def offset_pos_and_cache_(
+        self, offset: torch.Tensor, active_args_override: Optional[Set[str]] = None
+    ) -> None:
         """Offset position and cache-related metadata for active arguments.
 
         Args:
             offset: 1D tensor [batch_size] with per-sequence position offsets.
+            active_args_override: Optional graph-input names for the next in-forward consumer. When
+                provided, host mirroring is limited to those active host args. The caller is
+                responsible for including every host argument the next consumer may read.
         """
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
@@ -1316,11 +1664,7 @@ class SequenceInfo:
             "seq_len_with_cache",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
+        needs_d2h_sync = self._active_host_update_args(_REQUIRES_UPDATE, active_args_override)
         sync_to_host = any(needs_d2h_sync)
         if sync_to_host:
             ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
@@ -1350,29 +1694,68 @@ class SequenceInfo:
             last_page_len %= self.tokens_per_block
             last_page_len += 1
 
+            # Adjust per-group cache assignments for VSWA groups 1..N-1
+            for group_idx in range(1, self.num_window_groups):
+                suffix = f"_g{group_idx}"
+                if self._is_active(f"cache_loc{suffix}"):
+                    lpl_g = self.get_arg(f"last_page_len{suffix}", truncate=True)
+                    lpl_g += offset
+                    delta_g = (lpl_g > self.tokens_per_block).int() - (lpl_g <= 0).int()
+                    torch.ops.auto_deploy.adjust_ragged_triton(
+                        cache_loc=self.get_arg(f"cache_loc{suffix}"),
+                        cu_num_blocks=self.get_arg(f"cu_num_pages{suffix}"),
+                        extra_idx=self.get_arg(f"extra_page_per_seq{suffix}"),
+                        delta=delta_g,
+                        num_sequences=num_sequences,
+                        max_blocks_per_seq=self.max_blocks_per_seq,
+                    )
+                    lpl_g -= 1
+                    lpl_g %= self.tokens_per_block
+                    lpl_g += 1
+
         # --- position_ids (device) ---
         position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
         # position_ids is per-token while offset is per-sequence; expand if needed
         if self.is_generate_only:
             offset_for_pos_ids = offset
+        elif self.is_extend_only:
+            _, num_extend, _ = self.batch_info.get_num_sequences()
+            _, num_extend_tokens, _ = self.batch_info.get_num_tokens()
+            tokens_per_seq = num_extend_tokens // num_extend
+            offset_for_pos_ids = offset[:num_extend].repeat_interleave(tokens_per_seq)
         else:
+            # mixed prefill + (extend/decode). Need to use seq_len in the generic case. Causes host sync.
+            # TODO: Can special case for cases where we know offset of prefill sequences to avoid host sync.
             seq_len = self.get_arg("seq_len", truncate=True)
             offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
+
         position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
         swc = self.get_arg("seq_len_with_cache", truncate=True)
         swc += offset
 
+        # Keep per-group seq_len_with_cache in sync with the global value for
+        # the overlap scheduler path.  This is exact in the non-eviction regime;
+        # under eviction the next nest_sequences re-caps to the window.
+        for group_idx in range(1, self.num_window_groups):
+            suffix = f"_g{group_idx}"
+            if self._is_active(f"seq_len_with_cache{suffix}"):
+                swc_g = self.get_arg(f"seq_len_with_cache{suffix}", truncate=True)
+                swc_g += offset
+
         # --- use_initial_states (device) ---
         use_initial_states = self.get_arg("use_initial_states", truncate=True)
         use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
-        # TODO: we have to continue thinking about this and dissect more what fields are needed in
-        # the forward pass if we use cudagraph...
+        # This ensures that the H2D copy done by InputBuffer.copy_to_device() has been executed
+        # before we update the host-side tensors.
+        # By gating this on sync_to_host, we ensure that we only sync when a custom op needs updated host arguments.
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
         if sync_to_host:
-            self._input_buffer.copy_to_host()
+            self._input_buffer.copy_to_host(non_blocking=False)
 
     @nvtx_range("ad_offset_with_new_lens_")
     def offset_with_new_lens_(self, new_lens_ungathered: torch.Tensor) -> None:
@@ -1385,23 +1768,40 @@ class SequenceInfo:
         increment = torch.zeros(self.num_sequences, dtype=torch.int32, device=self.device)
         num_prefill = self.batch_info.get_num_sequences()[0]
         gather_slot_idx = self.get_arg("_gather_slot_idx", truncate=True)
-        increment[num_prefill:] = new_lens_ungathered[gather_slot_idx] - 1
+        num_overlap = gather_slot_idx.numel()
+        # AD overlap mode packs real overlap-carried non-prefill sequences first. CUDA-graph dummy
+        # requests are appended later and therefore remain in the trailing zero-increment region.
+        # We deliberately only write gather_slot_idx entries for non-dummy requests, so that we
+        # can apply them to the prefix of "increment" here.
+        increment[num_prefill : num_prefill + num_overlap] = (
+            new_lens_ungathered[gather_slot_idx] - 1
+        )
         self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")
-    def switch_to_generate_(self) -> None:
+    def switch_to_generate_(self, active_args_override: Optional[Set[str]] = None) -> None:
         """Switch all sequences metadata to generate (decode) mode.
 
         Transitions the batch from any layout (prefill/extend/decode or mixed) to
         an all-decode layout where each sequence has exactly 1 token. We assume that we just take
         the last position of each sequence for the metadata.
 
-        NOTE: right now, we always update both host and device tensor to ensure this does not
-        interfere with the device-to-host sync in offset_pos_and_cache_.
+        Args:
+            active_args_override: Optional graph-input names for the next in-forward consumer. When
+                provided, host mirroring is limited to those active host args. The caller is
+                responsible for including every host argument the next consumer may read.
 
-        NOTE: we assume the same structure as in nest_sequences for when to update the arguments.
-        In particular, arguments that are always updated in nest_sequences are also updated here.
-        Others are updated optionally depending on the argument being active.
+        NOTE: update device tensors first and mirror back to host only when an updated host-side
+        argument is active.
+
+        This prevents race conditions with the H2D copy done by InputBuffer.copy_to_device().
+        The H2D copy was queued before the forward pass, but may not have been executed yet.
+        If this copy has not been executed and we updated host arguments directly,
+        we would be overwriting them with new values which would lead to these new values getting copied
+        to device when we wanted to copy the old data. By updating via a D2H sync on the active stream,
+        we ensure that these host-side tensors are updated *after* the H2D copy has been executed.
+
+        Additionally, we make sure the D2H sync only happens only when a custom op needs updated host arguments.
         """
         # already in generate mode
         if self.is_generate_only:
@@ -1413,32 +1813,49 @@ class SequenceInfo:
         # update batch_info
         self.batch_info.update([0, 0, 0, 0, num_seq, num_seq])
         self.batch_info.update_tokens_gather_info(num_seq, False)
+        # Default slot 14 (max_dp_num_tokens) to local total tokens; the executor
+        # overrides this when attention-DP is on.
+        self.batch_info.update_max_dp_num_tokens(num_seq)
 
-        for device, suffix in (
-            (self.host_device, self._host_suffix),
-            (self.device, ""),
-        ):
-            # --- input_ids ---
-            # use cu_seqlen as heuristic to get the input_ids if available
-            input_ids_flat = self.get_arg(f"input_ids{suffix}", truncate=False, unflatten=False)
-            extraction_indices = (self.get_arg(f"cu_seqlen{suffix}", truncate=True)[1:] - 1).long()
-            self.copy_(f"input_ids{suffix}", input_ids_flat[extraction_indices], strict=False)
+        # check if we need a d2h sync
+        _REQUIRES_UPDATE = {
+            "input_ids",
+            "input_pos",
+            "cu_seqlen",
+            "seq_len",
+            "position_ids",
+            "use_initial_states",
+        }
+        needs_d2h_sync = self._active_host_update_args(_REQUIRES_UPDATE, active_args_override)
+        sync_to_host = any(needs_d2h_sync)
 
-            # --- input_pos ---
-            input_pos = self.get_arg(f"input_pos{suffix}", truncate=True)
-            input_pos += self.get_arg(f"seq_len{suffix}", truncate=True) - 1
+        # --- input_ids (device) ---
+        # use cu_seqlen as heuristic to get the input_ids if available
+        input_ids_flat = self.get_arg("input_ids", truncate=False, unflatten=False)
+        extraction_indices = (self.get_arg("cu_seqlen", truncate=True)[1:] - 1).long()
+        self.copy_("input_ids", input_ids_flat[extraction_indices], strict=False)
 
-            # --- cu_seqlen ---
-            cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=device)
-            self.copy_(f"cu_seqlen{suffix}", cu_seqlen)
+        # --- input_pos (device) ---
+        input_pos = self.get_arg("input_pos", truncate=True)
+        input_pos += self.get_arg("seq_len", truncate=True) - 1
 
-            # --- seq_len ---
-            seq_len = self.get_arg(f"seq_len{suffix}", truncate=True)
-            seq_len.fill_(1)
+        # --- cu_seqlen (device) ---
+        cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=self.device)
+        self.copy_("cu_seqlen", cu_seqlen)
 
-            # --- update derivative metadata that change in generate-only mode if active ---
-            self.copy_(f"position_ids{suffix}", input_pos, strict=False)
-            self.copy_(f"use_initial_states{suffix}", input_pos > 0)
+        # --- seq_len (device) ---
+        seq_len = self.get_arg("seq_len", truncate=True)
+        seq_len.fill_(1)
+
+        # ---  update derivative metadata that change in generate-only mode if active (device) ---
+        self.copy_("position_ids", input_pos, strict=False)
+        self.copy_("use_initial_states", input_pos > 0)
+
+        # --- Bulk device-to-host sync ---
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
+        if sync_to_host:
+            self._input_buffer.copy_to_host(non_blocking=False)
 
     def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
         """Copy a tensor into the buffer. USE WITH CAUTION!
@@ -1499,18 +1916,42 @@ class ResourceHandler(ABC):
         """Initialize the resource for the given sequence info."""
 
 
+class EphemeralResourceHandler(ResourceHandler):
+    """Resources that are produced and consumed within one forward pass.
+
+    Examples include MTP/Eagle hidden-state resources, which are regenerated every
+    step and not needed across steps.
+
+    Used for judging whether resources can be safely dropped when transferring from one node
+    to another, e.g. for disagg. Ephemeral resources can be safely dropped if the transfer
+    happens between forward passes.
+
+    TODO: May need to revisit this notion for intra-forward resource transfers.
+    """
+
+
 class KVPagedResourceHandler(ResourceHandler):
     """Handler for paged KV cache resources.
 
-    This handler indicates the resource should be managed by the standard KVCacheManager.
+    This handler indicates the resource should be managed by the standard
+    KVCacheManager.  Handler equality (``__eq__``) is the single source of
+    truth for KV-cache grouping: layers whose handlers compare equal share a
+    storage pool and a metadata set (``group_idx == pool_idx``), and differ
+    otherwise.  Including ``sliding_window`` in the equality means same-head-dim
+    layers with different windows land in separate pools with their own
+    ``max_attention_window``.
 
     Args:
         num_kv_heads: Number of key-value heads.
         head_dim: Dimension of each head.
         dtype: The dtype of the KV cache.
         kv_factor: The factor of the KV cache. Default is 2 for combined k/v cache.
-        kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or "NHD" (num-head-dim).
-            Default is "HND" which is the standard layout for flashinfer.
+        kv_layout: Memory layout for the KV cache. Either "HND" (head-num-dim) or
+            "NHD" (num-head-dim). Default is "HND" which is the standard layout
+            for flashinfer.
+        attention_type: Attention layout semantics for this cache resource, e.g. ``AttentionType.mha``.
+        sliding_window: Sliding window size for this layer.  ``0`` means full
+            attention; a positive value puts this layer in its own VSWA group.
     """
 
     @property
@@ -1523,8 +1964,10 @@ class KVPagedResourceHandler(ResourceHandler):
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        attention_type: AttentionType,
         kv_factor: int = 2,
         kv_layout: Literal["HND", "NHD"] = "HND",
+        sliding_window: int = 0,
     ) -> None:
         """Initialize the KVPagedResourceHandler.
 
@@ -1534,6 +1977,8 @@ class KVPagedResourceHandler(ResourceHandler):
             dtype: The dtype of the KV cache.
             kv_factor: The factor of the KV cache. Default is 2.
             kv_layout: Memory layout - "HND" or "NHD". Default is "HND".
+            attention_type: Attention layout semantics for this cache resource, e.g. ``AttentionType.mha``.
+            sliding_window: Sliding window size for this layer. 0 means full attention.
         """
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -1541,9 +1986,21 @@ class KVPagedResourceHandler(ResourceHandler):
         self.kv_factor = kv_factor
         assert kv_factor in [1, 2], f"Invalid kv_factor: {kv_factor}"
         self.kv_layout = kv_layout
+        if not isinstance(attention_type, AttentionType):
+            raise TypeError(f"attention_type must be AttentionType, got {attention_type!r}")
+        self.attention_type = attention_type
+        self.sliding_window = (
+            sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
+        )
 
     def __eq__(self, other: Optional[ResourceHandler]) -> bool:
-        """Check compatibility for KVCacheManager (head_dim and dtype must match)."""
+        """Check compatibility — layers in the same group share a KVCacheManager pool.
+
+        Including sliding_window means same-head-dim layers with different windows
+        get separate pools.  This trades slightly higher memory (one pool per unique
+        window instead of a shared pool with multiple windows) for a simpler design
+        where group = pool = metadata set, with no cross-referencing needed.
+        """
         if type(other) is not type(self):
             return False
         return (
@@ -1551,6 +2008,8 @@ class KVPagedResourceHandler(ResourceHandler):
             and self.dtype == other.dtype
             and self.kv_factor == other.kv_factor
             and self.kv_layout == other.kv_layout
+            and self.attention_type == other.attention_type
+            and self.sliding_window == other.sliding_window
         )
 
     def _get_bytes_per_token(self) -> int:
@@ -1633,6 +2092,10 @@ class StateResourceHandler(ResourceHandler):
         return self.state_shape == other.state_shape and self.dtype == other.dtype
 
 
+class SpeculativeOnly:
+    """Trait mixin marking a resource that is only needed when speculative decoding is enabled."""
+
+
 class SSMResourceHandler(StateResourceHandler):
     """Handler for SSM state resources that maps directly to MambaCacheManager's ssm_states buffer.
 
@@ -1700,7 +2163,7 @@ class CausalConvResourceHandler(StateResourceHandler):
         return (self.conv_dim, self.d_conv - 1)
 
 
-class SpecSSMResourceHandler(StateResourceHandler):
+class IntermediateSSMStateHandler(SpeculativeOnly, StateResourceHandler):
     """Intermediate SSM state cache descriptor for speculative decoding.
 
     Acts as a type marker conveying the per-layer SSM shape to the cache interface.
@@ -1708,8 +2171,8 @@ class SpecSSMResourceHandler(StateResourceHandler):
     by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not SSMResourceHandler) so that
-    isinstance(h, SSMResourceHandler) returns False for spec handlers, eliminating
-    the need for exclusion guards throughout the codebase.
+    isinstance(h, SSMResourceHandler) returns False for intermediate handlers, eliminating
+    the need for exclusion guards throughout the codebase. Mixes in SpeculativeOnly.
     """
 
     def __init__(
@@ -1729,8 +2192,10 @@ class SpecSSMResourceHandler(StateResourceHandler):
         return (self.num_heads, self.head_dim, self.d_state)
 
     @classmethod
-    def from_base(cls, base: Optional["SSMResourceHandler"]) -> Optional["SpecSSMResourceHandler"]:
-        """Create a spec handler from a base SSM handler, or return None."""
+    def from_base(
+        cls, base: Optional["SSMResourceHandler"]
+    ) -> Optional["IntermediateSSMStateHandler"]:
+        """Create an intermediate handler from a base SSM handler, or return None."""
         if base is None:
             return None
         return cls(
@@ -1738,7 +2203,150 @@ class SpecSSMResourceHandler(StateResourceHandler):
         )
 
 
-class SpecCausalConvResourceHandler(StateResourceHandler):
+class ReplayOldXHandler(SpeculativeOnly, StateResourceHandler):
+    """Per-layer old_x cache for the replay SSM kernel (single-buffered, bf16).
+
+    Shape: (max_batch, T, num_heads, head_dim) — T is determined by the manager's
+    spec_config (max_draft_len + 1), not by this handler.  Acts as a type marker.
+    Routes to MambaHybridCacheManager via get_replay_old_x(layer_idx).
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, dtype: torch.dtype) -> None:
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        return (self.num_heads, self.head_dim)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldXHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, ReplayOldXHandler)
+            and self.num_heads == other.num_heads
+            and self.head_dim == other.head_dim
+            and self.dtype == other.dtype
+        )
+
+
+class ReplayOldBHandler(SpeculativeOnly, StateResourceHandler):
+    """Per-layer old_B cache for the replay SSM kernel (double-buffered, bf16).
+
+    Shape: (max_batch, 2, T, n_groups, d_state) — T from manager.
+    Routes to MambaHybridCacheManager via get_replay_old_B(layer_idx).
+    """
+
+    def __init__(self, n_groups: int, d_state: int, dtype: torch.dtype) -> None:
+        self.n_groups = n_groups
+        self.d_state = d_state
+        super().__init__(dtype=dtype)
+
+    @property
+    def state_shape(self) -> Tuple[int, int]:
+        return (self.n_groups, self.d_state)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldBHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, ReplayOldBHandler)
+            and self.n_groups == other.n_groups
+            and self.d_state == other.d_state
+            and self.dtype == other.dtype
+        )
+
+
+class ReplayOldDtHandler(SpeculativeOnly, StateResourceHandler):
+    """Per-layer old_dt cache for the replay SSM kernel (double-buffered, fp32).
+
+    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Routes to MambaHybridCacheManager via get_replay_old_dt(layer_idx).
+    """
+
+    def __init__(self, num_heads: int) -> None:
+        self.num_heads = num_heads
+        super().__init__(dtype=torch.float32)
+
+    @property
+    def state_shape(self) -> Tuple[int]:
+        return (self.num_heads,)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldDtHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayOldDtHandler) and self.num_heads == other.num_heads
+
+
+class ReplayOldDAcumsumHandler(SpeculativeOnly, StateResourceHandler):
+    """Per-layer old_dA_cumsum cache for the replay SSM kernel (double-buffered, fp32).
+
+    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Routes to MambaHybridCacheManager via get_replay_old_dA_cumsum(layer_idx).
+    """
+
+    def __init__(self, num_heads: int) -> None:
+        self.num_heads = num_heads
+        super().__init__(dtype=torch.float32)
+
+    @property
+    def state_shape(self) -> Tuple[int]:
+        return (self.num_heads,)
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayOldDAcumsumHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayOldDAcumsumHandler) and self.num_heads == other.num_heads
+
+
+class ReplayCacheBufIdxHandler(SpeculativeOnly, StateResourceHandler):
+    """Global cache_buf_idx tensor for the replay SSM kernel (shared across all layers, int32).
+
+    Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_cache_buf_idx().
+    The same tensor is returned for every SSM layer — the FX graph has one constant-address
+    input per layer, all pointing to the same buffer.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(dtype=torch.int32)
+
+    @property
+    def state_shape(self) -> Tuple[()]:
+        return ()
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayCacheBufIdxHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayCacheBufIdxHandler)
+
+
+class ReplayPrevNumAcceptedHandler(SpeculativeOnly, StateResourceHandler):
+    """Global prev_num_accepted_tokens tensor for the replay SSM kernel (int32, shared).
+
+    Shape: (max_batch,).  Routes to MambaHybridCacheManager.get_replay_prev_num_accepted_tokens().
+    """
+
+    def __init__(self) -> None:
+        super().__init__(dtype=torch.int32)
+
+    @property
+    def state_shape(self) -> Tuple[()]:
+        return ()
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        raise RuntimeError("ReplayPrevNumAcceptedHandler must be backed by MambaHybridCacheManager")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayPrevNumAcceptedHandler)
+
+
+class IntermediateConvStateHandler(SpeculativeOnly, StateResourceHandler):
     """Intermediate conv state cache descriptor for speculative decoding.
 
     Acts as a type marker conveying the per-layer conv shape to the cache interface.
@@ -1746,7 +2354,8 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
     by the MambaHybridCacheManager using spec_config, not by this handler.
 
     Inherits from StateResourceHandler (not CausalConvResourceHandler) so that
-    isinstance(h, CausalConvResourceHandler) returns False for spec handlers.
+    isinstance(h, CausalConvResourceHandler) returns False for intermediate handlers. Mixes in
+    SpeculativeOnly.
     """
 
     def __init__(
@@ -1766,8 +2375,8 @@ class SpecCausalConvResourceHandler(StateResourceHandler):
     @classmethod
     def from_base(
         cls, base: Optional["CausalConvResourceHandler"]
-    ) -> Optional["SpecCausalConvResourceHandler"]:
-        """Create a spec handler from a base conv handler, or return None."""
+    ) -> Optional["IntermediateConvStateHandler"]:
+        """Create an intermediate handler from a base conv handler, or return None."""
         if base is None:
             return None
         return cls(conv_dim=base.conv_dim, d_conv=base.d_conv, dtype=base.dtype)
@@ -1871,6 +2480,22 @@ class AttentionDescriptor(ABC):
     @classmethod
     def supports_shared_kv(cls) -> bool:
         """Whether this backend supports shared-KV cache aliasing."""
+        return False
+
+    @classmethod
+    def kernel_handles_cyclic_swa(cls) -> bool:
+        """Whether the backend's kernel applies the sliding-window mask itself.
+
+        When ``True`` (e.g. the trtllm ``thop.attention`` kernel), the kernel
+        cyclically indexes the KV cache internally using the per-layer attention
+        window, so the executor must hand it the *full* per-window block table
+        and a *global* (un-window-capped) KV length -- the same contract as the
+        PyTorch backend.
+
+        When ``False`` (default; e.g. triton / flashinfer), the kernel does not
+        cyclic-index, so the executor must host-slice the block table down to the
+        live sliding-window view (see ``ad_executor._compute_window_local_view``).
+        """
         return False
 
     @classmethod

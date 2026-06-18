@@ -6,3 +6,14 @@ wheel>=0.46.2
 tornado>=6.5.5
 # WAR against https://github.com/advisories/GHSA-3936-cmfr-pm3m
 black>=26.3.1
+# Upgrade base image nvidia-cutlass-dsl 4.3.5 to 4.4.2
+nvidia-cutlass-dsl>=4.4.2
+# The `nvidia-cutlass-dsl` package does not pin numpy at all, which can be problematic in certain CI
+# stages.
+numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
+# WAR against https://github.com/advisories/GHSA-8mp2-v27r-99xp
+mistune>=3.2.1
+# WAR against https://github.com/advisories/GHSA-rch3-82jr-f9w9
+notebook>=7.5.6
+# WAR against https://github.com/advisories/GHSA-rch3-82jr-f9w9
+jupyter_server>=2.18.0

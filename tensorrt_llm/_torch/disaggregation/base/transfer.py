@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -42,8 +41,21 @@ class LayerRange:
 
 @dataclass
 class KVSlice:
-    """
-    Specifies which portion of KV cache to transfer.
+    """A KV cache slice covering token_range = [start, end) of one request.
+
+    Single-slice transfer uses [0, prompt_len) with is_last_slice=True;
+    multi-slice transfers split token_range and mark the last slice.
+
+    Per-layer token starts are NOT encoded in token_range — they are derived
+    from block count by the sender:
+        total_blocks    = ceil(token_range.end / tpb)
+        token_start_i   = (total_blocks - len(block_ids_per_layer_groups[i])) * tpb
+    Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
+    block list. Beam search keeps this field 1-D: beam 0's blocks first,
+    followed by the final unshared block from each remaining beam.
+
+    SWA stale_end uses the request prompt_len (on the session), not
+    token_range.end — they differ for non-final slices.
     """
 
     token_range: Optional[TokenRange] = None
@@ -66,6 +78,7 @@ class SessionStatus(Enum):
     - KV_TRANSFERRED: KV cache transfer completed; auxiliary data transfer may still be pending.
     - FULLY_TRANSFERRED: Both KV cache and auxiliary data (e.g. tokens) transferred successfully.
     - ERROR: A transfer error occurred; the session cannot complete.
+    - CANCELLED: The session was explicitly cancelled before or during transfer.
     """
 
     INIT = "INIT"
@@ -74,6 +87,7 @@ class SessionStatus(Enum):
     KV_TRANSFERRED = "KV_TRANSFERRED"
     FULLY_TRANSFERRED = "FULLY_TRANSFERRED"
     ERROR = "ERROR"
+    CANCELLED = "CANCELLED"
 
 
 class WaitResult(Enum):
@@ -89,14 +103,17 @@ class SessionArgsBase:
     """Base arguments for transfer sessions."""
 
     params: DisaggregatedParams
+    # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
+    prompt_len: Optional[int] = None
+    beam_width: int = 1
 
 
 def get_unique_rid(request: LlmRequest) -> Optional[int]:
-    return (
-        request.py_disaggregated_params.disagg_request_id
-        if request.py_disaggregated_params
-        else request.request_id
-    )
+    if request.py_disaggregated_params:
+        rid = request.py_disaggregated_params.disagg_request_id
+        if rid is not None:
+            return rid
+    return request.request_id
 
 
 class SenderBase(ABC):
@@ -141,7 +158,7 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> concurrent.futures.Future: ...
+    def send(self, slice: KVSlice) -> None: ...
 
 
 class RxSessionBase(_SessionBase):
@@ -150,7 +167,7 @@ class RxSessionBase(_SessionBase):
         self._receiver = receiver
 
     @abstractmethod
-    def receive(self, slice: KVSlice) -> concurrent.futures.Future: ...
+    def receive(self, slice: KVSlice) -> None: ...
 
     @abstractmethod
     def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]: ...

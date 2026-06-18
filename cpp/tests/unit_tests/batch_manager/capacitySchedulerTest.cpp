@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -139,8 +139,8 @@ protected:
 
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
-            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
-            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, cacheType);
+            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, kvDtype, sinkTokenLength,
+            streamPtr, maxNumTokensPerSeq, maxNumTokensPerSeq, enableReuse, cacheType);
     }
 
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()
@@ -361,8 +361,9 @@ int runTest(CapacityScheduler& capacityScheduler,
         {
             if (llmReq->isDisaggGenerationInitState())
             {
-                kvCacheManager->addSequence(
-                    llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth, llmReq);
+                kvCacheManager->addSequenceBatch(
+                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth}}},
+                    {std::ref(*llmReq)});
                 llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 llmReq->setContextCurrentPosition(llmReq->mPromptLen);
                 llmReq->setDecodingIter(1);
@@ -385,12 +386,13 @@ int runTest(CapacityScheduler& capacityScheduler,
                 if (llmReq->isFirstContextChunk())
                 {
                     // We need to perform initialization work for the first context chunk.
-                    kvCacheManager->addSequence(
-                        llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth, llmReq);
+                    kvCacheManager->addSequenceBatch(
+                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth}}}, {std::ref(*llmReq)});
                     if (crossKvCacheManager)
                     {
-                        crossKvCacheManager->addSequence(llmReq->mRequestId, llmReq->getEncoderOutputLen(),
-                            llmReq->mSamplingConfig.beamWidth, llmReq);
+                        crossKvCacheManager->addSequenceBatch(
+                            {{{llmReq->mRequestId, llmReq->getEncoderOutputLen(), llmReq->mSamplingConfig.beamWidth}}},
+                            {std::ref(*llmReq)});
                     }
                 }
                 auto preContextLength = llmReq->getContextChunkSize();
@@ -2265,4 +2267,124 @@ TEST_F(CapacitySchedulerTest, MaxUtilizationNoReuseWhenDisabled)
     EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), 0);
     // Both requests start at iteration 0 and finish together, so numIterations = maxNewTokens
     EXPECT_EQ(numIterations, maxNewTokens);
+}
+
+// ============================================================================
+// ENCODER_INIT admission tests for dual-pool capacity scheduling.
+// ============================================================================
+//
+// These tests exercise the C++ scheduler paths that admit requests in the
+// LlmRequestState::kENCODER_INIT state. Encoder-init requests must not reserve
+// blocks from either the self or cross KV cache; decoder CONTEXT_INIT admission
+// owns that budgeting. They also must not be considered eviction victims by
+// MaxUtilization.
+//
+// Unlike the legacy enc-dec tests above (which use prepRequestsForEncoderSkip
+// to flip ENCODER_INIT → CONTEXT_INIT before the scheduler runs), the tests
+// below construct the scheduler with no_schedule_until_state=kENCODER_INIT
+// so the encoder phase reaches the policy code paths directly.
+
+namespace
+{
+// Helper to create an encoder-decoder request that stays in the ENCODER_INIT
+// state when it reaches the scheduler.
+std::shared_ptr<LlmRequest> createEncoderInitRequest(
+    int32_t promptLen, int32_t maxNewTokens, int32_t encoderInputLen, uint64_t reqId)
+{
+    auto inputTokens = VecTokens(promptLen, 1);
+    auto encoderInputTokens = VecTokens(encoderInputLen, 1);
+    tensorrt_llm::executor::OutputConfig outConfig;
+    outConfig.excludeInputFromOutput = false;
+    outConfig.returnLogProbs = false;
+    outConfig.returnGenerationLogits = false;
+    outConfig.returnContextLogits = false;
+    outConfig.returnEncoderOutput = false;
+    bool streaming = false;
+    auto executorReq = tensorrt_llm::executor::Request(
+        inputTokens, maxNewTokens, streaming, tensorrt_llm::executor::SamplingConfig(), outConfig);
+    executorReq.setEncoderInputTokenIds(encoderInputTokens);
+    auto req = std::make_shared<LlmRequest>(reqId, executorReq);
+    // executor::Request ctor sets kENCODER_INIT when encoderInputTokenIds is present.
+    EXPECT_EQ(req->getState(), LlmRequestState::kENCODER_INIT);
+    return req;
+}
+} // namespace
+
+// GuaranteedNoEvict: a single encoder-init request is admitted without
+// consuming self- or cross-pool blocks.
+// Without a cross_kv_cache_manager, an encoder-init request cannot honour the
+// dual-pool contract and must fail fast for both policies.
+TEST_F(CapacitySchedulerTest, EncoderInitWithoutCrossManagerThrows)
+{
+    SizeType32 const maxNumRequests = 4;
+    SizeType32 const tokensPerBlock = 10;
+    SizeType32 const selfMaxTokens = 200;
+    SizeType32 const selfMaxTokensPerSeq = 100;
+    int32_t const encoderInputLen = 20;
+
+    for (auto policy : {CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION})
+    {
+        auto kvCacheManager = getKvCacheManager(maxNumRequests, tokensPerBlock, selfMaxTokens, selfMaxTokensPerSeq);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, policy, kvCacheManager != nullptr,
+            /*twoStepsLookAhead=*/false, LlmRequestState::kENCODER_INIT, LlmRequestState::kGENERATION_COMPLETE);
+
+        RequestList activeRequests;
+        activeRequests.push_back(
+            createEncoderInitRequest(/*promptLen=*/10, /*maxNewTokens=*/40, encoderInputLen, /*id=*/1));
+
+        // No cross manager passed.
+        EXPECT_THROW((void) capacityScheduler(
+                         activeRequests, kvCacheManager, peftCacheManager, /*crossKvCacheManager=*/std::nullopt),
+            tc::TllmException)
+            << "policy=" << static_cast<int>(policy);
+    }
+}
+
+// Cross pool pressure does not throttle encoder admission. The request will
+// face the cross-pool budget on its later decoder CONTEXT_INIT iteration.
+TEST_F(CapacitySchedulerTest, EncoderInitDoesNotConsumeCrossPool)
+{
+    SizeType32 const maxNumRequests = 4;
+    SizeType32 const tokensPerBlock = 10;
+    SizeType32 const selfMaxTokens = 400;
+    SizeType32 const selfMaxTokensPerSeq = 100;
+    // Cross pool fits one 20-token encoder sequence, but encoder admission
+    // should not consume it.
+    SizeType32 const crossMaxTokens = 20;
+    SizeType32 const crossMaxTokensPerSeq = 20;
+    int32_t const encoderInputLen = 20;
+
+    for (auto policy : {CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION})
+    {
+        auto kvCacheManager = getKvCacheManager(maxNumRequests, tokensPerBlock, selfMaxTokens, selfMaxTokensPerSeq);
+        auto crossKvCacheManager = getKvCacheManager(maxNumRequests, tokensPerBlock, crossMaxTokens,
+            crossMaxTokensPerSeq, /*sinkTokenLength=*/0, /*enableReuse=*/false, kv_cache_manager::CacheType::kCROSS);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, policy, kvCacheManager != nullptr,
+            /*twoStepsLookAhead=*/false, LlmRequestState::kENCODER_INIT, LlmRequestState::kGENERATION_COMPLETE);
+
+        RequestList activeRequests;
+        activeRequests.push_back(
+            createEncoderInitRequest(/*promptLen=*/10, /*maxNewTokens=*/40, encoderInputLen, /*id=*/1));
+        activeRequests.push_back(
+            createEncoderInitRequest(/*promptLen=*/10, /*maxNewTokens=*/40, encoderInputLen, /*id=*/2));
+
+        auto const selfFreeBefore = kvCacheManager->getNumFreeBlocks();
+        auto const crossFreeBefore = crossKvCacheManager->getNumFreeBlocks();
+
+        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, crossKvCacheManager);
+
+        EXPECT_EQ(fittingRequests.size(), 2u) << "policy=" << static_cast<int>(policy);
+        EXPECT_EQ(fittingDisaggGenInitRequests.size(), 0u) << "policy=" << static_cast<int>(policy);
+        EXPECT_EQ(pausedRequests.size(), 0u) << "policy=" << static_cast<int>(policy);
+        EXPECT_EQ(fittingRequests.front()->mRequestId, 1u) << "policy=" << static_cast<int>(policy);
+        EXPECT_EQ(fittingRequests.back()->mRequestId, 2u) << "policy=" << static_cast<int>(policy);
+
+        // Scheduling alone reserves blocks via in-memory bookkeeping only; the
+        // managers' free-block counters are unaffected by encoder admission.
+        EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), selfFreeBefore) << "policy=" << static_cast<int>(policy);
+        EXPECT_EQ(crossKvCacheManager->getNumFreeBlocks(), crossFreeBefore) << "policy=" << static_cast<int>(policy);
+    }
 }

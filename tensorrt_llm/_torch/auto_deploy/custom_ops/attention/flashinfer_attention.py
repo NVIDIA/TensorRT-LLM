@@ -22,8 +22,17 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
-from ....flashinfer_utils import get_env_enable_pdl
+from ..._compat import KvCacheConfig
+
+try:
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+except (ModuleNotFoundError, ImportError):
+    import os
+
+    def get_env_enable_pdl() -> bool:
+        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
+
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
@@ -31,6 +40,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -138,9 +148,12 @@ class _FlashInferPlanner:
         cu_num_pages: torch.Tensor,
         cache_loc: torch.Tensor,
         last_page_len: torch.Tensor,
+        pool_window_left: Optional[int] = None,
     ):
         for plan_params in self.cached_cuda_graph_decode_wrappers:
             if plan_params.num_seq == num_seq:
+                if pool_window_left is not None and plan_params.window_left != pool_window_left:
+                    continue
                 wrapper = self.cached_cuda_graph_decode_wrappers[plan_params]
                 flashinfer.decode.fast_decode_plan(
                     wrapper,
@@ -316,6 +329,7 @@ def prepare_flashinfer_metadata_host(
     cu_num_pages_host: torch.Tensor,
     cache_loc_host: torch.Tensor,
     last_page_len_host: torch.Tensor,
+    pool_window_left: Optional[int] = None,
 ) -> None:
     batch_info = BatchInfo(batch_info_host)
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
@@ -326,6 +340,7 @@ def prepare_flashinfer_metadata_host(
             cu_num_pages_host[: num_decode + 1],
             cache_loc_host,
             last_page_len_host[:num_decode],
+            pool_window_left=pool_window_left,
         )
 
 
@@ -401,6 +416,11 @@ def flashinfer_mha_with_cache(
             kv_last_page_len=last_page_len[:num_seq],
             kv_layout=_GlobalFlashInferPlanner.kv_layout,
         )
+
+    if num_prefill > 0 and not read_cache_only:
+        # FlashInfer planning depends on the preceding paged-KV append completing.
+        # Keep the same append-before-plan synchronization used by the PyTorch backend.
+        torch.cuda.current_stream().synchronize()
 
     bs = b * s
     if out is not None:
@@ -568,10 +588,15 @@ class FlashInferAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
+        """Build the per-layer KV handler used by the kvcache transform."""
         # source op is [bsnd] layout already
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
         num_kv_heads = k_fake.shape[2]
         head_dim = k_fake.shape[3]
+        # ``sliding_window`` is propagated into the handler so layers
+        # with different windows land in separate pools.
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
@@ -580,6 +605,8 @@ class FlashInferAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
                 kv_factor=2,
                 kv_layout=_GlobalFlashInferPlanner.kv_layout,
+                sliding_window=sliding_window,
+                attention_type=AttentionType.mha,
             )
         }
 

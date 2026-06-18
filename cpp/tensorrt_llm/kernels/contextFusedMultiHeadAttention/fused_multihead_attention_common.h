@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -262,6 +262,11 @@ struct MHARunnerParams
     int totalQSeqLen;
     // The total number of KV sequence lengths in the batch.
     int totalKvSeqLen;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllmGenJITWarmup = false;
+    int32_t trtllmGenJITWarmupMaxNumRequests = 0;
+    int32_t trtllmGenJITWarmupMaxSeqLenQ = 0;
+    int32_t trtllmGenJITWarmupMaxSeqLenKv = 0;
 
     // Buffers.
     // The packed QKV buffer ptr.
@@ -274,6 +279,10 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
+    // The V tensor token stride in bytes (0 = compute from head dimensions).
+    // Set this when V's actual stride differs from the default (e.g. contiguous V in AutoDeploy
+    // vs non-contiguous V from kv.split() in PyTorch backend).
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.
@@ -298,6 +307,11 @@ struct MHARunnerParams
     void const* cuMaskRowsPtr;
     // The dynamic scheduler tile counter.
     void* tileCounterPtr;
+    // Scratch buffer (partialO + partialStats) for MultiCtasKv mode in trtllm-gen generation-style kernels.
+    // Only required when the sparse context path selects a GmemReduction cubin; nullptr otherwise.
+    void* multiCtasKvScratchPtr = nullptr;
+    // Per-CTA counter buffer for MultiCtasKv mode synchronization; sized as sizeof(int32_t) * SM count.
+    int32_t* multiCtasKvCounterPtr = nullptr;
     // The bmm1 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).

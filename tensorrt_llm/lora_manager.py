@@ -650,7 +650,9 @@ def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.T
 
         model_weights_bytes = model_weights_file.read()
         model_weights_dict = torch.load(
-            io.BytesIO(model_weights_bytes), map_location=torch.device("cpu")
+            io.BytesIO(model_weights_bytes),
+            map_location=torch.device("cpu"),
+            weights_only=True,
         )
 
         return model_config_dict, model_weights_dict

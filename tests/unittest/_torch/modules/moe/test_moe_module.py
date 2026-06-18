@@ -30,6 +30,7 @@ import functools
 import logging
 import os
 import pickle
+import socket
 import sys
 import tempfile
 import traceback
@@ -40,6 +41,7 @@ from typing import List, Optional
 import cloudpickle
 import pytest
 import torch
+import torch.distributed as dist
 from _torch.modules.moe.moe_test_utils import (
     IS_CI_MODE,
     MoeBackendType,
@@ -48,14 +50,18 @@ from _torch.modules.moe.moe_test_utils import (
     get_quick_skip_reason,
     iter_base_test_configs,
     replay_tactics_and_check,
+    resolve_deepseek_group_config,
     should_skip_cutedsl,
     should_skip_cutlass,
     should_skip_deepgemm,
     should_skip_densegemm,
+    should_skip_megamoe_cutedsl,
+    should_skip_megamoe_deepgemm,
     should_skip_multi_gpu,
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
+    skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -74,6 +80,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
+    SigmoidRenormMoeRoutingMethod,
     create_moe,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
@@ -88,6 +95,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FP8QDQFusedMoEMethod,
     INT8WoqPerChannelFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
+    NVFP4MegaMoECuteDslMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4FP8CutlassFusedMoEMethod,
@@ -112,6 +120,38 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+def _get_free_tcp_port() -> int:
+    """Return a local TCP port for MPI-worker torch.distributed rendezvous."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
+    """MegaMoE backends resolve an EP ProcessGroup at construction time.
+
+    Applies to both ``MEGAMOE_DEEPGEMM`` and ``MEGAMOE_CUTEDSL`` since they
+    share the same ``_resolve_ep_pg`` contract.
+    """
+    megamoe_backend_values = {
+        MoeBackendType.MEGAMOE_DEEPGEMM.value,
+        MoeBackendType.MEGAMOE_CUTEDSL.value,
+    }
+    if moe_backend not in megamoe_backend_values:
+        return
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for MegaMoE tests")
+    if dist.is_initialized():
+        return
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29561")
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
 def _create_mapping_for_parallel_mode(world_size, parallel_mode):
@@ -219,6 +259,14 @@ def _create_model_config(
         else None
     )
 
+    # CUTE_DSL_B12X is an internal-only MoeBackendType — it has no
+    # corresponding user-facing MoeConfig.backend literal. Route through
+    # "CUTEDSL" so the test exercises the cuteDSL-family selection path that
+    # users hit on SM120/121 + NVFP4 (where get_moe_cls returns the hybrid
+    # CuteDslB12xFusedMoE backend when flashinfer is importable).
+    if moe_backend == MoeBackendType.CUTE_DSL_B12X.value:
+        moe_backend = MoeBackendType.CUTEDSL.value
+
     kwargs = dict(
         pretrained_config=pretrained_config,
         mapping=mapping,
@@ -318,7 +366,7 @@ def _run_eplb_test(
     )
 
 
-def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
+def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_config=None):
     """
     Create a routing method instance with appropriate parameters for each routing method type.
 
@@ -327,6 +375,7 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
         top_k: Number of experts to select per token
         num_experts: Total number of experts
         dtype: Data type for tensors
+        model_config: Optional model config with routing-specific parameters
 
     Returns:
         An instance of the routing method
@@ -341,13 +390,9 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
 
     # DeepSeekV3 routing method requires special parameters
     if routing_method_cls == DeepSeekV3MoeRoutingMethod:
-        # DeepSeek-V3 routing: groups experts, selects top groups, then selects top_k from those
-        # The routing logic does topk(k=2) within each group, so each group must have >= 2 experts
-        # Calculate n_group such that each group has at least 2 experts
-        experts_per_group = 2
-        n_group = max(1, num_experts // experts_per_group)
-        # topk_group should be <= n_group and reasonable for the selection
-        topk_group = min(n_group, max(1, n_group // 2))
+        if model_config is None:
+            model_config = MoeModelConfig(num_experts, top_k, hidden_size=0, intermediate_size=0)
+        n_group, topk_group = resolve_deepseek_group_config(model_config)
         routed_scaling_factor = 1.0
         # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
@@ -370,6 +415,13 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
         )
 
+    # SigmoidRenorm routing method requires num_experts
+    if routing_method_cls == SigmoidRenormMoeRoutingMethod:
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+        )
+
     # Fallback: try with just top_k
     return routing_method_cls(top_k=top_k)
 
@@ -390,6 +442,7 @@ def _test_moe_worker(
     swiglu_alpha: float = 1,
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
+    bias_dtype: Optional[torch.dtype] = None,
 ):
     """
     Test MoE module worker function.
@@ -407,6 +460,8 @@ def _test_moe_worker(
         swiglu_alpha: SwiGLU alpha parameter (default=1, non-gptoss)
         swiglu_beta: SwiGLU beta parameter (default=0, non-gptoss)
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
+        bias_dtype: Data type for routing bias (default: same as dtype).
+                    Use torch.float32 to test fp32 bias plumbing.
     """
     try:
         _test_moe_worker_impl(
@@ -425,6 +480,7 @@ def _test_moe_worker(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            bias_dtype=bias_dtype,
         )
     except Exception:
         traceback.print_exc()
@@ -447,6 +503,7 @@ def _test_moe_worker_impl(
     swiglu_alpha: float = 1,
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
+    bias_dtype: Optional[torch.dtype] = None,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -466,14 +523,20 @@ def _test_moe_worker_impl(
     mapping.rank = mpi_rank()
     all_rank_num_tokens = [seq_len] * mapping.world_size
     torch.cuda.set_device(mapping.rank)
+    _ensure_dist_for_megamoe(moe_backend, mapping.rank, mapping.world_size)
 
     with torch.device(f"cuda:{mapping.rank}"):
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
 
         # Create routing method and input tensors
+        effective_bias_dtype = bias_dtype if bias_dtype is not None else dtype
         routing_method = _create_routing_method(
-            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+            routing_method_cls,
+            top_k=top_k,
+            num_experts=num_experts,
+            dtype=effective_bias_dtype,
+            model_config=model_config,
         )
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
         if enable_eplb:
@@ -511,14 +574,8 @@ def _test_moe_worker_impl(
             swiglu_limit=swiglu_limit if swiglu_gptoss_style else None,
             num_local_experts=num_local_experts,
         )
-        weights = quantize_util.create_weights(**quant_kwargs)
-
-        # For EPLB, keep weights on CPU
-        if enable_eplb:
-            for key in weights:
-                if isinstance(weights[key], torch.Tensor):
-                    weights[key] = weights[key].to("cpu")
-        ref_weights = copy.deepcopy(weights) if enable_eplb else weights
+        ref_cls = quant_kwargs.pop("ref_cls", None)
+        ref_module_kwargs = {}
 
         # Use a small max_num_tokens for unit tests to avoid NVSHMEM buffer
         # allocation failures.  DeepEP low-latency buffers are sized by
@@ -567,6 +624,28 @@ def _test_moe_worker_impl(
                 weight_loading_mode=weight_loading_mode,
             ) as fused_moe,
         ):
+            # W4A8_MXFP4_MXFP8 needs backend-layout-aware weights.  In
+            # particular, MegaMoEDeepGemm and TRTLLMGen can have different
+            # padded backend/ref tensor layouts, so create weights after the
+            # backend exposes its quant_method shapes.
+            if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+                (
+                    weights,
+                    ref_weights,
+                    ref_module_kwargs,
+                ) = quantize_util.prepare_weights_from_backend(fused_moe, **quant_kwargs)
+            else:
+                weights = quantize_util.create_weights(**quant_kwargs)
+                ref_weights = weights
+
+            # For EPLB, keep backend weights on CPU.
+            if enable_eplb:
+                for key, value in weights.items():
+                    if isinstance(value, torch.Tensor):
+                        weights[key] = value.to("cpu")
+                if ref_weights is weights:
+                    ref_weights = copy.deepcopy(weights)
+
             fused_moe.load_weights([weights])
             fused_moe.post_load_weights()
             fused_moe.cuda(f"cuda:{mapping.rank}")
@@ -585,7 +664,12 @@ def _test_moe_worker_impl(
                 G_LOGGER.info(f"[EPLB Debug] Initial expert_ids (after init): {initial_expert_ids}")
 
             # Create reference module
-            ref_fused_moe = quantize_util.create_ref_module(routing_method)
+            if ref_cls is not None:
+                ref_fused_moe = quantize_util.create_ref_module(
+                    routing_method, ref_cls=ref_cls, **ref_module_kwargs
+                )
+            else:
+                ref_fused_moe = quantize_util.create_ref_module(routing_method, **ref_module_kwargs)
             ref_fused_moe.moe_tp_size = mapping.moe_tp_size
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
@@ -675,19 +759,38 @@ def _test_moe_multi_gpu(
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
     """
 
-    def init_worker(custom_paths, comm_method_type):
+    def init_worker(custom_paths, comm_method_type, master_port, moe_backend):
         # Update the sys.path to align with main process for submodule import
         for custom_path in custom_paths:
             if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
                 sys.path.append(custom_path)
 
-        # Set comm method
-        os.environ["TRTLLM_FORCE_COMM_METHOD"] = comm_method_type
+        # Both MegaMoEDeepGemm and MegaMoECuteDsl bypass the host
+        # ``Communication.dispatch`` strategy entirely (DG via its own
+        # internal EP comm, CuteDsl via the in-kernel
+        # ``MegaMoeSymmMemProvider``). Their dedicated multi-GPU / EPLB
+        # generators pass the ``IGNORE`` sentinel string here so the
+        # worker does not force ``TRTLLM_FORCE_COMM_METHOD`` on backends
+        # that ignore it.
+        if comm_method_type == MEGAMOE_IGNORE_COMM_METHOD:
+            os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
+        else:
+            os.environ["TRTLLM_FORCE_COMM_METHOD"] = comm_method_type
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ["MASTER_PORT"] = str(master_port)
+
+        # MegaMoECuteDsl threads per-expert fc31_alpha / fc2_alpha /
+        # fc1_norm_const through the kernel ABI, so NVFP4QuantizeUtil's
+        # non-1 weight_scale_2 values are computed correctly end-to-end
+        # (EPLB shared-staging / migration included) without a test bypass.
 
     mapping = _create_mapping_for_parallel_mode(world_size, parallel_mode)
+    master_port = _get_free_tcp_port()
 
     with MPIPoolExecutor(
-        initializer=init_worker, initargs=(sys.path, comm_method_type), max_workers=world_size
+        initializer=init_worker,
+        initargs=(sys.path, comm_method_type, master_port, moe_backend),
+        max_workers=world_size,
     ) as executor:
         results = executor.map(
             _test_moe_worker,
@@ -730,6 +833,7 @@ QUANT_ALGOS = [
     QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.W4A8_NVFP4_FP8,
     QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
@@ -742,6 +846,9 @@ BACKEND_TYPES = [
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
+    MoeBackendType.CUTE_DSL_B12X,
 ]
 
 # Data types to test
@@ -757,13 +864,14 @@ DTYPES = [
 # Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
 CI_MOE_MODEL_CONFIGS = [
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
-    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
+    MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
 ]
 
 LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
+    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(384, 8, 7168, 2048),  # Kimi-K2
     # === Boundary Tests: num_experts / top_k ===
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
@@ -787,6 +895,7 @@ ROUTING_METHODS = [
     Llama4RenormalizeMoeRoutingMethod,  # Top1 -> Sigmoid (Llama4)
     DeepSeekV3MoeRoutingMethod,  # Sigmoid -> BiasAdd -> Group TopK (DeepSeek-V3)
     MiniMaxM2MoeRoutingMethod,  # Sigmoid -> BiasAdd -> TopK -> Renormalize (MiniMax-M2)
+    SigmoidRenormMoeRoutingMethod,  # Sigmoid -> TopK -> Renormalize
 ]
 
 
@@ -815,6 +924,14 @@ COMM_METHODS = [
     "DEEPEPLOWLATENCY",
 ]
 
+# Both MegaMoE backends (DeepGemm, CuteDsl) own cross-rank exchange in the
+# fused kernel, so the test harness must NOT force a host
+# ``Communication.dispatch`` strategy: the ``IGNORE`` comm sentinel tells the
+# worker (``comm_method_type == MEGAMOE_IGNORE_COMM_METHOD``) to pop
+# ``TRTLLM_FORCE_COMM_METHOD`` and let the backend take the fused path. Both
+# backends share the same multi-GPU parallel-mode coverage.
+MEGAMOE_IGNORE_COMM_METHOD = "IGNORE"
+MEGAMOE_PARALLEL_MODES = ["DEP"] if IS_CI_MODE else ["DEP", "TEP"]
 # SwiGLU parameters for swiglu_gptoss_style testing
 SWIGLU_ALPHAS = [1, 1.702]  # default, GPT-OSS (modeling_gpt_oss.py)
 SWIGLU_BETAS = [0, 1.0]  # default, GPT-OSS
@@ -892,6 +1009,108 @@ def _get_comm_method_skip_reason(
     return None
 
 
+def should_skip_MegaMoEDeepGemm(
+    parallel_mode: str,
+    comm_method: str,
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    dtype: torch.dtype,
+    model_config: MoeModelConfig,
+    routing_method_cls,
+    swiglu_gptoss_style: bool,
+) -> Optional[str]:
+    """Check MegaMoEDeepGemm constraints for module-level multi-GPU tests."""
+    if backend_type != MoeBackendType.MEGAMOE_DEEPGEMM:
+        return None
+
+    if comm_method != MEGAMOE_IGNORE_COMM_METHOD:
+        return (
+            "MegaMoEDeepGemm uses DeepGEMM internal EP communication; "
+            f"use comm={MEGAMOE_IGNORE_COMM_METHOD} instead of "
+            f"forcing {comm_method}."
+        )
+
+    if parallel_mode not in ("DEP", "TEP"):
+        return f"MegaMoEDeepGemm Phase 1 is MoE-EP only (got {parallel_mode})"
+
+    base_reason = should_skip_megamoe_deepgemm(
+        backend_type,
+        quant_algo=quant_algo,
+        dtype=dtype,
+        model_config=model_config,
+        moe_tp_size=1,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+    )
+    if base_reason:
+        return base_reason
+
+    # The DeepGEMM mega kernel consumes precomputed top-k expert ids and
+    # routing weights. Routing itself runs before the kernel, so module tests
+    # can cover the routing methods already used by the multi-GPU matrix.
+    if routing_method_cls not in (RenormalizeMoeRoutingMethod, DeepSeekV3MoeRoutingMethod):
+        return (
+            "MegaMoEDeepGemm module multi-GPU coverage is limited to "
+            "Renormalize and DeepSeekV3 routing methods"
+        )
+
+    return None
+
+
+def should_skip_MegaMoECuteDsl(
+    parallel_mode: str,
+    comm_method: str,
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    dtype: torch.dtype,
+    model_config: MoeModelConfig,
+    routing_method_cls,
+    swiglu_gptoss_style: bool,
+) -> Optional[str]:
+    """Check MegaMoECuteDsl constraints for module-level multi-GPU tests.
+
+    Mirrors :func:`should_skip_MegaMoEDeepGemm` but applies to the
+    NVFP4 CuteDSL variant: the kernel owns cross-rank exchange via
+    ``MegaMoeSymmMemProvider``, so any forced host comm method is
+    rejected. Multi-GPU coverage is limited to EP-shard routing
+    (``DEP`` / ``TEP``) and routing methods exercised elsewhere in
+    the multi-GPU matrix.
+    """
+    if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
+        return None
+
+    if comm_method != MEGAMOE_IGNORE_COMM_METHOD:
+        return (
+            "MegaMoECuteDsl uses an in-kernel cuMem symmetric-memory "
+            f"provider; use comm={MEGAMOE_IGNORE_COMM_METHOD} "
+            f"instead of forcing {comm_method}."
+        )
+
+    if parallel_mode not in ("DEP", "TEP"):
+        return f"MegaMoECuteDsl is EP-only (got {parallel_mode})"
+
+    base_reason = should_skip_megamoe_cutedsl(
+        backend_type,
+        quant_algo=quant_algo,
+        dtype=dtype,
+        model_config=model_config,
+        moe_tp_size=1,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+    )
+    if base_reason:
+        return base_reason
+
+    # MegaMoECuteDsl kernel consumes precomputed top-k expert ids and
+    # routing weights (same as DG). Limit routing coverage to the
+    # methods already exercised in the multi-GPU matrix.
+    if routing_method_cls not in (RenormalizeMoeRoutingMethod, DeepSeekV3MoeRoutingMethod):
+        return (
+            "MegaMoECuteDsl module multi-GPU coverage is limited to "
+            "Renormalize and DeepSeekV3 routing methods"
+        )
+
+    return None
+
+
 def generate_multi_gpu_test_params(
     parallel_modes,
     comm_methods,
@@ -947,14 +1166,22 @@ def generate_multi_gpu_test_params(
             if not skip_reason:
                 # TP modes shard intermediate_size; EP modes don't
                 moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
+                # Match the canonical predicate used by the worker impl so
+                # backend skip checks (e.g. the W4A8_MXFP4_FP8 + TRTLLM-Gen
+                # gpt-oss SwiGLU kernel-bug skip) fire on multi-GPU runs too.
+                swiglu_gptoss_style = (
+                    swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+                )
                 for reason in (
                     _get_comm_method_skip_reason(comm_method, model_config, dtype=dtype),
                     should_skip_trtllm(
                         backend_type,
                         quant_algo,
                         model_config,
+                        swiglu_gptoss_style=swiglu_gptoss_style,
                         comm_method=comm_method,
                         moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
                     ),
                     should_skip_cutlass(
                         backend_type,
@@ -986,6 +1213,30 @@ def generate_multi_gpu_test_params(
                         moe_tp_size=moe_tp_size,
                         parallel_mode=parallel_mode,
                     ),
+                    should_skip_megamoe_deepgemm(
+                        backend_type,
+                        quant_algo=quant_algo,
+                        dtype=dtype,
+                        model_config=model_config,
+                        comm_method=comm_method,
+                        moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
+                        swiglu_gptoss_style=swiglu_alpha != 1
+                        or swiglu_beta != 0
+                        or swiglu_limit != float("inf"),
+                    ),
+                    should_skip_megamoe_cutedsl(
+                        backend_type,
+                        quant_algo=quant_algo,
+                        dtype=dtype,
+                        model_config=model_config,
+                        comm_method=comm_method,
+                        moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
+                        swiglu_gptoss_style=swiglu_alpha != 1
+                        or swiglu_beta != 0
+                        or swiglu_limit != float("inf"),
+                    ),
                     should_skip_multi_gpu(
                         parallel_mode, model_config, world_size=4, comm_method=comm_method
                     ),
@@ -993,6 +1244,84 @@ def generate_multi_gpu_test_params(
                     if reason:
                         skip_reason = reason
                         break
+
+            if skip_reason:
+                continue
+
+            test_id = f"parallel={parallel_mode}-comm={comm_method}-{base_test_id}"
+            param_values = (
+                parallel_mode,
+                comm_method,
+                dtype,
+                backend_type.value,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                swiglu_alpha,
+                swiglu_beta,
+                swiglu_limit,
+            )
+            params.append(create_test_param(param_values, test_id))
+
+    return params
+
+
+def _generate_megamoe_multi_gpu_test_params(
+    *,
+    backend_type,
+    quant_algo,
+    should_skip_fn,
+) -> List:
+    """Generate focused MegaMoE module multi-GPU coverage for one backend.
+
+    Both MegaMoE backends share the same multi-GPU matrix shape; only the
+    backend/quant enum and capability skip hook differ between DeepGemm
+    (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4). The comm method is hardcoded to
+    the ``IGNORE`` sentinel because the fused kernel owns dispatch/combine
+    (the worker pops ``TRTLLM_FORCE_COMM_METHOD`` and takes the fused path).
+    """
+    params: List = []
+    seq_lens = [8] if IS_CI_MODE else SEQ_LENS
+
+    for parallel_mode, comm_method in product(MEGAMOE_PARALLEL_MODES, [MEGAMOE_IGNORE_COMM_METHOD]):
+        for (
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            model_config,
+            seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],
+            MOE_MODEL_CONFIGS,
+            seq_lens,
+            [torch.bfloat16],
+            [backend_type],
+            [quant_algo],
+            MULTI_GPU_ROUTING_METHODS,
+        ):
+            if not skip_reason:
+                skip_reason = should_skip_fn(
+                    parallel_mode,
+                    comm_method,
+                    backend_type,
+                    quant_algo,
+                    dtype,
+                    model_config,
+                    routing_method_cls,
+                    swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf"),
+                )
+
+            if not skip_reason:
+                skip_reason = should_skip_multi_gpu(
+                    parallel_mode, model_config, world_size=4, comm_method=comm_method
+                )
 
             if skip_reason:
                 continue
@@ -1109,8 +1438,10 @@ def test_configurable_moe_single_gpu(
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    backend_type = MoeBackendType(moe_backend)
+    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
-        backend_type=MoeBackendType(moe_backend),
+        backend_type=backend_type,
         quant_algo=quant_algo,
         model_config=model_config,
         routing_method_cls=routing_method_cls,
@@ -1153,6 +1484,111 @@ def test_configurable_moe_single_gpu(
 
 
 # ============================================================================
+# FP32 Routing Bias Tests
+# ============================================================================
+# MiniMax-M2 and DeepSeek models can have fp32 routing_bias with bf16 model dtype.
+# These tests verify that the trtllmGen MoE backend correctly handles fp32 bias
+# across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
+
+
+def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bias_tensor):
+    """Create routing method with a specific bias tensor."""
+    if routing_method_cls == DeepSeekV3MoeRoutingMethod:
+        n_group = max(1, num_experts // 32)
+        topk_group = min(n_group, max(1, n_group // 2))
+        return routing_method_cls(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=1.0,
+            callable_e_score_correction_bias=lambda: bias_tensor,
+            is_fused=False,
+        )
+    elif routing_method_cls == MiniMaxM2MoeRoutingMethod:
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: bias_tensor,
+        )
+    else:
+        raise ValueError(f"Unsupported routing method for bias test: {routing_method_cls}")
+
+
+@pytest.mark.parametrize(
+    "routing_method_cls,moe_model_config",
+    [
+        (MiniMaxM2MoeRoutingMethod, MoeModelConfig(256, 6, 2048, 1408)),
+        (DeepSeekV3MoeRoutingMethod, MoeModelConfig(256, 8, 7168, 2048, n_group=8, topk_group=4)),
+    ],
+)
+@pytest.mark.parametrize(
+    "quant_algo",
+    [
+        QuantAlgo.NVFP4,
+        QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+        QuantAlgo.FP8,
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quant_algo, dtype):
+    """
+    Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
+
+    MiniMax-M2 and DeepSeek models emit fp32 routing_bias from trust_remote_code
+    model definitions. This test verifies that the fp32 bias is correctly plumbed
+    through the thop boundary (TORCH_CHECK), Runner::run() (dtypeRoutingBias),
+    and routing kernels (mDtypeBias) without silent corruption (reading fp32 as bf16).
+
+    Compares fused trtllmGen output against the PyTorch reference module.
+    """
+    moe_backend = MoeBackendType.TRTLLM.value
+    backend_type = MoeBackendType.TRTLLM
+
+    ci_skip = should_skip_to_accelerate_ci(
+        backend_type=backend_type,
+        quant_algo=quant_algo,
+        model_config=moe_model_config,
+        routing_method_cls=routing_method_cls,
+        dtype=dtype,
+    )
+    if ci_skip:
+        pytest.skip(ci_skip)
+
+    skip_reason = should_skip_trtllm(
+        backend_type, quant_algo, moe_model_config, routing_method_cls=routing_method_cls
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    skip_if_insufficient_gpu_memory(
+        moe_model_config.num_experts,
+        moe_model_config.hidden_size,
+        moe_model_config.intermediate_size,
+        dtype,
+    )
+
+    dtype_routing_logits = None
+    if (
+        moe_backend == MoeBackendType.TRTLLM.value
+        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    ):
+        dtype_routing_logits = torch.float32
+
+    _test_moe_worker(
+        moe_backend=moe_backend,
+        dtype=dtype,
+        quant_algo=quant_algo,
+        model_config=moe_model_config,
+        seq_len=8,
+        enable_autotune=True,
+        routing_method_cls=routing_method_cls,
+        dtype_routing_logits=dtype_routing_logits,
+        bias_dtype=torch.float32,
+    )
+
+
+# ============================================================================
 # MoE Multi-GPU Tests
 # ============================================================================
 # Pre-generate multi-GPU test parameters at module load time
@@ -1166,6 +1602,16 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     backend_types=BACKEND_TYPES,
     quant_algos=QUANT_ALGOS,
     routing_methods=MULTI_GPU_ROUTING_METHODS,
+)
+MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
+    backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
+    quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    should_skip_fn=should_skip_MegaMoEDeepGemm,
+)
+MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
+    backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
+    quant_algo=QuantAlgo.NVFP4,
+    should_skip_fn=should_skip_MegaMoECuteDsl,
 )
 
 
@@ -1189,8 +1635,10 @@ def test_configurable_moe_multi_gpu(
     swiglu_limit,
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    backend_type = MoeBackendType(moe_backend)
+    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
-        backend_type=MoeBackendType(moe_backend),
+        backend_type=backend_type,
         quant_algo=quant_algo,
         model_config=model_config,
         routing_method_cls=routing_method_cls,
@@ -1315,6 +1763,15 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
         }
         return method_map.get(quant_algo)
 
+    # MEGAMOE_CUTEDSL backend: NVFP4 only, dynamic-EPLB supported via
+    # NVFP4MegaMoECuteDslMethod which registers mega-format CPU staging
+    # tensors and per-expert fc1_norm_const alongside the parent NVFP4 family.
+    if backend_str == "MEGAMOE_CUTEDSL":
+        method_map = {
+            QuantAlgo.NVFP4: NVFP4MegaMoECuteDslMethod,
+        }
+        return method_map.get(quant_algo)
+
     return None
 
 
@@ -1433,16 +1890,125 @@ def generate_eplb_test_params(
     return params
 
 
+def _generate_megamoe_eplb_test_params(
+    *,
+    backend_type,
+    quant_algo,
+    should_skip_fn,
+) -> List:
+    """Generate focused dynamic-EPLB params for a MegaMoE fused-comm backend.
+
+    Both MegaMoE backends share the same EPLB param shape: they own
+    cross-rank exchange in-kernel and support dynamic EPLB through CPU
+    shared-staging tensors registered by their quantization method, so slot
+    migration replaces all derived state atomically alongside the raw
+    weights + scales. Only the backend/quant enum and capability skip hook
+    differ between DeepGemm (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4).
+
+    The comm method is hardcoded to the ``IGNORE`` sentinel: the fused
+    kernel owns dispatch/combine, so the harness must pop
+    ``TRTLLM_FORCE_COMM_METHOD`` instead of forcing a host
+    ``Communication.dispatch`` strategy.
+    """
+    params: List = []
+    ep_size = 4
+
+    for parallel_mode, comm_method, num_slots in product(
+        EPLB_PARALLEL_MODES, [MEGAMOE_IGNORE_COMM_METHOD], EPLB_NUM_SLOTS_LIST
+    ):
+        for (
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            model_config,
+            _seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],
+            EPLB_MODEL_CONFIGS,
+            [8],
+            [torch.bfloat16],
+            [backend_type],
+            [quant_algo],
+            EPLB_ROUTING_METHODS,
+        ):
+            if not skip_reason:
+                skip_reason = should_skip_fn(
+                    parallel_mode,
+                    comm_method,
+                    backend_type,
+                    quant_algo,
+                    dtype,
+                    model_config,
+                    routing_method_cls,
+                    swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf"),
+                )
+
+            if not skip_reason and num_slots <= model_config.num_experts:
+                skip_reason = (
+                    f"EPLB requires num_slots ({num_slots}) > "
+                    f"num_experts ({model_config.num_experts})"
+                )
+
+            if not skip_reason and num_slots % ep_size != 0:
+                skip_reason = (
+                    f"{backend_type.value} requires num_slots ({num_slots}) "
+                    f"divisible by ep_size ({ep_size})."
+                )
+
+            if skip_reason:
+                continue
+
+            test_id = (
+                f"parallel={parallel_mode}-comm={comm_method}-{base_test_id}-"
+                f"slots={num_slots}-eplb=dynamic"
+            )
+            param_values = (
+                parallel_mode,
+                comm_method,
+                dtype,
+                backend_type.value,
+                quant_algo,
+                model_config,
+                num_slots,
+                routing_method_cls,
+            )
+            params.append(create_test_param(param_values, test_id))
+
+    return params
+
+
 # Pre-generate EPLB test parameters at module load time
-EPLB_TEST_PARAMS = generate_eplb_test_params(
-    parallel_modes=EPLB_PARALLEL_MODES,
-    comm_methods=EPLB_COMM_METHODS,
-    model_configs=EPLB_MODEL_CONFIGS,
-    num_slots_list=EPLB_NUM_SLOTS_LIST,
-    dtypes=DTYPES,
-    backend_types=BACKEND_TYPES,
-    quant_algos=QUANT_ALGOS,
-    routing_methods=EPLB_ROUTING_METHODS,
+EPLB_TEST_PARAMS = (
+    generate_eplb_test_params(
+        parallel_modes=EPLB_PARALLEL_MODES,
+        comm_methods=EPLB_COMM_METHODS,
+        model_configs=EPLB_MODEL_CONFIGS,
+        num_slots_list=EPLB_NUM_SLOTS_LIST,
+        dtypes=DTYPES,
+        backend_types=[
+            b
+            for b in BACKEND_TYPES
+            if b not in (MoeBackendType.MEGAMOE_DEEPGEMM, MoeBackendType.MEGAMOE_CUTEDSL)
+        ],
+        quant_algos=QUANT_ALGOS,
+        routing_methods=EPLB_ROUTING_METHODS,
+    )
+    + _generate_megamoe_eplb_test_params(
+        backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+        should_skip_fn=should_skip_MegaMoEDeepGemm,
+    )
+    + _generate_megamoe_eplb_test_params(
+        backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
+        quant_algo=QuantAlgo.NVFP4,
+        should_skip_fn=should_skip_MegaMoECuteDsl,
+    )
 )
 
 
@@ -1465,6 +2031,8 @@ def test_configurable_moe_multi_gpu_eplb(
     num_slots,
     routing_method_cls,
 ):
+    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
+
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
         model_config.hidden_size,

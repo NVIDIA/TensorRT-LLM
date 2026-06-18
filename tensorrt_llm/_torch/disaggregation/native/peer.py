@@ -97,11 +97,14 @@ class PeerRegistrar:
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
         if self_layers != peer_layers:
+            # Allow mismatch when one side has speculative (e.g. MTP) layers
+            # that the other side doesn't. The pool_mapping logic will only
+            # transfer layers that exist on both sides.
             logger.warning(
-                "PeerRegistrar: total layer count mismatch "
-                f"(local={self_layers}, peer={peer_layers})."
+                "PeerRegistrar: layer count differs "
+                f"(local={self_layers}, peer={peer_layers}), "
+                "allowing partial layer transfer."
             )
-            return False
 
         return True
 

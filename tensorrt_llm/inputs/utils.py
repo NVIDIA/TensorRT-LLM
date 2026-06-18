@@ -1,18 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import base64
-import math
-import os
 import tempfile
 from collections import defaultdict
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
-import aiohttp
 import numpy as np
-import requests
 import soundfile
 import torch
 from PIL import Image
@@ -22,8 +20,17 @@ from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
-from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
-                                            default_hasher)
+from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
+                                          _load_and_convert_image,
+                                          _load_video_by_cv2,
+                                          _normalize_file_uri,
+                                          _safe_aiohttp_get, _safe_request_get)
+from tensorrt_llm.inputs.media_io import \
+    convert_image_mode as convert_image_mode
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.multimodal_data import \
+    BaseModalityData as BaseModalityData
+from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
@@ -31,90 +38,6 @@ from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
-
-# Module-level aiohttp session shared across all media fetch calls.
-# Created lazily on first use inside the async event loop, then reused so that
-# TCP connections are kept alive and not re-established per request.
-_global_aiohttp_session: aiohttp.ClientSession | None = None
-
-
-async def _get_aiohttp_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp.ClientSession, creating it on first call."""
-    global _global_aiohttp_session
-    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
-        _global_aiohttp_session = aiohttp.ClientSession()
-    return _global_aiohttp_session
-
-
-@dataclass
-class BaseModalityData:
-    """Base class for modality-specific data.
-
-    This class serves as the foundation for all modality data types (image, video, audio, etc.),
-    providing a common interface for modality-specific data structures.
-
-    Subclasses should define their own attributes based on the specific needs of each modality.
-    """
-
-
-@dataclass
-class VideoData(BaseModalityData):
-    """Data class for video loading results.
-
-    Attributes:
-        frames: List of video frames, either as PIL Images or PyTorch tensors.
-        metadata: Dictionary containing video metadata including:
-            - total_num_frames: Total number of frames in the video
-            - fps: Original frames per second of the video
-            - duration: Duration of the video in seconds
-            - frames_indices: List of indices of the sampled frames
-    """
-    frames: Union[List[Image.Image], List[torch.Tensor]]
-    """The loaded video frames, either as PIL Images or PyTorch tensors."""
-
-    metadata: Dict[str, Any]
-    """Metadata associated with the video (e.g., fps, duration, frame indices)."""
-
-    def __post_init__(self):
-        """Validate that frames list is not empty."""
-        if not self.frames:
-            raise ValueError("frames list cannot be empty")
-        if not isinstance(self.metadata, dict):
-            raise TypeError("metadata must be a dictionary")
-
-
-def rgba_to_rgb(
-    image: Image.Image,
-    background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
-) -> Image.Image:
-    """Convert an RGBA image to RGB with filled background color.
-
-    Uses white (255, 255, 255) as the default background color because:
-    1. It's the most neutral and commonly expected background for images
-    2. Maintains backward compatibility with existing code
-    """
-    if image.mode != "RGBA":
-        raise ValueError(
-            f"Expected image mode to be 'RGBA', but got '{image.mode}'")
-    converted = Image.new("RGB", image.size, background_color)
-    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
-    return converted
-
-
-def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
-    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
-    if image.mode == to_mode:
-        return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
-
-
-def _load_and_convert_image(image):
-    image = Image.open(image)
-    image.load()
-    return convert_image_mode(image, "RGB")
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
@@ -150,12 +73,14 @@ def load_image(image: Union[str, Image.Image],
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        image = requests.get(image, stream=True, timeout=10).raw
-        image = _load_and_convert_image(image)
+        resp = _safe_request_get(image, stream=True)
+        image = _load_and_convert_image(resp.raw)
     elif parsed_url.scheme == "data":
         image = load_base64_image(parsed_url)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         image = _load_and_convert_image(image)
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
         return ToTensor()(image).to(device=device)
@@ -176,202 +101,22 @@ async def async_load_image(
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(image) as response:
-            content = await response.read()
+        content = await _safe_aiohttp_get(image, session=session)
         image = await asyncio.to_thread(_load_and_convert_image,
                                         BytesIO(content))
     elif parsed_url.scheme == "data":
         image = await asyncio.to_thread(load_base64_image, parsed_url)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         image = await asyncio.to_thread(_load_and_convert_image,
                                         Path(parsed_url.path))
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
         return await asyncio.to_thread(lambda: ToTensor()
                                        (image).to(device=device))
     else:
         return image
-
-
-def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
-    """Convert a PyAV audio frame to a NumPy array, averaging channels if mono."""
-    chunk = frame.to_ndarray()
-    if mono and chunk.ndim > 1:
-        chunk = chunk.mean(axis=0)
-    return chunk
-
-
-# TODO(TRTLLM-12001): Add unit tests for this.
-def extract_audio_from_video(
-    source: Union[str, BytesIO],
-    *,
-    sr: Optional[float] = None,
-    mono: bool = True,
-) -> Tuple[np.ndarray, int]:
-    """Extract the audio track from a video file using PyAV.
-
-    Args:
-        source: File path, URL, or BytesIO containing the video.
-        sr: Target sample rate. If `None`, the native sample rate is kept.
-        mono: If `True` (default), average channels to produce a mono waveform.
-
-    Returns:
-        `(waveform, sample_rate)` where *waveform* is a 1-D float32
-        NumPy array and *sample_rate* is an integer in Hz.
-
-    Raises:
-        ValueError: If the video has no audio stream or the data is corrupt.
-    """
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
-        raise RuntimeError(
-            "PyAV is required for audio extraction from video. "
-            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it.")
-    try:
-        import av
-    except ImportError:
-        raise ImportError(
-            "PyAV is required for audio extraction from video but is not installed."
-        )
-
-    try:
-        with av.open(source) as container:
-            if not container.streams.audio:
-                raise ValueError("No audio stream found in the video.")
-            stream = container.streams.audio[0]
-            stream.thread_type = "AUTO"
-            native_sr = stream.rate
-            target_sr = int(sr) if sr is not None else native_sr
-
-            chunks: List[np.ndarray] = []
-            target_layout = "mono" if mono else stream.layout.name
-            needs_resampling = (not math.isclose(
-                float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
-                                or stream.format.name != "fltp"
-                                or stream.layout.name != target_layout)
-            resampler = (av.AudioResampler(
-                format="fltp",
-                layout=target_layout,
-                rate=target_sr,
-            ) if needs_resampling else None)
-            for frame in container.decode(stream):
-                if needs_resampling:
-                    for out_frame in resampler.resample(frame):
-                        chunks.append(_audio_frame_to_array(out_frame, mono))
-                else:
-                    chunks.append(_audio_frame_to_array(frame, mono))
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            "Invalid or corrupted video data when extracting audio. "
-            "Ensure the input is a valid video file.") from e
-
-    if not chunks:
-        raise ValueError("No audio frames decoded from the video.")
-
-    audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
-
-    return audio, target_sr
-
-
-def _load_video_by_cv2(video: str,
-                       num_frames: int = 10,
-                       fps: int = 30,
-                       format: str = "pt",
-                       device: str = "cpu",
-                       extract_audio: bool = False) -> VideoData:
-    # Keep this import local to avoid importing cv2 if not needed
-    import cv2
-
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
-
-    vidcap = cv2.VideoCapture(video)
-
-    try:
-        if not vidcap.isOpened():
-            raise ValueError(
-                f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
-            )
-
-        frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-        original_fps = vidcap.get(cv2.CAP_PROP_FPS)
-
-        if frame_count <= 0 or original_fps <= 0:
-            raise ValueError("Video has no frames or invalid FPS.")
-
-        duration = frame_count / original_fps
-        num_frames_to_sample = frame_count
-        if num_frames > 0:
-            num_frames_to_sample = min(num_frames, frame_count)
-        if fps > 0:
-            num_frames_to_sample = min(num_frames_to_sample,
-                                       math.floor(duration * fps))
-        num_frames_to_sample = max(1,
-                                   num_frames_to_sample)  # at least one sample
-
-        indices = np.linspace(0,
-                              frame_count - 1,
-                              num_frames_to_sample,
-                              dtype=int).tolist()
-
-        # Sequential forward scan — grab() without per-frame seek
-        target_set = set(indices)
-        max_idx = indices[-1]
-        raw_frames: dict[int, np.ndarray] = {}
-        frame_idx = 0
-        while frame_idx <= max_idx:
-            grab_succeeded = vidcap.grab()
-            if not grab_succeeded:
-                break
-            if frame_idx in target_set:
-                # cv2 decodes frames in BGR order; convert to RGB for downstream use
-                retrieve_succeeded, bgr_frame = vidcap.retrieve()
-                if retrieve_succeeded:
-                    raw_frames[frame_idx] = cv2.cvtColor(
-                        bgr_frame, cv2.COLOR_BGR2RGB)
-            frame_idx += 1
-        vidcap.release()
-
-        if not raw_frames:
-            raise ValueError("Video has no readable frames.")
-
-        valid_indices = [i for i in indices if i in raw_frames]
-        if format == "pt":
-            # Bypass PIL: direct numpy HWC uint8 -> torch CHW float32
-            loaded_frames = [
-                torch.from_numpy(raw_frames[i]).permute(
-                    2, 0, 1).float().div_(255.0).to(device=device)
-                for i in valid_indices
-            ]
-        else:
-            loaded_frames = [
-                Image.fromarray(raw_frames[i]) for i in valid_indices
-            ]
-
-        metadata = {
-            "total_num_frames": frame_count,
-            "fps": original_fps,
-            "duration": duration,
-            "frames_indices": valid_indices,
-        }
-    finally:
-        # Release the OpenCV handle before any downstream re-open (e.g. PyAV
-        # audio extraction on Windows) and to avoid leaking descriptors.
-        vidcap.release()
-
-    if extract_audio:
-        try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(video)
-            metadata["audio_samples"] = audio_samples
-            metadata["audio_sample_rate"] = audio_sample_rate
-        except ValueError as e:
-            if "No audio stream found" in str(e):
-                logger.warning(
-                    "Video has no audio track, skipping audio extraction.")
-            else:
-                raise
-
-    return VideoData(frames=loaded_frames, metadata=metadata)
 
 
 def load_base64_video(video: str) -> BytesIO:
@@ -394,7 +139,19 @@ def load_video(video: str,
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
     parsed_url = urlparse(video)
-    if parsed_url.scheme in ["http", "https", ""]:
+    if parsed_url.scheme in ["http", "https"]:
+        resp = _safe_request_get(video, stream=False)
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix=".mp4") as tmp_file:
+            tmp_file.write(resp.content)
+            tmp_file.flush()
+            return _load_video_by_cv2(tmp_file.name,
+                                      num_frames,
+                                      fps,
+                                      format,
+                                      device,
+                                      extract_audio=extract_audio)
+    elif parsed_url.scheme in ("", "file"):
         return _load_video_by_cv2(video,
                                   num_frames,
                                   fps,
@@ -440,23 +197,21 @@ async def async_load_video(video: str,
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(video) as response:
-            content = await response.content.read()
-        return await asyncio.to_thread(_load_from_bytes, content)
+        video_data = await _safe_aiohttp_get(video, session=session)
+        return await asyncio.to_thread(_load_from_bytes, video_data)
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
+        decoded_video = await asyncio.to_thread(load_base64_video, video)
         return await asyncio.to_thread(_load_from_bytes, decoded_video)
+    elif parsed_url.scheme in ("", "file"):
+        return await asyncio.to_thread(_load_video_by_cv2,
+                                       video,
+                                       num_frames,
+                                       fps,
+                                       format,
+                                       device,
+                                       extract_audio=extract_audio)
     else:
-        return await asyncio.to_thread(_load_video_by_cv2, video, num_frames,
-                                       fps, format, device)
-
-
-def _normalize_file_uri(uri: str) -> str:
-    """Strip the file:// scheme and unquote percent-encoded characters."""
-    parsed = urlparse(uri)
-    if parsed.scheme == "file":
-        return unquote(parsed.path)
-    return uri
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
 
 def load_audio(
@@ -466,10 +221,13 @@ def load_audio(
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
     if parsed_url.scheme in ["http", "https"]:
-        audio = requests.get(audio, stream=True, timeout=10)
-        audio = BytesIO(audio.content)
-    elif parsed_url.scheme == "file":
-        audio = _normalize_file_uri(audio)
+        resp = _safe_request_get(audio, stream=False)
+        audio = BytesIO(resp.content)
+    elif parsed_url.scheme in ("", "file"):
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     audio = soundfile.read(audio)
     return audio
@@ -489,12 +247,13 @@ async def async_load_audio(
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(audio) as response:
-            content = await response.content.read()
-        # Offload CPU-bound soundfile decoding to thread pool
-        return await asyncio.to_thread(soundfile.read, BytesIO(content))
-    elif parsed_url.scheme == "file":
-        audio = _normalize_file_uri(audio)
+        audio_data = await _safe_aiohttp_get(audio, session=session)
+        audio = BytesIO(audio_data)
+    elif parsed_url.scheme in ("", "file"):
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     return await asyncio.to_thread(soundfile.read, audio)
 
@@ -502,9 +261,8 @@ async def async_load_audio(
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
-    with requests.get(content_url, timeout=10) as response:
-        response.raise_for_status()
-        result = base64.b64encode(response.content).decode('utf-8')
+    resp = _safe_request_get(content_url, stream=False)
+    result = base64.b64encode(resp.content).decode('utf-8')
 
     return result
 
@@ -602,9 +360,11 @@ class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
     def __init__(
-            self,
-            model_type: str,
-            multimodal_server_config: Optional[MultimodalServerConfig] = None):
+        self,
+        model_type: str,
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
+        request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
         self._embeddings = defaultdict[str, list](list)
@@ -612,6 +372,14 @@ class MultimodalDataTracker:
         self._placeholder_to_modality: dict[str, str] = {}
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
+        # Per-request override merged with the server default at media-load
+        # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
+        self._request_media_io_kwargs = request_media_io_kwargs
+
+    @property
+    def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Per-request `media_io_kwargs` override, or `None` if not set."""
+        return self._request_media_io_kwargs
 
     async def retrieve_all_async(
         self
@@ -926,6 +694,7 @@ def apply_chat_template(
     result = tokenizer.apply_chat_template(
         conversation=conversation,
         tokenize=enable_tokenize,
+        return_dict=False,
         add_generation_prompt=add_generation_prompt,
         tools=tools,
         documents=documents,
@@ -950,6 +719,7 @@ def default_multimodal_input_loader(
                                   List[List[torch.Tensor]]]] = None,
     device: str = "cpu",
     extract_audio: bool = False,
+    trust_remote_code: bool = True,
 ) -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(
@@ -1067,13 +837,13 @@ def default_multimodal_input_loader(
         model_type) == ContentFormat.PASSTHROUGH)
 
     if tokenizer is None and not is_passthrough:
-        tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
+        tokenizer = ModelLoader.load_hf_tokenizer(
+            model_dir, trust_remote_code=trust_remote_code, use_fast=True)
 
     processor = None
     if not is_passthrough:
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  use_fast=True,
-                                                  trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, use_fast=True, trust_remote_code=trust_remote_code)
 
     inputs = []
     for prompt_idx, (prompt,
@@ -1123,14 +893,3 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
-
-
-def get_cache_salt_id(cache_salt: str) -> int:
-    b = cache_salt.encode("utf-8")
-    h = default_hasher(b).digest(length=8)
-    cache_salt_id = int.from_bytes(h, "little", signed=False)
-    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
-        raise ValueError(
-            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
-
-    return cache_salt_id

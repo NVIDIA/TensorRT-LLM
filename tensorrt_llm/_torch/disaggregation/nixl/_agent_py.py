@@ -1,13 +1,32 @@
+import importlib
 import time
 from enum import Enum
-
-from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 # Import base classes for type compatibility
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+
+# The PyPI ``nixl`` meta-package provides a top-level ``nixl`` shim that
+# redirects to ``nixl_cu13`` or ``nixl_cu12``. When only ``nixl-cu13`` (or
+# ``nixl-cu12``) is installed without the meta-package, ``import nixl`` fails.
+# Try the CUDA-specific packages first, then fall back to the meta-package.
+_nixl_mod = None
+for _candidate in ("nixl_cu13", "nixl_cu12", "nixl"):
+    try:
+        _nixl_mod = importlib.import_module(_candidate)
+        break
+    except ImportError:
+        continue
+if _nixl_mod is None:
+    raise ImportError(
+        "Could not find a NIXL Python package. "
+        "Install ``nixl-cu13`` (CUDA 13) or ``nixl-cu12`` (CUDA 12)."
+    )
+nixl_agent = _nixl_mod.nixl_agent
+nixl_agent_config = _nixl_mod.nixl_agent_config
+nixl_xfer_handle = _nixl_mod.nixl_xfer_handle
 
 
 class TransferState(Enum):

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import os
 from abc import ABC, abstractmethod
@@ -7,6 +22,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm.logger import logger
@@ -20,12 +36,32 @@ from ..pyexecutor.resource_manager import (BaseResourceManager,
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from ..pyexecutor.llm_request import LlmRequest
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
+from .one_model_sampler import (compute_probs_from_logits,
+                                rejection_sampling_one_model,
+                                sampling_batch_spec_dec_one_model,
+                                sampling_batch_spec_dec_one_model_for_rejection)
+
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+# RNG pool configuration for the fractional (probabilistic) component of the
+# synthetic acceptance rate. Pool size MUST be a power of two so we can use
+# a bitmask (`& (pool_size - 1)`) for wrap-around — this stays cheap and
+# keeps tensor shapes static for CUDA graph capture. The fixed seed is what
+# guarantees identical random draws on every TP rank (so all ranks accept the
+# same number of tokens per iteration and downstream collectives stay in
+# lock-step). The two stride primes mix the per-call counter with the
+# per-slot index so consecutive calls / consecutive slots map to decorrelated
+# pool entries.
+_FORCE_ACCEPT_RNG_POOL_SIZE = 1 << 16  # 65536 entries (256 KiB float32)
+_FORCE_ACCEPT_RNG_SEED = 0xACCE9D
+_FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
+_FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
@@ -88,14 +124,26 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
             'slot_mapping_scale':
             m.slot_mapping_scale.clone(),
         }
-        block_ids_per_seq = draft_kv_cache_manager.get_block_ids_per_seq(
-            m.request_ids)
-        num_blocks = block_ids_per_seq.shape[1]
-        m.host_indexer_k_cache_block_offsets[:len(
-            block_ids_per_seq), :num_blocks].copy_(block_ids_per_seq)
+        # Derive pool indices from the draft manager's encoded block
+        # offsets (via _get_pool_block_indices) instead of using raw block
+        # IDs.  With host cache offload, block IDs can exceed
+        # blocks_in_primary_pool after offload swaps (the block keeps its
+        # original high ID even though its memory now lives in the primary
+        # GPU pool).  Using raw block IDs as pool indices causes OOB access
+        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
+        # decodes memPoolBlockIndex from the C++ encoded offsets.
+        # Note: kv_cache_manager was already swapped to draft above (line 67).
+        pool_indices = m._get_pool_block_indices()
+        num_blocks = pool_indices.shape[1]
+        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
+            pool_indices)
         m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
             m.host_indexer_k_cache_block_offsets[:m.num_seqs],
             non_blocking=True)
+        # Safety clamp: sanitize stale padding entries beyond num_seqs
+        # that may contain negative or out-of-range values, matching the
+        # regular DSA prepare() flow.
+        m.indexer_k_cache_block_offsets.clamp_(min=0)
         Indexer.recompute_slot_mappings(m)
     return saved
 
@@ -124,7 +172,14 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
 
 def get_force_num_accepted_tokens() -> int:
     """
-    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment
+    variable as an integer.
+
+    Used by speculative decoding paths that operate on Python lists/slices and
+    therefore require an integer count (e.g. the two-model path in
+    ``TorchSampler``). For the one-model path, see
+    :func:`get_force_num_accepted_tokens_float`, which supports fractional
+    synthetic acceptance rates.
 
     Returns:
         int: The forced number of accepted tokens, or 0 if not set or invalid.
@@ -137,6 +192,31 @@ def get_force_num_accepted_tokens() -> int:
             f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid integer, "
             f"got '{env_value}'. Using default value 0.")
         return 0
+
+
+def get_force_num_accepted_tokens_float() -> float:
+    """
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment
+    variable as a (possibly fractional) float.
+
+    Used by the one-model speculative decoding path to synthesize non-integer
+    acceptance rates: the integer part is the number of draft tokens accepted
+    on every iteration, and the fractional part is the probability of
+    accepting one additional draft token. For example, "2.6" means always
+    accept 2 draft tokens and accept one more with probability 0.6.
+
+    Returns:
+        float: The forced (possibly fractional) number of accepted draft
+        tokens, or 0.0 if not set or invalid.
+    """
+    env_value = os.environ.get(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR, "0")
+    try:
+        return float(env_value)
+    except ValueError:
+        logger.warning(
+            f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid number "
+            f"(int or float), got '{env_value}'. Using default value 0.0.")
+        return 0.0
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -152,11 +232,15 @@ class SpeculativeDecodingMode(IntEnum):
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
+    DFLASH = auto()
     NONE = auto()
     AUTO = auto()
 
     def is_mtp_one_model(self):
-        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+        # Union: covers vanilla MTP and MTP_EAGLE_ONE_MODEL. Use is_mtp_vanilla()
+        # when only the vanilla MTP variant should match.
+        return (self == SpeculativeDecodingMode.MTP
+                or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
 
     def is_mtp_eagle_one_model(self):
         return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
@@ -180,6 +264,12 @@ class SpeculativeDecodingMode(IntEnum):
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
 
+    def is_dflash(self):
+        return self == SpeculativeDecodingMode.DFLASH
+
+    def is_parallel_draft(self):
+        return self.is_pard() or self.is_dflash()
+
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
@@ -202,7 +292,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def is_external_drafter(self):
-        return self.is_pard() or self.is_draft_target_one_model()
+        return self.is_parallel_draft() or self.is_draft_target_one_model()
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
@@ -226,7 +316,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def support_dynamic_draft_len(self):
         # TODO: expand to all one-model algorithms
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_eagle_one_model()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -366,12 +456,64 @@ class SpecMetadata:
     # Always set by model_engine.forward() before any downstream code reads it.
     runtime_draft_len: int = 0
 
-    # For non-greedy sampling on 1-model.
-    allow_advanced_sampling: bool = False
+    # Auto-detected per step from populated sampling params:
+    # True if every request is greedy (no temp/top_k/top_p) and we can take
+    # the argmax fast-path. False if any request needs sampling.
+    # Used as part of the CUDA graph key so we capture two variants
+    # (greedy fast-path vs advanced sampling) and dispatch at replay.
+    # Defaults to True so non-one-engine paths (where populate is a no-op)
+    # never accidentally select the advanced graph variant.
+    is_all_greedy_sample: bool = True
+    # Whether to use rejection sampling for one-model speculative decoding.
+    use_rejection_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
+    # Whether top-k/top-p/temperature are globally disabled for the current batch.
+    skip_temperature: bool = False
+    skip_top_k: bool = False
+    skip_top_p: bool = False
+    has_greedy_requests: bool = False
+    # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
+    # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
+    top_k_max: int = 0
+    # Sampling parameters indexed per request.
+    request_temperatures: Optional[torch.Tensor] = None
+    request_top_ks: Optional[torch.Tensor] = None
+    request_top_ps: Optional[torch.Tensor] = None
+    # Whether to use sampling parameters when sampling draft tokens.
+    use_sampling_params_for_draft_tokens: bool = False
+    # Vocab size used for draft_probs buffer allocation.
+    vocab_size: int = 0
+    # Draft probabilities buffer for rejection sampling, indexed by py_seq_slot
+    # so per-request data is stable across iterations regardless of batch
+    # composition shifts (chunking ctx, gen completion, new ctx joining).
+    # Shape: [max_num_requests, max_draft_len, vocab_size].
+    draft_probs: Optional[torch.Tensor] = None
+    draft_probs_vocab_size: int = 0
+    # Whether draft_probs contains valid data.
+    draft_probs_valid: bool = False
+    # Last dimension size of the draft logits/probs stored in draft_probs.
+    draft_probs_last_dim: int = 0
+    # Per-request slot ids (py_seq_slot) for the current batch, in batch order.
+    # Used to scatter draft probs by slot at write time and gather them by slot
+    # at the next iter's verify. Shape: [max_num_requests], dtype=long.
+    batch_slot_ids: Optional[torch.Tensor] = None
+    # Draft-to-target vocab offset tensor.
+    d2t: Optional[torch.Tensor] = None
+    # Pre-allocated scratch for draft probs expanded to the target vocab size.
+    # Filled with zeros once at prepare(); each rejection iter only overwrites
+    # the positions selected by d2t (or [:draft_vocab] when there is no d2t),
+    # so the zeros outside those positions persist across iterations and we
+    # avoid a per-iter 64 MB zero-fill on the (max_num_requests, max_draft_len,
+    # vocab_size) tensor. Shape: [max_num_requests, max_draft_len, vocab_size].
+    full_draft_probs: Optional[torch.Tensor] = None
+    # Cached d2t-projected target vocab indices, computed once on first use
+    # (d2t is a model-static tensor). Replaces the per-iter
+    # arange + (source + d2t) % vocab_size kernel sequence inside the d2t
+    # padding step. Shape: [draft_vocab_size], dtype long.
+    d2t_target_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         pass
@@ -380,6 +522,30 @@ class SpecMetadata:
         """
         Hook to be called before the forward step of the model.
         """
+        if (self.use_rejection_sampling and self.draft_probs is None
+                and self.vocab_size > 0):
+            # 3D [slot, draft_step, vocab] so we can scatter/gather by slot id
+            # and avoid the brittle "batch position == buffer position" mapping.
+            self.draft_probs = torch.empty(
+                (self.max_num_requests, self.max_draft_len, self.vocab_size),
+                dtype=torch.float32,
+                device='cuda')
+            self.draft_probs_vocab_size = self.vocab_size
+        if (self.use_rejection_sampling and self.batch_slot_ids is None
+                and self.max_num_requests > 0):
+            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.long,
+                                              device='cuda')
+        if (self.use_rejection_sampling and self.full_draft_probs is None
+                and self.vocab_size > 0):
+            # Zero-fill once. Subsequent iters only overwrite the d2t-mapped
+            # positions (constant across iters since d2t is model-static), so
+            # untouched positions stay 0 forever — saves the per-iter 64 MB
+            # zero-fill in _sample_and_accept_draft_tokens_rejection.
+            self.full_draft_probs = torch.zeros(
+                (self.max_num_requests, self.max_draft_len, self.vocab_size),
+                dtype=torch.float32,
+                device='cuda')
 
     def create_cuda_graph_metadata(self, max_batch_size: int):
         """
@@ -409,25 +575,19 @@ class SpecMetadata:
         model. Use this method to record them. By default, does nothing.
         """
 
-    def populate_sampling_params_for_one_model(
-            self, requests: list["LlmRequest"]) -> None:
-        """
-        Set up topp/topk/temperatures for 1-model sampler.
+    def _scan_one_model_sampling(
+        self, requests: list["LlmRequest"]
+    ) -> tuple[list[tuple[float, int, float, int]], list[int]]:
+        """Single source of truth for one-engine sampling-param detection.
+
+        Scans the batch's sampling configs and sets skip_*/has_greedy_requests/
+        is_all_greedy_sample (honoring the warmup capture override). Returns
+        ``(per_request_normalized, per_request_slot_ids)`` for buffer
+        population. Does NOT allocate or fill GPU buffers, so it is safe to call
+        before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
         from tensorrt_llm.sampling_params import SamplingParams
-
-        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
-        ):
-            return
-
-        if self.temperatures is None:
-            # Ensures determinism across ranks.
-            torch.manual_seed(0)
-
-        temperatures = []
-        top_ks = []
-        top_ps = []
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
         DISABLE_TEMP_VAL = 1e-5
@@ -435,47 +595,215 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
+        def _first_or_none(values):
+            """Return the first sampling parameter value when present."""
+            return values[0] if values is not None and len(values) > 0 else None
+
+        def _normalize_request_sampling_params(
+            *,
+            temperature: Optional[float],
+            top_k: Optional[int],
+            top_p: Optional[float],
+        ) -> tuple[float, int, float, bool, bool, bool, bool]:
+            """Convert request sampling params into normalized per-request scalars."""
+            is_greedy = SamplingParams.params_imply_greedy_decoding(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                use_beam_search=False)
+
+            use_temperature = (not is_greedy
+                               and temperature not in (None, 0, 1))
+            use_top_k = not is_greedy and top_k is not None and top_k > 0
+            use_top_p = not is_greedy and top_p is not None and top_p < 1.0
+
+            normalized_temperature = (DISABLE_TEMP_VAL
+                                      if is_greedy or temperature is None
+                                      or temperature == 0 else temperature)
+            normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
+            normalized_top_p = (DISABLE_TOPP_VAL
+                                if is_greedy or top_p is None else top_p)
+
+            return (
+                normalized_temperature,
+                normalized_top_k,
+                normalized_top_p,
+                use_temperature,
+                use_top_k,
+                use_top_p,
+                is_greedy,
+            )
+
+        # Phase 1: collect per-request flags and normalized values.
+        per_request_normalized: list[tuple[float, int, float, int]] = []
+        temperature_enabled = False
+        top_k_enabled = False
+        top_p_enabled = False
+        has_greedy_requests = False
+        per_request_slot_ids: list[int] = []
+
         for request in requests:
             sampling_config = request.sampling_config
-            temp = sampling_config.temperature
-            temp_val = temp[0] if temp is not None and len(temp) > 0 else None
-
-            tk = sampling_config.top_k
-            tk_val = tk[0] if tk is not None and len(tk) > 0 else None
-
-            tp = sampling_config.top_p
-            tp_val = tp[0] if tp is not None and len(tp) > 0 else None
+            temp_val = _first_or_none(sampling_config.temperature)
+            tk_val = _first_or_none(sampling_config.top_k)
+            tp_val = _first_or_none(sampling_config.top_p)
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
-            is_greedy = SamplingParams.params_imply_greedy_decoding(
+            (
+                temp_val,
+                tk_val,
+                tp_val,
+                use_temperature,
+                use_top_k,
+                use_top_p,
+                is_greedy,
+            ) = _normalize_request_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
-                use_beam_search=False)
+            )
 
-            temp_val = DISABLE_TEMP_VAL if is_greedy or temp_val is None or temp_val == 0 else temp_val
-            tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val
-            tp_val = DISABLE_TOPP_VAL if is_greedy or tp_val is None else tp_val
+            temperature_enabled |= use_temperature
+            top_k_enabled |= use_top_k
+            top_p_enabled |= use_top_p
+            has_greedy_requests |= is_greedy
 
+            per_request_normalized.append(
+                (temp_val, tk_val, tp_val, num_tokens))
+            # py_seq_slot is a stable per-request id used to scatter / gather
+            # draft probs across iterations. Dummies / unallocated slots fall
+            # back to 0 (any valid index is fine — the data at that slot will
+            # be overwritten on the next real iteration before being read).
+            per_request_slot_ids.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
+
+        self.skip_temperature = not temperature_enabled
+        self.skip_top_k = not top_k_enabled
+        self.skip_top_p = not top_p_enabled
+        self.has_greedy_requests = has_greedy_requests
+        # Used in the CUDA graph key to pick the argmax / advanced variant.
+        self.is_all_greedy_sample = (self.skip_temperature and self.skip_top_k
+                                     and self.skip_top_p)
+
+        # Warmup-time override (set via runtime attribute by the model engine):
+        # force the advanced-sampling code path so the CUDA graph for the
+        # (is_all_greedy_sample=False) key gets captured. Dummy warmup requests
+        # carry no sampling params, so the natural detection above always
+        # returns True; this branch substitutes synthetic non-greedy scalars
+        # into the per-request data and lets Phase 2 run normally to populate
+        # the GPU buffers used by the captured kernels.
+        if getattr(self, '_force_non_greedy_for_capture', False):
+            self.skip_temperature = False
+            self.skip_top_k = False
+            self.skip_top_p = False
+            self.is_all_greedy_sample = False
+            per_request_normalized = [
+                (0.7, 50, 0.9, num_tokens)
+                for (_, _, _, num_tokens) in per_request_normalized
+            ]
+
+        return per_request_normalized, per_request_slot_ids
+
+    def update_is_all_greedy_sample(self, requests: list["LlmRequest"]) -> None:
+        """Refresh ``is_all_greedy_sample`` for the *current* batch.
+
+        Must be called BEFORE the CUDA graph key is built (the key includes
+        ``is_all_greedy_sample`` to choose the argmax vs advanced-sampling graph
+        variant). ``populate_sampling_params_for_one_model`` runs later, inside
+        ``_prepare_inputs``, and re-derives the same flag while filling the GPU
+        sampling buffers. Computing the flag here first keeps the selected graph
+        consistent with the buffers ``populate`` fills; otherwise the key would
+        use the previous iteration's stale value and could replay the advanced
+        graph against unpopulated (greedy) buffers, which can hang/corrupt the
+        run (notably for MTP with num_nextn>=2).
+        """
+        if not self.spec_dec_mode.use_one_engine():
+            return
+        self._scan_one_model_sampling(requests)
+
+    def populate_sampling_params_for_one_model(
+            self, requests: list["LlmRequest"]) -> None:
+        """
+        Set up topp/topk/temperatures for 1-model sampler.
+
+        Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
+        any request needs sampling, also builds per-token/per-request lists
+        and copies them to GPU buffers; all-greedy batches skip this entirely.
+        """
+        if not self.spec_dec_mode.use_one_engine():
+            return
+
+        if self.temperatures is None:
+            # Ensures determinism across ranks.
+            torch.manual_seed(0)
+
+        per_request_normalized, per_request_slot_ids = (
+            self._scan_one_model_sampling(requests))
+
+        tokens_per_request = (self.max_total_draft_tokens + 1 if
+                              self.is_spec_dec_tree else self.max_draft_len + 1)
+        # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
+        # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
+        actual_flat_size = sum(
+            num_tokens for _, _, _, num_tokens in per_request_normalized)
+        required_flat_size = max(tokens_per_request * self.max_num_requests,
+                                 actual_flat_size)
+
+        if self.temperatures is None or self.temperatures.numel(
+        ) < required_flat_size:
+            # Allocate once; the captured graph reads from these stable addresses.
+            self.temperatures = torch.ones(required_flat_size,
+                                           dtype=torch.float32,
+                                           device='cuda')
+            self.top_ks = torch.zeros(required_flat_size,
+                                      dtype=torch.int32,
+                                      device='cuda')
+            self.top_ps = torch.ones(required_flat_size,
+                                     dtype=torch.float32,
+                                     device='cuda')
+            self.request_temperatures = torch.ones(self.max_num_requests,
+                                                   dtype=torch.float32,
+                                                   device='cuda')
+            self.request_top_ks = torch.zeros(self.max_num_requests,
+                                              dtype=torch.int32,
+                                              device='cuda')
+            self.request_top_ps = torch.ones(self.max_num_requests,
+                                             dtype=torch.float32,
+                                             device='cuda')
+
+        # Always-populate the per-request slot id table when rejection sampling
+        # is configured: it's tiny (max_num_requests longs) and needed at
+        # draft-sampler time to scatter draft probs by slot.
+        if self.use_rejection_sampling and self.batch_slot_ids is not None:
+            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
+                torch.tensor(per_request_slot_ids,
+                             dtype=torch.long,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+
+        # All-greedy: sampler takes the argmax branch (and rejection sampling
+        # is also bypassed for all-greedy), so the per-token buffers are never
+        # read. Skip the heavier H->D copies.
+        if self.is_all_greedy_sample:
+            return
+
+        # Phase 2: build per-token / per-request lists and copy to GPU.
+        temperatures: list[float] = []
+        top_ks: list[int] = []
+        top_ps: list[float] = []
+        request_temperatures: list[float] = []
+        request_top_ks: list[int] = []
+        request_top_ps: list[float] = []
+        for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+            request_temperatures.append(temp_val)
+            request_top_ks.append(tk_val)
+            request_top_ps.append(tp_val)
             temperatures.extend(temp_val for _ in range(num_tokens))
             top_ks.extend(tk_val for _ in range(num_tokens))
             top_ps.extend(tp_val for _ in range(num_tokens))
-
-        if self.temperatures is None:
-            self.temperatures = torch.ones(
-                (self.max_draft_len + 1) * self.max_num_requests,
-                dtype=torch.float32,
-                device='cuda')
-            self.top_ks = torch.zeros(
-                (self.max_draft_len + 1) * self.max_num_requests,
-                dtype=torch.int32,
-                device='cuda')
-            self.top_ps = torch.ones(
-                (self.max_draft_len + 1) * self.max_num_requests,
-                dtype=torch.float32,
-                device='cuda')
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -486,6 +814,30 @@ class SpecMetadata:
         self.top_ps[:len(top_ps)].copy_(torch.tensor(
             top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
+        self.request_temperatures[:len(request_temperatures)].copy_(
+            torch.tensor(request_temperatures,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True)
+        self.request_top_ks[:len(request_top_ks)].copy_(
+            torch.tensor(request_top_ks,
+                         dtype=torch.int32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True,
+        )
+        self.request_top_ps[:len(request_top_ps)].copy_(
+            torch.tensor(request_top_ps,
+                         dtype=torch.float32,
+                         pin_memory=prefer_pinned()),
+            non_blocking=True,
+        )
+
+        # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
+        # encounter boolean-tensor indexing (dynamic size) or .item() calls.
+        # DISABLE_TOPK_VAL (INT32_MAX) is the sentinel for "top-k disabled".
+        _disable_topk = torch.iinfo(torch.int32).max
+        self.top_k_max = max(
+            (tk for tk in request_top_ks if 0 < tk < _disable_topk), default=0)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -497,11 +849,20 @@ class SpecWorkerBase(nn.Module, ABC):
     def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
-        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.4"
+        self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
+        )
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and Version(
+            flashinfer.__version__) >= Version("0.6.4")
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
+        # Lazily-initialized state for the fractional synthetic acceptance
+        # rate. The pool is a fixed-seed, rank-independent table of uniform
+        # [0, 1) values; the counter is a device-side int64 advanced in-place
+        # inside captured CUDA graphs (mirroring the existing flashinfer
+        # seed/offset pattern in `_sample_tokens_for_batch`).
+        self._force_accept_rng_pool: Optional[torch.Tensor] = None
+        self._force_accept_rng_counter: Optional[torch.Tensor] = None
 
     @property
     @abstractmethod
@@ -520,8 +881,15 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata,
         spec_metadata,
         draft_model,
+        resource_manager=None,
     ):
-        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs.
+
+        ``resource_manager`` is accepted but unused; it appears in the
+        ``forward()`` signature of one-model workers (Eagle3 / MTP-Eagle) and
+        the caller in ``modeling_speculative.py`` forwards it unconditionally,
+        so the skip path must accept it as well.
+        """
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
@@ -610,25 +978,112 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
+    def _ensure_force_accept_rng_state(self, device: torch.device) -> None:
+        """
+        Lazily build the deterministic RNG state used by
+        :meth:`_apply_force_accepted_tokens` for fractional synthetic
+        acceptance rates.
+
+        The pool is filled from a CPU generator with a fixed seed so that
+        every tensor-parallel rank produces the bit-for-bit identical pool
+        (TP ranks must agree on the per-iteration accepted-token count, or
+        downstream collectives expecting identical shapes will hang).
+
+        First-call allocation must happen during eager warmup — never inside
+        a captured CUDA graph. The CUDA-graph runner already runs warmup
+        forwards before capture, which satisfies this in practice.
+        """
+        if self._force_accept_rng_pool is not None:
+            return
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(_FORCE_ACCEPT_RNG_SEED)
+        pool_cpu = torch.rand(_FORCE_ACCEPT_RNG_POOL_SIZE,
+                              dtype=torch.float32,
+                              generator=cpu_gen)
+        self._force_accept_rng_pool = pool_cpu.to(device=device)
+        self._force_accept_rng_counter = torch.zeros(1,
+                                                     dtype=torch.int64,
+                                                     device=device)
+
     def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
                                      runtime_draft_len: int):
         """
-        Apply forced number of accepted tokens if environment variable is set.
-        This is used for testing and debugging.
+        Apply a forced (synthetic) number of accepted draft tokens if the
+        ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` environment variable is
+        set. This is used for testing and debugging speculative decoding.
+
+        The forced value supports fractional synthetic acceptance rates: the
+        integer part is the number of draft tokens accepted on every
+        generation iteration, and the fractional part is the probability of
+        accepting one additional draft token on that iteration. For example,
+        a value of ``2.6`` means: always accept 2 draft tokens, and accept
+        one more with probability 0.6 (per generation request).
+
+        The implementation is CUDA-graph-compatible AND tensor-parallel
+        deterministic. Randomness is sourced from a fixed-seed lookup pool
+        plus a device-side counter that is advanced in place each call —
+        the same pattern as the flashinfer seed/offset state used by
+        :meth:`_sample_tokens_for_batch`. Because every rank seeds the pool
+        identically and increments the counter on the same captured ops,
+        every rank draws the same uniform values and therefore agrees on the
+        accepted-token count for every request in every iteration.
 
         Args:
-            num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
-            num_contexts: Number of context (prefill) requests
+            num_accepted_tokens: Tensor of shape [batch_size] with current
+                accepted counts (target token + accepted draft tokens).
+            num_contexts: Number of context (prefill) requests in the batch.
             runtime_draft_len: The draft length for the current iteration.
 
         Returns:
-            Modified num_accepted_tokens tensor
+            Modified num_accepted_tokens tensor.
         """
-        if self.force_num_accepted_tokens != 0:
-            # total tokens per iteration = accepted draft tokens + 1 target token
-            force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     runtime_draft_len + 1)
+        if self.force_num_accepted_tokens == 0.0:
+            return num_accepted_tokens
+
+        # Decompose into a deterministic integer part (always accepted) and a
+        # probabilistic fractional part. ``int(...)`` truncates toward zero,
+        # which matches floor for the supported non-negative range.
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+
+        # ``num_accepted_tokens`` counts the target token + accepted draft
+        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+
+        if frac_part > 0.0 and base_total < max_total:
+            self._ensure_force_accept_rng_state(num_accepted_tokens.device)
+
+            # ``num_gens`` is fixed at CUDA-graph capture time (graphs are
+            # captured for a specific batch shape with ``num_contexts``
+            # typically 0), so all of the ops below have static shapes.
+            num_gens = num_accepted_tokens.shape[0] - num_contexts
+
+            # In-place counter bump is captured by the graph and replayed on
+            # every iteration, so each replay yields fresh draws from the
+            # pool. All TP ranks bump in lock-step → identical indices.
+            self._force_accept_rng_counter += 1
+
+            slot_ids = torch.arange(num_gens,
+                                    device=num_accepted_tokens.device,
+                                    dtype=torch.int64)
+            # Hash (counter, slot) → pool index. ``& (pool_size - 1)`` is a
+            # cheap power-of-two modulo. The two stride primes are coprime
+            # to ``pool_size`` so consecutive calls and consecutive slots
+            # land on decorrelated pool entries.
+            indices = (self._force_accept_rng_counter *
+                       _FORCE_ACCEPT_RNG_COUNTER_STRIDE +
+                       slot_ids * _FORCE_ACCEPT_RNG_SLOT_STRIDE) & (
+                           _FORCE_ACCEPT_RNG_POOL_SIZE - 1)
+            rand = self._force_accept_rng_pool[indices]
+            extra = (rand < frac_part).to(num_accepted_tokens.dtype)
+            # ``base_total + extra`` is at most ``int_part + 2``; clamp so we
+            # never exceed the available draft slots.
+            force_total_tokens = (base_total + extra).clamp_(max=max_total)
             num_accepted_tokens[num_contexts:] = force_total_tokens
+        else:
+            num_accepted_tokens[num_contexts:] = base_total
+
         return num_accepted_tokens
 
     def _sample_and_accept_draft_tokens_base(
@@ -700,6 +1155,182 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+    def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
+                             batch_size, spec_metadata):
+        """
+        Accept draft tokens with optional rejection sampling support.
+
+        Mixed batches (num_contexts > 0) are supported: context rows take the
+        first sampled target token via the base logic, and rejection sampling
+        runs on the gen subset. Draft probs for the gen subset are gathered
+        from the slot-indexed buffer by `py_seq_slot`.
+        """
+        num_gens = batch_size - num_contexts
+        if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
+            draft_len = draft_tokens.shape[1]
+            stored_vocab = (spec_metadata.draft_probs_last_dim
+                            if spec_metadata.draft_probs_last_dim > 0 else
+                            spec_metadata.draft_probs_vocab_size)
+            # Gather the slot rows for the gen subset. The buffer was filled
+            # at the previous draft step indexed by py_seq_slot, so each gen
+            # request reads back exactly its own probs, regardless of batch
+            # composition changes since then.
+            gen_slot_ids = spec_metadata.batch_slot_ids[num_contexts:batch_size]
+            draft_probs = spec_metadata.draft_probs[
+                gen_slot_ids, :draft_len, :stored_vocab]
+            return self._sample_and_accept_draft_tokens_rejection(
+                logits, draft_tokens, draft_probs, num_contexts, batch_size,
+                spec_metadata)
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+    def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata) -> bool:
+        # Skip rejection sampling when the whole batch is greedy: the accepted
+        # result is identical to argmax and the base path is cheaper. Mixed
+        # batches (context + gen) are handled via slot-indexed draft probs and
+        # are split inside _sample_and_accept_draft_tokens_rejection.
+        return (spec_metadata.use_rejection_sampling
+                and spec_metadata.draft_probs_valid
+                and not spec_metadata.is_all_greedy_sample)
+
+    def _sample_and_accept_draft_tokens_rejection(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        spec_metadata,
+    ):
+        """
+        Rejection-sampling acceptance for one-model speculative decoding.
+
+        Mixed batches are handled by treating the two subsets separately:
+          - context rows (first `num_contexts`) take the target's sampled first
+            token; no draft tokens to verify.
+          - generation rows (`[num_contexts:batch_size]`) run the rejection
+            sampling kernel on slot-gathered draft probs.
+
+        Per-token sampling-parameter tensors (`temperatures / top_ks / top_ps`)
+        are laid out as `[ctx (1 each), gen (draft_len+1 each)]`, matching the
+        logits layout, so slicing is symmetric for both subsets.
+        """
+        device = logits.device
+        vocab_size = logits.shape[-1]
+        num_gens = batch_size - num_contexts
+        runtime_draft_len = draft_tokens.shape[1]
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=device)
+
+        # === Context subset: sample target's first token directly ===
+        if num_contexts > 0:
+            ctx_target_tokens = self._sample_tokens_for_batch(
+                logits[:num_contexts], spec_metadata, num_contexts,
+                num_contexts)
+            accepted_tokens[:num_contexts, 0] = ctx_target_tokens
+
+        # === Generation subset: rejection sampling on the gen slice ===
+        if num_gens > 0:
+            num_gen_logits = num_gens * (runtime_draft_len + 1)
+            gen_logits = logits[num_contexts:num_contexts + num_gen_logits]
+            gen_start = num_contexts
+            gen_end = num_contexts + num_gen_logits
+
+            temperatures = spec_metadata.temperatures[gen_start:gen_end]
+            # Pass None instead of an all-disabled tensor so the C++ op can short-circuit
+            # on a host-side check rather than a `.item<bool>()` sync, which would break
+            # CUDA graph capture.
+            top_ks = (None if spec_metadata.skip_top_k else
+                      spec_metadata.top_ks[gen_start:gen_end])
+            top_ps = (None if spec_metadata.skip_top_p else
+                      spec_metadata.top_ps[gen_start:gen_end])
+
+            target_probs_flat = compute_probs_from_logits(
+                gen_logits, temperatures, top_ks, top_ps)
+            target_probs = target_probs_flat.reshape(num_gens,
+                                                     runtime_draft_len + 1,
+                                                     vocab_size)
+
+            draft_vocab_size = draft_probs.shape[-1]
+            assert draft_probs.shape[0] == num_gens, (
+                f"draft_probs batch mismatch: {draft_probs.shape[0]} != "
+                f"num_gens={num_gens}")
+            assert draft_probs.shape[1] == runtime_draft_len, (
+                f"draft_probs draft length mismatch: {draft_probs.shape[1]} != "
+                f"{runtime_draft_len}")
+            d2t = getattr(spec_metadata, "d2t", None)
+            if draft_vocab_size != vocab_size:
+                # Use the pre-allocated buffer from spec_metadata.prepare()
+                # (zero-filled once at init; untouched positions stay 0).
+                # Falls back to per-iter allocation if the buffer is not
+                # configured, e.g. when use_rejection_sampling was off at
+                # prepare() time.
+                if spec_metadata.full_draft_probs is not None:
+                    full_draft_probs = spec_metadata.full_draft_probs[:num_gens]
+                else:
+                    full_draft_probs = torch.zeros(
+                        (num_gens, runtime_draft_len, vocab_size),
+                        dtype=torch.float32,
+                        device=device)
+                if d2t is not None:
+                    assert d2t.numel() == draft_vocab_size, (
+                        f"d2t size mismatch: {d2t.numel()} != {draft_vocab_size}"
+                    )
+                    # d2t is model-static; compute target_indices once and
+                    # cache on spec_metadata to skip the arange + add + mod
+                    # kernel sequence on every iter.
+                    target_indices = spec_metadata.d2t_target_indices
+                    if target_indices is None:
+                        source_indices = torch.arange(draft_vocab_size,
+                                                      device=device,
+                                                      dtype=torch.long)
+                        target_indices = (source_indices +
+                                          d2t.to(device=device)) % vocab_size
+                        spec_metadata.d2t_target_indices = target_indices
+                    full_draft_probs[:, :runtime_draft_len,
+                                     target_indices] = draft_probs
+                else:
+                    assert draft_vocab_size < vocab_size
+                    full_draft_probs[:, :runtime_draft_len, :
+                                     draft_vocab_size] = (draft_probs)
+            else:
+                full_draft_probs = draft_probs
+
+            full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
+
+            if self.seed is None:
+                self.seed = torch.tensor([0], dtype=torch.int64, device=device)
+            if self.offset is None:
+                self.offset = torch.tensor([0],
+                                           dtype=torch.int64,
+                                           device=device)
+            self.seed += 1
+            self.seed %= 2**31
+
+            gen_accepted, gen_num_accepted = rejection_sampling_one_model(
+                draft_probs=full_draft_probs,
+                draft_token_ids=full_draft_tokens,
+                target_probs=target_probs,
+                deterministic=True,
+                seed=self.seed,
+                offset=self.offset,
+            )
+
+            accepted_tokens[num_contexts:] = gen_accepted
+            num_accepted_tokens[num_contexts:] = gen_num_accepted
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len)
+        return accepted_tokens, num_accepted_tokens
+
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
         """
         Simple greedy draft token sampling using argmax.
@@ -714,6 +1345,128 @@ class SpecWorkerBase(nn.Module, ABC):
         draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft and target model dictionaries)
+        if d2t is not None:
+            draft_tokens = d2t[draft_tokens] + draft_tokens
+
+        return draft_tokens.type(torch.int32)
+
+    def _draft_sampler_advanced(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: "SpecMetadata",
+        batch_size: int,
+        d2t: Optional[torch.Tensor] = None,
+    ):
+        """
+        Draft token sampling using per-request sampling parameters from the
+        target's sampling config. Falls back to argmax when the batch is
+        all-greedy.
+
+        Args:
+            logits: [batch_size, vocab_size] - Draft model logits (one row per
+                request, since each draft step emits one token per request).
+            spec_metadata: Source of per-request temperatures / top_k / top_p
+                tensors populated by populate_sampling_params_for_one_model.
+            batch_size: Number of active requests in the batch.
+            d2t: Optional dictionary offset tensor for vocab mapping.
+
+        Returns:
+            draft_tokens: [batch_size] - Sampled draft token ids (int32)
+        """
+        if spec_metadata.is_all_greedy_sample:
+            return self._draft_sampler_greedy(logits, d2t)
+
+        temperatures = spec_metadata.request_temperatures[:batch_size]
+        top_ks = spec_metadata.request_top_ks[:batch_size]
+        top_ps = spec_metadata.request_top_ps[:batch_size]
+
+        if self.use_flashinfer:
+            top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
+            if self.seed is None:
+                self.seed = torch.tensor([0],
+                                         dtype=torch.int64,
+                                         device=logits.device)
+                self.offset = torch.tensor([0],
+                                           dtype=torch.int64,
+                                           device=logits.device)
+            self.seed += 1
+            self.seed %= (2**31)
+
+        draft_tokens = sampling_batch_spec_dec_one_model(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            use_flashinfer=self.use_flashinfer,
+            seed=self.seed,
+            offset=self.offset)
+
+        if d2t is not None:
+            draft_tokens = d2t[draft_tokens] + draft_tokens
+
+        return draft_tokens.type(torch.int32)
+
+    def _draft_sampler_advanced_for_rejection(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: "SpecMetadata",
+        batch_size: int,
+        d2t: Optional[torch.Tensor] = None,
+        draft_step: int = 0,
+    ):
+        """
+        Rejection-sampling-aware variant of ``_draft_sampler_advanced``.
+
+        Single-pass compute + sample + scatter: computes the per-request prob
+        distribution once via TRT-LLM's fused ``compute_probs_from_logits``
+        (temp + top_k + top_p + softmax + greedy override in one CUDA kernel),
+        samples the draft token from that distribution, and scatters the same
+        probs into the slot-indexed ``spec_metadata.draft_probs`` buffer for
+        next-iter rejection verification. Replaces the previous two-stage path
+        (flashinfer fused sampling kernel + a redundant softmax pass to store
+        probs).
+
+        All-greedy batches take the cheaper argmax path —
+        ``_can_use_rejection_sampling`` will bypass rejection for those anyway.
+        """
+        if spec_metadata.is_all_greedy_sample:
+            return self._draft_sampler_greedy(logits, d2t)
+
+        temperatures = spec_metadata.request_temperatures[:batch_size]
+        top_ks = spec_metadata.request_top_ks[:batch_size]
+        top_ps = spec_metadata.request_top_ps[:batch_size]
+
+        if self.seed is None:
+            self.seed = torch.tensor([0],
+                                     dtype=torch.int64,
+                                     device=logits.device)
+            self.offset = torch.tensor([0],
+                                       dtype=torch.int64,
+                                       device=logits.device)
+        self.seed += 1
+        self.seed %= (2**31)
+
+        draft_tokens, probs = sampling_batch_spec_dec_one_model_for_rejection(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            seed=self.seed,
+            offset=self.offset,
+        )
+
+        # Scatter probs into the slot-indexed buffer (shaped
+        # [max_num_requests, max_draft_len, vocab_size]). Each request's data
+        # always lands at its stable py_seq_slot row regardless of batch
+        # composition shifts across iterations.
+        assert spec_metadata.batch_slot_ids is not None, (
+            "batch_slot_ids must be populated by "
+            "populate_sampling_params_for_one_model before draft probs storage")
+        batch_slots = spec_metadata.batch_slot_ids[:batch_size]
+        vocab = probs.shape[-1]
+        spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
+        spec_metadata.draft_probs_last_dim = vocab
+
         if d2t is not None:
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
@@ -848,12 +1601,12 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
-        if spec_metadata.allow_advanced_sampling:
-            from .one_model_sampler import sampling_batch_spec_dec_one_model
-
-            num_gens = batch_size - num_contexts
-            num_tokens = num_contexts + num_gens * (
-                spec_metadata.runtime_draft_len + 1)
+        if not spec_metadata.is_all_greedy_sample:
+            # Use logits.shape[0] directly: for PARD under CUDA graph capture
+            # runtime_draft_len may reflect the PARD-max while the captured
+            # graph was built for a shorter draft_len, causing a shape mismatch
+            # in sampling_batch_spec_dec_one_model (which is torch.compiled).
+            num_tokens = logits.shape[0]
 
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
