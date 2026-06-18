@@ -76,6 +76,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._perf_metrics_collector = perf_metrics_collector
         self._cluster_storage = disagg_cluster_storage
         self._health_check_interval_secs = health_check_interval_secs
+        # Opt-in body-shrink for generation_only requests; see _get_gen_request.
+        self._strip_gen_message_history = config.gen_strip_message_history
 
         self._ctx_client = None
         self._gen_client = None
@@ -350,6 +352,17 @@ class OpenAIDisaggregatedService(OpenAIService):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
                 request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Opt-in: drop conversation history so the gen worker doesn't
+                # re-parse the full conversation JSON (dominates its GIL at high
+                # concurrency). It uses prompt_token_ids and only reads the last
+                # message; tools are preserved. Config-gated because it's unsafe
+                # for harmony/multimodal workers (model type is fixed per deploy).
+                if (
+                    self._strip_gen_message_history
+                    and request.messages
+                    and len(request.messages) > 1
+                ):
+                    request.messages = request.messages[-1:]
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
