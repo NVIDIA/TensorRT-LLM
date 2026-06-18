@@ -186,6 +186,14 @@ class GatedMLP(nn.Module):
             return False
         return True
 
+    def can_use_nvfp4_pre_quant_fusion(self):
+        """Return whether gate_up_proj can consume externally quantized FP4 input."""
+        return (self.gate_up_proj.has_nvfp4
+                and hasattr(self.gate_up_proj, "input_scale")
+                and self.gate_up_proj.input_scale is not None
+                and not self.gate_up_proj.force_dynamic_quantization
+                and self.gate_up_proj.pre_quant_scale is None)
+
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
 

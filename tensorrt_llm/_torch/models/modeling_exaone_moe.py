@@ -236,9 +236,6 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
             self.mlp_tp_size = self._compute_mlp_tp_size(config.intermediate_size, block_size)
             has_mlp_tp = self.mlp_tp_size > 1
 
-            self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
-            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
-
             self.mlp = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -251,6 +248,10 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 layer_idx=layer_idx,
                 reduce_output=has_mlp_tp,
             )
+            self.fusion_config.PRE_MLP_FUSION = (
+                self.enable_fusion and has_mlp_tp
+                and self.mlp.can_use_nvfp4_pre_quant_fusion())
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
         self.disable_attn_allreduce = (
             self.fusion_config.PRE_MOE_FUSION

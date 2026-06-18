@@ -554,8 +554,6 @@ class Glm4DecoderLayer(DecoderLayer):
             self.mlp_tp_size = self._compute_mlp_tp_size(config.intermediate_size, block_size)
 
             has_mlp_tp = self.mlp_tp_size > 1
-            self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
-            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
             self.mlp = GatedMLP(
                 hidden_size=config.hidden_size,
@@ -566,6 +564,10 @@ class Glm4DecoderLayer(DecoderLayer):
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=True,
             )
+            self.fusion_config.PRE_MLP_FUSION = (
+                self.enable_fusion and has_mlp_tp
+                and self.mlp.can_use_nvfp4_pre_quant_fusion())
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
