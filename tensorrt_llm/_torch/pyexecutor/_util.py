@@ -1303,7 +1303,7 @@ class KvCacheCreator:
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=None,
-            sparse_attn_config=None,
+            sparse_attention_config=None,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=1,
             kv_connector_manager=None,
