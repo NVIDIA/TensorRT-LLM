@@ -2502,6 +2502,14 @@ class MLA(nn.Module):
 
                 self.dsv4_compressor_event.wait()
                 self.dsv4_indexer_event.wait()
+
+                # q/topk_indices were produced on other streams; record on the
+                # consuming stream so the caching allocator can't recycle them mid-use.
+                cur_stream = torch.cuda.current_stream()
+                if q is not None:
+                    q.record_stream(cur_stream)
+                if topk_indices is not None:
+                    topk_indices.record_stream(cur_stream)
             else:
                 q, _ = maybe_execute_in_parallel(
                     _q_branch,
