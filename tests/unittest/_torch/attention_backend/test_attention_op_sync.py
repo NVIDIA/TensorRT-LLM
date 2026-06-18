@@ -72,6 +72,14 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
         "metadata",
         ("max_total_draft_tokens",),
     ),
+    "skip_softmax_threshold_scale_factor_decode": (
+        "skip_softmax_kernel_params",
+        ("threshold_scale_factor_decode",),
+    ),
+    "skip_softmax_threshold_scale_factor_prefill": (
+        "skip_softmax_kernel_params",
+        ("threshold_scale_factor_prefill",),
+    ),
     "workspace_": ("metadata", ("effective_workspace",)),
 }
 
