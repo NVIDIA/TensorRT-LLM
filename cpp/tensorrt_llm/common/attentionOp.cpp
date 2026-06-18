@@ -1133,7 +1133,15 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mMaxSeqLenCacheKv = generation_params.max_attention_window_size;
         // This should be set to numDraftTokens + 1.
         tllmRunnerParams.mMaxSeqLenQ = params.acc_q_len / batch_beam;
-        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_past_kv_length;
+        // Pin mMaxSeqLenKv to the static max cache capacity so trtllm-gen FMHA picks the
+        // same kernel as CUDA-graph warmup and the PR #14851 JIT warmup grid. Using a
+        // dynamic max_past_kv_length here cycles through buckets that the warmup grid
+        // (which uses mMaxSeqLen) never covered, causing 1-15 NVRTC re-compiles of
+        // 7-9 s each on the first MTP-decode iterations and blowing TTFT P99 from
+        // 882 ms to 25 s on DeepSeek-R1-FP8 8K1K. Safe for PagedKv: strides do not
+        // depend on mMaxSeqLenKv, and extra KV CTAs early-exit through seqLensKvPtr
+        // (rationale from PR #13505 / commit c37992c that #14851 inadvertently reverted).
+        tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
         tllmRunnerParams.mJITWarmup = generation_params.trtllm_gen_jit_warmup;
         tllmRunnerParams.mJITWarmupMaxNumRequests = mMaxNumRequests;
         tllmRunnerParams.mJITWarmupMaxSeqLenQ = mMaxContextLength;
