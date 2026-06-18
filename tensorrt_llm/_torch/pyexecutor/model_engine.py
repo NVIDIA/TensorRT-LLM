@@ -5234,6 +5234,10 @@ class PyTorchModelEngine(ModelEngine):
         # Build a fresh, no-cache attention metadata for the encoder
         # pass.  We do not reuse ``self.attn_metadata`` because that
         # object is bound to the decoder's KV-cache manager.
+        sparse_metadata_params = (
+            self.sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=self.model.model_config.pretrained_config)
+            if self.sparse_attention_config is not None else None)
         encoder_attn_metadata = self.attn_backend.Metadata(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -5244,7 +5248,7 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=False,
             cache_indirection=None,
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
             num_heads_per_kv=1,
         )
         assert isinstance(
