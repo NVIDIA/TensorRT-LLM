@@ -40,11 +40,12 @@ import torch.nn.functional as F
 
 try:
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-    from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.visual_gen.args import AttentionConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
