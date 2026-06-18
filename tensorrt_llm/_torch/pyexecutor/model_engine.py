@@ -27,6 +27,7 @@ from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig,
                                           EncodeCudaGraphConfig,
+                                          SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -494,10 +495,9 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_backend = get_attention_backend(
             self.llm_args.attn_backend,
-            sparse_attn_config=self.sparse_attention_config)
+            sparse_attention_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
-            self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
@@ -551,6 +551,7 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
+        self.spec_metadata = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1335,8 +1336,8 @@ class PyTorchModelEngine(ModelEngine):
             effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
 
         sparse_config = self.sparse_attention_config
-        if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(
-        ):
+        if (isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
+                and sparse_config.needs_separate_short_long_cuda_graphs()):
             # For short sequences, use the (seq_len_threshold - max_draft_len - 1) as the maximum sequence length
             # to make sure all of the past and current input tokens are within the sequence length threshold.
             # For long sequences, use the default maximum sequence length.
@@ -1349,33 +1350,70 @@ class PyTorchModelEngine(ModelEngine):
         else:
             max_seq_len_list = [effective_max_seq_len]
 
-        for bs, draft_len in graphs_to_capture:
-            if bs > self.batch_size:
-                continue
-
-            for max_seq_len in max_seq_len_list:
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len, max_seq_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        # No KV cache space, cannot continue capturing graphs
+        def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
+            spec_metadata = self.spec_metadata
+            if force_non_greedy and spec_metadata is not None:
+                spec_metadata._force_non_greedy_for_capture = True
+                # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
+                # to build the graph cache key BEFORE populate runs inside
+                # _prepare_inputs. Pre-flip it here so the very first capture
+                # in this pass uses the non-greedy key; populate's override
+                # below will keep it False on every subsequent iteration.
+                spec_metadata.is_all_greedy_sample = False
+            try:
+                for bs, draft_len in graphs_to_capture:
+                    if bs > self.batch_size:
                         continue
-                    logger.info(
-                        f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
-                    )
-                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
-                        self.spec_config is not None
-                        and self.spec_config.spec_dec_mode.use_one_engine())
-                    self._update_draft_inference_state_for_warmup(
-                        batch, draft_len > 0, resource_manager)
-                    self.runtime_draft_len = draft_len
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+
+                    for max_seq_len in max_seq_len_list:
+                        warmup_request = self._create_cuda_graph_warmup_request(
+                            resource_manager, bs, draft_len, max_seq_len)
+                        with self._release_batch_context(
+                                warmup_request, resource_manager) as batch:
+                            if batch is None:
+                                # No KV cache space, cannot continue capturing graphs
+                                continue
+                            logger.info(
+                                f"Run generation-only CUDA graph warmup ({label}) "
+                                f"for batch size={bs}, draft_len={draft_len}, "
+                                f"max_seq_len={max_seq_len}")
+                            self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
+                                self.spec_config is not None and
+                                self.spec_config.spec_dec_mode.use_one_engine())
+                            self._update_draft_inference_state_for_warmup(
+                                batch, draft_len > 0, resource_manager)
+                            self.runtime_draft_len = draft_len
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+            finally:
+                if force_non_greedy and spec_metadata is not None:
+                    spec_metadata._force_non_greedy_for_capture = False
+
+        # Pass 1: greedy fast-path (dummy requests carry no sampling params,
+        # so is_all_greedy_sample is naturally True).
+        _run_capture_pass(force_non_greedy=False, label="greedy")
+        # Pass 2: advanced sampling variant. Required because on-the-fly capture
+        # is disabled outside warmup, so any inference batch that contains a
+        # non-greedy request would otherwise fall back to eager. Only meaningful
+        # for one-engine spec dec (where is_all_greedy_sample participates in
+        # the graph key); other paths default to True and would never key into
+        # this variant.
+        needs_non_greedy_capture = (
+            self.spec_config is not None
+            and self.spec_config.spec_dec_mode.use_one_engine())
+        if needs_non_greedy_capture:
+            _run_capture_pass(force_non_greedy=True, label="advanced sampling")
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
+        # The advanced-sampling capture pass above leaves is_all_greedy_sample
+        # set to False on spec_metadata. Reset it to the default so the first
+        # real iteration's graph-key selection is not seeded with this
+        # capture-only value. (update_is_all_greedy_sample refreshes it every
+        # iteration; this is a defensive guard.)
+        if self.spec_metadata is not None:
+            self.spec_metadata.is_all_greedy_sample = True
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -1737,11 +1775,17 @@ class PyTorchModelEngine(ModelEngine):
         else:
             num_heads_per_kv = 1
 
+        metadata_cls = self.attn_backend.Metadata
+        sparse_metadata_params = (
+            self.sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=config)
+            if self.sparse_attention_config is not None else None)
+
         if kv_cache_manager is None:
             # Cache the no-cache metadata.
             if self.encoder_attn_metadata is not None:
                 return self.encoder_attn_metadata
-            self.encoder_attn_metadata = self.attn_backend.Metadata(
+            metadata_kwargs = dict(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
@@ -1752,8 +1796,9 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv=
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
-                sparse_attention_config=self.sparse_attention_config,
-                num_heads_per_kv=num_heads_per_kv)
+                num_heads_per_kv=num_heads_per_kv,
+                sparse_metadata_params=sparse_metadata_params)
+            self.encoder_attn_metadata = metadata_cls(**metadata_kwargs)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -1764,7 +1809,7 @@ class PyTorchModelEngine(ModelEngine):
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        self.attn_metadata = self.attn_backend.Metadata(
+        metadata_kwargs = dict(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
@@ -1775,9 +1820,10 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
-            sparse_attention_config=self.sparse_attention_config,
             num_heads_per_kv=num_heads_per_kv,
+            sparse_metadata_params=sparse_metadata_params,
         )
+        self.attn_metadata = metadata_cls(**metadata_kwargs)
 
         return self.attn_metadata
 
@@ -4878,6 +4924,17 @@ class PyTorchModelEngine(ModelEngine):
                 self.runtime_draft_len) as padded_requests:
             self._pad_batch_seed_mrope_delta_cache(padded_requests)
 
+            # Refresh is_all_greedy_sample for the *current* batch BEFORE the
+            # CUDA graph key is built below. The key includes this flag to pick
+            # the argmax vs advanced-sampling graph variant; populate (inside
+            # _prepare_inputs) runs later and fills the matching GPU buffers.
+            # Without this pre-scan the key would use the previous iteration's
+            # stale value and could replay the advanced graph against
+            # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
+            if spec_metadata is not None:
+                spec_metadata.update_is_all_greedy_sample(
+                    padded_requests.all_requests())
+
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
                 enable_spec_decode=self.enable_spec_decode,
@@ -5177,6 +5234,10 @@ class PyTorchModelEngine(ModelEngine):
         # Build a fresh, no-cache attention metadata for the encoder
         # pass.  We do not reuse ``self.attn_metadata`` because that
         # object is bound to the decoder's KV-cache manager.
+        sparse_metadata_params = (
+            self.sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=self.model.model_config.pretrained_config)
+            if self.sparse_attention_config is not None else None)
         encoder_attn_metadata = self.attn_backend.Metadata(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -5187,7 +5248,7 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=False,
             cache_indirection=None,
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
             num_heads_per_kv=1,
         )
         assert isinstance(
