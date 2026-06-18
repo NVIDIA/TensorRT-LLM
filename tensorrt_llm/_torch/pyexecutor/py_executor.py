@@ -47,6 +47,8 @@ from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
 from ..models.modeling_llama import Llama4ForConditionalGeneration
+from ..models.modeling_multimodal_mixin import \
+    maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
@@ -450,6 +452,7 @@ class PyExecutor:
         # unnecessary).  Several revert/skip paths gate on this flag.
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        self._prefetched_request_ids: set[int] = set()
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         self.enable_partial_reuse_for_disagg = (
@@ -2587,6 +2590,30 @@ class PyExecutor:
         for req in dropped_context_requests:
             self.kv_cache_manager.revert_allocate_context(req)
 
+    @nvtx_range("_prefetch_for_context_requests")
+    def _prefetch_for_context_requests(self) -> None:
+        """Pre-stage disk blocks to host for upcoming context requests with block reuse."""
+        if not isinstance(getattr(self, "kv_cache_manager", None),
+                          KVCacheManagerV2):
+            return
+        if not self.kv_cache_manager.enable_block_reuse:
+            return
+        if self.kv_cache_manager.disk_prefetch_num_reqs <= 0:
+            return
+        max_prefetch = self.kv_cache_manager.disk_prefetch_num_reqs
+        candidates = []
+        for req in self.active_requests:
+            if len(candidates) >= max_prefetch:
+                break
+            if (req.is_first_context_chunk and req.py_request_id
+                    not in self.kv_cache_manager.kv_cache_map
+                    and req.py_request_id not in self._prefetched_request_ids):
+                candidates.append(req)
+                self._prefetched_request_ids.add(req.py_request_id)
+
+        if candidates:
+            self.kv_cache_manager.prefetch_for_context_tokens(candidates)
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -2604,6 +2631,8 @@ class PyExecutor:
                 self._get_new_active_requests_queue_latency())
 
         self._pad_attention_dp_dummy_request()
+
+        self._prefetch_for_context_requests()
 
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
@@ -2998,6 +3027,8 @@ class PyExecutor:
                             self.dwdp_manager.prefetch_first_layers()
                         batch_outputs = self._forward_step(scheduled_batch)
 
+                    self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
+
                     guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
                         guided_decoder_failed_requests = self.guided_decoder.execute(
@@ -3123,7 +3154,7 @@ class PyExecutor:
     def _sync_and_process_resource_governor_queue(self):
         """Synchronize and process resource governor requests across all ranks.
 
-        Only called when ``_resource_governor_enabled`` is ``True``.
+        Only called when ``_resource_governor_enabled`` is `True`.
         Uses a two-phase broadcast: first broadcast the count (a single int),
         then broadcast the actual requests only when count > 0.  This avoids
         serializing and deserializing an empty Python list on every iteration.
@@ -3413,6 +3444,8 @@ class PyExecutor:
                         batch_outputs = self._forward_step(
                             scheduled_batch, previous_tensors_device,
                             num_accepted_tokens_device)
+
+                    self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -4702,6 +4735,61 @@ class PyExecutor:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
         self._check_cache_transfer_errors("generation requests")
 
+    def _maybe_prefetch_next_iter_mm_encoders(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Best-effort hook for cross-iter MM encoder prefetch.
+
+        Called immediately after `_forward_step`, so the side-stream encoder
+        work can overlap current-iteration sampling in the non-overlap loop and
+        previous-batch `_update_requests` in the overlap loop. No-op unless
+        `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is positive and the model is a
+        `MultimodalModelMixin` subclass.
+
+        Walks `active_requests` for context-init candidates that are NOT
+        in the just-scheduled batch (and, in overlap mode, not in the
+        previous batch either) and dispatches one of them, subject to the
+        outstanding-ahead cap in `maybe_prefetch_mm_encoder_for_next_iter`.
+        That helper runs the encoder on a side CUDA stream and stashes
+        results back into `request.py_multimodal_data`. The next iteration's
+        `_prepare_inputs` then picks up the cached embedding and the mixin
+        consume site waits on the recorded CUDA event.
+
+        Shared between `_executor_loop` (non-overlap) and
+        `_executor_loop_overlap`. `self.previous_batch` is always None in
+        non-overlap mode, so the second union term is a no-op there.
+        """
+        model = getattr(self.model_engine, "model", None)
+        if model is None:
+            return
+        in_flight = {r.py_request_id for r in scheduled_batch.all_requests()}
+        if self.previous_batch is not None:
+            in_flight |= {
+                r.py_request_id
+                for r in self.previous_batch.scheduled_requests.all_requests()
+            }
+        pending = [
+            r for r in self.active_requests
+            if r.state == LlmRequestState.CONTEXT_INIT
+        ]
+        if not pending:
+            return
+        try:
+            maybe_prefetch_mm_encoder_for_next_iter(
+                model=model,
+                pending_requests=pending,
+                in_flight_request_ids=in_flight,
+                max_prefetch=1,
+            )
+        except Exception:
+            # Speculative prefetch is best-effort and must never crash the
+            # executor loop. On failure, `py_mm_encoder_event` is not stamped,
+            # so the next iteration's `_prepare_inputs` falls back to the
+            # standard in-iter encode path (which re-runs `to_device` and the
+            # encoder unconditionally when no cached embedding is present).
+            logger.warning(
+                f"Cross-iter MM encoder prefetch failed; falling back to "
+                f"in-iter encode.\n{traceback.format_exc()}")
+
     def _forward_step(
             self,
             scheduled_requests: ScheduledRequests,
@@ -5017,6 +5105,7 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
+        self._prefetched_request_ids.discard(request.py_request_id)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
