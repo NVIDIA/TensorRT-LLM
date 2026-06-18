@@ -1271,7 +1271,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     containerDir="$containerDir"
                     mkdir -p "\$containerDir"
-                    imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
+                    # If the image URI already contains a manifest digest (@sha256:…) use
+                    # it directly for content-addressed caching; otherwise hash the tag
+                    # string, which is stable for per-build images but will not detect a
+                    # re-pushed mutable tag within the 3-day TTL window.
+                    if printf '%s' "$container" | grep -q '@sha256:'
+                    then
+                        imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+                    else
+                        imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
+                    fi
                     export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
                     importContainerWithRetries() {
