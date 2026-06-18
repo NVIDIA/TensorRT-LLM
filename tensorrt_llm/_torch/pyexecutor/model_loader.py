@@ -307,10 +307,10 @@ class ModelLoader:
     @staticmethod
     def load_config_and_apply_defaults(
             checkpoint_dir: str, llm_args: TorchLlmArgs,
-            checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
+            checkpoint_loader: BaseCheckpointLoader) -> tuple[TorchLlmArgs, type | None]:
         """Load model config and apply model-specific defaults to llm_args."""
         if checkpoint_loader is None:
-            return llm_args
+            return llm_args, None
 
         config_kwargs = {
             'trust_remote_code': llm_args.trust_remote_code,
@@ -344,7 +344,7 @@ class ModelLoader:
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
 
-        return llm_args
+        return llm_args, model_cls
 
     @staticmethod
     def _needs_source_identity(checkpoint_loader: BaseCheckpointLoader,

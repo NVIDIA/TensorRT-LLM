@@ -441,6 +441,18 @@ def update_spec_config_from_model_config(spec_config, model_config):
 
     spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
+    # Gemma4 assistant MTP layers use Q-only attention and read backbone KV via
+    # cache_layer_idx.  A separate draft KV pool is unnecessary and breaks
+    # hybrid per-layer head layout (full backbone layer_types vs 1 draft slot).
+    from ..pyexecutor.config_utils import is_gemma4_hybrid
+    if (is_gemma4_hybrid(model_config)
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()):
+        spec_config._allow_separate_draft_kv_cache = False
+        logger.info(
+            "Gemma4 MTP: disabled separate draft KV cache (assistant shares "
+            "backbone KV via Q-only attention)."
+        )
+
 
 @dataclass
 class SpecDecodingTensor:

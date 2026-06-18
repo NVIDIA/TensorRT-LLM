@@ -235,9 +235,9 @@ def _load_config_and_create_checkpoint_loader(
         mx_config=llm_args.mx_config,
         mx_model_name=llm_args.model,
     )
-    llm_args = ModelLoader.load_config_and_apply_defaults(
+    llm_args, model_cls = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
-    return llm_args, checkpoint_loader
+    return llm_args, checkpoint_loader, model_cls
 
 
 def create_encoder_executor(
@@ -259,7 +259,7 @@ def create_encoder_executor(
     """
     from .encoder_executor import EncoderExecutor
 
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+    llm_args, checkpoint_loader, _ = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
@@ -324,7 +324,7 @@ def create_py_executor(
     """
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+    llm_args, checkpoint_loader, model_cls = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
@@ -399,6 +399,12 @@ def create_py_executor(
         from tensorrt_llm._torch.speculative import suggest_spec_config
         spec_config = suggest_spec_config(max_batch_size)
 
+    if (spec_config is not None
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and model_cls is not None
+            and getattr(model_cls, "uses_shared_backbone_kv_for_mtp", False)):
+        spec_config._allow_separate_draft_kv_cache = False
+
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
         if not spec_config.spec_dec_mode.support_overlap_scheduler():
             logger.warning(
@@ -406,14 +412,27 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        gemma4_shared_kv_mtp = (
+            model_cls is not None
+            and getattr(model_cls, "uses_shared_backbone_kv_for_mtp", False))
+        if (llm_args.attn_backend == "TRTLLM" and gemma4_shared_kv_mtp
+                and get_sm_version() not in (100, 103)):
             raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+                "TRTLLM attention does not support Gemma4 global attention layers "
+                "(head_dim=512) on Hopper: MMHA rejects head_dim 512. Use "
+                "attn_backend='FLASHINFER' for Gemma4 MTP on H100.")
+        if llm_args.attn_backend == "FLASHINFER" and not gemma4_shared_kv_mtp:
+            raise ValueError(
+                f"FLASHINFER attention backend is not supported with one-engine "
+                f"speculative decoding mode '{spec_config.spec_dec_mode.name}'. "
+                f"Please use attn_backend='TRTLLM'.")
+        elif llm_args.attn_backend == "FLASHINFER" and gemma4_shared_kv_mtp:
+            logger.info(
+                "Using FLASHINFER for Gemma4 one-engine MTP: Triton paged "
+                "attention supports head_dim=512 with spec-dec metadata on "
+                "FlashInferAttentionMetadata."
+            )
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

@@ -1437,13 +1437,37 @@ class MTPForCausalLM(nn.Module):
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP
+            case "gemma4_text":
+                from .modeling_gemma4 import Gemma4MTP
+                mtp_layer = Gemma4MTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
-        checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
+
+        # Gemma4 uses a separate assistant model checkpoint; num_nextn_predict_layers
+        # is not defined in its config.  Use max_draft_len as the layer count and
+        # load the assistant config to determine internal decoder layer types.
+        mtp_kwargs: dict = {}
+        if model_type == "gemma4_text":
+            checkpoint_mtp_num_layers = model_config.spec_config.max_draft_len
+            _assistant_layer_types = None
+            _speculative_model = getattr(model_config.spec_config, "speculative_model", None)
+            if _speculative_model:
+                try:
+                    from transformers import Gemma4AssistantConfig
+                    _asst_cfg = Gemma4AssistantConfig.from_pretrained(_speculative_model)
+                    if _asst_cfg.text_config is not None:
+                        _assistant_layer_types = _asst_cfg.text_config.layer_types
+                except Exception:
+                    pass
+            if _assistant_layer_types is not None:
+                mtp_kwargs["mtp_layer_types"] = _assistant_layer_types
+        else:
+            checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
+
         if spec_dec_mode.is_mtp_eagle_one_model():
             mtp_num_layers = 1
             mtp_repeat_count = model_config.spec_config.max_draft_len
@@ -1456,11 +1480,105 @@ class MTPForCausalLM(nn.Module):
 
         self.mtp_layers = nn.ModuleList([
             mtp_layer(model_config, layer_idx + start_layer_idx,
-                      model.aux_stream_dict)
+                      model.aux_stream_dict, **mtp_kwargs)
             for layer_idx in range(mtp_num_layers)
         ])
         self.lm_head = lm_head
         self.embed_tokens = model.embed_tokens
+        self._model_type = model_type
+
+    def load_weights(self, weights: Dict, weight_mapper=None):
+        """Load MTP weights from a draft/assistant model checkpoint.
+
+        Currently only needed for Gemma4 whose assistant is a separate checkpoint.
+        For other models, MTP weights are embedded in the backbone checkpoint and
+        loaded as part of the backbone's ``load_weights``.
+        """
+        if self._model_type != "gemma4_text":
+            return
+
+        # Map from HF Gemma4 assistant checkpoint layout to TRT-LLM module paths.
+        # HF layout:
+        #   pre_projection.weight
+        #   post_projection.weight  (not used directly; backbone lm_head shared)
+        #   model.norm.weight
+        #   model.layers.{i}.self_attn.q_proj.weight
+        #   model.layers.{i}.self_attn.q_norm.weight
+        #   model.layers.{i}.self_attn.o_proj.weight
+        #   model.layers.{i}.mlp.*
+        #   model.layers.{i}.input_layernorm.weight
+        #   model.layers.{i}.post_attention_layernorm.weight
+        #   model.layers.{i}.pre_feedforward_layernorm.weight
+        #   model.layers.{i}.post_feedforward_layernorm.weight
+        #   model.layers.{i}.layer_scalar
+        # TRT-LLM layout (for each mtp_layers[k]):
+        #   mtp_layers.{k}.pre_projection.*
+        #   mtp_layers.{k}.shared_head.norm.*
+        #   mtp_layers.{k}.mtp_layers.{j}.self_attn.qkv_proj.*  (Q-only)
+        #   mtp_layers.{k}.mtp_layers.{j}.self_attn.q_norm.*
+        #   mtp_layers.{k}.mtp_layers.{j}.self_attn.o_proj.*
+        #   mtp_layers.{k}.mtp_layers.{j}.mlp.*
+        #   mtp_layers.{k}.mtp_layers.{j}.{norm}.*
+        #   mtp_layers.{k}.mtp_layers.{j}.layer_scalar
+        #
+        # Each MTPForCausalLM instance (mtp_layers[k]) shares the same assistant
+        # checkpoint weights (the assistant model is called repeatedly for each
+        # draft step, not a new checkpoint per step).
+
+        # Build mapping: assistant checkpoint key -> TRT-LLM parameter path
+        remap: Dict[str, str] = {}
+        for k in range(len(self.mtp_layers)):
+            prefix = f"mtp_layers.{k}."
+            remap[f"pre_projection.weight"] = f"{prefix}pre_projection.weight"
+            remap[f"model.norm.weight"] = f"{prefix}shared_head.norm.weight"
+            # Decoder sub-layers
+            num_sub = len(self.mtp_layers[k].mtp_layers)
+            for j in range(num_sub):
+                sub_prefix = f"{prefix}mtp_layers.{j}."
+                hf_sub = f"model.layers.{j}."
+                for sfx in [
+                    "self_attn.o_proj.weight",
+                    "self_attn.q_norm.weight",
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
+                    "mlp.down_proj.weight",
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight",
+                    "pre_feedforward_layernorm.weight",
+                    "post_feedforward_layernorm.weight",
+                    "layer_scalar",
+                ]:
+                    remap[hf_sub + sfx] = sub_prefix + sfx
+                # Q-only projection: q_proj -> qkv_proj
+                remap[hf_sub + "self_attn.q_proj.weight"] = (
+                    sub_prefix + "self_attn.qkv_proj.weight"
+                )
+
+        # Load into module via state_dict update (allow missing/unexpected).
+        state_dict = self.state_dict()
+        updated: set = set()
+        for hf_key, tensor in weights.items():
+            trt_key = remap.get(hf_key)
+            if trt_key is not None and trt_key in state_dict:
+                state_dict[trt_key] = tensor
+                updated.add(trt_key)
+
+        missing = set(state_dict.keys()) - updated - {
+            k for k in state_dict if "lm_head" in k or "embed_tokens" in k
+        }
+        if missing:
+            from tensorrt_llm.logger import logger
+            logger.warning(
+                f"Gemma4 MTP: {len(missing)} parameters not found in assistant "
+                f"checkpoint (e.g. {next(iter(missing))}). "
+                "This is expected if parameters are shared with the backbone."
+            )
+        self.load_state_dict(state_dict, strict=False)
+
+    def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
+        """Share lm_head and embed_tokens with the backbone model."""
+        self.lm_head = target_model.lm_head
+        self.embed_tokens = target_model.model.embed_tokens
 
 
 class MTPDraftModel(nn.Module):

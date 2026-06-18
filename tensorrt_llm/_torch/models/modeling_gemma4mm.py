@@ -586,11 +586,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     """
 
     @classmethod
+    def flashinfer_supports_one_engine_spec_decode(cls) -> bool:
+        from .modeling_gemma4 import Gemma4ForCausalLM
+        return Gemma4ForCausalLM.flashinfer_supports_one_engine_spec_decode()
+
+    uses_shared_backbone_kv_for_mtp = True
+
+    @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        from .modeling_gemma4 import Gemma4ForCausalLM
+        return Gemma4ForCausalLM.get_model_defaults(llm_args)
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         # transformers 5.x ``PreTrainedModel.__init__`` calls this with an
