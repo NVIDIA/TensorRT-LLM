@@ -1247,6 +1247,14 @@ def init_pp_comm(mapping):
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
     else:
+        # On x86_64 hosts running NCCL <2.30.4 (and on GB10 DGX Spark),
+        # NVLS/MNNVL static-connection setup deadlocks during
+        # ncclCommInitRank, hanging disagg PP-2 workers before they reach
+        # readiness.  Disable NVLS/MNNVL via env vars BEFORE constructing
+        # NcclCommunicatorOp (which calls ncclCommInitRank).
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+            init_nccl_pp_workaround
+        init_nccl_pp_workaround()
         _pp_comm = PPCommNCCL(mapping)
     init_helix_cp_comm(mapping)
 

@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import enum
 import os
+import platform
 import threading
+from ctypes.util import find_library
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -56,6 +59,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
+_NCCL_GB10_SYMMETRIC_FIXED_VERSION = 23004  # NCCL 2.30.4
+_NCCL_MNNVL_ENABLE = "NCCL_MNNVL_ENABLE"
+_NCCL_NVLS_ENABLE = "NCCL_NVLS_ENABLE"
+
+
+@lru_cache(maxsize=None)
+def _is_gb10() -> bool:
+    """Return True on GB10 (DGX Spark)."""
+    return "GB10" in torch.cuda.get_device_name()
+
+
+@lru_cache(maxsize=None)
+def _get_nccl_runtime_version_code() -> Optional[int]:
+    lib_names = ["libnccl.so.2", "libnccl.so"]
+    nccl_lib = find_library("nccl")
+    if nccl_lib is not None and nccl_lib not in lib_names:
+        lib_names.append(nccl_lib)
+
+    for lib_name in lib_names:
+        try:
+            nccl = ctypes.CDLL(lib_name)
+            nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            nccl.ncclGetVersion.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            continue
+
+        version = ctypes.c_int()
+        if nccl.ncclGetVersion(ctypes.byref(version)) == 0:
+            return version.value
+
+    return None
+
 
 def _init_deep_gemm_pdl() -> None:
     try:
@@ -75,6 +110,29 @@ def _init_deep_gemm_pdl() -> None:
 
 
 _init_deep_gemm_pdl()
+
+
+@lru_cache(maxsize=None)
+def init_nccl_pp_workaround() -> bool:
+    """Disable NCCL NVLS/MNNVL before ncclCommInitRank where they can deadlock.
+
+    NCCL <2.30.4 NVLS/MNNVL static-connection setup (forced by
+    NCCL_RUNTIME_CONNECT=0 in tensorrt_llm's NcclCommunicator) deadlocks
+    during ncclCommInitRank on x86_64 hosts that have no MNNVL/IMEX fabric
+    and on GB10 (DGX Spark), leaving disagg PP-2 workers stuck before
+    "Init COMPLETE".  On hosts that ship NCCL >= 2.30.4 this is a no-op.
+    Honors user-set values via os.environ.setdefault.  Must run before any
+    ncclCommInitRank call on the worker process.
+    """
+    runtime_version = _get_nccl_runtime_version_code()
+    if (runtime_version is not None
+            and runtime_version >= _NCCL_GB10_SYMMETRIC_FIXED_VERSION):
+        return False
+    if platform.machine() != "x86_64" and not _is_gb10():
+        return False
+    os.environ.setdefault(_NCCL_MNNVL_ENABLE, "0")
+    os.environ.setdefault(_NCCL_NVLS_ENABLE, "0")
+    return True
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
