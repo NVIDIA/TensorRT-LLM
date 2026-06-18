@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@emma/add_cpu_partition', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1106,6 +1106,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
             def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
             def scriptFatBuildPathNode = "${jobWorkspace}/${jobUID}-fat_build_inline.sh"
+            // Fat builder sbatch wrapper: generated inline by Groovy (not a static file).
+            def scriptFatBuildSbatchPathLocal = Utils.createTempLocation(pipeline, "./fat_build_sbatch.sh")
+            def scriptFatBuildSbatchPathNode = "${jobWorkspace}/${jobUID}-fat_build_sbatch.sh"
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
@@ -1153,6 +1156,77 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptFatBuildPathNode,
                     true
                 )
+                if (cluster.fatBuilderArgs != null) {
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
+                    def scriptFatBuildSbatchContent = """#!/bin/bash
+#SBATCH --output=${fatBuildLogPath}
+#SBATCH ${cluster.fatBuilderArgs}
+set -euo pipefail
+trap 'rc=\$?; echo "Error on line \$LINENO: exit \$rc"; exit \$rc' ERR
+export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+
+# Resolve base sqsh using image digest (shared cache, same logic as srunPrologue).
+mkdir -p "${containerDir}"
+imageDigest=\$(printf '%s' "${container}" | sha256sum | cut -d' ' -f1)
+baseSqshPath="${containerDir}/container-\${imageDigest}.sqsh"
+
+# Import base sqsh if not already cached (flock so concurrent builds share one import).
+importContainerWithRetries() {
+    local docker_uri=\$1
+    local output_path=\$2
+    local max_attempts=\${3:-3}
+    local delay=\${4:-60}
+    local attempt=1
+    local tmp_path
+    exec 9>"\${output_path}.lock" || true
+    flock 9 || true
+    if [ -f "\$output_path" ]; then
+        echo "[fat_build_sbatch] Reusing cached base sqsh: \$output_path"
+        touch "\$output_path" || true
+        flock -u 9 || true
+        return 0
+    fi
+    tmp_path="\${output_path}.\${SLURM_JOB_ID:-\$\$}.tmp"
+    rm -f "\$tmp_path"
+    until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"; do
+        if (( attempt >= max_attempts )); then
+            echo "[fat_build_sbatch] enroot import failed after \$max_attempts attempts"
+            rm -f "\$tmp_path"
+            flock -u 9 || true
+            return 1
+        fi
+        echo "[fat_build_sbatch] enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+        rm -f "\$tmp_path"
+        sleep \$delay
+        attempt=\$((attempt + 1))
+    done
+    mv -f "\$tmp_path" "\$output_path"
+    flock -u 9 || true
+}
+importContainerWithRetries "${container}" "\$baseSqshPath"
+
+# Build fat sqsh from cached base sqsh.
+mkdir -p "${fatSqshDir}"
+fatHash=\$(printf '%s' "${llmTarfile}|${LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
+fatSqshPath="${fatSqshDir}/fat-\${fatHash}.sqsh"
+if [ -f "\$fatSqshPath" ]; then
+    echo "[fat_build_sbatch] Fat sqsh already exists: \$fatSqshPath"
+    exit 0
+fi
+bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}" "${tarName}" || echo "[fat_build_sbatch] Build failed (non-fatal); GPU job will fall back to base sqsh + full install"
+""".replaceAll("(?m)^\\s{20}", "")
+                    pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
+                    Utils.exec(pipeline, script: "echo \"Fat builder sbatch script: \" && cat ${scriptFatBuildSbatchPathLocal}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        scriptFatBuildSbatchPathLocal,
+                        scriptFatBuildSbatchPathNode,
+                        true
+                    )
+                }
                 Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
@@ -1263,10 +1337,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
-                    # Fat sqsh: reuse pre-built container image with trtllm already installed.
-                    # Hash key = sha256(llmTarfile|LLM_DOCKER_IMAGE)[:16] — encodes commit, platform, and base image.
+                    # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
                     fatSqshDir="$fatSqshDir"
-                    mkdir -p "\$fatSqshDir"
                     fatHash=\$(printf '%s' "$llmTarfile|$LLM_DOCKER_IMAGE" | sha256sum | cut -d' ' -f1 | head -c 16)
                     fatSqshPath="\$fatSqshDir/fat-\${fatHash}.sqsh"
 
@@ -1276,8 +1348,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         export SKIP_INSTALL=1
                         touch "\$fatSqshPath" || true
                     else
-                        # Import base container per-job (original fallback behavior).
-                        baseSqshPath="$containerDir/container-\${SLURM_JOB_ID}.sqsh"
+                        # Fat sqsh not ready; use digest-cached base sqsh + full install.
+                        containerDir="$containerDir"
+                        mkdir -p "\$containerDir"
+                        imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
+                        export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
                         importContainerWithRetries() {
                             local docker_uri=\$1
@@ -1285,50 +1360,43 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             local max_attempts=\${3:-3}
                             local delay=\${4:-60}
                             local attempt=1
+                            local tmp_path
 
-                            rm -f "\$output_path"
+                            exec 9>"\${output_path}.lock" || true
+                            flock 9 || true
 
-                            until enroot import -o "\$output_path" -- "docker://\$docker_uri"
+                            if [ -f "\$output_path" ]
+                            then
+                                echo "Reusing cached container image: \$output_path"
+                                touch "\$output_path" || true
+                                flock -u 9 || true
+                                return 0
+                            fi
+
+                            tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
+                            rm -f "\$tmp_path"
+
+                            until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
                             do
                                 if ((attempt >= max_attempts))
                                 then
                                     echo "enroot import failed after \$max_attempts attempts"
+                                    rm -f "\$tmp_path"
+                                    flock -u 9 || true
                                     return 1
                                 fi
 
                                 echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
-                                rm -f "\$output_path"
+                                rm -f "\$tmp_path"
                                 sleep \$delay
-                                ((attempt++))
+                                attempt=\$((attempt + 1))
                             done
+
+                            mv -f "\$tmp_path" "\$output_path"
+                            flock -u 9 || true
                         }
 
-                        importContainerWithRetries "$container" "\$baseSqshPath"
-                        export enrootImagePath="\$baseSqshPath"
-
-                        # Build fat sqsh for future job reuse. Best-effort flock so
-                        # only one concurrent job builds while others use base sqsh.
-                        # The current job also benefits if the build succeeds.
-                        exec 8>"\${fatSqshPath}.lock" || true
-                        if flock -n 8 2>/dev/null; then
-                            if [ ! -f "\$fatSqshPath" ]; then
-                                echo "Building fat sqsh: \$fatSqshPath"
-                                if bash "$scriptFatBuildPathNode" "\$fatSqshPath" "\$baseSqshPath" "$llmTarfile" "$tarName"; then
-                                    export enrootImagePath="\$fatSqshPath"
-                                    export SKIP_INSTALL=1
-                                    echo "Fat sqsh ready, switching to it (SKIP_INSTALL=1)"
-                                else
-                                    echo "Fat sqsh build failed (non-fatal), using base sqsh for this job"
-                                fi
-                            else
-                                echo "Fat sqsh appeared while waiting for lock: \$fatSqshPath"
-                                export enrootImagePath="\$fatSqshPath"
-                                export SKIP_INSTALL=1
-                            fi
-                            flock -u 8 || true
-                        else
-                            echo "Another job is building fat sqsh, using base sqsh for this job"
-                        fi
+                        importContainerWithRetries "$container" "\$enrootImagePath"
                     fi
                     """.replaceAll("(?m)^\\s*", "")
                 }
@@ -1463,6 +1531,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptRunPathNode,
                     scriptInstallPathNode,
                     scriptFatBuildPathNode,
+                    scriptFatBuildSbatchPathNode,
                     scriptBashUtilsPathNode,
                     scriptLaunchPathNode,
                     scriptSubmitPathNode,
@@ -1472,6 +1541,29 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     coverageConfigFile
                 ]
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
+
+                def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                def fatSqshSubmitSection = ""
+                if (cluster.fatBuilderArgs != null) {
+                    fatSqshSubmitSection = """
+# Fat sqsh: submit CPU builder job if needed, then add --dependency to GPU test job.
+mkdir -p "${fatSqshDir}"
+fatHash=\$(printf '%s' "${llmTarfile}|${LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
+fatSqshPath="${fatSqshDir}/fat-\${fatHash}.sqsh"
+SBATCH_DEPENDENCY=""
+if [ ! -f "\$fatSqshPath" ]; then
+    EXISTING=\$(squeue -h -n "fat_build_\${fatHash}" -o "%i" 2>/dev/null | head -1 || true)
+    if [ -n "\$EXISTING" ]; then
+        echo "Fat sqsh builder already running as job \$EXISTING, adding dependency"
+        SBATCH_DEPENDENCY="--dependency=afterok:\$EXISTING"
+    else
+        BUILDER_ID=\$(sbatch --parsable --job-name="fat_build_\${fatHash}" "${scriptFatBuildSbatchPathNode}" | head -1)
+        echo "Submitted fat sqsh builder as job \$BUILDER_ID"
+        SBATCH_DEPENDENCY="--dependency=afterok:\$BUILDER_ID"
+    fi
+fi
+""".replaceAll("(?m)^\\s{20}", "")
+                }
 
                 def scriptSubmit = """#!/bin/bash
                     set -xEeuo pipefail
@@ -1489,8 +1581,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Clean up workspace: remove all files/dirs not in the keep list
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
+                    ${fatSqshSubmitSection}
                     touch ${slurmJobLogPath}
-                    jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
+                    jobId=\$(sbatch \${SBATCH_DEPENDENCY:-} ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1

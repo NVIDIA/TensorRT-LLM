@@ -14,15 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build a "fat" enroot sqsh (base image + trtllm pre-installed) on the compute node.
-# Called from srunPrologue when the fat sqsh for this commit is not yet cached.
+# Build a "fat" enroot sqsh (base image + trtllm pre-installed).
+# Called by the CPU fat-builder sbatch job after the base sqsh has already been
+# imported/cached. The GPU test job depends on this builder job completing
+# (--dependency=afterok) and then uses the fat sqsh directly (SKIP_INSTALL=1).
 #
 # Usage:
 #   fat_build_inline.sh <fat_sqsh_path> <base_sqsh_path> <llm_tarfile_url> <tar_name>
 #
-# Exits 0 on success (fat sqsh written to <fat_sqsh_path>), non-zero on any
-# failure. The caller wraps this with || true so failures are non-fatal and
-# the job falls back to the base sqsh + full slurm_install.sh.
+# Exits 0 on success (fat sqsh written atomically to <fat_sqsh_path>).
+# The caller uses || true so failures are non-fatal; the GPU test job will then
+# fall back to the base sqsh + full slurm_install.sh.
 
 set -euo pipefail
 
@@ -46,10 +48,8 @@ echo "[fat_build] Starting: $FAT_SQSH_PATH"
 echo "[fat_build] Base sqsh: $BASE_SQSH_PATH"
 echo "[fat_build] LLM tarfile: ${LLM_TARFILE_URL%%\?*}"
 
-# Write the install script to WORK_DIR (mounted into container as /work).
-# Variable expansion happens here in the outer shell; the container sees
-# literal values already substituted. Install steps mirror slurm_install.sh
-# exactly so the fat sqsh matches what a regular CI job would produce.
+# Write the install script into WORK_DIR (mounted as /work inside the container).
+# Variable expansion happens here in the outer shell; the container sees literal values.
 cat > "$WORK_DIR/install.sh" << INSTALL_EOF
 #!/bin/bash
 set -euo pipefail
