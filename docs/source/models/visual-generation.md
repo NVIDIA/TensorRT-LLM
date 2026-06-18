@@ -55,7 +55,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required. 
+[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 work both as VisualGen dynamic quantization from a BF16 checkpoint (no pre-quantized checkpoint required) and by loading a pre-quantized ModelOpt checkpoint (static scales, with the checkpoint's `quantization_config` `ignore` list keeping the embedders, output projection, and first/last transformer blocks in high precision). 
 
 ## Quick Start
 

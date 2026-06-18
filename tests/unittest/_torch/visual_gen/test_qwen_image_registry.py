@@ -65,6 +65,49 @@ def test_transformer_load_weights_detects_mismatch():
         model.load_weights({})
 
 
+def test_static_quant_excludes_high_precision_layers():
+    """Layers in the checkpoint's ``ignore`` list build as unquantized.
+
+    A statically pre-quantized ModelOpt NVFP4 checkpoint stores the excluded
+    layers (embedders, output projection, first/last transformer blocks) in
+    BF16 with no scales, so they must fall back to the unquantized Linear
+    method while the rest stay NVFP4.
+    """
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4,
+        group_size=16,
+        exclude_modules=[
+            "img_in",
+            "txt_in",
+            "proj_out",
+            "norm_out*",
+            "transformer_blocks.0*",
+            "transformer_blocks.1.*",
+        ],
+    )
+    model_config = DiffusionModelConfig(
+        quant_config=quant_config,
+        skip_create_weights_in_init=True,
+    )
+    model = QwenImageTransformer2DModel(model_config=model_config, num_layers=4)
+    model._clear_quant_config_on_excluded_layers()
+
+    # Excluded -> quant_config cleared (unquantized Linear method).
+    assert model.img_in.quant_config is None
+    assert model.txt_in.quant_config is None
+    assert model.proj_out.quant_config is None
+    assert model.norm_out.linear.quant_config is None
+    assert model.transformer_blocks[0].attn.to_q.quant_config is None
+    assert model.transformer_blocks[1].img_mlp.up_proj.quant_config is None
+    # Quantized blocks keep NVFP4.
+    keep = model.transformer_blocks[2].attn.to_q.quant_config
+    assert keep is not None and keep.quant_algo == QuantAlgo.NVFP4
+    assert model.transformer_blocks[3].img_mlp.down_proj.quant_config is not None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("with_text_mask", [False, True])
 def test_transformer_forward_sanity(with_text_mask):
