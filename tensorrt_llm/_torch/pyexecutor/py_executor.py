@@ -1,6 +1,5 @@
 import dataclasses
 import datetime
-import functools
 import os
 import threading
 import time
@@ -39,9 +38,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
-    get_global_profiler, host_profiler_context)
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
+    host_profiler_context
 
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
@@ -71,6 +69,8 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
+from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
+from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
@@ -86,18 +86,14 @@ from .scheduler.adp_router import ADPRouter
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
-# Environment variable to specify iteration ranges for profiling start/stop.
-# Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
-PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
-
-# Environment variable to enable PyTorch profiler tracing.
-# Set to a path to save detailed tracing of PyTorch operations.
-PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
-
-# Environment variable to control which ranks print step logging.
-# Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
-# Default: "0" (only rank 0 prints, matching existing behavior).
-PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+# Profiling env-var names and the iteration-index parser live in
+# ``.profiling`` and are re-exported here for backward compatibility
+# with code/tests that import them from ``py_executor``.
+__all_profile_compat__ = (
+    "PROFILE_START_STOP_ENV_VAR_NAME",
+    "PROFILE_TRACE_ENV_VAR_NAME",
+    "PROFILE_LOG_RANKS_ENV_VAR_NAME",
+)
 
 
 class PPCommTag(IntEnum):
@@ -108,32 +104,6 @@ class PPCommTag(IntEnum):
     SCHEDULE_RESULT = 20001
     EXECUTED_BATCH_NUM = 20002
     SAMPLE_STATE = 20003
-
-
-@functools.cache
-def _load_iteration_indexes(env_var: str):
-    spans = os.environ.get(env_var, None)
-    starts, stops = [], []
-
-    if spans:
-        spans = spans.split(',')
-
-        for span in spans:
-            try:
-                if '-' in span:
-                    start, stop = span.strip().split('-')
-                    starts.append(int(start))
-                    stops.append(int(stop))
-                else:
-                    it = int(span.strip())
-                    starts.append(it)
-                    stops.append(it)
-            except ValueError as e:
-                raise ValueError(
-                    f"Cannot parse span in environment variable `{env_var}`: {e}"
-                ) from None
-
-    return frozenset(starts), frozenset(stops)
 
 
 def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
@@ -360,8 +330,44 @@ class PyExecutor:
 
         self.iter_counter = 0
         # profile config
-        self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
+        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
+        # Convert to mutable sets so start_profile()/stop_profile() can
+        # .add() runtime-configured iteration indices.
+        # _load_iteration_indexes returns frozensets.
+        self.profile_start_iters = set(_env_start_iters)
+        self.profile_stop_iters = set(_env_stop_iters)
+
+        # Runtime-configurable profiling state. Populated by start_profile()
+        # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
+        # or API calls. When these are None/False the _profiler() context
+        # falls back to the environment-variable driven configuration.
+        self._runtime_profile_trace_path: Optional[str] = None
+        self._runtime_profile_activities: Optional[List[str]] = None
+        self._runtime_profile_cuda_only: bool = False
+        # Iteration markers added by the most recent runtime start_profile().
+        # Tracked so stop_profile() can cancel a start that has not fired
+        # yet (e.g. the caller stops before sending any requests) without
+        # leaking a pending profile window that would start later.
+        self._runtime_profile_pending_start_iter: Optional[int] = None
+        self._runtime_profile_pending_stop_iter: Optional[int] = None
+
+        # Mirrors the in-loop profile window state (maintained by
+        # ``_profiler()``) so external callers can query whether a profile
+        # is currently active. torch.profiler is not thread-safe so we do
+        # NOT call .stop() from other threads; ``stop_profile()`` schedules
+        # the iteration-scoped stop and (when triggered via an HTTP
+        # handler) the server tickles the executor loop so the stop fires
+        # even when the engine is otherwise idle.
+        self._profile_state_lock = threading.Lock()
+        self._profile_enabled: bool = False
+
+        # The profile-state machine (start/stop scheduling, broadcast
+        # apply, per-iteration torch.profiler driver) lives in the
+        # ``PyExecutorProfileManager``. ``PyExecutor`` keeps the state
+        # fields above on ``self`` for backward-compat introspection;
+        # the manager operates on those fields via a weakref.
+        self._profile_manager = PyExecutorProfileManager(self)
 
         # related modules
         self.resource_manager = resource_manager
@@ -1134,168 +1140,79 @@ class PyExecutor:
 
     @contextmanager
     def _profiler(self):
-        it = -1
-        enabled = False
-        start_time = None
+        """Per-iteration profile bookkeeping driver.
 
-        # These events are used to record the time of the previous batch.
-        # We need two set of the start-end events to record the time through
-        # a ping-pong way so that it works with overlap scheduler.
-        start_event_1 = None
-        end_event_1 = torch.cuda.Event(enable_timing=True)
-        start_event_2 = None
-        end_event_2 = torch.cuda.Event(enable_timing=True)
-        prev_device_step_time = None
+        Forwards to ``PyExecutorProfileManager.profile_step``; see
+        ``profiling.py`` for the full state machine. Kept as a method
+        on ``PyExecutor`` so the executor loop's ``with self._profiler()``
+        call site is unchanged.
+        """
+        with self._profile_manager.profile_step() as step:
+            yield step
 
-        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
-        if torch_trace_path is not None:
-            # Append the rank so each rank writes to its own file. Without
-            # this, TP/PP/DP > 1 runs have every rank calling
-            # torch_profiler.export_chrome_trace() on the same path
-            # concurrently, producing interleaved output that fails to
-            # parse in Chrome tracing / Perfetto.
-            trace_base, trace_ext = os.path.splitext(torch_trace_path)
-            torch_trace_path = f"{trace_base}-rank-{self.global_rank}{trace_ext}"
-        profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
-                                            None)
-        enable_torch_trace = bool(torch_trace_path and profile_start_stop)
-        if torch_trace_path and profile_start_stop is None:
-            logger.warning(
-                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
-                "needs to be set to enable the torch trace. Example to profile "
-                f"iteration 10-20: export {PROFILE_START_STOP_ENV_VAR_NAME}=10-20"
-            )
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start iteration-scoped profiling.
 
-        if enable_torch_trace:
-            activities = [
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-                torch.profiler.ProfilerActivity.XPU,
-            ]
-            torch_profiler = torch.profiler.profile(activities=activities,
-                                                    record_shapes=True,
-                                                    with_modules=True)
+        Mirrors the functionality of the ``TLLM_PROFILE_START_STOP`` /
+        ``TLLM_TORCH_PROFILE_TRACE`` environment variables but is
+        triggerable at runtime (e.g. via ``trtllm-serve``'s
+        ``/start_profile`` HTTP endpoint).
 
-        log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
-        if log_ranks_str.strip().lower() == "all":
-            log_all_ranks = True
-            log_ranks = set()
-        else:
-            log_all_ranks = False
-            log_ranks = {int(r) for r in log_ranks_str.split(",")}
+        Args:
+            output_dir: Directory where chrome traces are written. If
+                ``None``, falls back to the ``TLLM_TORCH_PROFILER_DIR``
+                environment variable and finally to ``/tmp``.
+            num_steps: Number of iterations to profile. If ``None``,
+                profiling runs until ``stop_profile`` is called.
+            start_step: Additional iterations to skip before profiling
+                starts (relative to the current iteration counter).
+            activities: Subset of ``["CPU", "GPU", "CUDA_PROFILER"]``.
 
-        calibrator = get_calibrator()
+        See ``PyExecutorProfileManager.start_profile`` for the full
+        state-machine contract.
+        """
+        return self._profile_manager.start_profile(
+            output_dir=output_dir,
+            num_steps=num_steps,
+            start_step=start_step,
+            activities=activities,
+        )
 
-        def profile_step():
-            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
-            calibrator.post_step(it)
-            if (self.iter_counter in self.profile_stop_iters
-                    and not self.is_warmup):
-                assert enabled, "Inconsistent CUDA profiling state"
-                if enable_torch_trace:
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(
-                        f"Profiling stopped at iteration {self.iter_counter}, "
-                        f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
-                calibrator.stop()
-                enabled = False
+    def stop_profile(self) -> None:
+        """Schedule the in-progress runtime profiling to stop on the
+        next executor iteration.
 
-            # Capture per-loop timing whenever stats or the iter log are
-            # enabled. The reading of the OTHER parity's event pair (the
-            # ping-pong) is what keeps synchronize() from blocking the GPU
-            # — the events being read have already passed by the time we
-            # read them. Stashing on self lets the /metrics serializer pick
-            # up the values without going through the log line.
-            should_capture_timing = start_time is not None and (
-                self.print_log or self.enable_iter_perf_stats)
-            if should_capture_timing:
-                end_time = time.time()
-                if it % 2 == 0:
-                    end_event_1.record()
-                    if start_event_2 is not None:
-                        end_event_2.synchronize()
-                        prev_device_step_time = start_event_2.elapsed_time(
-                            end_event_2)
-                else:
-                    end_event_2.record()
-                    if start_event_1 is not None:
-                        end_event_1.synchronize()
-                        prev_device_step_time = start_event_1.elapsed_time(
-                            end_event_1)
+        See ``PyExecutorProfileManager.stop_profile`` for details.
+        """
+        return self._profile_manager.stop_profile()
 
-                host_step_time = (end_time - start_time) * 1000  # milliseconds
-                self._latest_host_step_time_ms = host_step_time
-                self._latest_prev_device_step_time_ms = prev_device_step_time
+    def _apply_profile_start_config(self, config: Dict) -> None:
+        """Apply a broadcasted profile-start config on this rank.
 
-                if self.print_log and (log_all_ranks
-                                       or self.dist.rank in log_ranks):
-                    if prev_device_step_time is None:
-                        prev_device_step_time_str = "N/A"  # Handle first iteration
-                    else:
-                        prev_device_step_time_str = f"{prev_device_step_time}ms"
-                    kv_util_str = "N/A"
-                    if self.kv_cache_manager is not None:
-                        kv_stats = self.kv_cache_manager.get_kv_cache_stats()
-                        if kv_stats.max_num_blocks > 0:
-                            kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
-                    formatted_timestamp = datetime.datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S")
-                    logger.info(
-                        f"iter = {self.iter_counter}, "
-                        f"global_rank = {self.global_rank}, "
-                        f"rank = {self.dist.rank}, "
-                        f"num_scheduled_requests = {self.num_scheduled_requests}, "
-                        f"kv_cache_util = {kv_util_str}, "
-                        f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
-                        f"{self.num_fetch_requests}, "
-                        f"host_step_time = {host_step_time}ms, "
-                        f"prev_device_step_time = {prev_device_step_time_str}, "
-                        f"timestamp = {formatted_timestamp}, "
-                        f"states = {self.model_engine.iter_states}")
+        Forwards to ``PyExecutorProfileManager.apply_start_config``.
+        Kept on ``PyExecutor`` so ``_handle_special_queue_items`` and
+        unit tests that patch this name continue to work unchanged.
+        """
+        return self._profile_manager.apply_start_config(config)
 
-            it += 1
+    def _apply_profile_stop_config(self) -> None:
+        """Apply a broadcasted profile-stop on this rank.
 
-            if (self.iter_counter in self.profile_start_iters
-                    and not self.is_warmup):
-                assert not enabled, "Inconsistent CUDA profiling state"
-                calibrator.start()
-                torch.cuda.cudart().cudaProfilerStart()
-                if enable_torch_trace:
-                    torch_profiler.start()
-                logger.info(
-                    f"Profiling started at iteration {self.iter_counter}.")
-                enabled = True
+        Forwards to ``PyExecutorProfileManager.apply_stop_config``.
+        """
+        return self._profile_manager.apply_stop_config()
 
-            # Notify host line profiler of iteration for iteration-aware profiling
-            host_profiler = get_global_profiler()
-            if host_profiler is not None:
-                host_profiler.notify_iteration(self.iter_counter)
-
-            calibrator.pre_step(it)
-            start_time = time.time()
-            if it % 2 == 0:
-                if start_event_1 is None:
-                    start_event_1 = torch.cuda.Event(enable_timing=True)
-                start_event_1.record()
-            else:
-                if start_event_2 is None:
-                    start_event_2 = torch.cuda.Event(enable_timing=True)
-                start_event_2.record()
-
-        try:
-            yield profile_step
-        finally:
-            if enabled:
-                # Stop on early exit / exception
-                if enable_torch_trace:
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(f"Profiling stopped at iteration {it}, "
-                                f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
-                calibrator.stop()
+    # _wake_executor_loop_for_profile was previously used to enqueue a
+    # sentinel cancel-request to unblock the idle executor loop.  It is
+    # no longer needed: the profile-start / profile-stop broadcast
+    # items (enqueued by start_profile/stop_profile on rank 0) land on
+    # the same queue and already wake the fetch. The broadcast of those
+    # items via RequestBroadcaster also synchronizes all ranks, so we
+    # don't need a separate wake on non-zero ranks.
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
@@ -2169,17 +2086,23 @@ class PyExecutor:
                         gpu_forward_events_from_perf_pool = True
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
+                    # Per-iteration step[...] scope. Appears in Kineto traces
+                    # under the user_annotation / gpu_user_annotation
+                    # categories so trtllm-serve /start_profile output exposes
+                    # per-iteration boundaries to downstream trace viewers.
+                    pp_step_label = self._build_step_scope_label(
+                        scheduled_batch)
                     if not self.dist.is_last_pp_rank:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
-                        ):
+                        ), torch.profiler.record_function(pp_step_label):
                             sample_state = self._forward_step_inter_pp(
                                 scheduled_batch, gpu_forward_start,
                                 gpu_forward_end)
                     else:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
-                        ):
+                        ), torch.profiler.record_function(pp_step_label):
                             # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                             if self.guided_decoder is not None and self.kv_cache_transceiver:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -2896,6 +2819,33 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _build_step_scope_label(self,
+                                scheduled_batch: ScheduledRequests) -> str:
+        """Format a per-iteration scope label for ``torch.profiler``.
+
+        The label uses a ``step[...]`` convention that exposes per-iteration
+        boundaries in chrome traces and can be parsed programmatically. The
+        label appears in the Kineto ``user_annotation`` /
+        ``gpu_user_annotation`` lanes.
+
+        Format:
+          - ``step[DECODE bs=N]`` when every scheduled request is in
+            generation phase (no context requests this iteration).
+          - ``step[EXTEND bs=N toks=M]`` when any context requests are
+            scheduled. ``bs`` is the number of extend (context) requests
+            and ``toks`` is the total number of context tokens being
+            processed this iteration (sum of each request's
+            ``context_chunk_size``).
+        """
+        num_ctx = scheduled_batch.num_context_requests
+        num_gen = scheduled_batch.num_generation_requests
+        if num_ctx == 0:
+            return f"step[DECODE bs={num_gen}]"
+        total_toks = 0
+        for req in scheduled_batch.context_requests:
+            total_toks += int(getattr(req, "context_chunk_size", 0) or 0)
+        return f"step[EXTEND bs={num_ctx} toks={total_toks}]"
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -3019,21 +2969,29 @@ class PyExecutor:
                         )
                         gpu_forward_events_from_perf_pool = True
 
-                    with self.perf_manager.record_perf_events(
-                            gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        if self.dwdp_manager is not None:
-                            self.dwdp_manager.prefetch_first_layers()
-                        batch_outputs = self._forward_step(scheduled_batch)
+                    # Emit a step[...] user_annotation scope around the
+                    # forward+sample region so Kineto traces from
+                    # trtllm-serve /start_profile expose per-iteration
+                    # boundaries with a consistent category and label
+                    # format.
+                    with torch.profiler.record_function(
+                            self._build_step_scope_label(scheduled_batch)):
+                        with self.perf_manager.record_perf_events(
+                                gpu_forward_start,
+                                gpu_forward_end) as fwd_timing:
+                            if self.dwdp_manager is not None:
+                                self.dwdp_manager.prefetch_first_layers()
+                            batch_outputs = self._forward_step(scheduled_batch)
 
-                    guided_decoder_failed_requests = None
-                    if self.guided_decoder is not None:
-                        guided_decoder_failed_requests = self.guided_decoder.execute(
-                            batch_outputs['logits'])
+                        guided_decoder_failed_requests = None
+                        if self.guided_decoder is not None:
+                            guided_decoder_failed_requests = self.guided_decoder.execute(
+                                batch_outputs['logits'])
 
-                    with self.perf_manager.record_perf_events(
-                            None, gpu_sample_end) as sample_timing:
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
+                        with self.perf_manager.record_perf_events(
+                                None, gpu_sample_end) as sample_timing:
+                            sample_state = self._sample_async(
+                                scheduled_batch, batch_outputs)
 
                     if self.perf_manager.enabled:
                         self.perf_manager.save_timing_to_requests(
@@ -3326,6 +3284,12 @@ class PyExecutor:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
+                # Per-iteration scope label for torch.profiler. Reused to
+                # wrap forward and sample calls below so the resulting
+                # chrome trace has ``step[...]`` user_annotation scopes
+                # marking each iteration.
+                step_scope_label = self._build_step_scope_label(scheduled_batch)
+
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
 
@@ -3437,9 +3401,10 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        batch_outputs = self._forward_step(
-                            scheduled_batch, previous_tensors_device,
-                            num_accepted_tokens_device)
+                        with torch.profiler.record_function(step_scope_label):
+                            batch_outputs = self._forward_step(
+                                scheduled_batch, previous_tensors_device,
+                                num_accepted_tokens_device)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -3475,14 +3440,15 @@ class PyExecutor:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
-                        if self.guided_decoder is not None:
-                            # add_batch must be called again to have updated new tokens.
-                            self.guided_decoder.add_batch(scheduled_batch)
-                            guided_decoder_failed_requests = self.guided_decoder.execute(
-                                batch_outputs['logits'])
+                        with torch.profiler.record_function(step_scope_label):
+                            if self.guided_decoder is not None:
+                                # add_batch must be called again to have updated new tokens.
+                                self.guided_decoder.add_batch(scheduled_batch)
+                                guided_decoder_failed_requests = self.guided_decoder.execute(
+                                    batch_outputs['logits'])
 
-                        sample_state = self._sample_async(
-                            scheduled_batch, batch_outputs)
+                            sample_state = self._sample_async(
+                                scheduled_batch, batch_outputs)
 
                     assert sample_state is not None, "Sampling failed"
 
@@ -3876,6 +3842,14 @@ class PyExecutor:
                 if self.dist.rank == 0:
                     self.request_accumulated.extend(new_requests[idx + 1:])
                 break
+            elif req_item.is_profile_start_request:
+                # Broadcasted from rank 0 via RequestBroadcaster; apply
+                # on this rank so every PyExecutor has the same
+                # profile_start_iters / pending markers.  Idempotent on
+                # rank 0 (start_profile already applied locally).
+                self._apply_profile_start_config(req_item.profile_config or {})
+            elif req_item.is_profile_stop_request:
+                self._apply_profile_stop_config()
             else:
                 accepted_new_requests.append(req_item)
 

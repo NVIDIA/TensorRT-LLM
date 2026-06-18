@@ -17,8 +17,10 @@ The server also supports the following endpoints:
 - ``/health``
 - ``/metrics``
 - ``/version``
+- ``/start_profile`` (prototype)
+- ``/stop_profile`` (prototype)
 
-The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
+The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below.
 
 Starting a Server
 -----------------
@@ -311,6 +313,73 @@ Example output:
             ...
         }
     ]
+
+.. _runtime-profiling-endpoints:
+
+Runtime Profiling Endpoints
+---------------------------
+
+.. note::
+
+   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). They are no-ops on the TensorRT backend. APIs, parameters, and behaviour may change in future releases.
+
+The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting ``trtllm-serve`` and without setting ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``. Under TP/PP > 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a ``rank-<N>`` suffix in the filename) and all ranks profile the same iterations in lockstep.
+
+POST /start_profile
+~~~~~~~~~~~~~~~~~~~
+
+Start a profile window. All fields in the JSON body are optional.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 15 50
+
+   * - Field
+     - Type
+     - Description
+   * - ``output_dir``
+     - string
+     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise ``/tmp``. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
+   * - ``num_steps``
+     - int
+     - Number of engine iterations to capture. When set, the engine stops the window automatically and you do not need to call ``/stop_profile``. When omitted, profiling runs until ``/stop_profile`` is called.
+   * - ``start_step``
+     - int (default ``0``)
+     - Iterations to skip after the call before profiling starts. Use to exclude warmup-like transients from the capture.
+   * - ``activities``
+     - list of string
+     - Subset of ``["CPU", "GPU", "CUDA_PROFILER"]`` (default ``["CPU", "GPU"]``). When ``["CUDA_PROFILER"]`` is specified, ``torch.profiler`` is not started and only ``cudaProfilerStart`` / ``cudaProfilerStop`` are called — this composes cleanly with ``nsys profile -c cudaProfilerApi``.
+
+Response: ``200`` with ``{"message": "Profiling started"}`` on success. ``409`` with ``{"success": false, "message": ...}`` if a profile window is already active or pending (the backend does not silently queue a second window).
+
+POST /stop_profile
+~~~~~~~~~~~~~~~~~~
+
+Stop an in-progress profile window and flush the chrome trace to disk. Takes no body. The call blocks until ``export_chrome_trace()`` has run on the backend thread, so by the time the handler returns the file is on disk. Call this only if ``/start_profile`` was invoked without ``num_steps``; otherwise the window self-terminates.
+
+Example
+~~~~~~~
+
+.. code-block:: bash
+
+   # Start a 30-iteration profile window into /tmp/traces.
+   curl -s -X POST http://127.0.0.1:8000/start_profile \
+       -H "Content-Type: application/json" \
+       -d '{"output_dir": "/tmp/traces", "num_steps": 30}'
+
+   # ... drive load via /v1/completions or /v1/chat/completions ...
+
+   # If you started the window without num_steps, stop it:
+   curl -s -X POST http://127.0.0.1:8000/stop_profile
+
+   # Inspect the resulting chrome traces.
+   ls /tmp/traces/
+   # trtllm-trace-1778480665-7993d824-rank-0.json
+   # trtllm-trace-1778480665-7993d824-rank-1.json   (TP=2)
+
+Open the trace files in `ui.perfetto.dev <https://ui.perfetto.dev/>`_ or ``chrome://tracing``. Each captured iteration is wrapped in a ``step[EXTEND bs=N toks=M]`` or ``step[DECODE bs=N]`` user-annotation scope.
+
+For a full benchmarking + profiling workflow (including multi-cycle capture under steady-state load), see :doc:`run-benchmark-with-trtllm-serve`.
 
 .. _configuring-with-yaml-files:
 

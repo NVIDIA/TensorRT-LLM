@@ -17,6 +17,7 @@ import concurrent.futures
 import json
 import os
 import threading
+import time
 import weakref
 from queue import Empty
 from typing import Dict, List, Optional, Union
@@ -36,7 +37,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+                      StopProfileRequest)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
@@ -165,6 +167,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             name="proxy_error_monitor")
         self._error_monitor_thread.start()
 
+        # Single-thread executor that owns *all* profile-control IPC traffic
+        # (``request_queue.put`` for StartProfile/StopProfile and
+        # ``profile_ack_queue.get`` for the matching ack). Pinning these
+        # ZMQ socket operations to one owning thread is required because:
+        #
+        #   * pyzmq sockets are not thread-safe; concurrent access from
+        #     multiple threads — even one writer + one reader — is undefined
+        #     behavior in libzmq.
+        #   * The HTTP handler reaches us through ``asyncio.to_thread``,
+        #     which does not pin to the same worker thread between calls,
+        #     so back-to-back ``/start_profile`` and ``/stop_profile``
+        #     could otherwise touch ``profile_ack_queue`` from two
+        #     different threads.
+        #
+        # The HTTP handler still blocks on a Future returned by this
+        # executor, so the synchronous "chrome trace is on disk by the
+        # time /stop_profile returns 200" contract is preserved without
+        # any ZMQ socket op leaking into the FastAPI thread pool.
+        #
+        # NOTE: ``request_queue`` is also written from ``submit()`` /
+        # ``abort_request()`` on user-caller threads — that pre-existing
+        # cross-thread access is out of scope for this change. The fix
+        # here narrowly targets the new profile-control path.
+        self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="proxy_profile_control")
+
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
         # we have to notify workers to exit before MPI starts to wait them.
@@ -289,6 +317,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._resource_governor_queue = IpcQueue(
             is_server=True, name="proxy_resource_governor_queue"
         ) if self._enable_resource_governor else None
+        # Worker -> proxy ack channel for synchronous control requests
+        # (start_profile / stop_profile). Worker pushes a tuple
+        # ``(kind, error_msg)`` after it has finished processing the
+        # corresponding request; ``error_msg`` is non-None when
+        # ``PyExecutor`` rejected the call (e.g. RequestError "already
+        # in progress") so the proxy can re-raise. PAIR socket is fine
+        # because the worker leader is the sole producer.
+        self.profile_ack_queue = IpcQueue(is_server=True,
+                                          name="proxy_profile_ack_queue")
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
@@ -296,6 +333,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             result_queue_addr=self.result_queue.address,
             resource_governor_queue_addr=self._resource_governor_queue.address
             if self._resource_governor_queue is not None else None,
+            profile_ack_queue_addr=self.profile_ack_queue.address,
         )
 
     @property
@@ -312,6 +350,123 @@ class GenerationExecutorProxy(GenerationExecutor):
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
+
+    # Per-call timeouts for the synchronous worker round-trip. The stop
+    # path can take up to 30s because PyExecutor.stop_profile itself
+    # polls ``_profile_enabled`` for that long while the executor loop
+    # flushes the chrome trace; we add a small safety margin.
+    _START_PROFILE_ACK_TIMEOUT_S = 60.0
+    _STOP_PROFILE_ACK_TIMEOUT_S = 35.0
+
+    def _wait_profile_ack(self, expected_kind: str, timeout: float) -> None:
+        """Block on the worker's ack queue for a profile control request.
+
+        Waits for the worker to push an ack on ``profile_ack_queue``
+        matching ``expected_kind`` ("start" or "stop"), or until the
+        cumulative ``timeout`` elapses across any number of stale-ack
+        consumptions.
+
+        If a stale or out-of-order ack is read (e.g. the previous call
+        timed out and its ack arrived after we returned), we discard it
+        and keep waiting for the expected kind. Returning on a mismatch
+        would break the synchronous contract: the next call could return
+        before its own request has been processed, making the documented
+        guarantee ("trace is on disk by the time /stop_profile returns
+        200") unsound under back-to-back invocations.
+
+        If the worker reports a rejection (non-empty error message), we
+        re-raise as ``RuntimeError`` so the HTTP layer can map "already
+        in progress" / "pending" to 409. On true timeout we log a warning
+        and return — the chrome trace may still be flushing on the
+        backend, but blocking the FastAPI event loop indefinitely is
+        worse than a possibly-stale 200.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"{expected_kind}_profile: timed out waiting for "
+                    f"worker ack after {timeout:.1f}s. The chrome trace "
+                    "may not be on disk yet.")
+                return
+            try:
+                ack = self.profile_ack_queue.get(timeout=remaining)
+            except Empty:
+                logger.warning(
+                    f"{expected_kind}_profile: timed out waiting for "
+                    f"worker ack after {timeout:.1f}s. The chrome trace "
+                    "may not be on disk yet.")
+                return
+            kind, error_msg = ack
+            if kind != expected_kind:
+                # Out-of-order ack from a previous call; discard and keep
+                # waiting for the ack that belongs to this request.
+                logger.warning(
+                    f"profile ack kind mismatch (expected "
+                    f"{expected_kind!r}, got {kind!r}); discarding stale "
+                    "ack and continuing to wait.")
+                continue
+            if error_msg:
+                raise RuntimeError(error_msg)
+            return
+
+    def _profile_control_call(self, kind: str, request, timeout: float) -> None:
+        """Worker-side body of ``start_profile`` / ``stop_profile``.
+
+        Runs on ``_profile_control_executor`` so all profile-related
+        ZMQ socket ops (``request_queue.put`` and ``profile_ack_queue.get``
+        via ``_wait_profile_ack``) happen on a single owning thread.
+        """
+        self.request_queue.put(request)
+        self._wait_profile_ack(kind, timeout)
+
+    def start_profile(self,
+                      output_dir=None,
+                      num_steps=None,
+                      start_step: int = 0,
+                      activities=None) -> None:
+        """Forward runtime profiling start to the IPC worker process.
+
+        Blocks until the worker has processed the request, then
+        raises ``RuntimeError`` if ``PyExecutor`` rejected the start
+        (e.g. a profile window is already active or pending) so the
+        HTTP /start_profile endpoint can return 409.
+
+        The actual ZMQ traffic (``request_queue.put`` +
+        ``profile_ack_queue.get``) is dispatched onto
+        ``_profile_control_executor`` — a single-thread executor — so the
+        FastAPI thread-pool worker that called us never touches the
+        ZMQ sockets directly. ``Future.result()`` re-raises any
+        ``RuntimeError`` from ``_wait_profile_ack`` so the HTTP layer
+        still sees worker rejections.
+        """
+        request = StartProfileRequest(output_dir=output_dir,
+                                      num_steps=num_steps,
+                                      start_step=start_step,
+                                      activities=activities)
+        future = self._profile_control_executor.submit(
+            self._profile_control_call, "start", request,
+            self._START_PROFILE_ACK_TIMEOUT_S)
+        future.result()
+
+    def stop_profile(self) -> None:
+        """Forward runtime profiling stop to the IPC worker process.
+
+        Blocks until the worker has finished flushing the chrome
+        trace. This makes the IPC-proxy path match the in-process and
+        RPC-proxy paths: by the time this method returns the trace
+        file is on disk, so HTTP callers can reliably read it
+        immediately after /stop_profile returns 200.
+
+        Like ``start_profile``, the actual ZMQ traffic is dispatched
+        onto ``_profile_control_executor`` so the calling thread never
+        touches the ZMQ sockets.
+        """
+        future = self._profile_control_executor.submit(
+            self._profile_control_call, "stop", StopProfileRequest(),
+            self._STOP_PROFILE_ACK_TIMEOUT_S)
+        future.result()
 
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
@@ -505,6 +660,16 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread.stop()
             self.dispatch_result_thread.join()
 
+        # Drain the profile-control executor before closing its sockets.
+        # ``shutdown(wait=True)`` blocks until any in-flight
+        # start_profile/stop_profile call has finished its
+        # ``_wait_profile_ack`` round-trip on the owner thread, so we
+        # don't tear ``profile_ack_queue`` out from under it.
+        if hasattr(self, '_profile_control_executor'
+                   ) and self._profile_control_executor is not None:
+            self._profile_control_executor.shutdown(wait=True)
+            self._profile_control_executor = None
+
         # step3: finish all remaining work
 
         # close the RPC client
@@ -518,6 +683,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.result_queue.close()
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
+        # ``profile_ack_queue`` is only torn down here because the
+        # owning ``_profile_control_executor`` was just drained above.
+        self.profile_ack_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
@@ -529,10 +697,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult
-            which can be waited.
-            Forwards the request to the workers through the request queue.
+        """Low-level API to the executor.
+
+        Returns a "future" GenerationResult which can be waited.
+        Forwards the request to the workers through the request queue.
         """
 
         self._start_dispatch_threads()
