@@ -1,10 +1,14 @@
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (VanillaAttention,
                                                    VanillaAttentionMetadata)
+from tensorrt_llm._torch.attention_backend.interface import \
+    PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -12,6 +16,56 @@ from tensorrt_llm.mapping import Mapping
 
 
 class TestVanillaAttention(unittest.TestCase):
+
+    def test_sdpa_fallback_uses_metadata_cross_flag_for_causal_mask(self):
+        vanilla_attn = VanillaAttention(layer_idx=0,
+                                        num_heads=1,
+                                        head_dim=1,
+                                        num_kv_heads=1)
+        q = torch.ones(2, 1, 1)
+        k = torch.ones(2, 1, 1)
+        v = torch.ones(2, 1, 1)
+        seqlens = torch.tensor([2], dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+        observed_is_causal = []
+
+        def fake_sdpa(q_s, k_s, v_s, *, is_causal, scale):
+            del k_s, v_s, scale
+            observed_is_causal.append(is_causal)
+            return torch.zeros_like(q_s)
+
+        with patch.object(F, "scaled_dot_product_attention", fake_sdpa):
+            vanilla_attn._no_kv_cache_sdpa_fallback(
+                q,
+                k,
+                v,
+                num_heads=1,
+                num_kv_heads=1,
+                head_dim=1,
+                seqlens_q=seqlens,
+                cu_seqlens_q=cu_seqlens,
+                max_seqlen_q=2,
+                attention_mask=PredefinedAttentionMask.CAUSAL,
+                seqlens_kv=seqlens.clone(),
+                cu_seqlens_k=cu_seqlens.clone(),
+                max_seqlen_k=2,
+                is_cross=True,
+            )
+            vanilla_attn._no_kv_cache_sdpa_fallback(
+                q,
+                k,
+                v,
+                num_heads=1,
+                num_kv_heads=1,
+                head_dim=1,
+                seqlens_q=seqlens,
+                cu_seqlens_q=cu_seqlens,
+                max_seqlen_q=2,
+                attention_mask=PredefinedAttentionMask.CAUSAL,
+                is_cross=False,
+            )
+
+        self.assertEqual(observed_is_causal, [False, True])
 
     def test_vanilla_attention(self):
         num_heads = 32

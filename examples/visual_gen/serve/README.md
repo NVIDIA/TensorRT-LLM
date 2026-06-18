@@ -29,21 +29,21 @@ Before running these examples, ensure you have:
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash
-   trtllm-serve <path to your model> --extra_visual_gen_options <path to config yaml>
+   trtllm-serve <path to your model> --visual_gen_args <path to config yaml>
    ```
 
    e.g.
 
    ```bash
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml
-   trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --extra_visual_gen_options ./configs/wan22.yml
-   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
-   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
-   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
-   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --extra_visual_gen_options ./configs/qwen_image.yml
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml
+   trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --visual_gen_args ./configs/wan22.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --visual_gen_args ./configs/flux1.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --visual_gen_args ./configs/flux2.yml
+   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --visual_gen_args ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --visual_gen_args ./configs/qwen_image.yml
 
    # Run server on background:
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml > /tmp/serve.log 2>&1 &
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml > /tmp/serve.log 2>&1 &
 
    ## Check if the server is setup
    tail -f /tmp/serve.log
