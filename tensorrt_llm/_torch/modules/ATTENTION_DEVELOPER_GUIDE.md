@@ -28,6 +28,8 @@ for deprecation.
 | TP | Tensor Parallelism |
 | CP | Context Parallelism |
 | KV | Key/Value |
+| Chunked prefill | Runtime feature that splits context processing into chunks while preserving full causal semantics; in TRT-LLM this is the same feature historically called chunked context |
+| Chunked attention | Attention-mask mode that restricts tokens to attend only within their chunk |
 
 ## How to Read the Stack
 
@@ -229,11 +231,42 @@ update pattern.
 
 When KV cache is enabled, all current `_torch` backends use paged KV cache.
 `VanillaAttention` also has a separate no-KV-cache path for models that do not
-use cache. `KVCacheManager.get_buffers()` exposes a per-layer view of the
-primary pool:
+use cache. There are two main cache-manager implementations in the current
+stack:
 
-- For standard dense attention, `kv_factor = 2` (separate K and V planes).
-- For MLA-style cache, `kv_factor = 1` (one latent-cache tensor per token).
+- `KVCacheManager`: backed by `KVCacheManagerCpp`
+- `KVCacheManagerV2`: backed by the runtime v2 cache stack
+
+For new-model evaluation, start with `KVCacheManagerV2` unless there is a clear
+reason to stay on `KVCacheManager`.
+
+At a high level, the cache manager owns storage, not attention semantics. It
+manages pages, pools, capacity, reuse, and request-to-page mapping. Treat
+`get_buffers()` as one possible Python-side view of that storage, not as the
+universal cache contract.
+
+#### 3.2.2 Runtime chain: `KVCacheManager` vs `KVCacheManagerV2`
+
+For attention work, read the full runtime chain:
+
+- `KVCacheManager` path:
+  `scheduler -> KVCacheManager / KVCacheManagerCpp -> model_engine -> attn metadata -> Attention -> backend`
+- V2 path:
+  `scheduler_v2 -> KVCacheManagerV2 -> model_engine -> attn metadata -> Attention -> backend`
+
+The two paths differ in runtime control flow, but the same rule applies to
+both: do not judge a cache question from the manager API or the backend kernel
+alone. Trace the whole chain.
+
+#### 3.2.3 `TRTLLM` backend + cache-manager interaction
+
+For dense attention work, start with the `TRTLLM` backend.
+
+On the default dense `TRTLLM` path, the backend consumes paged-KV runtime
+descriptors rather than a single high-level K/V tensor view. Treat the cache
+manager as storage owner and the backend as the consumer of that storage.
+
+#### 3.2.4 Backend cache consumption patterns
 
 The main differences across backends:
 
@@ -243,7 +276,47 @@ The main differences across backends:
 | `VANILLA` | Python-side | Python-side slicing |
 | `FLASHINFER` | Python-side (explicit append) | Page-table metadata |
 
-#### 3.2.2 `TRTLLM` internal `trtllm_gen` path
+This distinction matters for layout questions: something that works on the
+default `TRTLLM` path may still fail on Python-side paths that trust the
+reshaped tensor returned by `get_buffers()`.
+
+#### 3.2.5 KV-page storage is not the same as attention semantics
+
+For heterogeneous attention, separate two questions:
+
+- how the cache manager stores KV pages
+- how the attention/backend path interprets and uses them
+
+Those are related but not the same. A storage layout may admit more than one
+interpretation, and a backend may only support some of them. Final claims still
+need validation on append/read paths, chunked prefill, and quantized layouts.
+
+#### 3.2.6 Chunked prefill is not chunked attention
+
+This guide uses **chunked prefill** for the runtime feature historically called
+`chunked context` in TRT-LLM.
+
+These two ideas are different:
+
+- **Chunked prefill** splits context execution into scheduler/runtime chunks,
+  stores earlier chunks in paged KV cache, and should preserve the same causal
+  semantics as one-shot prefill.
+- **Chunked attention** changes the mask itself so tokens only attend within
+  their chunk.
+
+Do not use one as evidence for the other.
+
+#### 3.2.7 Chunked-prefill contract
+
+To claim that an attention path supports chunked prefill, verify that the
+scheduler, cache manager, metadata path, context dispatcher, and backend all
+agree on the same semantics as full prefill. On the default dense `TRTLLM`
+path, earlier chunks must land in paged KV, later chunks must reuse the same
+paged-KV runtime descriptors, and context execution usually goes through
+paged-context FMHA. MLA chunked prefill is a separate path and should be
+checked independently.
+
+#### 3.2.8 `TRTLLM` internal `trtllm_gen` path
 
 `trtllm_gen.py` integrates trtllm-gen kernels from FlashInfer into the
 `TRTLLM` backend. It is not a separate backend. It is an internal fast path
@@ -251,18 +324,18 @@ disabled by default (`TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION`). It bridges the
 TRTLLM block-offset format into the page-table shape expected by those kernels.
 If it does not apply, `TrtllmAttention` stays on its regular runtime path.
 
-#### 3.2.3 MLA cached-context semantics
+#### 3.2.9 MLA cached-context semantics
 
 MLA cached state is not regular dense K and V. The paged cache stores
 latent-cache state rather than separate K and V planes. Backend ops handle
 appending, RoPE application, and loading cached state for attention use.
 
 MLA fit cannot be judged from attention math alone. The module and backend must
-agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
-context behavior. Read the MLA section of `attention.py` and the relevant
+agree on latent-cache layout, paged-KV read/write paths, and cached and
+chunked-prefill behavior. Read the MLA section of `attention.py` and the relevant
 backend code for the current implementation details.
 
-#### 3.2.4 Sparse side-cache semantics
+#### 3.2.10 Sparse side-cache semantics
 
 Sparse backends may add side caches beyond the main KV cache. Some sparse
 algorithms keep the standard cache manager; others replace it with a
@@ -298,7 +371,7 @@ as the current blocker.
 
 - **Backend layer**
   Which backend family can run the source behavior, and whether it needs fused
-  RoPE, fused QKV, MLA, sparse, or chunked-context support. Do not use backend
+  RoPE, fused QKV, MLA, sparse, or chunked-prefill support. Do not use backend
   name alone as proof of support.
 
 - **Positional embedding and masking**
@@ -347,9 +420,9 @@ Working rules:
 
 - Test lite and non-lite MLA separately when changing projection logic.
 - Test eager and compiled paths separately when changing DSA MLA dispatch.
-- Test fresh context, cached context, chunked context, and generation
+- Test fresh context, cached context, chunked prefill, and generation
   separately.
-- Any dispatch change touching `forward_context()` needs chunked-context tests.
+- Any dispatch change touching `forward_context()` needs chunked-prefill tests.
 
 Key test files:
 
@@ -364,5 +437,5 @@ Key test files:
 - Do not treat attention work as "math only".
 - Do not treat backend choice as independent from metadata choice.
 - Do not treat KV-cache semantics as a small implementation detail.
-- Do not bypass MLA's context dispatcher for chunked or cached-KV cases.
+- Do not bypass MLA's context dispatcher for chunked-prefill or cached-KV cases.
 - Do not duplicate RoPE handling before checking the fused path.
