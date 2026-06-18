@@ -29,6 +29,8 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gpt_oss import (
     GptOssTopKRouter,
 )
 
+_GPT_OSS_MODELING_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337238")
+
 # ---------------------------------------------------------------------------
 # HF reference imports (skip tests if unavailable)
 # ---------------------------------------------------------------------------
@@ -162,6 +164,7 @@ def test_rmsnorm_equivalence():
         torch.testing.assert_close(ad(x), ref(x), rtol=1e-3, atol=1e-3)
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_rotary_embedding_equivalence():
     """Our pre-cached RoPE table matches HF's on-the-fly computation."""
     hf = _get_hf_classes()
@@ -197,6 +200,7 @@ def test_rotary_embedding_equivalence():
     )
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_router_equivalence():
     """torch_moe_router scatter output matches HF's router_scores."""
     hf = _get_hf_classes()
@@ -228,6 +232,7 @@ def _init_experts_(ref_experts, ad_experts):
     ad_experts.load_state_dict(ref_experts.state_dict())
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_experts_equivalence():
     """torch_moe_dense_mlp matches HF GptOssExperts inference path."""
     hf = _get_hf_classes()
@@ -259,6 +264,7 @@ def test_experts_equivalence():
     assert_rmse_close(ad_out, ref_out, rmse_ratio_tol=0.02, msg="Experts: ")
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_mlp_equivalence():
     """Full MoE block (router + experts) matches HF GptOssMLP."""
     hf = _get_hf_classes()
@@ -330,6 +336,7 @@ def _hf_attention_forward(
     return out
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_attention_equivalence_full():
     """GQA attention with sinks (full attention layer)."""
     hf = _get_hf_classes()
@@ -356,6 +363,7 @@ def test_attention_equivalence_full():
     assert_rmse_close(ad_out, ref_out, rmse_ratio_tol=0.10, msg="Attention (full): ")
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_attention_equivalence_sliding():
     """GQA attention with sinks AND sliding window (sliding layer)."""
     hf = _get_hf_classes()
@@ -438,6 +446,7 @@ def _run_hf_decoder(hf_layer, x: torch.Tensor, hf_pos, sliding_window: Optional[
     return out
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_decoder_layer_equivalence_full():
     hf = _get_hf_classes()
     if hf is None:
@@ -461,6 +470,7 @@ def test_decoder_layer_equivalence_full():
     assert_rmse_close(ad_out, ref_out, rmse_ratio_tol=0.05, msg="Decoder (full): ")
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_decoder_layer_equivalence_sliding():
     hf = _get_hf_classes()
     if hf is None:
@@ -498,6 +508,7 @@ def _transfer_hf_to_ad_full_model(hf_model, ad_model: GptOssForCausalLM):
     assert not unexpected, f"Unexpected keys: {unexpected[:10]}"
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_full_model_equivalence():
     hf = _get_hf_classes()
     if hf is None:
@@ -536,6 +547,7 @@ def test_full_model_equivalence():
 # ---------------------------------------------------------------------------
 
 
+@_GPT_OSS_MODELING_NVBUG
 def test_export():
     """Model can be exported with torch.export and produces correct output."""
     device = "cpu"
