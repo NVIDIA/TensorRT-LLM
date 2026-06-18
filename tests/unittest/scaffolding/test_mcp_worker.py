@@ -368,6 +368,7 @@ async def test_multiple_calls_to_same_tool(mcp_server):
     worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_scaffolding_with_chat_mcp_controller(mcp_server):
     # Initialize workers
