@@ -171,6 +171,8 @@ EXCLUDE_TEST_FILES = {
     "test_mxfp4_moe_layout.py",
     # Require TRT-LLM distributed ops (trtllm_dist_all_gather)
     "test_gather_logits_before_lm_head.py",
+    # Calls torch.ops.auto_deploy.trtllm_dist_all_reduce directly (not registered standalone)
+    "test_allreduce_residual_rmsnorm_matcher.py",
     # Multimodal processors depend on TensorRT-LLM multimodal request types.
     "test_gemma4_modeling.py",
     "test_qwen3_5_moe.py",
