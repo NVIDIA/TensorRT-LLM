@@ -484,31 +484,40 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
 
-    seq_len_threshold: Optional[int] = Field(
-        default=None,
-        description=
-        "The sequence length threshold for separating short and long sequences."
-    )
-
     def supports_backend(self, backend: str) -> bool:
         """Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
 
+    def to_sparse_params(self, **kwargs):
+        """Lower user-facing config into SparseParams."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement SparseParams lowering.")
+
+    def to_sparse_metadata_params(self, **kwargs):
+        """Lower user-facing config into SparseMetadataParams."""
+        return None
+
+
+class SeqLenAwareSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Sparse attention config with sequence-length dependent behavior."""
+
+    seq_len_threshold: Optional[int] = Field(
+        default=None,
+        description=
+        "The sequence length threshold for separating short and long sequences."
+    )
+
     def get_indices_block_size(self) -> int:
         return 1
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
-        If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
-        If False, capture a single unified CUDA graph for all sequences regardless of length.
-        The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
-        """
+        """Whether to capture separate CUDA graphs for short and long sequences."""
         return False
 
 
-class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
+class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
     algorithm: Literal["rocket"] = Field(default="rocket")
     window_size: Optional[int] = Field(
@@ -532,8 +541,41 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     def get_indices_block_size(self) -> int:
         return self.page_size
 
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.rocket import \
+            RocketKVParams
 
-class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
+        def _value(name: str, default):
+            value = getattr(self, name)
+            return default if value is None else value
+
+        return RocketKVParams(
+            window_size=_value("window_size", 32),
+            kernel_size=_value("kernel_size", 63),
+            topr=_value("topr", 128),
+            topk=_value("topk", 64),
+            prompt_budget=_value("prompt_budget", 2048),
+            page_size=_value("page_size", 4),
+            kt_cache_dtype=_value("kt_cache_dtype", "float8_e5m2"),
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.rocket import \
+            RocketKVMetadataParams
+
+        def _value(name: str, default):
+            value = getattr(self, name)
+            return default if value is None else value
+
+        return RocketKVMetadataParams(
+            prompt_budget=_value("prompt_budget", 2048),
+            window_size=_value("window_size", 32),
+            page_size=_value("page_size", 4),
+            topk=_value("topk", 64),
+        )
+
+
+class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     """Configuration for DeepSeek Sparse Attention."""
     algorithm: Literal["dsa"] = Field(default="dsa")
     index_n_heads: Optional[int] = Field(
@@ -621,6 +663,56 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
 
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+
+        def _value(name: str, default=None):
+            value = getattr(self, name)
+            if value is not None:
+                return value
+            if pretrained_config is not None:
+                return getattr(pretrained_config, name, default)
+            return default
+
+        return DSAParams(
+            index_n_heads=_value("index_n_heads"),
+            index_head_dim=_value("index_head_dim"),
+            index_topk=_value("index_topk"),
+            indexer_max_chunk_size=self.indexer_max_chunk_size,
+            skip_indexer_for_short_seqs=self.skip_indexer_for_short_seqs,
+            use_cute_dsl_topk=self.use_cute_dsl_topk,
+            use_cute_dsl_paged_mqa_logits=self.use_cute_dsl_paged_mqa_logits,
+            q_split_threshold=self.q_split_threshold,
+            indexer_rope_interleave=self.indexer_rope_interleave,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            indexer_k_dtype=self.indexer_k_dtype,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.dsa import \
+            DSAMetadataParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+
+        def _value(name: str, default=None):
+            value = getattr(self, name)
+            if value is not None:
+                return value
+            if pretrained_config is not None:
+                return getattr(pretrained_config, name, default)
+            return default
+
+        return DSAMetadataParams(
+            indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
+            max_sparse_topk=_value("index_topk"),
+            enable_indexer_skip=self.skip_indexer_for_short_seqs,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
+            q_split_threshold=self.q_split_threshold,
+        )
+
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
@@ -634,71 +726,86 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
 
+    @field_validator("target_sparsity")
+    @classmethod
+    def validate_target_sparsity(cls, target_sparsity):
+        values = target_sparsity.values() if isinstance(
+            target_sparsity, dict) else (target_sparsity, )
+        for value in values:
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    "target_sparsity must be in [0, 1] for Skip Softmax Attention."
+                )
+        return target_sparsity
+
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
-    @property
-    def threshold_scale_factor_prefill(self) -> Optional[float]:
-        if isinstance(self.threshold_scale_factor, dict):
-            return self.threshold_scale_factor.get('prefill', None)
-        return self.threshold_scale_factor
+    def to_sparse_params(self, **kwargs):
+        import fnmatch
 
-    @property
-    def threshold_scale_factor_decode(self) -> Optional[float]:
-        if isinstance(self.threshold_scale_factor, dict):
-            return self.threshold_scale_factor.get('decode', None)
-        return self.threshold_scale_factor
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            SkipSoftmaxParams, SkipSoftmaxScheduler,
+            skip_softmax_ignore_from_ckpt_sparse_attention_config,
+            skip_softmax_target_sparsity_from_ckpt_sparse_attention_config)
 
-    @property
-    def target_sparsity_prefill(self) -> Optional[float]:
-        if isinstance(self.target_sparsity, dict):
-            return self.target_sparsity.get('prefill', None)
-        return self.target_sparsity
-
-    @property
-    def target_sparsity_decode(self) -> Optional[float]:
-        if isinstance(self.target_sparsity, dict):
-            return self.target_sparsity.get('decode', None)
-        return self.target_sparsity
-
-    def resolve_for_target_sparsity(
-            self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
-        """Compute threshold_scale_factor from formula coefficients and target_sparsity.
-
-        Given formula coefficients from HF config.json (dict with 'prefill' and
-        'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
-        and return a new SkipSoftmaxAttentionConfig with it set.
-
-        formula example:
-          {"prefill": {"a": 7e-5, "b": 7.929109},
-           "decode":  {"a": 7e-5, "b": 16.9025}}
-
-        If threshold_scale_factor is already set, it takes precedence and
-        this method returns self unchanged.
-        """
-        if self.threshold_scale_factor is not None:
-            return self
-
-        import math
-
-        def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
-            if sparsity is None:
+        ckpt_sparse_attention_config = kwargs.get(
+            "ckpt_sparse_attention_config", None)
+        checkpoint_config = kwargs.get("checkpoint_config", None)
+        if ckpt_sparse_attention_config is None and isinstance(
+                checkpoint_config, dict):
+            ckpt_sparse_attention_config = checkpoint_config.get(
+                "sparse_attention_config", checkpoint_config)
+        pretrained_config = kwargs.get("pretrained_config", None)
+        if ckpt_sparse_attention_config is None and isinstance(
+                pretrained_config, dict):
+            ckpt_sparse_attention_config = pretrained_config.get(
+                "sparse_attention_config", pretrained_config)
+        if ckpt_sparse_attention_config is None and pretrained_config is not None:
+            ckpt_sparse_attention_config = getattr(pretrained_config,
+                                                   "sparse_attention_config",
+                                                   None)
+        module_names = []
+        module_name = kwargs.get("module_name", None)
+        if module_name is not None:
+            module_names.append(str(module_name))
+        layer_idx = kwargs.get("layer_idx", None)
+        if layer_idx is not None:
+            layer_idx = str(layer_idx)
+            module_names.extend((
+                f"model.layers.{layer_idx}.self_attn",
+                f"model.layers.{layer_idx}.attention",
+                f"layers.{layer_idx}.self_attn",
+                f"layers.{layer_idx}.attention",
+            ))
+        if module_names:
+            ignore = (skip_softmax_ignore_from_ckpt_sparse_attention_config(
+                ckpt_sparse_attention_config) or ())
+            if any(
+                    fnmatch.fnmatch(name, pattern) for pattern in ignore
+                    for name in module_names):
                 return None
-            coeffs = formula.get(phase)
-            if not coeffs or 'a' not in coeffs or 'b' not in coeffs:
-                raise ValueError(
-                    f"SkipSoftmaxAttentionConfig: config.json is missing formula "
-                    f"coefficients for phase '{phase}' needed to compute "
-                    f"threshold_scale_factor from target_sparsity.")
-            return coeffs['a'] * math.exp(coeffs['b'] * sparsity)
 
-        return SkipSoftmaxAttentionConfig(
-            algorithm=self.algorithm,
-            target_sparsity=self.target_sparsity,
-            threshold_scale_factor={
-                'prefill': _compute('prefill', self.target_sparsity_prefill),
-                'decode': _compute('decode', self.target_sparsity_decode),
-            })
+        target_sparsity = self.target_sparsity
+        if target_sparsity is None:
+            target_sparsity = skip_softmax_target_sparsity_from_ckpt_sparse_attention_config(
+                ckpt_sparse_attention_config)
+        if (self.threshold_scale_factor is None and target_sparsity is not None
+                and not isinstance(ckpt_sparse_attention_config, dict)):
+            raise ValueError(
+                "sparse_attention_config with target_sparsity requires formula "
+                "coefficients in the model's config.json "
+                "(sparse_attention_config.config_groups.*."
+                "threshold_scale_factor.{prefill,decode}.{a,b}), "
+                "but sparse_attention_config was not found or was not dict type in config.json."
+            )
+        scheduler = (
+            SkipSoftmaxScheduler.from_threshold_scale_factor(
+                self.threshold_scale_factor) if self.threshold_scale_factor
+            is not None else SkipSoftmaxScheduler.from_target_sparsity(
+                target_sparsity,
+                ckpt_sparse_attention_config=ckpt_sparse_attention_config))
+        return SkipSoftmaxParams(scheduler=scheduler)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
@@ -1120,21 +1227,23 @@ class DecodingBaseConfig(StrictBaseModel):
         "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
         "PyTorch backend only.")
 
-    allow_advanced_sampling: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "If true, allows non-greedy sampling when speculation is used. Only applicable "
-        "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
-    )
-
     use_rejection_sampling: bool = Field(
         default=False,
         status="prototype",
         description=
-        "If true, enables rejection sampling for one-model speculative decoding paths. "
-        "This is intended for non-greedy sampling configurations on the PyTorch backend. "
+        "If true, enables rejection sampling for one-model speculative decoding "
+        "paths when the batch contains any non-greedy request. All-greedy batches "
+        "always take the argmax fast path regardless of this flag. Set to false "
+        "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
+
+    allow_advanced_sampling: bool = Field(
+        default=False,
+        status="deprecated",
+        description=
+        "DEPRECATED: no-op kept for backward compatibility. Will be removed "
+        "in a future release. Non-greedy sampling is now auto-detected per "
+        "request; this flag no longer has any effect.")
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
@@ -1190,14 +1299,32 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_config(self):
-        """Reject SA-enhanced configurations that invalidate rejection sampling."""
+        """Disable rejection sampling when SA-enhanced configurations are
+        active, since SA may override the proposed draft tokens. This is a
+        silent fallback so the new default (True) does not break sa_config
+        users.
+        """
         if self.use_rejection_sampling and getattr(self, 'sa_config',
                                                    None) is not None:
-            raise ValueError(
-                "use_rejection_sampling is incompatible with sa_config "
-                "because SA enhancement may override the proposed draft tokens."
-            )
+            self.use_rejection_sampling = False
         return self
+
+    @model_validator(mode='before')
+    @classmethod
+    def _warn_deprecated_allow_advanced_sampling(cls, data):
+        """Warn when users set the deprecated allow_advanced_sampling flag.
+
+        Non-greedy sampling is now auto-detected per request and always
+        available, so the flag is a no-op; warn loudly so callers update
+        their configs before the flag is removed.
+        """
+        if isinstance(data, dict) and 'allow_advanced_sampling' in data:
+            logger.warning(
+                "DecodingBaseConfig: 'allow_advanced_sampling' is deprecated "
+                "and will be removed in a future release. The flag has no "
+                "effect — non-greedy sampling is now auto-detected per "
+                "request.")
+        return data
 
     @model_validator(mode='after')
     # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
@@ -2796,7 +2923,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
-        "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Default is 50%. Should only be set when using encoder-decoder model."
+        "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise."
     )
     secondary_offload_min_priority: Optional[int] = Field(
         default=None,
@@ -2907,6 +3034,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "your own risk. Only used when using KV cache manager v2 "
         "(experimental).")
 
+    disk_prefetch_num_reqs: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
+        "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
+    )
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -2932,6 +3067,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
+    @field_validator('cross_kv_cache_fraction')
+    @classmethod
+    def validate_cross_kv_cache_fraction(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.cross_kv_cache_fraction must be a float between 0 and 1"
             )
         return v
 
@@ -4535,12 +4681,17 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
-            if self.speculative_config.use_rejection_sampling:
-                if not isinstance(self.speculative_config,
-                                  Eagle3DecodingConfig):
-                    raise ValueError(
-                        "use_rejection_sampling is only supported for "
-                        "PyTorch Eagle3 one-model speculative decoding paths.")
+            if self.speculative_config.use_rejection_sampling and not isinstance(
+                    self.speculative_config, Eagle3DecodingConfig):
+                # Rejection sampling is only wired up for Eagle3 one-model paths.
+                # Silently fall back for other spec types so the new default
+                # (True) does not break them.
+                # TODO: extend rejection sampling to the remaining speculative
+                # decoding paths (MTP / DraftTarget / PARD / DFlash /
+                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
+                # so new spec algorithms get rejection sampling for free; once
+                # all paths are covered this whitelist guard can be removed.
+                self.speculative_config.use_rejection_sampling = False
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
