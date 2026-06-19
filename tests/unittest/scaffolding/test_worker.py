@@ -89,7 +89,9 @@ def test_trtoai_worker_chat(default_prompt, model_name, server):
 
 
 def create_trtllm_worker(model_path):
-    return TRTLLMWorker.init_with_new_llm(str(model_path), backend="pytorch")
+    return TRTLLMWorker.init_with_new_llm(str(model_path),
+                                          backend="pytorch",
+                                          kv_cache_free_gpu_memory_fraction=0.5)
 
 
 def test_trtllm_worker_generation(default_prompt, deepseek_distill_7b_path):

@@ -301,8 +301,14 @@ class MajorityVoteController(Controller):
             tasks_list, **majority_vote_kwargs)
 
         assert isinstance(majority_answer, str), "majority_vote failed"
-        # The task returned by majority vote does not have output_tokens and logits.
-        tasks[0].result = tasks_list[majority_index][0].result
+        winning_task = tasks_list[majority_index][0]
+        tasks[0].output_str = winning_task.output_str
+        tasks[0].output_tokens = winning_task.output_tokens
+        tasks[0].finish_reason = winning_task.finish_reason
+        tasks[0].context_logits = winning_task.context_logits
+        tasks[0].logprobs = winning_task.logprobs
+        tasks[
+            0].customized_result_fields = winning_task.customized_result_fields
 
     def majority_vote(self, candidates_tasks: List[List[Task]],
                       **kwargs) -> Tuple[int, str]:
