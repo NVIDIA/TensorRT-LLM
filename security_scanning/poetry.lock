@@ -1350,14 +1350,14 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.12"
+version = "0.6.13rc1"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.12-py3-none-any.whl", hash = "sha256:0c7a01e586b4796810d974cbf13a9c0eb2ade6a94d12e3220cf7782a1c09b8d3"},
-    {file = "flashinfer_python-0.6.12.tar.gz", hash = "sha256:bed67f9c46d81dd22611dfef2787998fc412b2fe2648d9e7d336861dda912694"},
+    {file = "flashinfer_python-0.6.13rc1-py3-none-any.whl", hash = "sha256:9077a616a86be8b8dc6c3b553ae5d5bc87b73ee8f938ea4f480876b3f2ba0943"},
+    {file = "flashinfer_python-0.6.13rc1.tar.gz", hash = "sha256:490790f21708bae5ec62f16d9bfd6efd6000ceed7dab88e4af38cb241ee0250a"},
 ]
 
 [package.dependencies]
