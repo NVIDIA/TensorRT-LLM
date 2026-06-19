@@ -98,7 +98,16 @@ _TINY_KWARGS_UNIVERSAL: Dict[str, Any] = {
     "num_experts": 8,
     "num_experts_per_tok": 2,
     "num_local_experts": 8,
-    "moe_intermediate_size": 16,
+    # MoE intermediate sizes must stay divisible by the NVFP4 block size (16)
+    # AFTER sharding so the ``--sharding-ir-quant nvfp4`` path's on-the-fly
+    # ``fp4_quantize`` load hook (needs ``in_features % 16 == 0``) doesn't trip
+    # ``Expected k % sfVecSize == 0``. Routed experts are MoE-TP-sharded by
+    # ``moe_tp_size`` (<=2 here): 32 -> 16 stays valid. The NemotronH shared
+    # expert (``moe_shared_expert_intermediate_size``) is a dense MLP TP-sharded
+    # by the full ``tp_size`` (<=4 under ``tep``): 64 -> 16 stays valid. bf16
+    # runs are unaffected (just wider experts).
+    "moe_intermediate_size": 32,
+    "moe_shared_expert_intermediate_size": 64,
     "first_k_dense_replace": 0,
     "n_routed_experts": 8,
     "n_shared_experts": 1,

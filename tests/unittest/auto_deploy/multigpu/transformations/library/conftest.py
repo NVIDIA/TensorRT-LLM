@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 _DIST_CONFIG_CHOICES = ("tp-only", "ep-only", "tep", "attn-dp")
+_QUANT_CHOICES = ("none", "nvfp4")
 
 # When --sharding-ir-dist-config is omitted:
 #   * if --sharding-ir-modeling-file is supplied: keep the legacy single-file
@@ -69,6 +70,21 @@ def pytest_addoption(parser):
             "--sharding-ir-modeling-file is supplied, "
             f"{_DIST_CONFIG_DEFAULT_AUTO!r} (cheapest, broad-coverage mode) "
             "when it's not."
+        ),
+    )
+    parser.addoption(
+        "--sharding-ir-quant",
+        action="store",
+        default=None,
+        choices=_QUANT_CHOICES,
+        help=(
+            "Quantization to apply before sharding in "
+            "test_sharding_num_correctness. 'none' (default) exercises the "
+            "bf16 path; 'nvfp4' runs the NVFP4 quant pre-pass "
+            "(quantize_nvfp4_linear_from_config + match_nvfp4_swiglu_pattern + "
+            "quantize_nvfp4_moe) on both the sharded and unsharded graphs so "
+            "the FP4 weight-scale sharding paths are verified. The NVFP4 path "
+            "is skipped (not failed) on non-Blackwell hardware."
         ),
     )
     parser.addoption(
@@ -131,6 +147,13 @@ def pytest_generate_tests(metafunc):
         else:
             configs = [_DIST_CONFIG_DEFAULT_AUTO]
         metafunc.parametrize("sharding_ir_dist_config", configs)
+
+    if "sharding_ir_quant" in metafunc.fixturenames:
+        # Default to bf16-only ('none') so existing CI behavior is unchanged;
+        # opt into NVFP4 explicitly via --sharding-ir-quant nvfp4.
+        cli_quant = metafunc.config.getoption("--sharding-ir-quant")
+        quants = [cli_quant] if cli_quant is not None else ["none"]
+        metafunc.parametrize("sharding_ir_quant", quants, ids=lambda q: f"quant-{q}")
 
 
 @pytest.fixture

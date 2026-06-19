@@ -218,6 +218,15 @@ class ShardableNode(ABC):
 
     _REGISTRY: Dict[OpOverload, Type["ShardableNode"]] = {}
 
+    # Minimum per-rank shard size (in elements along the split dim) this op
+    # requires, independent of any model/layer/config hint. The TP split is
+    # rounded down to a multiple of this value (see ``_split_tensor_for_tp``).
+    # NVFP4 linears override this to 32 because the NVFP4 GEMM requires the
+    # local ``n`` dimension to be divisible by 32 -- a hard dtype constraint,
+    # not a tunable. The effective floor is ``max(MIN_LOCAL_SHAPE, hint)`` so
+    # larger constraints (e.g. GQA head_dim) still win.
+    MIN_LOCAL_SHAPE: int = 1
+
     def __init__(self, node: Node):
         self.node = node
 
@@ -360,7 +369,14 @@ class LinearShardableNode(ShardableNode):
             return 0
         split_dim = SplitDimension.COLUMN if tp_mode == "colwise" else SplitDimension.ROW
         fused = tuple(output_sizes) if output_sizes else None
-        min_shape = tp_min_local_shape if tp_min_local_shape else 1
+        # Honor the op's dtype floor (e.g. 32 for NVFP4) on top of any hint so the
+        # per-rank shard stays GEMM-valid regardless of model/layer config. The
+        # NVFP4 GEMM constrains the *output* (column) dim to a multiple of 32; the
+        # input (row) dim is FP4-packed (2 values/byte) so a column floor must NOT
+        # be applied there (it would over-constrain the packed dim and reject
+        # otherwise-valid shards).
+        col_floor = self.MIN_LOCAL_SHAPE if split_dim == SplitDimension.COLUMN else 1
+        min_shape = max(tp_min_local_shape if tp_min_local_shape else 1, col_floor)
 
         weight_nodes = extract_weight_nodes(self.node)
 
@@ -431,6 +447,10 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
 )
 class FP4LinearShardableNode(LinearShardableNode):
     """NVFP4 linear: shards cutlass-format ``weight_scale`` buffers."""
+
+    # NVFP4 GEMM requires the local ``n`` dimension divisible by 32; floor the
+    # TP split granularity so every rank's shard stays kernel-valid.
+    MIN_LOCAL_SHAPE: int = 32
 
     def _shard_scales(self, gm, dc, weight_nodes, dim, min_shape=1, fused=None):
         weight_shape = weight_nodes.weights[0].tensor.shape if weight_nodes.weights else None
@@ -737,13 +757,19 @@ class SwiGLUShardableNode(ShardableNode):
             return 0
 
         for wn in weight_nodes.weights:
+            wdim = self._dim_for_key(wn.node_key)
+            # Column floor (e.g. 32 for NVFP4) applies only to the output dim;
+            # the row dim is FP4-packed and must not inherit it (see
+            # LinearShardableNode.apply).
+            min_ls = self.MIN_LOCAL_SHAPE if wdim == SplitDimension.COLUMN else 1
             shard_weight_tensor(
                 gm=gm,
                 weight_tensor=wn.tensor,
                 param_key=wn.node_key,
-                dim=self._dim_for_key(wn.node_key),
+                dim=wdim,
                 rank=dc.tp_rank,
                 world_size=dc.tp_size,
+                min_local_shape=min_ls,
             )
 
         for bn in weight_nodes.biases:
@@ -794,6 +820,10 @@ class FineGrainedFP8SwiGLUShardableNode(SwiGLUShardableNode):
 class FP4SwiGLUShardableNode(SwiGLUShardableNode):
     """NVFP4 SwiGLU: shards cutlass-format ``weight_scale`` buffers."""
 
+    # NVFP4 GEMM requires the local ``n`` dimension divisible by 32 (see
+    # FP4LinearShardableNode); apply the same floor to the fused SwiGLU split.
+    MIN_LOCAL_SHAPE: int = 32
+
     def _shard_scales(self, gm, dc, weight_nodes):
         if not weight_nodes.weights:
             return
@@ -814,13 +844,14 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
         for sn in weight_nodes.scales:
             weight_shape = shape_by_prefix.get(_module_prefix(sn.node_key), fallback_shape)
             dim = self._dim_for_key(sn.node_key)
+            min_ls = self.MIN_LOCAL_SHAPE if dim == SplitDimension.COLUMN else 1
             f_split = partial(
                 _shard_fp4_weight_scale,
                 original_uint8_weight_shape=weight_shape,
                 dim=dim,
                 rank=dc.tp_rank,
                 world_size=dc.tp_size,
-                min_local_shape=1,
+                min_local_shape=min_ls,
                 fused_weight_dims=None,
             )
             sharded = f_split(sn.tensor)
@@ -830,7 +861,7 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
                 sharded,
                 f_split,
                 _fp4_weight_scale_pipeline_cache_spec(
-                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, 1
+                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, min_ls
                 ),
             )
 
@@ -918,21 +949,36 @@ class MoEShardableNode(ShardableNode):
                 nodes_to_remove.extend(removed)
         self.node.args = tuple(args)
 
-        if enable_alltoall:
-            mapping_config = dc.serialize()
-            batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
-            batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
-            set_op_args(
-                self.node,
-                mapping_config=mapping_config,
-                max_num_tokens=max_num_tokens,
-                batch_info_host=batch_info_host_node,
-            )
-        else:
-            # with pure EP/TP parallelism, global expert indices must be localized
+        # Localize global expert indices to per-rank-local indices on the all-reduce
+        # path (attention-DP off): each rank computes only its expert slice and the
+        # partials are summed by all_reduce. The all-to-all path (attention-DP on)
+        # keeps GLOBAL expert IDs -- dispatch/combine handles routing.
+        if not enable_alltoall:
             self._localize_expert_indices(
                 gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
+
+        # Always record the MoE grid + workspace inputs on the op, mirroring legacy
+        # ``_insert_sharded_moe`` (which sets these unconditionally). The gate on the
+        # parallelism mode is *localization* (above), not the mapping metadata -- the
+        # latter is consumed by multiple backends/paths regardless of all-to-all:
+        #   * all-to-all: ``mapping_config`` + ``max_num_tokens`` + ``batch_info_host``
+        #     drive dispatch/combine and workspace sizing.
+        #   * all-reduce + TRTLLM-Gen internal routing: ``mapping_config`` lets the
+        #     fused kernel recover the GLOBAL expert count and per-rank expert offset;
+        #     without it the op falls back to ``num_experts = local_num_experts`` while
+        #     ``router_logits`` keeps the global width -> "routing_logits has incorrect
+        #     shape" (or silent misrouting).
+        # Args a given path does not consume (e.g. ``max_num_tokens`` on all-reduce)
+        # are harmless.
+        batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
+        batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+        set_op_args(
+            self.node,
+            mapping_config=dc.serialize(),
+            max_num_tokens=max_num_tokens,
+            batch_info_host=batch_info_host_node,
+        )
 
         ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "

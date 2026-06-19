@@ -163,6 +163,90 @@ def _apply_sharding_to_gm(gm_sharded, dist_config, rank: int):
 # detection.
 
 
+# NVFP4 quant pre-pass.
+#
+# To exercise the FP4 *scale*-sharding paths -- ``FP4LinearShardableNode``,
+# ``FP4SwiGLUShardableNode`` and the NVFP4 branch of ``MoEShardableNode`` (all
+# in ``transform/library/sharding_ir.py``) -- the graph must carry FP4 ops with
+# their cutlass-format ``weight_scale`` / ``alpha`` buffers BEFORE sharding
+# runs. This reproduces the production ``pattern_matcher`` quant stage offline:
+# ``torch_linear_simple`` -> ``torch_fake_quant_nvfp4_linear`` (folding any
+# gate/up/down SwiGLU into ``torch_nvfp4_swiglu_mlp``) and ``torch_moe`` ->
+# ``torch_quant_nvfp4_moe``.
+#
+# The weights stay bf16 in the snapshot; the NVFP4 ``load_hook`` quantizes them
+# on the fly via ``torch.ops.trtllm.fp4_quantize`` at ``load_state_dict`` time,
+# so NO real FP4 checkpoint is needed (same trick as
+# ``singlegpu/.../test_nvfp4_swiglu.py``). Because this pre-pass runs before
+# ``_apply_sharding_to_gm``, the quant load hooks are registered BEFORE the
+# sharding load hooks; at load time the bf16 weight is therefore quantized to
+# FP4 first and the sharding hook then slices the FP4 weight + scales -- the
+# exact ordering the production pipeline uses (pattern_matcher quant stage ->
+# sharding stage).
+_NVFP4_QUANT_TRANSFORMS = {
+    "quantize_nvfp4_linear_from_config": {"stage": "pattern_matcher"},
+    "match_nvfp4_swiglu_pattern": {"stage": "pattern_matcher", "requires_shape_prop": True},
+    "quantize_nvfp4_moe": {"stage": "pattern_matcher", "run_shape_prop": True},
+}
+
+
+class _StubNVFP4Factory:
+    """Minimal ``ModelFactory`` stand-in for the offline NVFP4 quant pre-pass.
+
+    The ``quantize_*_from_config`` transforms read exactly one thing off the
+    factory -- ``get_quant_config()`` -- to pick the algo and the modules to
+    skip. ``lm_head`` is excluded to mirror real NVFP4 checkpoints (the final
+    projection stays unquantized).
+    """
+
+    def get_quant_config(self):
+        return {"quant_algo": "NVFP4", "exclude_modules": ["lm_head"]}
+
+
+def _apply_nvfp4_quant(gm):
+    """Rewrite linear / SwiGLU / MoE ops in *gm* to their NVFP4 equivalents.
+
+    Applied to BOTH the unsharded reference and the to-be-sharded graph so the
+    FP4 quantization rounding is identical on both sides and only the sharding
+    delta survives the comparison -- mirroring the bf16 design where the
+    ``torch_export_to_gm`` semantic gap cancels out of both sides.
+    """
+    from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+
+    return InferenceOptimizer(_StubNVFP4Factory(), _NVFP4_QUANT_TRANSFORMS)(None, gm)
+
+
+# NVFP4 MoE fusion (post-load), mirroring the production trtllm_gen path. The
+# reference NVFP4 config (``examples/auto_deploy/.../super_v3.yaml``) runs
+# ``fuse_nvfp4_moe: backend: trtllm_gen, enable_trtllm_gen_internal_routing:
+# true``. Under pure EP (no attention-DP) this takes the TRTLLM-Gen *internal
+# routing* path: the fused kernel routes over the FULL ``router_logits`` (global
+# num_experts) but operates on the EP-local expert slice. That global-vs-local
+# mismatch is exactly where the production ``routing_logits has incorrect
+# shape`` crash occurs, so wiring this fusion in (after sharding + load) lets the
+# tiny harness reproduce the real fused-kernel bug -- something the unfused
+# reference ``torch_quant_nvfp4_moe`` op cannot surface on its own. Gated behind
+# ``SHARDING_IR_NVFP4_FUSE`` so the default nvfp4 path stays on the reference op.
+# Backend is env-switchable for diagnostics: ``trtllm_gen`` (default, matches
+# super_v3.yaml) vs ``cutlass`` (matches ultra_v3.yaml default). Used to isolate
+# whether an EP-MoE accuracy regression is cutlass-specific.
+_NVFP4_FUSE_TRANSFORMS = {
+    "fuse_nvfp4_moe": {
+        "stage": "post_load_fusion",
+        "backend": os.environ.get("SHARDING_IR_NVFP4_MOE_BACKEND", "trtllm_gen"),
+        "enable_trtllm_gen_internal_routing": True,
+        "allow_different_input_scales": True,
+    },
+}
+
+
+def _apply_nvfp4_moe_fusion(gm):
+    """Fuse ``torch_quant_nvfp4_moe`` -> TRTLLM-Gen fused MoE (post-load)."""
+    from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+
+    return InferenceOptimizer(_StubNVFP4Factory(), _NVFP4_FUSE_TRANSFORMS)(None, gm)
+
+
 # Parallelism configurations exercised by the test. The key is the value of
 # ``--sharding-ir-dist-config``; the dict supplies the world_size, the MoE
 # TP/EP grid, and the attention-DP flag. ``tp_size`` equals ``world_size``
@@ -259,6 +343,7 @@ def _run_equivalence_job_impl(
     rank: int,
     world_size: int,
     dist_config_name: str,
+    quant: str = "none",
 ) -> None:
     """Per-rank job body invoked by ``spawn_multiprocess_job``.
 
@@ -366,6 +451,42 @@ def _run_equivalence_job_impl(
     )
 
     # ------------------------------------------------------------------
+    # 3.5. Optional NVFP4 quant pre-pass on BOTH graphs (before sharding).
+    #
+    # Converts linear / SwiGLU / MoE ops to their NVFP4 equivalents so the FP4
+    # weight-scale sharding paths are exercised. Applied to the unsharded
+    # reference too, so the FP4 rounding is identical on both sides and only
+    # the sharding delta remains. See ``_apply_nvfp4_quant`` for why no real
+    # checkpoint is needed (the NVFP4 load hook quantizes the bf16 snapshot at
+    # load time) and why the quant->shard load-hook ordering is correct.
+    # ------------------------------------------------------------------
+    if quant == "nvfp4":
+        # ``_apply_nvfp4_quant`` registers scale buffers (input_scale / weight_scale
+        # / alpha) via ``default_scales`` WITHOUT a device, so they land on CPU even
+        # though the rest of the graph is on ``device``. Move both graphs back to the
+        # rank device so the on-the-fly NVFP4 load hook and the forward see a single
+        # device (production moves the whole model to device after quant).
+        gm_unsharded = _apply_nvfp4_quant(gm_unsharded).to(device)
+        gm_sharded = _apply_nvfp4_quant(gm_sharded).to(device)
+        # The NVFP4 load hook quantizes the bf16 weight on the fly (so no real
+        # FP4 checkpoint is needed) but reads the per-module ``input_scale``
+        # straight out of the loaded state_dict, and the bf16 snapshot taken in
+        # step 2 has no scale entries. Quantization registered the scale
+        # buffers (``input_scale`` / ``weight_scale`` / ``alpha``) as defaults
+        # on the gm; merge every key the quant pass added (i.e. the ones the
+        # bf16 snapshot lacks) so both loads see a complete FP4 state_dict. The
+        # real bf16 weights are kept (their keys already exist in the
+        # snapshot); the placeholder ``weight_scale`` / ``alpha`` get
+        # recomputed from the bf16 weight inside the load hook. ``input_scale``
+        # stays at its default -- only sharding equivalence is under test, so
+        # the absolute scale value is irrelevant as long as both sides match.
+        # Sourced from gm_unsharded so the scales are full-size; the sharding
+        # hooks on gm_sharded then slice them per rank.
+        for k, v in gm_unsharded.state_dict().items():
+            if k not in sd_snapshot:
+                sd_snapshot[k] = v.detach().clone().to(device)
+
+    # ------------------------------------------------------------------
     # 4. Apply sharding to gm_sharded.
     #
     # The branch happens inside ``_apply_sharding_to_gm``:
@@ -412,6 +533,17 @@ def _run_equivalence_job_impl(
     # rejected. ``missing`` is the bug signal: any param in the sharded
     # graph that the snapshot can't supply.
     assert not missing, f"Missing keys when loading sharded state_dict: {missing[:5]}"
+
+    # ------------------------------------------------------------------
+    # 5.5. Optional NVFP4 MoE fusion (post-load), mirroring the production
+    # trtllm_gen path. Runs AFTER sharding + load so the fused kernel sees the
+    # EP-local expert slice while internal routing still spans the full
+    # router_logits -- the exact configuration that reproduces the real
+    # 'routing_logits has incorrect shape' crash. See _apply_nvfp4_moe_fusion.
+    # ------------------------------------------------------------------
+    if quant == "nvfp4" and os.environ.get("SHARDING_IR_NVFP4_FUSE") == "1":
+        gm_unsharded = _apply_nvfp4_moe_fusion(gm_unsharded)
+        gm_sharded = _apply_nvfp4_moe_fusion(gm_sharded)
 
     # ------------------------------------------------------------------
     # 6. Forward both graphs and compare via relative RMSE.
@@ -472,6 +604,7 @@ def _run_equivalence_job_impl(
 def _run_equivalence_job(
     modeling_file: str,
     dist_config_name: str,
+    quant: str,
     rank: int,
     world_size: int,
 ) -> None:
@@ -484,7 +617,7 @@ def _run_equivalence_job(
     import traceback
 
     try:
-        _run_equivalence_job_impl(modeling_file, rank, world_size, dist_config_name)
+        _run_equivalence_job_impl(modeling_file, rank, world_size, dist_config_name, quant)
     except BaseException:
         with open(f"/tmp/sharding_ir_equiv_rank{rank}.log", "w") as f:
             f.write(traceback.format_exc())
@@ -503,11 +636,20 @@ def _gpu_check(dist_config_name: str) -> Optional[str]:
 def test_sharding_num_correctness(
     sharding_ir_modeling_file: str,
     sharding_ir_dist_config: str,
+    sharding_ir_quant: str,
 ) -> None:
     """Verify sharded == unsharded prefill for the supplied modeling file."""
     skip = _gpu_check(sharding_ir_dist_config)
     if skip:
         pytest.skip(skip)
+
+    # NVFP4 quant pre-pass needs Blackwell (sm_100+) and the TRT-LLM FP4 ops
+    # (torch.ops.trtllm.fp4_quantize, used by the on-the-fly NVFP4 load hook).
+    if sharding_ir_quant == "nvfp4":
+        from _torch_test_utils import fp4_compatible, trtllm_ops_available
+
+        if not (fp4_compatible() and trtllm_ops_available()):
+            pytest.skip("NVFP4 sharding check requires Blackwell (sm_100+) and TRT-LLM ops")
 
     # Known-failing modeling files whose Mamba/MoE/etc. blocks have
     # *pre-existing* sharding-compat issues unrelated to this test harness.
@@ -557,7 +699,12 @@ def test_sharding_num_correctness(
 
     world_size = _DIST_CONFIGS[sharding_ir_dist_config]["world_size"]
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_equivalence_job, sharding_ir_modeling_file, sharding_ir_dist_config),
+        job=partial(
+            _run_equivalence_job,
+            sharding_ir_modeling_file,
+            sharding_ir_dist_config,
+            sharding_ir_quant,
+        ),
         size=world_size,
     )
 
