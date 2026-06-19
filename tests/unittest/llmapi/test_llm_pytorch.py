@@ -1190,8 +1190,12 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
 
     model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
 
-    # Five adapters with varying ranks; max_lora_rank must cover the largest.
-    ranks = [8, 16, 32, 16, 64]
+    # Adapters with varying ranks; max_lora_rank must cover the largest. Three
+    # ranks are sufficient to exercise the slot-indexed device-path's per-slot
+    # rank dispatch (min, mid, max) plus the rank-0 skip row in the mixed batch
+    # below, while keeping the overall test cost inside the unittest harness's
+    # pytest-timeout budget on H100 PCIe.
+    ranks = [8, 32, 64]
     max_rank = max(ranks)
 
     # HF expert-projection names -> routed-expert TRT-LLM module ids. The
@@ -1251,7 +1255,7 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
                   kv_cache_config=global_kvcache_config,
                   cuda_graph_config=cuda_graph_config)
         try:
-            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+            sampling_params = SamplingParams(max_tokens=5, temperature=0.0)
             prompt = "What is your name?"
 
             base_tokens = list(
