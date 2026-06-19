@@ -22,13 +22,15 @@ namespace tc = tensorrt_llm::common;
 
 TEST(EnvUtils, ResolveNixlPortLockPathDefault)
 {
+    std::string const kDefaultNixlPortLockPath = "/tmp/trtllm_nixl_port.lock";
     // Unset (nullptr) and set-but-empty both fall back to the default path.
-    EXPECT_EQ(tc::resolveNixlPortLockPath(nullptr), "/tmp/trtllm_nixl_port.lock");
-    EXPECT_EQ(tc::resolveNixlPortLockPath(""), "/tmp/trtllm_nixl_port.lock");
+    EXPECT_EQ(tc::resolveNixlPortLockPath(nullptr), kDefaultNixlPortLockPath);
+    EXPECT_EQ(tc::resolveNixlPortLockPath(""), kDefaultNixlPortLockPath);
 }
 
 TEST(EnvUtils, ResolveNixlPortLockPathOverride)
 {
+    std::string const kOverrideNixlPortLockPath = "/run/deployA/nixl_port.lock";
     // A non-empty value is used verbatim.
-    EXPECT_EQ(tc::resolveNixlPortLockPath("/run/deployA/nixl_port.lock"), "/run/deployA/nixl_port.lock");
+    EXPECT_EQ(tc::resolveNixlPortLockPath(kOverrideNixlPortLockPath.c_str()), kOverrideNixlPortLockPath);
 }
