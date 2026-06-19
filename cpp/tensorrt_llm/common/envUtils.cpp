@@ -309,9 +309,14 @@ std::string getEnvUCXInterface()
     return ucxInterface;
 }
 
+namespace
+{
+char const* const kDefaultNixlPortLockPath = "/tmp/trtllm_nixl_port.lock";
+} // namespace
+
 std::string resolveNixlPortLockPath(char const* envValue)
 {
-    return (envValue && *envValue) ? std::string(envValue) : std::string("/tmp/trtllm_nixl_port.lock");
+    return (envValue && *envValue) ? std::string(envValue) : std::string(kDefaultNixlPortLockPath);
 }
 
 std::string getEnvNixlPortLockPath()
