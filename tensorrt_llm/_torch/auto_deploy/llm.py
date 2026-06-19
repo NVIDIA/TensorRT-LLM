@@ -1,13 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import types
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ...executor.result import CompletionOutput
-from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
-from ...llmapi.llm import RequestOutput, _TorchLLM
-from ...llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
-from ...sampling_params import SamplingParams
+from tensorrt_llm.executor.result import CompletionOutput
+from tensorrt_llm.inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
+from tensorrt_llm.llmapi.llm import RequestOutput, _TorchLLM
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
+from tensorrt_llm.sampling_params import SamplingParams
+
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
 from .models.factory import ModelFactory
@@ -142,6 +159,20 @@ class LLM(_TorchLLM):
         """We don't need to validate args for AutoDeploy backend for now."""
         pass
 
+    @property
+    def _hf_model_dir(self):
+        return (
+            Path(self.factory._prefetched_model_path)
+            if self.factory._prefetched_model_path is not None
+            else None
+        )
+
+    @_hf_model_dir.setter
+    def _hf_model_dir(self, value):
+        # Parent class assigns this in __init__ and _build_model();
+        # AutoDeploy derives it from factory._prefetched_model_path instead.
+        pass
+
     def _create_input_processor(self) -> ADInputProcessor:
         processor = self.factory.init_processor()
         base = ADInputProcessor(self.tokenizer, processor)
@@ -166,8 +197,8 @@ class LLM(_TorchLLM):
         # _autodeploy backend.
         super()._build_model()
 
-        # now correct input processor
-        assert isinstance(self.input_processor, DefaultInputProcessor)
+        # Parent build normalizes tokenizer state, but AD owns the final processor;
+        # registered PyTorch processors (e.g. Gemma4) are expected to be replaced.
         assert self.tokenizer is None or isinstance(self.tokenizer, TransformersTokenizer)
         self.input_processor = self._create_input_processor()
 
@@ -180,6 +211,15 @@ class DemoLLM(LLM):
 
     def __init__(self, **kwargs):
         self.args: LlmArgs = LlmArgs(**kwargs)
+
+        if self.args.encode_only:
+            raise NotImplementedError(
+                "encode_only=True is not supported by DemoLLM (AutoDeploy debug path). "
+                "Use the standard LLM class with backend='pytorch' for encoder-only mode."
+            )
+        # set encode_only and encoder_executor to BaseLLM's default values
+        self._encode_only = False
+        self._encoder_executor = None
 
         self.mpi_session = None
         self.runtime_context = None

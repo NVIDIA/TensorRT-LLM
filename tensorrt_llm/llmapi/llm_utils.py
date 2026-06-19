@@ -26,16 +26,23 @@ from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
 from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
+from ..models.quant_config_utils import \
+    update_quant_config_from_compressed_tensors
 from ..module import Module
+from ..quantization.modelopt_config import (is_modelopt_quant_config,
+                                            read_modelopt_quant_config,
+                                            warn_if_inline_diverges)
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 # yapf: disable
-from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
-                       Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
-                       LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchLlmArgs, UserProvidedDecodingConfig,
-                       _ModelFormatKind, _ModelWrapper, _ParallelConfig,
+from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
+                       DraftTargetDecodingConfig, Eagle3DecodingConfig,
+                       EagleDecodingConfig, EncodeCudaGraphConfig,
+                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
+                       MedusaDecodingConfig, MTPDecodingConfig,
+                       NGramDecodingConfig, SchedulerConfig, TorchLlmArgs,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 # yapf: enable
@@ -80,9 +87,10 @@ class _ModelInfo:
 
 @dataclass
 class _ModelRuntimeContext:
-    ''' _ModelRuntimeContext holds the minimum runtime resources for running a model.
+    """_ModelRuntimeContext holds the minimum runtime resources for running a model.
+
     It could be a runtime cache in MPI nodes.
-    '''
+    """
     engine: Optional[Engine] = None
     mapping: Optional[Mapping] = None
     model_info: Optional[_ModelInfo] = None
@@ -97,9 +105,10 @@ class _ModelRuntimeContext:
 
 
 class ModelLoader:
-    ''' The ModelLoader is used to build an end-to-end model for a single-gpu.
+    """The ModelLoader is used to build an end-to-end model for a single-gpu.
+
     It accepts model name or a local model dir, and will download the model if necessary.
-    '''
+    """
 
     def __init__(self,
                  llm_args: LlmArgs,
@@ -239,9 +248,8 @@ class ModelLoader:
             self.counter += 1
 
     def __call__(self, engine_dir: Optional[Path] = None) -> Path:
-        '''
-        The engine_dir is the path to save the built engine.
-        '''
+        """The engine_dir is the path to save the built engine.
+        """
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return self.model_obj.model_dir
 
@@ -292,7 +300,7 @@ class ModelLoader:
         model_dir: str,
         engine_dir: str,
     ):
-        ''' Save the built engine on a single GPU to the given path. '''
+        """Save the built engine on a single GPU to the given path."""
         model.engine.save(engine_dir)
         if model.mapping.rank == 0:
             tokenizer = ModelLoader.load_hf_tokenizer(
@@ -303,7 +311,7 @@ class ModelLoader:
                 tokenizer.save_pretrained(engine_dir)
 
     def _download_hf_model(self):
-        ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
+        """Download HF model from third-party model hub like www.modelscope.cn or huggingface."""
         model_dir = None
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
@@ -318,13 +326,78 @@ class ModelLoader:
         self.model_obj.model_dir = self._model_dir  # mark as a local model
         assert self.model_obj.is_local_model
 
+    def _apply_modelopt_quant_config(self, hf_quant_config: Dict[str, Any],
+                                     explicit_kv_cache_quant_algo) -> None:
+        """Apply a normalized modelopt ``quantization`` inner dict onto ``self.llm_args.quant_config``.
+
+        Pops the well-known fields, validates them, then forwards any
+        remaining ``QuantConfig`` fields (e.g. AWQ ``has_zero_point`` /
+        ``pre_quant_scale``) via setattr.
+        """
+        quant_config = self.llm_args.quant_config
+        hf_quant_algo = hf_quant_config.pop("quant_algo", None)
+        if hf_quant_algo is None:
+            raise ValueError("Pre-quantized checkpoint must have quant_algo.")
+        hf_quant_algo = QuantAlgo(hf_quant_algo)
+        if quant_config.quant_algo is None:
+            logger.info(
+                f"Setting quant_algo={hf_quant_algo} from HF quant config.")
+            quant_config.quant_algo = hf_quant_algo
+        elif quant_config.quant_algo != hf_quant_algo:
+            raise ValueError(
+                f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
+            )
+
+        hf_kv_cache_quant_algo = hf_quant_config.pop("kv_cache_quant_algo",
+                                                     None)
+        if hf_kv_cache_quant_algo is not None:
+            hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
+            if explicit_kv_cache_quant_algo is not None:
+                if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                    logger.warning(
+                        f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={explicit_kv_cache_quant_algo}."
+                    )
+                quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+            elif quant_config.kv_cache_quant_algo is None:
+                logger.info(
+                    f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                )
+                quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+            elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                raise ValueError(
+                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                )
+        else:
+            if quant_config.kv_cache_quant_algo not in [
+                    None, QuantAlgo.FP8, QuantAlgo.NVFP4
+            ]:
+                raise ValueError(
+                    f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                )
+
+        # quantized_layers is handled separately (e.g. via LayerQuantConfig
+        # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
+        hf_quant_config.pop("quantized_layers", None)
+
+        quant_config_fields = set(quant_config.model_fields.keys())
+        for key, value in hf_quant_config.items():
+            if key not in quant_config_fields:
+                logger.warning(
+                    f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
+                )
+                continue
+            logger.info(
+                f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
+            )
+            setattr(quant_config, key, value)
+        self.llm_args.quant_config = quant_config
+
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
 
         Returns:
             prequantized (bool): Whether the checkpoint is pre-quantized.
         """
-        quant_config = self.llm_args.quant_config
         kv_cache_dtype = self.llm_args.kv_cache_config.dtype
         explicit_kv_cache_quant_algo = {
             "fp8": QuantAlgo.FP8,
@@ -337,75 +410,21 @@ class ModelLoader:
                 f"Found {hf_quant_config_path}, pre-quantized checkpoint is used."
             )
             with open(hf_quant_config_path, "r") as f:
-                hf_quant_config = json.load(f)
-                hf_quant_config = hf_quant_config["quantization"]
-
-            hf_quant_algo = hf_quant_config.pop("quant_algo", None)
-            if hf_quant_algo is not None:
-                # fp8_pb_wo from modelopt is the same as fp8_block_scales
-                if hf_quant_algo == "fp8_pb_wo":
-                    hf_quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                else:
-                    hf_quant_algo = QuantAlgo(hf_quant_algo)
-                if quant_config.quant_algo is None:
-                    logger.info(
-                        f"Setting quant_algo={hf_quant_algo} from HF quant config."
+                normalized = read_modelopt_quant_config(json.load(f))
+            # Cross-check against inline config.json.quantization_config if any.
+            # Done before _apply_modelopt_quant_config since the apply step
+            # mutates ``normalized`` via ``.pop()``.
+            try:
+                with open(f"{self._model_dir}/config.json", "r") as f:
+                    warn_if_inline_diverges(
+                        normalized,
+                        json.load(f).get("quantization_config"),
+                        source_file="hf_quant_config.json",
                     )
-                    quant_config.quant_algo = hf_quant_algo
-                elif quant_config.quant_algo != hf_quant_algo:
-                    raise ValueError(
-                        f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
-                    )
-            else:
-                raise ValueError(
-                    "Pre-quantized checkpoint must have quant_algo.")
-
-            hf_kv_cache_quant_algo = hf_quant_config.pop(
-                "kv_cache_quant_algo", None)
-            if hf_kv_cache_quant_algo is not None:
-                hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if explicit_kv_cache_quant_algo is not None:
-                    if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                        logger.warning(
-                            f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
-                        )
-                    quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo is None:
-                    logger.info(
-                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                    )
-                    quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
-                elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
-                    raise ValueError(
-                        f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
-                    )
-            else:
-                if quant_config.kv_cache_quant_algo not in [
-                        None, QuantAlgo.FP8, QuantAlgo.NVFP4
-                ]:
-                    raise ValueError(
-                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
-                    )
-
-            # quantized_layers is handled separately (e.g. via LayerQuantConfig
-            # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
-            hf_quant_config.pop("quantized_layers", None)
-
-            quant_config_fields = set(quant_config.model_fields.keys())
-            for key, value in hf_quant_config.items():
-                if key not in quant_config_fields:
-                    logger.warning(
-                        f"Ignoring unknown field '{key}' from HF quant config (not a QuantConfig field)."
-                    )
-                    continue
-                logger.info(
-                    f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
-                )
-                setattr(quant_config, key, value)
-
-            # Update the quant_config in llm_args for pytorch
-            self.llm_args.quant_config = quant_config
-
+            except FileNotFoundError:
+                pass
+            self._apply_modelopt_quant_config(normalized,
+                                              explicit_kv_cache_quant_algo)
             return True
 
         hf_config_path = f"{self._model_dir}/config.json"
@@ -429,12 +448,20 @@ class ModelLoader:
             )
 
         if hf_quant_config is not None:
+            if is_modelopt_quant_config(hf_quant_config):
+                self._apply_modelopt_quant_config(
+                    read_modelopt_quant_config(hf_quant_config),
+                    explicit_kv_cache_quant_algo)
+                return True
+            quant_config = self.llm_args.quant_config
             # DeepSeek V3 FP8 ckpt
-            if hf_quant_config.get(
-                    "quant_method") == "fp8" and hf_quant_config.get(
-                        "weight_block_size"):
-                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                quant_config.exclude_modules = ["*eh_proj"]
+            if hf_quant_config.get("quant_method") == "fp8":
+                if hf_quant_config.get("weight_block_size") is not None:
+                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    quant_config.exclude_modules = ["*eh_proj"]
+                else:
+                    # Ministral 3 static quant
+                    quant_config.quant_algo = QuantAlgo.FP8
             elif hf_quant_config.get("quant_method") == "mxfp4":
                 from .._torch.model_config import ModelConfig
                 quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
@@ -444,51 +471,31 @@ class ModelLoader:
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                     'embedding', 'unembedding'
                 ]
+            elif hf_quant_config.get("quant_method") == "mxfp8":
+                raise NotImplementedError(
+                    "MXFP8 quantization is not supported yet.")
             # NOTE: This is for llm-compressor's quantized checkpoints.
             elif hf_quant_config.get("quant_method") == "compressed-tensors":
-                config_groups = hf_quant_config.get("config_groups")
-                if config_groups is None:
-                    raise ValueError(
-                        f"config_groups is not set in {hf_quant_config}.")
+                update_quant_config_from_compressed_tensors(
+                    quant_config, hf_quant_config)
+            elif hf_quant_config.get("quant_method") == "nvfp4":
+                quant_config.quant_algo = QuantAlgo.NVFP4
+                group_size = hf_quant_config.get("group_size", 16)
+                assert group_size == 16, "NVFP4 only supports group_size=16"
+                quant_config.group_size = group_size
+                default_exclude = ['*.mlp.gate', 'lm_head']
 
-                weights_quant_config = config_groups["group_0"]["weights"]
-                inputs_quant_config = config_groups["group_0"][
-                    "input_activations"]
-                weights_quant_strategy = weights_quant_config["strategy"]
-                inputs_quant_strategy = inputs_quant_config["strategy"]
-
-                if weights_quant_config["num_bits"] == 8:
-                    if weights_quant_strategy == "channel":
-                        if inputs_quant_strategy != "token":
-                            raise ValueError(
-                                f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
-                            )
-                        quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-                    elif weights_quant_strategy == "block":
-                        if inputs_quant_strategy != "group":
-                            raise ValueError(
-                                f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
-                            )
-                        quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                        group_size = inputs_quant_config["group_size"]
-
-                        # NOTE: TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
-                        if group_size != 128:
-                            raise ValueError(
-                                f"Unsupported group_size: {group_size}. Supported: 128."
-                            )
-                        quant_config.group_size = group_size
-
-                    else:
-                        raise ValueError(
-                            f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
-                            "Supported strategies: 'channel', 'block'.")
+                hf_exclude_modules = hf_quant_config.get(
+                    'modules_to_not_convert', None)
+                if hf_exclude_modules is not None:
+                    quant_config.exclude_modules = list(
+                        dict.fromkeys(hf_exclude_modules + default_exclude))
                 else:
-                    raise ValueError(
-                        f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
-                        "Supported: 8.")
-
-                quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+                    quant_config.exclude_modules = default_exclude
+            elif hf_quant_config.get("quant_method") is None:
+                # quantization_config present but quant_method is null → not
+                # pre-quantized; tell caller so calibration is not skipped.
+                return False
             else:
                 raise NotImplementedError(
                     f"Unsupported quantization_config: {hf_quant_config}.")
@@ -498,7 +505,7 @@ class ModelLoader:
         return False
 
     def _load_model_from_hf(self):
-        ''' Load a TRT-LLM model from a HF model. '''
+        """Load a TRT-LLM model from a HF model."""
         assert self._model_dir is not None
 
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
@@ -561,7 +568,7 @@ class ModelLoader:
 
     @print_traceback_on_error
     def _load_model_from_ckpt(self):
-        ''' Load a TRT-LLM model from checkpoint. '''
+        """Load a TRT-LLM model from checkpoint."""
         self.pretrained_config = PretrainedConfig.from_json_file(
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
@@ -610,13 +617,14 @@ class ModelLoader:
         logger_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
-        '''
-        Persist the engine to disk for the cpp runtime. Currently, the cpp runtime can accept an engine path,
+        """Persist the engine to disk for the cpp runtime.
+
+        Currently, the cpp runtime can accept an engine path,
         that requires the engine should always be saved to disk.
 
         This explicit saving will be removed in the future when the cpp runtime can accept the engine buffer directly.
         But this is necessary for a build cache, but it can be optimized to async IO.
-        '''
+        """
         if self.build_cache_enabled:
             self._model_dir = self.engine_cache_stage.cache_dir
             self._model_format = _ModelFormatKind.TLLM_ENGINE
@@ -656,7 +664,14 @@ class ModelLoader:
             trust_remote_code: bool = True,
             **kwargs) -> Optional[transformers.PretrainedConfig]:
         try:
-            return transformers.PretrainedConfig.from_pretrained(
+            # Route via AutoConfig so model_types registered through
+            # transformers.models.auto.configuration_auto.CONFIG_MAPPING
+            # (e.g. deepseek_v32 / kimi_k2 via tensorrt_llm/_torch/configs/)
+            # are dispatched to their TRT-LLM-local config class. Calling
+            # PretrainedConfig.from_pretrained directly bypasses CONFIG_MAPPING
+            # and on transformers 5.5.x returns a bare PretrainedConfig that
+            # lacks attributes like max_position_embeddings.
+            return transformers.AutoConfig.from_pretrained(
                 model_dir, trust_remote_code=trust_remote_code, **kwargs)
         except Exception as e:
             logger.warning(
@@ -666,9 +681,8 @@ class ModelLoader:
 
 
 class CachedModelLoader:
-    '''
-    The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
-    '''
+    """The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
+    """
 
     def __init__(
         self,
@@ -805,7 +819,7 @@ class CachedModelLoader:
                                              is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
-        ''' Get the cache stage for engine building. '''
+        """Get the cache stage for engine building."""
         build_cache = BuildCache(self.llm_args.enable_build_cache)
 
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
@@ -838,9 +852,11 @@ class CachedModelLoader:
         )
 
     def get_pretrained_config(self) -> PretrainedConfig:
-        ''' Get the PretrainedConfig for cache key.
+        """Get the PretrainedConfig for cache key.
+
         NOTE, this is not the HF model's config, but the TRT-LLM's config. We use this as a generic information for
-        HF and other models. '''
+        HF and other models.
+        """
         assert self._hf_model_dir is not None
         return AutoConfig.from_hugging_face(
             self._hf_model_dir,
@@ -895,7 +911,7 @@ class CachedModelLoader:
 
                     if not has_storage:
                         print_colored(
-                            f"Build cache is disabled since the cache storage is too small.\n ",
+                            "Build cache is disabled since the cache storage is too small.\n ",
                             'yellow')
                         print_colored(
                             f"Free storage: {free_storage}GB, Required storage: {require_size}GB\n",
@@ -961,7 +977,7 @@ class CachedModelLoader:
 
 @dataclass
 class LlmBuildStats:
-    ''' LlmBuildStats is the statistics for the LLM model building. '''
+    """LlmBuildStats is the statistics for the LLM model building."""
     # Whether the cache is hit for the engine
     cache_hitted: bool = False
     cache_info: Optional[str] = None
@@ -1003,6 +1019,8 @@ __all__ = [
     'QuantConfig',
     'CalibConfig',
     'CudaGraphConfig',
+    'DecodeCudaGraphConfig',
+    'EncodeCudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',

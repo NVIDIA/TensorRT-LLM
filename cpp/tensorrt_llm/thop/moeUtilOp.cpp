@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,7 +48,7 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     int* blocked_expert_counts_, int* blocked_expert_counts_cumsum_, int* blocked_row_to_unpermuted_row_,
     cutlass_kernels::MOEParallelismConfig parallelism_config, bool use_lora, kernels::LoraParams& lora_params,
     bool use_fp8_block_scaling, bool min_latency_mode, cutlass_kernels::MoeMinLatencyParams& min_latency_params,
-    cudaStream_t stream)
+    bool skip_data_expand, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(experts_per_token * full_num_experts <= std::numeric_limits<int>::max(),
         "experts_per_token * num_experts is too large");
@@ -79,14 +79,17 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
     }
     sync_check_cuda_error(stream);
 
-    using ExpandedActivationsType = T;
-    float const* token_topk_unpermuted_scales = token_final_scales;
-    cutlass_kernels::expandInputRowsKernelLauncher(input_activations,
-        reinterpret_cast<ExpandedActivationsType*>(permuted_data_), token_topk_unpermuted_scales,
-        permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size, experts_per_token,
-        num_experts_per_node, quant_params, /*use_per_expert_act_scale*/ false, expert_first_token_offset_,
-        /* fc1_fp4_act_scale_ */ nullptr, input_sf, true, /* prequant_scales */ nullptr, stream);
-    sync_check_cuda_error(stream);
+    if (!skip_data_expand)
+    {
+        using ExpandedActivationsType = T;
+        float const* token_topk_unpermuted_scales = token_final_scales;
+        cutlass_kernels::expandInputRowsKernelLauncher(input_activations,
+            reinterpret_cast<ExpandedActivationsType*>(permuted_data_), token_topk_unpermuted_scales,
+            permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size, experts_per_token,
+            num_experts_per_node, quant_params, /*use_per_expert_act_scale*/ false, expert_first_token_offset_,
+            /* fc1_fp4_act_scale_ */ nullptr, input_sf, true, /* prequant_scales */ nullptr, stream);
+        sync_check_cuda_error(stream);
+    }
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_permute_op(
@@ -95,7 +98,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
     torch::optional<torch::Tensor> input_sf, int64_t const num_experts_on_rank, int64_t const tp_size,
     int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
-    int64_t const cluster_rank, bool min_latency_mode, bool use_fp8_block_scaling)
+    int64_t const cluster_rank, bool min_latency_mode, bool use_fp8_block_scaling, bool skip_data_expand)
 {
     TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
     TORCH_CHECK(min_latency_mode == false, "min_latency_mode is not supported now");
@@ -178,7 +181,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             static_cast<int*>(blocked_expert_counts_tensor.data_ptr()),
             static_cast<int*>(blocked_expert_counts_cumsum_tensor.data_ptr()),
             static_cast<int*>(blocked_row_to_unpermuted_row_tensor.data_ptr()), parallelism_config, /*use_lora*/ false,
-            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, stream);
+            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, skip_data_expand, stream);
         break;
     case torch::kBFloat16:
         runPermute<__nv_bfloat16>(input.const_data_ptr(),
@@ -199,7 +202,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             static_cast<int*>(blocked_expert_counts_tensor.data_ptr()),
             static_cast<int*>(blocked_expert_counts_cumsum_tensor.data_ptr()),
             static_cast<int*>(blocked_row_to_unpermuted_row_tensor.data_ptr()), parallelism_config, /*use_lora*/ false,
-            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, stream);
+            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, skip_data_expand, stream);
         break;
     case torch::kHalf:
         runPermute<half>(input.const_data_ptr(), input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
@@ -219,7 +222,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             static_cast<int*>(blocked_expert_counts_tensor.data_ptr()),
             static_cast<int*>(blocked_expert_counts_cumsum_tensor.data_ptr()),
             static_cast<int*>(blocked_row_to_unpermuted_row_tensor.data_ptr()), parallelism_config, /*use_lora*/ false,
-            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, stream);
+            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, skip_data_expand, stream);
         break;
     default:
         throw std::invalid_argument(
@@ -339,7 +342,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_permute_op(Tensor input, Tensor token_selected_experts, Tensor? token_final_scales, Tensor "
         "fc1_expert_weights, Tensor fc2_expert_weights, Tensor[]? quant_scales, Tensor? input_sf, int "
         "num_experts_on_rank, int tp_size, int tp_rank, int ep_size, int ep_rank, int cluster_size, int cluster_rank, "
-        "bool min_latency_mode, bool use_fp8_block_scaling)"
+        "bool min_latency_mode, bool use_fp8_block_scaling, bool skip_data_expand=False)"
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "moe_finalize_scale_op(Tensor gemm2_output, Tensor? biases, Tensor unpermuted_final_scales, Tensor "

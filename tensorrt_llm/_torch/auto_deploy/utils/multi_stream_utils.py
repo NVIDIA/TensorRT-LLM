@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Shared CUDA multi-stream utilities for multi-stream transforms.
 
 This module provides the core infrastructure for executing parts of an FX graph
@@ -11,14 +25,53 @@ Key components:
     required by FX graph execution and CUDA graph capture.
   - ``_make_aux_stream_impl``: factory for building an implementation that runs
     a base op on the auxiliary CUDA stream.
+  - ``disable_multi_stream`` context manager: turn all passthroughs and aux-stream
+    impls into no-ops for code paths where multi-stream execution is unsafe
+    (e.g. piecewise CUDA graph capture/replay for prefill/mixed batches).
 """
 
 from threading import RLock
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, TypeVar
 
 import torch
 
 from .logger import ad_logger
+
+T = TypeVar("T")
+
+# ---------------------------------------------------------------------------
+# Runtime enable/disable flag
+# ---------------------------------------------------------------------------
+# When False, all multi-stream passthroughs return ``x`` unchanged and
+# ``_make_aux_stream_impl`` impls run the base op on the caller's stream.
+# Used by the piecewise CUDA graph path to keep prefill/mixed batches on a
+# single stream — host-side ``caller_stream.synchronize()`` between captured
+# segments is incompatible with stable-address invariants required for replay.
+# Decode-only batches use the monolithic CG path and leave the flag set.
+_multi_stream_enabled: bool = True
+
+
+def is_multi_stream_enabled() -> bool:
+    return _multi_stream_enabled
+
+
+class disable_multi_stream:
+    """Context manager that disables multi-stream execution.
+
+    Nestable: saves the previous flag value on ``__enter__`` and restores it
+    on ``__exit__``.
+    """
+
+    def __enter__(self) -> "disable_multi_stream":
+        global _multi_stream_enabled
+        self._prev = _multi_stream_enabled
+        _multi_stream_enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        global _multi_stream_enabled
+        _multi_stream_enabled = self._prev
+
 
 # ---------------------------------------------------------------------------
 # Singleton metaclass
@@ -117,6 +170,19 @@ def wait_event(device: int, stream_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _record_stream_for_tensor_outputs(x: object, stream: torch.cuda.Stream) -> None:
+    if isinstance(x, torch.Tensor):
+        x.record_stream(stream)
+        return
+    if isinstance(x, (list, tuple)):
+        for item in x:
+            _record_stream_for_tensor_outputs(item, stream)
+        return
+    if isinstance(x, dict):
+        for item in x.values():
+            _record_stream_for_tensor_outputs(item, stream)
+
+
 @torch._dynamo.disable
 def record_event_passthrough(
     x: torch.Tensor,
@@ -130,6 +196,8 @@ def record_event_passthrough(
     computation, enabling overlap between the shared expert (main stream)
     and routed experts (aux stream).
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     torch.ops.auto_deploy.record_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
@@ -138,10 +206,10 @@ def record_event_passthrough(
 
 @torch._dynamo.disable
 def begin_aux_stream_passthrough(
-    x: torch.Tensor,
+    x: T,
     *,
     device: int = -1,
-) -> torch.Tensor:
+) -> T:
     """Record a CUDA event on the main stream, switch to aux, and wait for it.
 
     After this function returns the thread-local current stream is the
@@ -149,6 +217,8 @@ def begin_aux_stream_passthrough(
     interpreter will be recorded on aux until ``end_aux_stream_passthrough``
     switches back to main.
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     # Save the *actual* current stream so ``end_aux`` can restore it.
@@ -156,24 +226,22 @@ def begin_aux_stream_passthrough(
     # which is NOT ``torch.cuda.default_stream()``.
     caller_stream = torch.cuda.current_stream(device)
     cuda_stream_manager._caller_streams[device] = caller_stream
-    # Synchronize the caller stream before switching to aux.  The GPU-side
-    # event wait (aux_stream.wait_event) alone is NOT sufficient when
-    # MLIR-generated Triton kernels precede this point: their interaction
-    # with PyTorch's CUDA caching allocator can cause the allocator to
-    # recycle memory that the aux stream still needs, leading to illegal
-    # memory accesses or silent data corruption.  A CPU-side synchronize
-    # ensures all caller-stream GPU work has retired before aux-stream
-    # allocations begin.
-    # NOTE: this cannot be called during CUDA graph capture.  The cudagraph
-    # path must rely on event-based sync only; a separate fix is needed
-    # there (see TRTLLM multi_stream_moe + MLIR tracking).
-    if not torch.cuda.is_current_stream_capturing():
-        caller_stream.synchronize()
     # Record where the caller's stream has reached so aux knows when data is ready.
     main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
     main_event.record(caller_stream)
     # Switch the thread-local current stream to aux.
     aux_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
+    # Tell the caching allocator that x is also live on aux_stream.  Without
+    # this, MLIR/Triton kernels that produced x on the main stream can cause
+    # the allocator to recycle x's backing storage before aux-stream work
+    # has consumed it, leading to silent data corruption or illegal accesses.
+    # record_stream is the idiomatic PyTorch solution for this cross-stream
+    # liveness problem: it is a CPU-only allocator hint, never a GPU sync,
+    # so it cannot deadlock with in-flight NCCL collectives.
+    # NOTE: skip during CUDA graph capture — passthrough partitions are
+    # reclassified as dynamic and won't be captured anyway.
+    if not torch.cuda.is_current_stream_capturing():
+        _record_stream_for_tensor_outputs(x, aux_stream)
     torch.cuda.set_stream(aux_stream)
     # Make aux wait for the main-stream event before executing any work.
     aux_stream.wait_event(main_event)
@@ -193,6 +261,8 @@ def end_aux_stream_passthrough(
     need to be synchronised (typically right before the ``add`` that merges
     shared-expert and routed-expert outputs).
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     # Record the aux-stream progress so the caller's stream can wait for it later.
@@ -226,6 +296,8 @@ def wait_aux_stream_passthrough(
     Uses ``torch.cuda.current_stream()`` rather than the stored default stream
     so that the correct stream is waited on during CUDA graph capture.
     """
+    if not _multi_stream_enabled:
+        return x
     if device < 0:
         device = torch.cuda.current_device()
     aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
@@ -242,6 +314,8 @@ def _make_aux_stream_impl(base_overload: Callable) -> Callable:
     """Build an implementation that runs *base_overload* on the auxiliary CUDA stream."""
 
     def _impl(*args, **kwargs):
+        if not _multi_stream_enabled:
+            return base_overload(*args, **kwargs)
         device = torch.cuda.current_device()
         with torch.cuda.stream(
             cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)

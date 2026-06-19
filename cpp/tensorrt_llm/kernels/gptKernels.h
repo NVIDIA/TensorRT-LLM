@@ -115,6 +115,10 @@ struct BuildDecoderInfoParams
     int* seqQOffsets;
     // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
     int* seqKVOffsets;
+    // Precomputed offsets to the 1st token in each sequence of Q buffer. Shape: [batchSize+1].
+    int const* precomputedSeqQOffsets;
+    // Precomputed offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
+    int const* precomputedSeqKVOffsets;
     // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
     // [numTokens].
     int* paddingOffsets;
@@ -168,7 +172,7 @@ struct BuildDecoderInfoParams
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
     // The number of sink tokens in the kv cache.
-    int sinkTokenLength;
+    int sinkTokenLength{0};
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
     // Remove padding or not.

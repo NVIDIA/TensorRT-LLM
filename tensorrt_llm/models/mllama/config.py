@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from typing import List, Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...functional import LayerNormPositionType, LayerNormType, MLPType
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
@@ -166,7 +167,7 @@ class MLLaMAConfig(PretrainedConfig):
         attn_bias = getattr(hf_text_config, 'bias', False) or getattr(
             hf_text_config, 'attention_bias', False)
         rotary_scaling = getattr(hf_text_config, "rope_scaling", None)
-        rotary_base = getattr(hf_text_config, "rope_theta", 10000.0)
+        rotary_base = get_hf_rope_theta(hf_text_config, 10000.0)
         residual_mlp = getattr(hf_text_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)

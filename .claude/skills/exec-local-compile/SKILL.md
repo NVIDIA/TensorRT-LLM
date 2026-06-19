@@ -45,7 +45,7 @@ git checkout main && git pull
 Run the build command (**incremental by default** — omit `-c`/`--clean` unless explicitly requested or the incremental build fails):
 
 ```bash
-./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks -ccache -a "<arch>" -f --nvtx
+./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache -a "<arch>" -f --nvtx
 ```
 
 Replace `<arch>` with the target GPU architecture (see Architecture Reference below). If not specified by the user, auto-detect from `nvidia-smi`.
@@ -70,7 +70,7 @@ python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
 | `--benchmarks` | Build the C++ benchmarks |
 | `-a "<arch>"` | Target GPU architecture(s) |
 | `--nvtx` | Enable NVTX markers for profiling |
-| `-ccache` | Use ccache for faster recompilation |
+| `--use_ccache` | Use ccache for faster recompilation |
 | `-f` / `--fast_build` | Skip some kernels for faster dev compilation. **Always use for dev builds.** |
 | `-c` / `--clean` | Clean build directory before building. Only when needed (see below). |
 | `--skip_building_wheel` | Build in-place without creating a wheel file |

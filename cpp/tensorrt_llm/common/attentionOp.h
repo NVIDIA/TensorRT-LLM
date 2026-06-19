@@ -53,10 +53,11 @@ public:
     ~AttentionOp() = default;
 
     int initialize() noexcept;
+    [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize() const noexcept;
     [[nodiscard]] int getHeadSize(bool checkInit = true) const;
     [[nodiscard]] int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     [[nodiscard]] size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0) const noexcept;
+        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0, int32_t total_kv_len = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;
@@ -123,6 +124,8 @@ public:
         float const* sage_attn_sfs_q = nullptr;
         float const* sage_attn_sfs_k = nullptr;
         float const* sage_attn_sfs_v = nullptr;
+        // Optional TRTLLM-Gen FMHA JIT warmup shape.
+        bool trtllm_gen_jit_warmup = false;
     };
 
     template <typename T>
@@ -143,10 +146,18 @@ public:
         // optional for separate QKV input, currently only used for context MLA
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
+        // V tensor token stride in bytes (0 = use default computed from head dims).
+        int64_t v_stride_in_bytes = 0;
 
         // Helix parallelism params.
         int32_t const* helix_position_offsets = nullptr;
         bool const* helix_is_inactive_rank = nullptr;
+
+        // Optional packed-varlen boundaries for context attention. When set,
+        // these describe attention sequences/segments and are used directly by
+        // FMHA instead of the workspace boundaries rebuilt from context_lengths.
+        int32_t const* cu_q_seqlens = nullptr;
+        int32_t const* cu_kv_seqlens = nullptr;
 
         std::string enqueueContextParamsToString() const
         {
@@ -206,6 +217,8 @@ public:
             ss << "softmaxStatsPtr: " << this->softmax_stats << std::endl;
             ss << "k_ptr: " << this->k_ptr << std::endl;
             ss << "v_ptr: " << this->v_ptr << std::endl;
+            ss << "cu_q_seqlens: " << this->cu_q_seqlens << std::endl;
+            ss << "cu_kv_seqlens: " << this->cu_kv_seqlens << std::endl;
             return ss.str();
         }
     };
@@ -467,6 +480,8 @@ public:
     bool mUnfuseQkvGemm = false;
     nvinfer1::DataType mType;
     int32_t mMaxContextLength = 0;
+    int32_t mMaxSeqLen = 0;
+    int32_t mMaxNumRequests = 0;
     bool mQKVBiasEnabled = false;
     bool mCrossAttention = false;
     int mMaxDistance = 0;
@@ -484,6 +499,8 @@ public:
     bool mIsSpecDecTree = true;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
+    // Static spec-dec tree length used by FMHA autotuning.
+    int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
@@ -548,14 +565,15 @@ public:
             mRotaryEmbeddingLongMscale, mRotaryEmbeddingMaxPositions, mRotaryEmbeddingOriginalMaxPositions,
             (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding, (int32_t) mMaskType,
             mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(), mTpSize, mTpRank,
-            mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
-            mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput, mFP8ContextMLA, mFP8GenerationMLA,
-            mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask, mIsSpecDecodingEnabled,
-            mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable, mSpecDecodingMaxGenerationLength,
-            mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged,
-            mUseTllmGenSparseAttention, mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads,
-            mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast,
-            mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
+            mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mMaxSeqLen, mMaxNumRequests, mQKVBiasEnabled,
+            mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
+            mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
+            mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
+            mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mIsMLAEnabled, mIsGenerationMLA,
+            mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention,
+            mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
+            mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
+            mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
             mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);

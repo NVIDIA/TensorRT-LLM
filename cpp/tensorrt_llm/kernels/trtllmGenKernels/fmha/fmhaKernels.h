@@ -18,9 +18,11 @@
 
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <linux/limits.h>
 #include <memory>
 #include <mutex>
@@ -29,6 +31,7 @@
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -40,6 +43,7 @@
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "prepareCustomMask.h"
+#include <chrono>
 
 // Switch to streaming-style TLLM_LOG_* macros for trtllm-gen export headers,
 // which use streaming syntax (e.g., TLLM_LOG_INFO("val=", x)) instead of
@@ -175,8 +179,20 @@ public:
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
                 if (kernelMeta.mSharedMemBytes >= 48 * 1024)
                 {
-                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
+                    auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
+                    if (result != CUDA_SUCCESS)
+                    {
+                        char const* errorName = nullptr;
+                        char const* errorString = nullptr;
+                        mDriver->cuGetErrorName(result, &errorName);
+                        mDriver->cuGetErrorString(result, &errorString);
+                        TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
+                            + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
+                            + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
+                            + std::string(errorString != nullptr ? errorString : "unknown"));
+                        continue;
+                    }
                 }
                 // Make sure the hashIds are not duplicated.
                 // Except for the case where we have both family version and specific version of the same config.
@@ -199,6 +215,23 @@ public:
                 }
             }
         }
+    }
+
+    static bool shouldUseNvrtc(FmhaOptions const& options)
+    {
+        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+        if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
+        {
+            return true;
+        }
+        // Dynamic sparse MLA uses cubin as a compiler issue in NVRTC path.
+        // This constraint can be removed when CUDA version upgrades to 13.2 or later.
+        if (isDynamicTokenSparse(options.mSparseType))
+        {
+            return false;
+        }
+        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
+            && options.mDtypeKv != tg::Dtype::E2m1;
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
@@ -227,13 +260,21 @@ public:
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
         computeNumCtas(options, params.mMultiProcessorCount);
+
+        if (shouldUseNvrtc(options))
+        {
+            // For the NVRTC path, we return supported as long as autotuner successfully selected a kernel config.
+            return std::make_pair(true, "NVRTC path is supported");
+        }
 
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).
         // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
@@ -252,13 +293,54 @@ public:
 
     void algoFilterForCubinPath(FmhaOptions& options) const
     {
-        if (!isContextKernel(options.mFmhaKernelType) && options.mMaskType == TrtllmGenAttentionMaskType::Dense)
+        if (!isContextKernel(options.mFmhaKernelType) && options.mMaskType == TrtllmGenAttentionMaskType::Dense
+            && !options.mIsMlaGen && !isTokenSparse(options.mSparseType))
         {
             options.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
     }
 
-    void run(RunnerParams const& params)
+private:
+    // Warmup up grid selection should be able to cover most possible kernel cases.
+    // Given a model, autotuner decision is relative to number of numCtas/numCtasPerSeqKv,
+    // which translate to batch size, seqLenQ and seqLenKv. Autotuner is sensitive to
+    // numCtas/numCtasPerSeqKv in the range of 1-24, but became much insensitive later.
+
+    // Selection of batch size: numCtas = numCtasPerSeqKv * batchsize
+    // So we need batch size = 1-24 to cover sensitive area when numCtasPerSeqKv = 1
+    // And then gradually increase gap between batch sizes.
+    inline static std::vector<int> const kDefaultWarmupBatchSizeCandidates
+        = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 28, 30, 32, 36,
+            40, 48, 56, 64, 80, 96, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048};
+    // Selection of seqLenKv: numCtasPerSeqKv = seqLenKv / (tileSizePerKv)
+    // TileSizePerKv is typically 128, 256 and 512 and numCtasPerSeqKv is capped at SM number.
+    // For numCtasPerSeqKv we like to cover full range of 1-23, and sparsely cover 25-256
+    // Final formula: set({1, ..., 24, 26, 28, 32, 40, 48, 64, 80, 96, 128, 192, 256} * {128, 256, 512})
+    inline static std::vector<int> const kDefaultWarmupSeqLenKvCandidates = {1, 128, 256, 384, 512, 640, 768, 896, 1024,
+        1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048, 2176, 2304, 2432, 2560, 2688, 2816, 2944, 3072, 3328, 3584,
+        3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144, 6656, 7168, 7680, 8192, 8704, 9216, 9728, 10240,
+        10752, 11264, 11776, 12288, 13312, 14336, 16384, 20480, 24576, 32768, 40960, 49152, 65536, 98304, 131072};
+    // Selection of seqLenQ: typically our prefill kernels would not use JIT and seqLenQ is fixed during decode.
+    // However seqLenQ can change when we use generation kernel to do prefill. SeqLenQ is sensitive in the range 1-16.
+    // But for prefill we typically face much longer sequence. So we only use a very single datapoint.
+    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {128};
+
+    static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
+    {
+        std::vector<int> candidateSizes;
+        for (int size : defaultCandidateSizes)
+        {
+            if (size >= maxSize)
+            {
+                break;
+            }
+            candidateSizes.push_back(size);
+        }
+        candidateSizes.push_back(maxSize);
+        return candidateSizes;
+    }
+
+    void warmupOneKernel(RunnerParams const& params)
     {
         if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
             || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
@@ -274,10 +356,138 @@ public:
 
         FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        checkFmhaOptions(options, optionsFromArgs);
+        updateFmhaOptions(options, optionsFromArgs);
+
+        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
+        tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
+
+        if (shouldUseNvrtc(options))
+        {
+            FmhaConfig fmhaConfig;
+            fmhaConfig.mOptions = options;
+            std::ostringstream sstream;
+            populateJsonConfig(options, sstream);
+            fmhaConfig.mGenCfgJsonStr = sstream.str();
+
+            fmhaConfig.mExecPath = getExecPath().c_str();
+            fmhaConfig.mCtaDim = ctaDim;
+            fmhaConfig.mGrid = grid;
+            auto const compileStart = std::chrono::steady_clock::now();
+            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
+            auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
+            if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
+            {
+                auto const& kernelName = fmhaConfig.mFunctionName;
+                TLLM_LOG_INFO("JIT Warmup: Warmup for %s took %.3f ms", kernelName.c_str(), compileElapsedMs);
+            }
+        }
+    }
+
+    void runJITWarmupGridIfRequested(RunnerParams const& runnerParams)
+    {
+        if (!runnerParams.mJITWarmup || runnerParams.mKernelType != FmhaKernelType::Generation)
+        {
+            return;
+        }
+
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(runnerParams.stream, &captureStatus));
+        TLLM_CHECK_WITH_INFO(captureStatus == cudaStreamCaptureStatusNone,
+            "TRTLLM-Gen FMHA JIT warmup must not run during CUDA graph capture.");
+
+        bool const useGenKernelForPrefill = runnerParams.mUseGenKernelForPrefill;
+        int const maxBatchSize = runnerParams.mJITWarmupMaxNumRequests;
+        int const maxSeqLenQ = runnerParams.mJITWarmupMaxSeqLenQ;
+        int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
+
+        TLLM_LOG_DEBUG(
+            "TRTLLM-Gen Fmha Warmup Params: maxBatchSize=%d, maxSeqLenKv=%d, useGenKernelForPrefill=%d, maxSeqLenQ=%d",
+            maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
+        TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
+            "TRTLLM-Gen Fmha Warmup Param is invalid.");
+
+        std::vector<int> batchSizeCandidates
+            = makeWarmupCandidateSizes(kDefaultWarmupBatchSizeCandidates, maxBatchSize);
+        // Use specified Q for generation, and use our Q grid for prefill
+        std::vector<int> seqLenQCandidates = useGenKernelForPrefill
+            ? makeWarmupCandidateSizes(kDefaultWarmupSeqLenQCandidates, maxSeqLenQ)
+            : std::vector<int>{runnerParams.mMaxSeqLenQ};
+        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenKvCandidates, maxSeqLenKv);
+
+        auto warmupParams = runnerParams;
+
+        for (int batchSize : batchSizeCandidates)
+        {
+            warmupParams.mBatchSize = batchSize;
+            for (int seqLenQ : seqLenQCandidates)
+            {
+                warmupParams.mMaxSeqLenQ = seqLenQ;
+                for (int seqLenKv : seqLenKvCandidates)
+                {
+                    warmupParams.mMaxSeqLenKv = seqLenKv;
+                    int64_t const sumOfSeqLensQ
+                        = static_cast<int64_t>(warmupParams.mBatchSize) * warmupParams.mMaxSeqLenQ;
+                    int64_t const sumOfSeqLensKv
+                        = static_cast<int64_t>(warmupParams.mBatchSize) * warmupParams.mMaxSeqLenKv;
+                    warmupParams.mSumOfSeqLensQ
+                        = static_cast<int>(std::min<int64_t>(sumOfSeqLensQ, std::numeric_limits<int>::max()));
+                    warmupParams.mSumOfSeqLensKv
+                        = static_cast<int>(std::min<int64_t>(sumOfSeqLensKv, std::numeric_limits<int>::max()));
+                    if (useGenKernelForPrefill && warmupParams.mMaxSeqLenKv < warmupParams.mMaxSeqLenQ)
+                    {
+                        continue;
+                    }
+                    warmupOneKernel(warmupParams);
+                }
+            }
+        }
+    }
+
+public:
+    void run(RunnerParams const& params)
+    {
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return;
+        }
+        runJITWarmupGridIfRequested(params);
+
+        int32_t ctaDim = 512;
+        FmhaOptions options;
+        FmhaOptionsFromArgs optionsFromArgs;
+        parseOptionsFromRunnerParams(params, options);
+        options.mCudaArch = intToCudaArch(mSM);
+
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
+        // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
+        if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
+        {
+            options.mTileScheduler = TileScheduler::Static;
+        }
+
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+
+        // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
+        // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
+            || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
+        {
+            TLLM_CHECK_WITH_INFO(params.multiCtasKvScratchPtr != nullptr && params.multiCtasKvCounterPtr != nullptr,
+                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when fmha kernel uses gmem-based "
+                "multi-CTA reduction. "
+                "The dispatcher must allocate and pass these buffers.");
+        }
+
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
@@ -296,14 +506,8 @@ public:
 
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
-        bool isLlama70bFp4Tp4 = options.mHeadDimQk == 128 && options.mHeadDimV == 128
-            && options.mDtypeK == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
 
-        bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeK != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
-            && !isTokenSparse(options.mSparseType);
-
-        if (shouldUseNvrtc)
+        if (shouldUseNvrtc(options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
             FmhaConfig fmhaConfig;
@@ -315,7 +519,18 @@ public:
             fmhaConfig.mExecPath = getExecPath().c_str();
             fmhaConfig.mCtaDim = ctaDim;
             fmhaConfig.mGrid = grid;
+            auto const compileStart = std::chrono::steady_clock::now();
             mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
+            auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
+            if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
+            {
+                auto const& kernelName = fmhaConfig.mFunctionName;
+                TLLM_LOG_WARNING(
+                    "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took %.3f ms, kernelName=%s, "
+                    "batchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d. This could affect performance measurement.",
+                    compileElapsedMs, kernelName.c_str(), params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
+            }
             mFmhaInterface.run(fmhaConfig, fmhaData, params.stream, params.mMultiProcessorCount, 0);
         }
         else
@@ -340,18 +555,20 @@ public:
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
-                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr, fmhaData.mMetaData.kvPageIdxD,
+                fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
+                fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr, fmhaData.mMetaData.kvPageIdxD,
                 fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
                 fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
                 fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
-                fmhaData.mScales.sageAttnSfsQPtrD, fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD,
-                fmhaData.mScales.sageAttnSfsVPtrD, fmhaData.mInputBuffers.attentionSinksPtrD,
-                fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD, fmhaData.mOutputBuffers.multiCtasKvCounterPtrD,
-                fmhaData.mOutputBuffers.partialOPtrD, fmhaData.mOutputBuffers.partialStatsPtrD,
-                fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD, fmhaData.mOutputBuffers.softmaxStatsD,
-                fmhaData.mOutputBuffers.oDebugPtrD, fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax,
-                fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
-                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
+                fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mScales.sageAttnSfsQPtrD,
+                fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD, fmhaData.mScales.sageAttnSfsVPtrD,
+                fmhaData.mInputBuffers.attentionSinksPtrD, fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD,
+                fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
+                fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
+                fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
+                fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
+                options.mUsesSharedPagedKvIdx);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
@@ -628,6 +845,7 @@ private:
         fmhaData.mMetaData.cumSeqLensKvPtrD = params.cumSeqLensKvPtr;
         fmhaData.mMetaData.seqLensKvD = params.seqLensKvPtr;
         fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD = params.firstSparseMaskOffsetsKvPtr;
+        fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
@@ -659,6 +877,7 @@ private:
         fmhaData.mInputBuffers.qBasePtr = qPtr;
         fmhaData.mInputBuffers.kBasePtr = kPtr;
         fmhaData.mInputBuffers.vBasePtr = vPtr;
+        fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr = params.slidingWindowKvPoolBasePtr;
         fmhaData.mInputBuffers.attentionSinksPtrD = params.attentionSinksPtr;
         fmhaData.mInputBuffers.customMaskPtrD = params.customMaskPtr;
         fmhaData.mInputBuffers.customMaskOffsetsPtrD = params.customMaskOffsetsPtr;
@@ -752,6 +971,7 @@ private:
         // Sparse attention (MLA / MQA / GQA)
         options.mSparseType = params.mSparseAttention;
         options.mSparseAttnTopK = params.mSparseTopK;
+        options.mHasSlidingWindowKvPool = isMlaGenKernel(params) && isDynamicTokenSparse(params.mSparseAttention);
 
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
@@ -793,6 +1013,8 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
+        // Carry static tree length into FMHA kernel selection.
+        options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;
     }
@@ -816,9 +1038,24 @@ private:
         // loop. And the number of loops are not the same in different tasks.
         sstream << "\"checksTaskSchedules\": false,\n";
 
+        bool hasCompileDefs = false;
+        auto writeCompileDef = [&](char const* compileDef)
+        {
+            if (!hasCompileDefs)
+            {
+                sstream << "\"compileDefs\": [";
+                hasCompileDefs = true;
+            }
+            else
+            {
+                sstream << ", ";
+            }
+            sstream << "\"" << compileDef << "\"";
+        };
+
         if (options.mIsExportingCubin)
         {
-            sstream << "\"compileDefs\": [\"-DTLLM_EXPORT_CUBIN\"],\n";
+            writeCompileDef("-DTLLM_EXPORT_CUBIN");
         }
 
         // Set compile flags for E2M1 KV kernel benchmark.
@@ -826,7 +1063,18 @@ private:
         if (options.mChecksResults == 0 && options.mDtypeKv == tg::Dtype::E2m1)
         {
             TLLM_LOG_INFO("Forcing -DTLLM_BENCHMARK_E2M1_KV_CACHE for E2m1 Kv. The results are not correct.");
-            sstream << "\"compileDefs\": [\"-DTLLM_BENCHMARK_E2M1_KV_CACHE\"],\n";
+            writeCompileDef("-DTLLM_BENCHMARK_E2M1_KV_CACHE");
+        }
+
+        // SwapsMmaAb NVRTC kernels already emit __launch_bounds__; avoid a CUDA 13 .reqntid/.maxntid conflict.
+        if (shouldUseNvrtc(options) && options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration)
+        {
+            writeCompileDef("-DTLLM_DISABLE_BLOCK_SIZE");
+        }
+
+        if (hasCompileDefs)
+        {
+            sstream << "],\n";
         }
 
         // Enable programmatic dependent launch.
@@ -994,7 +1242,8 @@ private:
     // Is it MLA generation kernel ?
     inline bool isMlaGenKernel(RunnerParams const& params) const
     {
-        return params.mHeadDimQk == 576 && params.mHeadDimV == 512;
+        return (params.mHeadDimQk == 576 && params.mHeadDimV == 512)
+            || (isTokenSparse(params.mSparseAttention) && params.mHeadDimQk == 512 && params.mHeadDimV == 512);
     }
 
     // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.

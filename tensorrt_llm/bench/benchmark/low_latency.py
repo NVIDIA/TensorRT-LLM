@@ -24,7 +24,8 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm.bench.benchmark import (generate_json_report,
+from tensorrt_llm.bench.benchmark import (collect_explicit_cli_keys,
+                                          generate_json_report,
                                           get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
@@ -65,9 +66,9 @@ from tensorrt_llm.sampling_params import SamplingParams
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
-    "Can be specified as either --config or --extra_llm_api_options.")
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Can be specified as either --config or "
+    "--extra_llm_api_options.")
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -116,7 +117,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--custom_tokenizer",
     type=str,
     default=None,
-    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    help="Custom tokenizer alias (e.g., 'deepseek_v32') or "
     "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
     "is incompatible with AutoTokenizer.",
 )
@@ -303,6 +304,7 @@ def latency_command(
     exec_settings["performance_options"]["multi_block_mode"] = True
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Decoding Options
     if medusa_choices is not None:

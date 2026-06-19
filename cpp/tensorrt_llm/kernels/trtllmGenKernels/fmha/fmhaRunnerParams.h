@@ -229,6 +229,8 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr = nullptr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer
@@ -243,6 +245,8 @@ struct TllmGenFmhaRunnerParams
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t* firstSparseMaskOffsetsKvPtr;
+    // The variable sparse MLA topK lengths with shape [numTokensQ].
+    int32_t const* ptrSparseMlaTopKLens = nullptr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -294,6 +298,13 @@ struct TllmGenFmhaRunnerParams
     int mMaxSeqLenQ;
     // The max kv sequence length.
     int mMaxSeqLenKv;
+    // Optional JIT warmup shape.
+    bool mJITWarmup = false;
+    int mJITWarmupMaxNumRequests = 0;
+    int mJITWarmupMaxSeqLenQ = 0;
+    int mJITWarmupMaxSeqLenKv = 0;
+    // True when a prefill/context path intentionally uses a generation kernel.
+    bool mUseGenKernelForPrefill = false;
     // The attention window size for sliding window attention (sliding-window-attention is enabled when seqLenKv >
     // mAttentionWindowSize).
     int mAttentionWindowSize;
@@ -331,6 +342,7 @@ struct TllmGenFmhaRunnerParams
     // When seqlensQPtr[i] < mPackedMaskMaxSeqLenQ, the packed mask tensor has
     // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
     int32_t mPackedMaskMaxSeqLenQ = 0;
+    int32_t mSpecDecodingTargetMaxGenLen = 0;
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

@@ -6,7 +6,7 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig, Qwen3HybridConfig
 from .utils import get_device_memory
 import math
 
@@ -26,6 +26,7 @@ def calc_engine_setting(
     target_input_len: int,
     target_output_len: int,
     kv_cache_gpu_mem_fraction: float = 0.95,
+    enable_attention_dp: bool = False,
 ) -> Tuple[int, int]:
     """ Calculate the engine build settings (max batch size and max num tokens)
         for a specific model + parallelism mapping + dataset configuration.
@@ -44,6 +45,9 @@ def calc_engine_setting(
         target_output_len (int): Target output length to compile the engine.
         kv_cache_gpu_mem_fraction (float): Fraction of free memory to allocate
             for KV cache.
+        enable_attention_dp (bool): Whether attention data parallelism is
+            enabled. When True, each TP rank independently manages its own
+            KV cache and batch, so max_batch_size is computed per-rank.
 
     Raises:
         RuntimeError: When the number of GPUs or amount of KV cache is unable to
@@ -67,9 +71,24 @@ def calc_engine_setting(
 
     # Number of GPU used for this run.
     n_gpus = tp_size * pp_size
-    # Total engine size.
-    engine_size = model_config.param_count * byte_per_elem / (1024**3)
-    total_gpu_memory = get_device_memory() * n_gpus
+    # Use checkpoint size from safetensors metadata for accurate estimation.
+    # This is critical for quantized models (e.g. NVFP4) where different
+    # tensors have different dtypes.
+    if model_config.checkpoint_size_in_gb > 0:
+        engine_size = model_config.checkpoint_size_in_gb
+    else:
+        # Fallback to param_count-based estimation for backward compatibility.
+        engine_size = model_config.param_count * byte_per_elem / (1024**3)
+    # With attention DP, each TP rank independently manages its own KV cache.
+    # Attention weights are replicated across TP ranks, while MoE/MLP weights
+    # are distributed via expert parallelism (EP). We approximate per-rank
+    # engine size as total / tp_size, which slightly underestimates because
+    # replicated attention weights are small relative to distributed MoE weights.
+    if enable_attention_dp:
+        total_gpu_memory = get_device_memory() * pp_size
+        engine_size = engine_size / tp_size
+    else:
+        total_gpu_memory = get_device_memory() * n_gpus
     # Available memory to allocate KV cache.
     available_memory = total_gpu_memory - engine_size
     logger.info(f"Estimated engine size: {engine_size:.2f} GB")
@@ -82,7 +101,7 @@ def calc_engine_setting(
         kv_cache_gpu_mem_fraction)
 
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
-    if isinstance(model_config, NemotronHybridConfig):
+    if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
         mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
         if mamba_ssm_cache_dtype != "auto":
             if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
@@ -110,8 +129,8 @@ def calc_engine_setting(
         target_input_len,
         target_output_len,
         pp_size,
-        disable_optimistic_tuning=isinstance(model_config,
-                                             NemotronHybridConfig))
+        disable_optimistic_tuning=isinstance(
+            model_config, (NemotronHybridConfig, Qwen3HybridConfig)))
 
     # Functional and performance
     if total_gpu_memory < engine_size:
@@ -136,7 +155,8 @@ def calc_engine_setting(
     if kv_cache_max_requests < 1:
         raise RuntimeError("The amount of KV cache memory is insufficient to "
                            "run this model. Please try with more GPUs.")
-    if cache_memory / n_gpus < 10.0:
+    warning_gpu_count = pp_size if enable_attention_dp else n_gpus
+    if cache_memory / warning_gpu_count < 10.0:
         logger.warning(
             f"The KV cache memory per GPU is less than 10 GB. "
             "Performance may be undesirable. Please consider using a different "

@@ -485,9 +485,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         = executorConfig.getSpecDecConfig().has_value() && executorConfig.getSpecDecConfig()->fastLogits;
     if (mSpeculativeDecodingFastLogits && modelConfig.getSpeculativeDecodingMode().isNone() && mIsLeaderInOrchMode)
     {
-        mDraftModelSendLogitsThread = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice,
-            &mDraftModelThreadShouldExit, &mDraftRequestsWaitingToSendLogits, mSeqSlotManager, getMaxInputLen(),
-            mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
+        mDraftModelSendLogitsThread
+            = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice, &mDraftModelThreadShouldExit,
+                &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsMtx);
     }
 
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
@@ -670,11 +670,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
     }
 
-    kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
-    tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
-    tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
-    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
-
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.getEnableBlockReuse())
     {
         TLLM_LOG_INFO(
@@ -684,10 +679,10 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.getEnableBlockReuse() : false;
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(),
-        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(), enableBlockReuse,
-        kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
+        blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, kvDtype, getSinkTokenLen(),
+        mRuntime->getStreamPtr(),
+        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(),
+        getMaxNumTokens().value(), enableBlockReuse, kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
@@ -904,6 +899,19 @@ void TrtGptModelInflightBatching::forwardSync()
             }
         }
 
+        // Terminate draft requests whose logits have been sent by the background thread.
+        {
+            RequestVector doneSending;
+            {
+                std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
+                doneSending.swap(mDraftRequestsDoneSendingLogits);
+            }
+            for (auto const& llmReq : doneSending)
+            {
+                terminateRequest(llmReq);
+            }
+        }
+
         // Finished context requests have been moved to generationRequests by moveFinishedContextRequestsToGeneration
         for (auto const& llmReq : currRequests.generationRequests)
         {
@@ -915,7 +923,7 @@ void TrtGptModelInflightBatching::forwardSync()
                     TLLM_CHECK_WITH_INFO(mCacheTransceiver,
                         "Disaggregated serving is not enabled, please check the configuration of "
                         "cacheTransceiverConfig.");
-                    mCacheTransceiver->respondAndSendAsync(llmReq.get());
+                    mCacheTransceiver->respondAndSendAsync(llmReq);
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
             }
@@ -1596,11 +1604,11 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
             mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
         if (common::getEnvDisableKVCacheTransferOverlap())
         {
-            mCacheTransceiver->requestAndReceiveSync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveSync(newGenReq);
         }
         else
         {
-            mCacheTransceiver->requestAndReceiveAsync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveAsync(newGenReq);
         }
     }
     if (!common::getEnvDisableKVCacheTransferOverlap())
@@ -2524,6 +2532,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             {
                 if (llmReq->getReturnGenerationLogits() && mSpeculativeDecodingFastLogits && mIsLeaderInOrchMode)
                 {
+                    std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
                     mDraftRequestsWaitingToSendLogits.push_back(llmReq);
                 }
                 else

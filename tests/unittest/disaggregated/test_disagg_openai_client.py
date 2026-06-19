@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
 import pytest
@@ -194,9 +194,9 @@ class TestOpenAIHttpClient:
         mock_response = self.dummy_response()
 
         mock_http_response = AsyncMock()
+        mock_http_response.status = 200
         mock_http_response.headers = {"Content-Type": "application/json"}
         mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
-        mock_http_response.raise_for_status = Mock()
         mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
         mock_http_response.__aexit__ = AsyncMock()
 
@@ -231,9 +231,9 @@ class TestOpenAIHttpClient:
         mock_response = self.dummy_response()
 
         mock_http_response = AsyncMock()
+        mock_http_response.status = 200
         mock_http_response.headers = {"Content-Type": "application/json"}
         mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
-        mock_http_response.raise_for_status = Mock()
         mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
         mock_http_response.__aexit__ = AsyncMock()
 
@@ -269,3 +269,146 @@ class TestOpenAIHttpClient:
         """Test handling of invalid request type."""
         with pytest.raises(ValueError, match="Invalid request type"):
             await openai_client.send_request("invalid_request")
+
+
+class TestHttpErrorBodyPreservation:
+    """Test that HTTP 4xx/5xx errors include the response body (TRTLLM-11123)."""
+
+    def _mock_http_error(self, status, body):
+        r = AsyncMock()
+        r.status = status
+        r.reason = "Bad Request" if status == 400 else "Internal Server Error"
+        r.text = AsyncMock(return_value=body)
+        r.headers = {"Content-Type": "application/json"}
+        r.request_info = MagicMock()
+        r.history = ()
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _make_client(self, session, **kwargs):
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        return OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=0,
+            session=session,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status,body",
+        [
+            (400, '{"error":"missing field X"}'),
+            (500, "internal failure detail"),
+        ],
+    )
+    async def test_error_body_in_exception(self, status, body):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._mock_http_error(status, body)
+        client = self._make_client(session)
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
+        )
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await client.send_request(req)
+        assert body[:20] in str(exc_info.value.message)
+
+
+class TestDisaggIdRegenOnRetry:
+    """Test that disagg_request_id is regenerated on retry (TRTLLM-11123)."""
+
+    def _ok_response(self):
+        return CompletionResponse(
+            model="m",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+            choices=[CompletionResponseChoice(index=0, text="ok")],
+        ).model_dump()
+
+    def _mock_http_ok(self, json_val):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "application/json"}
+        r.json = AsyncMock(return_value=json_val)
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock()
+        return r
+
+    def _make_client(self, session, **kwargs):
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        return OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=2,
+            retry_interval_sec=0,
+            session=session,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_regenerates_disagg_id(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ids = iter(range(1000, 2000))
+        client = self._make_client(session, disagg_id_generator=lambda: next(ids))
+
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            resp = await client.send_request(req)
+
+        assert req.disaggregated_params.disagg_request_id != 42
+        assert isinstance(resp, CompletionResponse)
+
+    @pytest.mark.asyncio
+    async def test_no_generator_keeps_original_id(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session)  # no disagg_id_generator
+
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(self._ok_response()),
+        ]
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(req)
+
+        assert req.disaggregated_params.disagg_request_id == 42

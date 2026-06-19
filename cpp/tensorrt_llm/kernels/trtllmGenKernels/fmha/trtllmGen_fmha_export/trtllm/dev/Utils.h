@@ -30,6 +30,16 @@ namespace dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// __block_size__ is only supported in CUDA 13 and later.
+// We can always emit the macro, and it will simply be ignored in CUDA 12.
+#if !defined(TLLM_DISABLE_BLOCK_SIZE) && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
+#else
+#define TLLM_BLOCK_SIZE(bx, by, bz)
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename T> inline __device__ T clamp(T x, T lb, T ub) {
   return (x < lb) ? lb : (x > ub ? ub : x);
 }
@@ -90,21 +100,118 @@ inline __device__ void cpAsync(T* dst,
     uint32_t* dstUInt32 = reinterpret_cast<uint32_t*>(dst + dstOffset);
     uint32_t const* srcUInt32 = reinterpret_cast<uint32_t const*>(src + srcOffset);
     uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt32));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dstU32), "l"(srcUInt32));
+    // .ca only (PTX: cp.async.cg requires size==16). L2::128B still promotes
+    // DRAM line fetches to 128B regardless of the .ca/.cg cache scope.
+    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n" ::"r"(dstU32),
+                 "l"(srcUInt32));
   } else if (cpSize == 8) {
     uint64_t* dstUInt64 = reinterpret_cast<uint64_t*>(dst + dstOffset);
     uint64_t const* srcUInt64 = reinterpret_cast<uint64_t const*>(src + srcOffset);
     uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt64));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(dstU32), "l"(srcUInt64));
+    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 8;\n" ::"r"(dstU32),
+                 "l"(srcUInt64));
   } else if (cpSize == 16) {
+    // .cg (cache-global, L1 bypass) + L2::128B — matches CuteDSL's
+    // LDGSTS.E.BYPASS.LTC128B SASS. 16B is the only size .cg accepts.
     uint4* dstUInt128 = reinterpret_cast<uint4*>(dst + dstOffset);
     uint4 const* srcUInt128 = reinterpret_cast<uint4 const*>(src + srcOffset);
     uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt128));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(dstU32), "l"(srcUInt128));
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(dstU32),
+                 "l"(srcUInt128));
   } else {
     assert(0 && "cpSize is not supported"); // The compiler will eliminate that code.
   }
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Predicated cp.async. Same semantics as `if (pred) cpAsync(...)` but without an
+// enclosing C++ scope -- callers can issue a straight-line sequence of predicated
+// LDGSTSes and let nvcc CSE stride/pointer LDCs and address arithmetic across them.
+// 4B/8B variants use `.ca` (L1-cached); `.cg` is legal only at 16B.
+template <typename T>
+inline __device__ void cpAsyncPredicated(bool pred,
+                                         T* dst,
+                                         T const* src,
+                                         int32_t dstOffset = 0,
+                                         int64_t srcOffset = 0,
+                                         const int cpSize = sizeof(T)) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  int predI32 = static_cast<int>(pred);
+  if (cpSize == 4) {
+    uint32_t* dstUInt32 = reinterpret_cast<uint32_t*>(dst + dstOffset);
+    uint32_t const* srcUInt32 = reinterpret_cast<uint32_t const*>(src + srcOffset);
+    uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt32));
+    asm volatile("{\n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.s32 p, %2, 0;\n"
+                 "  @p cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n"
+                 "}\n" ::"r"(dstU32),
+                 "l"(srcUInt32),
+                 "r"(predI32));
+  } else if (cpSize == 8) {
+    uint64_t* dstUInt64 = reinterpret_cast<uint64_t*>(dst + dstOffset);
+    uint64_t const* srcUInt64 = reinterpret_cast<uint64_t const*>(src + srcOffset);
+    uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt64));
+    asm volatile("{\n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.s32 p, %2, 0;\n"
+                 "  @p cp.async.ca.shared.global.L2::128B [%0], [%1], 8;\n"
+                 "}\n" ::"r"(dstU32),
+                 "l"(srcUInt64),
+                 "r"(predI32));
+  } else if (cpSize == 16) {
+    uint4* dstUInt128 = reinterpret_cast<uint4*>(dst + dstOffset);
+    uint4 const* srcUInt128 = reinterpret_cast<uint4 const*>(src + srcOffset);
+    uint32_t dstU32 = static_cast<uint32_t>(__cvta_generic_to_shared(dstUInt128));
+    asm volatile("{\n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.s32 p, %2, 0;\n"
+                 "  @p cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+                 "}\n" ::"r"(dstU32),
+                 "l"(srcUInt128),
+                 "r"(predI32));
+  } else {
+    assert(0 && "cpSize is not supported"); // The compiler will eliminate that code.
+  }
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool CxIsOne, bool CyIsOne, bool CzIsOne>
+inline __device__ dim3 getBlockIdInCluster() {
+  dim3 result;
+  if constexpr (CxIsOne) {
+    result.x = 0u;
+  } else {
+    asm volatile("mov.u32 %0, %%cluster_ctaid.x;\n" : "=r"(result.x) : );
+  }
+  if constexpr (CyIsOne) {
+    result.y = 0u;
+  } else {
+    asm volatile("mov.u32 %0, %%cluster_ctaid.y;\n" : "=r"(result.y) : );
+  }
+  if constexpr (CzIsOne) {
+    result.z = 0u;
+  } else {
+    asm volatile("mov.u32 %0, %%cluster_ctaid.z;\n" : "=r"(result.z) : );
+  }
+  return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool IsSingleBlock>
+inline __device__ uint32_t getBlockRankInCluster() {
+  if constexpr (IsSingleBlock) {
+    return 0u;
+  } else {
+    uint32_t rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank) : );
+    return rank;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -416,6 +523,60 @@ initPersistentSchedulerSm90Params(KernelParams const& kernelParams,
   }
 
   return schedulerParams;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Relaxed arrive-and-wait at GPU scope.
+// Flips the MSB phase bit of *ptr by adding (arrivalCount + 0x80000000u - totalArrivals),
+// then spins until the phase bit changes.
+inline __device__ void arriveAndWaitRelaxedGpu(uint32_t* ptr,
+                                               uint32_t arrivalCount,
+                                               uint32_t totalArrivals) {
+  uint32_t phaseFlip = arrivalCount + 0x80000000u - totalArrivals;
+  uint32_t prevPhase =
+    0x80000000u &
+    __nv_atomic_fetch_add(ptr, phaseFlip, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_DEVICE);
+  while (prevPhase ==
+         (0x80000000u & __nv_atomic_load_n(ptr, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_DEVICE))) {
+  }
+}
+
+// Relaxed arrive-and-wait at SYS scope.
+// Flips the MSB phase bit of *ptr by adding (0x80000000u - totalArrivals),
+// then spins until the phase bit changes.
+inline __device__ void arriveAndWaitRelaxedSys(uint32_t* ptr, uint32_t totalArrivals) {
+  uint32_t phaseFlip = 0x80000000u - totalArrivals;
+  uint32_t prevPhase =
+    0x80000000u &
+    __nv_atomic_fetch_add(ptr, phaseFlip, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_SYSTEM);
+  while (prevPhase ==
+         (0x80000000u & __nv_atomic_load_n(ptr, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_SYSTEM))) {
+  }
+}
+
+// Relaxed global-memory atomic red with SYS-scope semantics
+inline __device__ void redRelaxedSys(uint32_t* ptr, uint32_t val) {
+  asm("red.relaxed.sys.global.add.u32 [%0], %1;"
+      :
+      : "l"((uint64_t)__cvta_generic_to_global(ptr)), "r"(val)
+      : "memory");
+}
+
+// Asynchronous global-memory atomic red with GPU-scope release semantics.
+inline __device__ void redAsyncReleaseGpu(uint32_t* ptr, uint32_t val) {
+  asm("red.async.release.gpu.global.add.u32 [%0], %1;"
+      :
+      : "l"((uint64_t)__cvta_generic_to_global(ptr)), "r"(val)
+      : "memory");
+}
+
+// Asynchronous global-memory atomic red with SYS-scope release semantics.
+inline __device__ void redAsyncReleaseSys(uint32_t* ptr, uint32_t val) {
+  asm("red.async.release.sys.global.add.u32 [%0], %1;"
+      :
+      : "l"((uint64_t)__cvta_generic_to_global(ptr)), "r"(val)
+      : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

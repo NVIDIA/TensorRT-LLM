@@ -15,473 +15,212 @@
 import asyncio
 import atexit
 import itertools
-import os
-import queue
-import socket
-import threading
-import time
-import traceback
+import secrets
+import sys
 import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
-import torch.multiprocessing as mp
-import zmq
-
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
-from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.executor import (
+    DiffusionRemoteClient,
+    _detect_external_launch,
+    run_diffusion_worker,
+)
+from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.params import VisualGenParams
+from tensorrt_llm.visual_gen.output import VisualGenOutput
+from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
 
 __all__ = [
     "VisualGen",
     "VisualGenParams",
     "ExtraParamSchema",
-    "MediaOutput",
-    "VisualGenError",
-    "VisualGenParamsError",
     "VisualGenResult",
 ]
-from tensorrt_llm.executor.ipc import ZeroMqQueue
-from tensorrt_llm.inputs.data import VisualGenInputs
 from tensorrt_llm.llmapi.utils import set_api_status
 from tensorrt_llm.logger import logger
-
-# Timeouts (seconds)
-POLL_TIMEOUT = 0.01
-AWAIT_TIMEOUT = 0.05
-THREAD_TIMEOUT = 5.0
-WORKER_TIMEOUT = 2.0
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def get_ip_address() -> str:
-    """Get local IP address."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
-@set_api_status("prototype")
-class VisualGenError(RuntimeError):
-    """Base exception for all VisualGen operations."""
-
-
-@set_api_status("prototype")
-class VisualGenParamsError(ValueError):
-    """Raised when request parameters fail validation.
-
-    This covers unknown parameter keys, unsupported universal fields
-    for the loaded pipeline, type mismatches, and out-of-range values.
-    Caught by the executor so it returns an error response rather than
-    crashing the server.
-    """
-
-
-class DiffusionRemoteClient:
-    """Client proxy for remote DiffusionExecutor in worker processes."""
-
-    def __init__(
-        self,
-        args: VisualGenArgs,
-    ):
-        self.args = args
-        self.n_workers = args.parallel.n_workers
-
-        # Setup distributed env
-        self.master_addr = "127.0.0.1"
-        self.master_port = find_free_port()
-
-        # Setup IPC addresses
-        self.host_ip = get_ip_address()
-        req_port, resp_port = find_free_port(), find_free_port()
-
-        self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-        self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-        self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
-        self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
-
-        # Generate shared HMAC keys for IPC authentication
-        self.req_hmac_key = os.urandom(32)
-        self.resp_hmac_key = os.urandom(32)
-
-        # IPC setup
-        self.requests_ipc = None
-        self.responses_ipc = None
-        self.pending_requests = queue.Queue()
-        self.completed_responses: Dict[int, DiffusionResponse] = {}
-
-        # We'll create asyncio primitives in the background thread's event loop
-        self._event_loop = None
-        self.response_event = None
-        self.lock = None
-        self.shutdown_event = threading.Event()
-        self.event_loop_ready = threading.Event()
-
-        # Start background thread (it will create its own event loop)
-        self.background_thread = threading.Thread(target=self._serve_forever_thread, daemon=True)
-        self.background_thread.start()
-
-        # Wait for the background thread to initialize the event loop
-        self.event_loop_ready.wait()
-
-        # Pipeline metadata — populated by _wait_ready from the READY signal.
-        self.default_generation_params: Dict = {}
-        self.extra_param_specs: Dict = {}
-
-        # Launch workers (VisualGenArgs is pickled via mp.Process spawn context)
-        n_workers = self.n_workers
-        logger.info(f"DiffusionClient: Launching {n_workers} workers")
-        ctx = mp.get_context("spawn")
-        self.worker_processes = []
-        for rank in range(n_workers):
-            p = ctx.Process(
-                target=run_diffusion_worker,
-                kwargs={
-                    "rank": rank,
-                    "world_size": n_workers,
-                    "master_addr": self.master_addr,
-                    "master_port": self.master_port,
-                    "request_queue_addr": self.req_addr_connect,
-                    "response_queue_addr": self.resp_addr_connect,
-                    "diffusion_args": self.args,
-                    "req_hmac_key": self.req_hmac_key,
-                    "resp_hmac_key": self.resp_hmac_key,
-                    "log_level": logger.level,
-                },
-            )
-            p.start()
-            self.worker_processes.append(p)
-
-        self._wait_ready()
-
-    @staticmethod
-    def _close_socket(ipc_queue):
-        if ipc_queue and ipc_queue.socket:
-            ipc_queue.socket.setsockopt(zmq.LINGER, 0)
-            ipc_queue.close()
-
-    def enqueue_requests(self, requests: List[DiffusionRequest]) -> List[int]:
-        """Enqueue requests and return their IDs."""
-        req_ids = []
-        for req in requests:
-            self.pending_requests.put(req)
-            req_ids.append(req.request_id)
-        return req_ids
-
-    async def await_responses(
-        self, request_ids: Union[int, List[int]], timeout: Optional[float] = None
-    ) -> Union[DiffusionResponse, List[DiffusionResponse]]:
-        """Wait for responses by request IDs.
-
-        Args:
-            request_ids: Single request ID or list of request IDs to wait for
-            timeout: Maximum total wait time in seconds (None = wait indefinitely)
-
-        Returns:
-            Single response or list of responses (None if request timed out)
-        """
-        is_single = isinstance(request_ids, int)
-        ids = [request_ids] if is_single else request_ids
-
-        start_time = time.time()
-        results = {}
-
-        while len(results) < len(ids):
-            async with self.lock:
-                for req_id in ids:
-                    if req_id in self.completed_responses:
-                        results[req_id] = self.completed_responses.pop(req_id)
-
-            # All responses collected
-            if len(results) == len(ids):
-                break
-
-            # Check if overall timeout exceeded
-            if timeout is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= timeout:
-                    break
-                # Wait for remaining time or AWAIT_TIMEOUT, whichever is shorter
-                wait_time = min(timeout - elapsed, AWAIT_TIMEOUT)
-            else:
-                wait_time = AWAIT_TIMEOUT
-
-            try:
-                await asyncio.wait_for(self.response_event.wait(), timeout=wait_time)
-            except asyncio.TimeoutError:
-                pass
-            self.response_event.clear()
-
-        out = [results.get(rid) for rid in ids]
-        return out[0] if is_single else out
-
-    def await_responses_sync(
-        self, request_ids: Union[int, List[int]], timeout: Optional[float] = None
-    ) -> Union[DiffusionResponse, List[DiffusionResponse]]:
-        """Sync wrapper to await responses from the main thread."""
-        future = asyncio.run_coroutine_threadsafe(
-            self.await_responses(request_ids, timeout), self._event_loop
-        )
-        return future.result(timeout=timeout if timeout else None)
-
-    def _init_ipc(self) -> bool:
-        """Initialize IPC queues."""
-        try:
-            logger.info("DiffusionClient: Initializing IPC")
-            self.requests_ipc = ZeroMqQueue(
-                (self.request_queue_addr, self.req_hmac_key),
-                is_server=True,
-                socket_type=zmq.PUSH,
-                use_hmac_encryption=True,
-            )
-            self.responses_ipc = ZeroMqQueue(
-                (self.response_queue_addr, self.resp_hmac_key),
-                is_server=True,
-                socket_type=zmq.PULL,
-                use_hmac_encryption=True,
-            )
-            logger.info("DiffusionClient: IPC ready")
-            return True
-        except Exception as e:
-            logger.error(f"DiffusionClient: IPC init failed: {e}")
-            return False
-
-    def _send_shutdown(self):
-        """Send shutdown signal."""
-        logger.info("DiffusionClient: Sending shutdown signal")
-        if self.requests_ipc:
-            self.requests_ipc.put(None)
-            self._close_socket(self.requests_ipc)
-
-    def _process_requests(self):
-        """Process pending requests."""
-        try:
-            req = self.pending_requests.get(timeout=POLL_TIMEOUT)
-            if req is None:
-                self._send_shutdown()
-                self.shutdown_event.set()
-                return
-
-            logger.info(f"DiffusionClient: Sending request {req.request_id}")
-            self.requests_ipc.put(req)
-        except queue.Empty:
-            pass
-        except Exception as e:
-            logger.error(f"DiffusionClient: Error sending request: {e}")
-            logger.error(traceback.format_exc())
-
-    def _process_responses(self):
-        """Poll and process responses."""
-        try:
-            if self.responses_ipc.poll(timeout=POLL_TIMEOUT):
-                response = self.responses_ipc.get()
-                if isinstance(response, DiffusionResponse):
-                    if response.request_id == -1:
-                        logger.info("DiffusionClient: Received READY signal")
-
-                    # Schedule the lock acquisition and event setting in the event loop
-                    asyncio.run_coroutine_threadsafe(
-                        self._store_response(response), self._event_loop
-                    )
-        except Exception as e:
-            logger.error(f"DiffusionClient: Error processing response: {e}")
-
-    async def _store_response(self, response: DiffusionResponse):
-        """Store response in the completed_responses dict (async helper)."""
-        async with self.lock:
-            self.completed_responses[response.request_id] = response
-        self.response_event.set()
-
-    def _cleanup_ipc(self):
-        """Cleanup IPC."""
-        logger.info("DiffusionClient: Cleaning up IPC")
-        self._close_socket(self.requests_ipc)
-        self._close_socket(self.responses_ipc)
-
-    def _serve_forever_thread(self):
-        """Background thread wrapper that creates and runs an event loop."""
-        logger.info("DiffusionClient: Background thread started")
-
-        # Create a new event loop for this thread
-        self._event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._event_loop)
-
-        # Create async primitives in this thread's event loop
-        self.response_event = asyncio.Event()
-        self.lock = asyncio.Lock()
-
-        # Signal that the event loop is ready
-        self.event_loop_ready.set()
-
-        # Run the async serve_forever
-        try:
-            self._event_loop.run_until_complete(self._serve_forever())
-        finally:
-            self._event_loop.close()
-            logger.info("DiffusionClient: Background thread stopped")
-
-    async def _serve_forever(self):
-        """Background thread main loop (async version)."""
-        if not self._init_ipc():
-            return
-
-        while not self.shutdown_event.is_set():
-            self._process_requests()
-            self._process_responses()
-            await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
-
-        self._cleanup_ipc()
-
-    def shutdown(self):
-        """Shutdown client and workers."""
-        logger.info("DiffusionClient: Shutting down")
-        self.pending_requests.put(None)
-
-        self.background_thread.join(timeout=THREAD_TIMEOUT)
-        if self.background_thread.is_alive():
-            logger.warning("DiffusionClient: Force stopping background thread")
-            self.shutdown_event.set()
-            self.background_thread.join(timeout=1.0)
-
-        # Shutdown workers
-        logger.info("DiffusionClient: Stopping workers")
-        for p in self.worker_processes:
-            p.join(timeout=WORKER_TIMEOUT)
-            if p.is_alive():
-                logger.warning(f"DiffusionClient: Terminating worker {p.pid} with SIGTERM")
-                p.terminate()
-                p.join(timeout=WORKER_TIMEOUT)
-                if p.is_alive():
-                    logger.warning(f"DiffusionClient: Force killing worker {p.pid} with SIGKILL")
-                    p.kill()
-                    p.join(timeout=WORKER_TIMEOUT)
-
-    def _wait_ready(self):
-        """Wait for workers to be ready (sync wrapper for async operation)."""
-        logger.info("DiffusionClient: Waiting for workers")
-
-        future = asyncio.run_coroutine_threadsafe(self._wait_ready_async(), self._event_loop)
-        try:
-            future.result()
-        except Exception:
-            self.shutdown()
-            raise
-
-    async def _wait_ready_async(self):
-        """Wait for workers to be ready (async version).
-
-        Polls indefinitely for the ready signal. If any worker process dies
-        during initialization, raises RuntimeError immediately (LLM-style).
-        """
-        start_time = time.time()
-        last_log_time = start_time
-        log_interval = 300
-
-        while True:
-            async with self.lock:
-                if -1 in self.completed_responses:
-                    ready_resp = self.completed_responses.pop(-1)
-                    # Extract pipeline metadata from the READY payload.
-                    payload = ready_resp.output
-                    if isinstance(payload, dict):
-                        self.default_generation_params = payload.get(
-                            "default_generation_params", {}
-                        )
-                        self.extra_param_specs = payload.get("extra_param_specs", {})
-                    elapsed = time.time() - start_time
-                    logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
-                    return
-
-            if any(not p.is_alive() for p in self.worker_processes):
-                raise RuntimeError("DiffusionClient: Worker died during initialization")
-
-            now = time.time()
-            if now - last_log_time >= log_interval:
-                elapsed = now - start_time
-                logger.info(f"DiffusionClient: Still waiting for workers ({elapsed:.0f}s elapsed)")
-                last_log_time = now
-
-            try:
-                await asyncio.wait_for(self.response_event.wait(), timeout=AWAIT_TIMEOUT)
-            except asyncio.TimeoutError:
-                pass
-            self.response_event.clear()
 
 
 @set_api_status("prototype")
 class VisualGenResult:
-    """Future-like object for async generation."""
+    """Future-like awaitable handle for a VisualGen request.
 
-    def __init__(self, request_id: int, executor: DiffusionRemoteClient):
+    A single instance backs both single-prompt and batch-prompt requests:
+
+    - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
+      Underlying-request failure raises :class:`RuntimeError`.
+    - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
+      Per-item or whole-batch failure never raises; failed items carry
+      ``error != None`` (Option B semantics).
+
+    Three wait flavors are supported:
+
+    - ``await handle`` — preferred async style; equivalent to
+      ``await handle.aresult()``.
+    - ``handle.aresult(timeout=None)`` — explicit async coroutine; usable
+      from any async context (e.g., FastAPI handlers).
+    - ``handle.result(timeout=None)`` — blocking call for non-async callers.
+    """
+
+    def __init__(
+        self,
+        request_id: int,
+        executor: "DiffusionRemoteClient",
+        batch_size: Optional[int] = None,
+    ):
         self.request_id = request_id
         self.executor = executor
-        self._result = None
+        # ``None`` means single-prompt; an int means batch and is the
+        # number of per-item outputs to fan out from one wire response.
+        self._batch_size = batch_size
+        self._resolved = None
         self._finished = False
-        self._error = None
 
     @property
     def done(self) -> bool:
-        """True if the generation has completed (successfully or with error)."""
+        """True once the underlying request has completed (success or error)."""
         return self._finished
 
-    async def result(self, timeout: Optional[float] = None) -> Any:
-        """Wait for and return result (async version).
+    def __await__(self):
+        return self.aresult().__await__()
 
-        Can be awaited from any async context (e.g., FastAPI background tasks).
+    async def aresult(self, timeout: Optional[float] = None):
+        """Wait for the underlying request and return the resolved value.
+
+        For single-prompt requests, returns a :class:`VisualGenOutput`. Raises
+        :class:`RuntimeError` on underlying-request failure.
+
+        For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
+        raises; failed items carry ``error != None``.
         """
         if self._finished:
-            if self._error:
-                raise VisualGenError(self._error)
-            return self._result
+            return self._resolved_value()
 
-        # Use run_coroutine_threadsafe to execute in the background thread's event loop
         future = asyncio.run_coroutine_threadsafe(
             self.executor.await_responses(self.request_id, timeout=timeout),
             self.executor._event_loop,
         )
-
-        # Await the future in the current event loop
         response = await asyncio.wrap_future(future)
 
         if response is None:
-            raise VisualGenError("Generation timed out")
-
-        if response.error_msg:
-            self._error = response.error_msg
+            # Timeout before any response. Tell the executor to drop any
+            # late-arriving response for this id so a full PipelineOutput
+            # tensor does not leak into completed_responses for the process
+            # lifetime, then persist the timeout as resolved error state so
+            # subsequent aresult()/result() calls replay the same outcome
+            # via the ``self._finished`` fast path instead of returning None.
+            abandon_future = asyncio.run_coroutine_threadsafe(
+                self.executor.abandon_request_id(self.request_id),
+                self.executor._event_loop,
+            )
+            await asyncio.wrap_future(abandon_future)
+            if self._batch_size is None:
+                self._resolved = VisualGenOutput(
+                    request_id=self.request_id, error="Generation timed out"
+                )
+            else:
+                self._resolved = [
+                    VisualGenOutput(request_id=self.request_id, error="Generation timed out")
+                    for _ in range(self._batch_size)
+                ]
             self._finished = True
-            raise VisualGenError(f"Generation failed: {response.error_msg}")
+            return self._resolved_value()
 
-        self._result = response.output
+        self._resolved = self._build_resolved(response)
         self._finished = True
-        return self._result
+        return self._resolved_value()
 
-    def result_sync(self, timeout: Optional[float] = None) -> Any:
-        """Blocking wrapper around result() for non-async callers."""
+    def result(self, timeout: Optional[float] = None):
+        """Blocking variant of :meth:`aresult` for non-async callers.
+
+        Internally dispatches to the executor's background event loop, so it
+        works even when called from inside a different event loop's thread.
+        """
+        # Only the inner ``aresult`` carries a timeout; it owns the
+        # ``abandon_request_id`` cleanup on the timeout branch. A second
+        # ``timeout`` on ``future.result`` would let the cross-thread wait
+        # raise before that cleanup runs, so a late-arriving response could
+        # leak into ``completed_responses``.
         future = asyncio.run_coroutine_threadsafe(
-            self.result(timeout=timeout),
+            self.aresult(timeout=timeout),
             self.executor._event_loop,
         )
-        return future.result(timeout=timeout)
+        return future.result()
 
     def cancel(self):
         raise NotImplementedError("Cancel request (not yet implemented).")
 
+    # ----- internals -----
+
+    def _build_resolved(self, response: "DiffusionResponse"):
+        if self._batch_size is None:
+            return to_visual_gen_output(response)
+        return split_visual_gen_output(response, self._batch_size)
+
+    def _resolved_value(self):
+        # For single prompts, surface engine-side failure as
+        # ``RuntimeError``. Request-parameter validation is enforced
+        # synchronously at :meth:`VisualGen.generate_async` entry, so
+        # anything reaching this point is by definition a runtime
+        # failure from ``pipeline.infer()``. For batches, return the
+        # list as-is so callers iterate per-item ``error``.
+        if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
+            if self._resolved.error is not None:
+                raise RuntimeError(f"Generation failed: {self._resolved.error}")
+        return self._resolved
+
 
 class VisualGen:
     """High-level API for visual generation."""
+
+    @classmethod
+    @set_api_status("prototype")
+    def supported_models(cls) -> List[str]:
+        """Return canonical HuggingFace model IDs of every registered pipeline.
+
+        The returned list is a *subset* of the variants each pipeline can
+        actually run. It typically contains the original official upstream
+        checkpoints and well-known optimized checkpoints (e.g. NVIDIA NVFP4 /
+        FP8 quantizations published on HuggingFace) that have been tested.
+        Other variants — community fine-tunes and quantizations not
+        enumerated here while some of them may run if no model architecture
+        changes.
+
+        IDs are returned sorted alphabetically for stable.
+        """
+        return sorted(hf_id for entry in PIPELINE_REGISTRY.values() for hf_id in entry.hf_ids)
+
+    @classmethod
+    @set_api_status("prototype")
+    def pipeline_config(cls, model: Union[str, Path]) -> Dict[str, Any]:
+        """Return the default ``pipeline_config`` knobs for ``model``.
+
+        ``model`` may be:
+
+        * A canonical HuggingFace model id (looked up in each entry's
+          ``hf_ids`` list — the common user-facing path).
+        * A local checkpoint path (resolved to ``_class_name`` via the same
+          logic ``PipelineLoader`` uses).
+        * A registered Diffusers ``_class_name`` (e.g. ``"WanPipeline"``)
+          for callers that already know the family.
+
+        Raises ``KeyError`` when no entry matches. The returned dict is a
+        copy — mutating it does not affect the registry.
+        """
+        key = str(model)
+        # 1. HF id match — most common user path.
+        for entry in PIPELINE_REGISTRY.values():
+            if key in entry.hf_ids:
+                return dict(entry.defaults)
+        # 2. Direct _class_name match.
+        if key in PIPELINE_REGISTRY:
+            return dict(PIPELINE_REGISTRY[key].defaults)
+        # 3. Local path — defer to PipelineLoader's resolution logic.
+        class_name = AutoPipeline._detect_from_checkpoint(key)
+        return dict(PIPELINE_REGISTRY[class_name].defaults)
 
     @set_api_status("prototype")
     def __init__(
@@ -490,7 +229,41 @@ class VisualGen:
         args: Optional[VisualGenArgs] = None,
     ):
         self.model = str(model)
-        self.args = (args or VisualGenArgs()).model_copy(update={"checkpoint_path": self.model})
+        self.args = (args or VisualGenArgs()).model_copy(update={"model": self.model})
+
+        # In external-launch mode (torchrun/srun), ranks 1..N-1 run as pure
+        # workers and never return to user code.
+        ext = _detect_external_launch()
+        if ext is not None:
+            rank, local_rank, world_size, master_addr, master_port = ext
+            n_workers = self.args.parallel_config.n_workers
+            if world_size != n_workers:
+                raise ValueError(
+                    f"Launcher world_size ({world_size}) does not match "
+                    f"n_workers ({n_workers}). "
+                    "Launch exactly n_workers tasks."
+                )
+            if rank != 0:
+                logger.info(
+                    f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
+                    "starting as worker (external launch mode)"
+                )
+                run_diffusion_worker(
+                    rank=rank,
+                    world_size=n_workers,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    request_queue_addr=None,  # unused: non-zero ranks receive requests via dist.broadcast_object_list
+                    response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
+                    visual_gen_args=self.args,
+                    req_hmac_key=None,
+                    resp_hmac_key=None,
+                    local_rank=local_rank,
+                )
+                sys.exit(0)
+            logger.info(
+                f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
+            )
 
         self.executor = DiffusionRemoteClient(
             args=self.args,
@@ -538,102 +311,110 @@ class VisualGen:
     @set_api_status("prototype")
     def generate(
         self,
-        inputs: VisualGenInputs,
-        params: VisualGenParams,
-    ) -> MediaOutput:
+        inputs: Union[str, List[str]],
+        params: Optional[VisualGenParams] = None,
+    ) -> Union[VisualGenOutput, List[VisualGenOutput]]:
         """Synchronous generation. Blocks until complete.
 
         Args:
-            params: Generation parameters.
+            inputs: Text prompt or list of prompts. A list triggers batch
+                inference and returns one :class:`VisualGenOutput` per prompt.
+            params: Single :class:`VisualGenParams` shared by every prompt
+                in the batch. A list of params is not yet supported.
 
         Returns:
-            MediaOutput: Generated media with model-specific fields populated:
-                - FLUX2: MediaOutput(image=torch.Tensor)
-                - WAN: MediaOutput(video=torch.Tensor)
-                - LTX2: MediaOutput(video=torch.Tensor, audio=torch.Tensor)
-        """
-        future = self.generate_async(
-            inputs=inputs,
-            params=params,
-        )
+            For a single prompt, a :class:`VisualGenOutput`. For a list of
+            prompts, ``List[VisualGenOutput]`` of the same length.
 
-        # Use the sync wrapper to get result
-        response = self.executor.await_responses_sync(future.request_id, timeout=None)
-        if response.error_msg:
-            raise VisualGenError(f"Generation failed: {response.error_msg}")
-        return response.output
+        Raises:
+            RuntimeError: Single-prompt path on underlying-request failure.
+                The batch path never raises on per-item or whole-batch
+                failure; failed items carry ``error != None``.
+            NotImplementedError: ``params`` is a list (per-item parameters
+                are not yet supported).
+        """
+        return self.generate_async(inputs=inputs, params=params).result(timeout=None)
 
     @set_api_status("prototype")
     def generate_async(
         self,
-        inputs: VisualGenInputs,
-        params: VisualGenParams,
+        inputs: Union[str, List[str]],
+        params: Optional[VisualGenParams] = None,
     ) -> VisualGenResult:
-        """Async generation. Returns immediately with future-like object.
+        """Async generation. Returns a :class:`VisualGenResult` handle.
+
+        ``await`` on the handle (or :meth:`VisualGenResult.aresult`) resolves
+        to a :class:`VisualGenOutput` for single-prompt input or a
+        ``List[VisualGenOutput]`` for batch input.
 
         Args:
-            params: Generation parameters.
+            inputs: Text prompt or list of prompts.
+            params: Single :class:`VisualGenParams` shared by every prompt.
+                A list of params is not yet supported.
 
-        Returns:
-            VisualGenResult: Call result() to get output dict.
+        Raises:
+            ValueError: ``inputs`` is empty or contains non-strings.
+            NotImplementedError: ``params`` is a list.
         """
+        if isinstance(params, list):
+            raise NotImplementedError(
+                "Per-item params (List[VisualGenParams]) are not supported in this "
+                "release; pass a single VisualGenParams shared across the batch."
+            )
+
         req_id = next(self._req_counter)
 
-        # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
-        # so DiffusionRequest.prompt is always a list.
-        if isinstance(inputs, dict):
-            prompt = [inputs.get("prompt")]
-            negative_prompt = inputs.get("negative_prompt", None)
-        elif isinstance(inputs, str):
+        # Normalize inputs to List[str] and remember whether the caller
+        # passed a single prompt so the handle resolves to the right shape.
+        if isinstance(inputs, str):
             prompt = [inputs]
-            negative_prompt = None
+            batch_size: Optional[int] = None
         elif isinstance(inputs, (list, tuple)):
-            # Batch generation: list of prompts
             if not inputs:
                 raise ValueError("Batch inputs must contain at least one item")
-
-            prompt = []
-            negative_prompts = []
-            for idx, inp in enumerate(inputs):
-                if isinstance(inp, str):
-                    prompt.append(inp)
-                    negative_prompts.append(None)
-                elif isinstance(inp, dict):
-                    item_prompt = inp.get("prompt")
-                    if item_prompt is None:
-                        raise ValueError(f"Batch input at index {idx} is missing 'prompt'")
-                    prompt.append(item_prompt)
-                    negative_prompts.append(inp.get("negative_prompt"))
-                else:
-                    raise ValueError(f"Invalid batch item type at index {idx}: {type(inp)}")
-
-            unique_negatives = {p for p in negative_prompts if p is not None}
-            if len(unique_negatives) > 1:
-                raise ValueError("Per-item negative_prompt is not supported for batch inputs")
-            negative_prompt = next(iter(unique_negatives), None)
+            if not all(isinstance(item, str) for item in inputs):
+                raise ValueError("Batch inputs must contain only strings (prompt text)")
+            prompt = list(inputs)
+            batch_size = len(prompt)
         else:
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
+
+        # Snapshot caller-provided params so later mutations don't affect
+        # the queued request (the dispatcher thread serializes it lazily).
+        # When the caller passed no params, materialize a default
+        # :class:`VisualGenParams` from the loaded pipeline's
+        # declared defaults + extra-param specs (cached on the executor
+        # from the READY signal) and skip validation — there's nothing
+        # user-supplied to validate against.
+        if params is not None:
+            resolved_params = params.model_copy(deep=True)
+            # Raising in the caller's process means ``ValueError`` reaches
+            # the user as a natural Python exception; the worker only has
+            # to deal with genuine runtime failures from ``pipeline.infer()``.
+            validate_visual_gen_params(
+                resolved_params,
+                declared_defaults=self.executor.default_generation_params,
+                extra_param_specs=self.executor.extra_param_specs,
+            )
+        else:
+            resolved_params = self.default_params
+
+        # Materialize the seed once, here at the public Python boundary,
+        # so every downstream layer (executor, broadcast, pipeline) sees
+        # a concrete int. Drawing on the coordinator process and
+        # broadcasting the resolved value keeps multi-rank parallelism
+        # (cfg_size, ulysses_size) deterministic.
+        if resolved_params.seed is None:
+            resolved_params.seed = secrets.randbits(63)
 
         request = DiffusionRequest(
             request_id=req_id,
             prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=params.height,
-            width=params.width,
-            num_inference_steps=params.num_inference_steps,
-            guidance_scale=params.guidance_scale,
-            max_sequence_length=params.max_sequence_length,
-            seed=params.seed,
-            num_frames=params.num_frames,
-            frame_rate=params.frame_rate,
-            num_images_per_prompt=params.num_images_per_prompt,
-            image=params.image,
-            image_cond_strength=params.image_cond_strength,
-            extra_params=params.extra_params,
+            params=resolved_params,
         )
 
         self.executor.enqueue_requests([request])
-        return VisualGenResult(req_id, self.executor)
+        return VisualGenResult(req_id, self.executor, batch_size=batch_size)
 
     @staticmethod
     def _atexit_shutdown(self_ref):

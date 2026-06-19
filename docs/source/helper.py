@@ -64,8 +64,18 @@ LLMAPI_SECTIONS = ["Basics", "Customization", "Slurm"]
 def generate_examples():
     root_dir = Path(__file__).parent.parent.parent.resolve()
     ignore_list = {
-        '__init__.py', 'quickstart_example.py', 'quickstart_advanced.py',
-        'quickstart_multimodal.py', 'star_attention.py'
+        '__init__.py',
+        'quickstart_example.py',
+        'quickstart_advanced.py',
+        'quickstart_multimodal.py',
+        'star_attention.py',
+        # Older VisualGen example scripts without ### :title metadata; opt
+        # in by adding the metadata block and removing the entry below.
+        'visual_gen_flux.py',
+        'visual_gen_ltx2.py',
+        'visual_gen_wan_i2v.py',
+        'visual_gen_wan_t2v.py',
+        'visual_gen_mgmn_distributed.sh'
     }
     doc_dir = root_dir / "docs/source/examples"
 
@@ -94,6 +104,13 @@ def generate_examples():
         doc_dir / f"{path.stem}.rst" for path in serve_script_paths
     ]
     serve_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/serve"
+
+    # Collect source paths for VisualGen examples
+    visual_gen_script_paths = collect_script_paths("visual_gen")
+    visual_gen_doc_paths = [
+        doc_dir / f"{path.stem}.rst" for path in visual_gen_script_paths
+    ]
+    visual_gen_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/visual_gen"
 
     def _get_lines_without_metadata(filename: str) -> str:
         """Get line ranges that exclude metadata lines.
@@ -267,6 +284,18 @@ def generate_examples():
                 example_name="Online Serving Examples",
                 section_order=[])
 
+    # Generate the toctree for VisualGen example scripts. No section_order
+    # while the example set is small; add one alongside ### :section
+    # metadata on the scripts once we have enough examples to group.
+    visual_gen_metas = write_scripts(visual_gen_script_base_url,
+                                     visual_gen_script_paths,
+                                     visual_gen_doc_paths)
+    write_index(metas=visual_gen_metas,
+                doc_template_path=doc_dir / "llm_examples_index.template.rst_",
+                doc_path=doc_dir / "visual_gen_examples.rst",
+                example_name="VisualGen Examples",
+                section_order=[])
+
 
 def extract_all_and_eval(file_path):
     ''' Extract the __all__ variable from a Python file.
@@ -368,6 +397,9 @@ def update_version():
         updated = content.replace(
             "nvcr.io/nvidia/tensorrt-llm/release:x.y.z",
             f"nvcr.io/nvidia/tensorrt-llm/release:{version}",
+        ).replace(
+            "nvcr.io/nvidia/tensorrt-llm/devel:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/devel:{version}",
         )
         if updated != content:
             with open(file_path, "w") as f:

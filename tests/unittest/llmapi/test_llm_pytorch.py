@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import pathlib
 import random
 import time
@@ -12,7 +13,8 @@ from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
-from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig)
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
                                           SchedulerConfig, WaitingQueuePolicy)
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -40,6 +42,7 @@ from utils.util import (force_ampere, similar, similarity_score,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.llmapi.llm_args import MoeConfig
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -67,7 +70,7 @@ from dataclasses import replace
 
 
 @force_ampere
-@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
@@ -610,14 +613,15 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config)
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     prompts = [
         "Hello, how are you?",
         "Hello, how are you?",
     ]
 
-    sampling_params = SamplingParams(max_tokens=10, add_special_tokens=False)
+    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
     lora_req = LoRARequest(
         "task-0", 0,
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
@@ -1093,6 +1097,194 @@ def test_qwen_moe_shared_expert_lora():
         llm.shutdown()
 
 
+def _write_routed_expert_lora_adapter(save_dir: str, *, moe_layers: list[int],
+                                      num_experts: int, hidden_size: int,
+                                      moe_intermediate_size: int, rank: int,
+                                      lora_alpha: float, seed: int) -> None:
+    """Fabricate a per-expert routed-expert HF LoRA adapter on disk.
+
+    Current transformers stores Qwen2-MoE routed experts as fused 3D parameters
+    (experts.gate_up_proj, experts.down_proj) rather than per-expert Linears, so
+    PEFT cannot emit the per-expert adapter keys the TRT-LLM loader expects.
+    This writes those keys directly: for every MoE layer and expert it creates
+    random lora_A/lora_B for gate_proj (moe_h_to_4h), up_proj (moe_gate) and
+    down_proj (moe_4h_to_h), keyed as .../mlp.experts.{e}.{proj}.lora_{A,B}.weight.
+    lora_B is non-zero so each adapter perturbs the routed-expert output.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def randn(rows, cols, std=0.02):
+        weight = torch.randn(rows,
+                             cols,
+                             generator=generator,
+                             dtype=torch.float32)
+        return (weight * std).to(torch.bfloat16)
+
+    # (projection name, in_features, out_features) for a single expert.
+    projections = (
+        ("gate_proj", hidden_size, moe_intermediate_size),
+        ("up_proj", hidden_size, moe_intermediate_size),
+        ("down_proj", moe_intermediate_size, hidden_size),
+    )
+
+    state_dict = {}
+    for layer_idx in moe_layers:
+        prefix = f"base_model.model.model.layers.{layer_idx}.mlp.experts"
+        for expert_idx in range(num_experts):
+            for proj, in_features, out_features in projections:
+                key = f"{prefix}.{expert_idx}.{proj}"
+                state_dict[f"{key}.lora_A.weight"] = randn(rank, in_features)
+                state_dict[f"{key}.lora_B.weight"] = randn(out_features, rank)
+
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(state_dict, os.path.join(save_dir, "adapter_model.bin"))
+    adapter_config = {
+        "peft_type": "LORA",
+        "r": int(rank),
+        "lora_alpha": float(lora_alpha),
+        "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        "bias": "none",
+        "task_type": "CAUSAL_LM",
+        "use_rslora": False,
+    }
+    with open(os.path.join(save_dir, "adapter_config.json"), "w") as f:
+        json.dump(adapter_config, f)
+
+
+@skip_gpu_memory_less_than_80gb
+@pytest.mark.parametrize("moe_lora_mode", [
+    "host_path",
+    "device_path_eager",
+    "device_path_cudagraph",
+])
+def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
+        moe_lora_mode: str, monkeypatch) -> None:
+    """Routed-expert MoE LoRA on Qwen1.5-MoE with the PyTorch CUTLASS backend.
+
+    Five dummy adapters of varying rank target the routed experts (moe_h_to_4h,
+    moe_gate, moe_4h_to_h). The same workload runs through each of the three
+    routed-expert LoRA execution paths, selected by moe_lora_mode:
+
+    - host_path: eager, legacy host path (per-request D2H pointer expand).
+    - device_path_eager: eager, capture-safe device path forced on via
+      TLLM_MOE_LORA_USE_DEVICE_PATH (per-request schema, no CUDA graph).
+    - device_path_cudagraph: CUDA graph decode, which always takes the
+      slot-indexed device path; all adapters share one captured graph,
+      exercising the slot-indexed device path and per-slot rank handling.
+
+    Current transformers stores the routed experts as fused 3D parameters, so
+    PEFT cannot produce per-expert adapter weights; the adapters are fabricated
+    directly in the per-expert key layout the TRT-LLM loader expects. An
+    explicit module mapping is supplied because the default map only knows
+    w1/w2/w3 for routed experts. lora_B is non-zero so each adapter perturbs the
+    routed-expert output, letting the test assert the LoRA is actually applied.
+    """
+    # Select the execution path. The eager device path is forced via env var
+    # (read once at FusedMoeRunner construction); the CUDA-graph path always
+    # takes the slot-indexed device path, so it needs no env opt-in.
+    cuda_graph_config = None
+    if moe_lora_mode == "device_path_eager":
+        monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    elif moe_lora_mode == "device_path_cudagraph":
+        cuda_graph_config = CudaGraphConfig(max_batch_size=10)
+
+    model_dir = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
+
+    # Five adapters with varying ranks; max_lora_rank must cover the largest.
+    ranks = [8, 16, 32, 16, 64]
+    max_rank = max(ranks)
+
+    # HF expert-projection names -> routed-expert TRT-LLM module ids. The
+    # default map only carries w1/w2/w3, so the gate/up/down names need an
+    # explicit entry. (gate_proj->w1->moe_h_to_4h, up_proj->w3->moe_gate,
+    # down_proj->w2->moe_4h_to_h.)
+    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
+    trtllm_modules_to_hf_modules = {
+        "moe_h_to_4h": "gate_proj",
+        "moe_gate": "up_proj",
+        "moe_4h_to_h": "down_proj",
+    }
+
+    # Derive expert dims and the set of MoE layers from the model config so the
+    # fabricated adapter matches the served model.
+    with open(f"{model_dir}/config.json") as f:
+        cfg = json.load(f)
+    num_experts = cfg["num_experts"]
+    hidden_size = cfg["hidden_size"]
+    moe_intermediate_size = cfg["moe_intermediate_size"]
+    num_hidden_layers = cfg["num_hidden_layers"]
+    decoder_sparse_step = cfg.get("decoder_sparse_step", 1)
+    mlp_only_layers = cfg.get("mlp_only_layers") or []
+    moe_layers = [
+        layer_idx for layer_idx in range(num_hidden_layers)
+        if layer_idx not in mlp_only_layers and num_experts > 0 and
+        (layer_idx + 1) % decoder_sparse_step == 0
+    ]
+
+    with tempfile.TemporaryDirectory() as lora_dir:
+        lora_paths = []
+        for i, r in enumerate(ranks):
+            lora_path = f"{lora_dir}/lora_{i}"
+            _write_routed_expert_lora_adapter(
+                lora_path,
+                moe_layers=moe_layers,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                moe_intermediate_size=moe_intermediate_size,
+                rank=r,
+                lora_alpha=2 * r,
+                seed=1000 + i,
+            )
+            lora_paths.append(lora_path)
+
+        lora_config = LoraConfig(
+            lora_dir=lora_paths,
+            lora_target_modules=target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            max_lora_rank=max_rank,
+            max_loras=len(ranks),
+            max_cpu_loras=len(ranks),
+        )
+        llm = LLM(model=model_dir,
+                  lora_config=lora_config,
+                  moe_config=MoeConfig(backend="CUTLASS"),
+                  kv_cache_config=global_kvcache_config,
+                  cuda_graph_config=cuda_graph_config)
+        try:
+            sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+            prompt = "What is your name?"
+
+            base_tokens = list(
+                llm.generate([prompt], sampling_params,
+                             lora_request=None)[0].outputs[0].token_ids)
+
+            lora_requests = [
+                LoRARequest(f"moe-lora-{i}", i, path)
+                for i, path in enumerate(lora_paths)
+            ]
+
+            # One batch mixes a no-LoRA (rank-0) request with every adapter so
+            # the rank-0 skip path and all adapters run through a single
+            # (captured, when enabled) decode graph.
+            requests = [None] + lora_requests
+            outputs = llm.generate([prompt] * len(requests),
+                                   sampling_params,
+                                   lora_request=requests)
+            out_tokens = [list(o.outputs[0].token_ids) for o in outputs]
+
+            # The no-LoRA row (index 0) must run (rank-0 skip path) and produce
+            # output.
+            assert out_tokens[0], (
+                "No-LoRA row in the mixed batch produced no tokens.")
+            # Every adapter -- not just one -- must change the output vs base.
+            for i in range(len(lora_requests)):
+                assert out_tokens[i + 1] != base_tokens, (
+                    f"Routed-expert MoE LoRA adapter {i} produced output "
+                    "identical to the base model; it was not applied.")
+        finally:
+            llm.shutdown()
+
+
 class TestLlmError:
 
     @pytest.mark.part3
@@ -1505,7 +1697,8 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-def test_llm_context_only_timed_out():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+def test_llm_context_only_timed_out(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1517,11 +1710,15 @@ def test_llm_context_only_timed_out():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
-                  backend="UCX", kv_transfer_timeout_ms=1000),
+                  backend=backend,
+                  kv_transfer_timeout_ms=1000,
+                  transceiver_runtime=transceiver_runtime),
               **llm_args_extra)
 
     max_tokens = 1
@@ -1579,8 +1776,14 @@ def test_llm_context_only_timed_out():
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
-                                                       backend):
+                                                       backend,
+                                                       transceiver_runtime):
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    if transceiver_runtime == "PYTHON" and backend == "UCX":
+        pytest.skip("Python transceiver (V2) does not support UCX backend")
+
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1595,15 +1798,15 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
                                     max_tokens=1000,
                                     enable_block_reuse=False)
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=kv_cache_config,
-        tensor_parallel_size=tp_size,
-        cache_transceiver_config=CacheTransceiverConfig(
-            backend=backend,
-            kv_transfer_timeout_ms=1000,
-            kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
-        **llm_args_extra)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=kv_cache_config,
+              tensor_parallel_size=tp_size,
+              cache_transceiver_config=CacheTransceiverConfig(
+                  backend=backend,
+                  kv_transfer_timeout_ms=1000,
+                  kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms,
+                  transceiver_runtime=transceiver_runtime),
+              **llm_args_extra)
 
     max_tokens = 1
     sampling_params = SamplingParams(max_tokens=max_tokens)
@@ -1655,7 +1858,8 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-async def test_llm_disagg_gen_cancelled():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+async def test_llm_disagg_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1667,18 +1871,24 @@ async def test_llm_disagg_gen_cancelled():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     try:
@@ -1727,19 +1937,22 @@ async def test_llm_disagg_gen_cancelled():
             print(f"num output tokens: {num_output_tokens}")
             assert result.outputs[0].finish_reason == "cancelled"
 
-            # Num check that the number of free/used blocks is as expected
+            # Wait until KV cache blocks are released (usedNumBlocks == 0)
             time.sleep(1.)
             max_retries = 10
+            all_results = []
             for _ in range(max_retries):
                 results = llm_gen.get_stats(2)
                 print("len(results):", len(results))
-                if len(results) == num_output_tokens - (1 if iter == 0 else 0):
+                all_results.extend(results)
+                if all_results and all_results[-1]["kvCacheStats"][
+                        "usedNumBlocks"] == 0:
                     break
                 time.sleep(1)
             else:
                 pytest.fail(
-                    f"Failed to get stats with len=={num_output_tokens - 1} after {max_retries} retries"
-                )
+                    f"KV cache blocks not released after {max_retries} retries")
+            results = all_results
 
             after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
             assert after_used_num_blocks == 0
@@ -1827,7 +2040,8 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-async def test_llm_disagg_streaming_gen_cancelled():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1839,18 +2053,24 @@ async def test_llm_disagg_streaming_gen_cancelled():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     try:

@@ -2,8 +2,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)
@@ -13,6 +11,7 @@ from tensorrt_llm._utils import prefer_pinned
 from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_clip import CLIPEncoder
 from .modeling_utils import _load_weights_impl, register_auto_model
 

@@ -4,7 +4,8 @@ import time
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
-                                 CudaGraphConfig, DraftTargetDecodingConfig,
+                                 CudaGraphConfig, DFlashDecodingConfig,
+                                 DraftTargetDecodingConfig,
                                  Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
@@ -189,9 +190,6 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
-    parser.add_argument('--allow_advanced_sampling',
-                        default=False,
-                        action='store_true')
     parser.add_argument('--eagle3_model_arch',
                         type=str,
                         default="llama3",
@@ -278,7 +276,7 @@ def setup_llm(args, **kwargs):
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
         spec_config = MTPDecodingConfig(
-            num_nextn_predict_layers=args.spec_decode_max_draft_len,
+            max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
@@ -293,10 +291,12 @@ def setup_llm(args, **kwargs):
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
-            allow_advanced_sampling=args.allow_advanced_sampling,
             eagle3_model_arch=args.eagle3_model_arch,
-            max_total_draft_tokens=args.max_total_draft_tokens,
-            max_batch_size=args.max_batch_size)
+            max_total_draft_tokens=args.max_total_draft_tokens)
+    elif spec_decode_algo == "DFLASH":
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=args.spec_decode_max_draft_len,
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,

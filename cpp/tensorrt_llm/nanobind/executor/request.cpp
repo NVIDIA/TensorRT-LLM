@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -307,27 +307,40 @@ void initRequestBindings(nb::module_& m)
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
     {
         return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
-            self.getMultimodalUuids());
+            self.getMultimodalUuids(), self.getMultimodalItemRunCuOffsets(), self.getMultimodalRunPositions(),
+            self.getMultimodalRunLengths());
     };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 4 && state.size() != 7)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
+        auto multimodalItemRunCuOffsets = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[4])
+                                                            : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunPositions = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[5])
+                                                        : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunLengths = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[6])
+                                                      : std::optional<std::vector<SizeType32>>(std::nullopt);
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
             nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
-            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]));
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]),
+            std::move(multimodalItemRunCuOffsets), std::move(multimodalRunPositions), std::move(multimodalRunLengths));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
         .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
-                 std::optional<std::vector<std::optional<std::string>>>>(),
+                 std::optional<std::vector<std::optional<std::string>>>, std::optional<std::vector<SizeType32>>,
+                 std::optional<std::vector<SizeType32>>, std::optional<std::vector<SizeType32>>>(),
             nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
-            nb::arg("multimodal_uuids") = nb::none())
+            nb::arg("multimodal_uuids") = nb::none(), nb::arg("multimodal_item_run_cu_offsets") = nb::none(),
+            nb::arg("multimodal_run_positions") = nb::none(), nb::arg("multimodal_run_lengths") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
         .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
         .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
         .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
+        .def_prop_ro("multimodal_item_run_cu_offsets", &tle::MultimodalInput::getMultimodalItemRunCuOffsets)
+        .def_prop_ro("multimodal_run_positions", &tle::MultimodalInput::getMultimodalRunPositions)
+        .def_prop_ro("multimodal_run_lengths", &tle::MultimodalInput::getMultimodalRunLengths)
         .def("__getstate__", multimodalInputGetstate)
         .def("__setstate__", multimodalInputSetstate);
 
@@ -600,7 +613,7 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getCacheSaltID(), self.getDisaggRequestId());
+            self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
@@ -629,7 +642,7 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
             nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]), nb::cast<std::optional<tle::IdType>>(state[34]));
+            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
@@ -670,8 +683,8 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
                  std::optional<tle::MillisecondsType>,          // allottedTimeMs
-                 std::optional<tle::CacheSaltIDType>,           // cacheSaltID
-                 std::optional<tle::IdType>                     // disaggRequestId
+                 std::optional<tle::IdType>,                    // disaggRequestId
+                 std::optional<std::string>                     // cacheSalt
                  >(),
             // clang-format off
         nb::arg("input_token_ids"),
@@ -711,9 +724,9 @@ void initRequestBindings(nb::module_& m)
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
-                nb::arg("cache_salt_id") = nb::none(),
-        nb::arg("disagg_request_id") = nb::none()
-    )         // clang-format on
+        nb::arg("disagg_request_id") = nb::none(),
+        nb::arg("cache_salt") = nb::none()
+    )                // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -755,7 +768,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
-        .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
+        .def_prop_rw("cache_salt", &tle::Request::getCacheSalt, &tle::Request::setCacheSalt)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
         .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)

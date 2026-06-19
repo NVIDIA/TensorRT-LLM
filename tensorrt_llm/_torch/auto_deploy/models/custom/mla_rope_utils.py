@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Shared MLA RoPE utilities for auto_deploy custom models.
 
@@ -10,10 +11,7 @@ from typing import Dict
 
 import torch
 
-from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
-    dequant_fp8_nk_weight_auto_scale_layout,
-)
-
+from ...utils.fp8_dequant import dequant_fp8_nk_weight_auto_scale_layout
 from ...utils.quantization_utils import FLOAT8_DTYPES
 
 

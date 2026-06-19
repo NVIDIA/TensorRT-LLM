@@ -710,6 +710,36 @@ class AutoTunerProfilingCache:
         return cache
 
 
+def _spec_in_bounds(spec, shapes_list) -> bool:
+    """Validate that spec.input_idx and spec.dim_idx are in range for shapes_list.
+
+    On out-of-bounds access, log a warning and return False. Otherwise return True.
+    Pass the SHAPE LIST (list-of-lists or equivalent indexable), not the wrapping
+    object. Both ``OptimizationProfile.shapes`` and the raw list-of-lists
+    ``base_profile`` used inside :meth:`AutoTuner._find_nearest_profile` are valid
+    inputs because the helper only uses ``len(...)`` and indexing.
+
+    Args:
+        spec: A ``DynamicTensorSpec`` or ``ConstraintSpec`` with ``input_idx`` and
+            ``dim_idx`` attributes. The spec's class name is used in the warning
+            message.
+        shapes_list: An indexable container of per-input shape lists.
+    """
+    spec_kind = type(spec).__name__
+    if spec.input_idx < 0 or spec.input_idx >= len(shapes_list):
+        logger.warning(
+            f"[Autotuner] Skipping {spec_kind} with input_idx={spec.input_idx}: "
+            f"only {len(shapes_list)} inputs available.")
+        return False
+    if spec.dim_idx < 0 or spec.dim_idx >= len(shapes_list[spec.input_idx]):
+        logger.warning(
+            f"[Autotuner] Skipping {spec_kind} with dim_idx={spec.dim_idx} for "
+            f"input {spec.input_idx}: shape has only "
+            f"{len(shapes_list[spec.input_idx])} dims.")
+        return False
+    return True
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT LLM operations.
 
@@ -1078,6 +1108,15 @@ class AutoTuner:
                             **kwargs,
                         )
                 except Exception as e:
+                    # Synchronize to clear any pending CUDA errors left by the
+                    # failed tactic.  Without this, the stale error propagates
+                    # to subsequent CUDA/cuBLAS calls in the forward pass
+                    # (observed as CUBLAS_STATUS_EXECUTION_FAILED on SM103).
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
                     logger.warning_once(
@@ -1301,6 +1340,8 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            if not _spec_in_bounds(spec, base_profile.shapes):
+                continue
             if self.skip_dynamic_tuning_buckets:
                 if spec.map_to_tuning_buckets is not None:
                     # Still include the bucketed value of the actual shape so the
@@ -1358,10 +1399,12 @@ class AutoTuner:
 
             # Adjust the profile to satisfy the constraints
             for spec in tuning_config.constraint_specs:
-                min_value = opt_value = max_value = spec.infer_shape(
-                    p.get_opt_shapes())
+                if not _spec_in_bounds(spec, p.shapes):
+                    continue
                 if p.shapes[spec.input_idx] == [StaticDim(0)]:
                     continue
+                min_value = opt_value = max_value = spec.infer_shape(
+                    p.get_opt_shapes())
                 p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
                     min_value, opt_value, max_value)
             generated_profiles.append(p)
@@ -1395,6 +1438,12 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in dynamic_tensor_specs:
+            # Bounds check: skip specs that reference inputs or dimensions not present in the
+            # current shapes tuple. This can happen on hardware (e.g. SM121 / DGX Spark) where
+            # ops produce fewer or differently-shaped tensors than the specs were authored for.
+            if not _spec_in_bounds(spec, base_profile):
+                continue
+
             # During runtime: apply map_to_tuning_buckets to map input to bucket
             # During tuning: no mapper, use raw bucket value
             if apply_map_to_tuning_buckets:
@@ -1409,6 +1458,9 @@ class AutoTuner:
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for spec in constraint_specs:
+            # Bounds check: same defensive guard as above for constraint specs.
+            if not _spec_in_bounds(spec, base_profile):
+                continue
             if base_profile[spec.input_idx] == [0]:
                 continue
             base_profile[spec.input_idx][spec.dim_idx] = -1
@@ -1459,8 +1511,7 @@ class AutoTuner:
         if dtype == torch.float4_e2m1fn_x2:
             return (torch.rand(shapes, device=device) * 10 - 5).to(
                 torch.uint8).view(dtype)
-        else:
-            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+        return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,

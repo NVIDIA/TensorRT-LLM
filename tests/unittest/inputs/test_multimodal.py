@@ -1,0 +1,265 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
+
+import pytest
+import torch
+
+from tensorrt_llm.inputs.multimodal import (
+    DisaggPrefillMultimodalInputs,
+    MultimodalInput,
+    MultimodalRuntimeData,
+    _find_mm_embedding_lengths_from_masks,
+    find_mm_token_lengths,
+)
+from tensorrt_llm.inputs.registry import (
+    create_input_processor_with_hash,
+    maybe_compute_mm_embed_cumsum,
+)
+
+
+def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
+    """Producer writes a flat int64 cumsum tensor at py_multimodal_data[multimodal_embed_mask_cumsum]."""
+
+    class FakeProcessor:
+        def get_vocab_size(self):
+            return 1000
+
+        def get_mm_token_ids(self):
+            return None
+
+        def get_mm_special_token_ids(self):
+            return torch.tensor([2000])
+
+    # [text, img, img, special, img, img, img, text]
+    prompt_token_ids = [10, 1001, 1002, 2000, 1003, 1004, 1005, 20]
+    extra = {"multimodal_data": {}}
+    maybe_compute_mm_embed_cumsum(prompt_token_ids, extra, FakeProcessor())
+
+    cumsum = extra["multimodal_data"]["multimodal_embed_mask_cumsum"]
+    torch.testing.assert_close(
+        cumsum,
+        torch.tensor([0, 1, 2, 2, 3, 4, 5, 5], dtype=torch.int64),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
+    """Final expanded prompt layout wins over dummy-placeholder metadata."""
+
+    class FakeProcessor:
+        multimodal_hashing_supported = True
+
+        def get_text_with_mm_placeholders(self, mm_counts):
+            assert mm_counts == {"image": 1}
+            return "<image>"
+
+        def __call__(self, inputs, sampling_params):
+            # Tokenized fast path: multimodal_hashing_process forwards the raw
+            # request dict (prompt_token_ids + multi_modal_data), with no
+            # synthesized "prompt" text key. The real call_with_token_ids
+            # returns the EXPANDED token ids (placeholder tokens replaced with
+            # MM feature tokens) alongside stale dummy-placeholder metadata, and
+            # downstream mask math runs on that post-expansion layout. Mirror it
+            # by routing through this processor's own expansion hook.
+            assert inputs["prompt_token_ids"] == [10, 98, 20]
+            expanded_ids, _ = self.expand_prompt_token_ids_for_mm(inputs["prompt_token_ids"], [4])
+            return expanded_ids, {
+                "multimodal_data": {
+                    # Stale dummy-placeholder value; recomputed to [3] downstream.
+                    "multimodal_embedding_lengths": [999],
+                }
+            }
+
+        def get_num_tokens_per_image(self, *, image):
+            torch.testing.assert_close(image, torch.tensor([1]))
+            return 4
+
+        def expand_prompt_token_ids_for_mm(self, prompt_token_ids, num_mm_tokens, **kwargs):
+            assert prompt_token_ids == [10, 98, 20]
+            assert num_mm_tokens == [4]
+            return [10, 101, 102, 200, 103, 20], None
+
+        def get_vocab_size(self):
+            return 100
+
+        def get_mm_token_ids(self):
+            return None
+
+        def get_mm_special_token_ids(self):
+            return torch.tensor([200])
+
+    input_processor = create_input_processor_with_hash(FakeProcessor())
+
+    prompt_token_ids, extra = input_processor(
+        {
+            "prompt_token_ids": [10, 98, 20],
+            "multi_modal_data": {"image": [torch.tensor([1])]},
+        },
+        sampling_params=None,
+    )
+
+    assert prompt_token_ids == [10, 101, 102, 200, 103, 20]
+    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == [3]
+
+
+def test_multimodal_embedding_lengths_exclude_special_tokens():
+    """Embedding lengths omit multimodal wrapper tokens used only in prompts."""
+    mm_mask = torch.tensor([False, True, True, True, True, True, False, True, True, True, True])
+    embed_mask = torch.tensor(
+        [
+            False,
+            False,
+            True,
+            True,
+            False,
+            True,
+            False,
+            True,
+            False,
+            True,
+            True,
+        ]
+    )
+
+    embedding_lengths = _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask, [5, 4])
+
+    assert embedding_lengths == [3, 3]
+
+
+def test_find_mm_token_lengths_passes_all_grid_rows_for_single_video():
+    """A single logical video can have multiple processor grid rows."""
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, video_grid_thw=None):
+            assert video == ["frame"]
+            assert isinstance(video_grid_thw, torch.Tensor)
+            assert video_grid_thw.device.type == "cpu"
+            torch.testing.assert_close(
+                video_grid_thw,
+                torch.tensor([[1, 8, 10], [1, 8, 10]]),
+                rtol=0,
+                atol=0,
+            )
+            return 40
+
+    assert find_mm_token_lengths(
+        {"video": [["frame"]]},
+        FakeVideoProcessor(),
+        multimodal_data={"video": {"video_grid_thw": [[1, 8, 10], [1, 8, 10]]}},
+    ) == {"video": [40]}
+
+
+def test_find_mm_token_lengths_preserves_2d_grid_rows_per_video():
+    """One-row-per-video grids stay as [1, 3] CPU tensors."""
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, video_grid_thw=None):
+            assert isinstance(video_grid_thw, torch.Tensor)
+            assert video_grid_thw.device.type == "cpu"
+            assert tuple(video_grid_thw.shape) == (1, 3)
+            return int(video_grid_thw[0, 0].item())
+
+    assert find_mm_token_lengths(
+        {"video": [["frame0"], ["frame1"]]},
+        FakeVideoProcessor(),
+        multimodal_data={"video": {"video_grid_thw": torch.tensor([[1, 8, 10], [2, 8, 10]])}},
+    ) == {"video": [1, 2]}
+
+
+def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
+    """Typed EPD handoff converts back to legacy MultimodalInput fields."""
+    handoff = DisaggPrefillMultimodalInputs(
+        prompt_token_ids=[10, 1001, 1002, 2000, 1003, 20],
+        multimodal_lengths=[4],
+        multimodal_positions=[1],
+        multimodal_embedding_lengths=[3],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[1],
+        multimodal_run_lengths=[4],
+        special_token_offsets=[2],
+        item_types=[0],
+    )
+
+    multimodal_input = handoff.to_multimodal_input([[1, 2, 3, 4]])
+
+    assert multimodal_input.multimodal_positions == [1]
+    assert multimodal_input.multimodal_lengths == [4]
+    assert multimodal_input.multimodal_item_run_cu_offsets == [0, 1]
+    assert multimodal_input.multimodal_run_positions == [1]
+    assert multimodal_input.multimodal_run_lengths == [4]
+    assert handoff.multimodal_embedding_lengths == [3]
+    assert handoff.special_token_offsets == [2]
+    assert handoff.item_types == [0]
+
+
+def test_multimodal_input_rejects_invalid_prompt_spans():
+    """Prompt span validation rejects negative starts and zero lengths."""
+    with pytest.raises(ValueError, match="multimodal_positions must be non-negative"):
+        MultimodalInput.from_components([[1, 2, 3, 4]], [-1], [1])
+
+    with pytest.raises(ValueError, match="multimodal_lengths must be positive"):
+        MultimodalInput.from_components([[1, 2, 3, 4]], [0], [0])
+
+
+def test_runtime_data_cumsum_math_simplest():
+    """All-True mask, full request, no cache."""
+    is_embed = torch.ones(5, dtype=torch.bool)
+    rt = MultimodalRuntimeData(
+        past_seen_token_num=0,
+        chunk_end_pos=5,
+        embed_mask_cumsum=is_embed.cumsum(0, dtype=torch.int64),
+    )
+    assert rt.num_cached_mm_tokens == 0
+    assert rt.num_mm_tokens_in_chunk == 5
+    assert rt.total_embeds_in_request == 5
+
+
+def test_runtime_data_cumsum_math_partial_chunk():
+    """Chunk ends before end of mask."""
+    is_embed = torch.tensor([True, True, False, True, True, False, True])
+    rt = MultimodalRuntimeData(
+        past_seen_token_num=0,
+        chunk_end_pos=4,
+        embed_mask_cumsum=is_embed.cumsum(0, dtype=torch.int64),
+    )
+    assert rt.num_cached_mm_tokens == 0
+    assert rt.num_mm_tokens_in_chunk == 3
+    assert rt.total_embeds_in_request == 5
+
+
+def test_runtime_data_cumsum_math_partial_cache():
+    """past_seen_token_num > 0: cached counts embeds before watermark."""
+    is_embed = torch.tensor([True, True, False, True, True, False, True])
+    rt = MultimodalRuntimeData(
+        past_seen_token_num=3,
+        chunk_end_pos=7,
+        embed_mask_cumsum=is_embed.cumsum(0, dtype=torch.int64),
+    )
+    assert rt.num_cached_mm_tokens == 2
+    assert rt.num_mm_tokens_in_chunk == 3
+    assert rt.total_embeds_in_request == 5
+
+
+def test_runtime_data_cumsum_math_with_specials_mistral_shape():
+    """Chunk boundary inside a unit with inline special (Mistral-shape)."""
+    # [text, img, img, special, img, img, img, text]
+    is_embed = torch.tensor([False, True, True, False, True, True, True, False])
+    cumsum = is_embed.cumsum(0, dtype=torch.int64)
+
+    rt0 = MultimodalRuntimeData(past_seen_token_num=0, chunk_end_pos=5, embed_mask_cumsum=cumsum)
+    assert rt0.num_cached_mm_tokens == 0
+    assert rt0.num_mm_tokens_in_chunk == 3
+    assert rt0.total_embeds_in_request == 5
+
+    rt1 = MultimodalRuntimeData(past_seen_token_num=5, chunk_end_pos=8, embed_mask_cumsum=cumsum)
+    assert rt1.num_cached_mm_tokens == 3
+    assert rt1.num_mm_tokens_in_chunk == 2
+    assert rt1.total_embeds_in_request == 5
+
+
+def test_runtime_data_requires_cumsum():
+    """embed_mask_cumsum is required."""
+    with pytest.raises(TypeError):
+        MultimodalRuntimeData(past_seen_token_num=0, chunk_end_pos=5)

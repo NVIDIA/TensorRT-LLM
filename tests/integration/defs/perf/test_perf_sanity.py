@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,28 +34,13 @@ from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
+from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
 from .perf_regression_utils import process_and_upload_test_results
 
-# Model PATH of local dir synced from internal LLM models repo
+# Sanity-side path differs from test_perf for this key; preserve historical value.
 MODEL_PATH_DICT = {
-    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
-    "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
-    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
-    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
-    "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
-    "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
-    "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
-    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
-    "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
-    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
-    "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
-    "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
-    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
-    "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
+    **_MODEL_PATH_DICT_BASE,
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-    "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
-    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -137,6 +122,160 @@ PERF_METRIC_LOG_QUERIES = {
     "p99_e2el": re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
 }
 
+# Spec-decoding-only metrics: parsed from benchmark output but only stored
+# (and regression-checked) when the test runs with speculative decoding.
+SPEC_DECODING_PERF_METRIC_LOG_QUERIES = {
+    "al": re.compile(r"Mean Avg Decoded Tokens per Iter:\s+(-?[\d\.]+)"),
+}
+
+# gen_only-only metric: appended to each trtllm-benchmark log by
+# DisaggTestCmds.run_cmd after parsing gen_server_*.log; only forwarded to
+# the database for gen_only mode.
+GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
+    "mean_gen_worker_per_iter_device_step_time": re.compile(
+        r"Average Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+}
+
+# Per-iter prev_device_step_time logged by each gen worker. Example line:
+#   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
+#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
+# Only the gen worker (decode) emits this. The device value reported at iter N
+# is the device step time of iter N-1 (device runs async). Iters 0-4 are
+# skipped: iter 0/1 include KV-cache transfer wait time, and iters 2-4 are
+# warmup that has not yet reached steady state. prev_device_step_time may be
+# 'N/A' (e.g. iter 1); the regex requires a numeric value so those lines do
+# not match.
+_DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
+
+
+def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
+    """Current byte size of each gen_server_{i}.log (0 if missing).
+
+    Used to delimit per-client segments in DisaggTestCmds.run_cmd: snapshot
+    sizes before launching a client, then pass the snapshot as start_offsets
+    to parse_gen_worker_device_step_time after the client exits.
+    """
+    sizes: List[int] = []
+    for i in range(num_gen_servers):
+        log_path = os.path.join(output_dir, f"gen_server_{i}.log")
+        sizes.append(os.path.getsize(log_path) if os.path.isfile(log_path) else 0)
+    return sizes
+
+
+def _scan_gen_worker_device_step_time(
+    output_dir: str,
+    num_gen_servers: int,
+    start_offsets: Optional[List[int]] = None,
+) -> Tuple[List[float], int]:
+    """Single pass over the gen logs. Returns (per_file_means, total_count).
+
+    per_file_means holds one mean per file that had >=1 usable line;
+    total_count is the number of usable (iter >= 5, numeric) lines across all
+    files, used by the caller to detect when the cross-node log flush has
+    settled. errors="replace" guards against invalid UTF-8: tqdm progress bars
+    (model load) write partial multibyte sequences that would otherwise raise
+    UnicodeDecodeError mid-scan.
+    """
+    per_file_means: List[float] = []
+    total_count = 0
+    for i in range(num_gen_servers):
+        log_path = os.path.join(output_dir, f"gen_server_{i}.log")
+        if not os.path.isfile(log_path):
+            continue
+        # Welford streaming mean: O(1) memory and numerically stable for
+        # large iteration counts.
+        count = 0
+        mean = 0.0
+        with open(log_path, errors="replace") as f:
+            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]:
+                f.seek(start_offsets[i])
+            for line in f:
+                m = _DEVICE_STEP_TIME_RE.search(line)
+                if m is None:
+                    continue
+                iter_idx = int(m.group(1))
+                if iter_idx < 5:
+                    continue
+                count += 1
+                mean += (float(m.group(2)) - mean) / count
+        if count:
+            per_file_means.append(mean)
+            total_count += count
+    return per_file_means, total_count
+
+
+def parse_gen_worker_device_step_time(
+    output_dir: str,
+    num_gen_servers: int,
+    start_offsets: Optional[List[int]] = None,
+    settle_timeout: float = 90.0,
+    poll_interval: float = 3.0,
+) -> Optional[float]:
+    """Mean per-iter prev_device_step_time (ms) across all gen workers.
+
+    For each gen_server_{i}.log, average prev_device_step_time over iters >= 5,
+    then average those per-file means across the num_gen_servers workers.
+    Returns None if no usable line is found in any file.
+
+    When start_offsets is provided, only the bytes from start_offsets[i] to
+    end-of-file are considered for gen_server_{i}.log — used to slice out a
+    single client's iteration segment.
+
+    The gen worker writes gen_server_{i}.log on a different node than the
+    benchmark/pytest process, and the worker is kept alive (waiting on the
+    benchmark_status file) when this runs — so when the client returns, the
+    decode iterations are done but their log lines may still be flushing across
+    NFS. Reading once immediately can see zero iter>=5 lines and wrongly return
+    None. So poll the slice until the usable-line count is non-zero AND stable
+    across two consecutive reads (flush drained), bounded by settle_timeout.
+    """
+    deadline = time.time() + settle_timeout
+    prev_count = -1
+    while True:
+        per_file_means, total_count = _scan_gen_worker_device_step_time(
+            output_dir, num_gen_servers, start_offsets
+        )
+        # Non-empty and unchanged since the last poll → the flush has settled.
+        if total_count > 0 and total_count == prev_count:
+            return sum(per_file_means) / len(per_file_means)
+        if time.time() >= deadline:
+            if per_file_means:
+                print_info(
+                    f"parse_gen_worker_device_step_time: settle_timeout "
+                    f"({settle_timeout}s) reached with {total_count} line(s); "
+                    "returning current mean."
+                )
+                return sum(per_file_means) / len(per_file_means)
+            return None
+        prev_count = total_count
+        time.sleep(poll_interval)
+
+
+def add_perf_metric_value(
+    new_data: dict,
+    metrics: dict,
+    spec_decoding: bool,
+    benchmark_mode: Optional[str] = None,
+) -> None:
+    """Populate `new_data` with per-test perf metrics from `metrics`.
+
+    - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
+    - Adds `d_al` only when spec_decoding=True; non-spec rows omit it so
+      OpenSearch baselines don't blend the two populations.
+    - Adds `d_mean_gen_worker_per_iter_device_step_time` only for the
+      disagg gen_only mode (the only mode whose regression is gated on it).
+    """
+    for metric_name in PERF_METRIC_LOG_QUERIES:
+        new_data[f"d_{metric_name}"] = metrics[metric_name]
+    if spec_decoding:
+        new_data["d_al"] = metrics["al"]
+    if benchmark_mode == "gen_only":
+        new_data["d_mean_gen_worker_per_iter_device_step_time"] = metrics[
+            "mean_gen_worker_per_iter_device_step_time"
+        ]
+
+
 # Metrics where larger is better
 MAXIMIZE_METRICS = [
     "d_seq_throughput",
@@ -146,6 +285,7 @@ MAXIMIZE_METRICS = [
     "d_mean_tpot",
     "d_median_tpot",
     "d_p99_tpot",
+    "d_al",
 ]
 
 # Metrics where smaller is better
@@ -159,9 +299,12 @@ MINIMIZE_METRICS = [
     "d_mean_e2el",
     "d_median_e2el",
     "d_p99_e2el",
+    # gen_only-only: per-iter device step time averaged across gen workers
+    "d_mean_gen_worker_per_iter_device_step_time",
 ]
 
-# Key metrics that determine regression (throughput metrics only)
+# Default key metrics that determine regression (throughput metrics only).
+# d_al is appended at runtime when any client runs spec decoding.
 REGRESSION_METRICS = [
     "d_token_throughput",
     "d_total_token_throughput",
@@ -201,6 +344,15 @@ def to_env_dict(env_vars: str) -> Dict[str, str]:
     return env
 
 
+def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
+    """Extract TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS from a space-separated KEY=val env-var string.
+
+    Returns 0 when not set.
+    """
+    val = to_env_dict(env_vars).get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS")
+    return int(val) if val is not None else 0
+
+
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     """Add host and port to command."""
     return cmd + ["--host", host, "--port", str(port)]
@@ -215,6 +367,7 @@ class ServerConfig:
         self.model_name = server_config_data["model_name"]
         self.model_path = ""
         self.env_vars = env_vars
+        self.force_num_accepted_tokens = force_num_accepted_tokens_from_env_str(env_vars)
         self.disagg_run_type = server_config_data.get("disagg_run_type", "aggr")
 
         # Extract optional fields with defaults
@@ -295,7 +448,12 @@ class ServerConfig:
         # speculative_config
         speculative_config = server_config_data.get("speculative_config", {})
         self.spec_decoding_type = speculative_config.get("decoding_type", "")
-        self.num_nextn_predict_layers = speculative_config.get("num_nextn_predict_layers", 0)
+        # MTP user config migrated from num_nextn_predict_layers to max_draft_len.
+        # Keep both DB field names populated for perf/baseline compatibility while
+        # the surrounding reporting pipeline transitions to l_max_draft_len.
+        self.max_draft_len = speculative_config.get(
+            "max_draft_len", speculative_config.get("num_nextn_predict_layers", 0)
+        )
         eagle3_value = speculative_config.get("eagle3_layers_to_capture", [])
         if isinstance(eagle3_value, int):
             self.eagle3_layers_to_capture = [eagle3_value]
@@ -303,7 +461,6 @@ class ServerConfig:
             self.eagle3_layers_to_capture = eagle3_value
         else:
             self.eagle3_layers_to_capture = []
-        self.max_draft_len = speculative_config.get("max_draft_len", 0)
         self.speculative_model = speculative_config.get("speculative_model", "")
         self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
@@ -324,6 +481,7 @@ class ServerConfig:
             "match_mode",
             "backend",
             "extra_llm_api_config_path",
+            "server_env_var",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
@@ -371,8 +529,14 @@ class ServerConfig:
             # cache_transceiver_config
             "s_cache_transceiver_backend",
             # speculative_config
+            # Keep baseline matching on the legacy key during DB migration.
+            # l_max_draft_len is written to DB but not used for matching until
+            # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            "l_force_num_accepted_tokens",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -422,9 +586,10 @@ class ServerConfig:
             "l_cache_transceiver_max_tokens_in_buffer": self.cache_transceiver_max_tokens_in_buffer,
             # speculative_config
             "s_spec_decoding_type": self.spec_decoding_type,
-            "l_num_nextn_predict_layers": self.num_nextn_predict_layers,
+            "l_num_nextn_predict_layers": self.max_draft_len,
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
+            "l_force_num_accepted_tokens": self.force_num_accepted_tokens,
             "s_speculative_model_dir": self.speculative_model,
             "b_eagle3_one_model": self.eagle3_one_model,
             "s_server_log_link": "",
@@ -461,6 +626,134 @@ class ServerConfig:
         return yaml.dump(config_data, default_flow_style=False, sort_keys=False)
 
 
+class AccuracyConfig:
+    """Accuracy test configuration (lm_eval against the running server).
+
+    Shape mirrors the existing top-level `accuracy:` block in disagg yamls:
+        enable_accuracy_test: bool
+        env_var: dict[str, str]
+        tasks:
+          <task_name>:
+            model: local-completions | local-chat-completions
+            model_args_extra: str
+            extra_kwargs: dict   # forwarded to lm_eval as --<k> <v>
+    """
+
+    _ENDPOINT_MAP = {
+        "local-completions": "v1/completions",
+        "local-chat-completions": "v1/chat/completions",
+    }
+
+    def __init__(self, accuracy_data: dict):
+        self.enable_accuracy_test = bool(accuracy_data.get("enable_accuracy_test", False))
+        self.env_var = dict(accuracy_data.get("env_var") or {})
+        self.tasks = dict(accuracy_data.get("tasks") or {})
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> Optional["AccuracyConfig"]:
+        if not data:
+            return None
+        # Short-circuit when accuracy is disabled so we don't try to parse
+        # legacy-shape `tasks:` (a string instead of the expected dict).
+        if not bool(data.get("enable_accuracy_test", False)):
+            return None
+        return cls(data)
+
+    def build_lm_eval_invocations(
+        self,
+        model_name: str,
+        server_hostname: str,
+        server_port: int,
+        output_dir: str,
+        server_idx: int,
+    ) -> List[Tuple[List[str], str, Dict[str, str], str]]:
+        """Build (cmd, log_file, env, task_name) tuples for each configured task."""
+        model_path = get_model_dir(model_name)
+        invocations = []
+        for task_name, task_cfg in self.tasks.items():
+            model_type = task_cfg.get("model", "local-completions")
+            model_args_extra = task_cfg.get("model_args_extra", "")
+            extra_kwargs = dict(task_cfg.get("extra_kwargs") or {})
+            base_url = (
+                f"http://{server_hostname}:{server_port}/"
+                f"{self._ENDPOINT_MAP.get(model_type, 'v1/completions')}"
+            )
+            model_args = f"model={model_path},base_url={base_url},{model_args_extra}"
+
+            acc_output_dir = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}")
+            log_file = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}.log")
+            os.makedirs(acc_output_dir, exist_ok=True)
+
+            cmd = [
+                "lm_eval",
+                "--model",
+                model_type,
+                "--tasks",
+                task_name,
+                "--model_args",
+                model_args,
+                "--log_samples",
+                "--output_path",
+                acc_output_dir,
+            ]
+
+            include_path = extra_kwargs.pop("include_path", None)
+            custom_config = extra_kwargs.pop("custom_config", None)
+            if custom_config and not include_path:
+                # Substitute LLM_MODELS_ROOT (and other env vars) in the lm_eval
+                # task yaml, write to <output_dir>/lm_eval_configs/, and pass the
+                # directory to --include_path. lm_eval requires a directory.
+                cfg_path = (
+                    custom_config
+                    if os.path.isabs(custom_config)
+                    else os.path.join(get_llm_root(), custom_config)
+                )
+                lm_eval_dir = os.path.join(output_dir, "lm_eval_configs")
+                os.makedirs(lm_eval_dir, exist_ok=True)
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                content = content.replace("LLM_MODELS_ROOT", llm_models_root())
+                out_path = os.path.join(lm_eval_dir, os.path.basename(cfg_path))
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                # Copy sibling utils.py if present (some tasks like GPQA need it)
+                sibling_utils = os.path.join(os.path.dirname(cfg_path), "utils.py")
+                if os.path.exists(sibling_utils):
+                    shutil.copy(sibling_utils, lm_eval_dir)
+                include_path = lm_eval_dir
+            if include_path:
+                cmd += ["--include_path", include_path]
+
+            for k, v in extra_kwargs.items():
+                if isinstance(v, bool):
+                    if v:
+                        cmd += [f"--{k}"]
+                else:
+                    cmd += [f"--{k}", str(v)]
+
+            run_env = copy.deepcopy(os.environ)
+            run_env.update({k: str(v) for k, v in self.env_var.items()})
+            invocations.append((cmd, log_file, run_env, task_name))
+        return invocations
+
+    def run(
+        self,
+        model_name: str,
+        server_hostname: str,
+        server_port: int,
+        output_dir: str,
+        server_idx: int,
+    ) -> None:
+        """Run all configured accuracy tasks against the live server."""
+        for cmd, log_file, run_env, task_name in self.build_lm_eval_invocations(
+            model_name, server_hostname, server_port, output_dir, server_idx
+        ):
+            print_info(f"[Accuracy] Running {task_name}, output: {log_file}")
+            with open(log_file, "w") as lf:
+                ret = subprocess.run(cmd, env=run_env, stdout=lf, stderr=subprocess.STDOUT)
+            print_info(f"[Accuracy] {task_name} done, exit_code={ret.returncode}")
+
+
 class ClientConfig:
     """Configurations of benchmark client."""
 
@@ -469,6 +762,7 @@ class ClientConfig:
         client_config_data: dict,
         model_name: str,
         env_vars: str = "",
+        spec_decoding: bool = False,
     ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
@@ -484,6 +778,18 @@ class ClientConfig:
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         self.env_vars = env_vars
+        # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
+        # is now always passed; output-length stability with spec decoding comes from
+        # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS (set per-yaml).
+        self.spec_decoding = spec_decoding
+
+        # Accuracy testing (lm_eval after benchmark). only_run_accuracy is silently
+        # ignored when no accuracy_config is present or enable_accuracy_test=False.
+        self.accuracy_config = AccuracyConfig.from_dict(client_config_data.get("accuracy_config"))
+        only_run_accuracy = bool(client_config_data.get("only_run_accuracy", False))
+        self.only_run_accuracy = only_run_accuracy and bool(
+            self.accuracy_config and self.accuracy_config.enable_accuracy_test
+        )
 
         # Generate default name if not provided
         self.name = client_config_data.get("name", "")
@@ -514,7 +820,6 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--random-input-len",
             str(self.isl),
             "--random-output-len",
@@ -524,6 +829,7 @@ class ClientConfig:
             "--save-result",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
+            "--ignore-eos",
         ]
         if self.backend:
             benchmark_cmd.extend(["--backend", self.backend])
@@ -549,10 +855,10 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
+            "--ignore-eos",
         ]
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
@@ -600,10 +906,14 @@ class ClientConfig:
             "b_use_chat_template",
             "b_streaming",
             "b_use_nv_sa_benchmark",
+            "b_eos",
         ]
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
+        # b_eos retained for baseline-matching continuity. spec-decoding runs are now
+        # further differentiated from non-spec-decoding runs via the
+        # l_force_num_accepted_tokens match key on ServerConfig.
         db_data = {
             "s_client_name": self.name,
             "l_concurrency": self.concurrency,
@@ -617,6 +927,7 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            "b_eos": self.spec_decoding,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -663,16 +974,26 @@ class AggrTestCmds(NamedTuple):
     timeout: int
     output_dir: str
     test_output_dir: str
+    client_configs: Dict[int, List["ClientConfig"]] = {}
+    model_name: str = ""
+    server_configs: List["ServerConfig"] = []
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
         return [server_file_path]
 
     def run_cmd(self, server_idx: int) -> List[str]:
-        """Run all clients for a server and return outputs."""
+        """Run all clients for a server and return outputs.
+
+        For each client: starts benchmark unless only_run_accuracy=True; runs
+        accuracy_config (lm_eval) afterward when configured. Empty string is
+        appended to outputs for only_run_accuracy clients to keep client_idx
+        aligned with self.client_cmds[server_idx].
+        """
         outputs = []
         server_proc = None
         server_cmd = self.server_cmds[server_idx]
+        client_configs = self.client_configs.get(server_idx, [])
 
         try:
             server_hostname = "localhost"
@@ -681,10 +1002,13 @@ class AggrTestCmds(NamedTuple):
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
+            server_env = copy.deepcopy(os.environ)
+            if server_idx < len(self.server_configs):
+                server_env.update(self.server_configs[server_idx].to_env())
             with open(server_file_path, "w") as server_ctx:
                 server_proc = subprocess.Popen(
                     server_cmd_with_port,
-                    env=copy.deepcopy(os.environ),
+                    env=server_env,
                     stdout=server_ctx,
                     stderr=subprocess.STDOUT,
                 )
@@ -698,23 +1022,50 @@ class AggrTestCmds(NamedTuple):
 
             # Run all clients for this server
             for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
-                client_file_path = os.path.join(
-                    self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                client_config = (
+                    client_configs[client_idx] if client_idx < len(client_configs) else None
                 )
-                client_cmd_with_port = add_host_port_to_cmd(
-                    client_cmd, server_hostname, server_port
-                )
-                print_info(f"Starting client. cmd is {client_cmd_with_port}")
+                only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
 
-                output = subprocess.check_output(
-                    client_cmd_with_port,
-                    stderr=subprocess.STDOUT,
-                    env=copy.deepcopy(os.environ),
-                ).decode()
+                if not only_run_accuracy:
+                    client_file_path = os.path.join(
+                        self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                    )
+                    client_cmd_with_port = add_host_port_to_cmd(
+                        client_cmd, server_hostname, server_port
+                    )
+                    print_info(f"Starting client. cmd is {client_cmd_with_port}")
 
-                with open(client_file_path, "w") as client_ctx:
-                    client_ctx.write(output)
-                outputs.append(output)
+                    client_env = copy.deepcopy(os.environ)
+                    if client_config:
+                        client_env.update(client_config.to_env())
+                    output = subprocess.check_output(
+                        client_cmd_with_port,
+                        stderr=subprocess.STDOUT,
+                        env=client_env,
+                    ).decode()
+
+                    with open(client_file_path, "w") as client_ctx:
+                        client_ctx.write(output)
+                    outputs.append(output)
+                else:
+                    print_info(
+                        f"Skipping perf benchmark for client {client_idx}: only_run_accuracy=True"
+                    )
+                    outputs.append("")
+
+                if (
+                    client_config
+                    and client_config.accuracy_config
+                    and client_config.accuracy_config.enable_accuracy_test
+                ):
+                    client_config.accuracy_config.run(
+                        model_name=self.model_name or client_config.model_name,
+                        server_hostname=server_hostname,
+                        server_port=server_port,
+                        output_dir=self.test_output_dir,
+                        server_idx=server_idx,
+                    )
 
         finally:
             if server_proc:
@@ -740,6 +1091,13 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    client_configs: Dict[int, List["ClientConfig"]] = {}
+    # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
+    # Used by run_cmd() to merge per-config env vars into the appropriate
+    # subprocess env based on this rank's disagg_serving_type. For multi-node
+    # disagg, only rank-0 pytest goes through this path; multi-rank workers
+    # receive env via SLURM env propagation set up by submit.py.
+    server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
 
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
@@ -855,16 +1213,16 @@ class DisaggTestCmds(NamedTuple):
             server_logs.append(
                 os.path.join(self.test_output_dir, f"trtllm-serve.CTX_{i}.{server_idx}.log")
             )
-            server_logs.append(os.path.join(self.output_dir, f"ctx_server_{i}.log"))
+            server_logs.append(os.path.join(self.test_output_dir, f"ctx_server_{i}.log"))
         for i in range(self.num_gen_servers):
             server_logs.append(
                 os.path.join(self.test_output_dir, f"trtllm-serve.GEN_{i}.{server_idx}.log")
             )
-            server_logs.append(os.path.join(self.output_dir, f"gen_server_{i}.log"))
+            server_logs.append(os.path.join(self.test_output_dir, f"gen_server_{i}.log"))
         server_logs.append(
             os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
         )
-        server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
+        server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
         return server_logs
 
     @staticmethod
@@ -887,6 +1245,9 @@ class DisaggTestCmds(NamedTuple):
             self.test_output_dir, f"benchmark_status.{server_idx}.txt"
         )
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
+        configs_for_idx = (
+            self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
+        )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             port = get_free_port()
             self._generate_hostname_file(server_idx, port)
@@ -907,10 +1268,14 @@ class DisaggTestCmds(NamedTuple):
                     self.test_output_dir,
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
+                worker_env = copy.deepcopy(os.environ)
+                if configs_for_idx is not None:
+                    ctx_cfg, gen_cfg, _ = configs_for_idx
+                    worker_env.update((ctx_cfg if is_ctx else gen_cfg).to_env())
                 with open(server_file_path, "w") as server_ctx:
                     server_proc = subprocess.Popen(
                         server_cmd,
-                        env=copy.deepcopy(os.environ),
+                        env=worker_env,
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
@@ -928,10 +1293,14 @@ class DisaggTestCmds(NamedTuple):
                     self.test_output_dir,
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
+                disagg_env = copy.deepcopy(os.environ)
+                if configs_for_idx is not None:
+                    _, _, disagg_cfg = configs_for_idx
+                    disagg_env.update(to_env_dict(disagg_cfg.server_env_var))
                 with open(disagg_server_file_path, "w") as disagg_server_ctx:
                     disagg_server_proc = subprocess.Popen(
                         disagg_cmd,
-                        env=copy.deepcopy(os.environ),
+                        env=disagg_env,
                         stdout=disagg_server_ctx,
                         stderr=subprocess.STDOUT,
                     )
@@ -953,41 +1322,84 @@ class DisaggTestCmds(NamedTuple):
                     check_files=self.get_server_logs(server_idx),
                 )
 
+                client_configs = self.client_configs.get(server_idx, [])
+
                 # Run all clients for this server
                 for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
-                    benchmark_file_path = os.path.join(
-                        self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
+                    client_config = (
+                        client_configs[client_idx] if client_idx < len(client_configs) else None
                     )
-                    client_cmd_with_port = add_host_port_to_cmd(
-                        client_cmd, disagg_server_hostname, disagg_server_port
-                    )
-                    print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
+                    only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
 
-                    output = subprocess.check_output(
-                        client_cmd_with_port,
-                        env=copy.deepcopy(os.environ),
-                        stderr=subprocess.STDOUT,
-                    ).decode()
-
-                    with open(benchmark_file_path, "w") as benchmark_ctx:
-                        benchmark_ctx.write(output)
-                    outputs.append(output)
-
-                # Run accuracy tests after benchmark (if configured)
-                acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
-                if acc_cfg_json:
-                    import json as _json
-
-                    acc_cfg = _json.loads(acc_cfg_json)
-                    if acc_cfg.get("enable_accuracy_test"):
-                        _run_accuracy_tests(
-                            acc_cfg,
-                            self.model_name,
-                            disagg_server_hostname,
-                            disagg_server_port,
-                            self.test_output_dir,
-                            server_idx,
+                    if not only_run_accuracy:
+                        benchmark_file_path = os.path.join(
+                            self.test_output_dir, f"trtllm-benchmark.{server_idx}.{client_idx}.log"
                         )
+                        client_cmd_with_port = add_host_port_to_cmd(
+                            client_cmd, disagg_server_hostname, disagg_server_port
+                        )
+                        print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
+
+                        # Snapshot gen_server log sizes so the per-client
+                        # average covers only iterations driven by this client.
+                        gen_log_start_offsets = gen_worker_log_sizes(
+                            self.test_output_dir, self.num_gen_servers
+                        )
+
+                        bench_env = copy.deepcopy(os.environ)
+                        if client_config:
+                            bench_env.update(client_config.to_env())
+                        output = subprocess.check_output(
+                            client_cmd_with_port,
+                            env=bench_env,
+                            stderr=subprocess.STDOUT,
+                        ).decode()
+
+                        with open(benchmark_file_path, "w") as benchmark_ctx:
+                            benchmark_ctx.write(output)
+
+                        # Only gen_only emits prev_device_step_time; other
+                        # modes yield None and we skip writing the line.
+                        device_step_time_mean = parse_gen_worker_device_step_time(
+                            self.test_output_dir,
+                            self.num_gen_servers,
+                            start_offsets=gen_log_start_offsets,
+                        )
+                        if device_step_time_mean is not None:
+                            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
+                            with open(benchmark_file_path, "a") as benchmark_ctx:
+                                benchmark_ctx.write(f"\n{summary_line}\n")
+                            output = f"{output}\n{summary_line}\n"
+
+                        outputs.append(output)
+                    else:
+                        print_info(
+                            f"Skipping perf benchmark for client {client_idx}: "
+                            "only_run_accuracy=True"
+                        )
+                        outputs.append("")
+
+                # Prefer per-client AccuracyConfig (sourced from yaml). Fall back
+                # to ACCURACY_CONFIG_JSON env-var injected by submit.py for older
+                # workflows.
+                accuracy_cfg = None
+                if client_configs and client_configs[0].accuracy_config:
+                    accuracy_cfg = client_configs[0].accuracy_config
+                else:
+                    acc_cfg_json = os.environ.get("ACCURACY_CONFIG_JSON")
+                    if acc_cfg_json:
+                        import json as _json
+
+                        accuracy_cfg = AccuracyConfig.from_dict(_json.loads(acc_cfg_json))
+
+                if accuracy_cfg and accuracy_cfg.enable_accuracy_test:
+                    accuracy_cfg.run(
+                        model_name=self.model_name,
+                        server_hostname=disagg_server_hostname,
+                        server_port=disagg_server_port,
+                        output_dir=self.test_output_dir,
+                        server_idx=server_idx,
+                    )
 
             finally:
                 with open(benchmark_status_file, "w") as status_file:
@@ -997,60 +1409,6 @@ class DisaggTestCmds(NamedTuple):
 
     def get_cmd_str(self, server_idx: int) -> List[str]:
         return ["multi-node disaggregated server tests, please check config files"]
-
-
-def _run_accuracy_tests(
-    accuracy_cfg: dict,
-    model_name: str,
-    server_hostname: str,
-    server_port: int,
-    output_dir: str,
-    server_idx: int,
-) -> None:
-    """Run lm_eval against the running disagg server. Saves results only — no validation."""
-    endpoint_map = {
-        "local-completions": "v1/completions",
-        "local-chat-completions": "v1/chat/completions",
-    }
-    env_var = accuracy_cfg.get("env_var") or {}
-    model_path = get_model_dir(model_name)
-
-    for task_name, task_cfg in accuracy_cfg.get("tasks", {}).items():
-        model_type = task_cfg.get("model", "local-completions")
-        model_args_extra = task_cfg.get("model_args_extra", "")
-        extra_kwargs = task_cfg.get("extra_kwargs", {})
-        base_url = f"http://{server_hostname}:{server_port}/{endpoint_map.get(model_type, 'v1/completions')}"
-        model_args = f"model={model_path},base_url={base_url},{model_args_extra}"
-
-        acc_output_dir = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}")
-        log_file = os.path.join(output_dir, f"accuracy_eval_{task_name}.{server_idx}.log")
-        os.makedirs(acc_output_dir, exist_ok=True)
-
-        cmd = [
-            "lm_eval",
-            "--model",
-            model_type,
-            "--tasks",
-            task_name,
-            "--model_args",
-            model_args,
-            "--log_samples",
-            "--output_path",
-            acc_output_dir,
-        ]
-        if "include_path" in extra_kwargs:
-            cmd += ["--include_path", extra_kwargs["include_path"]]
-        for k, v in extra_kwargs.items():
-            if k == "include_path":
-                continue
-            cmd += [f"--{k}"] if isinstance(v, bool) and v else [f"--{k}", str(v)]
-
-        run_env = copy.deepcopy(os.environ)
-        run_env.update({k: str(v) for k, v in env_var.items()})
-        print_info(f"[Accuracy] Running {task_name}, output: {log_file}")
-        with open(log_file, "w") as lf:
-            ret = subprocess.run(cmd, env=run_env, stdout=lf, stderr=subprocess.STDOUT)
-        print_info(f"[Accuracy] {task_name} done, exit_code={ret.returncode}")
 
 
 def parse_select_pattern(select_pattern: str) -> list:
@@ -1170,7 +1528,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode
@@ -1219,13 +1579,10 @@ class PerfSanityTestConfig:
             config = yaml.safe_load(f)
 
         metadata = config.get("metadata", {})
-        environment = config.get("environment", {})
         hardware = config.get("hardware", {})
         gpus_per_node = hardware.get("gpus_per_node", 0)
 
         model_name = metadata.get("model_name", "")
-        server_env_var = environment.get("server_env_var", "")
-        client_env_var = environment.get("client_env_var", "")
 
         server_configs = []
         server_client_configs = {}
@@ -1246,16 +1603,21 @@ class PerfSanityTestConfig:
             server_config_data["concurrency"] = -1
             server_config_data["gpus_per_node"] = gpus_per_node
 
+            # Per-config env vars: server_env_var lives on each server_config entry,
+            # client_env_var lives on each client_config entry.
+            server_env_var = server_config_data.get("server_env_var", "")
             server_config = ServerConfig(server_config_data, server_env_var)
             server_id = len(server_configs)
             server_configs.append(server_config)
 
             client_configs = []
             for client_config_data in server_config_data["client_configs"]:
+                client_env_var = client_config_data.get("client_env_var", "")
                 client_config = ClientConfig(
                     client_config_data,
                     server_config_data["model_name"],
                     env_vars=client_env_var,
+                    spec_decoding=bool(server_config.spec_decoding_type),
                 )
                 client_configs.append(client_config)
 
@@ -1382,6 +1744,18 @@ class PerfSanityTestConfig:
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
+        if benchmark_mode == "ctx_only":
+            spec_decoding = bool(ctx_server_config.spec_decoding_type)
+        else:
+            spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
+                gen_server_config.spec_decoding_type
+            )
+
+        # Accuracy lives at the top of disagg yamls; only_run_accuracy lives inside
+        # benchmark: (since `benchmark` is what becomes the disagg ClientConfig).
+        accuracy_data = config.get("accuracy") or None
+        only_run_accuracy = bool(benchmark.get("only_run_accuracy", False))
+
         client_configs = []
         for concurrency in concurrency_values:
             client_config_data = {
@@ -1397,11 +1771,14 @@ class PerfSanityTestConfig:
                 "streaming": benchmark.get("streaming", True),
                 "dataset_file": dataset_file,
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
+                "accuracy_config": accuracy_data,
+                "only_run_accuracy": only_run_accuracy,
             }
             client_config = ClientConfig(
                 client_config_data,
                 model_name,
                 env_vars=client_env_var,
+                spec_decoding=spec_decoding,
             )
             client_configs.append(client_config)
 
@@ -1441,12 +1818,20 @@ class PerfSanityTestConfig:
                 client_cmd = client_config.to_cmd()
                 client_cmds[server_idx].append(client_cmd)
 
+        # AggrTestCmds needs the model name (for lm_eval --model_args). All
+        # server_configs in an agg yaml share the same model_name.
+        first_server = self.server_configs[0] if self.server_configs else None
+        agg_model_name = first_server.model_name if first_server else ""
+
         return AggrTestCmds(
             server_cmds=server_cmds,
             client_cmds=client_cmds,
             timeout=DEFAULT_TIMEOUT,
             output_dir=output_dir,
             test_output_dir=test_output_dir,
+            client_configs=self.server_client_configs,
+            model_name=agg_model_name,
+            server_configs=list(self.server_configs),
         )
 
     def _get_disagg_commands(self, output_dir: str, test_output_dir: str):
@@ -1511,6 +1896,8 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            client_configs=self.server_client_configs,
+            server_configs=list(self.server_configs),
         )
 
     def _check_benchmark_errors(self, output: str) -> None:
@@ -1560,10 +1947,16 @@ class PerfSanityTestConfig:
 
             except Exception as e:
                 outputs[server_idx] = []
-                report_error(
-                    error_msg=e,
-                    log_files=commands.get_server_logs(server_idx),
-                )
+                # Aggregated mode does not set DISAGG_SERVING_TYPE, so the
+                # default "BENCHMARK" applies and report_error is always called.
+                # Disagg mode sets DISAGG_SERVING_TYPE per srun; only the
+                # BENCHMARK srun reports errors gathered from sibling logs.
+                if os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK") == "BENCHMARK":
+                    report_error(
+                        error_msg=e,
+                        log_files=commands.get_server_logs(server_idx),
+                    )
+                raise
 
         return outputs
 
@@ -1573,8 +1966,13 @@ class PerfSanityTestConfig:
         def parse_metrics_from_output(output: str) -> Optional[Dict[str, float]]:
             """Parse all metrics from a single output string."""
             metrics = {}
+            all_queries = {
+                **PERF_METRIC_LOG_QUERIES,
+                **SPEC_DECODING_PERF_METRIC_LOG_QUERIES,
+                **GEN_ONLY_PERF_METRIC_LOG_QUERIES,
+            }
             for line in output.split("\n"):
-                for metric_type, regex in PERF_METRIC_LOG_QUERIES.items():
+                for metric_type, regex in all_queries.items():
                     if metric_type in metrics:
                         continue
                     match = regex.search(line)
@@ -1588,6 +1986,14 @@ class PerfSanityTestConfig:
             self._perf_results[server_idx] = []
             server_outputs = outputs.get(server_idx, [])
             for client_idx, output in enumerate(server_outputs):
+                # only_run_accuracy clients have no benchmark output to parse;
+                # use None sentinel so check/upload paths can skip them.
+                if (
+                    client_idx < len(client_configs)
+                    and client_configs[client_idx].only_run_accuracy
+                ):
+                    self._perf_results[server_idx].append(None)
+                    continue
                 metrics = parse_metrics_from_output(output)
                 # SA benchmark (bench_serving) doesn't report user_throughput.
                 # Use None as sentinel to distinguish "not available" from actual zero.
@@ -1611,13 +2017,48 @@ class PerfSanityTestConfig:
                     f"is not equal to client number: {len(client_configs)}. "
                 )
             for client_idx, metrics in enumerate(server_perf_results):
-                if len(metrics) != len(PERF_METRIC_LOG_QUERIES):
+                # only_run_accuracy clients produce no perf metrics by design.
+                if (
+                    client_idx < len(client_configs)
+                    and client_configs[client_idx].only_run_accuracy
+                ):
+                    continue
+                missing = [k for k in PERF_METRIC_LOG_QUERIES if k not in (metrics or {})]
+                if missing:
                     error_msg += (
-                        f"Some metrics in Server {server_idx} Client {client_idx} are missing. "
-                        f"The broken metrics is {metrics}. "
+                        f"Some metrics in Server {server_idx} Client {client_idx} are missing: "
+                        f"{missing}. The parsed metrics is {metrics}. "
+                    )
+                # Spec-decoding tests must report 'Mean Avg Decoded Tokens per Iter'
+                # (parsed as 'al'). If the field is missing the test fails here so the
+                # data is never uploaded to OpenSearch.
+                if (
+                    client_idx < len(client_configs)
+                    and client_configs[client_idx].spec_decoding
+                    and "al" not in metrics
+                ):
+                    error_msg += (
+                        f"Speculative decoding test Server {server_idx} Client {client_idx} "
+                        f"is missing 'Mean Avg Decoded Tokens per Iter' in benchmark output. "
+                    )
+                # gen_only tests must report mean_gen_worker_per_iter_device_step_time
+                # (parsed from gen_server_*.log). It is the sole regression metric for
+                # gen_only, so a missing value must hard-fail rather than silently upload.
+                if (
+                    self.runtime == "multi_node_disagg_server"
+                    and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
+                    and (
+                        not metrics
+                        or metrics.get("mean_gen_worker_per_iter_device_step_time") is None
+                    )
+                ):
+                    error_msg += (
+                        f"gen_only test Server {server_idx} Client {client_idx} is "
+                        f"missing 'prev_device_step_time' in gen_server_*.log under "
+                        f"{self._output_dir}. "
                     )
         if error_msg:
-            raise Exception(error_msg)
+            raise RuntimeError(error_msg)
 
     def upload_test_results_to_database(self):
         """Upload test results and baseline to database."""
@@ -1669,8 +2110,11 @@ class PerfSanityTestConfig:
                     # Add test_case_name for convenient filtering on OpenSearch
                     new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
 
-                    for metric_name in PERF_METRIC_LOG_QUERIES:
-                        new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
+                    add_perf_metric_value(
+                        new_data,
+                        server_perf_results[client_idx],
+                        spec_decoding=client_config.spec_decoding,
+                    )
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
@@ -1731,8 +2175,12 @@ class PerfSanityTestConfig:
                     # Add test_case_name for convenient filtering on OpenSearch
                     new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config.name}"
 
-                    for metric_name in PERF_METRIC_LOG_QUERIES:
-                        new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
+                    add_perf_metric_value(
+                        new_data,
+                        server_perf_results[client_idx],
+                        spec_decoding=client_config.spec_decoding,
+                        benchmark_mode=disagg_config.benchmark_mode,
+                    )
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
@@ -1750,7 +2198,14 @@ class PerfSanityTestConfig:
                         if num_ctx_servers > 0:
                             match_keys.extend(add_list_prefix(ctx_config.to_match_keys(), "ctx"))
                         if num_gen_servers > 0:
-                            match_keys.extend(add_list_prefix(gen_config.to_match_keys(), "gen"))
+                            gen_match_keys = add_list_prefix(gen_config.to_match_keys(), "gen")
+                            if disagg_config.benchmark_mode == "gen_only":
+                                gen_match_keys = [
+                                    k
+                                    for k in gen_match_keys
+                                    if k != "gen_s_cache_transceiver_backend"
+                                ]
+                            match_keys.extend(gen_match_keys)
                         match_keys.extend(client_config.to_match_keys())
         else:
             return
@@ -1760,12 +2215,30 @@ class PerfSanityTestConfig:
             "s_test_list": self._test_param_labels,
         }
 
+        # gen_only tests are gated solely on per-iter prev_device_step_time, not
+        # token throughput (token-based numbers are dominated by KV cache transfer
+        # time in gen_only mode and are not a useful regression signal there).
+        # For all other modes, d_al is added when any client runs spec decoding.
+        if self.runtime == "multi_node_disagg_server" and any(
+            sc[2].benchmark_mode == "gen_only" for sc in self.server_configs
+        ):
+            regression_metrics = ["d_mean_gen_worker_per_iter_device_step_time"]
+        else:
+            regression_metrics = list(REGRESSION_METRICS)
+            has_spec_decoding = any(
+                cc.spec_decoding
+                for clients in self.server_client_configs.values()
+                for cc in clients
+            )
+            if has_spec_decoding:
+                regression_metrics.append("d_al")
+
         process_and_upload_test_results(
             new_data_dict=new_data_dict,
             match_keys=match_keys,
             maximize_metrics=MAXIMIZE_METRICS,
             minimize_metrics=MINIMIZE_METRICS,
-            regression_metrics=REGRESSION_METRICS,
+            regression_metrics=regression_metrics,
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
         )
