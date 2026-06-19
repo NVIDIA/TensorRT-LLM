@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -456,7 +456,9 @@ class MambaForCausalLM(PretrainedModel):
                                                quant_config=quant_config,
                                                **kwargs)
 
-        if not os.path.exists(hf_model_dir):
+        if use_preloading:
+            weights = convert_hf_mamba(hf_model, dtype)
+        elif not os.path.exists(hf_model_dir):
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_dir, dtype="auto", trust_remote_code=True)
 
