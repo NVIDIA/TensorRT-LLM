@@ -32,6 +32,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
 
@@ -61,29 +62,14 @@ def create_dsa_cache_manager(
     max_seq_len: int,
     num_layers: int = 1,
     indexer_k_dtype: str = "fp8",
+    index_topk: int = 2048,
 ):
     """Helper to create a DSACacheManager for testing."""
 
-    # Create a minimal sparse attention config
-    class SparseAttentionConfig:
-        """Minimal mock of SparseAttentionConfig for testing."""
-
-        def __init__(self, index_head_dim, index_n_heads, index_topk,
-                     indexer_k_dtype):
-            """Initialize sparse attention config with indexer parameters."""
-            self.index_head_dim = index_head_dim
-            self.index_n_heads = index_n_heads
-            self.index_topk = index_topk
-            self.prompt_budget = 1024
-            self.use_cute_dsl_topk = False
-            self.use_cute_dsl_paged_mqa_logits = False
-            self.enable_heuristic_topk = False
-            self.indexer_k_dtype = indexer_k_dtype
-
-    sparse_attn_config = SparseAttentionConfig(
+    sparse_attn_config = DeepSeekSparseAttentionConfig(
         index_head_dim=head_dim,
         index_n_heads=32,  # Default number of heads for indexer
-        index_topk=2048,
+        index_topk=index_topk,
         indexer_k_dtype=indexer_k_dtype)
 
     # Create KV cache config
@@ -108,7 +94,7 @@ def create_dsa_cache_manager(
         max_batch_size=batch_size,
         mapping=mapping,
         dtype=DataType.HALF,
-        sparse_attn_config=sparse_attn_config,
+        sparse_attention_config=sparse_attn_config,
     )
 
     return cache_manager, sparse_attn_config
@@ -138,7 +124,8 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             self.q_lora_rank = 512  # Example q_lora_rank
             self.qk_rope_head_dim = 64
 
-    mla_params = MLAParams(sparse_attn_config.index_head_dim)
+    sparse_params = sparse_attn_config.to_sparse_params()
+    mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
     with patch(
@@ -155,7 +142,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
             skip_create_weights_in_init=True,  # Skip weight creation for test
-            sparse_attention_config=sparse_attn_config,
+            sparse_params=sparse_params,
             dtype=torch.bfloat16,
             layer_idx=layer_idx)
 
@@ -1975,8 +1962,8 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
         head_dim=head_dim,
         tokens_per_block=block_size,
         max_seq_len=max_model_len,
-        num_layers=1)
-    sparse_attn_config.index_topk = index_topk
+        num_layers=1,
+        index_topk=index_topk)
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     # Allocate blocks for all sequences
@@ -2255,8 +2242,8 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         head_dim=head_dim,
         tokens_per_block=block_size,
         max_seq_len=max_model_len,
-        num_layers=1)
-    sparse_attn_config.index_topk = index_topk
+        num_layers=1,
+        index_topk=index_topk)
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     # Allocate blocks for all sequences (including historical + new tokens)
@@ -2470,8 +2457,8 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
         head_dim=head_dim,
         tokens_per_block=block_size,
         max_seq_len=max_model_len,
-        num_layers=1)
-    sparse_attn_config.index_topk = index_topk
+        num_layers=1,
+        index_topk=index_topk)
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     # Allocate cache blocks
@@ -2579,8 +2566,8 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
         head_dim=head_dim,
         tokens_per_block=block_size,
         max_seq_len=max_model_len,
-        num_layers=1)
-    sparse_attn_config.index_topk = index_topk
+        num_layers=1,
+        index_topk=index_topk)
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     request_ids = list(range(batch_size))
@@ -2731,8 +2718,8 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         head_dim=head_dim,
         tokens_per_block=block_size,
         max_seq_len=max_model_len,
-        num_layers=1)
-    sparse_attn_config.index_topk = index_topk
+        num_layers=1,
+        index_topk=index_topk)
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     # Allocate blocks
