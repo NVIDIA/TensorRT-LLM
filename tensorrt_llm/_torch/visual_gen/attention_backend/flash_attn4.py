@@ -26,9 +26,11 @@ import torch
 
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+from .utils import _merge_flash_attn_namespace
 
 _flash_attn_fwd_import_error = None
 try:
+    _merge_flash_attn_namespace()
     from flash_attn.cute.interface import _flash_attn_fwd
 except (ImportError, OSError) as e:
     _flash_attn_fwd = None
