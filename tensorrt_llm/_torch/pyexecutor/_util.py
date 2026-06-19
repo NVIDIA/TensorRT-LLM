@@ -98,9 +98,19 @@ def get_kv_cache_manager_cls(
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+        if use_py_mamba_cache_manager():
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "TRTLLM_USE_PY_MAMBA=1 forces "
+                    "MixedMambaHybridCacheManager, which does not support "
+                    "block reuse. Disable block reuse or unset "
+                    "TRTLLM_USE_PY_MAMBA to use CppMambaHybridCacheManager.")
+            logger.info(
+                "Using MixedMambaHybridCacheManager for hybrid mamba model")
+            return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if use_cpp_mamba_cache_manager() or use_py_mamba_cache_manager():
+        if use_cpp_mamba_cache_manager():
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
@@ -1681,7 +1691,11 @@ def _create_kv_cache_manager(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
 
-        use_replay = sm >= 80
+        use_replay = spec_config is not None and sm >= 80
+        if spec_config is None:
+            logger.info(
+                "Replay kernel requires speculative decoding; using non-replay path"
+            )
 
         # Block reuse (prefix caching): replay leaves SSM state at a
         # checkpoint after speculation. The next decode step replays forward
