@@ -32,6 +32,9 @@ from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
+from smg_grpc_proto.generated import common_pb2
+
+from .kv_events import convert_batch
 from .grpc_request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
@@ -318,6 +321,47 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             context_parallel_size=1,  # Context parallelism is separate from TP/PP
             world_size=world_size,
         )
+
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ):
+        """Stream KV-cache events for the gateway's cache-aware router.
+
+        Bridges TRT-LLM's ``get_kv_cache_events_async`` to the engine-neutral
+        ``common.KvEventBatch`` stream. ``start_sequence_number`` (replay) is
+        not honored — the stream starts from the current queue position.
+        """
+        cfg = getattr(getattr(self.request_manager, "llm", None), "args", None)
+        cfg = getattr(cfg, "kv_cache_config", None)
+        enabled = (bool(getattr(cfg, "enable_block_reuse", False))
+                   and int(getattr(cfg, "event_buffer_max_size", 0) or 0) > 0)
+        if not enabled:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events not enabled. Start TensorRT-LLM with "
+                "enable_block_reuse=True and event_buffer_max_size>0 in KvCacheConfig.",
+            )
+            return
+
+        await context.send_initial_metadata(())
+        seq = 0
+        try:
+            while not context.cancelled():
+                async for event in self.request_manager.llm.get_kv_cache_events_async(timeout=1):
+                    batch = convert_batch(event, seq)
+                    if batch is not None and len(batch.events) > 0:
+                        batch.timestamp = time.time()
+                        yield batch
+                        seq += 1  # only advance on yield -> contiguous seq numbers
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.exception("SubscribeKvEvents failed")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            logger.info("SubscribeKvEvents stream closed")
 
     # ========== Helper methods ==========
 

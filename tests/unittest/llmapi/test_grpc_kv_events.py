@@ -88,3 +88,90 @@ def test_convert_batch_uses_event_id_and_seq_and_dp_rank():
 def test_convert_batch_returns_none_for_skipped_event():
     created = {"event_id": 0, "data": {"type": "created", "num_blocks_per_cache_level": [1, 0]}}
     assert convert_batch(created, seq_num=0) is None
+
+
+import asyncio
+
+import grpc
+from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
+
+
+class _Cfg:
+    def __init__(self, enable_block_reuse, event_buffer_max_size):
+        self.enable_block_reuse = enable_block_reuse
+        self.event_buffer_max_size = event_buffer_max_size
+
+
+class _Args:
+    def __init__(self, cfg):
+        self.kv_cache_config = cfg
+
+
+class _FakeLLM:
+    def __init__(self, cfg, events):
+        self.args = _Args(cfg)
+        self._events = events
+
+    async def get_kv_cache_events_async(self, timeout=2):
+        for e in self._events:
+            yield e
+
+
+class _FakeRM:
+    def __init__(self, llm):
+        self.llm = llm
+
+
+class _Abort(Exception):
+    pass
+
+
+class _FakeCtx:
+    """Cancels after the first drain; records abort calls."""
+    def __init__(self):
+        self._checks = 0
+        self.aborted = None
+        self.metadata_sent = False
+
+    def cancelled(self):
+        sent = self._checks > 0
+        self._checks += 1
+        return sent
+
+    async def send_initial_metadata(self, md):
+        self.metadata_sent = True
+
+    async def abort(self, code, details):
+        self.aborted = (code, details)
+        raise _Abort(details)
+
+
+async def _collect(servicer, ctx):
+    out = []
+    async for batch in servicer.SubscribeKvEvents(None, ctx):
+        out.append(batch)
+    return out
+
+
+def test_subscribe_streams_stored_and_removed_skips_created():
+    events = [
+        {"event_id": 0, "data": {"type": "created", "num_blocks_per_cache_level": [2231, 0]}},
+        {"event_id": 1, "data": {"type": "stored", "parent_hash": None,
+            "blocks": [{"block_hash": 10, "tokens": [{"token_id": 1, "token_extra_id": 0}]}]}},
+        {"event_id": 151, "data": {"type": "removed", "block_hashes": [20]}},
+    ]
+    servicer = TrtllmServiceServicer(_FakeRM(_FakeLLM(_Cfg(True, 1024), events)))
+    ctx = _FakeCtx()
+    batches = asyncio.run(_collect(servicer, ctx))
+    assert ctx.metadata_sent is True
+    assert [b.events[0].WhichOneof("data") for b in batches] == ["stored", "removed"]
+    assert [b.sequence_number for b in batches] == [0, 1]
+    assert [b.events[0].event_id for b in batches] == [1, 151]
+
+
+def test_subscribe_unimplemented_when_events_disabled():
+    servicer = TrtllmServiceServicer(_FakeRM(_FakeLLM(_Cfg(False, 0), [])))
+    ctx = _FakeCtx()
+    with pytest.raises(_Abort):
+        asyncio.run(_collect(servicer, ctx))
+    assert ctx.aborted[0] == grpc.StatusCode.UNIMPLEMENTED
