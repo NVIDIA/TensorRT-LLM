@@ -46,7 +46,7 @@ WAN_T2V_HEIGHT = 480
 WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
 VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )

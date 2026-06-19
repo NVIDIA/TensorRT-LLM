@@ -30,6 +30,21 @@ from tensorrt_llm.visual_gen.args import AttentionConfig
 from .interface import AttentionBackend
 
 
+def _merge_flash_attn_namespace() -> None:
+    """Merge legacy `flash-attn` (v2) and `flash-attn-4` (cute-only) wheels.
+
+    `flash-attn-4` ships only `flash_attn/cute/` and relies on namespace
+    extension into the co-installed legacy `flash-attn` regular package.
+    When both wheels coexist, Python pins `flash_attn.__path__` to the v2
+    location and never sees `cute/`; re-extend the path to merge them.
+    """
+    import pkgutil
+
+    import flash_attn
+
+    flash_attn.__path__ = pkgutil.extend_path(flash_attn.__path__, flash_attn.__name__)
+
+
 def get_visual_gen_attention_backend(
     backend_name: str,
 ) -> Type[AttentionBackend]:
