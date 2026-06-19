@@ -28,6 +28,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gpt_oss import (
     GptOssRotaryEmbedding,
     GptOssTopKRouter,
 )
+from tensorrt_llm._utils import get_hf_rope_theta
 
 # ---------------------------------------------------------------------------
 # HF reference imports (skip tests if unavailable)
@@ -125,12 +126,13 @@ def _rope_position_embeddings(
     HF pos_emb: (cos, sin) of shape ``[B, S, head_dim/2]`` (GPT-OSS native).
     """
     head_dim = config.head_dim
-    # AD-side
+    # AD-side. ``rope_theta`` was relocated to ``config.rope_parameters`` in
+    # transformers v5; use the same helper the production model uses.
     rope = GptOssRotaryEmbedding(
         head_dim=head_dim,
         max_position_embeddings=config.max_position_embeddings,
-        rope_theta=config.rope_theta,
-        rope_scaling=config.rope_scaling,
+        rope_theta=get_hf_rope_theta(config, 10000.0),
+        rope_scaling=getattr(config, "rope_scaling", None),
     ).to(device=device)
     pos_ids = _position_ids(B, S, device)
     dummy = torch.zeros(1, device=device, dtype=dtype)
@@ -212,9 +214,21 @@ def test_router_equivalence():
     ad = GptOssTopKRouter(config).to(device=device, dtype=dtype).eval()
     ad.load_state_dict(ref.state_dict())
 
-    x = torch.randn(2, 8, config.hidden_size, device=device, dtype=dtype)
+    B, S = 2, 8
+    T = B * S
+    E = config.num_local_experts
+    x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     with torch.no_grad():
-        ref_scores, _ = ref(x)  # [B*S, E]
+        # transformers v5 ``GptOssTopKRouter`` returns
+        # ``(logits, top_k_scores, top_k_indices)`` and operates on a flattened
+        # ``[T, H]`` tensor (the HF ``GptOssMLP`` reshapes before calling it).
+        # AD's router still returns the scattered ``[T, E]`` tensor and accepts
+        # ``[B, S, H]`` directly; rebuild the scatter on the reference side so
+        # the comparison stays meaningful.
+        _, ref_top_v, ref_top_idx = ref(x.view(T, -1))
+        ref_scores = torch.zeros(T, E, device=device, dtype=ref_top_v.dtype).scatter_(
+            1, ref_top_idx, ref_top_v
+        )
         ad_scores = ad(x)  # [B*S, E]
     assert_rmse_close(ad_scores, ref_scores, rmse_ratio_tol=1e-3, msg="Router: ")
 
@@ -251,9 +265,12 @@ def test_experts_equivalence():
 
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     with torch.no_grad():
-        # HF GptOssExperts is in inference mode here; it picks the dense bmm branch on CUDA.
-        # On CPU it picks the sparse branch — both are mathematically equivalent.
-        ref_out = ref(x, router_indices=top_idx, routing_weights=routing_weights)
+        # transformers v5 ``GptOssExperts.forward`` expects ``router_indices``
+        # of shape ``[T, top_k]`` and ``routing_weights`` of shape ``[T, top_k]``
+        # (the post-softmax top-k scores, NOT the scattered ``[T, E]`` tensor),
+        # plus a flattened ``[T, H]`` hidden tensor. AD's signature is unchanged.
+        ref_out = ref(x.view(T, -1), router_indices=top_idx, routing_weights=top_v)
+        ref_out = ref_out.view(B, S, -1)
         ad_out = ad(x, routing_weights)
         ad_out = ad_out.view(B, S, -1)
     assert_rmse_close(ad_out, ref_out, rmse_ratio_tol=0.02, msg="Experts: ")
@@ -506,6 +523,13 @@ def test_full_model_equivalence():
     # Use 3 layers so we exercise both sliding and full attention plus an extra.
     config = _small_config(num_layers=3)
     config._attn_implementation = "eager"
+    # transformers v5 ``PreTrainedModel.__init__`` validates
+    # ``config._experts_implementation`` and promotes ``None`` to ``grouped_mm``
+    # after the HF init. The second init (our custom AD class) then re-validates
+    # the now-set value and rejects it because the AD class does not carry the
+    # ``@use_experts_implementation`` decorator. Forcing ``eager`` keeps both
+    # paths happy and matches the inference dispatch the test expects anyway.
+    config._experts_implementation = "eager"
 
     ref = hf["ForCausalLM"](config).to(device=device, dtype=dtype).eval()
     # Random init (default _init_weights leaves stacked params with empty().normal_()
