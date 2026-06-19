@@ -106,7 +106,7 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
+    marks=None,
 ):
     if num_beams == 1:
         expected_output_token_ids = (
@@ -127,6 +127,10 @@ def _test_case(
 
     assert not exact_match or expected_output_token_ids is not None
 
+    param_kwargs = {"id": f"{feature_id}-{model_name}"}
+    if marks is not None:
+        param_kwargs["marks"] = marks
+
     return pytest.param(
         model_name,
         expected_output_token_ids,
@@ -136,8 +140,7 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
-        id=f"{feature_id}-{model_name}",
-        marks=marks,
+        **param_kwargs,
     )
 
 
@@ -371,7 +374,6 @@ def _mixed_batch_test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
 ):
     expected_output_token_ids_by_request = (
         _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS.get((model_name, num_beams))
@@ -389,7 +391,6 @@ def _mixed_batch_test_case(
         num_return_sequences,
         exact_match,
         id=f"{feature_id}-{model_name}",
-        marks=marks,
     )
 
 

@@ -185,6 +185,7 @@ class PhasedFmha(Fmha):
             fp8_context_fmha=fp8_context_fmha,
             kv_factor=self.kv_factor,
             total_num_blocks=self._get_total_num_blocks(metadata),
+            is_cross=metadata.is_cross,
         )
 
         sequence_length = metadata.kv_lens_cuda_runtime

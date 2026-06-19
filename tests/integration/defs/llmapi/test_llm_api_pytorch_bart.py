@@ -63,7 +63,6 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
     kv_cache_dtype: str = "auto",
 ):
     expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
@@ -79,7 +78,6 @@ def _test_case(
         exact_match,
         kv_cache_dtype,
         id=f"{feature_id}-{_MODEL_NAME}",
-        marks=marks,
     )
 
 

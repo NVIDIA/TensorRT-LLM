@@ -41,15 +41,6 @@ class CrossAttention(nn.Module):
     subsequent generation steps, K/V are read from the cache without
     re-projection.
 
-    The cross-attention sub-layer honors ``ModelConfig.attn_backend``: when
-    set to ``"TRTLLM"`` it dispatches through the production attention backend
-    on every supported architecture. If the internal ``trtllm_gen`` fast path
-    is enabled and supports the current shape, cross-attention writes encoder
-    K/V to the cross-KV pool and uses the trtllm-gen kernels; otherwise it
-    falls back to the standard THOP attention path.
-
-    Encoder and decoder self-attention are unaffected and continue to use
-    whatever backend ``ModelConfig.attn_backend`` selects.
     """
 
     def __init__(

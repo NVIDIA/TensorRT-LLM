@@ -189,11 +189,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def effective_beam_width(self) -> int:
         """Beam width visible to the kernel.
 
-        Cross-attention metadata is already expanded to one row per decoder
-        beam, and all beams read the same encoder K/V cache. Keep kernel beam
-        indirection disabled for that path.
+        Cross-attention K/V storage is request-scoped, but its metadata is
+        expanded to one row per decoder beam so kernels still need the active
+        decoder beam width.
         """
-        return 1 if self.is_cross else self.beam_width
+        return self.beam_width
 
     @property
     def max_seq_len(self) -> int:

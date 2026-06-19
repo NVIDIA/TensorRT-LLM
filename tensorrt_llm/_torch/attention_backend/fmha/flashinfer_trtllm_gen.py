@@ -596,13 +596,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         sparse_params = attn.sparse_params
         has_skip_softmax = getattr(sparse_params, "algorithm", None) == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
-        if meta.is_cross and is_mla_enable:
-            return False, "Cross attention with MLA is not supported by trtllm-gen backend."
-        if meta.is_cross and (meta.is_spec_decoding_enabled or meta.use_spec_decoding):
-            return (
-                False,
-                "Cross attention with speculative decoding is not supported by trtllm-gen backend.",
-            )
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
@@ -656,11 +649,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         kv_cache_dtype = self._get_kv_cache_dtype(meta)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
-        if meta.is_cross and kv_cache_dtype == DataType.NVFP4:
-            return (
-                False,
-                "Cross attention with NVFP4 KV cache is not supported by trtllm-gen backend.",
-            )
+        if meta.is_cross:
+            if kv_cache_dtype == DataType.NVFP4:
+                return (
+                    False,
+                    "Cross attention with NVFP4 KV cache is not supported by trtllm-gen backend.",
+                )
+            if is_mla_enable:
+                return False, "Cross attention with MLA is not supported by trtllm-gen backend."
+            if meta.is_spec_decoding_enabled or meta.use_spec_decoding:
+                return (
+                    False,
+                    "Cross attention with speculative decoding is not supported by "
+                    "trtllm-gen backend.",
+                )
 
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
@@ -698,7 +700,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 )
 
         if has_generation_phase:
-            if meta.effective_beam_width != 1:
+            if meta.effective_beam_width != 1 and not meta.is_cross:
                 return (
                     False,
                     f"[Generation] Beam search (beam_width={meta.effective_beam_width}) "
