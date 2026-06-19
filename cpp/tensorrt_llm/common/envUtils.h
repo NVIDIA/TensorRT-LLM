@@ -141,6 +141,10 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 uint16_t getEnvNixlPort();
 
+// Pure resolver (exposed for unit testing): a null or empty value yields the
+// default lock path, otherwise the value is used verbatim.
+std::string resolveNixlPortLockPath(char const* envValue);
+
 // Path to the file lock that serializes NIXL listen-port selection across
 // colocated agents. Defaults to "/tmp/trtllm_nixl_port.lock"; override with
 // TRTLLM_NIXL_PORT_LOCK_PATH to avoid collisions on a shared /tmp (e.g. multi-tenant hosts).
