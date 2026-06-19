@@ -529,10 +529,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     nixl_status_t status;
     if (config.useListenThread)
     {
-        FileLock lock("/tmp/trtllm_nixl_port.lock");
+        auto const lockPath = common::getEnvNixlPortLockPath();
+        FileLock lock(lockPath);
         if (!lock.lock())
         {
-            TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
+            TLLM_THROW("Failed to lock %s", lockPath.c_str());
         }
         auto envPort = common::getEnvNixlPort();
         uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
