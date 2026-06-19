@@ -64,12 +64,13 @@ def test_convert_event_stored_with_parent():
 
 
 def test_convert_event_removed():
+    # Both hashes are > 2**63 to exercise the unsigned->signed wrap on each.
     ev = {"event_id": 151, "data": {"type": "removed",
-          "block_hashes": [10385249491213107555, 6338905736856950139]}}
+          "block_hashes": [10385249491213107555, 12379813738877118345]}}
     out = convert_event(ev, event_id=151)
     assert out.WhichOneof("data") == "removed"
     assert list(out.removed.block_hashes) == [
-        10385249491213107555 - 2**64, 6338905736856950139]
+        10385249491213107555 - 2**64, 12379813738877118345 - 2**64]
 
 
 def test_convert_event_created_and_updated_skipped():
@@ -132,6 +133,8 @@ class _FakeCtx:
         self.metadata_sent = False
 
     def cancelled(self):
+        # Returns False on the first call (enter loop), True on every subsequent
+        # call -- so the loop exits after one full drain of the event queue.
         sent = self._checks > 0
         self._checks += 1
         return sent
@@ -173,3 +176,19 @@ def test_subscribe_unimplemented_when_events_disabled():
     with pytest.raises(_Abort):
         asyncio.run(_collect(servicer, ctx))
     assert ctx.aborted[0] == grpc.StatusCode.UNIMPLEMENTED
+
+
+def test_subscribe_seq_persists_across_reconnects():
+    # A second SubscribeKvEvents call on the SAME servicer (a reconnect) must
+    # continue the sequence_number, not restart at 0 -- otherwise the consumer's
+    # stale-skip (seq <= last_seq) would drop fresh post-reconnect events.
+    def stored(h):
+        return {"event_id": h, "data": {"type": "stored", "parent_hash": None,
+                "blocks": [{"block_hash": h, "tokens": [{"token_id": 1, "token_extra_id": 0}]}]}}
+    llm = _FakeLLM(_Cfg(True, 1024), [stored(10), stored(11)])
+    servicer = TrtllmServiceServicer(_FakeRM(llm))
+    first = asyncio.run(_collect(servicer, _FakeCtx()))
+    llm._events = [stored(12), stored(13)]  # new events on the reconnected stream
+    second = asyncio.run(_collect(servicer, _FakeCtx()))
+    assert [b.sequence_number for b in first] == [0, 1]
+    assert [b.sequence_number for b in second] == [2, 3]  # continues, not reset to 0

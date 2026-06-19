@@ -26,14 +26,13 @@ from collections.abc import AsyncGenerator
 from typing import List, Union
 
 import grpc
+from smg_grpc_proto.generated import common_pb2
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
-from smg_grpc_proto.generated import common_pb2
-
 from .kv_events import convert_batch
 from .grpc_request_manager import (
     GrpcRequestManager,
@@ -65,6 +64,13 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         self.request_manager = request_manager
         self.model_path = model_path
         self._start_time = time.time()
+        # Monotonic KV-event sequence counter, persisted on the servicer so it
+        # continues across SubscribeKvEvents reconnects (the SMG consumer keeps
+        # a last_seq across reconnects and drops batches with seq <= last_seq).
+        # Advances only on yield, so disconnect-window losses create no gap.
+        # Assumes one active subscriber per worker (TRT-LLM's event queue is
+        # single-consumer); concurrent subscribers are out of scope.
+        self._kv_seq = 0
         logger.info("TrtllmServiceServicer initialized")
 
     async def Generate(
@@ -333,8 +339,8 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         ``common.KvEventBatch`` stream. ``start_sequence_number`` (replay) is
         not honored — the stream starts from the current queue position.
         """
-        cfg = getattr(getattr(self.request_manager, "llm", None), "args", None)
-        cfg = getattr(cfg, "kv_cache_config", None)
+        args = getattr(getattr(self.request_manager, "llm", None), "args", None)
+        cfg = getattr(args, "kv_cache_config", None)
         enabled = (bool(getattr(cfg, "enable_block_reuse", False))
                    and int(getattr(cfg, "event_buffer_max_size", 0) or 0) > 0)
         if not enabled:
@@ -346,15 +352,14 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             return
 
         await context.send_initial_metadata(())
-        seq = 0
         try:
             while not context.cancelled():
                 async for event in self.request_manager.llm.get_kv_cache_events_async(timeout=1):
-                    batch = convert_batch(event, seq)
+                    batch = convert_batch(event, self._kv_seq)
                     if batch is not None and len(batch.events) > 0:
                         batch.timestamp = time.time()
                         yield batch
-                        seq += 1  # only advance on yield -> contiguous seq numbers
+                        self._kv_seq += 1  # only advance on yield -> contiguous seq numbers
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001
