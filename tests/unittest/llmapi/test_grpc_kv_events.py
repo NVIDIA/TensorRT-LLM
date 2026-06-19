@@ -49,13 +49,13 @@ def test_convert_event_stored_with_parent():
         "event_id": 4,
         "data": {
             "type": "stored",
-            "parent_hash": 4054825000829942847,
+            "parent_hash": 9622824665191806685,  # > 2**63, must wrap negative
             "blocks": [{"type": "stored_block", "block_hash": 10,
                         "tokens": [{"token_id": 5, "token_extra_id": 0}]}],
         },
     }
     out = convert_event(ev, event_id=4)
-    assert out.stored.parent_block_hash == 4054825000829942847
+    assert out.stored.parent_block_hash == 9622824665191806685 - 2**64
     assert [b.block_hash for b in out.stored.blocks] == [10]
 
 

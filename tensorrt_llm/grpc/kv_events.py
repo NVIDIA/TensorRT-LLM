@@ -78,7 +78,7 @@ def convert_batch(event: dict, seq_num: int) -> Optional[common_pb2.KvEventBatch
     ``seq_num`` is a gateway-facing monotonic counter (the batch sequence
     number); the proto ``event_id`` keeps TRT-LLM's own monotonic id.
     """
-    proto_event = convert_event(event, int(event.get("event_id", seq_num)))
+    proto_event = convert_event(event, int(event["event_id"]))
     if proto_event is None:
         return None
     batch = common_pb2.KvEventBatch(sequence_number=seq_num, events=[proto_event])
