@@ -33,8 +33,7 @@ def default_prompt():
 
 @pytest.fixture(scope="module")
 def model_name():
-    #return "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
-    return "gpt-oss-20b"
+    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
 @pytest.fixture(scope="module", params=['pytorch'])
