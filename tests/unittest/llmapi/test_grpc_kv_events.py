@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the gRPC KV-cache event converter (CPU-only, no model)."""
+import asyncio
+
+import grpc
 import pytest
 
 pytest.importorskip("smg_grpc_proto")
+from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
 from tensorrt_llm.grpc.kv_events import convert_batch, convert_event, to_int64
 
 
@@ -88,12 +92,6 @@ def test_convert_batch_uses_event_id_and_seq_and_dp_rank():
 def test_convert_batch_returns_none_for_skipped_event():
     created = {"event_id": 0, "data": {"type": "created", "num_blocks_per_cache_level": [1, 0]}}
     assert convert_batch(created, seq_num=0) is None
-
-
-import asyncio
-
-import grpc
-from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
 
 
 class _Cfg:
