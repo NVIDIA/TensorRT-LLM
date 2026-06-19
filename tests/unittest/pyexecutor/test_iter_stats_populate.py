@@ -164,6 +164,8 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
         channel so regression tests can verify ``_update_iter_stats`` uses
         the explicit scheduled-batch stats argument instead.
     """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
     fake = MagicMock()
     fake.max_num_active_requests = 64
     fake.iter_counter = 1
@@ -173,6 +175,10 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
+    # Bind the real @staticmethod so production's ``self._is_stats_dummy_request(req)``
+    # dispatches to it instead of MagicMock's truthy auto-resolution (which would
+    # filter every request as a dummy and zero out the KV-token/count counters).
+    fake._is_stats_dummy_request = PyExecutor._is_stats_dummy_request
     return fake
 
 
