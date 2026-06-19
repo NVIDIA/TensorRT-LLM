@@ -245,6 +245,9 @@ class TransformersTokenizer(TokenizerBase):
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
+    def convert_tokens_to_ids(self, tokens, *args, **kwargs):
+        return self.tokenizer.convert_tokens_to_ids(tokens, *args, **kwargs)
+
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
         return self.tokenizer(texts, *args, **kwargs)
