@@ -527,6 +527,44 @@ class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.MiniMax2
 
 
+class MiniMaxM3MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
+    """MiniMax-M3 routing: sigmoid -> add bias -> top-k -> renorm -> scale.
+
+    Extends ``MiniMaxM2MoeRoutingMethod`` by multiplying the renormalized
+    top-k weights by ``routed_scaling_factor`` so the per-token routed
+    expert contribution is amplified before being summed into the
+    final hidden state. SGLang implements the same factor as ``TopK(
+    routed_scaling_factor=..., apply_routed_scaling_factor_on_output=True)``.
+    """
+
+    def __init__(
+        self,
+        top_k: int,
+        num_experts: int,
+        callable_e_score_correction_bias: Callable[[], torch.Tensor],
+        routed_scaling_factor: float = 1.0,
+        output_dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=callable_e_score_correction_bias,
+            output_dtype=output_dtype,
+        )
+        self.routed_scaling_factor = float(routed_scaling_factor)
+
+    def apply(self,
+              router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_idx, top_k_weights = super().apply(router_logits)
+        if self.routed_scaling_factor != 1.0:
+            top_k_weights = top_k_weights * self.routed_scaling_factor
+        return topk_idx, top_k_weights
+
+    @property
+    def routing_method_type(self):
+        return RoutingMethodType.MiniMax2
+
+
 class SigmoidRenormMoeRoutingMethod(BaseMoeRoutingMethod):
 
     def __init__(
