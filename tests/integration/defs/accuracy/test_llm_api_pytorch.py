@@ -7428,6 +7428,9 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=max_batch_size,
+                # Cap per-sequence block budget so block_reuse + Mamba
+                # snapshot pool fit; HF default 262144 starves both.
+                max_seq_len=8192,
                 tensor_parallel_size=tp_size,
                 moe_expert_parallel_size=ep_size,
                 pipeline_parallel_size=1,
