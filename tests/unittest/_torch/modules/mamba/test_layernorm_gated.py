@@ -225,15 +225,64 @@ class TestRMSNormNVFP4:
 
 
 @skip_no_cuda
+class TestRMSNormNVFP4NonAligned:
+    """Tests for group sizes not aligned to 256 (e.g., group_size=960 from mamba_head_dim=80)."""
+
+    @skip_unless_nvfp4_kernel
+    @pytest.mark.parametrize(
+        "hidden_size,group_size",
+        [
+            # hidden_size=7680, group_size=960 (not a multiple of 32)
+            (7680, 960),
+            # Smaller case.
+            (3840, 960),
+        ],
+    )
+    def test_nvfp4_non_aligned_group_size(self, hidden_size, group_size):
+        """Fused CUDA kernel produces valid output for non-256-aligned group sizes."""
+        batch_size = 4
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        norm = (
+            RMSNorm(
+                hidden_size, eps=1e-5, is_nvfp4=True, norm_before_gate=False, group_size=group_size
+            )
+            .to(device)
+            .to(dtype)
+        )
+        norm.nvfp4_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
+
+        torch.manual_seed(42)
+        x = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
+        z = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
+
+        output = norm(x, z=z)
+
+        assert isinstance(output, Fp4QuantizedTensor)
+        assert output.fp4_tensor.dtype == torch.uint8
+        assert output.is_sf_swizzled is True
+        assert output.fp4_tensor.shape == (batch_size, hidden_size // 2)
+        assert not torch.isnan(output.scaling_factor).any()
+        assert not torch.isinf(output.scaling_factor).any()
+
+
+@skip_no_cuda
 class TestRMSNormCUDAvsTriton:
     @skip_unless_nvfp4_kernel
-    def test_cuda_triton_fp4_comparison(self):
+    @pytest.mark.parametrize(
+        "hidden_size,group_size,dtype",
+        [
+            (2048, 1024, torch.float16),
+            # group_size=960 (non-256-aligned, exercises warp padding)
+            (7680, 960, torch.bfloat16),
+        ],
+        ids=["aligned_1024", "non_aligned_960"],
+    )
+    def test_cuda_triton_fp4_comparison(self, hidden_size, group_size, dtype):
         """Compare fused CUDA kernel (norm+FP4) vs Triton norm + separate fp4_quantize."""
-        hidden_size = 2048
         batch_size = 4
-        group_size = 1024
         device = "cuda"
-        dtype = torch.float16
         eps = 1e-5
         sf_vec_size = 16
 
@@ -243,7 +292,6 @@ class TestRMSNormCUDAvsTriton:
         weight = torch.empty(hidden_size, device=device, dtype=dtype)
         torch.nn.init.normal_(weight, mean=1.0, std=0.1)
 
-        # Compute sf_scale from the reference normalized output
         ref_normed = reference_rmsnorm_gated(
             x,
             weight,
@@ -273,7 +321,7 @@ class TestRMSNormCUDAvsTriton:
             .to(device)
             .to(dtype)
         )
-        norm_triton.weight.data.copy_(norm_cuda.weight.data)
+        norm_triton.weight.data.copy_(weight)
 
         output_cuda_fp4 = norm_cuda(x, z=z)
         output_triton = norm_triton(x, z=z)
@@ -281,21 +329,17 @@ class TestRMSNormCUDAvsTriton:
         assert isinstance(output_cuda_fp4, Fp4QuantizedTensor)
         assert isinstance(output_triton, torch.Tensor)
 
-        # Quantize the Triton output with the same NVFP4 scheme
         fp4_separate, sf_separate = torch.ops.trtllm.fp4_quantize(
             output_triton.contiguous(),
             sf_scale,
             sf_vec_size,
             False,
-            True,  # use_ue8m0=False, is_sf_swizzled_layout=True
+            True,
         )
 
-        # Compare FP4 packed values (byte-level)
         fp4_match_rate = (output_cuda_fp4.fp4_tensor == fp4_separate).float().mean().item()
         assert fp4_match_rate >= 0.99, f"FP4 packed values match rate {fp4_match_rate:.4f} < 0.99"
 
-        # Compare scale factors: unswizzle with padded dimensions, then
-        # slice the valid [batch_size, num_sf_cols] portion
         padded_rows = pad_up(batch_size, 128)
         num_sf_cols = ceil_div(hidden_size, sf_vec_size)
         padded_cols = pad_up(num_sf_cols, 4) * sf_vec_size
