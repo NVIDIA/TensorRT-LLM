@@ -393,7 +393,10 @@ def _execute_kv_path_in_aux_stream_no_allgather(
     node_order = {n: i for i, n in enumerate(graph.nodes)}
     num_matches = 0
 
-    for fork_point, q_linear, kv_linear in triples:
+    # event_id is a stable per-match id (one per MLA fork) so each layer gets its
+    # own main/aux CUDA event; without it monolithic CG capture dedups the shared
+    # event recorded N times and the Q/KV overlap collapses across layers.
+    for event_id, (fork_point, q_linear, kv_linear) in enumerate(triples):
         # Skip if kv_linear has an AllGather downstream — that's pattern 0's job.
         kv_ag = _find_downstream_node(kv_linear, lambda n: is_op(n, all_gather_ops()), max_depth=2)
         if kv_ag is not None:
@@ -430,13 +433,17 @@ def _execute_kv_path_in_aux_stream_no_allgather(
 
         # Step 1: begin_aux before kv_linear, wrapping fork_point as input.
         with graph.inserting_before(kv_linear):
-            begin_node = graph.call_function(begin_aux_stream_passthrough, args=(fork_point,))
+            begin_node = graph.call_function(
+                begin_aux_stream_passthrough, args=(fork_point,), kwargs={"event_id": event_id}
+            )
             begin_node.meta["val"] = fork_point.meta.get("val")
         kv_linear.args = tuple(begin_node if a is fork_point else a for a in kv_linear.args)
 
         # Step 2: end_aux right after last_kv_op (rewire mla_op).
         with graph.inserting_after(last_kv_op):
-            end_node = graph.call_function(end_aux_stream_passthrough, args=(last_kv_op,))
+            end_node = graph.call_function(
+                end_aux_stream_passthrough, args=(last_kv_op,), kwargs={"event_id": event_id}
+            )
             end_node.meta["val"] = last_kv_op.meta.get("val")
         mla_op.args = tuple(end_node if a is last_kv_op else a for a in mla_op.args)
 
@@ -450,7 +457,11 @@ def _execute_kv_path_in_aux_stream_no_allgather(
             continue
         q_input_for_wait = sorted(q_inputs_to_mla, key=lambda x: node_order.get(x, 0))[-1]
         with graph.inserting_before(mla_op):
-            wait_node = graph.call_function(wait_aux_stream_passthrough, args=(q_input_for_wait,))
+            wait_node = graph.call_function(
+                wait_aux_stream_passthrough,
+                args=(q_input_for_wait,),
+                kwargs={"event_id": event_id},
+            )
             wait_node.meta["val"] = q_input_for_wait.meta.get("val")
         mla_op.args = tuple(wait_node if a is q_input_for_wait else a for a in mla_op.args)
 
@@ -622,7 +633,10 @@ def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, 
     if not fused_nodes:
         return gm, 0
 
-    for dsv3 in fused_nodes:
+    # event_id is a stable per-match id (one per MLA fork) so each layer gets its
+    # own main/aux CUDA event; without it monolithic CG capture dedups the shared
+    # event recorded N times and the Q/KV overlap collapses across layers.
+    for event_id, dsv3 in enumerate(fused_nodes):
         narrows = [u for u in dsv3.users if _is_narrow_op(u) and len(u.args) >= 4]
         narrow_kv = next((n for n in narrows if int(n.args[3]) == _DSV3_KV_A_OUT), None)
         narrow_q = next((n for n in narrows if int(n.args[3]) == _DSV3_Q_A_OUT), None)
@@ -689,9 +703,12 @@ def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, 
         # Step 1: Insert begin_aux just before first_kv_compute, with narrow_kv
         # as input (semantics: aux waits for main's narrow_kv = dsv3, i.e. only
         # dsv3 must complete before KV-cone starts on aux).
-        # V8: shared CUDA event (default event_id=-1) — matches the wait_aux below.
+        # Per-fork event_id (begin/end/wait below share it) so each layer keeps a
+        # distinct CUDA event under monolithic CG capture.
         with graph.inserting_before(first_kv_compute):
-            begin_node = graph.call_function(begin_aux_stream_passthrough, args=(narrow_kv,))
+            begin_node = graph.call_function(
+                begin_aux_stream_passthrough, args=(narrow_kv,), kwargs={"event_id": event_id}
+            )
             begin_node.meta["val"] = narrow_kv.meta.get("val")
         first_kv_compute.args = tuple(
             begin_node if a is narrow_kv else a for a in first_kv_compute.args
@@ -700,7 +717,9 @@ def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, 
         # Step 2: Insert end_aux right after last_kv_op (switch back to main
         # so Q-cone enqueues on main).
         with graph.inserting_after(last_kv_op):
-            end_node = graph.call_function(end_aux_stream_passthrough, args=(last_kv_op,))
+            end_node = graph.call_function(
+                end_aux_stream_passthrough, args=(last_kv_op,), kwargs={"event_id": event_id}
+            )
             end_node.meta["val"] = last_kv_op.meta.get("val")
         # Rewire mla_op's reference to last_kv_op → end_node.
         mla_op.args = tuple(end_node if a is last_kv_op else a for a in mla_op.args)
@@ -709,7 +728,9 @@ def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, 
         # event wait — gates entire aux stream).
         with graph.inserting_before(mla_op):
             wait_node = graph.call_function(
-                wait_aux_stream_passthrough, args=(wait_input_for_wait,)
+                wait_aux_stream_passthrough,
+                args=(wait_input_for_wait,),
+                kwargs={"event_id": event_id},
             )
             wait_node.meta["val"] = wait_input_for_wait.meta.get("val")
         mla_op.args = tuple(wait_node if a is wait_input_for_wait else a for a in mla_op.args)
