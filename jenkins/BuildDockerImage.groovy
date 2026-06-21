@@ -443,6 +443,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         "Build CI Image (x86_64 tritondevel)": [:],
         "Build CI Image (SBSA tritondevel)": [
             arch: "arm64",
+            args: "BASE_IMAGE=gitlab-master.nvidia.com:5005/jbernloehr/host-boundedness/pytorch BASE_TAG=25.12-py3-bolt-optimized",
         ],
         "Build CI Image (RockyLinux8 Python310)": [
             target: "rockylinux8",
