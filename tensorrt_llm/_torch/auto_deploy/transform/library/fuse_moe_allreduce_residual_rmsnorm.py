@@ -74,7 +74,7 @@ class FuseMoEAllreduceResidualRMSNorm(BaseTransform):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        strategy = shared_config.dist_config.allreduce_strategy
+        default_strategy = shared_config.dist_config.allreduce_strategy
 
         graph = gm.graph
         tfarn = torch.ops.auto_deploy.triton_fused_add_rms_norm
@@ -101,9 +101,12 @@ class FuseMoEAllreduceResidualRMSNorm(BaseTransform):
                 shared = a
             if traced is None:
                 continue
-            routed, view_shape, _ar_strategy, wait_kwargs = traced
+            routed, view_shape, ar_strategy, wait_kwargs = traced
             if not isinstance(shared, Node):
                 continue
+            # Fused op inherits the AR node's own strategy so it stays identical to
+            # the standalone all-reduce it replaces (falls back to the dist default).
+            fused_strategy = ar_strategy if ar_strategy is not None else default_strategy
 
             ad_logger.info(
                 f"[V26] fusing MoE all-reduce into residual+rmsnorm at {norm_node.name} "
@@ -122,7 +125,7 @@ class FuseMoEAllreduceResidualRMSNorm(BaseTransform):
                 )
                 fused = graph.call_function(
                     torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm.default,
-                    args=(routed_3d, shared_plus_res, weight, eps, strategy),
+                    args=(routed_3d, shared_plus_res, weight, eps, fused_strategy),
                 )
                 fused.meta.update(norm_node.meta)
 
