@@ -42,7 +42,8 @@ def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     if not _trtllm_silu_resolved:
         try:
             _trtllm_silu_and_mul = torch.ops.trtllm.silu_and_mul
-        except Exception:
+        except AttributeError:
+            # Op not yet registered at resolve time; fall back to flashinfer/manual.
             _trtllm_silu_and_mul = None
         _trtllm_silu_resolved = True
     if _trtllm_silu_and_mul is not None:
