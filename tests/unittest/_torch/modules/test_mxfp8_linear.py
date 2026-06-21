@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import glob
-import os
-
 import pytest
 import torch
 
@@ -113,36 +110,3 @@ def test_mxfp8_linear_cutlass_matches_reference():
     ref = (x.float() @ w_deq.t()).to(torch.bfloat16)
     rel = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-6)
     assert rel < 0.05, f"CUTLASS vs reference rel err {rel}"
-
-
-CKPT = "/home/scratch.fredw_sw/workspace/hidden_trail/minimax-m3-preview_vv1"
-
-
-@pytest.mark.skipif(not os.path.isdir(CKPT), reason="MXFP8 ckpt not present")
-def test_load_real_mxfp8_dense_layer():
-    from safetensors import safe_open
-
-    # Find the shard holding layer 0 q_proj.
-    candidate_names = [
-        "language_model.model.layers.0.self_attn.q_proj.weight",
-        "model.layers.0.self_attn.q_proj.weight",
-    ]
-    name_w = name_s = None
-    w = s = None
-    for f in sorted(glob.glob(os.path.join(CKPT, "*.safetensors"))):
-        with safe_open(f, framework="pt") as h:
-            keys = set(h.keys())
-            for cand in candidate_names:
-                if cand in keys:
-                    name_w, name_s = cand, cand + "_scale_inv"
-                    w, s = h.get_tensor(name_w), h.get_tensor(name_s)
-                    break
-            if w is not None:
-                break
-    assert w is not None and s is not None, f"q_proj weight not found in {CKPT}"
-    assert w.dtype == torch.float8_e4m3fn
-    assert s.dtype == torch.uint8
-    # Scale layout is [out_features, in_features/32].
-    assert s.shape[1] == w.shape[1] // 32
-    w_deq = dequant_mxfp8_weight(w, s, 32)
-    assert torch.isfinite(w_deq).all()

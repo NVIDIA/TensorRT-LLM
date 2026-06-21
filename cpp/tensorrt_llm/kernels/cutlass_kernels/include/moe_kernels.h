@@ -685,7 +685,11 @@ public:
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override
     {
-        return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
+        // Pass `use_mxfp8_weight_scaling_` so MXFP8xMXFP8 enumerates only the
+        // Mxf8f6f4-valid tile shapes; otherwise autotuning would invoke FP8
+        // tile shapes that the runtime dispatcher rejects with TLLM_THROW.
+        return moe_gemm_runner_.getConfigs(
+            gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused(), use_mxfp8_weight_scaling_);
     }
 
     static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id)

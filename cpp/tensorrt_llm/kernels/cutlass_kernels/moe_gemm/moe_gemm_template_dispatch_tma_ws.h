@@ -463,7 +463,13 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
 
     if (gemm_config.sm_version == 90)
     {
-        if constexpr (kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
+        // Block-scaled MXFP8xMXFP8 (IsMXFPX=true) is Blackwell-only; the SM90 launcher
+        // has no `is_mx_fpx=True` explicit instantiation in generate_kernels.py. Gate
+        // the SM90 dispatch on `!IsMXFPX` so the IsMXFPX=true template is never
+        // instantiated for Sm90 (otherwise the link of libth_common.so fails with
+        // undefined references when SM90 is included in CMAKE_CUDA_ARCHITECTURES).
+        if constexpr (!IsMXFPX
+            && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, FUSION>())
         {
             switch (gemm_config.tile_config_sm90)
             {
@@ -558,34 +564,30 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
     // <e4m3, e4m3> needs the IsMXFPX template to match what the runtime dispatch will pick.
     constexpr bool is_wfp4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
     constexpr bool is_wfp8afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
-    if constexpr (is_wfp4afp8)
+    auto pick_kernel = [&]()
     {
-        dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
-            cutlass_extensions::EpilogueOpDefault, FUSION, true>(
-            input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
-    }
-    else if constexpr (is_wfp8afp8)
-    {
-        bool const use_mxfp8 = fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-        if (use_mxfp8)
+        if constexpr (is_wfp4afp8)
         {
-            dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
-                cutlass_extensions::EpilogueOpDefault, FUSION, true>(
-                input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+            return &dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+                cutlass_extensions::EpilogueOpDefault, FUSION, true>;
+        }
+        else if constexpr (is_wfp8afp8)
+        {
+            bool const use_mxfp8
+                = fpX_block_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+            return use_mxfp8 ? &dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+                       cutlass_extensions::EpilogueOpDefault, FUSION, true>
+                             : &dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+                                 cutlass_extensions::EpilogueOpDefault, FUSION, false>;
         }
         else
         {
-            dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
-                cutlass_extensions::EpilogueOpDefault, FUSION, false>(
-                input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
+            return &dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
+                cutlass_extensions::EpilogueOpDefault, FUSION, false>;
         }
-    }
-    else
-    {
-        dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType, OutputType,
-            cutlass_extensions::EpilogueOpDefault, FUSION, false>(
-            input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
-    }
+    };
+    auto selected_kernel = pick_kernel();
+    selected_kernel(input, num_experts, gemm_config, multi_processor_count, cudaStream_t{0}, nullptr, &count);
     return count;
 }
 

@@ -483,17 +483,17 @@ namespace kernels::cutlass_kernels
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
-    bool supports_finalize_fusion) const
+    bool supports_finalize_fusion, bool use_mxfp8) const
 {
-    return getConfigs(sm_, supports_finalize_fusion);
+    return getConfigs(sm_, supports_finalize_fusion, use_mxfp8);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
-    int sm, bool supports_finalize_fusion)
+    int sm, bool supports_finalize_fusion, bool use_mxfp8)
 {
     std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs
-        = getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
+        = getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion, use_mxfp8);
     std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
     std::copy(ampere_configs.begin(), ampere_configs.end(), std::back_inserter(candidate_configs));
     return candidate_configs;
@@ -530,7 +530,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 std::vector<cutlass_extensions::CutlassGemmConfig>
 MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(
-    int sm, bool supports_finalize_fusion)
+    int sm, bool supports_finalize_fusion, bool use_mxfp8)
 {
     using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     static constexpr auto weight_only_flag
@@ -545,8 +545,16 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     static constexpr auto fp4_only_flag
         = (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
     static constexpr auto fp8fp4_mixed_flag = use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
-    auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(weight_only_flag | simt_only_flag
-        | grouped_gemm_flag | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
+    // MXFP8xMXFP8 only applies to <e4m3, e4m3>; for other type pairs the flag is ignored.
+#if defined(ENABLE_FP8)
+    static constexpr bool is_wfp8afp8 = std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>;
+#else
+    static constexpr bool is_wfp8afp8 = false;
+#endif
+    int const mxfp8_flag = (use_mxfp8 && is_wfp8afp8) ? CutlassGemmConfig::MXFP8_MXFP8 : CutlassGemmConfig::NONE;
+    auto config_type_param
+        = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(weight_only_flag | simt_only_flag | grouped_gemm_flag
+            | enable_blackwell | enable_hopper | fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag | mxfp8_flag);
     TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper), "Blackwell and hopper flags are mutually exclusive");
 
     sm = use_wfp4afp8 && sm == 103 ? 100 : sm;
@@ -770,56 +778,38 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                 bool const use_mxfp8 = is_wfp8afp8
                     && hopper_inputs.fpX_block_scaling_type
                         == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+                // Pick the IsMXFPX template parameter for a given FUSION, factoring out the duplicated
+                // is_wfp4afp8 / is_wfp8afp8 / else chain. C++17-compatible via an integral_constant tag.
+                auto select_mxfpx_mode = [&](auto fusion_tag)
+                {
+                    constexpr auto FUSION = decltype(fusion_tag)::value;
+                    if constexpr (is_wfp4afp8)
+                    {
+                        return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
+                            OutputType, EpilogueTag, FUSION, true>;
+                    }
+                    else if constexpr (is_wfp8afp8)
+                    {
+                        return use_mxfp8 ? &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
+                                   WeightType, OutputType, EpilogueTag, FUSION, true>
+                                         : &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
+                                             WeightType, OutputType, EpilogueTag, FUSION, false>;
+                    }
+                    else
+                    {
+                        return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
+                            OutputType, EpilogueTag, FUSION, false>;
+                    }
+                };
                 auto select_function = [&]()
                 {
+                    using Fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
                     switch (hopper_inputs.fusion)
                     {
-                    case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE:
-                        if constexpr (is_wfp4afp8)
-                        {
-                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
-                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE,
-                                true>;
-                        }
-                        else if constexpr (is_wfp8afp8)
-                        {
-                            return use_mxfp8 ? &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
-                                       WeightType, OutputType, EpilogueTag,
-                                       TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, true>
-                                             : &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
-                                                 WeightType, OutputType, EpilogueTag,
-                                                 TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE, false>;
-                        }
-                        else
-                        {
-                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
-                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE,
-                                false>;
-                        }
-                    case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE:
-                        if constexpr (is_wfp4afp8)
-                        {
-                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
-                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
-                                true>;
-                        }
-                        else if constexpr (is_wfp8afp8)
-                        {
-                            return use_mxfp8 ? &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
-                                       WeightType, OutputType, EpilogueTag,
-                                       TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, true>
-                                             : &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T,
-                                                 WeightType, OutputType, EpilogueTag,
-                                                 TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE, false>;
-                        }
-                        else
-                        {
-                            return &cutlass_kernels_oss::dispatchMoeGemmSelectTileShapeTmaWarpSpecialized<T, WeightType,
-                                OutputType, EpilogueTag, TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
-                                false>;
-                        }
-                    case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION:
-                    case TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::GATED_ACTIVATION:
+                    case Fusion::FINALIZE: return select_mxfpx_mode(std::integral_constant<Fusion, Fusion::FINALIZE>{});
+                    case Fusion::NONE: return select_mxfpx_mode(std::integral_constant<Fusion, Fusion::NONE>{});
+                    case Fusion::ACTIVATION:
+                    case Fusion::GATED_ACTIVATION:
                     default: TLLM_THROW("Unimplemented fusion %d requested", (int) hopper_inputs.fusion);
                     };
                 };
@@ -923,10 +913,13 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
     int num_experts, bool use_mxfp8_weight_scaling) const
 {
-    if (num_experts != num_experts_)
+    if (num_experts != num_experts_ || use_mxfp8_weight_scaling != use_mxfp8_weight_scaling_)
     {
-        TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts, num_experts_);
+        TLLM_LOG_TRACE(
+            "Calling getMaxWorkspaceSize() with a new (expert count, use_mxfp8_weight_scaling) (%d, %d) vs (%d, %d)",
+            num_experts, (int) use_mxfp8_weight_scaling, num_experts_, (int) use_mxfp8_weight_scaling_);
         num_experts_ = num_experts;
+        use_mxfp8_weight_scaling_ = use_mxfp8_weight_scaling;
         gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts, use_mxfp8_weight_scaling);
     }
     return gemm_workspace_size_;
@@ -949,8 +942,11 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
         && !use_w4afp8 && !use_wfp4a16)
     {
         // Finalize fusion may not actually be supported by the kernel,
-        // if they are not we will catch the error and skip them
-        auto configs = getTmaWarpSpecializedConfigs(sm_, true);
+        // if they are not we will catch the error and skip them. Restrict the
+        // candidate set to MXFP8-valid tiles when the caller is sizing for the
+        // MXFP8xMXFP8 variant; otherwise the FP8 list would include tiles the
+        // dispatcher rejects.
+        auto configs = getTmaWarpSpecializedConfigs(sm_, true, use_mxfp8_weight_scaling);
         // For <e4m3, e4m3> the same template compiles both per-tensor FP8
         // (NONE) and MXFP8 block-scaled (MXFPX) variants; the caller passes
         // `use_mxfp8_weight_scaling` so we size workspace for exactly the
