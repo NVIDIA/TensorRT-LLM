@@ -41,7 +41,10 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 
 def _trace_ar_path(node: Node):
     """If *node* is wait_aux_passthrough(view(trtllm_dist_all_reduce(routed, strat))),
-    return (routed, view_shape, strategy); else None."""
+    return (routed, view_shape, strategy, wait_kwargs); else None.
+
+    wait_kwargs (device/event_id) is forwarded to the relocated wait_aux so the
+    fused path waits on the same aux event the original wait did."""
     # wait_aux passthrough (a @torch._dynamo.disable python function call_function)
     if not (node.op == "call_function" and node.target is wait_aux_stream_passthrough):
         return None
@@ -53,7 +56,7 @@ def _trace_ar_path(node: Node):
         return None
     routed = ar.args[0]
     strategy = ar.args[1] if len(ar.args) > 1 else None
-    return routed, view.args[1], strategy
+    return routed, view.args[1], strategy, dict(node.kwargs)
 
 
 @TransformRegistry.register("fuse_moe_allreduce_residual_rmsnorm")
@@ -98,7 +101,7 @@ class FuseMoEAllreduceResidualRMSNorm(BaseTransform):
                 shared = a
             if traced is None:
                 continue
-            routed, view_shape, _ar_strategy = traced
+            routed, view_shape, _ar_strategy, wait_kwargs = traced
             if not isinstance(shared, Node):
                 continue
 
@@ -108,7 +111,9 @@ class FuseMoEAllreduceResidualRMSNorm(BaseTransform):
             )
 
             with graph.inserting_before(norm_node):
-                shared_sync = graph.call_function(wait_aux_stream_passthrough, args=(shared,))
+                shared_sync = graph.call_function(
+                    wait_aux_stream_passthrough, args=(shared,), kwargs=wait_kwargs
+                )
                 shared_plus_res = graph.call_function(
                     torch.ops.aten.add.Tensor, args=(shared_sync, prev_residual)
                 )
