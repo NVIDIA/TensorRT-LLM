@@ -8,29 +8,47 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
-                                 nvtx_range_debug)
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionForwardArgs, AttentionInputType,
-                                 AttentionMetadata, FlashInferAttentionMetadata,
-                                 TrtllmAttention, TrtllmAttentionMetadata)
-from ..attention_backend.interface import (AttentionBackend, AttentionMask,
-                                           CustomAttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask)
+from ..attention_backend import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+)
+from ..attention_backend.interface import (
+    AttentionBackend,
+    AttentionMask,
+    CustomAttentionMask,
+    PositionalEmbeddingParams,
+    PredefinedAttentionMask,
+)
 from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
+    DSAtrtllmAttentionMetadata,
+    transform_local_topk_and_prepare_pool_view,
+)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
-                           cp_allgather, reducescatter)
+from ..distributed import (
+    AllReduceParams,
+    HelixAllToAllNative,
+    alltoall_helix,
+    cp_allgather,
+    reducescatter,
+)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compiled_cat,
-                     maybe_compiled_copy_)
+from ..utils import (
+    Fp4QuantizedTensor,
+    get_model_extra_attrs,
+    is_torch_compiling,
+    maybe_compiled_cat,
+    maybe_compiled_copy_,
+)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -41,6 +59,120 @@ try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
 except ImportError:
     flash_mla_sparse_fwd = None
+
+
+# === TRTLLM_DIFF_TRACE instrumentation (issue #15503 root-cause tracing) ===
+# Activated by env var TRTLLM_DIFF_TRACE=1.
+# Saves only the last-token slice (Run1: tensor[-1], Run2: tensor[0]) of layer-0
+# context-phase tensors, in priority order:
+#   A_qkv  -> self.qkv_proj output
+#   B_q, B_k, B_v -> q,k,v immediately before attention backend call
+#   C_attn_output -> attention backend output
+#   D_o_proj -> o_proj output
+# Compares each context forward directly against the FIRST context forward (Run 1).
+# Run 1 = fresh prefill (prompt_len=128, num_cached=0).
+# Run 2+ = identical prompt with cache reuse (prompt_len=1, num_cached=127).
+# Both are saved as the same "first" reference because the investigation's purpose
+# is to identify which tensor first differs when the same prompt is run again.
+# Stops saving once the first differing tensor (in priority order) is found.
+#
+# Note: this is a debugging-only instrument. Global state is intentional and
+# minimal. The "first run" reference is process-scoped; the user runs the same
+# prompt 6 times in one process and inspects the diff. Reset state by restarting
+# the process.
+_DIFF_TRACE_ENABLED = os.environ.get("TRTLLM_DIFF_TRACE", "0") == "1"
+_DIFF_TRACE_DIR = os.environ.get("TRTLLM_DIFF_TRACE_DIR", "/tmp/trtllm_diff_trace")
+_DIFF_PRIORITY = ["A_qkv", "B_q", "B_k", "B_v", "C_attn_output", "D_o_proj"]
+_DIFF_FIRST_RUN = {}          # name -> Run 1 tensor (CPU, last-token slice)
+_DIFF_FIRST_DIFFER = [None]   # name of the first tensor (in priority order) found to differ
+_DIFF_RUN_COUNTER = [0]       # context-forward counter, purely for log labels
+
+
+def _diff_is_context(attn_metadata):
+    """True if this forward call is a context (prefill) request, not decode-only."""
+    try:
+        return len(attn_metadata.prompt_lens) > 0
+    except AttributeError:
+        try:
+            return int(getattr(attn_metadata, "num_contexts", 0)) > 0
+        except AttributeError:
+            return False
+
+
+def _diff_should_save(name, layer_idx, attn_metadata):
+    if not _DIFF_TRACE_ENABLED:
+        return False
+    if layer_idx != 0:
+        return False
+    if not _diff_is_context(attn_metadata):
+        return False
+    if _DIFF_FIRST_DIFFER[0] is not None:
+        try:
+            first_idx = _DIFF_PRIORITY.index(_DIFF_FIRST_DIFFER[0])
+            cur_idx = _DIFF_PRIORITY.index(name)
+        except ValueError:
+            return True
+        if cur_idx > first_idx:
+            return False
+    return True
+
+
+def _diff_save_and_compare(name, tensor):
+    if not _DIFF_TRACE_ENABLED or tensor is None:
+        return
+    if not isinstance(tensor, torch.Tensor) or tensor.dim() < 1:
+        return
+    if tensor.shape[0] == 0:
+        return
+    # Last-token slice only (Run 1: [-1], Run 2: [0] -- both are the last/only token).
+    slice_to_save = tensor[-1:].detach().contiguous().cpu()
+    # Increment counter on the first saved name of each context forward for labeling.
+    if name == _DIFF_PRIORITY[0]:
+        _DIFF_RUN_COUNTER[0] += 1
+    run_idx = _DIFF_RUN_COUNTER[0]
+    try:
+        os.makedirs(_DIFF_TRACE_DIR, exist_ok=True)
+        path = f"{_DIFF_TRACE_DIR}/{name}_R{run_idx}.pt"
+        torch.save(slice_to_save, path)
+    except Exception as exc:
+        print(f"[TRTLLM_DIFF_TRACE] save failed for {name} R{run_idx}: {exc}",
+              flush=True)
+        return
+    if name in _DIFF_FIRST_RUN:
+        ref = _DIFF_FIRST_RUN[name]
+        try:
+            diff_mask = (slice_to_save != ref)
+            n_diff = int(diff_mask.sum())
+        except Exception:
+            n_diff = -1
+        if slice_to_save.is_floating_point and ref.is_floating_point:
+            try:
+                max_abs = float(
+                    (slice_to_save.float() - ref.float()).abs().max())
+            except Exception:
+                max_abs = float("nan")
+        else:
+            max_abs = float("nan")
+        status = "DIFFER" if n_diff > 0 else "MATCH"
+        print(
+            f"[TRTLLM_DIFF_TRACE] {name} R{run_idx} vs R1: "
+            f"shape={tuple(slice_to_save.shape)} dtype={slice_to_save.dtype} "
+            f"n_diff={n_diff} max_abs={max_abs:.6f} {status}",
+            flush=True,
+        )
+        if n_diff > 0 and _DIFF_FIRST_DIFFER[0] is None:
+            _DIFF_FIRST_DIFFER[0] = name
+            print(
+                f"[TRTLLM_DIFF_TRACE] *** FIRST DIFFER FOUND: {name} ***",
+                flush=True,
+            )
+    else:
+        _DIFF_FIRST_RUN[name] = slice_to_save
+        print(
+            f"[TRTLLM_DIFF_TRACE] {name} R{run_idx} (Run 1 reference saved): "
+            f"shape={tuple(slice_to_save.shape)} dtype={slice_to_save.dtype}",
+            flush=True,
+        )
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -897,6 +1029,8 @@ class Attention(nn.Module):
                                                   self.mapping, self.layer_idx)
 
         qkv = self.qkv_proj(hidden_states)
+        if _diff_should_save("A_qkv", self.layer_idx, attn_metadata):
+            _diff_save_and_compare("A_qkv", qkv)
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -936,6 +1070,12 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
+        if _diff_should_save("B_q", self.layer_idx, attn_metadata):
+            _diff_save_and_compare("B_q", q)
+        if _diff_should_save("B_k", self.layer_idx, attn_metadata):
+            _diff_save_and_compare("B_k", k)
+        if _diff_should_save("B_v", self.layer_idx, attn_metadata):
+            _diff_save_and_compare("B_v", v)
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
@@ -950,6 +1090,8 @@ class Attention(nn.Module):
                                         mrope_config=mrope_config,
                                         attention_sinks=attention_sinks,
                                         has_lora=bool(lora_params))
+        if _diff_should_save("C_attn_output", self.layer_idx, attn_metadata):
+            _diff_save_and_compare("C_attn_output", attn_output)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -960,6 +1102,8 @@ class Attention(nn.Module):
                                                   all_reduce_params,
                                                   self.mapping, self.mapping_o,
                                                   self.layer_idx, lora_params)
+        if _diff_should_save("D_o_proj", self.layer_idx, attn_metadata):
+            _diff_save_and_compare("D_o_proj", attn_output)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
