@@ -245,7 +245,7 @@ def create_transfer_worker_setup(
             for pg in page_table.pool_groups:
                 for pool_desc in pg.pools:
                     key = pool_desc.base_address
-                    pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
+                    pool_bytes = pool_desc.slot_stride * pool_desc.num_slots
                     if key not in unique_pools or pool_bytes > unique_pools[key]:
                         unique_pools[key] = pool_bytes
 
@@ -385,7 +385,7 @@ def create_transfer_worker_setup(
             for pg in gen_page_table.pool_groups:
                 for pool_desc in pg.pools:
                     key = pool_desc.base_address
-                    pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
+                    pool_bytes = pool_desc.slot_stride * pool_desc.num_slots
                     if key not in gen_unique_pools or pool_bytes > gen_unique_pools[key]:
                         gen_unique_pools[key] = pool_bytes
             gen_element_bytes = get_size_in_bytes(1, gen_kv_cache_manager.dtype)

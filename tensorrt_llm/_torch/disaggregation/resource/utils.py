@@ -23,14 +23,14 @@ class PoolRole(Enum):
 
 def get_pool_bytes(pool: PhysicalPool) -> int:
     """Total bytes across all slots in this pool."""
-    return pool.slot_bytes * pool.num_slots
+    return pool.slot_stride * pool.num_slots
 
 
 def get_slot_address(pool: PhysicalPool, slot_id: int) -> int:
     """Base address of *slot_id*."""
     if slot_id >= pool.num_slots:
         raise ValueError(f"slot_id {slot_id} >= num_slots {pool.num_slots}")
-    return pool.base_address + slot_id * pool.slot_bytes
+    return pool.base_address + slot_id * pool.slot_stride
 
 
 # -------------------------------------------------------------------------
@@ -160,7 +160,7 @@ def get_device_pointer(
         raise ValueError(f"slot_id {slot_id} >= num_slots {pool.num_slots}")
     for e in pool_view.buffer_entries:
         if int(e["local_layer_id"]) == int(local_layer_id) and int(e["role"]) == int(role):
-            return int(pool.base_address) + int(slot_id) * int(pool.slot_bytes) + int(e["offset"])
+            return int(pool.base_address) + int(slot_id) * int(pool.slot_stride) + int(e["offset"])
     raise ValueError(f"Buffer not found: local_layer_id={local_layer_id}, role={role}")
 
 
@@ -179,7 +179,7 @@ def get_unique_pool_memory_descs(
         if isinstance(lg, MambaLayerGroup):
             num_mamba_layers = len(lg.mamba_layer_offsets)
             for pool in [lg.conv_states, lg.ssm_states]:
-                pool_size = num_mamba_layers * pool.num_slots * pool.slot_bytes
+                pool_size = num_mamba_layers * pool.num_slots * pool.slot_stride
                 pool_key = (pool.base_address, pool_size)
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter

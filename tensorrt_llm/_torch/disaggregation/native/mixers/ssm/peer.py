@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -332,22 +332,6 @@ class MambaPolicy:
         return ri.tp_size, ri.tp_rank
 
     @staticmethod
-    def _build_layer_ptrs(
-        pool: PhysicalPool,
-        layer_offsets: Dict[int, int],
-        overlapping_layers: List[int],
-        slot: int,
-    ) -> np.ndarray:
-        """Build per-layer pointers for a given pool (conv or ssm) and slot."""
-        ptrs = []
-        for glid in overlapping_layers:
-            lid = layer_offsets[glid]
-            ptrs.append(
-                pool.base_address + lid * pool.num_slots * pool.slot_bytes + slot * pool.slot_bytes
-            )
-        return np.array(ptrs, dtype=np.int64)
-
-    @staticmethod
     def _select_mapper(
         *,
         is_conv: bool,
@@ -368,7 +352,7 @@ class MambaPolicy:
                 transfer_layers=transfer_layers,
                 src_layer_off=0,
                 dst_layer_off=0,
-                block_bytes_per_layer=self_pool.slot_bytes,
+                block_bytes_per_layer=self_pool.data_bytes,
             )
         if is_conv:
             return ConvStateMismatchMapper(
@@ -383,8 +367,8 @@ class MambaPolicy:
                 peer_tp_rank=peer_mamba_tp_rank,
             )
         # SSM state: head-level granularity
-        self_nheads = self_pool.slot_bytes // self_mlg.ssm_bytes_per_head
-        peer_nheads = peer_pool.slot_bytes // peer_mlg.ssm_bytes_per_head
+        self_nheads = self_pool.data_bytes // self_mlg.ssm_bytes_per_head
+        peer_nheads = peer_pool.data_bytes // peer_mlg.ssm_bytes_per_head
         return MambaHeadMismatchMapper(
             transfer_layers=transfer_layers,
             src_layer_off=0,
@@ -430,18 +414,14 @@ class MambaPolicy:
             (self_mlg.conv_states, peer_mlg.conv_states, True),
             (self_mlg.ssm_states, peer_mlg.ssm_states, False),
         ]:
-            src_ptrs = MambaPolicy._build_layer_ptrs(
-                self_pool, self_mlg.mamba_layer_offsets, overlapping_layers, src_slot
-            )
-            dst_ptrs = MambaPolicy._build_layer_ptrs(
-                peer_pool, peer_mlg.mamba_layer_offsets, overlapping_layers, dst_slot
-            )
+            src_ptrs = self_mlg.resolve_layer_ptrs(self_pool, overlapping_layers, src_slot)
+            dst_ptrs = peer_mlg.resolve_layer_ptrs(peer_pool, overlapping_layers, dst_slot)
 
             src_region = SpecRegion(
-                memory=MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self_pool.slot_bytes)
+                memory=MemRegionGroup(ptrs=src_ptrs, bytes_per_region=self_pool.data_bytes)
             )
             dst_region = SpecRegion(
-                memory=MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=peer_pool.slot_bytes)
+                memory=MemRegionGroup(ptrs=dst_ptrs, bytes_per_region=peer_pool.data_bytes)
             )
 
             mapper = MambaPolicy._select_mapper(

@@ -18,21 +18,31 @@ BUFFER_ENTRY_DTYPE = np.dtype(
 @dataclass
 class PhysicalPool:
     base_address: int  # uint64
-    slot_bytes: int
+    slot_stride: int  # bytes between consecutive slots (for addressing)
+    data_bytes: int  # actual data bytes per slot (for transfer size)
     num_slots: int
 
     def to_dict(self) -> dict:
         return {
             "base_address": int(self.base_address),
-            "slot_bytes": int(self.slot_bytes),
+            "slot_stride": int(self.slot_stride),
+            "data_bytes": int(self.data_bytes),
             "num_slots": int(self.num_slots),
         }
 
     @staticmethod
     def from_dict(data: dict) -> "PhysicalPool":
+        # Backward compat: old format has "slot_bytes" only.
+        if "slot_stride" in data:
+            slot_stride = int(data["slot_stride"])
+            data_bytes = int(data["data_bytes"])
+        else:
+            slot_stride = int(data["slot_bytes"])
+            data_bytes = slot_stride
         return PhysicalPool(
             base_address=int(data["base_address"]),
-            slot_bytes=int(data["slot_bytes"]),
+            slot_stride=slot_stride,
+            data_bytes=data_bytes,
             num_slots=int(data["num_slots"]),
         )
 
@@ -157,6 +167,23 @@ class MambaLayerGroup(LayerGroup):
     ssm_states: Optional[PhysicalPool] = None
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
+
+    def resolve_layer_ptrs(
+        self,
+        pool: PhysicalPool,
+        overlapping_layers: List[int],
+        slot: int,
+    ) -> np.ndarray:
+        """Compute per-layer physical addresses for a given pool and slot."""
+        ptrs = np.empty(len(overlapping_layers), dtype=np.int64)
+        for i, glid in enumerate(overlapping_layers):
+            lid = self.mamba_layer_offsets[glid]
+            ptrs[i] = (
+                pool.base_address
+                + lid * pool.num_slots * pool.slot_stride
+                + slot * pool.slot_stride
+            )
+        return ptrs
 
     def to_dict(self) -> dict:
         return {
