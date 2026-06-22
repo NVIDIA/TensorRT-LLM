@@ -48,13 +48,20 @@ def load_post_processor_hook(import_path: str) -> "PostProcessorHook":
         module_path, class_name = import_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
         hook_class = getattr(module, class_name)
-        return hook_class()
+        hook = hook_class()
     except (ValueError, ImportError, AttributeError, TypeError) as e:
         raise ValueError(
             f"Failed to load post-processor hook '{import_path}': {e}. "
             "Expected format: 'module.path.ClassName' resolving to a "
             "no-arg-constructible callable class."
         ) from e
+    if not callable(hook):
+        raise ValueError(
+            f"Failed to load post-processor hook '{import_path}': resolved "
+            f"object is not callable (got {type(hook).__name__}); expected an "
+            "instance implementing __call__(chunk)."
+        )
+    return hook
 
 
 @dataclasses.dataclass

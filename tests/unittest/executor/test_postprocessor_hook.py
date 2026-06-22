@@ -244,14 +244,24 @@ def test_unknown_action_fails_closed_through_apply():
 
 
 def test_loader_resolves_import_path():
-    # Any importable, no-arg-constructible class works as a smoke test.
-    hook = load_post_processor_hook("collections.OrderedDict")
+    # Any importable, no-arg-constructible callable instance works as a smoke
+    # test. MagicMock instances are callable, unlike e.g. OrderedDict.
+    hook = load_post_processor_hook("unittest.mock.MagicMock")
     assert hook is not None
 
 
 def test_loader_raises_on_bad_path():
     with pytest.raises(ValueError, match="Failed to load post-processor hook"):
         load_post_processor_hook("no.such.module.Nope")
+
+
+def test_loader_raises_on_non_callable():
+    """A non-callable resolved instance fails at load time, not per-chunk.
+
+    OrderedDict instances are not callable, so they exercise this path.
+    """
+    with pytest.raises(ValueError, match="not callable"):
+        load_post_processor_hook("collections.OrderedDict")
 
 
 def test_loader_builds_independent_instances():
@@ -261,8 +271,8 @@ def test_loader_builds_independent_instances():
     loading the same import path get distinct instances, so their per-request
     state never collides.
     """
-    a = load_post_processor_hook("collections.OrderedDict")
-    b = load_post_processor_hook("collections.OrderedDict")
+    a = load_post_processor_hook("unittest.mock.MagicMock")
+    b = load_post_processor_hook("unittest.mock.MagicMock")
     assert a is not b
 
 
