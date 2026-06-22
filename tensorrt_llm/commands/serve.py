@@ -988,8 +988,6 @@ class ChoiceWithAlias(click.Choice):
         "when you want to expose a custom name to clients.", "prototype"))
 @click.option(
     "--visual_gen_args",
-    "--extra_visual_gen_options",
-    "visual_gen_args",
     type=str,
     default=None,
     help=help_info_with_stability_tag(

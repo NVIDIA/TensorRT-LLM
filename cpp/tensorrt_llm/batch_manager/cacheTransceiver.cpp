@@ -508,6 +508,11 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
 CacheTransceiver::~CacheTransceiver()
 {
+    // Stop sender/receiver workers while the connection manager and transfer
+    // plugin are still alive. The workers can access both during termination.
+    mCacheSender.reset();
+    mCacheReceiver.reset();
+
     if (mWrapperLibHandle)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
