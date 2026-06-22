@@ -1312,14 +1312,14 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         # since the quantized weights have their own layout
         w3_w1_weight_shape = (module.expert_size_per_partition,
                               module.hidden_size,
-                              module.intermediate_size_per_partition * 2)
+                              module.expand_intermediate_size_per_partition)
         w2_weight_shape = (module.expert_size_per_partition,
                            module.intermediate_size_per_partition,
                            module.hidden_size)
 
         fc31_weight_scale = nn.Parameter(torch.empty(
             module.expert_size_per_partition,
-            module.intermediate_size_per_partition * 2,
+            module.expand_intermediate_size_per_partition,
             dtype=module.dtype),
                                          requires_grad=False)
         module.register_parameter("fc31_weight_scale", fc31_weight_scale)
@@ -1354,10 +1354,19 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
-        w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
-        w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
+
+        # w3_weight (gate_proj) is empty for non-gated MoE (e.g. Nemotron-H squared-ReLU).
+        # Only concatenate the gate projection when present; otherwise the single
+        # up-projection fills the (non-doubled) intermediate buffer. The unquantized
+        # fused-MoE path handles non-gated experts the same way.
+        if w3_weight is not None and w3_weight.numel() > 0:
+            w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN)
+            w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
+                                         dim=0)
+        else:
+            w31_weight_shard = w1_weight_shard
 
         weight_dtype = torch.int8
 
@@ -1398,25 +1407,33 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                             non_blocking=True)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        # fc31 scales
-        all_w3_scales = [
-            load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
-            for expert_id in module.initial_local_expert_ids
-        ]
+        # fc31 scales. w1 (up_proj) is always present; w3 (gate_proj) is absent
+        # for non-gated MoE (e.g. Nemotron-H squared-ReLU). Only concatenate the
+        # gate-projection scales when the gate weights are present; otherwise the
+        # up-projection scales alone fill the (non-doubled) fc31 scale buffer.
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
                               module.tp_size, module.tp_rank,
                               TensorParallelMode.COLUMN)
             for expert_id in module.initial_local_expert_ids
         ]
-        w3_w1_scales = torch.cat(
-            [torch.stack(all_w3_scales),
-             torch.stack(all_w1_scales)], dim=-1)
+        has_w3_scales = all(
+            f"{expert_id}.w3.weight_scale" in weights
+            for expert_id in module.initial_local_expert_ids)
+        if module.is_gated_activation and has_w3_scales:
+            all_w3_scales = [
+                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                  module.tp_size, module.tp_rank,
+                                  TensorParallelMode.COLUMN)
+                for expert_id in module.initial_local_expert_ids
+            ]
+            w3_w1_scales = torch.cat(
+                [torch.stack(all_w3_scales),
+                 torch.stack(all_w1_scales)], dim=-1)
+        else:
+            w3_w1_scales = torch.stack(all_w1_scales)
         w3_w1_scales = w3_w1_scales.to(module.dtype)
         module.fc31_weight_scale.data.copy_(w3_w1_scales.contiguous())
-
         # fc2 scales
         all_w2_scales = [
             load_weight_shard(weights[f"{expert_id}.w2.weight_scale"],
