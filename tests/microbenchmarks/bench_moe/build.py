@@ -291,6 +291,12 @@ def _build_moe_module(
             dtype=dtype,
             config=model_config,
             reduce_output=False,
+            # Route the shared GatedMLP's FP8 block-scale GEMM through cute_dsl
+            # (cute_dsl_fp8_gemm_blackwell) instead of the SM100f default DeepGEMM
+            # `fp8_swap_ab_gemm`. The DeepGEMM path hits an intermittent
+            # cudaErrorIllegalAddress when the routed TRTLLM-Gen MoE and this shared
+            # GatedMLP run in the same process across growing token counts.
+            use_cute_dsl_blockscaling_mm=True,
         )
         shared_mlp.cuda(f"cuda:{torch.cuda.current_device()}")
         moe = _UnfusedSharedMoE(moe, shared_mlp, use_cuda_graph=use_cuda_graph)
