@@ -9,11 +9,13 @@ with proper workspace management and synchronization.
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.alltoall_watchdog import (AlltoAllWatchdog,
+                                                   AlltoAllWatchdogTimeout)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -126,6 +128,11 @@ class MoeAlltoAll:
         num_slots: int,
         workspace_size_per_rank: int,
         num_experts: Optional[int] = None,
+        ep_group_health=None,
+        alltoall_watchdog_timeout_s: Optional[float] = None,
+        alltoall_watchdog_poll_interval_s: float = 0.05,
+        alltoall_watchdog_on_timeout: Optional[Callable[
+            [AlltoAllWatchdogTimeout], None]] = None,
     ):
         """
         Initialize MoeAlltoAll with workspace allocation.
@@ -138,6 +145,12 @@ class MoeAlltoAll:
                 Note: The terminology is mapped to `num_experts` in this class and the kernels.
             num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
+            ep_group_health: Optional EPGroupHealth-compatible object. When present, its mask is passed to the
+                CUDA kernels and used by the watchdog.
+            alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
+                watchdog is disabled.
+            alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
+            alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
         # Check for environment variable override
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
@@ -214,6 +227,65 @@ class MoeAlltoAll:
         self.metainfo = self._WORKSPACE["metainfo"]
         # Internal state
         self._state: _A2AState = _A2AState()
+        self.ep_group_health = ep_group_health
+        self._watchdog_flag_generation = 0
+        self._alltoall_watchdog: AlltoAllWatchdog | None = None
+        if alltoall_watchdog_timeout_s is not None:
+            self._watchdog_flag_generation = self._read_current_flag_val()
+            self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
+                workspace=self.workspace,
+                metainfo=self.metainfo,
+                metainfo_index=self._METAINFO_INDEX,
+                ep_rank=self.ep_rank,
+                ep_size=self.ep_size,
+                timeout_s=alltoall_watchdog_timeout_s,
+                poll_interval_s=alltoall_watchdog_poll_interval_s,
+                health=self.ep_group_health,
+                on_timeout=alltoall_watchdog_on_timeout,
+            )
+
+    def _read_current_flag_val(self) -> int:
+        flag_val_offset = self.metainfo[
+            self._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+        flag_val = self.workspace[self.ep_rank,
+                                  flag_val_offset:flag_val_offset + 4].view(
+                                      torch.int32)
+        if flag_val.device.type != "cpu":
+            flag_val = flag_val.detach().cpu()
+        return int(flag_val.item())
+
+    def _get_active_rank_mask_tensor(
+            self,
+            active_rank_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if active_rank_mask is not None:
+            return active_rank_mask
+        if self.ep_group_health is None:
+            return None
+        return torch.tensor(self.ep_group_health.get_mask_words(),
+                            dtype=torch.uint64,
+                            device="cpu")
+
+    def _active_mask_int(
+            self, active_rank_mask: Optional[torch.Tensor]) -> Optional[int]:
+        if active_rank_mask is not None:
+            mask_cpu = active_rank_mask.detach().cpu()
+            return sum(
+                int(word) << (64 * idx)
+                for idx, word in enumerate(mask_cpu.tolist()))
+        if self.ep_group_health is not None:
+            return self.ep_group_health.get_mask()
+        return None
+
+    def _watch_collective(self, phase: str,
+                          active_rank_mask: Optional[torch.Tensor]) -> None:
+        if self._alltoall_watchdog is None:
+            return
+        self._watchdog_flag_generation += 1
+        self._alltoall_watchdog.watch(
+            phase=phase,
+            expected_flag=self._watchdog_flag_generation,
+            active_mask=self._active_mask_int(active_rank_mask),
+        )
 
     def dispatch(self,
                  token_selected_experts: torch.Tensor,
@@ -221,7 +293,8 @@ class MoeAlltoAll:
                  runtime_max_tokens_per_rank: int,
                  invalid_token_expert_id: Optional[int] = None,
                  expert_id_payload_index: Optional[int] = None,
-                 eplb_local_stats: Optional[torch.Tensor] = None):
+                 eplb_local_stats: Optional[torch.Tensor] = None,
+                 active_rank_mask: Optional[torch.Tensor] = None):
         """
         Perform MoE all-to-all dispatch operation.
 
@@ -232,6 +305,7 @@ class MoeAlltoAll:
             invalid_token_expert_id: If not None, set the token_selected_experts of the invalid tokens to this expert id. This is used to notify the MoE to skip these tokens for GroupGEMM.
             expert_id_payload_index: The index of token_selected_experts in the input_payloads. Must be provided if invalid_token_expert_id is not None.
             eplb_local_stats: (Optional) [num_experts] tensor containing local statistics for EPLB
+            active_rank_mask: Optional uint64 CPU tensor overriding ep_group_health for this dispatch.
 
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
@@ -246,6 +320,7 @@ class MoeAlltoAll:
                 0
             ) == self.eplb_stats_num_experts, "eplb_local_stats size must match eplb_stats_num_experts"
 
+        active_rank_mask = self._get_active_rank_mask_tensor(active_rank_mask)
         recv_tensors, combine_payload_offset, eplb_gathered_stats = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -257,7 +332,9 @@ class MoeAlltoAll:
             self.top_k,
             self.num_experts,
             eplb_local_stats,
+            active_rank_mask,
         )
+        self._watch_collective("dispatch", active_rank_mask)
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
 
@@ -287,6 +364,7 @@ class MoeAlltoAll:
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
         use_low_precision_combine: bool = False,
+        active_rank_mask: Optional[torch.Tensor] = None,
     ):
         """
         Perform MoE all-to-all combine operation.
@@ -296,6 +374,7 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
             payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink transfer (halves NVLink bandwidth usage, output precision is preserved).
+            active_rank_mask: Optional uint64 CPU tensor overriding ep_group_health for this combine.
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
@@ -303,11 +382,13 @@ class MoeAlltoAll:
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
 
+        active_rank_mask = self._get_active_rank_mask_tensor(active_rank_mask)
         output = torch.ops.trtllm.moe_a2a_combine(
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace, use_low_precision_combine)
+            payload_in_workspace, use_low_precision_combine, active_rank_mask)
+        self._watch_collective("combine", active_rank_mask)
 
         # Reset state for next round
         self.reset_state()
