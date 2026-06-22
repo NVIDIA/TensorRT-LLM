@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 
@@ -88,9 +89,10 @@ def _make_executor(
     return exe
 
 
-def _make_request(req_id: int) -> MagicMock:
+def _make_request(req_id: int, is_dummy: bool = False) -> MagicMock:
     req = MagicMock()
     req.py_request_id = req_id
+    req.is_dummy = is_dummy
     return req
 
 
@@ -114,7 +116,8 @@ class TestCanPauseForRebalance:
         exe = _make_executor(pp_size=2)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
-    def test_tp_size_gt_one_returns_false(self):
+    def test_plain_tp_size_gt_one_returns_false(self):
+        # Plain TP (no attention DP) still needs bit-identical pool layouts.
         exe = _make_executor(tp_size=2)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
@@ -122,8 +125,15 @@ class TestCanPauseForRebalance:
         exe = _make_executor(cp_size=2)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
-    def test_attention_dp_returns_false(self):
-        exe = _make_executor(enable_attention_dp=True)
+    def test_attention_dp_with_tp_returns_true(self):
+        # Attention DP keeps per-rank pools, so it is allowed and the pause
+        # is coordinated collectively in _maybe_rebalance_kv_pools.
+        exe = _make_executor(enable_attention_dp=True, tp_size=2)
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
+
+    def test_attention_dp_with_cp_returns_false(self):
+        # CP is still gated off even under attention DP.
+        exe = _make_executor(enable_attention_dp=True, tp_size=2, cp_size=2)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
     def test_transceiver_present_returns_false(self):
@@ -225,6 +235,86 @@ class TestMaybeRebalanceKvPools:
 
         with pytest.raises(RuntimeError, match="boom"):
             PyExecutor._maybe_rebalance_kv_pools(exe)
+
+    def test_dummy_requests_are_not_suspended(self, monkeypatch):
+        real = _make_request(1)
+        dummy = _make_request(2, is_dummy=True)
+        exe = _make_executor(active_requests=[real, dummy])
+        # Both ids report active; only the real one should be touched.
+        exe.kv_cache_manager.is_request_active.side_effect = lambda rid: True
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe.kv_cache_manager.suspend_request.assert_called_once_with(real)
+        exe.kv_cache_manager.resume_request.assert_called_once_with(real)
+
+
+class TestMaybeRebalanceKvPoolsAttentionDP:
+    """Collective coordination of the pause across attention-DP TP ranks."""
+
+    def test_vote_yes_fires_full_cycle_and_barrier(self, monkeypatch):
+        reqs = [_make_request(1), _make_request(2)]
+        exe = _make_executor(
+            tp_size=2, enable_attention_dp=True, need_adjustment=True, active_requests=reqs
+        )
+        exe.dist.tp_allreduce.return_value = 1
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        # Voted with the local need via a MAX (logical-OR) reduction.
+        exe.dist.tp_allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
+        exe._consume_previous_batch_for_rebalance.assert_called_once()
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
+        assert exe.kv_cache_manager.suspend_request.call_count == 2
+        assert exe.kv_cache_manager.resume_request.call_count == 2
+        exe.dist.tp_barrier.assert_called_once()
+
+    def test_vote_no_is_noop(self, monkeypatch):
+        reqs = [_make_request(1)]
+        exe = _make_executor(
+            tp_size=2, enable_attention_dp=True, need_adjustment=False, active_requests=reqs
+        )
+        exe.dist.tp_allreduce.return_value = 0
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        sync = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", sync)
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        # No rank wants to adjust -> bail before any real work, no barrier.
+        exe.dist.tp_allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        exe._consume_previous_batch_for_rebalance.assert_not_called()
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        exe.dist.tp_barrier.assert_not_called()
+        sync.assert_not_called()
+
+    def test_pauses_for_peer_without_local_adjust(self, monkeypatch):
+        """A rank with no local need still pauses if a peer voted yes, but
+        does not touch its own pools."""
+        reqs = [_make_request(1)]
+        exe = _make_executor(
+            tp_size=2, enable_attention_dp=True, need_adjustment=False, active_requests=reqs
+        )
+        # Local need is 0 but a peer wants in -> MAX vote returns 1.
+        exe.dist.tp_allreduce.return_value = 1
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        exe.dist.tp_allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        # Lockstep pause happens...
+        exe._consume_previous_batch_for_rebalance.assert_called_once()
+        exe.kv_cache_manager.suspend_request.assert_called_once()
+        exe.kv_cache_manager.resume_request.assert_called_once()
+        exe.dist.tp_barrier.assert_called_once()
+        # ...but this rank does not adjust its own pools.
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

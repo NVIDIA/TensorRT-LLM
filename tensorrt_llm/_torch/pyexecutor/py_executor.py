@@ -3106,11 +3106,12 @@ class PyExecutor:
                 raise ValueError(f"Invalid request type: {type(request)}.")
 
     def _can_pause_for_rebalance(self) -> bool:
-        """Gate KV pool rebalance to the cases the v1 hook supports.
+        """Gate KV pool rebalance to the cases the hook supports.
 
-        MVP scope: single-GPU aggregated, no in-flight disagg transfer,
-        no beam search, no drafter, not during warmup or shutdown.
-        Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
+        Supported: single-GPU aggregated and attention-DP, with no
+        in-flight disagg transfer, no beam search, no drafter, and not
+        during warmup or shutdown.  Honors the ``enable_kv_pool_rebalance``
+        opt-in flag (default off).
 
         The rebalance hook makes its decision (``need_adjustment``) and
         derives its target pool ratios from *rank-local* state only.  Any
@@ -3118,20 +3119,26 @@ class PyExecutor:
         collectives (TP/CP all-reduce in the forward, attention-DP
         ``tp_allgather`` of batch sizes, PP send/recv ring), so a rank that
         pauses to ``adjust()`` while its peers proceed deadlocks NCCL.
-        Until cross-rank coordination is wired up, restrict to a single
-        rank.  ``pp_size``/``tp_size``/``cp_size`` cover tensor, context and
-        pipeline parallelism; ``enable_attention_dp`` covers attention data
-        parallelism (which can run with ``tp_size == 1`` per rank).
+
+        Attention DP is the one multi-rank case handled today: each rank
+        owns its KV pools and its own request stream, so the decision and
+        the resulting ratios legitimately stay rank-local and only the
+        *pause* has to be synchronized -- which ``_maybe_rebalance_kv_pools``
+        does with a collective vote.  Plain tensor/context parallelism
+        additionally requires every rank to hold a bit-identical pool
+        layout (shared block tables), which the rank-local ``adjust()``
+        cannot yet guarantee, so it stays disabled; pipeline parallelism
+        needs a full-pipeline drain that is not wired up either.
         """
         if not self.enable_kv_pool_rebalance:
             return False
         if self.dist.pp_size > 1:
             return False
-        if self.dist.tp_size > 1:
-            return False
         if self.dist.cp_size > 1:
             return False
-        if self.enable_attention_dp:
+        # Plain TP needs a bit-identical pool layout across ranks; only
+        # attention DP (per-rank pools) is coordinated for now.
+        if self.dist.tp_size > 1 and not self.enable_attention_dp:
             return False
         if self.kv_cache_transceiver is not None:
             return False
@@ -3182,9 +3189,25 @@ class PyExecutor:
         scheduler reactivates them through prepare_context /
         try_allocate_generation on the next iteration, the same path it
         uses today after eviction.
+
+        With attention DP every TP rank owns its pools but is welded to the
+        others by the per-iteration ``tp_allgather`` in scheduling, so the
+        *pause* must be collective even though each rank decides and adjusts
+        on its own.  All ranks take a MAX (logical-OR) vote on
+        ``need_adjustment``: if any rank wants to rebalance, all ranks pause
+        in lockstep, each adjusts only its own pools and only if it locally
+        needs to, then all resume and re-converge at a barrier.  A rank that
+        skipped a pause its peers took -- or paused alone -- would deadlock
+        NCCL at the next collective.
         """
         mgr = self.kv_cache_manager
-        if not mgr.impl.need_adjustment:
+        want_local = mgr.impl.need_adjustment
+
+        if self.dist.tp_size > 1:
+            want = self.dist.tp_allreduce(int(want_local), op=ReduceOp.MAX)
+            if not want:
+                return
+        elif not want_local:
             return
 
         torch.cuda.current_stream().synchronize()
@@ -3192,17 +3215,31 @@ class PyExecutor:
 
         paused: List[LlmRequest] = []
         for req in self.active_requests:
+            # Dummy requests (e.g. the attention-DP padding request) are not
+            # real occupants of the pools; never suspend/resume them.
+            if req.is_dummy:
+                continue
             if mgr.is_request_active(req.py_request_id):
                 mgr.suspend_request(req)
                 paused.append(req)
 
-        try:
-            mgr.impl.adjust()
-        except OutOfPagesError as e:
-            logger.warning(f"KV pool adjust() failed: {e!r}")
+        # Each rank adjusts only its own pools, and only when it locally
+        # needs to -- a rank that paused solely to keep its peers in
+        # lockstep leaves its pools untouched.
+        if want_local:
+            try:
+                mgr.impl.adjust()
+            except OutOfPagesError as e:
+                logger.warning(f"KV pool adjust() failed: {e!r}")
 
         for req in paused:
             mgr.resume_request(req)
+
+        # Re-converge before any rank reaches the next per-iteration
+        # collective in scheduling, bounding how far ranks drift while one is
+        # still resizing pools.
+        if self.dist.tp_size > 1:
+            self.dist.tp_barrier()
 
     @contextmanager
     def control_action(self):
