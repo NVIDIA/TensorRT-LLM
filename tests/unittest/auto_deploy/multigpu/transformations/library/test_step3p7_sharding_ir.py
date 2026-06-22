@@ -66,6 +66,6 @@ def test_step3p7_sharding_num_correctness(dist_config: str, monkeypatch) -> None
 
     world_size = _DIST_CONFIGS[dist_config]["world_size"]
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_equivalence_job, _MODELING_FILE, dist_config),
+        job=partial(_run_equivalence_job, _MODELING_FILE, dist_config, "none"),
         size=world_size,
     )
