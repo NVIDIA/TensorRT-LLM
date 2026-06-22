@@ -570,20 +570,27 @@ def test_DynamicBatchConfig_declaration():
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
-def test_SchedulerConfig_declaration():
+def test_SchedulerConfig_declaration() -> None:
+    default_config = SchedulerConfig()
+    default_pybind_config = PybindMirror.maybe_to_pybind(default_config)
+    assert default_config.enable_prefix_aware_scheduling is True
+    assert default_pybind_config.enable_prefix_aware_scheduling is True
+
     config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
         dynamic_batch_config=DynamicBatchConfig(
             enable_batch_size_tuning=True,
             enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=10))
+            dynamic_batch_moving_average_window=10),
+        enable_prefix_aware_scheduling=False)
 
     pybind_config = PybindMirror.maybe_to_pybind(config)
     assert pybind_config.capacity_scheduler_policy == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert pybind_config.context_chunking_policy == tle.ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
+    assert pybind_config.enable_prefix_aware_scheduling is False
 
 
 def test_PeftCacheConfig_declaration():

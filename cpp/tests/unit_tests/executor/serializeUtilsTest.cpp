@@ -502,11 +502,16 @@ TEST(SerializeUtilsTest, KvCacheConfig)
 
 TEST(SerializeUtilsTest, SchedulerConfig)
 {
-    texec::SchedulerConfig schedulerConfig(
-        texec::CapacitySchedulerPolicy::kMAX_UTILIZATION, texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+    texec::SchedulerConfig defaultSchedulerConfig;
+    EXPECT_TRUE(defaultSchedulerConfig.getEnablePrefixAwareScheduling());
+
+    texec::SchedulerConfig schedulerConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, std::nullopt, false);
     auto schedulerConfig2 = serializeDeserialize(schedulerConfig);
     EXPECT_EQ(schedulerConfig.getCapacitySchedulerPolicy(), schedulerConfig2.getCapacitySchedulerPolicy());
     EXPECT_EQ(schedulerConfig.getContextChunkingPolicy(), schedulerConfig2.getContextChunkingPolicy());
+    EXPECT_FALSE(schedulerConfig2.getDynamicBatchConfig().has_value());
+    EXPECT_FALSE(schedulerConfig2.getEnablePrefixAwareScheduling());
 }
 
 TEST(SerializeUtilsTest, ParallelConfig)

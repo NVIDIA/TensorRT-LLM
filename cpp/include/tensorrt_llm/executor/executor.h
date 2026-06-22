@@ -1019,7 +1019,7 @@ public:
     explicit SchedulerConfig(
         CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt,
-        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt);
+        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt, bool enablePrefixAwareScheduling = true);
 
     bool operator==(SchedulerConfig const& other) const;
 
@@ -1028,6 +1028,8 @@ public:
     [[nodiscard]] std::optional<ContextChunkingPolicy> getContextChunkingPolicy() const;
 
     [[nodiscard]] std::optional<DynamicBatchConfig> getDynamicBatchConfig() const;
+
+    [[nodiscard]] bool getEnablePrefixAwareScheduling() const;
 
 private:
     friend class Serialization;
@@ -1040,6 +1042,9 @@ private:
 
     /// @brief The config for tuning batch size dynamically. See DynamicBatchSizeConfig.
     std::optional<DynamicBatchConfig> mDynamicBatchConfig;
+
+    /// @brief Whether schedulers use KV prefix-reuse estimates for admission and token-budget decisions.
+    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Configuration class for the KV cache
