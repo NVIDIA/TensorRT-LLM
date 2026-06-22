@@ -1959,8 +1959,20 @@ class MLA(nn.Module):
                                  and self._should_use_short_mha(
                                      attn_metadata, position_ids))
 
+        # Cross-layer IndexCache reuse: a layer flagged skip_topk reuses the
+        # most recently computed Top-K indices (published on the metadata by an
+        # earlier indexer-running layer in this same forward) instead of
+        # re-running the indexer. The first indexer-running layer recomputes and
+        # republishes, so a leading skip layer (e.g. from index_skip_topk_offset)
+        # safely falls back to computing its own.
+        indexer = self.mqa.indexer
+        cached_topk = attn_metadata._reuse_topk_indices
+        can_reuse_topk = indexer.skip_topk and cached_topk is not None
+
         if use_short_mha_for_ctx and num_generations == 0:
             topk_indices = None
+        elif can_reuse_topk:
+            topk_indices = cached_topk[:num_tokens, ...]
         else:
             q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
             # Slice indexer intermediates to actual num_tokens (they were
@@ -1970,7 +1982,7 @@ class MLA(nn.Module):
             k_scale = k_scale[:num_tokens, ...]
             weights = weights[:num_tokens, ...]
             q_scale = q_scale[:num_tokens, ...]
-            topk_indices = self.mqa.indexer.sparse_attn_indexer(
+            topk_indices = indexer.sparse_attn_indexer(
                 attn_metadata,
                 q,  # only used for shape/device in buffer allocation
                 q_fp8,
@@ -1979,6 +1991,8 @@ class MLA(nn.Module):
                 weights,
                 q_scale=q_scale,
             )
+            # Publish so downstream skip_topk layers can reuse it.
+            attn_metadata._reuse_topk_indices = topk_indices
 
         assert output is not None, "output must be provided"
 

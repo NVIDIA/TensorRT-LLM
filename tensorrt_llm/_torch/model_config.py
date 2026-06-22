@@ -599,6 +599,18 @@ class ModelConfig(Generic[TConfig]):
                         'sparse_attention_config')
                     indexer_rope_interleave = getattr(
                         pretrained_config, 'indexer_rope_interleave', False)
+                    # Cross-layer indexer Top-K reuse (IndexCache) knobs. These
+                    # live in the HF config for GLM-MoE-DSA-style checkpoints
+                    # (e.g. GlmMoeDsaForCausalLM sets index_topk_freq=4,
+                    # index_skip_topk_offset=3); capture them on the user-facing
+                    # config so they are inspectable/serialized rather than only
+                    # read implicitly at sparse-params lowering time.
+                    pc_index_topk_freq = getattr(pretrained_config,
+                                                 'index_topk_freq', None)
+                    pc_index_topk_pattern = getattr(pretrained_config,
+                                                    'index_topk_pattern', None)
+                    pc_index_skip_topk_offset = getattr(
+                        pretrained_config, 'index_skip_topk_offset', 0) or 0
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
@@ -610,6 +622,9 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+                        index_topk_freq = sparse_attention_config.index_topk_freq or pc_index_topk_freq
+                        index_topk_pattern = sparse_attention_config.index_topk_pattern or pc_index_topk_pattern
+                        index_skip_topk_offset = sparse_attention_config.index_skip_topk_offset or pc_index_skip_topk_offset
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -621,6 +636,9 @@ class ModelConfig(Generic[TConfig]):
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
                         indexer_k_dtype = "fp8"
+                        index_topk_freq = pc_index_topk_freq
+                        index_topk_pattern = pc_index_topk_pattern
+                        index_skip_topk_offset = pc_index_skip_topk_offset
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -635,7 +653,10 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
-                            indexer_k_dtype=indexer_k_dtype)
+                            indexer_k_dtype=indexer_k_dtype,
+                            index_topk_freq=index_topk_freq,
+                            index_topk_pattern=index_topk_pattern,
+                            index_skip_topk_offset=index_skip_topk_offset)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

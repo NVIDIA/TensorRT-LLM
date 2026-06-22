@@ -701,6 +701,59 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
         "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
         "per-token footprint from 132 B to 68 B.")
+    index_topk_freq: Optional[int] = Field(
+        default=None,
+        description=
+        "Run the sparse-attention indexer (and Top-K selection) only once every "
+        "`index_topk_freq` decoder layers; intermediate layers reuse the most "
+        "recently computed Top-K indices (cross-layer IndexCache reuse). `None` "
+        "or `1` runs the indexer on every layer (default DSA behavior). When "
+        "unset, the value is read from the HF config field of the same name.")
+    index_topk_pattern: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Explicit list of decoder layer indices that run the indexer. Layers "
+        "not in the list reuse the previously computed Top-K indices. Takes "
+        "precedence over `index_topk_freq` when set. When unset, the value is "
+        "read from the HF config field of the same name.")
+    index_skip_topk_offset: int = Field(
+        default=0,
+        description=
+        "Layer offset applied when deriving the per-layer skip decision from "
+        "`index_topk_freq`. The indexer runs when "
+        "`max(layer_idx - index_skip_topk_offset + 1, 0) % index_topk_freq == 0`. "
+        "When unset, the value is read from the HF config field of the same name."
+    )
+
+    @staticmethod
+    def compute_skip_topk(
+            layer_idx: int,
+            index_topk_freq: Optional[int] = None,
+            index_skip_topk_offset: int = 0,
+            index_topk_pattern: Optional[List[int]] = None) -> bool:
+        """Decide whether a decoder layer should reuse cached Top-K indices.
+
+        Returns ``True`` when the layer should *skip* running the indexer and
+        instead reuse the most recently computed Top-K indices, and ``False``
+        when the layer must run the indexer itself.
+
+        Mirrors the cross-layer IndexCache reuse logic from the upstream
+        vLLM / SGLang DSA implementations:
+
+        * ``index_topk_pattern`` (when provided) is an explicit allow-list of
+          layers that run the indexer; all other layers reuse.
+        * Otherwise the indexer runs whenever
+          ``max(layer_idx - index_skip_topk_offset + 1, 0) % index_topk_freq == 0``.
+
+        The default (``index_topk_freq`` is ``None`` or ``1``) never skips, so
+        existing DSA models keep running the indexer on every layer.
+        """
+        if index_topk_pattern is not None:
+            return layer_idx not in index_topk_pattern
+        freq = index_topk_freq or 1
+        if freq <= 1:
+            return False
+        return (max(layer_idx - index_skip_topk_offset + 1, 0) % freq) != 0
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -745,6 +798,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
+        layer_idx = kwargs.get("layer_idx", None)
 
         def _value(name: str, default=None):
             value = getattr(self, name)
@@ -753,6 +807,22 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             if pretrained_config is not None:
                 return getattr(pretrained_config, name, default)
             return default
+
+        # Cross-layer indexer reuse (IndexCache). Read the reuse knobs with the
+        # usual user-config-overrides-HF-config precedence, then resolve the
+        # per-layer skip decision so the runtime path stays a cheap bool check.
+        # index_skip_topk_offset defaults to 0 (not None), so fall back to the
+        # HF config only when the user left it at the default.
+        index_skip_topk_offset = self.index_skip_topk_offset
+        if not index_skip_topk_offset and pretrained_config is not None:
+            index_skip_topk_offset = getattr(pretrained_config,
+                                             "index_skip_topk_offset", 0) or 0
+        skip_topk = (self.compute_skip_topk(
+            layer_idx,
+            index_topk_freq=_value("index_topk_freq"),
+            index_skip_topk_offset=index_skip_topk_offset,
+            index_topk_pattern=_value("index_topk_pattern"),
+        ) if layer_idx is not None else False)
 
         return DSAParams(
             index_n_heads=_value("index_n_heads"),
@@ -766,6 +836,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
             indexer_k_dtype=self.indexer_k_dtype,
+            skip_topk=skip_topk,
         )
 
     def to_sparse_metadata_params(self, **kwargs):

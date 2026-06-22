@@ -90,6 +90,10 @@ class DSAParams(SparseParams):
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
+    # Cross-layer IndexCache reuse: when True this layer reuses the most
+    # recently computed Top-K indices instead of running the indexer itself.
+    # Resolved per-layer in DeepSeekSparseAttentionConfig.to_sparse_params.
+    skip_topk: bool = False
 
     @property
     def indices_block_size(self) -> int:
@@ -528,6 +532,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        # Cross-layer IndexCache reuse: holds the most recently computed Top-K
+        # indices within the current forward so that layers with
+        # ``skip_topk=True`` can reuse them instead of re-running the indexer.
+        # forward_dsa_attn (Op 2) runs eagerly (not CUDA-graph captured), so
+        # holding a plain tensor reference here is replay-safe.
+        self._reuse_topk_indices = None
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -988,6 +998,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Prepare DSA metadata: compute slot mappings, block tables, and prefill chunks."""
         super().prepare()
         self._invalidate_pool_view_cache()
+        # Invalidate cross-layer Top-K reuse at the start of every forward so a
+        # reuse layer never consumes indices left over from a prior iteration.
+        self._reuse_topk_indices = None
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
@@ -1430,6 +1443,10 @@ class Indexer(nn.Module):
         self.head_dim = sparse_params.index_head_dim  # 128
         self.index_topk = sparse_params.index_topk  # 2048
         self.layer_idx = layer_idx
+        # Cross-layer IndexCache reuse: when True this layer reuses the most
+        # recently computed Top-K indices (stored on the attention metadata)
+        # instead of running the indexer. Resolved per-layer at config time.
+        self.skip_topk = sparse_params.skip_topk
 
         self.wq_b = Linear(
             self.q_lora_rank,

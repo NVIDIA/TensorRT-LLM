@@ -611,6 +611,14 @@ class DeepseekV3WeightLoader:
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
+                    # DSA cross-layer Top-K reuse (IndexCache): "shared" indexer
+                    # layers (skip_topk=True, e.g. GLM-MoE-DSA's non-"full"
+                    # layers) reuse a prior layer's Top-K indices and therefore
+                    # carry NO indexer weights in the checkpoint. Skip loading
+                    # such absent indexer submodules; runtime never selects with
+                    # them (forward_dsa_attn reuses cached indices instead).
+                    if ".indexer." in name and "weight" not in module_weights:
+                        continue
                     if hasattr(module, 'load_weights'):
                         module.load_weights(weights=[module_weights])
                     else:
