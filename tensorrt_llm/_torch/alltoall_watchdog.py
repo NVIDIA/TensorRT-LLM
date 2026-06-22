@@ -197,6 +197,7 @@ class AlltoAllWatchdog:
 
         self._cv = threading.Condition()
         self._queue: Deque[_CollectiveWatch] = deque()
+        self._closed = False
         self._stopping = False
         self._thread: threading.Thread | None = None
         self._last_error: BaseException | None = None
@@ -249,6 +250,8 @@ class AlltoAllWatchdog:
     def start(self) -> None:
         """Start the background polling thread. Idempotent."""
         with self._cv:
+            if self._closed:
+                raise RuntimeError("cannot start a stopped AlltoAllWatchdog")
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stopping = False
@@ -262,6 +265,7 @@ class AlltoAllWatchdog:
     def stop(self, timeout_s: float | None = None) -> None:
         """Stop the polling thread and wait for it to exit."""
         with self._cv:
+            self._closed = True
             self._stopping = True
             self._queue.clear()
             self._cv.notify_all()
@@ -291,7 +295,7 @@ class AlltoAllWatchdog:
 
         self.start()
         with self._cv:
-            if self._stopping:
+            if self._closed:
                 raise RuntimeError("cannot queue a stopped AlltoAllWatchdog")
             self._queue.append(
                 _CollectiveWatch(
