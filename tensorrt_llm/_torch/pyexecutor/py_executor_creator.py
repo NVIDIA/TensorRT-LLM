@@ -406,12 +406,6 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        if not spec_config.allow_advanced_sampling:
-            logger.warning(
-                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
-                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
-            )
         # Check FLASHINFER compatibility with one-engine speculative decoding
         if llm_args.attn_backend == "FLASHINFER":
             raise ValueError(
