@@ -1,0 +1,2053 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tensorrt_llm._torch.auto_deploy.transform.interface &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../../../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+
+
+
+    <script src="../../../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../../../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = `pre.mermaid {
+    /* Same as .mermaid-container > pre */
+    display: block;
+    width: 100%;
+}
+
+pre.mermaid > svg {
+    /* Same as .mermaid-container > pre > svg */
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}`;
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = `.mermaid-container {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+}
+
+.mermaid-container > pre {
+    display: block;
+    width: 100%;
+}
+
+.mermaid-container > pre > svg {
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}
+
+.mermaid-fullscreen-btn {
+    width: 28px;
+    height: 28px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    color: #333;
+}
+
+.mermaid-fullscreen-btn:hover {
+    opacity: 100% !important;
+    background: rgba(255, 255, 255, 1);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-btn.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-btn.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal {
+    display: none;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 95vw;
+    height: 100vh;
+    background: rgba(255, 255, 255, 0.98);
+    z-index: 9999;
+    padding: 20px;
+    overflow: auto;
+}
+
+.mermaid-fullscreen-modal.dark-theme {
+    background: rgba(0, 0, 0, 0.98);
+}
+
+.mermaid-fullscreen-modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen {
+    position: relative;
+    width: 95vw;
+    height: 90vh;
+    max-width: 95vw;
+    max-height: 90vh;
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen.dark-theme {
+    background: #1a1a1a;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+}
+
+.mermaid-container-fullscreen pre.mermaid {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen .mermaid svg {
+    height: 100% !important;
+    width: 100% !important;
+    cursor: grab;
+}
+
+.mermaid-fullscreen-close {
+    position: fixed !important;
+    top: 20px !important;
+    right: 20px !important;
+    width: 40px;
+    height: 40px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    border-radius: 50%;
+    cursor: pointer;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s;
+    font-size: 24px;
+    line-height: 1;
+    color: #333;
+}
+
+.mermaid-fullscreen-close:hover {
+    background: white;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-close.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-close.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
+    display: none !important;
+}`;
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        all_mermaids.forEach((el) => {
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+        await mermaid.run();
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+
+    if ("False" === "True") {
+        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("");
+            if(all_mermaids.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else if(svgs.size() !== mermaids_to_add_zoom) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else {
+                svgs.each(function() {
+                    var svg = d3.select(this);
+                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+                    var inner = svg.select("g");
+                    var zoom = d3.zoom().on("zoom", function(event) {
+                        inner.attr("transform", event.transform);
+                    });
+                    svg.call(zoom);
+                });
+            }
+        }
+    } else if(all_mermaids.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if ("True" !== "True") return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    const closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.classList.contains('active')) {
+            closeModal();
+        }
+    });
+
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = '⛶';
+        fullscreenBtn.style.opacity = '50%';
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scroll, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.sdisplay = 'block';
+
+                if ("False" === "True") {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+const load = async () => {
+    initStyles();
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...JSON.parse(
+                    `{"startOnLoad": false}`
+                ),
+                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...JSON.parse(
+        `{"startOnLoad": false}`
+    ),
+    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/_torch/auto_deploy/transform/interface';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../../../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../../search.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc19" />
+  
+    
+    <script src="../../../../../_static/searchtools.js"></script>
+    <script src="../../../../../_static/language_data.js"></script>
+    <script src="../../../../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../../../../index.html" class="nav-link">Module code</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">tensorrt_llm._torch.auto_deploy.transform.interface</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for tensorrt_llm._torch.auto_deploy.transform.interface</h1><div class="highlight"><pre>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+<span class="sd">&quot;&quot;&quot;The interface for all transforms.</span>
+
+<span class="sd">This module defines the base classes and interfaces for all transforms.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span><span class="p">,</span> <span class="n">nullcontext</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">total_ordering</span><span class="p">,</span> <span class="n">wraps</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Type</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">final</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseModel</span><span class="p">,</span> <span class="n">Field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">torch.fx</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">Node</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">..models.factory</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelFactory</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..shim.interface</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedSequenceInterface</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..utils._graph</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">add_graph_input</span><span class="p">,</span>
+    <span class="n">canonicalize_graph</span><span class="p">,</span>
+    <span class="n">lift_to_meta</span><span class="p">,</span>
+    <span class="n">named_graphmodules</span><span class="p">,</span>
+    <span class="n">placeholders_on_meta</span><span class="p">,</span>
+    <span class="n">run_shape_prop</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..utils.cuda_mem_tracker</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_mem_info</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..utils.dist_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistConfig</span>  <span class="c1"># kept in utils to avoid circular imports</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..utils.graph_writer</span><span class="w"> </span><span class="kn">import</span> <span class="n">graph_writer</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..utils.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">ad_logger</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.graph_module_visualizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">to_dot</span>
+
+<span class="c1"># ANSI color codes for log formatting (set to False to disable colors)</span>
+<span class="c1"># NOTE: colors disabled by default to make logging in CI/CD pipelines easier to read</span>
+<span class="n">_ENABLE_LOG_COLORS</span> <span class="o">=</span> <span class="kc">False</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_Colors</span><span class="p">:</span>
+    <span class="n">RESET</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[0m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">BOLD</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[1m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">DIM</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[2m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">CYAN</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[36m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">MAGENTA</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[35m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">GREEN</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[32m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">YELLOW</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[33m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">ORANGE</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\033</span><span class="s2">[38;5;208m&quot;</span> <span class="k">if</span> <span class="n">_ENABLE_LOG_COLORS</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+
+
+<div class="viewcode-block" id="MemStats">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">MemStats</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Memory statistics snapshot for tracking CUDA memory usage.&quot;&quot;&quot;</span>
+
+    <span class="n">tot</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">free</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">resv</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">alloc</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">frag</span><span class="p">:</span> <span class="nb">float</span>
+
+<div class="viewcode-block" id="MemStats.diff">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.diff">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">diff</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;MemStats&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;MemStats&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Calculate the difference (self - other).&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">MemStats</span><span class="p">(</span>
+            <span class="n">tot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tot</span> <span class="o">-</span> <span class="n">other</span><span class="o">.</span><span class="n">tot</span><span class="p">,</span>
+            <span class="n">free</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">free</span> <span class="o">-</span> <span class="n">other</span><span class="o">.</span><span class="n">free</span><span class="p">,</span>
+            <span class="n">resv</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">resv</span> <span class="o">-</span> <span class="n">other</span><span class="o">.</span><span class="n">resv</span><span class="p">,</span>
+            <span class="n">alloc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">alloc</span> <span class="o">-</span> <span class="n">other</span><span class="o">.</span><span class="n">alloc</span><span class="p">,</span>
+            <span class="n">frag</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">frag</span> <span class="o">-</span> <span class="n">other</span><span class="o">.</span><span class="n">frag</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="MemStats.to_dict">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.to_dict">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Convert to dictionary for serialization.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;tot&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">tot</span><span class="p">,</span>
+            <span class="s2">&quot;free&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">free</span><span class="p">,</span>
+            <span class="s2">&quot;resv&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">resv</span><span class="p">,</span>
+            <span class="s2">&quot;alloc&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">alloc</span><span class="p">,</span>
+            <span class="s2">&quot;frag&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">frag</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="MemStats.from_dict">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;MemStats&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Create from dictionary.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">tot</span><span class="o">=</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;tot&quot;</span><span class="p">],</span> <span class="n">free</span><span class="o">=</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;free&quot;</span><span class="p">],</span> <span class="n">resv</span><span class="o">=</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;resv&quot;</span><span class="p">],</span> <span class="n">alloc</span><span class="o">=</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;alloc&quot;</span><span class="p">],</span> <span class="n">frag</span><span class="o">=</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;frag&quot;</span><span class="p">])</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="TransformError">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformError">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">TransformError</span><span class="p">(</span><span class="ne">Exception</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;An exception raised when a transform fails.&quot;&quot;&quot;</span>
+
+    <span class="k">pass</span></div>
+
+
+
+<div class="viewcode-block" id="Stages">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages">[docs]</a>
+<span class="nd">@total_ordering</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Stages</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Enumerated (ordered!) stages of the transformation pipeline.</span>
+
+<span class="sd">    This is used to classify and pre-order transforms.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">FACTORY</span> <span class="o">=</span> <span class="s2">&quot;factory&quot;</span>  <span class="c1"># factory stage for building the model</span>
+    <span class="n">EXPORT</span> <span class="o">=</span> <span class="s2">&quot;export&quot;</span>  <span class="c1"># export stage for exporting the model to a graph module</span>
+    <span class="n">POST_EXPORT</span> <span class="o">=</span> <span class="s2">&quot;post_export&quot;</span>  <span class="c1"># low-level cleanups of the exported graph</span>
+    <span class="n">PATTERN_MATCHER</span> <span class="o">=</span> <span class="s2">&quot;pattern_matcher&quot;</span>  <span class="c1"># high-level pattern matching to standardize graph</span>
+    <span class="n">SHARDING</span> <span class="o">=</span> <span class="s2">&quot;sharding&quot;</span>  <span class="c1"># auto-sharding of the graph</span>
+    <span class="n">WEIGHT_LOAD</span> <span class="o">=</span> <span class="s2">&quot;weight_load&quot;</span>  <span class="c1"># loading of the model weights</span>
+    <span class="n">POST_LOAD_FUSION</span> <span class="o">=</span> <span class="s2">&quot;post_load_fusion&quot;</span>  <span class="c1"># post-loading fusion and perf optimizations of the graph</span>
+    <span class="n">CACHE_INIT</span> <span class="o">=</span> <span class="s2">&quot;cache_init&quot;</span>  <span class="c1"># initialization of cached attention + (KV) cache initialization</span>
+    <span class="n">VISUALIZE</span> <span class="o">=</span> <span class="s2">&quot;visualize&quot;</span>  <span class="c1"># visualization of the graph</span>
+    <span class="n">COMPILE</span> <span class="o">=</span> <span class="s2">&quot;compile&quot;</span>  <span class="c1"># graph compilation stage using low-level compilers like torch.compile</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__lt__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Enable sorting by definition order.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span> <span class="ow">is</span> <span class="n">other</span><span class="o">.</span><span class="vm">__class__</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="p">)</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">&lt;</span> <span class="nb">list</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="vm">__class__</span><span class="p">)</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">other</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">NotImplemented</span></div>
+
+
+
+<div class="viewcode-block" id="SharedConfig">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">SharedConfig</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Global config shared between multiple transforms in the inference optimizer.&quot;&quot;&quot;</span>
+
+    <span class="n">model_config</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="c1"># to provide an easy way to do config validation of child config classes with more fields</span>
+        <span class="s2">&quot;extra&quot;</span><span class="p">:</span> <span class="s2">&quot;allow&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;arbitrary_types_allowed&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="n">local_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">dist_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DistConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="TransformConfig">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">TransformConfig</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A simple configuration class that can be extended by a transform for configurability.&quot;&quot;&quot;</span>
+
+    <span class="n">model_config</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="c1"># to provide an easy way to do config validation of child config classes with more fields</span>
+        <span class="s2">&quot;extra&quot;</span><span class="p">:</span> <span class="s2">&quot;allow&quot;</span><span class="p">,</span>
+    <span class="p">}</span>
+
+    <span class="c1">### MANDATORY CONFIG ###########################################################################</span>
+    <span class="n">stage</span><span class="p">:</span> <span class="n">Stages</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The stage of the transformation pipeline where this transform should run.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="c1">### OPTIONAL CONFIG ###########################################################################</span>
+    <span class="n">run_per_gm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to run the transform per graph (sub)module or on whole module.&quot;</span><span class="p">,</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">enabled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to enable this transform.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">skip_on_error</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to skip the transform if an error occurs.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">run_graph_cleanup</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to run graph cleanup/canonicalization after this transform.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">run_shape_prop</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to run shape propagation after this transform.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">requires_clean_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether this transform requires the graph to be clean before it is applied.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">requires_shape_prop</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether this transform requires shape propagation before it is applied.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">debug_visualize_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Debug visualization directory. None to disable visualization, &quot;</span>
+        <span class="s2">&quot;or a path string to specify the output directory.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">expect_mem_change</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether this transform is expected to cause changes in CUDA memory stats.&quot;</span><span class="p">,</span>
+    <span class="p">)</span></div>
+
+
+
+<span class="n">AutodeployMeta</span> <span class="o">=</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span>
+<span class="n">_UntypedInferenceOptimizerConfig</span> <span class="o">=</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span>
+<span class="n">StrictInferenceOptimizerConfig</span> <span class="o">=</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">TransformConfig</span><span class="p">]</span>
+<span class="n">InferenceOptimizerConfig</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Union</span><span class="p">[</span><span class="n">TransformConfig</span><span class="p">,</span> <span class="n">_UntypedInferenceOptimizerConfig</span><span class="p">]]</span>
+
+
+<div class="viewcode-block" id="TransformInfo">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">TransformInfo</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Information about the result of a transform.&quot;&quot;&quot;</span>
+
+    <span class="n">model_config</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;frozen&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>  <span class="c1"># Make the model immutable after creation</span>
+    <span class="p">}</span>
+
+    <span class="n">skipped</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether the transform was skipped.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">num_matches</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Number of matches found.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">is_clean</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether the graph is clean after the transform. This can be set by the &quot;</span>
+        <span class="s2">&quot;transform to indicate that the transform does not change the graph and it preserves the &quot;</span>
+        <span class="s2">&quot;is_clean flag of the last transform.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">has_valid_shapes</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether meta tensor shapes are valid after the transform. This can be set by &quot;</span>
+        <span class="s2">&quot;the transform to indicate that the transform does not affect the shapes in the meta &quot;</span>
+        <span class="s2">&quot;information of the graph. In other words, the transform does not change the shapes of the &quot;</span>
+        <span class="s2">&quot;tensors in the graph and it preserves the has_valid_shapes flag of the last transform.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+<div class="viewcode-block" id="TransformInfo.from_last_info">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo.from_last_info">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_last_info</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Create a new TransformInfo from the last transform info.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">is_clean</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">is_clean</span><span class="p">,</span>
+            <span class="n">has_valid_shapes</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">has_valid_shapes</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__or__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Merge two TransformInfo objects.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">TransformInfo</span><span class="p">(</span>
+            <span class="n">skipped</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">skipped</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">skipped</span><span class="p">,</span>  <span class="c1"># we only count skipped if both were skipped</span>
+            <span class="n">num_matches</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_matches</span> <span class="o">+</span> <span class="n">other</span><span class="o">.</span><span class="n">num_matches</span><span class="p">,</span>
+            <span class="n">is_clean</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">is_clean</span> <span class="ow">or</span> <span class="n">other</span><span class="o">.</span><span class="n">is_clean</span><span class="p">,</span>
+            <span class="n">has_valid_shapes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">has_valid_shapes</span> <span class="ow">or</span> <span class="n">other</span><span class="o">.</span><span class="n">has_valid_shapes</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__and__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Merge two TransformInfo objects.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">TransformInfo</span><span class="p">(</span>
+            <span class="n">skipped</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">skipped</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">skipped</span><span class="p">,</span>  <span class="c1"># we only count skipped if both were skipped</span>
+            <span class="n">num_matches</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_matches</span> <span class="o">+</span> <span class="n">other</span><span class="o">.</span><span class="n">num_matches</span><span class="p">,</span>
+            <span class="n">is_clean</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">is_clean</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">is_clean</span><span class="p">,</span>
+            <span class="n">has_valid_shapes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">has_valid_shapes</span> <span class="ow">and</span> <span class="n">other</span><span class="o">.</span><span class="n">has_valid_shapes</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="c1"># implement + addition operator for TransformInfo</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__add__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;TransformInfo&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="fm">__and__</span><span class="p">(</span><span class="n">other</span><span class="p">)</span></div>
+
+
+
+<span class="n">TransformHistory</span> <span class="o">=</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]</span>
+
+
+<div class="viewcode-block" id="with_transform_logging">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.with_transform_logging">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">with_transform_logging</span><span class="p">(</span><span class="n">call_fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Callable</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Decorator to prepend transform-specific prefix to all ad_logger logs during __call__.</span>
+
+<span class="sd">    Temporarily patches `ad_logger.log` so that any logs emitted within the call automatically</span>
+<span class="sd">    include the `[stage=..., transform=...]` prefix that `_log_info` would otherwise add manually.</span>
+<span class="sd">    The original logger behavior is restored after the call, even if an exception occurs.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="nd">@wraps</span><span class="p">(</span><span class="n">call_fn</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_wrapper</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+        <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">:</span>
+        <span class="n">prefix</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;[stage=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">stage</span><span class="o">.</span><span class="n">value</span><span class="si">}</span><span class="s2">, transform=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">get_transform_key</span><span class="p">()</span><span class="si">}</span><span class="s2">]&quot;</span>
+        <span class="n">original_log</span> <span class="o">=</span> <span class="n">ad_logger</span><span class="o">.</span><span class="n">log</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">_patched_log</span><span class="p">(</span><span class="n">severity</span><span class="p">,</span> <span class="o">*</span><span class="n">msg</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">msg</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">and</span> <span class="n">msg</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="n">prefix</span><span class="p">):</span>
+                <span class="k">return</span> <span class="n">original_log</span><span class="p">(</span><span class="n">severity</span><span class="p">,</span> <span class="o">*</span><span class="n">msg</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">original_log</span><span class="p">(</span><span class="n">severity</span><span class="p">,</span> <span class="n">prefix</span><span class="p">,</span> <span class="o">*</span><span class="n">msg</span><span class="p">)</span>
+
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">log</span> <span class="o">=</span> <span class="n">_patched_log</span>  <span class="c1"># type: ignore[assignment]</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">call_fn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">factory</span><span class="p">,</span> <span class="n">shared_config</span><span class="p">,</span> <span class="n">idx</span><span class="p">)</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">log</span> <span class="o">=</span> <span class="n">original_log</span>  <span class="c1"># type: ignore[assignment]</span>
+
+    <span class="k">return</span> <span class="n">_wrapper</span></div>
+
+
+
+<div class="viewcode-block" id="BaseTransform">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">BaseTransform</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A base class for all transforms.&quot;&quot;&quot;</span>
+
+    <span class="n">config</span><span class="p">:</span> <span class="n">TransformConfig</span>  <span class="c1"># overwrite type hint if other config cls is used in subclass!</span>
+    <span class="n">_autodeploy_meta_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;_autodeploy&quot;</span>
+    <span class="n">_history_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;transform_history&quot;</span>
+    <span class="n">_mem_history_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;mem_history&quot;</span>
+    <span class="n">_transform_key</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># Set by TransformRegistry.register() decorator</span>
+
+<div class="viewcode-block" id="BaseTransform.get_transform_key">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.get_transform_key">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_transform_key</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the short name of the transform.</span>
+
+<span class="sd">        This is used to identify the transform in the transformation pipeline.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="s2">&quot;_transform_key&quot;</span><span class="p">):</span>
+            <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_transform_key</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Transform class </span><span class="si">{</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> must be registered with TransformRegistry.register() &quot;</span>
+            <span class="s2">&quot;or manually implement get_transform_key()&quot;</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="BaseTransform.get_config_class">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.get_config_class">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_class</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Type</span><span class="p">[</span><span class="n">TransformConfig</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the configuration class for the transform.</span>
+
+<span class="sd">        This is used to validate the configuration of the transform.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">TransformConfig</span></div>
+
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">TransformConfig</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Initialize the transform.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            config: The configuration for the transform, either as base config object or the actual</span>
+<span class="sd">                config object.</span>
+
+<span class="sd">        To customize the initialization, override the `_post_init` method.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_config_class</span><span class="p">()):</span>
+            <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_config_class</span><span class="p">()(</span><span class="o">**</span><span class="n">config</span><span class="o">.</span><span class="n">model_dump</span><span class="p">())</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_post_init</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_post_init</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Post-initialization hook that can be overridden by subclasses.&quot;&quot;&quot;</span>
+        <span class="k">pass</span>
+
+<div class="viewcode-block" id="BaseTransform.from_kwargs">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.from_kwargs">[docs]</a>
+    <span class="nd">@final</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_kwargs</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;BaseTransform&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Create a transform from kwargs.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            **kwargs: The configuration for the transform.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            The transform instance.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">get_config_class</span><span class="p">()(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">)</span></div>
+
+
+    <span class="nd">@with_transform_logging</span>
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+        <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Apply the transform to the graph.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            mod: The model to apply the transform to.</span>
+<span class="sd">            cm: The cached sequence interface defining the sequence interface.</span>
+<span class="sd">            factory: The model factory used to build the model.</span>
+<span class="sd">            shared_config: Global info shared between multiple transforms.</span>
+<span class="sd">            idx: The index of the transform in the pipeline.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            nn.Module: The transformed model.</span>
+
+<span class="sd">        NOTE: The transform can/should modify the graph module in place if possible. Returning the</span>
+<span class="sd">        graph is mostly to standardize the interface for transforms that cannot modify the graph</span>
+<span class="sd">        in place (e.g. the factory or export transform).</span>
+
+<span class="sd">        This method is the main entry point for any transforms and is called by the</span>
+<span class="sd">        InferenceOptimizer pipeline.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+
+        <span class="c1"># get the transform key</span>
+        <span class="n">t_name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_transform_key</span><span class="p">()</span>
+
+        <span class="c1"># retrieve autodeploy metadata from the graphmodule</span>
+        <span class="n">autodeploy_meta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_autodeploy_meta</span><span class="p">(</span><span class="n">mod</span><span class="p">)</span>
+
+        <span class="c1"># retrieve transform history and last transform info</span>
+        <span class="n">history</span><span class="p">:</span> <span class="n">TransformHistory</span> <span class="o">=</span> <span class="n">autodeploy_meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_history_key</span><span class="p">,</span> <span class="p">{})</span>
+        <span class="n">h_keys</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">history</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>  <span class="c1"># preserves order of insertion/transform execution</span>
+        <span class="n">info_last</span> <span class="o">=</span> <span class="n">history</span><span class="p">[</span><span class="n">h_keys</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]]</span> <span class="k">if</span> <span class="n">h_keys</span> <span class="k">else</span> <span class="n">TransformInfo</span><span class="p">(</span><span class="n">skipped</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+        <span class="c1"># initialize new info object</span>
+        <span class="n">info</span> <span class="o">=</span> <span class="n">TransformInfo</span><span class="o">.</span><span class="n">from_last_info</span><span class="p">(</span><span class="n">info_last</span><span class="p">)</span>
+
+        <span class="c1"># show debug info for debug config</span>
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">t_name</span><span class="si">}</span><span class="s2"> config: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># capture memory stats at the start</span>
+        <span class="n">mem_pre</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_mem_stats</span><span class="p">(</span><span class="n">empty_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+        <span class="c1"># store some timing information</span>
+        <span class="n">elapsed_time_total</span> <span class="o">=</span> <span class="o">-</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+        <span class="n">elapsed_time_pre_cleanup</span> <span class="o">=</span> <span class="mf">0.0</span>
+        <span class="n">elapsed_time_apply</span> <span class="o">=</span> <span class="mf">0.0</span>
+        <span class="n">elapsed_time_post_cleanup</span> <span class="o">=</span> <span class="mf">0.0</span>
+
+        <span class="c1"># run or skip the transform</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enabled</span><span class="p">:</span>
+            <span class="c1"># run graph pre-cleanup and update info object</span>
+            <span class="n">elapsed_time_pre_cleanup</span> <span class="o">=</span> <span class="o">-</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="n">info</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run_cleanup</span><span class="p">(</span>
+                <span class="n">mod</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">requires_clean_graph</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">requires_shape_prop</span><span class="p">,</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">is_clean</span><span class="p">,</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">has_valid_shapes</span><span class="p">,</span>
+                <span class="n">phase</span><span class="o">=</span><span class="s2">&quot;pre&quot;</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">elapsed_time_pre_cleanup</span> <span class="o">+=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+
+            <span class="c1"># run the transform in a error-handling wrapper if desired</span>
+            <span class="n">elapsed_time_apply</span> <span class="o">=</span> <span class="o">-</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_apply_logging_context</span><span class="p">():</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="s2">&quot;applying transform...&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">skip_on_error</span><span class="p">:</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">mod</span><span class="p">,</span> <span class="n">info_apply</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_apply_per_gm_or_whole_model</span><span class="p">(</span>
+                            <span class="n">mod</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">factory</span><span class="p">,</span> <span class="n">shared_config</span>
+                        <span class="p">)</span>
+                    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                        <span class="n">error_msg</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;Transform </span><span class="si">{</span><span class="n">t_name</span><span class="si">}</span><span class="s2"> failed&quot;</span>
+                        <span class="n">ad_logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">error_msg</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                        <span class="n">info_apply</span> <span class="o">=</span> <span class="n">TransformInfo</span><span class="p">(</span><span class="n">skipped</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="c1"># handle this here normally to improve debugging and error message</span>
+                    <span class="n">mod</span><span class="p">,</span> <span class="n">info_apply</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_apply_per_gm_or_whole_model</span><span class="p">(</span>
+                        <span class="n">mod</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">factory</span><span class="p">,</span> <span class="n">shared_config</span>
+                    <span class="p">)</span>
+            <span class="n">elapsed_time_apply</span> <span class="o">+=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+
+            <span class="c1"># we cannot say it&#39;s clean if the previous wasn&#39;t clean even if this one is</span>
+            <span class="c1"># create new info object with updated cleanup status</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="n">info</span> <span class="o">&amp;</span> <span class="n">info_apply</span>
+
+            <span class="c1"># run graph post-cleanup</span>
+            <span class="n">elapsed_time_post_cleanup</span> <span class="o">=</span> <span class="o">-</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="n">info</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run_cleanup</span><span class="p">(</span>
+                <span class="n">mod</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">run_graph_cleanup</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">run_shape_prop</span><span class="p">,</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">is_clean</span><span class="p">,</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">has_valid_shapes</span><span class="p">,</span>
+                <span class="n">phase</span><span class="o">=</span><span class="s2">&quot;post&quot;</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">elapsed_time_post_cleanup</span> <span class="o">+=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+
+        <span class="n">elapsed_time_total</span> <span class="o">+=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+
+        <span class="c1"># capture memory stats at the end and log summary (only log if enabled)</span>
+        <span class="n">mem_post</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_mem_stats</span><span class="p">(</span><span class="n">empty_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enabled</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_mem_summary</span><span class="p">(</span><span class="n">mem_pre</span><span class="p">,</span> <span class="n">mem_post</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">expect_mem_change</span><span class="p">)</span>
+
+        <span class="c1"># log the result of the transform</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_log_transform_summary</span><span class="p">(</span>
+            <span class="n">enabled</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enabled</span><span class="p">,</span>
+            <span class="n">skipped</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">skipped</span><span class="p">,</span>
+            <span class="n">num_matches</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">num_matches</span><span class="p">,</span>
+            <span class="n">elapsed_total</span><span class="o">=</span><span class="n">elapsed_time_total</span><span class="p">,</span>
+            <span class="n">elapsed_pre</span><span class="o">=</span><span class="n">elapsed_time_pre_cleanup</span><span class="p">,</span>
+            <span class="n">elapsed_apply</span><span class="o">=</span><span class="n">elapsed_time_apply</span><span class="p">,</span>
+            <span class="n">elapsed_post</span><span class="o">=</span><span class="n">elapsed_time_post_cleanup</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Model after </span><span class="si">{</span><span class="n">t_name</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">mod</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># update + store new meta data (transform history and memory history)</span>
+        <span class="n">history</span><span class="p">[</span><span class="n">t_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">info</span>
+        <span class="n">autodeploy_meta</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_history_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">history</span>
+
+        <span class="c1"># store memory history</span>
+        <span class="n">mem_history</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">autodeploy_meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_mem_history_key</span><span class="p">,</span> <span class="p">{}</span>
+        <span class="p">)</span>
+        <span class="n">mem_history</span><span class="p">[</span><span class="n">t_name</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;pre&quot;</span><span class="p">:</span> <span class="n">mem_pre</span><span class="o">.</span><span class="n">to_dict</span><span class="p">(),</span> <span class="s2">&quot;post&quot;</span><span class="p">:</span> <span class="n">mem_post</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()}</span>
+        <span class="n">autodeploy_meta</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_mem_history_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">mem_history</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_set_autodeploy_meta</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">autodeploy_meta</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_visualize_graph</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">idx</span><span class="p">)</span>
+
+        <span class="c1"># Dump graph after transform for debugging (controlled by AD_DUMP_GRAPHS_DIR env var)</span>
+        <span class="n">graph_writer</span><span class="o">.</span><span class="n">dump_graph</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">t_name</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">stage</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+
+        <span class="c1"># return the graph module</span>
+        <span class="k">return</span> <span class="n">mod</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_visualize_graph</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Visualize the graph if debug visualization is enabled.</span>
+<span class="sd">        Args:</span>
+<span class="sd">            mod: The graph module to visualize.</span>
+<span class="sd">            idx: The index of the transform in the pipeline.</span>
+<span class="sd">        Note:</span>
+<span class="sd">            we may want to consider doing this for each subgraph.</span>
+<span class="sd">            See https://github.com/NVIDIA/TensorRT-LLM/issues/10203</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">fx</span><span class="o">.</span><span class="n">GraphModule</span><span class="p">):</span>
+            <span class="k">return</span>
+        <span class="n">visualize_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">debug_visualize_dir</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">visualize_dir</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">visualize_dir</span><span class="p">):</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">visualize_dir</span><span class="p">)</span>
+        <span class="n">name_stem</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;gm_</span><span class="si">{</span><span class="n">idx</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="si">:</span><span class="s2">02d</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">get_transform_key</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="n">visualize_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">visualize_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name_stem</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">to_dot</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name_stem</span><span class="p">,</span> <span class="n">save_path</span><span class="o">=</span><span class="n">visualize_path</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">&quot;svg&quot;</span><span class="p">)</span>
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[</span><span class="si">{</span><span class="n">idx</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="si">:</span><span class="s2">02d</span><span class="si">}</span><span class="s2">] Visualized </span><span class="si">{</span><span class="n">name_stem</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">visualize_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_per_gm_or_whole_model</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">run_per_gm</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_apply_to_full_model</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">factory</span><span class="p">,</span> <span class="n">shared_config</span><span class="p">)</span>
+
+        <span class="c1"># just run it on first graph module we are encountering for now...</span>
+        <span class="n">info</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">graph_sub</span> <span class="ow">in</span> <span class="n">named_graphmodules</span><span class="p">(</span><span class="n">mod</span><span class="p">):</span>
+            <span class="n">graph_sub</span><span class="p">,</span> <span class="n">info_apply</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">graph_sub</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">factory</span><span class="p">,</span> <span class="n">shared_config</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">k</span> <span class="o">==</span> <span class="s2">&quot;&quot;</span><span class="p">:</span>
+                <span class="n">mod</span> <span class="o">=</span> <span class="n">graph_sub</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">mod</span><span class="o">.</span><span class="n">set_submodule</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">graph_sub</span><span class="p">)</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="n">info</span> <span class="o">&amp;</span> <span class="n">info_apply</span> <span class="k">if</span> <span class="n">info</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">info_apply</span>
+        <span class="k">return</span> <span class="n">mod</span><span class="p">,</span> <span class="n">info</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_warning</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="nb">any</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Log a warning message with the transform key.&quot;&quot;&quot;</span>
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="nb">any</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Log a message with the transform key.&quot;&quot;&quot;</span>
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_debug</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="nb">any</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Log a message with the transform key.&quot;&quot;&quot;</span>
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">)</span>
+
+    <span class="nd">@contextmanager</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_logging_context</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Context manager to add [APPLY] prefix to logs during transform execution.&quot;&quot;&quot;</span>
+        <span class="n">original_log</span> <span class="o">=</span> <span class="n">ad_logger</span><span class="o">.</span><span class="n">log</span>
+        <span class="n">apply_label</span> <span class="o">=</span> <span class="s2">&quot;[APPLY]&quot;</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">_patched_log</span><span class="p">(</span><span class="n">severity</span><span class="p">,</span> <span class="o">*</span><span class="n">msg</span><span class="p">):</span>
+            <span class="c1"># Prepend [APPLY] after any existing prefix</span>
+            <span class="k">if</span> <span class="n">msg</span><span class="p">:</span>
+                <span class="n">first</span> <span class="o">=</span> <span class="n">msg</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="nb">str</span><span class="p">(</span><span class="n">msg</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+                <span class="k">return</span> <span class="n">original_log</span><span class="p">(</span><span class="n">severity</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">apply_label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">first</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="o">*</span><span class="n">msg</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
+            <span class="k">return</span> <span class="n">original_log</span><span class="p">(</span><span class="n">severity</span><span class="p">,</span> <span class="n">apply_label</span><span class="p">)</span>
+
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">log</span> <span class="o">=</span> <span class="n">_patched_log</span>  <span class="c1"># type: ignore[assignment]</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">yield</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">log</span> <span class="o">=</span> <span class="n">original_log</span>  <span class="c1"># type: ignore[assignment]</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_cleanup_status</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">phase</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">action</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">reason</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Log cleanup status with colored formatting.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            phase: &quot;pre&quot; or &quot;post&quot;</span>
+<span class="sd">            action: &quot;ran&quot; or &quot;skipped&quot;</span>
+<span class="sd">            reason: Description of what ran or why skipped</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">label</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">CYAN</span><span class="si">}</span><span class="s2">[</span><span class="si">{</span><span class="n">phase</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span><span class="si">}</span><span class="s2">-CLEANUP]</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="k">if</span> <span class="n">action</span> <span class="o">==</span> <span class="s2">&quot;skipped&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">DIM</span><span class="si">}</span><span class="s2">skipped (</span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">)</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_transform_summary</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">enabled</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">skipped</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">num_matches</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">elapsed_total</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+        <span class="n">elapsed_pre</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+        <span class="n">elapsed_apply</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+        <span class="n">elapsed_post</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Log transform summary with colored formatting.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            enabled: Whether the transform was enabled.</span>
+<span class="sd">            skipped: Whether the transform was skipped.</span>
+<span class="sd">            num_matches: Number of matches found.</span>
+<span class="sd">            elapsed_total: Total elapsed time in seconds.</span>
+<span class="sd">            elapsed_pre: Pre-cleanup elapsed time in seconds.</span>
+<span class="sd">            elapsed_apply: Apply elapsed time in seconds.</span>
+<span class="sd">            elapsed_post: Post-cleanup elapsed time in seconds.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">label</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">GREEN</span><span class="si">}</span><span class="s2">[SUMMARY]</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="n">timing_str</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">elapsed_total</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">s &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;(pre=</span><span class="si">{</span><span class="n">elapsed_pre</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">s, apply=</span><span class="si">{</span><span class="n">elapsed_apply</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">s, post=</span><span class="si">{</span><span class="n">elapsed_post</span><span class="si">:</span><span class="s2">.3f</span><span class="si">}</span><span class="s2">s)&quot;</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">enabled</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">DIM</span><span class="si">}</span><span class="s2">disabled</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">skipped</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">DIM</span><span class="si">}</span><span class="s2">skipped</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2"> | time: </span><span class="si">{</span><span class="n">timing_str</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> matches=</span><span class="si">{</span><span class="n">num_matches</span><span class="si">}</span><span class="s2"> | time: </span><span class="si">{</span><span class="n">timing_str</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_get_mem_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">empty_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">MemStats</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get current CUDA memory statistics.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            empty_cache: Whether to empty the memory cache before getting the memory stats.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            MemStats object with current memory values in GB.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">tot</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">resv</span><span class="p">,</span> <span class="n">alloc</span><span class="p">,</span> <span class="n">frag</span> <span class="o">=</span> <span class="n">get_mem_info</span><span class="p">(</span><span class="n">empty_cache</span><span class="o">=</span><span class="n">empty_cache</span><span class="p">,</span> <span class="n">unit</span><span class="o">=</span><span class="s2">&quot;GB&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">MemStats</span><span class="p">(</span><span class="n">tot</span><span class="o">=</span><span class="n">tot</span><span class="p">,</span> <span class="n">free</span><span class="o">=</span><span class="n">free</span><span class="p">,</span> <span class="n">resv</span><span class="o">=</span><span class="n">resv</span><span class="p">,</span> <span class="n">alloc</span><span class="o">=</span><span class="n">alloc</span><span class="p">,</span> <span class="n">frag</span><span class="o">=</span><span class="n">frag</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_mem_summary</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pre</span><span class="p">:</span> <span class="n">MemStats</span><span class="p">,</span> <span class="n">post</span><span class="p">:</span> <span class="n">MemStats</span><span class="p">,</span> <span class="n">expect_mem_change</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Log memory summary with diff between pre and post stats.</span>
+
+<span class="sd">        Logs one of three cases:</span>
+<span class="sd">        1. Expected mem change: info log, magenta color</span>
+<span class="sd">        2. Unexpected mem change: warning log, yellow color</span>
+<span class="sd">        3. No mem change: debug log, no colors</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            pre: Memory stats captured before the transform.</span>
+<span class="sd">            post: Memory stats captured after the transform.</span>
+<span class="sd">            expect_mem_change: Whether this transform is expected to cause memory changes.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">diff</span> <span class="o">=</span> <span class="n">post</span><span class="o">.</span><span class="n">diff</span><span class="p">(</span><span class="n">pre</span><span class="p">)</span>
+
+        <span class="c1"># Threshold for detecting significant memory changes (in GB)</span>
+        <span class="n">mem_change_threshold</span> <span class="o">=</span> <span class="mf">0.005</span>
+
+        <span class="c1"># Check if there was a significant memory change</span>
+        <span class="n">has_mem_change</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="nb">abs</span><span class="p">(</span><span class="n">diff</span><span class="o">.</span><span class="n">resv</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">mem_change_threshold</span>
+            <span class="ow">or</span> <span class="nb">abs</span><span class="p">(</span><span class="n">diff</span><span class="o">.</span><span class="n">alloc</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">mem_change_threshold</span>
+            <span class="ow">or</span> <span class="nb">abs</span><span class="p">(</span><span class="n">diff</span><span class="o">.</span><span class="n">frag</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">mem_change_threshold</span>
+            <span class="ow">or</span> <span class="nb">abs</span><span class="p">(</span><span class="n">diff</span><span class="o">.</span><span class="n">free</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">mem_change_threshold</span>
+        <span class="p">)</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">_fmt_val_with_delta</span><span class="p">(</span><span class="n">val</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">delta</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">color</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">            </span><span class="sd">&quot;&quot;&quot;Format value with optional delta in the specified color.&quot;&quot;&quot;</span>
+            <span class="n">val_str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">val</span><span class="si">:</span><span class="s2">6.2f</span><span class="si">}</span><span class="s2">GB&quot;</span>
+            <span class="k">if</span> <span class="nb">abs</span><span class="p">(</span><span class="n">delta</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">mem_change_threshold</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">val_str</span>
+            <span class="n">sign</span> <span class="o">=</span> <span class="s2">&quot;+&quot;</span> <span class="k">if</span> <span class="n">delta</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+            <span class="k">if</span> <span class="n">color</span><span class="p">:</span>
+                <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">val_str</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">BOLD</span><span class="si">}{</span><span class="n">color</span><span class="si">}</span><span class="s2">(</span><span class="si">{</span><span class="n">sign</span><span class="si">}{</span><span class="n">delta</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">GB)</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">val_str</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">sign</span><span class="si">}{</span><span class="n">delta</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">GB)&quot;</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">_fmt_parts</span><span class="p">(</span><span class="n">color</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">            </span><span class="sd">&quot;&quot;&quot;Format all memory parts with the specified color for deltas.&quot;&quot;&quot;</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="sa">f</span><span class="s2">&quot;free: </span><span class="si">{</span><span class="n">_fmt_val_with_delta</span><span class="p">(</span><span class="n">post</span><span class="o">.</span><span class="n">free</span><span class="p">,</span><span class="w"> </span><span class="n">diff</span><span class="o">.</span><span class="n">free</span><span class="p">,</span><span class="w"> </span><span class="n">color</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="sa">f</span><span class="s2">&quot;resv: </span><span class="si">{</span><span class="n">_fmt_val_with_delta</span><span class="p">(</span><span class="n">post</span><span class="o">.</span><span class="n">resv</span><span class="p">,</span><span class="w"> </span><span class="n">diff</span><span class="o">.</span><span class="n">resv</span><span class="p">,</span><span class="w"> </span><span class="n">color</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="sa">f</span><span class="s2">&quot;alloc: </span><span class="si">{</span><span class="n">_fmt_val_with_delta</span><span class="p">(</span><span class="n">post</span><span class="o">.</span><span class="n">alloc</span><span class="p">,</span><span class="w"> </span><span class="n">diff</span><span class="o">.</span><span class="n">alloc</span><span class="p">,</span><span class="w"> </span><span class="n">color</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="sa">f</span><span class="s2">&quot;frag: </span><span class="si">{</span><span class="n">_fmt_val_with_delta</span><span class="p">(</span><span class="n">post</span><span class="o">.</span><span class="n">frag</span><span class="p">,</span><span class="w"> </span><span class="n">diff</span><span class="o">.</span><span class="n">frag</span><span class="p">,</span><span class="w"> </span><span class="n">color</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="p">]</span>
+            <span class="k">return</span> <span class="s2">&quot; | &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">has_mem_change</span> <span class="ow">and</span> <span class="n">expect_mem_change</span><span class="p">:</span>
+            <span class="c1"># Case 1: Expected mem change - info log, magenta</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">MAGENTA</span><span class="si">}</span><span class="s2">[CUDA MEM DIFF (EXPECTED)]</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">_fmt_parts</span><span class="p">(</span><span class="n">_Colors</span><span class="o">.</span><span class="n">MAGENTA</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">has_mem_change</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">expect_mem_change</span><span class="p">:</span>
+            <span class="c1"># Case 2: Unexpected mem change - warning log, yellow</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">YELLOW</span><span class="si">}</span><span class="s2">[CUDA MEM DIFF (UNEXPECTED)]</span><span class="si">{</span><span class="n">_Colors</span><span class="o">.</span><span class="n">RESET</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_warning</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">_fmt_parts</span><span class="p">(</span><span class="n">_Colors</span><span class="o">.</span><span class="n">YELLOW</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># Case 3: No mem change - debug log, no colors</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[CUDA MEM] </span><span class="si">{</span><span class="n">_fmt_parts</span><span class="p">(</span><span class="s1">&#39;&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_get_autodeploy_meta</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AutodeployMeta</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the autodeploy metadata from the graphmodule.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="s2">&quot;meta&quot;</span><span class="p">):</span>
+            <span class="n">mod</span><span class="o">.</span><span class="n">meta</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">return</span> <span class="n">mod</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autodeploy_meta_key</span><span class="p">,</span> <span class="p">{})</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_set_autodeploy_meta</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">autodeploy_meta</span><span class="p">:</span> <span class="n">AutodeployMeta</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Set the autodeploy metadata in the graphmodule.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="s2">&quot;meta&quot;</span><span class="p">):</span>
+            <span class="n">mod</span><span class="o">.</span><span class="n">meta</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">mod</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_autodeploy_meta_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">autodeploy_meta</span>
+
+    <span class="nd">@final</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_run_cleanup</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">clean_graph</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">clean_shape</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">is_clean</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">has_valid_shapes</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">phase</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TransformInfo</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Run graph cleanup before or after the transform.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            mod: The model to run cleanup on.</span>
+<span class="sd">            clean_graph: Whether we want a clean graph after the transform.</span>
+<span class="sd">            clean_shape: Whether we want clean shapes after the transform.</span>
+<span class="sd">            is_clean: The current cleanup status.</span>
+<span class="sd">            has_valid_shapes: The current shape propagation status.</span>
+<span class="sd">            phase: The phase of cleanup (&quot;pre&quot; or &quot;post&quot;).</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            An info object indicating the cleanup status after this function is called.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="c1"># check if run cleanup depending on the config and info</span>
+        <span class="k">if</span> <span class="n">clean_shape</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="n">is_clean</span> <span class="ow">and</span> <span class="n">has_valid_shapes</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_cleanup_status</span><span class="p">(</span><span class="n">phase</span><span class="p">,</span> <span class="s2">&quot;ran&quot;</span><span class="p">,</span> <span class="s2">&quot;graph canonicalization + shape_prop&quot;</span><span class="p">)</span>
+            <span class="n">canonicalize_graph</span><span class="p">(</span><span class="n">mod</span><span class="p">)</span>
+            <span class="k">with</span> <span class="n">lift_to_meta</span><span class="p">(</span><span class="n">mod</span><span class="p">)</span> <span class="k">if</span> <span class="n">placeholders_on_meta</span><span class="p">(</span><span class="n">mod</span><span class="p">)</span> <span class="k">else</span> <span class="n">nullcontext</span><span class="p">():</span>
+                <span class="n">run_shape_prop</span><span class="p">(</span><span class="n">mod</span><span class="p">)</span>
+            <span class="n">is_clean</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="n">has_valid_shapes</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">elif</span> <span class="n">clean_graph</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_clean</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_cleanup_status</span><span class="p">(</span><span class="n">phase</span><span class="p">,</span> <span class="s2">&quot;ran&quot;</span><span class="p">,</span> <span class="s2">&quot;graph canonicalization&quot;</span><span class="p">)</span>
+            <span class="n">canonicalize_graph</span><span class="p">(</span><span class="n">mod</span><span class="p">)</span>
+            <span class="n">is_clean</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="n">has_valid_shapes</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">elif</span> <span class="ow">not</span> <span class="n">clean_graph</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">clean_shape</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_cleanup_status</span><span class="p">(</span><span class="n">phase</span><span class="p">,</span> <span class="s2">&quot;skipped&quot;</span><span class="p">,</span> <span class="s2">&quot;disabled&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_cleanup_status</span><span class="p">(</span><span class="n">phase</span><span class="p">,</span> <span class="s2">&quot;skipped&quot;</span><span class="p">,</span> <span class="s2">&quot;graph already clean&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">TransformInfo</span><span class="p">(</span><span class="n">is_clean</span><span class="o">=</span><span class="n">is_clean</span><span class="p">,</span> <span class="n">has_valid_shapes</span><span class="o">=</span><span class="n">has_valid_shapes</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Apply the transform to the graph.</span>
+
+<span class="sd">        This is the core method that should be implemented by subclasses.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Transform </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">get_transform_key</span><span class="p">()</span><span class="si">}</span><span class="s2"> only supports `run_per_gm=False`.&quot;</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_to_full_model</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">model</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Apply the transform to the full model.&quot;&quot;&quot;</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Transform </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">get_transform_key</span><span class="p">()</span><span class="si">}</span><span class="s2"> only supports `run_per_gm=True`.&quot;</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_add_or_retrieve_input</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">init_val</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Node</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Add or retrieve an input node from the graph.&quot;&quot;&quot;</span>
+        <span class="n">input_nodes</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">find_nodes</span><span class="p">(</span><span class="n">op</span><span class="o">=</span><span class="s2">&quot;placeholder&quot;</span><span class="p">,</span> <span class="n">target</span><span class="o">=</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_nodes</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">activate_arg</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">init_val</span><span class="p">:</span>
+                <span class="c1"># Pass the runtime tensor so add_graph_input populates the</span>
+                <span class="c1"># placeholder&#39;s meta[&quot;val&quot;] with a proper FakeTensor (shape +</span>
+                <span class="c1"># dtype propagated via fake_mode.from_tensor). Leaving meta empty</span>
+                <span class="c1"># (the default _NO_VAL path) causes downstream transforms that</span>
+                <span class="c1"># look up node.meta[&quot;val&quot;] (FX export, fuse_fp8_linear&#39;s pattern</span>
+                <span class="c1"># matcher) to silently misbehave -- e.g. an adjacent</span>
+                <span class="c1"># fc2_latent_proj ends up with None in its input slot and the FP8</span>
+                <span class="c1"># fake impl crashes on `input.dtype`.</span>
+                <span class="k">return</span> <span class="n">add_graph_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">val</span><span class="o">=</span><span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">get_arg</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">add_graph_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_nodes</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">input_nodes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Expected exactly one input node for </span><span class="si">{</span><span class="n">name</span><span class="si">=}</span><span class="s2">, got </span><span class="si">{</span><span class="n">input_nodes</span><span class="si">=}</span><span class="s2">&quot;</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="TransformRegistry">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">TransformRegistry</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A registry for all transforms.&quot;&quot;&quot;</span>
+
+    <span class="n">_registry</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Type</span><span class="p">[</span><span class="n">BaseTransform</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+
+<div class="viewcode-block" id="TransformRegistry.register">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.register">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Type</span><span class="p">[</span><span class="n">BaseTransform</span><span class="p">]],</span> <span class="n">Type</span><span class="p">[</span><span class="n">BaseTransform</span><span class="p">]]:</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">inner</span><span class="p">(</span><span class="n">fn</span><span class="p">:</span> <span class="n">Type</span><span class="p">[</span><span class="n">BaseTransform</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Type</span><span class="p">[</span><span class="n">BaseTransform</span><span class="p">]:</span>
+            <span class="bp">cls</span><span class="o">.</span><span class="n">_registry</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">fn</span>
+            <span class="c1"># Auto-store the transform key as a class attribute</span>
+            <span class="n">fn</span><span class="o">.</span><span class="n">_transform_key</span> <span class="o">=</span> <span class="n">name</span>
+            <span class="k">return</span> <span class="n">fn</span>
+
+        <span class="k">return</span> <span class="n">inner</span></div>
+
+
+<div class="viewcode-block" id="TransformRegistry.get">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.get">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Type</span><span class="p">[</span><span class="n">BaseTransform</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the transform class by name.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_registry</span><span class="p">[</span><span class="n">name</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="TransformRegistry.get_config_class">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.get_config_class">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_class</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Type</span><span class="p">[</span><span class="n">TransformConfig</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the configuration class for a transform by name.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span><span class="o">.</span><span class="n">get_config_class</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="TransformRegistry.has">
+<a class="viewcode-back" href="../../../../../features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.has">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">has</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Check if a transform is registered.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_registry</span></div>
+</div>
+
+</pre></div>
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+<div class="bd-sidebar-secondary"></div>
+
+
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 22, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

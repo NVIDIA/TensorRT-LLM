@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -496,9 +496,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'genindex';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -839,7 +839,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -888,6 +888,21 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
@@ -903,6 +918,8 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -1378,13 +1395,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
-    --extra_visual_gen_options
-
-      <ul>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-visual_gen_args">trtllm-serve-serve command line option</a>
-</li>
-      </ul></li>
-      <li>
     --fail_fast_on_attention_window_too_large
 
       <ul>
@@ -1722,8 +1732,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-modality">trtllm-bench-throughput command line option</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --model
 
@@ -1733,6 +1741,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="commands/trtllm-eval.html#cmdoption-trtllm-eval-model">trtllm-eval command line option</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --model_path
 
@@ -2514,6 +2524,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.__init__">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.__init__">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.__init__">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.__init__">(tensorrt_llm.llmapi.MpiCommSession method)</a>
@@ -2682,6 +2694,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.algorithm">algorithm (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.algorithm">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.algorithm">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.algorithm">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig attribute)</a>
@@ -2689,11 +2703,13 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.alibi">alibi (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.alibi_with_scale">alibi_with_scale (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allgather">allgather() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.alloc">alloc (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.allow_advanced_sampling">allow_advanced_sampling (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
 
@@ -2733,6 +2749,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceStrategy">AllReduceStrategy (class in tensorrt_llm.functional)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer.analyze_graph_structure">analyze_graph_structure() (in module tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.apply_batched_logits_processor">apply_batched_logits_processor (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_llama3_scaling">apply_llama3_scaling() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
@@ -2742,6 +2760,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">apply_rotary_pos_emb_chatglm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_cogvlm">apply_rotary_pos_emb_cogvlm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir.ApplyShardingHints">ApplyShardingHints (class in tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.arange">arange() (in module tensorrt_llm.functional)</a>
 </li>
@@ -2825,6 +2845,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.BaichuanForCausalLM">BaichuanForCausalLM (class in tensorrt_llm.models)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform">BaseTransform (class in tensorrt_llm._torch.auto_deploy.transform.interface)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.batch_size">batch_size (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig.batch_sizes">batch_sizes (tensorrt_llm.llmapi.DecodeCudaGraphConfig attribute)</a>
@@ -2861,12 +2883,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.begin_thinking_phase_token">begin_thinking_phase_token (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.bert_attention">bert_attention() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.bert_attention_plugin">bert_attention_plugin (tensorrt_llm.plugin.PluginConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.bert_context_fmha_fp32_acc">bert_context_fmha_fp32_acc (tensorrt_llm.plugin.PluginConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">BertAttention (class in tensorrt_llm.layers.attention)</a>
@@ -2901,6 +2923,18 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.build_config">build_config (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms.build_custom_args_for_linear">build_custom_args_for_linear() (tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFP4Gemms.build_custom_args_for_linear">(tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFP4Gemms method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFP8Gemms.build_custom_args_for_linear">(tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFP8Gemms method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig.build_custom_args_for_linear">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig static method)</a>
+</li>
+      </ul></li>
+      <li><a href="features/auto_deploy/transforms/factory.html#tensorrt_llm._torch.auto_deploy.transform.library.build_model.BuildAndLoadFactoryModel">BuildAndLoadFactoryModel (class in tensorrt_llm._torch.auto_deploy.transform.library.build_model)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig">BuildCacheConfig (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig.Config">BuildCacheConfig.Config (class in tensorrt_llm.llmapi)</a>
@@ -2909,12 +2943,16 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.Config">BuildConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/factory.html#tensorrt_llm._torch.auto_deploy.transform.library.build_model.BuildModel">BuildModel (class in tensorrt_llm._torch.auto_deploy.transform.library.build_model)</a>
+</li>
   </ul></td>
 </tr></table>
 
 <h2 id="C">C</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.CACHE_INIT">CACHE_INIT (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig.cache_root">cache_root (tensorrt_llm.llmapi.BuildCacheConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.cache_transceiver_config">cache_transceiver_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -3037,6 +3075,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.clamp_val">clamp_val (tensorrt_llm.llmapi.QuantConfig attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.cleanup_identity_dtype_cast.CleanupIdentityDtypeCast">CleanupIdentityDtypeCast (class in tensorrt_llm._torch.auto_deploy.transform.library.cleanup_identity_dtype_cast)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_export.html#tensorrt_llm._torch.auto_deploy.transform.library.cleanup_input_constraints.CleanupInputConstraints">CleanupInputConstraints (class in tensorrt_llm._torch.auto_deploy.transform.library.cleanup_input_constraints)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_export.html#tensorrt_llm._torch.auto_deploy.transform.library.cleanup_noop_add.CleanupNoopAdd">CleanupNoopAdd (class in tensorrt_llm._torch.auto_deploy.transform.library.cleanup_noop_add)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_export.html#tensorrt_llm._torch.auto_deploy.transform.library.cleanup_noop_slice.CleanupNoopSlice">CleanupNoopSlice (class in tensorrt_llm._torch.auto_deploy.transform.library.cleanup_noop_slice)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.clear_logprob_params">clear_logprob_params() (tensorrt_llm.llmapi.RequestOutput method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.client_id">client_id (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
@@ -3075,6 +3121,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.CombinedTimestepTextProjEmbeddings">CombinedTimestepTextProjEmbeddings (class in tensorrt_llm.layers.embedding)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.COMPILE">COMPILE (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileModel">CompileModel (class in tensorrt_llm._torch.auto_deploy.transform.library.compile_model)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CompletionOutput">CompletionOutput (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.compute_relative_bias">compute_relative_bias() (in module tensorrt_llm.layers.attention)</a>
@@ -3082,6 +3132,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.concat">concat() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Conditional">Conditional (class in tensorrt_llm.functional)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.config">config (tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.BaichuanForCausalLM.config_class">config_class (tensorrt_llm.models.BaichuanForCausalLM attribute)</a>
 
@@ -3168,6 +3220,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.construct">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.construct">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.construct">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.construct">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -3251,6 +3305,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.conv_transpose2d">conv_transpose2d() (in module tensorrt_llm.functional)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig.convert_amax_hook">convert_amax_hook() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig.convert_amax_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.convert_enable_disable">convert_enable_disable() (tensorrt_llm.plugin.PluginConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.convert_load_format">convert_load_format() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
@@ -3293,6 +3353,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.copy">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.copy">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.copy">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.copy">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
@@ -3435,6 +3497,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.debug_tensors_to_save">debug_tensors_to_save (tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.debug_visualize_dir">debug_visualize_dir (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.decode">decode() (tensorrt_llm.runtime.GenerationSession method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.decode_batch">decode_batch() (tensorrt_llm.runtime.GenerationSession method)</a>
@@ -3507,9 +3571,29 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.default_record_creator">default_record_creator() (tensorrt_llm.llmapi.RequestOutput.PostprocWorker static method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization.default_scales">default_scales() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig.default_scales">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig.default_scales">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig.default_scales">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig.default_scales">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig.default_scales">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE.default_scales">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.deferred">deferred (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.denominator">denominator (tensorrt_llm.llmapi.DisaggScheduleStyle attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache_transformers.DetectHFAttnLayers">DetectHFAttnLayers (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache_transformers)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.hidden_states.DetectHiddenStatesForCapture">DetectHiddenStatesForCapture (class in tensorrt_llm._torch.auto_deploy.transform.library.hidden_states)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.detokenize">detokenize (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
@@ -3560,6 +3644,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.dict">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.dict">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.dict">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.dict">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
@@ -3593,6 +3679,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.diff">diff() (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DiffusersAttention">DiffusersAttention (class in tensorrt_llm.layers.attention)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.DimRange">DimRange (class in tensorrt_llm.functional)</a>
@@ -3638,6 +3726,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.disk_cache_path">disk_cache_path (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.disk_cache_size">disk_cache_size (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.disk_prefetch_num_reqs">disk_prefetch_num_reqs (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig.dist_config">dist_config (tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT">DiT (class in tensorrt_llm.models)</a>
 </li>
@@ -3793,6 +3885,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.elementwise_binary">elementwise_binary() (in module tensorrt_llm.functional)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.eliminate_redundant_transposes.EliminateRedundantTransposes">EliminateRedundantTransposes (class in tensorrt_llm._torch.auto_deploy.transform.library.eliminate_redundant_transposes)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Embedding">Embedding (class in tensorrt_llm.layers.embedding)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.embedding">embedding() (in module tensorrt_llm.functional)</a>
@@ -3897,6 +3991,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.enable_userbuffers">enable_userbuffers (tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.enabled">enabled (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner">EncDecModelRunner (class in tensorrt_llm.runtime)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.encode">encode() (tensorrt_llm.llmapi.AsyncLLM method)</a>
@@ -3991,7 +4087,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.expandtabs">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.expect_mem_change">expect_mem_change (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS">EXPLICIT_DRAFT_TOKENS (tensorrt_llm.models.SpeculativeDecodingMode attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.EXPORT">EXPORT (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/export.html#tensorrt_llm._torch.auto_deploy.transform.library.export_to_gm.ExportToGM">ExportToGM (class in tensorrt_llm._torch.auto_deploy.transform.library.export_to_gm)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.extended_runtime_perf_knob_config">extended_runtime_perf_knob_config (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
@@ -4036,6 +4138,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.Config.extra">(tensorrt_llm.llmapi.MedusaDecodingConfig.Config attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.Config.extra">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.Config attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.Config.extra">(tensorrt_llm.llmapi.MoeConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.Config.extra">(tensorrt_llm.llmapi.MTPDecodingConfig.Config attribute)</a>
@@ -4079,6 +4183,8 @@ window.runMermaid = runMermaid;</script>
 <h2 id="F">F</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.FACTORY">FACTORY (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.fail_fast_on_attention_window_too_large">fail_fast_on_attention_window_too_large (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.FalconConfig">FalconConfig (class in tensorrt_llm.models)</a>
@@ -4132,6 +4238,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.find_best_medusa_path">find_best_medusa_path() (tensorrt_llm.runtime.GenerationSession method)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization">FineGrainedFP8LinearQuantization (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CompletionOutput.finish_reason">finish_reason (tensorrt_llm.llmapi.CompletionOutput attribute)</a>
 
@@ -4323,8 +4431,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.WhisperEncoder.forward">(tensorrt_llm.models.WhisperEncoder method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.forward_with_cfg">forward_with_cfg() (tensorrt_llm.models.DiT method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.forward_without_cfg">forward_without_cfg() (tensorrt_llm.models.DiT method)</a>
@@ -4337,6 +4443,16 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.fp8_rowwise_gemm_plugin">fp8_rowwise_gemm_plugin (tensorrt_llm.plugin.PluginConfig attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig">FP8BMMQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig">FP8LinearQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8QuantizationFromGraph">FP8QuantizationFromGraph (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.frag">frag (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.free">free (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.free_gpu_memory_fraction">free_gpu_memory_fraction (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.frequency_penalty">frequency_penalty (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -4345,6 +4461,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.frequency_penalty">(tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SpeculativeDecodingMode.from_arguments">from_arguments() (tensorrt_llm.models.SpeculativeDecodingMode static method)</a>
 
       <ul>
@@ -4361,9 +4479,11 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.from_config">from_config() (tensorrt_llm.models.PretrainedModel class method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.from_dict">from_dict() (tensorrt_llm.llmapi.QuantConfig class method)</a>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.from_dict">from_dict() (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.from_dict">(tensorrt_llm.llmapi.QuantConfig class method)</a>
+</li>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.from_dict">(tensorrt_llm.models.PretrainedConfig class method)</a>
 </li>
       </ul></li>
@@ -4441,6 +4561,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.from_json_file">(tensorrt_llm.models.PretrainedConfig class method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.from_kwargs">from_kwargs() (tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform class method)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo.from_last_info">from_last_info() (tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo class method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.LLaMAConfig.from_meta_ckpt">from_meta_ckpt() (tensorrt_llm.models.LLaMAConfig class method)</a>
 
       <ul>
@@ -4491,6 +4615,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.from_orm">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.from_orm">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.from_orm">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.from_orm">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
@@ -4557,12 +4683,72 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.SD3Transformer2DModel.fuse_qkv_projections">fuse_qkv_projections() (tensorrt_llm.models.SD3Transformer2DModel method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_add_rms_norm.FuseAddRMSNorm">FuseAddRMSNorm (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_add_rms_norm)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.collectives.FuseAllreduceResidualRMSNorm">FuseAllreduceResidualRMSNorm (class in tensorrt_llm._torch.auto_deploy.transform.library.collectives)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_causal_conv.FuseCausalConvActivation">FuseCausalConvActivation (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_causal_conv)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP">FusedGatedMLP (class in tensorrt_llm.layers.mlp)</a>
 
       <ul>
         <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.MLPType.FusedGatedMLP">(tensorrt_llm.functional.MLPType attribute)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms">FuseFineGrainedFP8Gemms (class in tensorrt_llm._torch.auto_deploy.transform.library.fusion)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseFineGrainedFP8Linear">FuseFineGrainedFP8Linear (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseFineGrainedFP8Moe">FuseFineGrainedFP8Moe (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseFineGrainedFP8SwiGLU">FuseFineGrainedFP8SwiGLU (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFP4Gemms">FuseFP4Gemms (class in tensorrt_llm._torch.auto_deploy.transform.library.fusion)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFP8Gemms">FuseFP8Gemms (class in tensorrt_llm._torch.auto_deploy.transform.library.fusion)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseFP8Linear">FuseFP8Linear (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseFP8Moe">FuseFP8Moe (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_gdn_gating.FuseGdnGating">FuseGdnGating (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_gdn_gating)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseGemms">FuseGemms (class in tensorrt_llm._torch.auto_deploy.transform.library.fusion)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseGemmsMixedChildren">FuseGemmsMixedChildren (class in tensorrt_llm._torch.auto_deploy.transform.library.fusion)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.l2_norm.FuseL2Norm">FuseL2Norm (class in tensorrt_llm._torch.auto_deploy.transform.library.l2_norm)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_mamba_a_log.FuseMambaALog">FuseMambaALog (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_mamba_a_log)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseMoe">FuseMoe (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.FuseMXFP4Moe">FuseMXFP4Moe (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseNVFP4Linear">FuseNVFP4Linear (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseNVFP4Moe">FuseNVFP4Moe (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseNVFP4SwiGLU">FuseNVFP4SwiGLU (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_relu2_quant_nvfp4.FuseRelu2QuantNVFP4">FuseRelu2QuantNVFP4 (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_relu2_quant_nvfp4)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.rms_norm.FuseRMSNorm">FuseRMSNorm (class in tensorrt_llm._torch.auto_deploy.transform.library.rms_norm)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8.FuseRMSNormQuantFP8">FuseRMSNormQuantFP8 (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4.FuseRMSNormQuantNVFP4">FuseRMSNormQuantNVFP4 (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_into_trtllm_attention.FuseRopeIntoTrtllmAttention">FuseRopeIntoTrtllmAttention (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_into_trtllm_attention)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla.FuseRopeIntoTrtllmMLA">FuseRopeIntoTrtllmMLA (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_silu_mul.FuseSiluMul">FuseSiluMul (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_silu_mul)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseSwiGLU">FuseSwiGLU (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_trtllm_attention_quant_fp8.FuseTrtllmAttentionQuantFP8">FuseTrtllmAttentionQuantFP8 (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_trtllm_attention_quant_fp8)</a>
+</li>
   </ul></td>
 </tr></table>
 
@@ -4610,6 +4796,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.gather_last_token_logits">gather_last_token_logits() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.gather_nd">gather_nd() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.gather_logits_before_lm_head.GatherLogitsBeforeLmHeadTransform">GatherLogitsBeforeLmHeadTransform (class in tensorrt_llm._torch.auto_deploy.transform.library.gather_logits_before_lm_head)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.gegelu">gegelu() (in module tensorrt_llm.functional)</a>
 </li>
@@ -4687,6 +4875,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession">GenerationSession (class in tensorrt_llm.runtime)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.get">get() (tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry class method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_1d_sincos_pos_embed_from_grid">get_1d_sincos_pos_embed_from_grid() (in module tensorrt_llm.layers.embedding)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_2d_sincos_pos_embed">get_2d_sincos_pos_embed() (in module tensorrt_llm.layers.embedding)</a>
@@ -4701,6 +4891,100 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.get_comm">get_comm() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.get_config_class">get_config_class() (tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform class method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchAttentionLayout.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchAttentionLayout class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/factory.html#tensorrt_llm._torch.auto_deploy.transform.library.build_model.BuildModel.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.build_model.BuildModel class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileModel.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileModel class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/export.html#tensorrt_llm._torch.auto_deploy.transform.library.export_to_gm.ExportToGM.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.export_to_gm.ExportToGM class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_gdn_gating.FuseGdnGating.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_gdn_gating.FuseGdnGating class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseFineGrainedFP8Linear.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseFineGrainedFP8Linear class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseFP8Linear.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseFP8Linear class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseNVFP4Linear.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant.FuseNVFP4Linear class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_relu2_quant_nvfp4.FuseRelu2QuantNVFP4.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_relu2_quant_nvfp4.FuseRelu2QuantNVFP4 class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8.FuseRMSNormQuantFP8.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8.FuseRMSNormQuantFP8 class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4.FuseRMSNormQuantNVFP4.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4.FuseRMSNormQuantNVFP4 class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_into_trtllm_attention.FuseRopeIntoTrtllmAttention.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_into_trtllm_attention.FuseRopeIntoTrtllmAttention class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_silu_mul.FuseSiluMul.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_silu_mul.FuseSiluMul class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseFineGrainedFP8SwiGLU.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseFineGrainedFP8SwiGLU class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseNVFP4SwiGLU.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseNVFP4SwiGLU class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseSwiGLU.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.FuseSwiGLU class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchFineGrainedFP8SwiGLUPattern.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchFineGrainedFP8SwiGLUPattern class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchNVFP4SwiGLUPattern.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchNVFP4SwiGLUPattern class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchSwiGLUPattern.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchSwiGLUPattern class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_trtllm_attention_quant_fp8.FuseTrtllmAttentionQuantFP8.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fuse_trtllm_attention_quant_fp8.FuseTrtllmAttentionQuantFP8 class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseFP8Moe.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseFP8Moe class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseMoe.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseMoe class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseNVFP4Moe.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.FuseNVFP4Moe class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchBmmMoePattern.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchBmmMoePattern class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.SplitMoeFusedForSharding.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.SplitMoeFusedForSharding class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.FuseMXFP4Moe.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.FuseMXFP4Moe class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.QuantizeMXFP4MOE.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.QuantizeMXFP4MOE class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.hidden_states.DetectHiddenStatesForCapture.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.hidden_states.DetectHiddenStatesForCapture class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.l2_norm.FuseL2Norm.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.l2_norm.FuseL2Norm class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/weight_load.html#tensorrt_llm._torch.auto_deploy.transform.library.load_weights.LoadFactoryModelWeights.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.load_weights.LoadFactoryModelWeights class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/weight_load.html#tensorrt_llm._torch.auto_deploy.transform.library.load_weights.LoadWeightsToDevice.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.load_weights.LoadWeightsToDevice class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.mlir_elementwise_fusion.MLIRElementwiseFusion.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.mlir_elementwise_fusion.MLIRElementwiseFusion class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.moe_routing.MatchMoeRoutingPattern.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.moe_routing.MatchMoeRoutingPattern class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache.InitializeMropeDeltaCache.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache.InitializeMropeDeltaCache class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.rms_norm.FuseRMSNorm.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.rms_norm.FuseRMSNorm class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.rms_norm.MatchRMSNormPattern.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.rms_norm.MatchRMSNormPattern class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.rope.MatchRopeLayout.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.rope.MatchRopeLayout class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding.Sharding.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.sharding.Sharding class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding.ShardingTransformExecutor.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.sharding.ShardingTransformExecutor class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir.ApplyShardingHints.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir.ApplyShardingHints class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/weight_load.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir.StripShardingHints.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir.StripShardingHints class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.SSMCacheTransform.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.SSMCacheTransform class method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.PipelineCache.get_config_class">(tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.PipelineCache class method)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.get_config_group">get_config_group() (tensorrt_llm.models.PretrainedConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.get_context_phase_params">get_context_phase_params() (tensorrt_llm.llmapi.DisaggregatedParams method)</a>
@@ -4714,13 +4998,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.get_indices_block_size">get_indices_block_size() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.get_indices_block_size">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.get_indices_block_size">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
 </li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.get_indices_block_size">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
-</li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.get_kv_cache_events">get_kv_cache_events() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
@@ -4800,6 +5082,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.get_timestep_embedding">get_timestep_embedding() (in module tensorrt_llm.layers.embedding)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform.get_transform_key">get_transform_key() (tensorrt_llm._torch.auto_deploy.transform.interface.BaseTransform class method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.get_users">get_users() (tensorrt_llm.functional.Tensor method)</a>
 </li>
@@ -4883,6 +5167,8 @@ window.runMermaid = runMermaid;</script>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.handle_per_step">handle_per_step() (tensorrt_llm.runtime.GenerationSession method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.has">has() (tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry class method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceParams.has_affine">has_affine() (tensorrt_llm.functional.AllReduceParams method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceParams.has_bias">has_bias() (tensorrt_llm.functional.AllReduceParams method)</a>
@@ -4905,6 +5191,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo.has_valid_shapes">has_valid_shapes (tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.has_zero_point">has_zero_point (tensorrt_llm.llmapi.QuantConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.head_size">head_size (tensorrt_llm.runtime.GenerationSession property)</a>
@@ -4913,6 +5201,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.head_size">(tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache_transformers.HFReplaceCachedAttn">HFReplaceCachedAttn (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache_transformers)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.hidden_size">hidden_size (tensorrt_llm.runtime.GenerationSession property)</a>
 
       <ul>
@@ -4973,6 +5263,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session.infer_shapes">infer_shapes() (tensorrt_llm.runtime.Session method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.optimizer.InferenceOptimizer">InferenceOptimizer (class in tensorrt_llm._torch.auto_deploy.transform.optimizer)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.INFLIGHT">INFLIGHT (tensorrt_llm.llmapi.BatchingType attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_audio_encoder">init_audio_encoder() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
@@ -4987,7 +5279,27 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_tokenizer">init_tokenizer() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InitializeCache">InitializeCache (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.InitializeCausalConvCache">InitializeCausalConvCache (class in tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache.InitializeMropeDeltaCache">InitializeMropeDeltaCache (class in tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.input_timing_cache">input_timing_cache (tensorrt_llm.llmapi.BuildConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedAttention">InsertCachedAttention (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.InsertCachedDeltaRule">InsertCachedDeltaRule (class in tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.InsertCachedGatedDeltaRule">InsertCachedGatedDeltaRule (class in tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedMLAAttention">InsertCachedMLAAttention (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.hidden_states.InsertCachedResidualAdd">InsertCachedResidualAdd (class in tensorrt_llm._torch.auto_deploy.transform.library.hidden_states)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig">INT4GPTQLinearQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig">INT4LinearQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.INT8">INT8 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
@@ -4996,6 +5308,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.interpolate">interpolate() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.is_alibi">is_alibi() (tensorrt_llm.functional.PositionEmbeddingType method)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo.is_clean">is_clean (tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.is_comm_session">is_comm_session() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
@@ -5045,6 +5359,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.is_medusa_mode">is_medusa_mode (tensorrt_llm.runtime.GenerationSession property)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.is_module_excluded_from_quantization">is_module_excluded_from_quantization() (tensorrt_llm.llmapi.QuantConfig method)</a>
@@ -5053,8 +5369,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_public_pool">is_public_pool (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.is_redrafter_mode">is_redrafter_mode (tensorrt_llm.runtime.GenerationSession property)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.is_rope">is_rope() (tensorrt_llm.functional.PositionEmbeddingType method)</a>
@@ -5257,6 +5571,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.json">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.json">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.json">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
@@ -5493,9 +5809,31 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization.load_hook">load_hook() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig.load_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig.load_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig.load_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig.load_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig.load_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE.load_hook">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_audio">load_test_audio() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data">load_test_data() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/weight_load.html#tensorrt_llm._torch.auto_deploy.transform.library.load_weights.LoadFactoryModelWeights">LoadFactoryModelWeights (class in tensorrt_llm._torch.auto_deploy.transform.library.load_weights)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/weight_load.html#tensorrt_llm._torch.auto_deploy.transform.library.load_weights.LoadWeightsToDevice">LoadWeightsToDevice (class in tensorrt_llm._torch.auto_deploy.transform.library.load_weights)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig.local_rank">local_rank (tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.locate_accepted_draft_tokens">locate_accepted_draft_tokens() (tensorrt_llm.runtime.GenerationSession method)</a>
 </li>
@@ -5674,6 +6012,42 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.masked_scatter">masked_scatter() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.masked_select">masked_select() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchAttentionLayout">MatchAttentionLayout (class in tensorrt_llm._torch.auto_deploy.transform.library.attention)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchBmmMoePattern">MatchBmmMoePattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchEagerAttention">MatchEagerAttention (class in tensorrt_llm._torch.auto_deploy.transform.library.attention)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchFineGrainedFP8SwiGLUPattern">MatchFineGrainedFP8SwiGLUPattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchFP8MoePattern">MatchFP8MoePattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.l2_norm.MatchL2NormPattern">MatchL2NormPattern (class in tensorrt_llm._torch.auto_deploy.transform.library.l2_norm)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.moe_routing.MatchMoeRoutingPattern">MatchMoeRoutingPattern (class in tensorrt_llm._torch.auto_deploy.transform.library.moe_routing)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.MatchMXFP4MoePattern">MatchMXFP4MoePattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchNVFP4MoePattern">MatchNVFP4MoePattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchNVFP4SwiGLUPattern">MatchNVFP4SwiGLUPattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchRepeatKV">MatchRepeatKV (class in tensorrt_llm._torch.auto_deploy.transform.library.attention)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchRepeatKVWithTorchAttention">MatchRepeatKVWithTorchAttention (class in tensorrt_llm._torch.auto_deploy.transform.library.attention)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.rms_norm.MatchRMSNormPattern">MatchRMSNormPattern (class in tensorrt_llm._torch.auto_deploy.transform.library.rms_norm)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.rope.MatchRopeLayout">MatchRopeLayout (class in tensorrt_llm._torch.auto_deploy.transform.library.rope)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.rope.MatchRopePattern">MatchRopePattern (class in tensorrt_llm._torch.auto_deploy.transform.library.rope)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.attention.MatchSDPAToTorchAttention">MatchSDPAToTorchAttention (class in tensorrt_llm._torch.auto_deploy.transform.library.attention)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchSimpleMoePattern">MatchSimpleMoePattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu.MatchSwiGLUPattern">MatchSwiGLUPattern (class in tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.matmul">matmul() (in module tensorrt_llm.functional)</a>
 </li>
@@ -5897,6 +6271,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.maximum">maximum() (in module tensorrt_llm.functional)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.PipelineCache.maybe_restore">maybe_restore() (tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.PipelineCache method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.maybe_to_pybind">maybe_to_pybind() (tensorrt_llm.llmapi.CacheTransceiverConfig static method)</a>
 
       <ul>
@@ -5941,6 +6317,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaForCausalLm">MedusaForCausalLm (class in tensorrt_llm.models)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats">MemStats (class in tensorrt_llm._torch.auto_deploy.transform.interface)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.meshgrid2d">meshgrid2d() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.metrics">metrics (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
@@ -5958,6 +6336,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.min_tokens">min_tokens (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig">MiniMaxM3SparseAttentionConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.Config">MiniMaxM3SparseAttentionConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.minimum">minimum() (in module tensorrt_llm.functional)</a>
 </li>
@@ -5992,6 +6374,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.activation.Mish">Mish (class in tensorrt_llm.layers.activation)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.MIXED_PRECISION">MIXED_PRECISION (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.mlir_elementwise_fusion.MLIRElementwiseFusion">MLIRElementwiseFusion (class in tensorrt_llm._torch.auto_deploy.transform.library.mlir_elementwise_fusion)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.MLLaMAForCausalLM">MLLaMAForCausalLM (class in tensorrt_llm.models)</a>
 </li>
@@ -6065,6 +6449,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_computed_fields">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_computed_fields">(tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
@@ -6132,6 +6518,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_config">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_config">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_config">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_config">(tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
@@ -6201,6 +6589,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_construct">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_construct">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_construct">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_construct">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -6268,6 +6658,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_copy">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_copy">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_copy">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_copy">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
@@ -6337,6 +6729,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_dump">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_dump">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_dump">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_dump">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
@@ -6405,6 +6799,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_dump_json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_dump_json">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
@@ -6472,6 +6868,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_extra">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_extra">(tensorrt_llm.llmapi.MedusaDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_extra">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_extra">(tensorrt_llm.llmapi.MoeConfig property)</a>
 </li>
@@ -6543,6 +6941,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_fields">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_fields">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_fields">(tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_fields">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
@@ -6610,6 +7010,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.MedusaDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_fields_set">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_fields_set">(tensorrt_llm.llmapi.MoeConfig property)</a>
 </li>
@@ -6684,6 +7086,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_json_schema">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_json_schema">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
@@ -6761,6 +7165,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_parametrized_name">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_parametrized_name">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -6828,6 +7234,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_post_init">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_post_init">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_post_init">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_post_init">(tensorrt_llm.llmapi.MoeConfig method)</a>
 </li>
@@ -6899,6 +7307,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_rebuild">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_rebuild">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -6966,6 +7376,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.model_validate">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_validate">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_validate">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_validate">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
@@ -7035,6 +7447,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_validate_json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_validate_json">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -7103,6 +7517,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.model_validate_strings">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.model_validate_strings">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -7145,6 +7561,12 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="legacy/python-api/tensorrt_llm.functional.html#module-tensorrt_llm">tensorrt_llm</a>, <a href="legacy/python-api/tensorrt_llm.layers.html#module-tensorrt_llm">[1]</a>, <a href="legacy/python-api/tensorrt_llm.models.html#module-tensorrt_llm">[2]</a>, <a href="legacy/python-api/tensorrt_llm.plugin.html#module-tensorrt_llm">[3]</a>, <a href="legacy/python-api/tensorrt_llm.quantization.html#module-tensorrt_llm">[4]</a>, <a href="legacy/python-api/tensorrt_llm.runtime.html#module-tensorrt_llm">[5]</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/core.html#module-tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer">tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/core.html#module-tensorrt_llm._torch.auto_deploy.transform.interface">tensorrt_llm._torch.auto_deploy.transform.interface</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/core.html#module-tensorrt_llm._torch.auto_deploy.transform.optimizer">tensorrt_llm._torch.auto_deploy.transform.optimizer</a>
 </li>
         <li><a href="legacy/python-api/tensorrt_llm.functional.html#module-tensorrt_llm.functional">tensorrt_llm.functional</a>
 </li>
@@ -7271,6 +7693,12 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.multiply_collect">(tensorrt_llm.layers.linear.RowLinear method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_gemm.MultiStreamGemm">MultiStreamGemm (class in tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_gemm)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn.MultiStreamMLAAttn">MultiStreamMLAAttn (class in tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/compile.html#tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe.MultiStreamMOE">MultiStreamMOE (class in tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.mx_config">mx_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
   </ul></td>
@@ -7303,8 +7731,6 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.needs_separate_short_long_cuda_graphs">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
-</li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.needs_separate_short_long_cuda_graphs">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
 </li>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.network">network (tensorrt_llm.functional.Tensor property)</a>
@@ -7417,6 +7843,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunnerCpp.num_layers">(tensorrt_llm.runtime.ModelRunnerCpp property)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo.num_matches">num_matches (tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.num_medusa_heads">num_medusa_heads (tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
 
       <ul>
@@ -7449,6 +7877,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.nvfp4_gemm_config">nvfp4_gemm_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig">NVFP4LinearQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4QuantizationFromGraph">NVFP4QuantizationFromGraph (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv48nvinfer1">nvinfer1 (C++ type)</a>
 </li>
   </ul></td>
@@ -7472,6 +7904,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.opt_num_tokens">opt_num_tokens (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.OPTForCausalLM">OPTForCausalLM (class in tensorrt_llm.models)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/post_load_fusion.html#tensorrt_llm._torch.auto_deploy.transform.library.rope.OptimizeRope">OptimizeRope (class in tensorrt_llm._torch.auto_deploy.transform.library.rope)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.OPTModel">OPTModel (class in tensorrt_llm.models)</a>
 </li>
@@ -7588,6 +8022,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.parse_file">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.parse_file">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.parse_file">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.parse_file">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -7655,6 +8091,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.parse_obj">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.parse_obj">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.parse_obj">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.parse_obj">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
@@ -7724,6 +8162,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.parse_raw">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.parse_raw">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.parse_raw">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.parse_raw">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -7769,6 +8209,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LoRARequest.path">path (tensorrt_llm.llmapi.LoRARequest property)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.PATTERN_MATCHER">PATTERN_MATCHER (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.pause_generation">pause_generation() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.peft_cache_config">peft_cache_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -7803,6 +8245,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.pipeline_parallel_size">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.PipelineCache">PipelineCache (class in tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.PixArtAlphaTextProjection">PixArtAlphaTextProjection (class in tensorrt_llm.layers.embedding)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.plugin_config">plugin_config (tensorrt_llm.llmapi.BuildConfig attribute)</a>
@@ -7813,7 +8257,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType">PositionEmbeddingType (class in tensorrt_llm.functional)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.POST_EXPORT">POST_EXPORT (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.LayerNormPositionType.post_layernorm">post_layernorm (tensorrt_llm.functional.LayerNormPositionType attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.POST_LOAD_FUSION">POST_LOAD_FUSION (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig.post_load_hook">post_load_hook() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.posterior_threshold">posterior_threshold (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 
@@ -8035,8 +8485,6 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig">QuantConfig (class in tensorrt_llm.llmapi)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.Config">QuantConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.BaichuanForCausalLM.quantize">quantize() (tensorrt_llm.models.BaichuanForCausalLM class method)</a>
@@ -8055,11 +8503,37 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.quantize">(tensorrt_llm.models.PretrainedModel class method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.quantize_and_export">quantize_and_export() (in module tensorrt_llm.quantization)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.quantize_per_token_plugin">quantize_per_token_plugin (tensorrt_llm.plugin.PluginConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.quantize_tensor_plugin">quantize_tensor_plugin (tensorrt_llm.plugin.PluginConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization.quantize_weight">quantize_weight() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig.quantize_weight">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig.quantize_weight">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig.quantize_weight">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig.quantize_weight">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig.quantize_weight">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE.quantize_weight">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE method)</a>
+</li>
+      </ul></li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE">QuantizeFineGrainedFP8MOE (class in tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFP8MOE">QuantizeFP8MOE (class in tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4.QuantizeMXFP4MOE">QuantizeMXFP4MOE (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeNVFP4MOE">QuantizeNVFP4MOE (class in tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.QuantMode">QuantMode (class in tensorrt_llm.quantization)</a>
 </li>
@@ -8120,6 +8594,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.reduce_scatter">reduce_scatter() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.GuidedDecodingParams.regex">regex (tensorrt_llm.llmapi.GuidedDecodingParams attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry.register">register() (tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry class method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.relative">relative (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
@@ -8239,14 +8715,18 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output">RequestOutput.PostprocWorker.Output (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.requires_clean_graph">requires_clean_graph (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.requires_shape_prop">requires_shape_prop (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.res">res (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM">RESIDUAL_RMS_NORM (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8">RESIDUAL_RMS_NORM_OUT_QUANT_FP8 (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4">RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8">RESIDUAL_RMS_NORM_QUANT_FP8 (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
@@ -8255,7 +8735,9 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM">RESIDUAL_RMS_PREPOST_NORM (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.resolve_for_target_sparsity">resolve_for_target_sparsity() (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.ResizeKVCache">ResizeKVCache (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedMLAAttention.resolve_backend_for_node">resolve_backend_for_node() (tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedMLAAttention class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.resource_manager">resource_manager (tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
@@ -8264,6 +8746,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.resume">resume() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.resume_generation">resume_generation() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.resv">resv (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.return_context_logits">return_context_logits (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
@@ -8413,6 +8897,12 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session.run">(tensorrt_llm.runtime.Session method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.run_graph_cleanup">run_graph_cleanup (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.run_per_gm">run_per_gm (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.run_shape_prop">run_shape_prop (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.runtime">runtime (tensorrt_llm.runtime.GenerationSession attribute)</a>
 
       <ul>
@@ -8463,6 +8953,38 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.Config">SaveHiddenStatesDecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchFP8MoePattern.scale_arg_indices">scale_arg_indices() (tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchFP8MoePattern method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchNVFP4MoePattern.scale_arg_indices">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchNVFP4MoePattern method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchSimpleMoePattern.scale_arg_indices">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchSimpleMoePattern method)</a>
+</li>
+      </ul></li>
+      <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchFP8MoePattern.scale_keys">scale_keys() (tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchFP8MoePattern method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchNVFP4MoePattern.scale_keys">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchNVFP4MoePattern method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchSimpleMoePattern.scale_keys">(tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.MatchSimpleMoePattern method)</a>
+</li>
+      </ul></li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization.scale_names">scale_names() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig.scale_names">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig.scale_names">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig.scale_names">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig.scale_names">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig.scale_names">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE.scale_names">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.scatter">scatter() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.scatter_nd">scatter_nd() (in module tensorrt_llm.functional)</a>
@@ -8517,6 +9039,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.schema">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.schema">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.schema">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.schema">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
@@ -8586,6 +9110,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.schema_json">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.schema_json">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.schema_json">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.schema_json">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -8641,8 +9167,6 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.seq_len_threshold">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
-</li>
-        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.seq_len_threshold">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig attribute)</a>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig.seq_lens">seq_lens (tensorrt_llm.llmapi.EncodeCudaGraphConfig attribute)</a>
@@ -8721,10 +9245,16 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.shape">shape() (in module tensorrt_llm.functional)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.should_abort">should_abort (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
+      <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding.Sharding">Sharding (class in tensorrt_llm._torch.auto_deploy.transform.library.sharding)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.SHARDING">SHARDING (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/sharding.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding.ShardingTransformExecutor">ShardingTransformExecutor (class in tensorrt_llm._torch.auto_deploy.transform.library.sharding)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.should_abort">should_abort (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.shutdown">shutdown() (tensorrt_llm.llmapi.AsyncLLM method)</a>
 
       <ul>
@@ -8761,6 +9291,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.skip_indexer_for_short_seqs">skip_indexer_for_short_seqs (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.skip_on_error">skip_on_error (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.skip_special_tokens">skip_special_tokens (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.skip_tokenizer_init">skip_tokenizer_init (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -8769,6 +9301,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.skip_tokenizer_init">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo.skipped">skipped (tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig">SkipSoftmaxAttentionConfig (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.Config">SkipSoftmaxAttentionConfig.Config (class in tensorrt_llm.llmapi)</a>
@@ -8799,6 +9333,22 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.sparse_attention_config">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_block_size">sparse_block_size (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_disable_index_value">sparse_disable_index_value (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_index_dim">sparse_index_dim (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_init_blocks">sparse_init_blocks (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_local_blocks">sparse_local_blocks (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_num_index_heads">sparse_num_index_heads (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_score_type">sparse_score_type (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.sparse_topk_blocks">sparse_topk_blocks (tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.spec_dec_mode">spec_dec_mode (tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
 
       <ul>
@@ -8897,6 +9447,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.splitlines">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.fused_moe.SplitMoeFusedForSharding">SplitMoeFusedForSharding (class in tensorrt_llm._torch.auto_deploy.transform.library.fused_moe)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.sqrt">sqrt() (in module tensorrt_llm.functional)</a>
 
       <ul>
@@ -8913,7 +9465,13 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.squeeze">(tensorrt_llm.runtime.TensorInfo method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.SSMCacheTransform">SSMCacheTransform (class in tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.stack">stack() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig.stage">stage (tensorrt_llm._torch.auto_deploy.transform.interface.TransformConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages">Stages (class in tensorrt_llm._torch.auto_deploy.transform.interface)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.SliceInputType.start">start (tensorrt_llm.functional.SliceInputType attribute)</a>
 </li>
@@ -8977,6 +9535,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.strip">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/weight_load.html#tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir.StripShardingHints">StripShardingHints (class in tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.strongly_typed">strongly_typed (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.GuidedDecodingParams.structural_tag">structural_tag (tensorrt_llm.llmapi.GuidedDecodingParams attribute)</a>
@@ -9005,6 +9565,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.supports_backend">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.supports_backend">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.supports_backend">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.supports_backend">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
 </li>
@@ -9049,11 +9611,27 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.target_layer_ids">target_layer_ids (tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization.target_op">target_op() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization method)</a>
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8BMMQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.FP8LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4GPTQLinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.INT4LinearQuantizationFromConfig static method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFineGrainedFP8MOE method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFP8MOE.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeFP8MOE method)</a>
+</li>
+        <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeNVFP4MOE.target_op">(tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe.QuantizeNVFP4MOE method)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.target_sparsity">target_sparsity (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig attribute)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.target_sparsity_decode">target_sparsity_decode (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig property)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.target_sparsity_prefill">target_sparsity_prefill (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig property)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.telemetry_config">telemetry_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 
@@ -9086,6 +9664,27 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">tensorrt_llm (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[36]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[37]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[38]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[39]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[40]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[41]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[42]</a>
 </li>
+      <li>
+    tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/core.html#module-tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer">module</a>
+</li>
+      </ul></li>
+      <li>
+    tensorrt_llm._torch.auto_deploy.transform.interface
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/core.html#module-tensorrt_llm._torch.auto_deploy.transform.interface">module</a>
+</li>
+      </ul></li>
+      <li>
+    tensorrt_llm._torch.auto_deploy.transform.optimizer
+
+      <ul>
+        <li><a href="features/auto_deploy/transforms/core.html#module-tensorrt_llm._torch.auto_deploy.transform.optimizer">module</a>
+</li>
+      </ul></li>
       <li>
     tensorrt_llm.functional
 
@@ -9221,8 +9820,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor10BeamTokensE">tensorrt_llm::executor::BeamTokens (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor10BufferViewE">tensorrt_llm::executor::BufferView (C++ type)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15CacheSaltIDTypeE">tensorrt_llm::executor::CacheSaltIDType (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfigE">tensorrt_llm::executor::CacheTransceiverConfig (C++ class)</a>
 </li>
@@ -10874,7 +11471,9 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData10cacheLevelE">tensorrt_llm::executor::KVCacheStoredBlockData::cacheLevel (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEE">tensorrt_llm::executor::KVCacheStoredBlockData::KVCacheStoredBlockData (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData9cacheSaltE">tensorrt_llm::executor::KVCacheStoredBlockData::cacheSalt (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData22KVCacheStoredBlockDataE6IdTypeN12tensorrt_llm7runtime15VecUniqueTokensENSt8optionalIN12tensorrt_llm7runtime14LoraTaskIdTypeEEE10SizeType3210SizeType32NSt6vectorI5MmKeyEENSt8optionalINSt6stringEEE">tensorrt_llm::executor::KVCacheStoredBlockData::KVCacheStoredBlockData (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22KVCacheStoredBlockData6loraIdE">tensorrt_llm::executor::KVCacheStoredBlockData::loraId (C++ member)</a>
 </li>
@@ -11246,7 +11845,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request11getBadWordsEv">tensorrt_llm::executor::Request::getBadWords (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request14getCacheSaltIDEv">tensorrt_llm::executor::Request::getCacheSaltID (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request12getCacheSaltEv">tensorrt_llm::executor::Request::getCacheSalt (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor7Request11getClientIdEv">tensorrt_llm::executor::Request::getClientId (C++ function)</a>
 </li>
@@ -11326,13 +11925,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7RequestaSERK7Request">tensorrt_llm::executor::Request::operator= (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7RequestaSERR7Request">[1]</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestE9VecTokens10SizeType32bRK14SamplingConfigRK12OutputConfigRKNSt8optionalI10SizeType32EERKNSt8optionalI10SizeType32EENSt8optionalINSt6vectorI10SizeType32EEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalI6TensorEENSt8optionalI25ExternalDraftTokensConfigEENSt8optionalI18PromptTuningConfigEENSt8optionalI15MultimodalInputEENSt8optionalI6TensorEENSt8optionalI11MropeConfigEENSt8optionalI10LoraConfigEENSt8optionalI23LookaheadDecodingConfigEENSt8optionalI22KvCacheRetentionConfigEENSt8optionalINSt6stringEEENSt8optionalI19LogitsPostProcessorEENSt8optionalI9VecTokensEENSt8optionalI6IdTypeEEb12PriorityType11RequestTypeNSt8optionalI18ContextPhaseParamsEENSt8optionalI6TensorEENSt8optionalI10SizeType32EENSt8optionalI6TensorEE10SizeType32NSt8optionalI11EagleConfigEENSt8optionalI6TensorEENSt8optionalI20GuidedDecodingParamsEENSt8optionalI10SizeType32EENSt8optionalI16MillisecondsTypeEENSt8optionalI15CacheSaltIDTypeEENSt8optionalI6IdTypeEE">tensorrt_llm::executor::Request::Request (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERK7Request">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERR7Request">[2]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestE9VecTokens10SizeType32bRK14SamplingConfigRK12OutputConfigRKNSt8optionalI10SizeType32EERKNSt8optionalI10SizeType32EENSt8optionalINSt6vectorI10SizeType32EEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalINSt4listI9VecTokensEEEENSt8optionalI6TensorEENSt8optionalI25ExternalDraftTokensConfigEENSt8optionalI18PromptTuningConfigEENSt8optionalI15MultimodalInputEENSt8optionalI6TensorEENSt8optionalI11MropeConfigEENSt8optionalI10LoraConfigEENSt8optionalI23LookaheadDecodingConfigEENSt8optionalI22KvCacheRetentionConfigEENSt8optionalINSt6stringEEENSt8optionalI19LogitsPostProcessorEENSt8optionalI9VecTokensEENSt8optionalI6IdTypeEEb12PriorityType11RequestTypeNSt8optionalI18ContextPhaseParamsEENSt8optionalI6TensorEENSt8optionalI10SizeType32EENSt8optionalI6TensorEE10SizeType32NSt8optionalI11EagleConfigEENSt8optionalI6TensorEENSt8optionalI20GuidedDecodingParamsEENSt8optionalI10SizeType32EENSt8optionalI16MillisecondsTypeEENSt8optionalI6IdTypeEENSt8optionalINSt6stringEEE">tensorrt_llm::executor::Request::Request (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERK7Request">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request7RequestERR7Request">[2]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request17setAllottedTimeMsE16MillisecondsType">tensorrt_llm::executor::Request::setAllottedTimeMs (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request11setBadWordsERKNSt4listI9VecTokensEE">tensorrt_llm::executor::Request::setBadWords (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request14setCacheSaltIDE15CacheSaltIDType">tensorrt_llm::executor::Request::setCacheSaltID (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request12setCacheSaltENSt8optionalINSt6stringEEE">tensorrt_llm::executor::Request::setCacheSalt (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor7Request11setClientIdE6IdType">tensorrt_llm::executor::Request::setClientId (C++ function)</a>
 </li>
@@ -12174,8 +12773,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I0_NSt11enable_if_tINSt10is_const_vI1UEEbEEEN12tensorrt_llm7runtime11BufferRange11BufferRangeERK7IBuffer">tensorrt_llm::runtime::BufferRange::BufferRange (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0_NSt11enable_if_tIXntNSt10is_const_vI1UEEEbEEEN12tensorrt_llm7runtime11BufferRange11BufferRangeER7IBuffer">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11BufferRange11BufferRangeEP1T9size_type">[2]</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15CacheSaltIDTypeE">tensorrt_llm::runtime::CacheSaltIDType (C++ type)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13canAccessPeerERK11WorldConfig">tensorrt_llm::runtime::canAccessPeer (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I00EN12tensorrt_llm7runtime16constPointerCastENSt10shared_ptrINSt14remove_const_tI1TEEEERRNSt10unique_ptrI1T1DEE">tensorrt_llm::runtime::constPointerCast (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime16constPointerCastENSt10shared_ptrINSt14remove_const_tI1TEEEERKNSt10shared_ptrI1TEE">[1]</a>
@@ -12498,10 +13095,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState24getCacheIndirectionInputEv">tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionInput (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv">tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionOutput (C++ function)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState25getCacheIndirectionOutputEv">tensorrt_llm::runtime::decoder::DecoderState::getCacheIndirectionOutput (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState14getCumLogProbsE10SizeType32">tensorrt_llm::runtime::decoder::DecoderState::getCumLogProbs (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState14getCumLogProbsEv">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getEagleBuffersEv">tensorrt_llm::runtime::decoder::DecoderState::getEagleBuffers (C++ function)</a>
@@ -14914,10 +15511,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.threshold_scale_factor">threshold_scale_factor (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.threshold_scale_factor_decode">threshold_scale_factor_decode (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig property)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.threshold_scale_factor_prefill">threshold_scale_factor_prefill (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig property)</a>
-</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PrometheusMetricsConfig.time_per_output_token_buckets">time_per_output_token_buckets (tensorrt_llm.llmapi.PrometheusMetricsConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PrometheusMetricsConfig.time_to_first_token_buckets">time_to_first_token_buckets (tensorrt_llm.llmapi.PrometheusMetricsConfig attribute)</a>
@@ -14940,9 +15533,11 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.to_bytes">to_bytes() (tensorrt_llm.llmapi.DisaggScheduleStyle method)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMConfig.to_dict">to_dict() (tensorrt_llm.models.ChatGLMConfig method)</a>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.to_dict">to_dict() (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats method)</a>
 
       <ul>
+        <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.ChatGLMConfig.to_dict">(tensorrt_llm.models.ChatGLMConfig method)</a>
+</li>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.CogVLMConfig.to_dict">(tensorrt_llm.models.CogVLMConfig method)</a>
 </li>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.DbrxConfig.to_dict">(tensorrt_llm.models.DbrxConfig method)</a>
@@ -14962,12 +15557,34 @@ window.runMermaid = runMermaid;</script>
         <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.to_dict">(tensorrt_llm.models.PretrainedConfig method)</a>
 </li>
       </ul></li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer.to_dot">to_dot() (in module tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.to_json_file">to_json_file() (tensorrt_llm.models.PretrainedConfig method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedConfig.to_layer_quant_config">to_layer_quant_config() (tensorrt_llm.models.PretrainedConfig method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.to_legacy_setting">to_legacy_setting() (tensorrt_llm.plugin.PluginConfig method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.to_sparse_metadata_params">to_sparse_metadata_params() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.to_sparse_metadata_params">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.to_sparse_metadata_params">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.to_sparse_metadata_params">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
+</li>
+      </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.to_sparse_params">to_sparse_params() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.to_sparse_params">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.to_sparse_params">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.to_sparse_params">(tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig method)</a>
+</li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.LabelEmbedding.token_drop">token_drop() (tensorrt_llm.layers.embedding.LabelEmbedding method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig.token_end">token_end (tensorrt_llm.llmapi.KvCacheRetentionConfig.TokenRangeRetentionConfig property)</a>
@@ -15098,6 +15715,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.Config">TorchLlmArgs.Config (class in tensorrt_llm.llmapi)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.MemStats.tot">tot (tensorrt_llm._torch.auto_deploy.transform.interface.MemStats attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.Linear.tp_split_dim">tp_split_dim() (tensorrt_llm.layers.linear.Linear class method)</a>
 
       <ul>
@@ -15109,6 +15728,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.transceiver_runtime">transceiver_runtime (tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheRetentionConfig.transfer_mode">transfer_mode (tensorrt_llm.llmapi.KvCacheRetentionConfig property)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformError">TransformError</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.TransformRegistry">TransformRegistry (class in tensorrt_llm._torch.auto_deploy.transform.interface)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.translate">translate() (tensorrt_llm.llmapi.BatchingType method)</a>
 
@@ -15920,8 +16543,6 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-config">--extra_llm_api_options</a>
 </li>
-        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-visual_gen_args">--extra_visual_gen_options</a>
-</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">--fail_fast_on_attention_window_too_large</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">--free_gpu_memory_fraction</a>
@@ -16077,6 +16698,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.LookaheadDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.update_forward_refs">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.update_forward_refs">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
@@ -16290,6 +16913,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.validate">(tensorrt_llm.llmapi.MedusaDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig.validate">(tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.validate">(tensorrt_llm.llmapi.MoeConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.validate">(tensorrt_llm.llmapi.MTPDecodingConfig class method)</a>
@@ -16342,6 +16967,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.validate_capture_num_tokens">validate_capture_num_tokens() (tensorrt_llm.llmapi.TorchCompileConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">validate_checkpoint_format() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_cross_kv_cache_fraction">validate_cross_kv_cache_fraction() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_cute_dsl_bf16">validate_cute_dsl_bf16() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
@@ -16543,6 +17170,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_speculative_model">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.validate_target_sparsity">validate_target_sparsity() (tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig class method)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.GemmaConfig.VERBATIM">VERBATIM (tensorrt_llm.models.GemmaConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.video_preprocess">video_preprocess() (tensorrt_llm.runtime.MultimodalModelRunner method)</a>
@@ -16559,7 +17188,11 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.visual_engine_dir">visual_engine_dir (tensorrt_llm.runtime.MultimodalModelRunner property)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.VISUALIZE">VISUALIZE (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.visualize_network">visualize_network (tensorrt_llm.llmapi.BuildConfig attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/visualize.html#tensorrt_llm._torch.auto_deploy.transform.library.visualization.VisualizeNamespace">VisualizeNamespace (class in tensorrt_llm._torch.auto_deploy.transform.library.visualization)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.vocab_size">vocab_size (tensorrt_llm.runtime.GenerationSession property)</a>
 
@@ -16617,11 +17250,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN">W8A8_SQ_PER_TENSOR_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulerConfig.waiting_queue_policy">waiting_queue_policy (tensorrt_llm.llmapi.SchedulerConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.warn_on_unstable_feature_usage">warn_on_unstable_feature_usage() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.Stages.WEIGHT_LOAD">WEIGHT_LOAD (tensorrt_llm._torch.auto_deploy.transform.interface.Stages attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.weight_loader">weight_loader() (tensorrt_llm.layers.attention.DeepseekV2Attention method)</a>
 
@@ -16647,7 +17282,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestError.with_traceback">with_traceback() (tensorrt_llm.llmapi.RequestError method)</a>
 </li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.with_transform_logging">with_transform_logging() (in module tensorrt_llm._torch.auto_deploy.transform.interface)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.workspace">workspace (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
+</li>
+      <li><a href="features/auto_deploy/transforms/core.html#tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig.world_size">world_size (tensorrt_llm._torch.auto_deploy.transform.interface.SharedConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.wrapped_property">wrapped_property (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 
@@ -16725,8 +17364,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -16798,9 +17437,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       

@@ -1,0 +1,1990 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>tensorrt_llm._torch.auto_deploy.transform.library.kvcache &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../../../../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../../../../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../../../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+
+
+
+    <script src="../../../../../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../../../../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../../../../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../../../../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = `pre.mermaid {
+    /* Same as .mermaid-container > pre */
+    display: block;
+    width: 100%;
+}
+
+pre.mermaid > svg {
+    /* Same as .mermaid-container > pre > svg */
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}`;
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = `.mermaid-container {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+}
+
+.mermaid-container > pre {
+    display: block;
+    width: 100%;
+}
+
+.mermaid-container > pre > svg {
+    height: 500px;
+    width: 100%;
+    max-width: 100% !important;
+}
+
+.mermaid-fullscreen-btn {
+    width: 28px;
+    height: 28px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0;
+    color: #333;
+}
+
+.mermaid-fullscreen-btn:hover {
+    opacity: 100% !important;
+    background: rgba(255, 255, 255, 1);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-btn.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-btn.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal {
+    display: none;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 95vw;
+    height: 100vh;
+    background: rgba(255, 255, 255, 0.98);
+    z-index: 9999;
+    padding: 20px;
+    overflow: auto;
+}
+
+.mermaid-fullscreen-modal.dark-theme {
+    background: rgba(0, 0, 0, 0.98);
+}
+
+.mermaid-fullscreen-modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen {
+    position: relative;
+    width: 95vw;
+    height: 90vh;
+    max-width: 95vw;
+    max-height: 90vh;
+    background: white;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen.dark-theme {
+    background: #1a1a1a;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+}
+
+.mermaid-container-fullscreen pre.mermaid {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mermaid-container-fullscreen .mermaid svg {
+    height: 100% !important;
+    width: 100% !important;
+    cursor: grab;
+}
+
+.mermaid-fullscreen-close {
+    position: fixed !important;
+    top: 20px !important;
+    right: 20px !important;
+    width: 40px;
+    height: 40px;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.2);
+    border-radius: 50%;
+    cursor: pointer;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s;
+    font-size: 24px;
+    line-height: 1;
+    color: #333;
+}
+
+.mermaid-fullscreen-close:hover {
+    background: white;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+    transform: scale(1.1);
+}
+
+.mermaid-fullscreen-close.dark-theme {
+    background: rgba(50, 50, 50, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+}
+
+.mermaid-fullscreen-close.dark-theme:hover {
+    background: rgba(60, 60, 60, 1);
+    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
+    display: none !important;
+}`;
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        all_mermaids.forEach((el) => {
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+        await mermaid.run();
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+
+    if ("False" === "True") {
+        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("");
+            if(all_mermaids.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else if(svgs.size() !== mermaids_to_add_zoom) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            } else {
+                svgs.each(function() {
+                    var svg = d3.select(this);
+                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+                    var inner = svg.select("g");
+                    var zoom = d3.zoom().on("zoom", function(event) {
+                        inner.attr("transform", event.transform);
+                    });
+                    svg.call(zoom);
+                });
+            }
+        }
+    } else if(all_mermaids.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if ("True" !== "True") return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    const closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.classList.contains('active')) {
+            closeModal();
+        }
+    });
+
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = '⛶';
+        fullscreenBtn.style.opacity = '50%';
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scroll, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.sdisplay = 'block';
+
+                if ("False" === "True") {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+const load = async () => {
+    initStyles();
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...JSON.parse(
+                    `{"startOnLoad": false}`
+                ),
+                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...JSON.parse(
+        `{"startOnLoad": false}`
+    ),
+    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/_torch/auto_deploy/transform/library/kvcache';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../../../../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../../../search.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc19" />
+  
+    
+    <script src="../../../../../../_static/searchtools.js"></script>
+    <script src="../../../../../../_static/language_data.js"></script>
+    <script src="../../../../../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../../../../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../../../../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../../../../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../../../../../index.html" class="nav-link">Module code</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">tensorrt_llm._torch.auto_deploy.transform.library.kvcache</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for tensorrt_llm._torch.auto_deploy.transform.library.kvcache</h1><div class="highlight"><pre>
+<span></span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);</span>
+<span class="c1"># you may not use this file except in compliance with the License.</span>
+<span class="c1"># You may obtain a copy of the License at</span>
+<span class="c1">#</span>
+<span class="c1"># http://www.apache.org/licenses/LICENSE-2.0</span>
+<span class="c1">#</span>
+<span class="c1"># Unless required by applicable law or agreed to in writing, software</span>
+<span class="c1"># distributed under the License is distributed on an &quot;AS IS&quot; BASIS,</span>
+<span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
+<span class="c1"># See the License for the specific language governing permissions and</span>
+<span class="c1"># limitations under the License.</span>
+
+
+<span class="sd">&quot;&quot;&quot;Graph transformation to automatically add kv cache into fused MHA op.</span>
+
+<span class="sd">The transform runs in two passes so that KV grouping is driven by a single</span>
+<span class="sd">source of truth — ``KVPagedResourceHandler.__eq__``:</span>
+
+<span class="sd">    Pass 1: Walk each source attention node, ask the backend descriptor for the</span>
+<span class="sd">    KV handler via ``get_cache_initializers``, and assign a ``group_idx`` by</span>
+<span class="sd">    comparing the handler against previously-seen handlers (`_find_or_add_group`</span>
+<span class="sd">    semantics).  Same equivalence class → same group.  Because the handler&#39;s</span>
+<span class="sd">    equality includes ``sliding_window``, same-head-dim layers with different</span>
+<span class="sd">    windows automatically land in different groups.</span>
+
+<span class="sd">    Pass 2: For multi-group models, publish the per-group window sizes to the</span>
+<span class="sd">    interface (``set_kv_groups``) and to SequenceInfo</span>
+<span class="sd">    (``register_window_groups``), allocate per-group metadata placeholders for</span>
+<span class="sd">    groups ``1..N-1``, and insert cached attention ops with their layer&#39;s</span>
+<span class="sd">    group&#39;s metadata nodes.</span>
+
+<span class="sd">After the transform, ``group_idx == pool_idx`` holds everywhere: the executor</span>
+<span class="sd">reads per-pool windows from ``cache_seq_interface.kv_group_windows`` and</span>
+<span class="sd">issues per-window queries (``get_cache_indices(request, window_size=W)``)</span>
+<span class="sd">against the unified ``KVCacheManager``; the C++ side routes each call to the</span>
+<span class="sd">correct pool via its ``mLayerToWindowSize`` map.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">inspect</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">operator</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Type</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">Field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">torch.fx</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">Node</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">...custom_ops.attention_interface</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">AttentionDescriptor</span><span class="p">,</span>
+    <span class="n">AttentionRegistry</span><span class="p">,</span>
+    <span class="n">Constant</span><span class="p">,</span>
+    <span class="n">KVPagedResourceHandler</span><span class="p">,</span>
+    <span class="n">PrepareMetadataCallable</span><span class="p">,</span>
+    <span class="n">ResourceHandler</span><span class="p">,</span>
+    <span class="n">SpeculativeOnly</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...custom_ops.semantic_mask_registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">SemanticMaskRegistry</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...models.factory</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelFactory</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...shim.interface</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedSequenceInterface</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...utils._graph</span><span class="w"> </span><span class="kn">import</span> <span class="n">add_graph_input</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...utils.cuda_mem_tracker</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_mem_info</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...utils.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">ad_logger</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">...utils.node_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">extract_op_args</span><span class="p">,</span> <span class="n">get_op_schema</span><span class="p">,</span> <span class="n">is_op</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..interface</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">BaseTransform</span><span class="p">,</span>
+    <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="n">TransformConfig</span><span class="p">,</span>
+    <span class="n">TransformInfo</span><span class="p">,</span>
+    <span class="n">TransformRegistry</span><span class="p">,</span>
+<span class="p">)</span>
+
+
+<div class="viewcode-block" id="InsertCachedAttentionConfig">
+<a class="viewcode-back" href="../../../../../../features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedAttentionConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">InsertCachedAttentionConfig</span><span class="p">(</span><span class="n">TransformConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the insert cached attention transform.&quot;&quot;&quot;</span>
+
+    <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The attention backend to use.&quot;</span><span class="p">)</span></div>
+
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_InsertCachedOperator</span><span class="p">(</span><span class="n">BaseTransform</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A generic base transform to insert cached operators into the graph module.&quot;&quot;&quot;</span>
+
+    <span class="n">config</span><span class="p">:</span> <span class="n">InsertCachedAttentionConfig</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_class</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Type</span><span class="p">[</span><span class="n">TransformConfig</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="n">InsertCachedAttentionConfig</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">attn_descriptor</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Type</span><span class="p">[</span><span class="n">AttentionDescriptor</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="n">AttentionRegistry</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_process_metadata_std</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Process the standard metadata nodes.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">arg_name</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">arg_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_standard_metadata_args</span><span class="p">()</span>
+        <span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_process_semantic_mask</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">meta_nodes_std</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
+        <span class="n">attn_node</span><span class="p">:</span> <span class="n">Node</span><span class="p">,</span>
+        <span class="n">semantic_mask_cache</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">Node</span><span class="p">,</span> <span class="n">Node</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Node</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Lower a semantic attn_mask node into a backend-prepared cached mask node.&quot;&quot;&quot;</span>
+        <span class="c1"># Skip ops that don&#39;t have an attn_mask argument (e.g., SSM, gated delta rule)</span>
+        <span class="n">schema</span> <span class="o">=</span> <span class="n">get_op_schema</span><span class="p">(</span><span class="n">attn_node</span><span class="o">.</span><span class="n">target</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;attn_mask&quot;</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">schema</span><span class="o">.</span><span class="n">arguments</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">attn_mask</span> <span class="o">=</span> <span class="n">extract_op_args</span><span class="p">(</span><span class="n">attn_node</span><span class="p">,</span> <span class="s2">&quot;attn_mask&quot;</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">source_semantic_op</span> <span class="o">=</span> <span class="n">SemanticMaskRegistry</span><span class="o">.</span><span class="n">get_source_op</span><span class="p">(</span><span class="n">attn_mask</span><span class="p">)</span>
+        <span class="n">spec</span> <span class="o">=</span> <span class="n">SemanticMaskRegistry</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">attn_mask</span><span class="p">,</span> <span class="n">backend</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">spec</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">source_semantic_op</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">supported_backends</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+                    <span class="n">SemanticMaskRegistry</span><span class="o">.</span><span class="n">get_supported_backends</span><span class="p">(</span><span class="n">attn_mask</span><span class="p">)</span>
+                <span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Cached attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2"> does not support lowering semantic &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;mask op </span><span class="si">{</span><span class="n">source_semantic_op</span><span class="si">!s}</span><span class="s2">. Supported backends: </span><span class="si">{</span><span class="n">supported_backends</span><span class="si">}</span><span class="s2">.&quot;</span>
+                <span class="p">)</span>
+            <span class="k">return</span> <span class="n">attn_mask</span>
+
+        <span class="k">if</span> <span class="n">attn_mask</span> <span class="ow">in</span> <span class="n">semantic_mask_cache</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">semantic_mask_cache</span><span class="p">[</span><span class="n">attn_mask</span><span class="p">]</span>
+
+        <span class="n">std_meta_by_name</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+            <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_standard_metadata_args</span><span class="p">(),</span> <span class="n">meta_nodes_std</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="p">)</span>
+        <span class="n">prep_args</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">arg</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">prepare_op</span><span class="o">.</span><span class="n">_schema</span><span class="o">.</span><span class="n">arguments</span><span class="p">:</span>
+            <span class="n">input_name</span> <span class="o">=</span> <span class="n">arg</span><span class="o">.</span><span class="n">name</span>
+            <span class="k">if</span> <span class="n">input_name</span> <span class="ow">in</span> <span class="n">std_meta_by_name</span><span class="p">:</span>
+                <span class="n">prep_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">std_meta_by_name</span><span class="p">[</span><span class="n">input_name</span><span class="p">])</span>
+            <span class="k">elif</span> <span class="n">input_name</span> <span class="ow">in</span> <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">available_args</span> <span class="ow">or</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">find_nodes</span><span class="p">(</span>
+                <span class="n">op</span><span class="o">=</span><span class="s2">&quot;placeholder&quot;</span><span class="p">,</span> <span class="n">target</span><span class="o">=</span><span class="n">input_name</span>
+            <span class="p">):</span>
+                <span class="n">prep_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">input_name</span><span class="p">))</span>
+            <span class="k">elif</span> <span class="n">arg</span><span class="o">.</span><span class="n">has_default_value</span><span class="p">():</span>
+                <span class="n">prep_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">arg</span><span class="o">.</span><span class="n">default_value</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Semantic mask prep op expects unavailable input </span><span class="si">{</span><span class="n">input_name</span><span class="si">!r}</span><span class="s2"> for &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;backend=</span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">.&quot;</span>
+                <span class="p">)</span>
+
+        <span class="n">node_last_input</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">find_nodes</span><span class="p">(</span><span class="n">op</span><span class="o">=</span><span class="s2">&quot;placeholder&quot;</span><span class="p">,</span> <span class="n">sort</span><span class="o">=</span><span class="kc">True</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">with</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">node_last_input</span><span class="o">.</span><span class="n">next</span><span class="p">):</span>
+            <span class="n">ret_node</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">spec</span><span class="o">.</span><span class="n">prepare_op</span><span class="p">,</span>
+                <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="o">*</span><span class="n">prep_args</span><span class="p">,</span> <span class="o">*</span><span class="n">spec</span><span class="o">.</span><span class="n">const_args</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">num_outputs</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="n">prepared_mask</span> <span class="o">=</span> <span class="n">ret_node</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">prepared_mask</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span><span class="n">operator</span><span class="o">.</span><span class="n">getitem</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">ret_node</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+
+        <span class="n">semantic_mask_cache</span><span class="p">[</span><span class="n">attn_mask</span><span class="p">]</span> <span class="o">=</span> <span class="n">prepared_mask</span>
+        <span class="k">return</span> <span class="n">prepared_mask</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_insert_extra_metadata_op</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
+        <span class="n">prep_meta_op</span><span class="p">:</span> <span class="n">PrepareMetadataCallable</span><span class="p">,</span>
+        <span class="n">inputs_for_prep_meta</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
+        <span class="n">const_args</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Constant</span><span class="p">],</span>
+        <span class="n">num_meta_out</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">]:</span>
+        <span class="c1"># add the computed extra metadata nodes to the graph and add to meta for cached attention op</span>
+        <span class="n">meta_nodes_extra</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">node_last_input</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">find_nodes</span><span class="p">(</span><span class="n">op</span><span class="o">=</span><span class="s2">&quot;placeholder&quot;</span><span class="p">,</span> <span class="n">sort</span><span class="o">=</span><span class="kc">True</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">with</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">node_last_input</span><span class="o">.</span><span class="n">next</span><span class="p">):</span>
+            <span class="n">ret_node</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">prep_meta_op</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="o">*</span><span class="n">inputs_for_prep_meta</span><span class="p">,</span> <span class="o">*</span><span class="n">const_args</span><span class="p">)</span>
+            <span class="p">)</span>
+            <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_meta_out</span><span class="p">):</span>
+                <span class="n">meta_extra_node</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span><span class="n">operator</span><span class="o">.</span><span class="n">getitem</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">ret_node</span><span class="p">,</span> <span class="n">idx</span><span class="p">))</span>
+                <span class="n">meta_nodes_extra</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">meta_extra_node</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">meta_nodes_extra</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_process_metadata_extra</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span> <span class="n">any_source_attn_node</span><span class="p">:</span> <span class="n">Node</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Process the get_metadata function into an op and return node references.&quot;&quot;&quot;</span>
+        <span class="c1"># get the metadata op for extra metadata and number of return values</span>
+        <span class="n">prep_meta_op</span><span class="p">,</span> <span class="n">num_meta_out</span><span class="p">,</span> <span class="n">const_args</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_prepare_extra_metadata_info</span><span class="p">(</span><span class="n">any_source_attn_node</span><span class="p">)</span>
+        <span class="p">)</span>
+
+        <span class="c1"># if there is no extra metadata op or no return values, we can return early</span>
+        <span class="k">if</span> <span class="n">prep_meta_op</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">num_meta_out</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[]</span>
+
+        <span class="c1"># check what inputs the extra metadata op expects</span>
+        <span class="n">inputs_for_prep_meta</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">arg</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">arg</span> <span class="ow">in</span> <span class="n">get_op_schema</span><span class="p">(</span><span class="n">prep_meta_op</span><span class="p">)</span><span class="o">.</span><span class="n">arguments</span>
+            <span class="k">if</span> <span class="n">arg</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">available_args</span>
+        <span class="p">]</span>
+
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_insert_extra_metadata_op</span><span class="p">(</span>
+            <span class="n">gm</span><span class="p">,</span> <span class="n">prep_meta_op</span><span class="p">,</span> <span class="n">inputs_for_prep_meta</span><span class="p">,</span> <span class="n">const_args</span><span class="p">,</span> <span class="n">num_meta_out</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_process_metadata_host</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">handler_groups</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">KVPagedResourceHandler</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Process the host-side prepare metadata function.</span>
+
+<span class="sd">        When ``handler_groups`` has 2+ entries and the backend&#39;s host-prep</span>
+<span class="sd">        declares ``pool_window_left``, registers the host-prep once per pool:</span>
+<span class="sd">        pool 0 uses unsuffixed arg names, pools 1..N-1 use ``_g{i}`` /</span>
+<span class="sd">        ``_g{i}_host`` suffixed names plus a closure that remaps those</span>
+<span class="sd">        suffixed kwargs back to the function&#39;s canonical parameter names and</span>
+<span class="sd">        binds the pool&#39;s ``pool_window_left``.  Each invocation only refreshes</span>
+<span class="sd">        cached wrappers belonging to its pool.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">prep_meta_host_op</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_host_prepare_metadata_function</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">prep_meta_host_op</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+
+        <span class="n">sig</span> <span class="o">=</span> <span class="n">inspect</span><span class="o">.</span><span class="n">signature</span><span class="p">(</span><span class="n">prep_meta_host_op</span><span class="p">)</span>
+        <span class="n">sig_arg_names</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">sig</span><span class="o">.</span><span class="n">parameters</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+
+        <span class="c1"># Backend opts in to per-pool dispatch by declaring `pool_window_left`.</span>
+        <span class="n">backend_supports_per_pool</span> <span class="o">=</span> <span class="s2">&quot;pool_window_left&quot;</span> <span class="ow">in</span> <span class="n">sig</span><span class="o">.</span><span class="n">parameters</span>
+        <span class="n">num_groups</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">handler_groups</span><span class="p">)</span> <span class="k">if</span> <span class="n">handler_groups</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">backend_supports_per_pool</span> <span class="ow">or</span> <span class="n">num_groups</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="c1"># Register the host-side prepare metadata function with SequenceInfo.</span>
+            <span class="c1"># Arg availability is validated by require_copy() inside register_host_prepare.</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">register_host_prepare_for_attention_forward</span><span class="p">(</span>
+                <span class="n">prep_meta_host_op</span><span class="p">,</span>
+                <span class="p">[</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">sig_arg_names</span> <span class="k">if</span> <span class="n">name</span> <span class="o">!=</span> <span class="s2">&quot;pool_window_left&quot;</span><span class="p">],</span>
+            <span class="p">)</span>
+            <span class="k">return</span>
+
+        <span class="c1"># VSWA: register one host-prep per pool with per-pool args + bound</span>
+        <span class="c1"># pool_window_left.  Mirrors the per-group prepare_extra_metadata wiring</span>
+        <span class="c1"># below (vswa_swappable_bases) to keep the two routing paths consistent.</span>
+        <span class="c1">#</span>
+        <span class="c1"># The framework&#39;s run_host_prepare_for_attention_forward calls each</span>
+        <span class="c1"># registered function as ``host_function(**{arg: get_arg(arg)})`` — i.e.</span>
+        <span class="c1"># the registered arg names become the *kwarg keys* at call time.  For</span>
+        <span class="c1"># pool &gt; 0 the source tensors live under suffixed names</span>
+        <span class="c1"># (``cache_loc_g1_host`` etc.) but the underlying host-prep function</span>
+        <span class="c1"># only declares the unsuffixed parameter names.  Each per-pool</span>
+        <span class="c1"># registration therefore wraps the host-prep in a closure that remaps</span>
+        <span class="c1"># suffixed kwargs back to the function&#39;s canonical parameter names</span>
+        <span class="c1"># before delegating, and binds this pool&#39;s ``pool_window_left``.</span>
+        <span class="n">swappable_bases</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;cache_loc&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;cu_num_pages&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;last_page_len&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;seq_len_with_cache&quot;</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="n">host_suffix</span> <span class="o">=</span> <span class="s2">&quot;_host&quot;</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">_make_pool_host_prep</span><span class="p">(</span><span class="n">canonical_op</span><span class="p">,</span> <span class="n">pool_window_left</span><span class="p">,</span> <span class="n">kwarg_remap</span><span class="p">):</span>
+<span class="w">            </span><span class="sd">&quot;&quot;&quot;Closure: rename suffixed kwargs → canonical params, bind pool_window_left.&quot;&quot;&quot;</span>
+
+            <span class="k">def</span><span class="w"> </span><span class="nf">_invoke</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+                <span class="n">canonical</span> <span class="o">=</span> <span class="p">{</span><span class="n">kwarg_remap</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">k</span><span class="p">):</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+                <span class="k">return</span> <span class="n">canonical_op</span><span class="p">(</span><span class="o">**</span><span class="n">canonical</span><span class="p">,</span> <span class="n">pool_window_left</span><span class="o">=</span><span class="n">pool_window_left</span><span class="p">)</span>
+
+            <span class="k">return</span> <span class="n">_invoke</span>
+
+        <span class="k">for</span> <span class="n">gi</span><span class="p">,</span> <span class="n">handler</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">handler_groups</span><span class="p">):</span>
+            <span class="n">per_group_args</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">kwarg_remap</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># suffixed → canonical</span>
+            <span class="k">for</span> <span class="n">arg_name</span> <span class="ow">in</span> <span class="n">sig_arg_names</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">arg_name</span> <span class="o">==</span> <span class="s2">&quot;pool_window_left&quot;</span><span class="p">:</span>
+                    <span class="k">continue</span>  <span class="c1"># bound by closure</span>
+                <span class="k">if</span> <span class="n">gi</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="n">per_group_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">arg_name</span><span class="p">)</span>
+                    <span class="k">continue</span>
+                <span class="n">base</span> <span class="o">=</span> <span class="n">arg_name</span><span class="o">.</span><span class="n">removesuffix</span><span class="p">(</span><span class="n">host_suffix</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">base</span> <span class="ow">in</span> <span class="n">swappable_bases</span><span class="p">:</span>
+                    <span class="n">is_host</span> <span class="o">=</span> <span class="n">arg_name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="n">host_suffix</span><span class="p">)</span>
+                    <span class="n">suffixed</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base</span><span class="si">}</span><span class="s2">_g</span><span class="si">{</span><span class="n">gi</span><span class="si">}{</span><span class="n">host_suffix</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">is_host</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;&#39;</span><span class="si">}</span><span class="s2">&quot;</span>
+                    <span class="n">per_group_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">suffixed</span><span class="p">)</span>
+                    <span class="n">kwarg_remap</span><span class="p">[</span><span class="n">suffixed</span><span class="p">]</span> <span class="o">=</span> <span class="n">arg_name</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">per_group_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">arg_name</span><span class="p">)</span>
+
+            <span class="c1"># FlashInfer&#39;s _to_flashinfer_window_left convention:</span>
+            <span class="c1"># window_left = sliding_window - 1 for SWA, -1 for full attention.</span>
+            <span class="n">sw</span> <span class="o">=</span> <span class="n">handler</span><span class="o">.</span><span class="n">sliding_window</span>
+            <span class="n">pool_window_left</span> <span class="o">=</span> <span class="n">sw</span> <span class="o">-</span> <span class="mi">1</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sw</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="n">sw</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="o">-</span><span class="mi">1</span>
+
+            <span class="n">bound</span> <span class="o">=</span> <span class="n">_make_pool_host_prep</span><span class="p">(</span><span class="n">prep_meta_host_op</span><span class="p">,</span> <span class="n">pool_window_left</span><span class="p">,</span> <span class="n">kwarg_remap</span><span class="p">)</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">register_host_prepare_for_attention_forward</span><span class="p">(</span><span class="n">bound</span><span class="p">,</span> <span class="n">per_group_args</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_process_cache_node</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">cache_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Node</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Process the cache nodes by inserting a cached attention replacement op.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">add_graph_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cache_name</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_insert_cached_attn_node</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
+        <span class="n">attn_node</span><span class="p">:</span> <span class="n">Node</span><span class="p">,</span>
+        <span class="n">cached_attn_op</span><span class="p">,</span>
+        <span class="n">qkv_nodes</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
+        <span class="n">meta_nodes_std</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
+        <span class="n">meta_nodes_extra</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
+        <span class="n">cache_nodes</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
+        <span class="n">constants</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Constant</span><span class="p">],</span>
+        <span class="n">prepared_attn_mask</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Node</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Insert a cached attention node into the graph.&quot;&quot;&quot;</span>
+        <span class="k">with</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">attn_node</span><span class="p">):</span>
+            <span class="n">args</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="o">*</span><span class="n">qkv_nodes</span><span class="p">,</span>
+                <span class="o">*</span><span class="n">meta_nodes_std</span><span class="p">,</span>
+                <span class="o">*</span><span class="n">meta_nodes_extra</span><span class="p">,</span>
+                <span class="o">*</span><span class="n">cache_nodes</span><span class="p">,</span>
+                <span class="o">*</span><span class="n">constants</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">prepared_attn_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">args</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">prepared_attn_mask</span><span class="p">)</span>
+            <span class="n">cached_attn_node</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span><span class="n">cached_attn_op</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="n">args</span><span class="p">)</span>
+        <span class="n">attn_node</span><span class="o">.</span><span class="n">replace_all_uses_with</span><span class="p">(</span><span class="n">cached_attn_node</span><span class="p">)</span>
+        <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">erase_node</span><span class="p">(</span><span class="n">attn_node</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_suppress_spec_handlers_maybe</span><span class="p">(</span>
+        <span class="n">resource_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">ResourceHandler</span><span class="p">],</span> <span class="n">spec_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">ResourceHandler</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Drop a speculative-only resource to the None sentinel when spec decoding is off.</span>
+
+<span class="sd">        Handlers carrying the ``SpeculativeOnly`` trait are read only on the speculative extend</span>
+<span class="sd">        path and are never bound by the cache manager without ``spec_config``; registering them</span>
+<span class="sd">        would leak an unmanaged per-layer allocation. Returns ``None`` for such handlers when</span>
+<span class="sd">        ``spec_config`` is None, otherwise returns ``resource_handler`` unchanged (``isinstance``</span>
+<span class="sd">        is None-safe, so the existing None sentinel passes through untouched).</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">spec_config</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">resource_handler</span><span class="p">,</span> <span class="n">SpeculativeOnly</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">resource_handler</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Replace uncached source attention node with corresponding cached attn node.&quot;&quot;&quot;</span>
+        <span class="n">attn_descriptor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span>
+
+        <span class="c1"># look for relevant source attention nodes</span>
+        <span class="n">source_op</span> <span class="o">=</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_source_attention_op</span><span class="p">()</span>
+        <span class="n">source_attn_nodes</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">nodes</span> <span class="k">if</span> <span class="n">is_op</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">source_op</span><span class="p">)]</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">source_attn_nodes</span><span class="p">:</span>
+            <span class="c1"># If there are no nodes for kv cache insertion found, return current graph</span>
+            <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">(</span>
+                <span class="n">skipped</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">is_clean</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">True</span>
+            <span class="p">)</span>
+
+        <span class="c1"># Record whether this backend&#39;s kernel applies the sliding-window mask</span>
+        <span class="c1"># itself (cyclic KV indexing, e.g. trtllm). The executor uses this to</span>
+        <span class="c1"># decide between passing the full per-window block table + global KV</span>
+        <span class="c1"># lengths (cyclic) and host-slicing to the live window (triton/flashinfer).</span>
+        <span class="n">cm</span><span class="o">.</span><span class="n">set_kernel_handles_cyclic_swa</span><span class="p">(</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">kernel_handles_cyclic_swa</span><span class="p">())</span>
+
+        <span class="c1"># get standard metadata nodes for all source attention nodes</span>
+        <span class="n">meta_nodes_std</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_process_metadata_std</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">)</span>
+
+        <span class="c1"># insert metadata computation and extract each argument as a node</span>
+        <span class="n">meta_nodes_extra</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_process_metadata_extra</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">source_attn_nodes</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+
+        <span class="c1"># Seed KvCacheConfig.max_attention_window from per-layer sliding_window</span>
+        <span class="c1"># annotations so the rest of the KV-cache config plumbing (e.g.</span>
+        <span class="c1"># downstream C++ validators that inspect the vector) sees the intended</span>
+        <span class="c1"># per-layer windows.  The per-group KVCacheManager pools are configured</span>
+        <span class="c1"># separately in _prepare_kv_cache_config, using each group&#39;s reference</span>
+        <span class="c1"># handler.</span>
+        <span class="n">per_layer_sliding_windows</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">attn_node</span> <span class="ow">in</span> <span class="n">source_attn_nodes</span><span class="p">:</span>
+            <span class="p">(</span><span class="n">sw</span><span class="p">,)</span> <span class="o">=</span> <span class="n">extract_op_args</span><span class="p">(</span><span class="n">attn_node</span><span class="p">,</span> <span class="s2">&quot;sliding_window&quot;</span><span class="p">)</span>
+            <span class="n">per_layer_sliding_windows</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sw</span><span class="p">)</span>
+
+        <span class="n">has_any_sliding_window</span> <span class="o">=</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="nb">isinstance</span><span class="p">(</span><span class="n">sw</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="n">sw</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">sw</span> <span class="ow">in</span> <span class="n">per_layer_sliding_windows</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">cm</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">max_attention_window</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">has_any_sliding_window</span><span class="p">:</span>
+            <span class="n">max_attention_window</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">sw</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sw</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="n">sw</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">max_seq_len</span>
+                <span class="k">for</span> <span class="n">sw</span> <span class="ow">in</span> <span class="n">per_layer_sliding_windows</span>
+            <span class="p">]</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">update_kv_cache_config</span><span class="p">(</span><span class="n">max_attention_window</span><span class="o">=</span><span class="n">max_attention_window</span><span class="p">)</span>
+
+        <span class="c1"># --- Pass 1: register resources and assign per-layer group_idx ---</span>
+        <span class="c1"># Group identity comes from KVPagedResourceHandler.__eq__ (which</span>
+        <span class="c1"># includes sliding_window).  A group IS a pool IS a metadata set.</span>
+        <span class="n">handler_groups</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">KVPagedResourceHandler</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">per_layer_group_idx</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">group_idx_by_layer_idx</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+        <span class="n">num_cached_attn_replacements</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">cache_nodes_by_layer_idx</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">semantic_mask_cache</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">Node</span><span class="p">,</span> <span class="n">Node</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># Collect per-layer info for the second pass (node insertion).</span>
+        <span class="c1"># Tuple layout:</span>
+        <span class="c1">#   (attn_node, qkv, cache_in_nodes, constants, group_idx, prepared_mask)</span>
+        <span class="n">layer_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="k">for</span> <span class="n">attn_node</span> <span class="ow">in</span> <span class="n">source_attn_nodes</span><span class="p">:</span>
+            <span class="n">qkv</span> <span class="o">=</span> <span class="n">attn_node</span><span class="o">.</span><span class="n">args</span><span class="p">[:</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_num_qkv_args</span><span class="p">()]</span>
+            <span class="n">layer_idx</span> <span class="o">=</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_layer_idx</span><span class="p">(</span><span class="n">attn_node</span><span class="p">)</span>
+            <span class="n">shared_kv_source_layer_idx</span> <span class="o">=</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_shared_kv_source_layer_idx</span><span class="p">(</span><span class="n">attn_node</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">shared_kv_source_layer_idx</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">supports_shared_kv</span><span class="p">():</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;Backend &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="si">}</span><span class="s2">&#39; does not support shared-KV attention.&quot;</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                        <span class="s2">&quot;Shared-KV attention node is missing layer_idx metadata required for &quot;</span>
+                        <span class="s2">&quot;cache aliasing.&quot;</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="n">shared_kv_source_layer_idx</span> <span class="o">==</span> <span class="n">layer_idx</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Layer </span><span class="si">{</span><span class="n">layer_idx</span><span class="si">}</span><span class="s2"> cannot share its own KV cache.&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">shared_kv_source_layer_idx</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">cache_nodes_by_layer_idx</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;Missing shared-KV source layer </span><span class="si">{</span><span class="n">shared_kv_source_layer_idx</span><span class="si">}</span><span class="s2">.&quot;</span>
+                    <span class="p">)</span>
+                <span class="n">cache_in_nodes</span> <span class="o">=</span> <span class="n">cache_nodes_by_layer_idx</span><span class="p">[</span><span class="n">shared_kv_source_layer_idx</span><span class="p">]</span>
+                <span class="c1"># Shared-KV layers inherit their source layer&#39;s group</span>
+                <span class="n">group_idx</span> <span class="o">=</span> <span class="n">group_idx_by_layer_idx</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">shared_kv_source_layer_idx</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">cache_nodes_by_layer_idx</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;Duplicate KV cache owner detected for layer </span><span class="si">{</span><span class="n">layer_idx</span><span class="si">}</span><span class="s2">. &quot;</span>
+                        <span class="s2">&quot;Each non-shared attention layer must own exactly one cache.&quot;</span>
+                    <span class="p">)</span>
+                <span class="n">cache_in_nodes</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="n">group_idx</span> <span class="o">=</span> <span class="mi">0</span>
+                <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">resource_handler</span> <span class="ow">in</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_cache_initializers</span><span class="p">(</span>
+                    <span class="n">attn_node</span><span class="p">,</span> <span class="n">cm</span><span class="o">.</span><span class="n">kv_cache_config</span>
+                <span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="c1"># Speculative-only resources (intermediate SSM/conv state and replay</span>
+                    <span class="c1"># buffers) are never bound by the cache manager when spec decoding is off</span>
+                    <span class="c1"># (see CachedSequenceInterface._create_and_assign_state_views), so</span>
+                    <span class="c1"># allocating them would waste a full per-layer state buffer and OOM. Drop</span>
+                    <span class="c1"># them to the None sentinel instead of registering an unmanaged resource.</span>
+                    <span class="n">resource_handler</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_suppress_spec_handlers_maybe</span><span class="p">(</span>
+                        <span class="n">resource_handler</span><span class="p">,</span> <span class="n">cm</span><span class="o">.</span><span class="n">_spec_config</span>
+                    <span class="p">)</span>
+                    <span class="k">if</span> <span class="n">resource_handler</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="c1"># None sentinel: pass literal None positionally, no resource allocated.</span>
+                        <span class="n">cache_in_nodes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="c1"># A window that can&#39;t slide within max_seq_len is functionally</span>
+                        <span class="c1"># full attention; normalize it to 0 so the layer shares the</span>
+                        <span class="c1"># full-attention pool instead of forking a redundant</span>
+                        <span class="c1"># single-window pool.</span>
+                        <span class="k">if</span> <span class="p">(</span>
+                            <span class="nb">isinstance</span><span class="p">(</span><span class="n">resource_handler</span><span class="p">,</span> <span class="n">KVPagedResourceHandler</span><span class="p">)</span>
+                            <span class="ow">and</span> <span class="n">resource_handler</span><span class="o">.</span><span class="n">sliding_window</span> <span class="o">&gt;=</span> <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">max_seq_len</span>
+                        <span class="p">):</span>
+                            <span class="n">resource_handler</span><span class="o">.</span><span class="n">sliding_window</span> <span class="o">=</span> <span class="mi">0</span>
+                        <span class="n">resource_name</span> <span class="o">=</span> <span class="n">cm</span><span class="o">.</span><span class="n">add_resource</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">resource_handler</span><span class="p">)</span>
+                        <span class="n">node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_process_cache_node</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">resource_name</span><span class="p">)</span>
+                        <span class="n">cache_in_nodes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
+                        <span class="c1"># Determine group from handler equality</span>
+                        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">resource_handler</span><span class="p">,</span> <span class="n">KVPagedResourceHandler</span><span class="p">):</span>
+                            <span class="k">for</span> <span class="n">gi</span><span class="p">,</span> <span class="n">ref</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">handler_groups</span><span class="p">):</span>
+                                <span class="k">if</span> <span class="n">resource_handler</span> <span class="o">==</span> <span class="n">ref</span><span class="p">:</span>
+                                    <span class="n">group_idx</span> <span class="o">=</span> <span class="n">gi</span>
+                                    <span class="k">break</span>
+                            <span class="k">else</span><span class="p">:</span>
+                                <span class="n">group_idx</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">handler_groups</span><span class="p">)</span>
+                                <span class="n">handler_groups</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">resource_handler</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">layer_idx</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">cache_nodes_by_layer_idx</span><span class="p">[</span><span class="n">layer_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">cache_in_nodes</span>
+                    <span class="n">group_idx_by_layer_idx</span><span class="p">[</span><span class="n">layer_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">group_idx</span>
+
+            <span class="n">per_layer_group_idx</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">group_idx</span><span class="p">)</span>
+
+            <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">prepare_node_for_cache_insertion</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">attn_node</span><span class="p">)</span>
+
+            <span class="n">prepared_mask</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_process_semantic_mask</span><span class="p">(</span>
+                <span class="n">gm</span><span class="p">,</span>
+                <span class="n">cm</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
+                <span class="n">meta_nodes_std</span><span class="p">,</span>
+                <span class="n">attn_node</span><span class="p">,</span>
+                <span class="n">semantic_mask_cache</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">constants</span> <span class="o">=</span> <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_constants</span><span class="p">(</span><span class="n">attn_node</span><span class="p">)</span>
+
+            <span class="n">layer_infos</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="p">(</span><span class="n">attn_node</span><span class="p">,</span> <span class="n">qkv</span><span class="p">,</span> <span class="n">cache_in_nodes</span><span class="p">,</span> <span class="n">constants</span><span class="p">,</span> <span class="n">group_idx</span><span class="p">,</span> <span class="n">prepared_mask</span><span class="p">)</span>
+            <span class="p">)</span>
+
+        <span class="c1"># --- Group setup: register metadata groups and create graph placeholders ---</span>
+        <span class="c1"># Register every group (including the single-pool case) so downstream</span>
+        <span class="c1"># consumers see a consistent representation: num_pools == num_groups.</span>
+        <span class="c1"># Per-group graph placeholders are still only created for groups 1..N-1</span>
+        <span class="c1"># because group 0 reuses the legacy unsuffixed tensors.</span>
+        <span class="n">num_groups</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">handler_groups</span><span class="p">)</span>
+        <span class="n">is_multi_group</span> <span class="o">=</span> <span class="n">num_groups</span> <span class="o">&gt;=</span> <span class="mi">2</span>
+        <span class="n">vswa_group_nodes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">&quot;Node&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># Per-group extra-metadata: group 0 reuses the previously-built nodes;</span>
+        <span class="c1"># groups 1..N-1 get their own prepare-extra call wired to per-group</span>
+        <span class="c1"># swappable inputs.  This is required because some backends&#39; prepare-extra</span>
+        <span class="c1"># ops (e.g. Triton&#39;s, which consumes seq_len_with_cache) would otherwise</span>
+        <span class="c1"># produce group-0 outputs that silently feed every layer.</span>
+        <span class="n">meta_nodes_extra_by_group</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span><span class="mi">0</span><span class="p">:</span> <span class="n">meta_nodes_extra</span><span class="p">}</span>
+        <span class="n">host_suffix</span> <span class="o">=</span> <span class="s2">&quot;_host&quot;</span>
+
+        <span class="n">has_unmanaged_paged</span> <span class="o">=</span> <span class="n">num_groups</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="n">h</span><span class="o">.</span><span class="n">is_paged</span> <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">cm</span><span class="o">.</span><span class="n">_resource_lookup</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">num_groups</span> <span class="o">&gt;=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">group_windows</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">h</span><span class="o">.</span><span class="n">sliding_window</span> <span class="k">if</span> <span class="n">h</span><span class="o">.</span><span class="n">sliding_window</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">max_seq_len</span>
+                <span class="k">for</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">handler_groups</span>
+            <span class="p">]</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">register_window_groups</span><span class="p">(</span><span class="n">group_windows</span><span class="p">)</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">set_kv_groups</span><span class="p">(</span><span class="n">group_windows</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_process_metadata_host</span><span class="p">(</span><span class="n">cm</span><span class="p">,</span> <span class="n">handler_groups</span><span class="o">=</span><span class="n">handler_groups</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">has_unmanaged_paged</span><span class="p">:</span>
+            <span class="c1"># MLA-only (and any future paged-handler family that does not contribute</span>
+            <span class="c1"># to handler_groups): no KVPagedResourceHandler entries, but at least one</span>
+            <span class="c1"># paged cache still consumes cache_loc/cu_num_pages metadata. Register a</span>
+            <span class="c1"># single full-attention pool so ad_executor.py:740 stages those tensors</span>
+            <span class="c1"># instead of passing None to nest_sequences.</span>
+            <span class="c1"># TODO: unify paged-handler grouping (KV + MLA) under a shared abstraction</span>
+            <span class="c1"># so the predicate at line 361 covers all paged handlers naturally.</span>
+            <span class="n">group_windows</span> <span class="o">=</span> <span class="p">[</span><span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">]</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">register_window_groups</span><span class="p">(</span><span class="n">group_windows</span><span class="p">)</span>
+            <span class="n">cm</span><span class="o">.</span><span class="n">set_kv_groups</span><span class="p">(</span><span class="n">group_windows</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_process_metadata_host</span><span class="p">(</span><span class="n">cm</span><span class="p">,</span> <span class="n">handler_groups</span><span class="o">=</span><span class="p">[])</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># No paged caches at all (cache-less or state-only models like Mamba</span>
+            <span class="c1"># without attention). nest_sequences will correctly skip cache_loc</span>
+            <span class="c1"># staging because no kernel in the graph consumes it. Intentional no-op.</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                <span class="s2">&quot;kvcache transform: no paged KV resources registered; &quot;</span>
+                <span class="s2">&quot;cache_loc staging will be skipped. Expected for state-only or &quot;</span>
+                <span class="s2">&quot;cache-less models.&quot;</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_process_metadata_host</span><span class="p">(</span><span class="n">cm</span><span class="p">,</span> <span class="n">handler_groups</span><span class="o">=</span><span class="p">[])</span>
+
+        <span class="k">if</span> <span class="n">is_multi_group</span><span class="p">:</span>
+            <span class="c1"># Names that are routed per-group end-to-end.  seq_len_with_cache is</span>
+            <span class="c1"># in this set because under SWA front-eviction the live window&#39;s</span>
+            <span class="c1"># length diverges from the global (input_pos + seq_len); the kernel,</span>
+            <span class="c1"># the prepare-extra op, and the host prepare all need the</span>
+            <span class="c1"># window-capped value.</span>
+            <span class="n">vswa_swappable_bases</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;cache_loc&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;cu_num_pages&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;last_page_len&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;seq_len_with_cache&quot;</span><span class="p">,</span>
+            <span class="p">}</span>
+
+            <span class="c1"># Create per-group graph placeholders for groups 1..N-1</span>
+            <span class="n">std_arg_names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_standard_metadata_args</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">gi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_groups</span><span class="p">):</span>
+                <span class="n">vswa_group_nodes</span><span class="p">[</span><span class="n">gi</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+                <span class="k">for</span> <span class="n">arg_name</span> <span class="ow">in</span> <span class="n">std_arg_names</span><span class="p">:</span>
+                    <span class="n">base</span> <span class="o">=</span> <span class="n">arg_name</span><span class="o">.</span><span class="n">removesuffix</span><span class="p">(</span><span class="n">host_suffix</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">base</span> <span class="ow">in</span> <span class="n">vswa_swappable_bases</span><span class="p">:</span>
+                        <span class="n">is_host</span> <span class="o">=</span> <span class="n">arg_name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="n">host_suffix</span><span class="p">)</span>
+                        <span class="n">group_arg</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base</span><span class="si">}</span><span class="s2">_g</span><span class="si">{</span><span class="n">gi</span><span class="si">}{</span><span class="n">host_suffix</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">is_host</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;&#39;</span><span class="si">}</span><span class="s2">&quot;</span>
+                        <span class="n">vswa_group_nodes</span><span class="p">[</span><span class="n">gi</span><span class="p">][</span><span class="n">arg_name</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span>
+                            <span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">group_arg</span>
+                        <span class="p">)</span>
+
+            <span class="c1"># Per-group prepare-extra-metadata: re-invoke the op with this</span>
+            <span class="c1"># group&#39;s swappable inputs so each non-zero group&#39;s downstream</span>
+            <span class="c1"># consumers (e.g. update_paged_kv_cache write positions) reflect</span>
+            <span class="c1"># the window-capped view.  Skipped when the backend has no extra-op.</span>
+            <span class="n">prep_meta_op</span><span class="p">,</span> <span class="n">num_meta_out</span><span class="p">,</span> <span class="n">const_args_extra</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_prepare_extra_metadata_info</span><span class="p">(</span><span class="n">source_attn_nodes</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">prep_meta_op</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">num_meta_out</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">op_arg_names</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="n">arg</span><span class="o">.</span><span class="n">name</span>
+                    <span class="k">for</span> <span class="n">arg</span> <span class="ow">in</span> <span class="n">get_op_schema</span><span class="p">(</span><span class="n">prep_meta_op</span><span class="p">)</span><span class="o">.</span><span class="n">arguments</span>
+                    <span class="k">if</span> <span class="n">arg</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">available_args</span>
+                <span class="p">]</span>
+                <span class="k">for</span> <span class="n">gi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_groups</span><span class="p">):</span>
+                    <span class="n">group_inputs</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+                    <span class="k">for</span> <span class="n">arg_name</span> <span class="ow">in</span> <span class="n">op_arg_names</span><span class="p">:</span>
+                        <span class="n">base</span> <span class="o">=</span> <span class="n">arg_name</span><span class="o">.</span><span class="n">removesuffix</span><span class="p">(</span><span class="n">host_suffix</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">base</span> <span class="ow">in</span> <span class="n">vswa_swappable_bases</span><span class="p">:</span>
+                            <span class="n">is_host</span> <span class="o">=</span> <span class="n">arg_name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="n">host_suffix</span><span class="p">)</span>
+                            <span class="n">group_arg</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base</span><span class="si">}</span><span class="s2">_g</span><span class="si">{</span><span class="n">gi</span><span class="si">}{</span><span class="n">host_suffix</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">is_host</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;&#39;</span><span class="si">}</span><span class="s2">&quot;</span>
+                            <span class="n">group_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">group_arg</span><span class="p">))</span>
+                        <span class="k">else</span><span class="p">:</span>
+                            <span class="n">group_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">arg_name</span><span class="p">))</span>
+                    <span class="n">meta_nodes_extra_by_group</span><span class="p">[</span><span class="n">gi</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_insert_extra_metadata_op</span><span class="p">(</span>
+                        <span class="n">gm</span><span class="p">,</span> <span class="n">prep_meta_op</span><span class="p">,</span> <span class="n">group_inputs</span><span class="p">,</span> <span class="n">const_args_extra</span><span class="p">,</span> <span class="n">num_meta_out</span>
+                    <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># Backend has no extra-op: every group gets an empty list (which</span>
+                <span class="c1"># is what the original meta_nodes_extra would have been anyway).</span>
+                <span class="k">for</span> <span class="n">gi</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">num_groups</span><span class="p">):</span>
+                    <span class="n">meta_nodes_extra_by_group</span><span class="p">[</span><span class="n">gi</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="c1"># --- Pass 2: insert cached attention nodes with correct group metadata ---</span>
+        <span class="k">for</span> <span class="p">(</span>
+            <span class="n">attn_node</span><span class="p">,</span>
+            <span class="n">qkv</span><span class="p">,</span>
+            <span class="n">cache_in_nodes</span><span class="p">,</span>
+            <span class="n">constants</span><span class="p">,</span>
+            <span class="n">group_idx</span><span class="p">,</span>
+            <span class="n">prepared_mask</span><span class="p">,</span>
+        <span class="p">)</span> <span class="ow">in</span> <span class="n">layer_infos</span><span class="p">:</span>
+            <span class="n">layer_meta_nodes_std</span> <span class="o">=</span> <span class="n">meta_nodes_std</span>
+            <span class="k">if</span> <span class="n">is_multi_group</span> <span class="ow">and</span> <span class="n">group_idx</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">std_arg_names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_standard_metadata_args</span><span class="p">()</span>
+                <span class="n">layer_meta_nodes_std</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">meta_nodes_std</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">arg_pos</span><span class="p">,</span> <span class="n">arg_name</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">std_arg_names</span><span class="p">):</span>
+                    <span class="k">if</span> <span class="n">arg_name</span> <span class="ow">in</span> <span class="n">vswa_group_nodes</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">group_idx</span><span class="p">,</span> <span class="p">{}):</span>
+                        <span class="n">layer_meta_nodes_std</span><span class="p">[</span><span class="n">arg_pos</span><span class="p">]</span> <span class="o">=</span> <span class="n">vswa_group_nodes</span><span class="p">[</span><span class="n">group_idx</span><span class="p">][</span><span class="n">arg_name</span><span class="p">]</span>
+
+            <span class="n">layer_meta_nodes_extra</span> <span class="o">=</span> <span class="n">meta_nodes_extra_by_group</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">group_idx</span><span class="p">,</span> <span class="n">meta_nodes_extra</span><span class="p">)</span>
+
+            <span class="bp">self</span><span class="o">.</span><span class="n">_insert_cached_attn_node</span><span class="p">(</span>
+                <span class="n">gm</span><span class="p">,</span>
+                <span class="n">attn_node</span><span class="p">,</span>
+                <span class="n">attn_descriptor</span><span class="o">.</span><span class="n">get_cached_attention_op</span><span class="p">(),</span>
+                <span class="n">qkv</span><span class="p">,</span>
+                <span class="n">layer_meta_nodes_std</span><span class="p">,</span>
+                <span class="n">layer_meta_nodes_extra</span><span class="p">,</span>
+                <span class="n">cache_in_nodes</span><span class="p">,</span>
+                <span class="n">constants</span><span class="p">,</span>
+                <span class="n">prepared_mask</span><span class="p">,</span>
+            <span class="p">)</span>
+
+        <span class="n">num_cached_attn_replacements</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">layer_infos</span><span class="p">)</span>
+
+        <span class="n">info</span> <span class="o">=</span> <span class="n">TransformInfo</span><span class="p">(</span>
+            <span class="n">skipped</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">num_matches</span><span class="o">=</span><span class="n">num_cached_attn_replacements</span><span class="p">,</span>
+            <span class="n">is_clean</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="n">info</span>
+
+
+<div class="viewcode-block" id="InsertCachedAttention">
+<a class="viewcode-back" href="../../../../../../features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedAttention">[docs]</a>
+<span class="nd">@TransformRegistry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="s2">&quot;insert_cached_attention&quot;</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">InsertCachedAttention</span><span class="p">(</span><span class="n">_InsertCachedOperator</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A transform to insert cached attention into the graph module.&quot;&quot;&quot;</span></div>
+
+
+
+<div class="viewcode-block" id="InsertCachedMLAAttention">
+<a class="viewcode-back" href="../../../../../../features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedMLAAttention">[docs]</a>
+<span class="nd">@TransformRegistry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="s2">&quot;insert_cached_mla_attention&quot;</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">InsertCachedMLAAttention</span><span class="p">(</span><span class="n">_InsertCachedOperator</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A transform to insert cached MLA attention into the graph module.&quot;&quot;&quot;</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_get_mla_dims</span><span class="p">(</span><span class="n">source_attn_node</span><span class="p">:</span> <span class="n">Node</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+        <span class="n">compressed_kv_fake</span> <span class="o">=</span> <span class="n">source_attn_node</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span>
+        <span class="n">kpe_fake</span> <span class="o">=</span> <span class="n">source_attn_node</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">compressed_kv_fake</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">kpe_fake</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+
+<div class="viewcode-block" id="InsertCachedMLAAttention.resolve_backend_for_node">
+<a class="viewcode-back" href="../../../../../../features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InsertCachedMLAAttention.resolve_backend_for_node">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_backend_for_node</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">requested_backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">source_attn_node</span><span class="p">:</span> <span class="n">Node</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Resolve the MLA backend for a node based on shape and local GPU support.</span>
+
+<span class="sd">        AutoDeploy&#39;s current FlashInfer MLA integration is the Path 1</span>
+<span class="sd">        ``BatchMLAPagedAttentionWrapper`` route. That path is only validated for the</span>
+<span class="sd">        DeepSeek-style shape contract on Hopper+ today, so unsupported MLA variants</span>
+<span class="sd">        must fall back to the torch backend before cache insertion.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">requested_backend</span> <span class="ow">or</span> <span class="s2">&quot;torch_mla&quot;</span>
+        <span class="k">if</span> <span class="n">backend</span> <span class="o">!=</span> <span class="s2">&quot;flashinfer_mla&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">backend</span>
+
+        <span class="n">kv_lora_rank</span><span class="p">,</span> <span class="n">qk_rope_head_dim</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_get_mla_dims</span><span class="p">(</span><span class="n">source_attn_node</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;Falling back from flashinfer_mla to torch_mla because CUDA is unavailable.&quot;</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="s2">&quot;torch_mla&quot;</span>
+
+        <span class="n">capability</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_capability</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">capability</span> <span class="o">&lt;</span> <span class="p">(</span><span class="mi">9</span><span class="p">,</span> <span class="mi">0</span><span class="p">):</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;Falling back from flashinfer_mla to torch_mla because compute capability </span><span class="si">%s</span><span class="s2"> &quot;</span>
+                <span class="s2">&quot;is below Hopper.&quot;</span><span class="p">,</span>
+                <span class="n">capability</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="s2">&quot;torch_mla&quot;</span>
+
+        <span class="k">if</span> <span class="n">kv_lora_rank</span> <span class="o">!=</span> <span class="mi">512</span> <span class="ow">or</span> <span class="n">qk_rope_head_dim</span> <span class="o">!=</span> <span class="mi">64</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">capability</span> <span class="o">&gt;=</span> <span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">and</span> <span class="n">kv_lora_rank</span> <span class="o">==</span> <span class="mi">256</span> <span class="ow">and</span> <span class="n">qk_rope_head_dim</span> <span class="o">==</span> <span class="mi">64</span><span class="p">:</span>
+                <span class="n">ad_logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;Switching MLA backend from flashinfer_mla to flashinfer_trtllm_mla for &quot;</span>
+                    <span class="s2">&quot;Blackwell rank-256 decode support (kv_lora_rank=</span><span class="si">%d</span><span class="s2">, qk_rope_head_dim=</span><span class="si">%d</span><span class="s2">, &quot;</span>
+                    <span class="s2">&quot;compute capability=</span><span class="si">%s</span><span class="s2">).&quot;</span><span class="p">,</span>
+                    <span class="n">kv_lora_rank</span><span class="p">,</span>
+                    <span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                    <span class="n">capability</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="k">return</span> <span class="s2">&quot;flashinfer_trtllm_mla&quot;</span>
+
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;Falling back from flashinfer_mla to torch_mla for unsupported MLA shape &quot;</span>
+                <span class="s2">&quot;(kv_lora_rank=</span><span class="si">%d</span><span class="s2">, qk_rope_head_dim=</span><span class="si">%d</span><span class="s2">) on compute capability </span><span class="si">%s</span><span class="s2">. &quot;</span>
+                <span class="s2">&quot;The current AutoDeploy FlashInfer MLA path only supports kv_lora_rank=512 &quot;</span>
+                <span class="s2">&quot;and qk_rope_head_dim=64.&quot;</span><span class="p">,</span>
+                <span class="n">kv_lora_rank</span><span class="p">,</span>
+                <span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                <span class="n">capability</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="s2">&quot;torch_mla&quot;</span>
+
+        <span class="k">return</span> <span class="n">backend</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;flashinfer_mla&quot;</span><span class="p">:</span>
+            <span class="n">source_op</span> <span class="o">=</span> <span class="n">AttentionRegistry</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;torch_mla&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">get_source_attention_op</span><span class="p">()</span>
+            <span class="n">source_attn_nodes</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">nodes</span> <span class="k">if</span> <span class="n">is_op</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">source_op</span><span class="p">)]</span>
+            <span class="k">if</span> <span class="n">source_attn_nodes</span><span class="p">:</span>
+                <span class="n">resolved_backend</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">resolve_backend_for_node</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="n">source_attn_nodes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="p">)</span>
+                <span class="k">if</span> <span class="n">resolved_backend</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span> <span class="o">=</span> <span class="n">resolved_backend</span>
+
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="n">factory</span><span class="p">,</span> <span class="n">shared_config</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="ResizeKVCache">
+<a class="viewcode-back" href="../../../../../../features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.ResizeKVCache">[docs]</a>
+<span class="nd">@TransformRegistry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="s2">&quot;resize_kv_cache&quot;</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ResizeKVCache</span><span class="p">(</span><span class="n">BaseTransform</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Resize the KV cache to occupy available GPU memory.</span>
+
+<span class="sd">    This implements the two-phase approach:</span>
+<span class="sd">    1. Run a forward pass to allocate intermediate memory (activations, workspaces, etc.)</span>
+<span class="sd">    2. Call resize_kv_cache_manager() to recreate KVCacheManager with optimal capacity</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_to_full_model</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+        <span class="c1"># check if we need a resize or not</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">cm</span><span class="o">.</span><span class="n">needs_resize</span><span class="p">():</span>
+            <span class="k">return</span> <span class="n">mod</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">(</span>
+                <span class="n">skipped</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">is_clean</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">True</span>
+            <span class="p">)</span>
+
+        <span class="c1"># Run a forward pass to get the extra memory usage</span>
+        <span class="n">cm</span><span class="o">.</span><span class="n">info</span><span class="o">.</span><span class="n">set_max_num_tokens_sample</span><span class="p">()</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">cm</span><span class="o">.</span><span class="n">_spec_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">mod</span><span class="p">(</span><span class="o">**</span><span class="n">cm</span><span class="o">.</span><span class="n">named_args</span><span class="p">,</span> <span class="n">cache_seq_interface</span><span class="o">=</span><span class="n">cm</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">mod</span><span class="p">(</span><span class="o">**</span><span class="n">cm</span><span class="o">.</span><span class="n">named_args</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">torch</span><span class="o">.</span><span class="n">OutOfMemoryError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_log_info</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;OutOfMemoryError in forward pass while trying to resize the kv-cache:</span><span class="se">\n</span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+            <span class="k">raise</span> <span class="n">e</span>
+
+        <span class="c1"># NOTE: use fragmented memory without empty cache (peak forward memory + fragmented memory)</span>
+        <span class="c1"># as a proxy for the memory reserved for the forward pass. This is a rough estimate and</span>
+        <span class="c1"># may not be accurate.</span>
+        <span class="o">*</span><span class="n">_</span><span class="p">,</span> <span class="n">mem_reserved_for_forward</span> <span class="o">=</span> <span class="n">get_mem_info</span><span class="p">(</span><span class="n">empty_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">unit</span><span class="o">=</span><span class="s2">&quot;B&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Resize - KVCacheManager will compute optimal capacity based on free memory</span>
+        <span class="n">cm</span><span class="o">.</span><span class="n">resize_kv_cache_manager</span><span class="p">(</span><span class="n">mem_reserved_for_forward</span><span class="p">)</span>
+
+        <span class="n">info</span> <span class="o">=</span> <span class="n">TransformInfo</span><span class="p">(</span>
+            <span class="n">skipped</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">is_clean</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">mod</span><span class="p">,</span> <span class="n">info</span></div>
+
+
+
+<div class="viewcode-block" id="InitializeCache">
+<a class="viewcode-back" href="../../../../../../features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InitializeCache">[docs]</a>
+<span class="nd">@TransformRegistry</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="s2">&quot;initialize_cache&quot;</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">InitializeCache</span><span class="p">(</span><span class="n">BaseTransform</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Initialize KV caches using KVCacheManager.</span>
+
+<span class="sd">    Gets kv_cache_config from shared_config.ad_config and creates the KVCacheManager</span>
+<span class="sd">    in estimation mode with conservative capacity. The ResizeKVCache transform will</span>
+<span class="sd">    later recreate it with optimal capacity after measuring memory usage.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_to_full_model</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">mod</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+        <span class="n">cm</span><span class="p">:</span> <span class="n">CachedSequenceInterface</span><span class="p">,</span>
+        <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
+        <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+        <span class="c1"># Initialize with estimation mode</span>
+        <span class="c1"># This allows resize_kv_cache to recreate with correct capacity after measuring memory</span>
+        <span class="n">num_caches</span> <span class="o">=</span> <span class="n">cm</span><span class="o">.</span><span class="n">initialize_resources</span><span class="p">()</span>
+
+        <span class="n">info</span> <span class="o">=</span> <span class="n">TransformInfo</span><span class="p">(</span>
+            <span class="n">skipped</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="n">num_caches</span><span class="p">,</span> <span class="n">is_clean</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="n">mod</span><span class="p">,</span> <span class="n">info</span></div>
+
+</pre></div>
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+<div class="bd-sidebar-secondary"></div>
+
+
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../../../../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../../../../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 22, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
