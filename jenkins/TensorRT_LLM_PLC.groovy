@@ -218,7 +218,7 @@ def sonarScan()
 {
     container("cpu") {
         def sonarScannerCliVer = "8.0.0.6341"
-        sh "wget https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "wget https://maven-central.storage-download.googleapis.com/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
