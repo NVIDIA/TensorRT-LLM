@@ -224,8 +224,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1] TIMEOUT (60)
   - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_attn2d_2x1]
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2_ulysses2]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_attn2d_2x1]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2_ulysses2]
 - condition:
     ranges:
       system_gpu_count:
@@ -309,18 +309,18 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False]
-  - examples/test_visual_gen.py::test_wan_t2v_example
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4]
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2]
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2]
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[cfg2_tp2]
-  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2_ulysses2]
-  - examples/test_visual_gen.py::test_vbench_dimension_score_wan
-  - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8
-  - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4
-  - examples/test_visual_gen.py::test_vbench_dimension_score_ltx2_bf16
-  - examples/test_visual_gen.py::test_vbench_dimension_score_ltx2_fp8
+  - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[cfg2_tp2]
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_tp[tp2_ulysses2]
+  - examples/visual_gen/test_visual_gen.py::test_vbench_dimension_score_wan
+  - examples/visual_gen/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8
+  - examples/visual_gen/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4
+  - examples/visual_gen/test_visual_gen.py::test_vbench_dimension_score_ltx2_bf16
+  - examples/visual_gen/test_visual_gen.py::test_vbench_dimension_score_ltx2_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]
