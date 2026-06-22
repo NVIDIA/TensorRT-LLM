@@ -31,7 +31,12 @@ from typing import Callable, Deque, Mapping, Optional, Protocol, Sequence
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger as tllm_logger
+
+DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S = 5.0
+DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S = 0.1
+UNKNOWN_COMPLETION_FLAG = -(2**63)
 
 
 class CompletionFlagReader(Protocol):
@@ -51,6 +56,10 @@ class EPGroupHealthLike(Protocol):
         """Mark ``rank`` failed and return whether state changed."""
 
 
+class CompletionFlagReadTimeout(TimeoutError):
+    """Raised when the host watchdog cannot read completion flags in time."""
+
+
 @dataclass(frozen=True)
 class AlltoAllWatchdogTimeout:
     """Details emitted when an AlltoAll phase times out."""
@@ -61,6 +70,7 @@ class AlltoAllWatchdogTimeout:
     missing_ranks: tuple[int, ...]
     marked_failed_ranks: tuple[int, ...]
     elapsed_s: float
+    poll_timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,6 +91,7 @@ class _TorchCompletionFlagReader:
         ep_size: int,
         dispatch_completion_flags_offset: int,
         combine_completion_flags_offset: int,
+        device_copy_timeout_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     ) -> None:
         if workspace.dim() != 2:
             raise ValueError("workspace must be a 2D tensor [ep_size, size_per_rank]")
@@ -97,11 +108,50 @@ class _TorchCompletionFlagReader:
             "dispatch": int(dispatch_completion_flags_offset),
             "combine": int(combine_completion_flags_offset),
         }
+        self._device_copy_timeout_s = float(device_copy_timeout_s)
+        self._copy_stream: torch.cuda.Stream | None = None
+        self._retired_copies: list[tuple[torch.Tensor, torch.cuda.Event]] = []
+        if workspace.device.type == "cuda":
+            self._copy_stream = torch.cuda.Stream(device=workspace.device)
+
+    def _prune_retired_copies(self) -> None:
+        self._retired_copies = [
+            (host_flags, event) for host_flags, event in self._retired_copies if not event.query()
+        ]
+
+    def _read_cuda_flags(self, flags: torch.Tensor) -> tuple[int, ...]:
+        assert self._copy_stream is not None
+        self._prune_retired_copies()
+
+        host_flags = torch.empty(
+            (self._ep_size,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        event = torch.cuda.Event(blocking=False)
+        with torch.cuda.device(flags.device), torch.cuda.stream(self._copy_stream):
+            host_flags.copy_(flags.detach(), non_blocking=True)
+            event.record(self._copy_stream)
+
+        deadline_s = time.monotonic() + self._device_copy_timeout_s
+        while not event.query():
+            remaining_s = deadline_s - time.monotonic()
+            if remaining_s <= 0:
+                self._retired_copies.append((host_flags, event))
+                raise CompletionFlagReadTimeout(
+                    "timed out copying AlltoAll completion flags to host"
+                )
+            time.sleep(min(remaining_s, 0.001))
+
+        return tuple(int(v) for v in host_flags.tolist())
 
     def read_completion_flags(self, phase: str) -> tuple[int, ...]:
         offset = self._offsets[phase]
         end = offset + self._ep_size * 4
         flags = self._workspace[self._ep_rank, offset:end].view(torch.int32)
+        if flags.device.type == "cuda":
+            return self._read_cuda_flags(flags)
         if flags.device.type != "cpu":
             flags = flags.detach().cpu()
         return tuple(int(v) for v in flags.tolist())
@@ -123,8 +173,8 @@ class AlltoAllWatchdog:
         ep_size: int,
         ep_rank: int,
         completion_reader: CompletionFlagReader,
-        timeout_s: float,
-        poll_interval_s: float = 0.05,
+        timeout_s: float = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         health: Optional[EPGroupHealthLike] = None,
         on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
     ) -> None:
@@ -160,8 +210,8 @@ class AlltoAllWatchdog:
         metainfo_index: Mapping[str, int],
         ep_rank: int,
         ep_size: int,
-        timeout_s: float,
-        poll_interval_s: float = 0.05,
+        timeout_s: float = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         health: Optional[EPGroupHealthLike] = None,
         on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
     ) -> "AlltoAllWatchdog":
@@ -178,6 +228,7 @@ class AlltoAllWatchdog:
             ep_size=ep_size,
             dispatch_completion_flags_offset=dispatch_offset,
             combine_completion_flags_offset=combine_offset,
+            device_copy_timeout_s=poll_interval_s,
         )
         return cls(
             ep_size=ep_size,
@@ -288,11 +339,18 @@ class AlltoAllWatchdog:
             if observed_flags[rank] != watch.expected_flag
         )
 
-    def _handle_timeout(self, watch: _CollectiveWatch, observed_flags: tuple[int, ...]) -> None:
+    def _handle_timeout(
+        self,
+        watch: _CollectiveWatch,
+        observed_flags: tuple[int, ...],
+        *,
+        poll_timed_out: bool = False,
+    ) -> None:
         elapsed_s = time.monotonic() - watch.start_s
         missing_ranks = self._missing_ranks(watch, observed_flags)
         marked_failed: list[int] = []
-        if self._health is not None:
+        has_known_flags = UNKNOWN_COMPLETION_FLAG not in observed_flags
+        if self._health is not None and (has_known_flags or not poll_timed_out):
             for rank in missing_ranks:
                 if rank == self._ep_rank:
                     continue
@@ -306,20 +364,37 @@ class AlltoAllWatchdog:
             missing_ranks=missing_ranks,
             marked_failed_ranks=tuple(marked_failed),
             elapsed_s=elapsed_s,
+            poll_timed_out=poll_timed_out,
         )
-        tllm_logger.warning(
-            "AlltoAll watchdog timeout on rank %d during %s: expected flag %d, "
-            "missing ranks %s, observed flags %s",
-            self._ep_rank,
-            watch.phase,
-            watch.expected_flag,
-            list(missing_ranks),
-            list(observed_flags),
-        )
+        if poll_timed_out:
+            tllm_logger.error(
+                "AlltoAll watchdog could not read completion flags on rank %d "
+                "during %s before timeout %.3fs; expected flag %d, active "
+                "ranks %s, observed flags %s, marked ranks %s",
+                self._ep_rank,
+                watch.phase,
+                elapsed_s,
+                watch.expected_flag,
+                list(self._active_ranks(watch.active_mask)),
+                list(observed_flags),
+                list(marked_failed),
+            )
+        else:
+            tllm_logger.warning(
+                "AlltoAll watchdog timeout on rank %d during %s: expected flag %d, "
+                "missing ranks %s, observed flags %s",
+                self._ep_rank,
+                watch.phase,
+                watch.expected_flag,
+                list(missing_ranks),
+                list(observed_flags),
+            )
         if self._on_timeout is not None:
             self._on_timeout(event)
 
     def _run(self) -> None:
+        last_observed_flags = tuple(UNKNOWN_COMPLETION_FLAG for _ in range(self._ep_size))
+        poll_timed_out = False
         while True:
             with self._cv:
                 while not self._queue and not self._stopping:
@@ -337,6 +412,11 @@ class AlltoAllWatchdog:
                         f"completion reader returned {len(observed_flags)} flags; "
                         f"expected ep_size={self._ep_size}"
                     )
+                last_observed_flags = observed_flags
+                poll_timed_out = False
+            except CompletionFlagReadTimeout:
+                observed_flags = last_observed_flags
+                poll_timed_out = True
             except BaseException as exc:  # noqa: BLE001 - keep watchdog failures visible.
                 with self._cv:
                     self._last_error = exc
@@ -350,16 +430,20 @@ class AlltoAllWatchdog:
                     if self._queue and self._queue[0] is watch:
                         self._queue.popleft()
                     self._cv.notify_all()
+                last_observed_flags = tuple(UNKNOWN_COMPLETION_FLAG for _ in range(self._ep_size))
+                poll_timed_out = False
                 continue
 
             if time.monotonic() - watch.start_s >= self._timeout_s:
-                self._handle_timeout(watch, observed_flags)
+                self._handle_timeout(watch, observed_flags, poll_timed_out=poll_timed_out)
                 with self._cv:
                     # The GPU stream is no longer trustworthy once a collective
                     # times out. Drop queued follow-on phases so they do not
                     # produce duplicate or misleading reports.
                     self._queue.clear()
                     self._cv.notify_all()
+                last_observed_flags = tuple(UNKNOWN_COMPLETION_FLAG for _ in range(self._ep_size))
+                poll_timed_out = False
                 continue
 
             with self._cv:

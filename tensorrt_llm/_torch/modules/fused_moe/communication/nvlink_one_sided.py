@@ -30,7 +30,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.alltoall_watchdog import AlltoAllWatchdog, AlltoAllWatchdogTimeout
+from tensorrt_llm._torch.alltoall_watchdog import (
+    DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+    DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+    AlltoAllWatchdog,
+    AlltoAllWatchdogTimeout,
+)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -154,7 +159,7 @@ class NVLinkOneSided(Communication):
         use_low_precision_combine: bool = False,
         ep_group_health=None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
-        alltoall_watchdog_poll_interval_s: float = 0.05,
+        alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
     ):
         """
@@ -314,6 +319,8 @@ class NVLinkOneSided(Communication):
         self.ep_group_health = ep_group_health
         self._watchdog_flag_generation = 0
         self._alltoall_watchdog: AlltoAllWatchdog | None = None
+        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
+            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         if alltoall_watchdog_timeout_s is not None:
             self._watchdog_flag_generation = self._read_current_flag_val()
             self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
