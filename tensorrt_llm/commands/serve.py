@@ -555,7 +555,9 @@ _EMBEDDING_ARCH_MAP = {
 
 
 def _resolve_embedding_architecture_override(
-        model: str, trust_remote_code: bool) -> Optional[dict]:
+        model: str,
+        trust_remote_code: bool,
+        revision: Optional[str] = None) -> Optional[dict]:
     """Return a ``model_kwargs`` architecture override for a known embedder.
 
     Returns ``None`` to leave the model's declared architecture unchanged.
@@ -567,7 +569,7 @@ def _resolve_embedding_architecture_override(
     try:
         from transformers import AutoConfig
         hf_config = AutoConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code)
+            model, trust_remote_code=trust_remote_code, revision=revision)
         architectures = getattr(hf_config, "architectures", None) or []
     except Exception as e:  # noqa: BLE001 - config read is best-effort
         logger.warning(
@@ -613,7 +615,8 @@ def launch_embedding_server(
     # causal-LM architecture; remap it to the text-embedding model class so the
     # forward returns pooled+normalized sentence embeddings instead of LM logits.
     override = _resolve_embedding_architecture_override(
-        model, llm_args.get("trust_remote_code", False))
+        model, llm_args.get("trust_remote_code", False),
+        llm_args.get("revision"))
     if override is not None:
         model_kwargs = dict(llm_args.get("model_kwargs") or {})
         if "architectures" in model_kwargs:
@@ -1343,14 +1346,14 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     help="Maximum number of batched input tokens in each encode() call.")
 @click.option(
     "--max_queue_delay",
-    type=float,
+    type=click.FloatRange(min=0.0),
     default=0.005,
     help="Dynamic-batching hold window in seconds: how long an incoming request "
     "waits for others to join its batch before being dispatched (mirrors Triton's "
     "max_queue_delay_microseconds).")
 @click.option(
     "--max_queue_size",
-    type=int,
+    type=click.IntRange(min=1),
     default=2048,
     help="Maximum number of in-flight queued requests; further requests are "
     "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
@@ -1418,15 +1421,17 @@ def serve_embedding(
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    # The CLI does not expose TP/PP, but a --config YAML could still set them. Reject
+    # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
     # that explicitly rather than hang: the in-process encode-only path cannot shard.
     effective_tp = llm_args.get("tensor_parallel_size") or 1
     effective_pp = llm_args.get("pipeline_parallel_size") or 1
-    if effective_tp > 1 or effective_pp > 1:
+    effective_cp = llm_args.get("context_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
         raise click.BadParameter(
-            "The embeddings server is single-GPU only; multi-GPU (TP/PP) is not "
+            "The embeddings server is single-GPU only; multi-GPU (TP/PP/CP) is not "
             f"supported yet. Got tensor_parallel_size={effective_tp}, "
-            f"pipeline_parallel_size={effective_pp} from --config.",
+            f"pipeline_parallel_size={effective_pp}, "
+            f"context_parallel_size={effective_cp} from --config.",
             param_hint="config")
 
     metadata_server_cfg = parse_metadata_server_config_file(
