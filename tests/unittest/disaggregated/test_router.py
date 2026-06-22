@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import logging
 import threading
 from unittest import mock
 
@@ -852,6 +853,97 @@ async def test_kv_cache_aware_router_polls_kv_cache_events(
 
     # Returned events were applied to the server state
     assert 99999 in router._server_state[server]._kv_cache_block_table
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_backfills_block_hashes_on_finish(
+        servers, mock_aiohttp_session):
+    """Backfill keeps routing cache-aware when the worker reports no events.
+
+    The mocked endpoint returns ``[]``, so without backfill every block table
+    would stay empty. With it on, a follow-up request sharing a served prefix
+    must route back to the same server with a non-zero match count.
+    """
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        use_tokens=False,
+        max_batch_size=64,
+        tokens_per_block=32,
+        backfill_block_hashes_on_finish=True,
+    )
+
+    prefix = list(range(100))  # longer than tokens_per_block -> full blocks
+
+    req0 = CompletionRequest(model="TinyLlama", prompt=[prefix])
+    server0, info0 = await router.get_next_server(req0)
+    await router.finish_request(req0)
+
+    expected_blocks = {h for hl in info0["block_hashes"] for h in hl}
+    assert expected_blocks
+    assert expected_blocks.issubset(
+        router._server_state[server0]._kv_cache_block_table)
+    assert router._server_state[server0]._kv_events_applied == 0
+
+    req1 = CompletionRequest(model="TinyLlama", prompt=[[*prefix, 42]])
+    server1, info1 = await router.get_next_server(req1)
+    await router.finish_request(req1)
+
+    assert server1 == server0
+    server0_idx = list(router._server_state.keys()).index(server0)
+    assert info1["matches"][server0_idx] > 0
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_warns_on_dead_kv_signal(
+        servers, mock_aiohttp_session, caplog):
+    """A dead KV-cache signal is surfaced once instead of silently ignored.
+
+    With backfill off and the event endpoint returning nothing, every block
+    table stays empty and routing degrades to load-only; past the threshold the
+    router should emit exactly one warning.
+    """
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        use_tokens=False,
+        max_batch_size=64,
+        tokens_per_block=32,
+        backfill_block_hashes_on_finish=False,
+    )
+    router._kv_signal_warn_threshold = 4
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(router._kv_signal_warn_threshold + 3):
+            req = CompletionRequest(model="TinyLlama", prompt=[list(range(100))])
+            await router.get_next_server(req)
+            await router.finish_request(req)
+
+    dead_signal_warnings = [
+        r for r in caplog.records
+        if "silently degraded to load-only" in r.getMessage()
+    ]
+    assert len(dead_signal_warnings) == 1
+    assert router._kv_signal_warned is True
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_backfill_off_by_default(
+        servers, mock_aiohttp_session):
+    """Default behaviour is unchanged: no backfill, purely event-driven."""
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        use_tokens=False,
+        tokens_per_block=32,
+    )
+    assert router._backfill_block_hashes_on_finish is False
+
+    req = CompletionRequest(model="TinyLlama", prompt=[list(range(100))])
+    server, _ = await router.get_next_server(req)
+    assert router._request_block_hashes == {}
+    await router.finish_request(req)
+    assert len(router._server_state[server]._kv_cache_block_table) == 0
 
 
 def test_create_router_conversation():
