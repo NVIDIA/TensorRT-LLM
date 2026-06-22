@@ -1555,6 +1555,7 @@ def add_and_verify_chunked_request(
     ctx_info = _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len)
     ctx_block_ids = ctx_info["ctx_block_ids"]
     gen_block_ids = ctx_info["gen_block_ids"]
+    token_range = TokenRange(start=0, end=request_len)
 
     sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
     for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids, strict=True):
@@ -1569,6 +1570,7 @@ def add_and_verify_chunked_request(
             kv_slice = KVSlice(
                 is_last_slice=is_last,
                 block_ids_per_layer_groups=chunk_block_ids,
+                token_range=token_range,
                 chunk_block_offset=chunk_offset,
             )
             sender_session.send(kv_slice)
@@ -1581,6 +1583,7 @@ def add_and_verify_chunked_request(
         full_slice = KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=block_ids_per_groups,
+            token_range=token_range,
         )
         recv_session.receive(full_slice)
 

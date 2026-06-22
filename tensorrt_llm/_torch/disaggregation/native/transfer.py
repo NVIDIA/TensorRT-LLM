@@ -1196,6 +1196,10 @@ class TxSession(TxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self.kv_tasks):
+            return SessionStatus.ERROR
+        if self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR:
+            return SessionStatus.ERROR
         kv_all_transferred = bool(self.kv_tasks) and all(
             t.status == TaskStatus.TRANSFERRED for t in self.kv_tasks
         )
@@ -1813,15 +1817,15 @@ class RxSession(RxSessionBase):
                 )
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
-        # Aux is session-level (not per-slice); expected_transfers is identical
-        # across all kv_tasks, so any task provides the right count.
+        # Aux is session-level (not per-slice); use the final KV task's
+        # expected transfer count so chunked sessions wait for all senders.
         with self.lock:
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
                 )
                 return
-            task = self._kv_tasks[0]
+            task = self._kv_tasks[-1]
             if status == AgentResult.SUCCESS:
                 self._aux_count += 1
 
