@@ -14,6 +14,7 @@
 # limitations under the License.
 
 # GB200 NVL72 GPU config for Cosmos3-Super 14B.
+# See https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html for background.
 attention_config:
   backend: FA4
 parallel_config:
