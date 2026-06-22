@@ -1416,6 +1416,9 @@ TEST_F(CombinedSchedulerTest, PrefixAwareSchedulingDisabledKeepsReusableTokensZe
     EXPECT_TRUE(disaggInit1.empty());
     EXPECT_TRUE(paused1.empty());
     EXPECT_EQ(req1->getEstimatedReusableTokens(), 0);
+    auto const req1Scheduled
+        = std::any_of(scheduled1.begin(), scheduled1.end(), [](auto const& req) { return req->mRequestId == 1; });
+    ASSERT_TRUE(req1Scheduled) << "Capacity scheduler must admit req1 before micro batch budget filtering";
 
     RequestVector microBatchActive;
     for (auto& req : scheduled1)

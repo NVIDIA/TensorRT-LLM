@@ -351,7 +351,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                     }
                 }
-                else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                else if (mEnablePrefixAwareScheduling && isEncoderInit && crossKvCacheManager
+                    && crossKvCacheManager->isEnableBlockReuse()
                     && !crossKvCacheManager->getBlockManager().isVariableWindow())
                 {
                     // Encoder admission only needs the cross summary for reuse ordering.
