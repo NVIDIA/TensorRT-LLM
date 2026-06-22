@@ -13,7 +13,8 @@ from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy, SourceIdentity, check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
-                                          ModelExpressConfig, TorchLlmArgs)
+                                          ModelExpressConfig,
+                                          SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -95,6 +96,28 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
+
+
+def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
+                                             kv_cache_config) -> None:
+    """Validate encoder-decoder KV-cache requirements for the PyTorch runtime.
+
+    Both V1 (``KVCacheManager``, default and production target) and V2
+    (``KVCacheManagerV2``, additive secondary path) are supported for
+    encoder-decoder models.  Both paths require ``cross_kv_cache_fraction``
+    so the cross-attention pool can be sized.
+    """
+    if model_config.is_encoder_decoder:
+        if kv_cache_config.cross_kv_cache_fraction is None:
+            raise ValueError(
+                "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
+            )
+        return
+
+    if kv_cache_config.cross_kv_cache_fraction is not None:
+        raise ValueError(
+            "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
+        )
 
 
 def initialize_dummy_weights(
@@ -1021,6 +1044,8 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_kv_cache_config(config,
+                                                 self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
