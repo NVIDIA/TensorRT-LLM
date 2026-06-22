@@ -28,10 +28,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
-from tensorrt_llm.visual_gen.args import TorchCompileConfig
+from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cosmos3
 

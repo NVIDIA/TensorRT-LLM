@@ -448,7 +448,9 @@ def _transformer_inputs(device: str = "cuda"):
     torch.manual_seed(42)
     return (
         torch.randn(1, 16, 1, 64, 64, dtype=torch.bfloat16, device=device),
-        torch.tensor([500], dtype=torch.long, device=device),
+        # Normalized timestep in [0, 1]; WanTransformer3DModel rescales to the
+        # scheduler's 1000-step range internally.
+        torch.tensor([0.5], dtype=torch.float32, device=device),
         torch.randn(1, 128, 4096, dtype=torch.bfloat16, device=device),
     )
 
