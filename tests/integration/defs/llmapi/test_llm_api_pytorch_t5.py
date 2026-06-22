@@ -47,7 +47,7 @@ _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL = {
     "t5-base": [644, 4598, 229, 19250],
     "t5-large": [644, 4598, 229, 19250],
     "flan-t5-small": [644, 4598, 229, 9685],
-    "byt5-small": [258, 35, 119, 35],
+    "byt5-small": [258, 35, 119, 114],
 }
 # Known HF references for returned beam hypotheses. The tests exact-match greedy
 # outputs and the best beam when a reference is available; lower-ranked BF16
@@ -512,17 +512,18 @@ def _assert_expected_generation(
     assert all(decoded_text_by_output)
     if expected_token_ids_by_output is None:
         assert all(expected_text_fragment in text for text in decoded_text_by_output)
+    elif exact_match:
+        assert token_ids_by_output == expected_token_ids_by_output
+    elif len(expected_token_ids_by_output) > 1:
+        assert {tuple(token_ids) for token_ids in token_ids_by_output} == {
+            tuple(token_ids) for token_ids in expected_token_ids_by_output
+        }
     else:
         assert token_ids_by_output[0] == expected_token_ids_by_output[0]
     if len(token_ids_by_output) > 1:
         assert len({tuple(token_ids) for token_ids in token_ids_by_output}) == len(
             token_ids_by_output
         )
-    if not exact_match:
-        return
-
-    assert expected_token_ids_by_output is not None
-    assert token_ids_by_output == expected_token_ids_by_output
 
 
 def _run_t5_pytorch_generate_encoder_decoder(

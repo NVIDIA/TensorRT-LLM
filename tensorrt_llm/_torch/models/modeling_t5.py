@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import T5Config
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -130,6 +131,40 @@ def _clamp_fp16_infs(hidden_states: torch.Tensor) -> torch.Tensor:
         torch.finfo(hidden_states.dtype).max,
     )
     return torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+
+class T5LayerNorm(RMSNorm):
+    """T5 RMSNorm with HF-compatible architecture-specific precision.
+
+    On Hopper, HF uses Apex FusedRMSNorm when Apex is available. The generic
+    TRT-LLM RMSNorm path matches that behavior for ByT5 BF16 decoding. On
+    Blackwell, the generic fused path drifts from the HF reference, so use the
+    explicit T5 computation.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        eps: float,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(hidden_size=hidden_size, eps=eps, dtype=dtype)
+        self._use_hopper_rms_norm: Optional[bool] = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_hopper_rms_norm is None and hidden_states.is_cuda:
+            sm_version = get_sm_version()
+            self._use_hopper_rms_norm = 90 <= sm_version < 100
+
+        if self._use_hopper_rms_norm and hidden_states.dtype in (torch.float16, torch.bfloat16):
+            return super().forward(hidden_states)
+
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return self.weight * hidden_states
 
 
 def _t5_encoder_num_layers(config: T5Config) -> int:
@@ -399,12 +434,12 @@ class T5EncoderLayer(nn.Module):
 
         self.self_attn = T5Attention(model_config, layer_idx=layer_idx)
 
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = T5LayerNorm(
             hidden_size=hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = T5LayerNorm(
             hidden_size=hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
@@ -487,17 +522,17 @@ class T5DecoderLayer(nn.Module):
 
         self.cross_attn = T5CrossAttention(model_config, layer_idx=layer_idx)
 
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = T5LayerNorm(
             hidden_size=hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = T5LayerNorm(
             hidden_size=hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
         )
-        self.cross_attn_layernorm = RMSNorm(
+        self.cross_attn_layernorm = T5LayerNorm(
             hidden_size=hidden_size,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
@@ -599,7 +634,7 @@ class T5Encoder(nn.Module):
         self.layers = nn.ModuleList(
             [T5EncoderLayer(model_config, layer_idx=i) for i in range(num_layers)]
         )
-        self.final_layernorm = RMSNorm(
+        self.final_layernorm = T5LayerNorm(
             hidden_size=config.d_model,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
@@ -654,7 +689,7 @@ class T5Decoder(nn.Module):
         self.layers = nn.ModuleList(
             [T5DecoderLayer(model_config, layer_idx=i) for i in range(num_layers)]
         )
-        self.final_layernorm = RMSNorm(
+        self.final_layernorm = T5LayerNorm(
             hidden_size=config.d_model,
             eps=config.layer_norm_epsilon,
             dtype=config.torch_dtype,
