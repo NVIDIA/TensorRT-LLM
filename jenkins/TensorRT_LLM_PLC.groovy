@@ -85,6 +85,11 @@ def getLLMRepo () {
             LLM_REPO = DEFAULT_LLM_REPO
         }
     }
+    if (params.repoUrlKey == "tensorrt_llm_github_sync") {
+        withCredentials([string(credentialsId: 'github-llm-repo-sync', variable: 'GITHUB_LLM_REPO_SYNC')]) {
+            LLM_REPO = GITHUB_LLM_REPO_SYNC
+        }
+    }
     if (params.repoUrlKey == "github_fork") {
         if (!isValidGithubUser(params.forkOwner)) {
             throw new Exception("Invalid fork owner provided")
@@ -361,7 +366,7 @@ pipeline {
     }
     parameters {
         string(name: 'ref', defaultValue: 'main', description: 'Branch name or commit SHA (7–40 hex chars) to check out; branch push steps are skipped when a commit SHA is provided')
-        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'github_fork'], description: "The repo url to process")
+        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'tensorrt_llm_github_sync', 'github_fork'], description: "The repo url to process")
         string(name: 'forkOwner', defaultValue: '', description: 'Name of the fork owner, need to select \"github_fork\" for repoUrlKey, otherwise it will be ignored')
         string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
