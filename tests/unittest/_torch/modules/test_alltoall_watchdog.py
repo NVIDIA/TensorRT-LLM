@@ -108,6 +108,24 @@ def test_watchdog_defaults_match_design_doc() -> None:
     assert watchdog._poll_interval_s == DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S
 
 
+def test_watchdog_stop_is_terminal() -> None:
+    reader = FakeCompletionFlagReader(ep_size=1)
+    watchdog = AlltoAllWatchdog(
+        ep_size=1,
+        ep_rank=0,
+        completion_reader=reader,
+        timeout_s=0.2,
+        poll_interval_s=0.005,
+    )
+    watchdog.start()
+    watchdog.stop(timeout_s=1.0)
+
+    with pytest.raises(RuntimeError, match="stopped AlltoAllWatchdog"):
+        watchdog.start()
+    with pytest.raises(RuntimeError, match="stopped AlltoAllWatchdog"):
+        watchdog.watch(phase="dispatch", expected_flag=1)
+
+
 def test_wide_ep_ft_options_create_shared_health_when_enabled(monkeypatch) -> None:
     monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
     model_config = SimpleNamespace(
