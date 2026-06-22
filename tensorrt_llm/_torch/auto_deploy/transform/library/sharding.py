@@ -1482,6 +1482,20 @@ def validate_allreduce_strategy(v):
     return v  # Let Pydantic handle other types
 
 
+_LOGGED_DIST_BACKEND_CHOICES: set[tuple[str, str]] = set()
+
+
+def _log_dist_backend_choice(configured_backend: str, resolved_backend: str):
+    key = (configured_backend, resolved_backend)
+    if key in _LOGGED_DIST_BACKEND_CHOICES:
+        return
+    _LOGGED_DIST_BACKEND_CHOICES.add(key)
+    ad_logger.info(
+        f"AutoDeploy selected distributed backend: {resolved_backend} "
+        f"(configured: {configured_backend})"
+    )
+
+
 def _get_dist_ops(backend: str):
     """Get the (all_gather, all_reduce) op pair for *backend*.
 
@@ -1492,12 +1506,27 @@ def _get_dist_ops(backend: str):
     """
     if hasattr(backend, "value"):
         backend = backend.value
+    configured_backend = str(backend)
 
-    if backend == "trtllm" or is_trtllm_op_available():
+    if backend == "trtllm":
+        _log_dist_backend_choice(configured_backend, "trtllm")
         return (
             torch.ops.auto_deploy.trtllm_dist_all_gather.default,
             torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
         )
+    if backend == "torch":
+        _log_dist_backend_choice(configured_backend, "torch")
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
+        )
+    if is_trtllm_op_available():
+        _log_dist_backend_choice(configured_backend, "trtllm")
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    _log_dist_backend_choice(configured_backend, "torch")
     return (
         torch.ops.auto_deploy.torch_dist_all_gather.default,
         torch.ops.auto_deploy.torch_dist_all_reduce.default,

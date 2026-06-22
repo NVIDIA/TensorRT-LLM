@@ -3038,6 +3038,17 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
                 input_ids_start_offset=context_start_idx)
+            # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
+            # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
+            # not from the request.
+            # NOTE: the prefetch producer always writes the cached embedding into
+            # `py_multimodal_data` before stamping the event, so whenever the event is present,
+            # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
+            # it.
+            mm_encoder_event = request.py_mm_encoder_event
+            if mm_encoder_event is not None:
+                multimodal_params.encoder_event = mm_encoder_event
+                request.py_mm_encoder_event = None
             if multimodal_params.has_content():
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
@@ -5285,6 +5296,10 @@ class PyTorchModelEngine(ModelEngine):
         # Build a fresh, no-cache attention metadata for the encoder
         # pass.  We do not reuse ``self.attn_metadata`` because that
         # object is bound to the decoder's KV-cache manager.
+        sparse_metadata_params = (
+            self.sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=self.model.model_config.pretrained_config)
+            if self.sparse_attention_config is not None else None)
         encoder_attn_metadata = self.attn_backend.Metadata(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -5295,7 +5310,7 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=False,
             cache_indirection=None,
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
             num_heads_per_kv=1,
         )
         assert isinstance(
