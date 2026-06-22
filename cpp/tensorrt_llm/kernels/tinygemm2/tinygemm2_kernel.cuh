@@ -358,8 +358,8 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
             while (!weight_ready || !act_ready)
             {
-                weight_ready = bar_try_wait(bar_ptr_wt, phase);
-                act_ready = bar_try_wait(bar_ptr_act, phase);
+                weight_ready = bar_try_wait(__cvta_generic_to_shared(&bar_wt_ready[stage]), phase);
+                act_ready = bar_try_wait(__cvta_generic_to_shared(&bar_act_ready[stage]), phase);
             }
 
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0 && ki == 0)
