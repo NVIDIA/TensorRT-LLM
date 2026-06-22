@@ -412,7 +412,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # Only the JSON ``model_type`` distinguishes these variants. Other call
             # sites that consult multimodal/chat-template registries keyed on the
             # canonical class attribute should keep using ``type(cfg).model_type``.
-            if self.model_config.model_type == "kimi_k2":
+            if self.model_config.model_type in ("kimi_k2", "kimi_k25"):
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"

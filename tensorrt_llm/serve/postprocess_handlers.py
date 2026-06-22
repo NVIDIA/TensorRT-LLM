@@ -406,7 +406,12 @@ def chat_response_post_processor(
                 text = ""
             text, calls = apply_tool_parser(args, output.index, text, False)
             tool_calls = [
-                ToolCall(function=FunctionCall(name=call.name or "",
+                ToolCall(id=make_tool_call_id(
+                    id_type=args.tool_call_id_type,
+                    func_name=call.name or "",
+                    idx=call.tool_index,
+                ),
+                         function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
                 for call in calls
             ]
