@@ -8,14 +8,17 @@ with proper workspace management and synchronization.
 # ruff: noqa: E501
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.alltoall_watchdog import (AlltoAllWatchdog,
-                                                   AlltoAllWatchdogTimeout)
+from tensorrt_llm._torch.alltoall_watchdog import (
+    DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+    DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, AlltoAllWatchdog,
+    AlltoAllWatchdogTimeout)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -130,7 +133,8 @@ class MoeAlltoAll:
         num_experts: Optional[int] = None,
         ep_group_health=None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
-        alltoall_watchdog_poll_interval_s: float = 0.05,
+        alltoall_watchdog_poll_interval_s:
+        float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[
             [AlltoAllWatchdogTimeout], None]] = None,
     ):
@@ -228,8 +232,12 @@ class MoeAlltoAll:
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
+        self._destroyed = False
         self._watchdog_flag_generation = 0
         self._alltoall_watchdog: AlltoAllWatchdog | None = None
+        if (alltoall_watchdog_timeout_s is None
+                and self.ep_group_health is not None):
+            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         if alltoall_watchdog_timeout_s is not None:
             self._watchdog_flag_generation = self._read_current_flag_val()
             self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
@@ -243,6 +251,20 @@ class MoeAlltoAll:
                 health=self.ep_group_health,
                 on_timeout=alltoall_watchdog_on_timeout,
             )
+
+    def destroy(self) -> None:
+        """Stop background watchdog resources owned by this wrapper."""
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        watchdog = getattr(self, "_alltoall_watchdog", None)
+        if watchdog is not None:
+            watchdog.stop(timeout_s=1.0)
+            self._alltoall_watchdog = None
+
+    def __del__(self) -> None:
+        if not sys.is_finalizing():
+            self.destroy()
 
     def _read_current_flag_val(self) -> int:
         flag_val_offset = self.metainfo[

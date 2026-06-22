@@ -16,12 +16,21 @@
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.alltoall_watchdog import AlltoAllWatchdog, AlltoAllWatchdogTimeout
+from tensorrt_llm._torch.alltoall_watchdog import (
+    DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+    DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+    UNKNOWN_COMPLETION_FLAG,
+    AlltoAllWatchdog,
+    AlltoAllWatchdogTimeout,
+    CompletionFlagReadTimeout,
+)
 from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.modules.fused_moe.wide_ep_ft import get_wide_ep_ft_options
 
 
 class FakeCompletionFlagReader:
@@ -41,6 +50,23 @@ class FakeCompletionFlagReader:
     def read_completion_flags(self, phase: str) -> tuple[int, ...]:
         with self._lock:
             return tuple(self._flags[phase])
+
+
+class TimeoutCompletionFlagReader:
+    def read_completion_flags(self, phase: str) -> tuple[int, ...]:
+        raise CompletionFlagReadTimeout("blocked")
+
+
+class OneGoodReadThenTimeoutReader:
+    def __init__(self, flags: tuple[int, ...]) -> None:
+        self._flags = flags
+        self._read_count = 0
+
+    def read_completion_flags(self, phase: str) -> tuple[int, ...]:
+        self._read_count += 1
+        if self._read_count == 1:
+            return self._flags
+        raise CompletionFlagReadTimeout("blocked")
 
 
 def _wait_for(predicate, timeout_s: float = 1.0) -> None:
@@ -72,6 +98,32 @@ def test_watchdog_completes_when_all_active_flags_arrive() -> None:
 
     assert events == []
     assert health.all_active() is True
+
+
+def test_watchdog_defaults_match_design_doc() -> None:
+    reader = FakeCompletionFlagReader(ep_size=1)
+    watchdog = AlltoAllWatchdog(ep_size=1, ep_rank=0, completion_reader=reader)
+
+    assert watchdog._timeout_s == DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
+    assert watchdog._poll_interval_s == DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S
+
+
+def test_wide_ep_ft_options_create_shared_health_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
+    model_config = SimpleNamespace(
+        extra_attrs={},
+        mapping=SimpleNamespace(moe_ep_size=4),
+    )
+
+    health, timeout_s, poll_interval_s = get_wide_ep_ft_options(model_config)
+    health_again, timeout_again_s, poll_again_s = get_wide_ep_ft_options(model_config)
+
+    assert isinstance(health, EPGroupHealth)
+    assert health_again is health
+    assert timeout_s == DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
+    assert timeout_again_s == timeout_s
+    assert poll_interval_s == DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S
+    assert poll_again_s == poll_interval_s
 
 
 def test_watchdog_timeout_reports_and_marks_missing_remote_ranks() -> None:
@@ -147,6 +199,54 @@ def test_watchdog_reports_local_missing_but_does_not_mark_local_failed() -> None
     assert event.missing_ranks == (0,)
     assert event.marked_failed_ranks == ()
     assert health.get_failed_ranks() == frozenset()
+
+
+def test_watchdog_poll_timeout_without_snapshot_fails_closed() -> None:
+    health = EPGroupHealth(3)
+    events: list[AlltoAllWatchdogTimeout] = []
+
+    with AlltoAllWatchdog(
+        ep_size=3,
+        ep_rank=0,
+        completion_reader=TimeoutCompletionFlagReader(),
+        timeout_s=0.02,
+        poll_interval_s=0.005,
+        health=health,
+        on_timeout=events.append,
+    ) as watchdog:
+        watchdog.watch(phase="dispatch", expected_flag=1)
+        _wait_for(lambda: len(events) == 1)
+
+    event = events[0]
+    assert event.poll_timed_out is True
+    assert event.observed_flags == (UNKNOWN_COMPLETION_FLAG,) * 3
+    assert event.missing_ranks == (0, 1, 2)
+    assert event.marked_failed_ranks == ()
+    assert health.all_active() is True
+
+
+def test_watchdog_poll_timeout_with_prior_snapshot_marks_known_missing_rank() -> None:
+    health = EPGroupHealth(3)
+    events: list[AlltoAllWatchdogTimeout] = []
+
+    with AlltoAllWatchdog(
+        ep_size=3,
+        ep_rank=0,
+        completion_reader=OneGoodReadThenTimeoutReader((1, 0, 1)),
+        timeout_s=0.02,
+        poll_interval_s=0.005,
+        health=health,
+        on_timeout=events.append,
+    ) as watchdog:
+        watchdog.watch(phase="dispatch", expected_flag=1)
+        _wait_for(lambda: len(events) == 1)
+
+    event = events[0]
+    assert event.poll_timed_out is True
+    assert event.observed_flags == (1, 0, 1)
+    assert event.missing_ranks == (1,)
+    assert event.marked_failed_ranks == (1,)
+    assert health.get_failed_ranks() == frozenset({1})
 
 
 def test_watchdog_preserves_fifo_order_and_clears_followups_after_timeout() -> None:
