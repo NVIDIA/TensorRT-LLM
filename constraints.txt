@@ -17,5 +17,3 @@ mistune>=3.2.1
 notebook>=7.5.6
 # WAR against https://github.com/advisories/GHSA-rch3-82jr-f9w9
 jupyter_server>=2.18.0
-# NumPy 2.5.0 breaks type checking in CI
-numpy<2.5.0
