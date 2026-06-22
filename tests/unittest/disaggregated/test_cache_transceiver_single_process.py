@@ -105,6 +105,7 @@ class KvCacheConfigV2:
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
+    disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
 
 

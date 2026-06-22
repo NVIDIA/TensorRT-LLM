@@ -20,6 +20,13 @@ from test_triton_mamba_cached_op import _random_params
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+)
 from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
     replay_selective_state_update as _real_replay_selective_state_update,
 )
@@ -116,6 +123,8 @@ def test_flashinfer_decode_matches_triton(mamba_env):
         None,  # replay_old_da_cumsum
         None,  # replay_cache_buf_idx
         None,  # replay_prev_num_accepted
+        None,  # replay_work_items
+        None,  # replay_n_writes
         # CONSTANTS
         time_step_limit,
         chunk_size,
@@ -166,26 +175,41 @@ def test_flashinfer_extend_replay_calls_replay_kernel(mamba_env, head_dim):
     slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
 
     # Replay buffers: all zeros (first step, nothing cached yet; kernel still runs).
+    replay_history_size = 16
     replay_old_x = torch.zeros(
-        max_batch_size, tokens_per_extend, num_heads, head_dim, device=device, dtype=torch.bfloat16
+        max_batch_size,
+        2,
+        replay_history_size,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
     )
     replay_old_b = torch.zeros(
         max_batch_size,
         2,
-        tokens_per_extend,
+        replay_history_size,
         n_groups,
         ssm_state_size,
         device=device,
         dtype=torch.bfloat16,
     )
     replay_old_dt = torch.zeros(
-        max_batch_size, 2, num_heads, tokens_per_extend, device=device, dtype=torch.float32
+        max_batch_size, 2, num_heads, replay_history_size, device=device, dtype=torch.float32
     )
     replay_old_da_cumsum = torch.zeros(
-        max_batch_size, 2, num_heads, tokens_per_extend, device=device, dtype=torch.float32
+        max_batch_size, 2, num_heads, replay_history_size, device=device, dtype=torch.float32
     )
     replay_cache_buf_idx = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
     replay_prev_num_accepted = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
+    replay_work_items = torch.zeros(
+        max_batch_size, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32
+    )
+    replay_work_items[0, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = 0
+    replay_work_items[0, REPLAY_WORK_CACHE_SLOT] = slot_idx[0]
+    replay_work_items[0, REPLAY_WORK_PNAT] = 0
+    replay_work_items[0, REPLAY_WORK_CACHE_BUF_IDX] = 0
+    replay_n_writes = torch.zeros(1, device=device, dtype=torch.int32)
 
     # Extend-only batch with replay mode enabled.
     _bi = BatchInfo()
@@ -229,6 +253,8 @@ def test_flashinfer_extend_replay_calls_replay_kernel(mamba_env, head_dim):
             replay_old_da_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
             # CONSTANTS
             time_step_limit,
             chunk_size,
