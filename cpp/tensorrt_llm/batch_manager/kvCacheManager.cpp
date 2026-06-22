@@ -3957,16 +3957,11 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
         {
             for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
-                // For cross-KV (encoder features), all beams of a request share the same encoder output.
-                // Always use beam 0's block IDs so all beams attend to the correct encoder features.
-                auto const srcBeamIdx = isCrossKv() ? 0 : beamIdx;
-                TLLM_CHECK_WITH_INFO(!isCrossKv() || !cacheBlockIds.empty(),
-                    "Cross-KV sequence has no block IDs for request %lu", requestId);
-                auto const effectiveBlockCount = isCrossKv() ? cacheBlockIds[0].size() : cacheBlockIds[beamIdx].size();
+                auto const effectiveBlockCount = cacheBlockIds[beamIdx].size();
                 auto const copyChunkSize = effectiveBlockCount * sizeof(tk::KVCacheIndex);
                 for (auto xIdx : {kIdx, vIdx})
                 {
-                    auto const srcIndex = tc::flat_index(srcShape.d, poolIdx, srcBeamIdx, xIdx, 0);
+                    auto const srcIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, 0);
                     auto const dstIndex
                         = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);

@@ -15,23 +15,15 @@
  * limitations under the License.
  */
 
-// Regression tests for encoder-decoder beam-search fixes.
+// Regression tests for encoder-decoder beam-search logits gathering.
 //
-// Fix 1 — cross-KV copyBlockOffsets shares beam-0 blocks across all beams.
-//   Before: beams 1..N-1 received uninitialised physical blocks, causing
-//   degenerate output ("happ happ happ") when the decoder cross-attended to
-//   garbage encoder features.
-//   After:  KVCacheManager::copyBlockOffsets uses beam-0's block IDs for every
-//   beam when isCrossKv() is true, since the encoder output is identical for
-//   all beams of a request.
-//
-// Fix 3 — fragmentPointerDevice is now per-batch-slot ([maxBatchSize, kCACHE_LENGTH]).
-//   Before: fragmentPointerDevice was a single shared row ([kCACHE_LENGTH]); sequential
-//   flushes from different requests in the same batch clobbered each other's GPU pointer
-//   arrays, causing the mergeLogitsFragmentsKernel to read stale fragment addresses and
-//   produce degenerate output with gather_generation_logits=True.
-//   After:  each request gets its own device-side pointer row via getFragmentPointerSlot(),
-//   eliminating cross-request interference.
+// fragmentPointerDevice is per-batch-slot ([maxBatchSize, kCACHE_LENGTH]).
+// Before the fix, fragmentPointerDevice was a single shared row ([kCACHE_LENGTH]); sequential
+// flushes from different requests in the same batch clobbered each other's GPU pointer
+// arrays, causing the mergeLogitsFragmentsKernel to read stale fragment addresses and
+// produce degenerate output with gather_generation_logits=True.
+// After the fix, each request gets its own device-side pointer row via getFragmentPointerSlot(),
+// eliminating cross-request interference.
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -52,106 +44,6 @@ namespace tr = tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 using SizeType32 = tr::SizeType32;
-
-// ============================================================================
-// Fix 1: KVCacheManager::copyBlockOffsets cross-KV beam sharing
-// ============================================================================
-
-// Verify that copyBlockOffsets normalises all beam slots to beam-0's value on the
-// cross-KV path even when per-beam source rows differ.  The test writes distinct
-// sentinel values into each beam row of the source tensor before calling
-// copyBlockOffsets so that the old bug (srcBeamIdx = beamIdx) would leave beams
-// 1..N-1 with different values, while the fix (srcBeamIdx = 0 for isCrossKv())
-// produces equal values across all beams.
-TEST(CrossKvBeamSharingTest, CopyBlockOffsetsNormalisesAllBeamsToBeam0)
-{
-    auto stream = std::make_shared<tr::CudaStream>();
-
-    SizeType32 constexpr numLayers = 1;
-    SizeType32 constexpr numHeads = 1;
-    SizeType32 constexpr sizePerHead = 4;
-    SizeType32 constexpr tokensPerBlock = 8;
-    SizeType32 constexpr maxNumSequences = 1;
-    SizeType32 constexpr beamWidth = 3;
-    SizeType32 constexpr maxAttentionWindow = 16;
-    SizeType32 constexpr encoderLen = 16; // 2 blocks
-
-    SizeType32 constexpr numBlocks = maxNumSequences * beamWidth * (encoderLen / tokensPerBlock);
-    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
-
-    KVCacheManager crossKvMgr(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, {maxAttentionWindow}, nvinfer1::DataType::kHALF,
-        /*sinkTokenLength=*/0, stream, maxAttentionWindow, maxAttentionWindow,
-        /*enableBlockReuse=*/false, CacheType::kCROSS);
-    crossKvMgr.allocatePools(false);
-
-    RequestIdType constexpr requestId = 1;
-    auto inputTokens = std::make_shared<VecTokens>(encoderLen, 0);
-    tr::SamplingConfig const samplingConfig{beamWidth};
-    auto llmReq = std::make_shared<LlmRequest>(requestId, /*maxNewTokens=*/0, inputTokens, samplingConfig, false);
-    crossKvMgr.addSequenceBatch({{{requestId, encoderLen, beamWidth}}}, {std::ref(*llmReq)});
-
-    // Write distinct per-beam values into the source cacheBlockIndices tensor so
-    // that the old code (copying each beam's own row) would produce different
-    // outputs, while the fixed code (always copying beam-0's row) produces equal.
-    auto& seq = crossKvMgr.getSequence(requestId);
-    auto& srcTensor = seq.getCacheBlockIndices(maxAttentionWindow);
-    auto const& srcShape = srcTensor.getShape();
-    auto* const srcPtr = tr::bufferCast<tk::KVCacheIndex>(srcTensor);
-    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
-    {
-        for (SizeType32 kv = 0; kv < 2; ++kv)
-        {
-            for (SizeType32 block = 0; block < srcShape.d[3]; ++block)
-            {
-                auto const idx = tc::flat_index(srcShape.d, /*pool=*/0, beam, kv, block);
-                // Beam b gets value (b*100 + kv*10 + block), all non-zero and distinct.
-                srcPtr[idx]
-                    = tk::KVCacheIndex{static_cast<tk::KVCacheIndex::UnderlyingType>(beam * 100 + kv * 10 + block + 1)};
-            }
-        }
-    }
-
-    auto const dims = crossKvMgr.getOffsetTableDimensions();
-    SizeType32 const numPools = dims.numPools;
-    SizeType32 const maxBlocksPerSeq = dims.maxBlocksPerSeq;
-    auto blockOffsets
-        = tr::BufferManager::cpu(tr::ITensor::makeShape({numPools, maxNumSequences * beamWidth, 2, maxBlocksPerSeq}),
-            tr::TRTDataType<tk::KVCacheIndex>::value);
-
-    auto* const raw = tr::bufferCast<tk::KVCacheIndex>(*blockOffsets);
-    std::fill(raw, raw + blockOffsets->getSize(), tk::KVCacheIndex{tk::KVCacheIndex::kInvalidPoolIndex});
-
-    crossKvMgr.copyBlockOffsets(*blockOffsets, /*outputSlotOffset=*/0, requestId);
-
-    auto const& shape = blockOffsets->getShape();
-    for (SizeType32 pool = 0; pool < numPools; ++pool)
-    {
-        for (SizeType32 kv = 0; kv < 2; ++kv)
-        {
-            for (SizeType32 block = 0; block < maxBlocksPerSeq; ++block)
-            {
-                auto idx = [&](SizeType32 beam) { return tc::flat_index(shape.d, pool, beam, kv, block); };
-
-                // Beam 0 must have been written (non-sentinel) and reflect its source value.
-                EXPECT_NE(raw[idx(0)].get(), tk::KVCacheIndex::kInvalidPoolIndex)
-                    << "pool=" << pool << " beam=0 kv=" << kv << " block=" << block << ": not written";
-
-                // All other beams must equal beam 0 — the fix normalises them.
-                for (SizeType32 beam = 1; beam < beamWidth; ++beam)
-                {
-                    EXPECT_EQ(raw[idx(beam)].get(), raw[idx(0)].get())
-                        << "pool=" << pool << " beam=" << beam << " kv=" << kv << " block=" << block
-                        << ": differs from beam 0 — cross-KV beam sharing is broken";
-                }
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Fix 3: copyGenerationLogits per-slot fragmentPointerDevice
-// ============================================================================
 
 // Verify that copyGenerationLogits correctly assembles the host logits buffer
 // using the real kernel merge path, and that two back-to-back calls (simulating
