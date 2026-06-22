@@ -15,16 +15,6 @@
  * limitations under the License.
  */
 
-// Regression tests for encoder-decoder beam-search logits gathering.
-//
-// fragmentPointerDevice is per-batch-slot ([maxBatchSize, kCACHE_LENGTH]).
-// Before the fix, fragmentPointerDevice was a single shared row ([kCACHE_LENGTH]); sequential
-// flushes from different requests in the same batch clobbered each other's GPU pointer
-// arrays, causing the mergeLogitsFragmentsKernel to read stale fragment addresses and
-// produce degenerate output with gather_generation_logits=True.
-// After the fix, each request gets its own device-side pointer row via getFragmentPointerSlot(),
-// eliminating cross-request interference.
-
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
