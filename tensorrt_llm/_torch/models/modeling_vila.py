@@ -69,13 +69,16 @@ def _validate_vila_mm_alignment(
     input_ids: torch.IntTensor,
     embedding_layer: Embedding,
     mm_embeds: List[torch.Tensor],
+    mm_token_ids: Optional[torch.IntTensor] = None,
 ) -> Tuple[torch.IntTensor, torch.IntTensor]:
-    # VILA expands multimodal placeholders into out-of-vocab ids during
-    # preprocessing, so counting OOV ids here gives the active multimodal span
-    # for the current chunk. Reuse the indices for fusion to avoid an extra sync.
+    # VILA expands multimodal placeholders into the in-vocab media token id
+    # during preprocessing, so counting positions that match ``mm_token_ids``
+    # (via ``torch.isin``) gives the active multimodal span for the current
+    # chunk. Reuse the indices for fusion to avoid an extra sync.
     text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
         input_ids=input_ids,
         vocab_size=embedding_layer.num_embeddings,
+        mm_token_ids=mm_token_ids,
     )
     expected_tokens = mm_token_indices.shape[0]
     actual_embeds = sum(embed.shape[0] for embed in mm_embeds)
@@ -1281,6 +1284,7 @@ class VilaModel(PreTrainedModel):
                     input_ids=input_ids,
                     embedding_layer=self.llm.model.embed_tokens,
                     mm_embeds=mm_embeds,
+                    mm_token_ids=self.mm_token_ids,
                 )
 
         if text_token_indices is not None and mm_token_indices is not None:
