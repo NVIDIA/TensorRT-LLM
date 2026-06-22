@@ -1285,6 +1285,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
 
+            if request.mm_processor_kwargs:
+                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
