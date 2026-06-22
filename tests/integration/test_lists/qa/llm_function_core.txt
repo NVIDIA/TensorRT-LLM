@@ -987,6 +987,12 @@ llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_tensorrt
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
 
+# Routed-expert (MoE) LoRA
+llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[host_path] TIMEOUT (90)
+llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[device_path_eager] TIMEOUT (90)
+llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[device_path_cudagraph] TIMEOUT (90)
+llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks TIMEOUT (90)
+
 # CuteDSL NVFP4 tests
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
