@@ -46,6 +46,23 @@ class EagerFusionConfig:
     POST_MOE_FUSION: bool = False
 
 
+def gate_up_proj_supports_pre_mlp_nvfp4_fusion(gate_up_proj) -> bool:
+    """Return True when PRE_MLP NVFP4 fusion can read gate_up_proj.input_scale."""
+    return getattr(gate_up_proj, "has_nvfp4",
+                   False) and hasattr(gate_up_proj, "input_scale")
+
+
+def reconcile_pre_mlp_nvfp4_fusion(fusion_config: EagerFusionConfig,
+                                   mlp) -> None:
+    """Disable PRE_MLP_FUSION when dense MLP gate_up_proj is not NVFP4."""
+    if not fusion_config.PRE_MLP_FUSION:
+        return
+    gate_up_proj = getattr(mlp, "gate_up_proj", None)
+    if gate_up_proj is None or not gate_up_proj_supports_pre_mlp_nvfp4_fusion(
+            gate_up_proj):
+        fusion_config.PRE_MLP_FUSION = False
+
+
 class MetaInitException(RuntimeError):
     pass
 

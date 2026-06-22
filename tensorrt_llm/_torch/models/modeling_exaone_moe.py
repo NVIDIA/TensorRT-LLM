@@ -54,7 +54,10 @@ from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .checkpoints.hf.exaone_moe_weight_mapper import ExaoneMoeWeightMapper
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             gate_up_proj_supports_pre_mlp_nvfp4_fusion,
+                             reconcile_pre_mlp_nvfp4_fusion,
+                             register_auto_model)
 
 
 def check_is_moe(config: ExaoneMoeConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
@@ -432,7 +435,9 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.fusion_config.PRE_MLP_FUSION:
+        if (self.fusion_config.PRE_MLP_FUSION
+                and gate_up_proj_supports_pre_mlp_nvfp4_fusion(
+                    self.mlp.gate_up_proj)):
             act_fp4, act_sf, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -732,3 +737,5 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoe
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
+            if isinstance(layer.mlp, GatedMLP):
+                reconcile_pre_mlp_nvfp4_fusion(layer.fusion_config, layer.mlp)

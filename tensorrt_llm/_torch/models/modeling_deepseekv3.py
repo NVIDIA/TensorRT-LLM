@@ -74,6 +74,8 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
+                             gate_up_proj_supports_pre_mlp_nvfp4_fusion,
+                             reconcile_pre_mlp_nvfp4_fusion,
                              register_auto_model)
 
 
@@ -1541,7 +1543,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if self.fusion_config.PRE_MLP_FUSION:
+        if (self.fusion_config.PRE_MLP_FUSION
+                and gate_up_proj_supports_pre_mlp_nvfp4_fusion(
+                    self.mlp.gate_up_proj)):
             act_fp4, act_sf, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1929,3 +1933,5 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+            if isinstance(layer.mlp, GatedMLP):
+                reconcile_pre_mlp_nvfp4_fusion(layer.fusion_config, layer.mlp)
