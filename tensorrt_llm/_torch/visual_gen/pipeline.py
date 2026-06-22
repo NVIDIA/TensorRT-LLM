@@ -193,7 +193,11 @@ class BasePipeline(nn.Module):
             if model is None:
                 continue
 
-            runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True), shared_pool)
+            runner = CUDAGraphRunner(
+                CUDAGraphRunnerConfig(use_cuda_graph=True),
+                shared_pool,
+            )
+            model.register_cuda_graph_extra_key_fns(runner)
             logger.info(f"CUDA graph runner: wrapping {name}.forward")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
@@ -802,6 +806,7 @@ class BasePipeline(nn.Module):
         self,
         latents,
         extra_stream_latents,
+        step_index,
         timestep,
         local_embeds,
         forward_fn,
@@ -816,7 +821,14 @@ class BasePipeline(nn.Module):
         cfg_size = vgm.cfg_size if vgm else 1
 
         t_start = time.time()
-        result = forward_fn(latents, extra_stream_latents, timestep, local_embeds, local_extras)
+        result = forward_fn(
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            local_embeds,
+            local_extras,
+        )
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
@@ -866,6 +878,7 @@ class BasePipeline(nn.Module):
         self,
         latents,
         extra_stream_latents,
+        step_index,
         timestep,
         prompt_embeds,
         forward_fn,
@@ -889,7 +902,12 @@ class BasePipeline(nn.Module):
 
         t_start = time.time()
         result = forward_fn(
-            latent_input, extra_stream_input, timestep_expanded, prompt_embeds, local_extras
+            latent_input,
+            extra_stream_input,
+            step_index,
+            timestep_expanded,
+            prompt_embeds,
+            local_extras,
         )
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
@@ -977,8 +995,11 @@ class BasePipeline(nn.Module):
             prompt_embeds: Text embeddings (positive)
             guidance_scale: CFG strength (1.0 = no guidance)
             forward_fn: Transformer forward function
-                       Signature: forward_fn(latents, extra_stream_latents, timestep,
-                                            encoder_hidden_states, extra_tensors_dict)
+                       Signature: forward_fn(latents, extra_stream_latents, step_index,
+                                            timestep, encoder_hidden_states,
+                                            extra_tensors_dict)
+                       step_index is the ordinal denoising-loop index, distinct
+                       from the scheduler timestep value.
                        Returns: (primary_noise, extra_stream_noises_dict) or just primary_noise
             timesteps: Optional custom timesteps (defaults to scheduler.timesteps)
             neg_prompt_embeds: Optional negative text embeddings for CFG
@@ -1076,9 +1097,15 @@ class BasePipeline(nn.Module):
             with nvtx_range(f"denoise_step {i}"):
                 if do_cfg_parallel:
                     timestep = t.expand(latents.shape[0])
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
+                    (
+                        noise_pred,
+                        extra_noise_preds,
+                        t_trans,
+                        t_cfg,
+                    ) = self._denoise_step_cfg_parallel(
                         latents,
                         extra_stream_latents,
+                        i,
                         timestep,
                         cfg_config["local_embeds"],
                         forward_fn,
@@ -1088,9 +1115,15 @@ class BasePipeline(nn.Module):
                         local_extras,
                     )
                 else:
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
+                    (
+                        noise_pred,
+                        extra_noise_preds,
+                        t_trans,
+                        t_cfg,
+                    ) = self._denoise_step_standard(
                         latents,
                         extra_stream_latents,
+                        i,
                         t,
                         prompt_embeds,
                         forward_fn,

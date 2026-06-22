@@ -13,6 +13,16 @@ from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
+_SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
+    format_version=1,
+    model_fingerprint="model",
+    quant_fingerprint="quant",
+    backend_fingerprint="backend",
+    parallel_fingerprint="parallel",
+    rank=0,
+    shard_fingerprint="shard",
+)
+
 
 class _LinearStub(nn.Module):
     def post_load_weights(self):
@@ -77,6 +87,13 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
+    # These tests stub ModelConfig, while SourceIdentity has dedicated
+    # coverage. Keep this file focused on ModelLoader MX branch behavior.
+    monkeypatch.setattr(
+        model_loader_mod.SourceIdentity,
+        "from_model_config",
+        classmethod(lambda cls, *_args, **_kwargs: _SOURCE_IDENTITY),
+    )
     monkeypatch.setattr(
         model_loader_mod.AutoModelForCausalLM,
         "from_config",
@@ -105,6 +122,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["mapping"] is loader.mapping
     assert kwargs["model"] is model
+    assert kwargs["source_identity"] is loader._source_identity
     assert loader._call_load_weights.call_count == 0
     checkpoint_loader.get_initialized_weight_mapper.assert_called_once()
     assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
