@@ -30,7 +30,10 @@ from starlette.responses import JSONResponse, Response
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.utils import ConversationMessage, async_apply_chat_template
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.chat_utils import (
+    parse_chat_messages_coroutines,
+    resolve_top_level_model_type,
+)
 from tensorrt_llm.serve.openai_protocol import (
     KVCacheTruncateRequest,
     ensure_request_chat_template_allowed,
@@ -107,7 +110,7 @@ class ResourceGovernor:
             messages, self.model_config, None
         )
         token_task = async_apply_chat_template(
-            model_type=self.model_config.model_type,
+            model_type=resolve_top_level_model_type(self.model_config),
             tokenizer=self.tokenizer,
             processor=self.processor,
             conversation=conversation,
