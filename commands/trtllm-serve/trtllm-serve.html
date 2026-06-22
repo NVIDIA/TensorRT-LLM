@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'commands/trtllm-serve/trtllm-serve';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -459,6 +459,21 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -474,6 +489,8 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -918,14 +935,14 @@ the result of serializing a tensor via <cite>torch.save</cite>.</p>
 </div>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Video generation (Wan)</span>
 trtllm-serve<span class="w"> </span>Wan-AI/Wan2.2-T2V-A14B-Diffusers<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_visual_gen_options<span class="w"> </span>config.yml
+<span class="w">    </span>--visual_gen_args<span class="w"> </span>config.yml
 
 <span class="c1"># Image generation (FLUX)</span>
 trtllm-serve<span class="w"> </span>black-forest-labs/FLUX.2-dev<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_visual_gen_options<span class="w"> </span>config.yml
+<span class="w">    </span>--visual_gen_args<span class="w"> </span>config.yml
 </pre></div>
 </div>
-<p>The <code class="docutils literal notranslate"><span class="pre">--extra_visual_gen_options</span></code> flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/videos</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code>, and video management APIs.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">--visual_gen_args</span></code> flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/videos</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code>, and video management APIs.</p>
 <p>For full details, see the <span class="xref std std-doc">../../models/visual-generation.md</span> feature documentation. Example client scripts are available in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve">examples/visual_gen/serve/</a> directory.</p>
 </section>
 </section>
@@ -1375,7 +1392,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for reasoning models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3_5 | qwen3 | laguna | deepseek-r1 | nano-v3 | nemotron-v3 | gemma4 | kimi_k25 | kimi_k2</p>
+<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3_5 | qwen3 | laguna | deepseek-r1 | minimax_m3 | nano-v3 | nemotron-v3 | gemma4 | kimi_k25 | kimi_k2</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1386,7 +1403,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for tool models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | deepseek_v3 | deepseek_v31 | deepseek_v32 | gemma4 | glm4 | glm47 | minimax_m2 | poolside_v1</p>
+<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | deepseek_v3 | deepseek_v31 | deepseek_v32 | gemma4 | glm4 | glm47 | minimax_m2 | minimax_m3 | poolside_v1</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1477,7 +1494,7 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-visual_gen_args">
-<span id="cmdoption-trtllm-serve-serve-extra_visual_gen_options"></span><span class="sig-name descname"><span class="pre">--visual_gen_args</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--extra_visual_gen_options</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;visual_gen_args&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-visual_gen_args" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">--visual_gen_args</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;visual_gen_args&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-visual_gen_args" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Path to a YAML file with VisualGen engine args.</p>
 </dd></dl>
 
@@ -1599,8 +1616,8 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -1672,9 +1689,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       

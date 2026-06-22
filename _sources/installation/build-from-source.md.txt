@@ -30,7 +30,7 @@ git lfs pull
 Pull the pre-built TensorRT LLM `devel` container from NGC. Replace `x.y.z` with the desired version. Browse the [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags) to find the latest release.
 
 ```bash
-docker pull nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc18
+docker pull nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc19
 ```
 
 ## Step 3: Start the Container
@@ -44,7 +44,7 @@ docker run --rm -it \
         --gpus=all \
         --volume <path_to_tensorrt_llm_on_host>:<path_to_tensorrt_llm_in_container> \
         --workdir <path_to_tensorrt_llm_in_container> \
-        nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc18
+        nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc19
 ```
 
 ```{admonition} Note on Docker flags

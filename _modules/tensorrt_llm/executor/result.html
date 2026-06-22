@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -496,9 +496,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/executor/result';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -839,7 +839,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -888,6 +888,21 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
@@ -903,6 +918,8 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -1004,6 +1021,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">dataclasses</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
@@ -1027,6 +1045,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_tracer</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncQueue</span><span class="p">,</span> <span class="n">print_traceback_on_error</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span><span class="p">,</span> <span class="n">MetricsCollector</span><span class="p">,</span> <span class="n">RequestEventTiming</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..metrics.perf_utils</span><span class="w"> </span><span class="kn">import</span> \
     <span class="n">process_req_perf_metrics</span> <span class="k">as</span> <span class="n">_process_req_perf_metrics</span>
@@ -1070,8 +1089,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">ResponseWrapper</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    1. Wrapper of runtime response with optional outputs computed post runtime.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;1. Wrapper of runtime response with optional outputs computed post runtime.</span>
 <span class="sd">    2. A workaround to pass around RequestPerfMetrics.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
@@ -1175,7 +1193,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">GenerationResultBase</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; This holds the core logic of the GenerationResult class. &#39;&#39;&#39;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;This holds the core logic of the GenerationResult class.&quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="nb">id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1189,6 +1207,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># Average decoded tokens per runtime iteration; set when the first LLM response arrives.</span>
         <span class="c1"># None indicates not yet available (e.g., before first step/stream).</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1285,8 +1305,7 @@ window.runMermaid = runMermaid;</script>
                          <span class="n">logprobs_result</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                          <span class="n">req_perf_metrics_dict</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span>
                                                               <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot; Handle a single sequence in the response. &quot;&quot;&quot;</span>
-
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Handle a single sequence in the response.&quot;&quot;&quot;</span>
         <span class="n">seq_idx</span> <span class="o">=</span> <span class="n">sequence_index</span>
         <span class="n">src_idx</span> <span class="o">=</span> <span class="n">sequence_index</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span> <span class="k">else</span> <span class="mi">0</span>
 
@@ -1497,7 +1516,22 @@ window.runMermaid = runMermaid;</script>
             <span class="n">context_phase_params</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_phase_params</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">decoding_iter</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;cached_tokens&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;per_pos_drafted&#39;</span><span class="p">,</span>
+                                           <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;per_pos_accepted&#39;</span><span class="p">,</span>
+                                            <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">avg_decoded_tokens_per_iter</span>
+            <span class="c1"># Expose gen-first ctx usage so the postprocessor</span>
+            <span class="c1"># (_ctx_usage_from_outputs) can adopt the context-side accounting.</span>
+            <span class="c1"># ctx_usage only exists on the Python LlmResult wrapper; the raw C++</span>
+            <span class="c1"># bindings.executor.Result (non-disagg / benchmark path) does not</span>
+            <span class="c1"># have it, so fall back to None as with cached_tokens above.</span>
+            <span class="n">ctx_usage</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s1">&#39;ctx_usage&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">ctx_usage</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="o">=</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="ow">or</span> <span class="n">DisaggregatedParams</span><span class="p">(),</span>
+                    <span class="n">ctx_usage</span><span class="o">=</span><span class="n">ctx_usage</span><span class="p">,</span>
+                <span class="p">)</span>
             <span class="k">if</span> <span class="n">context_phase_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">existing_disagg_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span>
                 <span class="c1"># Use `replace` to preserve things like `mrope_position_ids_handle` and</span>
@@ -1532,9 +1566,12 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># can prepend them.</span>
             <span class="k">if</span> <span class="p">(</span><span class="n">context_phase_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
                     <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
-                <span class="n">first_gen_lp</span> <span class="o">=</span> <span class="p">[</span>
-                    <span class="n">out</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">out</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span> <span class="k">if</span> <span class="n">out</span><span class="o">.</span><span class="n">logprobs</span>
-                <span class="p">]</span>
+                <span class="n">first_gen_lp</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s2">&quot;first_gen_log_probs&quot;</span><span class="p">,</span>
+                                       <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">first_gen_lp</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">first_gen_lp</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">out</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">out</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span> <span class="k">if</span> <span class="n">out</span><span class="o">.</span><span class="n">logprobs</span>
+                    <span class="p">]</span>
                 <span class="k">if</span> <span class="n">first_gen_lp</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">first_gen_log_probs</span> <span class="o">=</span> \
                         <span class="n">first_gen_lp</span>
@@ -1552,7 +1589,6 @@ window.runMermaid = runMermaid;</script>
 
             <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s2">&quot;mm_embedding_handles&quot;</span>
                        <span class="p">)</span> <span class="ow">and</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="c1"># mm_embedding_handles is a list of handles (one per multimodal item).</span>
                 <span class="n">mm_embedding_handles</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">mm_embedding_handles</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span> <span class="o">=</span> <span class="n">mm_embedding_handles</span>
@@ -1616,10 +1652,87 @@ window.runMermaid = runMermaid;</script>
             <span class="n">metrics_stats</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">processed_metrics_stat</span><span class="p">)</span>
         <span class="c1"># Record prompt tokens only for the first candidate to avoid</span>
         <span class="c1"># double-counting the shared prompt across n candidates.</span>
+        <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="ow">and</span> <span class="n">sequence_index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">prompt_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_TOKENS</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span>
+
+        <span class="c1"># Request-scoped metrics: only record for the first candidate to avoid</span>
+        <span class="c1"># double-counting across n candidates.</span>
+        <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="ow">and</span> <span class="n">sequence_index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PROMPT_CACHE_CACHED_TOKENS</span><span class="p">]</span> <span class="o">=</span> \
+                <span class="bp">self</span><span class="o">.</span><span class="n">cached_tokens</span>
+
+            <span class="n">spec_dec_logged</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span>
+                    <span class="n">d</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span><span class="p">):</span>
+                <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">SPEC_DEC_ACCEPTED_PER_POS</span><span class="p">]</span> <span class="o">=</span> \
+                    <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_accepted</span>
+                <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">SPEC_DEC_DRAFTED_PER_POS</span><span class="p">]</span> <span class="o">=</span> \
+                    <span class="bp">self</span><span class="o">.</span><span class="n">per_pos_drafted</span>
+                <span class="n">spec_dec_logged</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">spec_dec_logged</span> <span class="ow">and</span> <span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">spec_dec</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">request_perf_metrics</span><span class="o">.</span><span class="n">speculative_decoding</span>
+                <span class="k">if</span> <span class="n">spec_dec</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">spec_dec</span><span class="o">.</span><span class="n">total_draft_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">SPEC_DEC_ACCEPTED_PER_POS</span><span class="p">]</span> <span class="o">=</span> \
+                        <span class="p">[</span><span class="n">spec_dec</span><span class="o">.</span><span class="n">total_accepted_draft_tokens</span><span class="p">]</span>
+                    <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">SPEC_DEC_DRAFTED_PER_POS</span><span class="p">]</span> <span class="o">=</span> \
+                        <span class="p">[</span><span class="n">spec_dec</span><span class="o">.</span><span class="n">total_draft_tokens</span><span class="p">]</span>
+
+            <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span> <span class="ow">and</span> <span class="n">prompt_token_ids</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">prompt_lps</span> <span class="o">=</span> <span class="p">[]</span>
+                    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">entry</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">prompt_logprobs</span><span class="p">):</span>
+                        <span class="k">if</span> <span class="n">i</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">):</span>
+                            <span class="k">break</span>
+                        <span class="n">token_id</span> <span class="o">=</span> <span class="n">prompt_token_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+                        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                            <span class="k">if</span> <span class="n">token_id</span> <span class="ow">in</span> <span class="n">entry</span><span class="p">:</span>
+                                <span class="n">lp_obj</span> <span class="o">=</span> <span class="n">entry</span><span class="p">[</span><span class="n">token_id</span><span class="p">]</span>
+                                <span class="n">lp</span> <span class="o">=</span> <span class="n">lp_obj</span><span class="o">.</span><span class="n">logprob</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+                                    <span class="n">lp_obj</span><span class="p">,</span> <span class="s1">&#39;logprob&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="nb">float</span><span class="p">(</span><span class="n">lp_obj</span><span class="p">)</span>
+                                <span class="n">prompt_lps</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lp</span><span class="p">)</span>
+                        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="p">(</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">)):</span>
+                            <span class="n">prompt_lps</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">entry</span><span class="p">))</span>
+                    <span class="k">if</span> <span class="n">prompt_lps</span><span class="p">:</span>
+                        <span class="n">mean_lp</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">prompt_lps</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_lps</span><span class="p">)</span>
+                        <span class="n">ppl</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">mean_lp</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">ppl</span><span class="p">):</span>
+                            <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">PREFILL_PERPLEXITY</span><span class="p">]</span> <span class="o">=</span> <span class="n">ppl</span>
+                <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;Failed to compute prefill perplexity&quot;</span><span class="p">,</span>
+                                 <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+        <span class="c1"># Candidate-scoped metric: generation perplexity is computed per candidate</span>
+        <span class="c1"># from this candidate&#39;s logprobs.</span>
+        <span class="n">num_gen_tokens</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">length</span>
+        <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="ow">and</span> <span class="n">num_gen_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">gen_ppl</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">gen_ppl</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">output</span><span class="o">.</span><span class="n">cumulative_logprob</span> <span class="o">/</span> <span class="n">num_gen_tokens</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">gen_lps</span> <span class="o">=</span> <span class="p">[]</span>
+                    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">entry</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">logprobs</span><span class="p">):</span>
+                        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                            <span class="n">token_id</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span>
+                                <span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+                            <span class="k">if</span> <span class="n">token_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">token_id</span> <span class="ow">in</span> <span class="n">entry</span><span class="p">:</span>
+                                <span class="n">lp_obj</span> <span class="o">=</span> <span class="n">entry</span><span class="p">[</span><span class="n">token_id</span><span class="p">]</span>
+                                <span class="n">lp</span> <span class="o">=</span> <span class="n">lp_obj</span><span class="o">.</span><span class="n">logprob</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+                                    <span class="n">lp_obj</span><span class="p">,</span> <span class="s1">&#39;logprob&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="nb">float</span><span class="p">(</span><span class="n">lp_obj</span><span class="p">)</span>
+                                <span class="n">gen_lps</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">lp</span><span class="p">)</span>
+                        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entry</span><span class="p">,</span> <span class="p">(</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">)):</span>
+                            <span class="n">gen_lps</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">entry</span><span class="p">))</span>
+                    <span class="k">if</span> <span class="n">gen_lps</span><span class="p">:</span>
+                        <span class="n">mean_lp</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">gen_lps</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">gen_lps</span><span class="p">)</span>
+                        <span class="n">gen_ppl</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="n">mean_lp</span><span class="p">)</span>
+                <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;Failed to compute generation perplexity&quot;</span><span class="p">,</span>
+                                 <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">gen_ppl</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">gen_ppl</span><span class="p">):</span>
+                <span class="n">metrics_stats</span><span class="p">[</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">GENERATION_PERPLEXITY</span><span class="p">]</span> <span class="o">=</span> <span class="n">gen_ppl</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">candidate_metrics</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">metrics_stats</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">metrics_stats</span><span class="p">)</span>
 
@@ -1728,7 +1841,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">DetokenizedGenerationResultBase</span><span class="p">(</span><span class="n">GenerationResultBase</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; The base class for the generation result with detokenization support. &#39;&#39;&#39;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;The base class for the generation result with detokenization support.&quot;&quot;&quot;</span>
     <span class="c1"># import once and avoid cyclic import</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocWorker</span>
 
@@ -1807,14 +1920,13 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">GenerationResult</span><span class="p">(</span><span class="n">GenerationResultBase</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
-<span class="sd">    The result of a generation request. It can be used to wait for the completion of the request.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;The result of a generation request. It can be used to wait for the completion of the request.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        generation_request (GenerationRequest): The generation request object.</span>
 <span class="sd">        background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.</span>
 <span class="sd">        executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1964,8 +2076,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">IterationResult</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Runtime results for all available iterations.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Runtime results for all available iterations.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1987,8 +2098,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">get_results</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Return all runtime results in the queue.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return all runtime results in the queue.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
@@ -2026,8 +2136,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">simple_prompt_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">simple_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LogProbsResult</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Compute top-K logprobs from logits when engine doesn&#39;t provide them directly.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Compute top-K logprobs from logits when engine doesn&#39;t provide them directly.</span>
 
 <span class="sd">    Used for post-processing logits into logprobs.</span>
 <span class="sd">    - Prompt logprobs (from context_logits): always used.</span>
@@ -2185,8 +2294,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -2258,9 +2367,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       

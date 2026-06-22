@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'models/visual-generation';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -459,6 +459,21 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -474,6 +489,8 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -584,8 +601,9 @@ actively evolving and may change in future releases.</p>
 <li><p>Pluggable attention backends: PyTorch SDPA (<code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>), TRT-LLM kernels (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>), TRT-LLM CuTe DSL kernels (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, Blackwell-class GPUs), and Flash Attention 4 (<code class="docutils literal notranslate"><span class="pre">FA4</span></code>).</p></li>
 <li><p>Quantization support (dynamic and static) using the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">ModelOpt</a> configuration format.</p></li>
 <li><p>Quantized attention support: <code class="docutils literal notranslate"><span class="pre">QK16PV8</span></code> to quantize Bmm2 on <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">SAGE</span></code> to run SageAttention on <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> (requires Blackwell SM100).</p></li>
+<li><p>Sparse attention support: see <a class="reference internal" href="../visual-gen/features/sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a>.</p></li>
 <li><p>Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).</p></li>
-<li><p><strong>TeaCache</strong> — a runtime caching optimization that skips transformer steps when timestep embeddings change slowly.</p></li>
+<li><p><strong>Step caching</strong> — two runtime caching backends (<strong>TeaCache</strong> and <strong>Cache-DiT</strong>) that skip transformer computation on steps where the step-to-step change is small.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> integration with OpenAI-compatible API endpoints for image and video generation.</p></li>
 </ul>
 </section>
@@ -652,6 +670,7 @@ actively evolving and may change in future releases.</p>
 <th class="head"><p>FP8 blockwise</p></th>
 <th class="head"><p>NVFP4</p></th>
 <th class="head"><p>TeaCache</p></th>
+<th class="head"><p>Cache-DiT</p></th>
 <th class="head"><p>CFG Parallelism</p></th>
 <th class="head"><p>Ulysses Parallelism</p></th>
 <th class="head"><p>Parallel VAE</p></th>
@@ -668,6 +687,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No <a class="footnote-reference brackets" href="#id4" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -679,6 +699,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>FLUX.2</strong></p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -705,11 +726,13 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>Wan 2.2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -726,6 +749,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -737,6 +761,7 @@ actively evolving and may change in future releases.</p>
 <tr class="row-odd"><td><p><strong>Qwen-Image</strong> <a class="footnote-reference brackets" href="#id5" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -751,6 +776,7 @@ actively evolving and may change in future releases.</p>
 <tr class="row-even"><td><p><strong>Cosmos3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -886,22 +912,155 @@ actively evolving and may change in future releases.</p>
 </pre></div>
 </div>
 </section>
+<section id="cuda-graphs">
+<h3>CUDA Graphs<a class="headerlink" href="#cuda-graphs" title="Link to this heading">#</a></h3>
+<p>VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See <a class="reference internal" href="../visual-gen/features/cuda-graph.html"><span class="std std-doc">VisualGen CUDA Graphs</span></a> for capture scope, graph keys, and sparse-attention phase behavior.</p>
+</section>
+<section id="step-caching">
+<h3>Step Caching<a class="headerlink" href="#step-caching" title="Link to this heading">#</a></h3>
+<p>Both caching backends are configured through <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cache_config</span></code>. The backend is selected by the <code class="docutils literal notranslate"><span class="pre">cache_backend</span></code> discriminator field.</p>
 <section id="teacache">
-<h3>TeaCache<a class="headerlink" href="#teacache" title="Link to this heading">#</a></h3>
+<h4>TeaCache<a class="headerlink" href="#teacache" title="Link to this heading">#</a></h4>
 <p>TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cache_config</span></code> (YAML or programmatic):</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cache_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">cache_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">teacache</span>
 <span class="w">  </span><span class="nt">teacache_thresh</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.2</span>
 </pre></div>
 </div>
-<p>The <code class="docutils literal notranslate"><span class="pre">teacache_thresh</span></code> parameter controls the similarity threshold. Cache-DiT is also supported via <code class="docutils literal notranslate"><span class="pre">cache_backend:</span> <span class="pre">cache_dit</span></code> with its own set of knobs (see <code class="docutils literal notranslate"><span class="pre">CacheDiTConfig</span></code>).</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">teacache_thresh</span></code></p></td>
+<td><p>float</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.2</span></code></p></td>
+<td><p>Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use <code class="docutils literal notranslate"><span class="pre">0.6</span></code> for FLUX.1 and <code class="docutils literal notranslate"><span class="pre">0.2</span></code> for FLUX.2 and Wan 2.1.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">use_ret_steps</span></code></p></td>
+<td><p>bool</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Enable retention-step caching variant.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">coefficients</span></code></p></td>
+<td><p>list[float]</p></td>
+<td><p>per-model</p></td>
+<td><p>Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="cache-dit">
+<h4>Cache-DiT<a class="headerlink" href="#cache-dit" title="Link to this heading">#</a></h4>
+<p>Cache-DiT uses residual-difference gating (<code class="docutils literal notranslate"><span class="pre">DBCache</span></code>) to adaptively skip transformer blocks, with optional TaylorSeer polynomial prediction and step-computation mask (<code class="docutils literal notranslate"><span class="pre">SCM</span></code>).</p>
+<p>Enable via <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cache_config</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">cache_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cache_dit</span>
+</pre></div>
+</div>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen</span><span class="w"> </span><span class="kn">import</span> <span class="n">CacheDiTConfig</span>
+
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Wan-AI/Wan2.2-T2V-A14B-Diffusers&quot;</span><span class="p">,</span>
+    <span class="n">cache_config</span><span class="o">=</span><span class="n">CacheDiTConfig</span><span class="p">(</span>
+        <span class="n">residual_diff_threshold</span><span class="o">=</span><span class="mf">0.20</span><span class="p">,</span>
+        <span class="n">max_continuous_cached_steps</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>Commonly used parameters:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Fn_compute_blocks</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Number of leading transformer blocks that are always fully computed at every denoising step (Fn in the Cache-DiT paper).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Bn_compute_blocks</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Number of trailing transformer blocks used for prediction refinement (Bn).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_warmup_steps</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4</span></code></p></td>
+<td><p>Initial denoising steps that always run a full forward pass; caching is disabled for this many steps at the start.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_cached_steps</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">-1</span></code></p></td>
+<td><p>Total cap on cached (skipped) steps across the run; <code class="docutils literal notranslate"><span class="pre">-1</span></code> means unlimited.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_continuous_cached_steps</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">3</span></code></p></td>
+<td><p>Maximum consecutive cached steps before a forced full-compute step is inserted. <code class="docutils literal notranslate"><span class="pre">-1</span></code> means unlimited.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">residual_diff_threshold</span></code></p></td>
+<td><p>float</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.24</span></code></p></td>
+<td><p>L1-distance threshold for DBCache residual gating. Increase to cache more aggressively (higher speedup, potential quality loss); decrease for more conservative caching.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">enable_taylorseer</span></code></p></td>
+<td><p>bool</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Enable TaylorSeer calibration. Uses Taylor series expansion to approximate hidden states at cached steps, improving output quality over plain residual reuse.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">taylorseer_order</span></code></p></td>
+<td><p>int</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Polynomial order for TaylorSeer (1–4). Only used when <code class="docutils literal notranslate"><span class="pre">enable_taylorseer=true</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scm_steps_mask_policy</span></code></p></td>
+<td><p>str | None</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Named step-computation mask policy from the <code class="docutils literal notranslate"><span class="pre">cache_dit</span></code> library (<code class="docutils literal notranslate"><span class="pre">&quot;slow&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;medium&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fast&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;ultra&quot;</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">scm_steps_policy</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;dynamic&quot;</span></code> | <code class="docutils literal notranslate"><span class="pre">&quot;static&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;dynamic&quot;</span></code></p></td>
+<td><p>Execution policy for the SCM mask; only active when <code class="docutils literal notranslate"><span class="pre">scm_steps_mask_policy</span></code> is set.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">force_refresh_step_hint</span></code></p></td>
+<td><p>int | None</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
+<td><p>Step index at which a forced full-compute pass is injected (useful for scheduled quality checkpoints).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">force_refresh_step_policy</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;once&quot;</span></code> | <code class="docutils literal notranslate"><span class="pre">&quot;repeat&quot;</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;once&quot;</span></code></p></td>
+<td><p>Whether <code class="docutils literal notranslate"><span class="pre">force_refresh_step_hint</span></code> fires only on the first call (<code class="docutils literal notranslate"><span class="pre">&quot;once&quot;</span></code>) or at that interval repeatedly (<code class="docutils literal notranslate"><span class="pre">&quot;repeat&quot;</span></code>).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Wan 2.2 dual-transformer note:</strong> Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All <code class="docutils literal notranslate"><span class="pre">CacheDiTConfig</span></code> parameters apply to both stacks, except <code class="docutils literal notranslate"><span class="pre">max_warmup_steps</span></code> and <code class="docutils literal notranslate"><span class="pre">max_cached_steps</span></code>: the low-noise stack always uses fixed internal caps (<code class="docutils literal notranslate"><span class="pre">max_warmup_steps=2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_cached_steps=20</span></code>) regardless of user config.</p>
+</section>
 </section>
 <section id="multi-gpu-parallelism">
 <h3>Multi-GPU Parallelism<a class="headerlink" href="#multi-gpu-parallelism" title="Link to this heading">#</a></h3>
 <p>Configured under <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.parallel_config</span></code>. Modes can be combined:</p>
 <ul class="simple">
 <li><p><strong>CFG Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>): Splits positive/negative guidance prompts across GPUs.</p></li>
-<li><p><strong>Ulysses Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">ulysses_size:</span> <span class="pre">N</span></code>): Splits the sequence dimension across GPUs for longer sequences.</p></li>
+<li><p><strong>Ulysses Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">ulysses_size:</span> <span class="pre">N</span></code>): Splits the sequence dimension across GPUs for longer sequences.</p>
+<ul>
+<li><p><strong>Async Ulysses A2A pipeline</strong> (<code class="docutils literal notranslate"><span class="pre">async_ulysses:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and an NVLink-connected GPU domain (uses PyTorch <code class="docutils literal notranslate"><span class="pre">_SymmetricMemory</span></code> with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.</p></li>
+</ul>
+</li>
 <li><p><strong>Parallel VAE</strong> (<code class="docutils literal notranslate"><span class="pre">parallel_vae_size:</span> <span class="pre">N</span></code>): Shards the final VAE decode along a spatial axis (constraint: <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span> <span class="pre">≤</span> <span class="pre">world_size</span></code>; WAN/Cosmos3 only).</p></li>
 <li><p><strong>Context Parallel (CP)</strong> — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (<code class="docutils literal notranslate"><span class="pre">FA4</span></code> or <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = <code class="docutils literal notranslate"><span class="pre">cp_size</span> <span class="pre">·</span> <span class="pre">ulysses_size</span></code>. The CP degree depends on the implementation below:</p>
 <ul>
@@ -942,7 +1101,7 @@ actively evolving and may change in future releases.</p>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BasePipeline</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">visual_gen/pipeline.py</span></code></p></td>
-<td><p>Base class: denoising loop, CFG handling, TeaCache, CUDA graph</p></td>
+<td><p>Base class: denoising loop, CFG handling, step caching (TeaCache / Cache-DiT), CUDA graph</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AutoPipeline</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">visual_gen/pipeline_registry.py</span></code></p></td>
@@ -1073,7 +1232,12 @@ actively evolving and may change in future releases.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optimizations">Optimizations</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization">Quantization</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantized-attention">Quantized Attention</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#teacache">TeaCache</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graphs">CUDA Graphs</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-caching">Step Caching</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#teacache">TeaCache</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-dit">Cache-DiT</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a></li>
 </ul>
 </li>
@@ -1106,8 +1270,8 @@ actively evolving and may change in future releases.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -1179,9 +1343,9 @@ actively evolving and may change in future releases.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       

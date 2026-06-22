@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -410,7 +410,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -459,6 +459,21 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -474,6 +489,8 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
@@ -633,7 +650,7 @@
 <p>The following roofline analysis illustrates why decoupling attention and FFN sharding is essential. We model a dense LLM with batch B=8, MLA attention, query heads Q=128, KV heads K=1, QK head size Hsz=576, V head size Hsz=512, and FFN dimension F=65536 running on GB200 NVLink72. The MLA-attention parameters mirror DeepSeek-R1: Q=128 query heads with a per-token latent KV of <code class="docutils literal notranslate"><span class="pre">kv_lora_rank=512</span></code> plus <code class="docutils literal notranslate"><span class="pre">qk_rope_head_dim=64</span></code> (giving Hsz=576) and V head size 512. DSR1’s actual FFN dimension is 18432; we use F=65536 here as a representative large dense FFN so that FFN weight-read time is on the same order as long-context attention reads and the bottleneck crossover is visible in a single plot. Both weights and KV cache are stored and fetched in FP8. Communication overhead from TP and KVP is not included; these plots show only the change in GPU DRAM-read latency as TP width and KVP width vary.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_roofline_analysis.png" alt="Roofline analysis for KV cache and Linear weight reads" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_roofline_analysis.png" alt="Roofline analysis for KV cache and Linear weight reads" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Roofline analysis for KV cache and Linear weight reads on GB200 NVLink72. (Left) DRAM read latency vs. TP width - benefits plateau beyond TP=K due to full KV duplication, highlighting the need for KV sharding in Helix. (Middle) DRAM read time vs. KV length S - self-attention cost scales linearly with S, eventually dominating latency. (Right) DRAM read time vs. KVP width - Helix applies KVP in attention to reduce per-GPU memory traffic and achieve linear scaling, enabling multi-million-token inference.</em></sub></p>
@@ -656,7 +673,7 @@
 </ul>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_helix_execution_flow.png" alt="Helix execution flow per transformer layer" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_helix_execution_flow.png" alt="Helix execution flow per transformer layer" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. End-to-end Helix workflow for a single transformer layer. (Top) During attention, each KVP GPU independently computes QKV projections and runs FlashAttention on its local KV shard, producing partial outputs and log-sum-exp scalars. A single All-to-All exchanges these fragments across KVP ranks; each GPU rescales and sums them into the exact softmax-normalized result. (Bottom) For FFNs, the same N GPUs are re-provisioned as either TP_F=N for dense models, or TP_F × EP for MoE models. Adapted from <a href="https://arxiv.org/pdf/2507.07120">Bhatia et al., 2025</a>.</em></sub></p>
@@ -667,7 +684,7 @@
 <p>Helix applies KV Parallelism (KVP) by sharding the KV cache along the sequence dimension across KVP GPUs, while applying Tensor Parallelism across attention heads (TP_A). TP_A is kept ≤ K (number of KV heads) to avoid duplication.</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_attention_sharding.png" alt="Comparison of attention sharding strategies" width="900">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_attention_sharding.png" alt="Comparison of attention sharding strategies" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. Attention sharding strategies for GQA with Q=4 query heads and K=2 KV heads. (a) No TP: all heads co-located, no duplication. (b) TP=2: clean split since TP ≤ K. (c) TP=4: more shards than KV heads, forcing KV cache duplication. (d) Helix (TP=2, KVP=2): avoids duplication by forming a 2D layout - TP splits heads, KVP splits the sequence dimension. Adapted from <a href="https://arxiv.org/pdf/2507.07120">Bhatia et al., 2025</a>.</em></sub></p>
@@ -849,7 +866,7 @@
 <p>The following results for DeepSeek-R1 are obtained on GB300 NVL72 using TensorRT-LLM with FP4 precision in disaggregated serving mode (Helix on the generation servers).</p>
 <div align="center">
 <figure>
-  <img src="../media/tech_blog22_dsr1_fp4_pareto.png" alt="DeepSeek-R1 FP4 throughput-latency Pareto on GB300 NVL72 with Helix, with parallelism configuration (concurrency, KVP, TP/DP, EP, PP) annotated at each Pareto point" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog22_dsr1_fp4_pareto.png" alt="DeepSeek-R1 FP4 throughput-latency Pareto on GB300 NVL72 with Helix, with parallelism configuration (concurrency, KVP, TP/DP, EP, PP) annotated at each Pareto point" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4. Throughput-latency Pareto frontier of serving DeepSeek-R1 (FP4) on GB300 NVL72 with Helix on the generation servers. Helix pushes the frontier outward, enabling both higher throughput and lower latency.</em></sub></p>
@@ -972,8 +989,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -1045,9 +1062,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       

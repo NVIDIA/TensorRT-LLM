@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -496,9 +496,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/index';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -839,7 +839,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -888,6 +888,21 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -903,6 +918,8 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -999,6 +1016,56 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>All modules for which code is available</h1>
 <ul><li><a href="tensorrt_llm/_torch/async_llm.html">tensorrt_llm._torch.async_llm</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/graph_module_visualizer.html">tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/interface.html">tensorrt_llm._torch.auto_deploy.transform.interface</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/attention.html">tensorrt_llm._torch.auto_deploy.transform.library.attention</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/build_model.html">tensorrt_llm._torch.auto_deploy.transform.library.build_model</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/cleanup_identity_dtype_cast.html">tensorrt_llm._torch.auto_deploy.transform.library.cleanup_identity_dtype_cast</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/cleanup_input_constraints.html">tensorrt_llm._torch.auto_deploy.transform.library.cleanup_input_constraints</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/cleanup_noop_add.html">tensorrt_llm._torch.auto_deploy.transform.library.cleanup_noop_add</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/cleanup_noop_slice.html">tensorrt_llm._torch.auto_deploy.transform.library.cleanup_noop_slice</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/collectives.html">tensorrt_llm._torch.auto_deploy.transform.library.collectives</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/compile_model.html">tensorrt_llm._torch.auto_deploy.transform.library.compile_model</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/eliminate_redundant_transposes.html">tensorrt_llm._torch.auto_deploy.transform.library.eliminate_redundant_transposes</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/export_to_gm.html">tensorrt_llm._torch.auto_deploy.transform.library.export_to_gm</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_causal_conv.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_causal_conv</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_gdn_gating.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_gdn_gating</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_mamba_a_log.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_mamba_a_log</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_quant.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_quant</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_relu2_quant_nvfp4.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_relu2_quant_nvfp4</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_rmsnorm_quant_fp8.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_rmsnorm_quant_nvfp4.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_rope_into_trtllm_attention.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_into_trtllm_attention</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_rope_mla.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_silu_mul.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_silu_mul</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_swiglu.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_swiglu</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fuse_trtllm_attention_quant_fp8.html">tensorrt_llm._torch.auto_deploy.transform.library.fuse_trtllm_attention_quant_fp8</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fused_add_rms_norm.html">tensorrt_llm._torch.auto_deploy.transform.library.fused_add_rms_norm</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fused_moe.html">tensorrt_llm._torch.auto_deploy.transform.library.fused_moe</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fused_moe_mxfp4.html">tensorrt_llm._torch.auto_deploy.transform.library.fused_moe_mxfp4</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/fusion.html">tensorrt_llm._torch.auto_deploy.transform.library.fusion</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/gather_logits_before_lm_head.html">tensorrt_llm._torch.auto_deploy.transform.library.gather_logits_before_lm_head</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/hidden_states.html">tensorrt_llm._torch.auto_deploy.transform.library.hidden_states</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/kvcache.html">tensorrt_llm._torch.auto_deploy.transform.library.kvcache</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/kvcache_transformers.html">tensorrt_llm._torch.auto_deploy.transform.library.kvcache_transformers</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/l2_norm.html">tensorrt_llm._torch.auto_deploy.transform.library.l2_norm</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/load_weights.html">tensorrt_llm._torch.auto_deploy.transform.library.load_weights</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/mlir_elementwise_fusion.html">tensorrt_llm._torch.auto_deploy.transform.library.mlir_elementwise_fusion</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/moe_routing.html">tensorrt_llm._torch.auto_deploy.transform.library.moe_routing</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/mrope_delta_cache.html">tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/multi_stream_attn.html">tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/multi_stream_gemm.html">tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_gemm</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/multi_stream_moe.html">tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_moe</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/quantization.html">tensorrt_llm._torch.auto_deploy.transform.library.quantization</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/quantize_moe.html">tensorrt_llm._torch.auto_deploy.transform.library.quantize_moe</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/rms_norm.html">tensorrt_llm._torch.auto_deploy.transform.library.rms_norm</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/rope.html">tensorrt_llm._torch.auto_deploy.transform.library.rope</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/sharding.html">tensorrt_llm._torch.auto_deploy.transform.library.sharding</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/sharding_ir.html">tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/ssm_cache.html">tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/library/visualization.html">tensorrt_llm._torch.auto_deploy.transform.library.visualization</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/optimizer.html">tensorrt_llm._torch.auto_deploy.transform.optimizer</a></li>
+<li><a href="tensorrt_llm/_torch/auto_deploy/transform/pipeline_cache/pipeline_cache.html">tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache</a></li>
 <li><a href="tensorrt_llm/bindings/executor.html">tensorrt_llm.bindings.executor</a></li>
 <li><a href="tensorrt_llm/builder.html">tensorrt_llm.builder</a></li>
 <li><a href="tensorrt_llm/disaggregated_params.html">tensorrt_llm.disaggregated_params</a></li>
@@ -1109,8 +1176,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -1182,9 +1249,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       

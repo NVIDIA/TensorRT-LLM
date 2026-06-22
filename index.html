@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
-<link href="_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+  <link href="_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <script defer src="_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
-<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+  <link rel="preload" as="script" href="_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
 
 
 
@@ -63,9 +63,9 @@
     <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'index';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc18';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -80,7 +80,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc18" />
+  <meta name="docsearch:version" content="1.3.0rc19" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -411,7 +411,7 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
 </ul>
@@ -460,6 +460,21 @@
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
@@ -475,6 +490,8 @@
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
@@ -621,7 +638,7 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html#visual-generation-models">Visual Generation Models</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="models/supported-models.html#id34">Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/supported-models.html#id38">Supported Models</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Beta)</a><ul>
@@ -724,6 +741,7 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RocketSparseAttentionConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.ReorderRequestPolicyConfig"><code class="docutils literal notranslate"><span class="pre">ReorderRequestPolicyConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig"><code class="docutils literal notranslate"><span class="pre">DeepSeekSparseAttentionConfig</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig"><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseAttentionConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulingParams"><code class="docutils literal notranslate"><span class="pre">SchedulingParams</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig"><code class="docutils literal notranslate"><span class="pre">SkipSoftmaxAttentionConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.PrometheusMetricsConfig"><code class="docutils literal notranslate"><span class="pre">PrometheusMetricsConfig</span></code></a></li>
@@ -845,8 +863,24 @@
 <li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/auto-deploy.html#key-features">Key Features</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/auto-deploy.html#get-started">Get Started</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/auto-deploy.html#support-matrix">Support Matrix</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/auto-deploy.html#api-reference">API Reference</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/auto-deploy.html#advanced-usage">Advanced Usage</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/auto-deploy.html#roadmap">Roadmap</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/transforms.html">AutoDeploy Transforms</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a><ul>
@@ -880,10 +914,12 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/sparse-attention.html">Sparse Attention</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#background-and-motivation">Background and Motivation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#algorithm-overview">Algorithm Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#sparse-attention-implementation">Sparse Attention Implementation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#rocketkv">RocketKV</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#deepseek-sparse-attention-dsa">DeepSeek Sparse Attention (DSA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#skip-softmax-attention">Skip Softmax Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#algorithm-comparison">Algorithm Comparison</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sparse-attention.html#further-reading">Further Reading</a></li>
 </ul>
 </li>
 </ul>
@@ -945,6 +981,19 @@
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/kv-transfer.html#key-components">Key Components</a></li>
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/kv-transfer.html#customization">Customization</a></li>
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/kv-transfer.html#evolution-outlook">Evolution Outlook</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/telemetry.html">Telemetry</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/telemetry.html#llm-api-configuration-fields">LLM API Configuration Fields</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html#two-integration-levels">Two integration levels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html#lowered-sparse-parameters">Lowered sparse parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html#framework-level-sparse-attention">Framework-level sparse attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html#adding-a-new-framework-level-algorithm">Adding a new framework-level algorithm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html#kernel-level-sparse-attention">Kernel-level sparse attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/sparse-attention-development-guide.html#roadmap">Roadmap</a></li>
 </ul>
 </li>
 </ul>
@@ -1320,8 +1369,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
-<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+  <script defer src="_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
 
 
   <footer class="bd-footer">
@@ -1393,9 +1442,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 08, 2026.</p>
+  <p>Last updated on June 22, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/15d06c0">15d06c0</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
   
 </div></div>
       
