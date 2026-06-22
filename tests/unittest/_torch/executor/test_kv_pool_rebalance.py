@@ -43,6 +43,9 @@ def _make_executor(
     *,
     enable_kv_pool_rebalance: bool = True,
     pp_size: int = 1,
+    tp_size: int = 1,
+    cp_size: int = 1,
+    enable_attention_dp: bool = False,
     kv_cache_transceiver=None,
     is_warmup: bool = False,
     is_shutdown: bool = False,
@@ -59,7 +62,8 @@ def _make_executor(
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
-    exe.dist = MagicMock(pp_size=pp_size)
+    exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
+    exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
     exe.is_warmup = is_warmup
     exe.is_shutdown = is_shutdown
@@ -108,6 +112,18 @@ class TestCanPauseForRebalance:
 
     def test_pp_size_gt_one_returns_false(self):
         exe = _make_executor(pp_size=2)
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_tp_size_gt_one_returns_false(self):
+        exe = _make_executor(tp_size=2)
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_cp_size_gt_one_returns_false(self):
+        exe = _make_executor(cp_size=2)
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_attention_dp_returns_false(self):
+        exe = _make_executor(enable_attention_dp=True)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
     def test_transceiver_present_returns_false(self):

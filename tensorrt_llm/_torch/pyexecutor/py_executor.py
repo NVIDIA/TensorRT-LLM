@@ -3111,10 +3111,27 @@ class PyExecutor:
         MVP scope: single-GPU aggregated, no in-flight disagg transfer,
         no beam search, no drafter, not during warmup or shutdown.
         Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
+
+        The rebalance hook makes its decision (``need_adjustment``) and
+        derives its target pool ratios from *rank-local* state only.  Any
+        multi-rank parallelism welds the executor loop together with
+        collectives (TP/CP all-reduce in the forward, attention-DP
+        ``tp_allgather`` of batch sizes, PP send/recv ring), so a rank that
+        pauses to ``adjust()`` while its peers proceed deadlocks NCCL.
+        Until cross-rank coordination is wired up, restrict to a single
+        rank.  ``pp_size``/``tp_size``/``cp_size`` cover tensor, context and
+        pipeline parallelism; ``enable_attention_dp`` covers attention data
+        parallelism (which can run with ``tp_size == 1`` per rank).
         """
         if not self.enable_kv_pool_rebalance:
             return False
         if self.dist.pp_size > 1:
+            return False
+        if self.dist.tp_size > 1:
+            return False
+        if self.dist.cp_size > 1:
+            return False
+        if self.enable_attention_dp:
             return False
         if self.kv_cache_transceiver is not None:
             return False
