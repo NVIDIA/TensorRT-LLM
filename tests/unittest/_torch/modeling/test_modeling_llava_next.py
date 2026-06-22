@@ -115,7 +115,7 @@ def test_llava_next_expand_prompt_token_ids_for_mm():
 
     image_token_id = LLAVA_NEXT_7B_CONFIG["image_token_index"]
     # In-vocab contract: placeholders stay as the real image_token_id (no legacy
-    # `vocab_size + 1` OOV remap); the model engine locates mm positions via
+    # ``vocab_size + 1`` OOV remap); the model engine locates mm positions via
     # torch.isin(input_ids, mm_token_ids).
     placeholder_id = image_token_id
 

@@ -2638,7 +2638,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
         # Expose the in-vocab context tokens to the model engine so
-        # `_prepare_multimodal_indices` selects the torch.isin predicate
+        # ``_prepare_multimodal_indices`` selects the torch.isin predicate
         # instead of the OOV fallback. Without this, the executor produces
         # empty mm_token_indices (img/sound IDs are < vocab_size), and the
         # propagated indices then trip the count-equality check inside

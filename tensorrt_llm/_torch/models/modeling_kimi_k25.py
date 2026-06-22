@@ -1695,13 +1695,13 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-            # The executor's `_prepare_multimodal_indices` now sees Kimi's
-            # in-vocab placeholder via `self.mm_token_ids` and emits indices
-            # that match `find_input_mm_embeds`'s active-chunk slice. The
-            # previous `(input_ids == placeholder).sum().item()` guard was a
+            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
+            # that match ``find_input_mm_embeds``'s active-chunk slice. The
+            # previous ``(input_ids == placeholder).sum().item()`` guard was a
             # host sync used to detect chunked-prefill / KV-reuse mismatches;
             # that mismatch surfaces as a row-count error inside
-            # `fuse_input_embeds` itself, so the explicit check is no longer
+            # ``fuse_input_embeds`` itself, so the explicit check is no longer
             # needed.
             if len(mm_embeds) > 0:
                 mm_token_ids = self.mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
