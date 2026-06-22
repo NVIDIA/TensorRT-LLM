@@ -106,6 +106,12 @@ def load_weight_shard(
     device: torch.device = torch.device('cpu'),
     return_slice_indices: bool = False,
 ) -> torch.Tensor:
+    """Legacy weight shard helper using ceil-divide sharding.
+
+    `Linear.load_shard` is preferred — it respects uneven-TP overrides, fused
+    QKV/gate-up sharding dicts, and quant-specific scale/packing semantics that
+    this function does not.
+    """
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
@@ -2923,8 +2929,11 @@ class Linear(nn.Module):
             'cutlass', 'cublaslt', 'cuda_core'
         ]
 
-        assert self.tp_mode in (TensorParallelMode.ROW,
-                                TensorParallelMode.COLUMN, None)
+        if self.tp_mode not in (TensorParallelMode.ROW,
+                                TensorParallelMode.COLUMN, None):
+            raise ValueError(
+                f"Invalid tp_mode {self.tp_mode!r}; expected ROW, COLUMN, or None."
+            )
 
         # Init TP sharding either from override or auto generated
         _uneven_tp_unsupported = {QuantAlgo.NVFP4_ARC}
@@ -3006,8 +3015,10 @@ class Linear(nn.Module):
     def _auto_tp_sharding(self, features, quant_config):
         """Auto-generate tp_sharding tuple based on quant alignment requirements.
 
-        For VANILLA mode only. Fused modes with non-divisible dims require
-        explicit override_tp_sharding from the model layer.
+        VANILLA mode only. Fused modes (FUSED_QKV, FUSED_GATE_UP) require explicit
+        override_tp_sharding because individual sub-weight sizes (Q vs K vs V; gate
+        vs up) are not knowable here — they aren't always equal (e.g. GQA), and
+        cross-rank consistency must be decided by the caller.
         """
         assert self.weights_loading_config.weight_mode == WeightMode.VANILLA, (
             f"_auto_tp_sharding only supports VANILLA mode, got "
@@ -3049,12 +3060,14 @@ class Linear(nn.Module):
             return end - start
 
     def calculate_local_in_features(self, in_features):
+        """Local input feature count after TP sharding (full size if not row-parallel)."""
         if self.tp_mode != TensorParallelMode.ROW:
             return in_features
 
         return self._calculate_local_features_helper(in_features)
 
     def calculate_local_out_features(self, out_features):
+        """Local output feature count after TP sharding (full size if not column-parallel)."""
         if self.tp_mode != TensorParallelMode.COLUMN:
             return out_features
 
@@ -3062,7 +3075,7 @@ class Linear(nn.Module):
 
     def load_shard(
         self,
-        weights: Dict,
+        weights: Union[Dict, torch.Tensor],
         label: Optional[str] = None,
         device: torch.device = torch.device('cpu'),
         name: Optional[str] = None,
@@ -3072,6 +3085,14 @@ class Linear(nn.Module):
         # 2 are packed in each 8 bit element of the tensor
         elm_packing: int = 1,
     ) -> torch.Tensor:
+        """Slice a weight tensor for this rank's TP shard.
+
+        Unified entry point for module-aware weight loading: respects
+        `self.tp_sharding` (uneven TP overrides, fused QKV/gate-up dicts) and
+        quant-specific knobs (`scale_span`, `elm_packing`). Pass `weights` as a
+        dict with `label` to pick the entry, or as a bare tensor when there's
+        only one. Supersedes the free function `load_weight_shard`.
+        """
         if label:
             if label not in weights:
                 return None

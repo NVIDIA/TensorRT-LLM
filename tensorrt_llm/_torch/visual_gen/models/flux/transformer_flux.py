@@ -495,6 +495,21 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_shard=(self.attn.local_q_dim_start, self.attn.local_q_dim_end),
         )
 
+        # MLP + Attn Output projection, requires special handling for TP
+        self.proj_out = FluxJointAttnMLPProj(
+            attn_dim=self.attn.q_dim,
+            mlp_dim=self.mlp_hidden_dim,
+            out_dim=dim,
+            bias=True,
+            dtype=dtype,
+            quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights,
+            force_dynamic_quantization=force_dynamic_quant,
+            config=config,
+            # need explicit shard because we are aligned on head boundaries
+            attn_shard=(self.attn.local_q_dim_start, self.attn.local_q_dim_end),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,

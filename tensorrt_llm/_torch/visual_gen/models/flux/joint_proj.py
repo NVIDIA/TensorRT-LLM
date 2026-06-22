@@ -63,7 +63,7 @@ class FluxJointAttnMLPProj(nn.Module):
         self.has_bias = bias
         self.attn_shard = attn_shard
 
-        assert attn_dim % self.tp_size == 0 or self.attn_shard, (
+        assert attn_dim % self.tp_size == 0 or self.attn_shard is not None, (
             "Explicit attention sharding required for uneven TP"
         )
 
@@ -197,6 +197,9 @@ class FluxJointQKVMLPProj(nn.Module):
             self.local_qkv_dim = q_dim + 2 * kv_dim
             self.local_mlp_dim = mlp_dim
         else:
+            assert override_qkv_sharding is not None, (
+                "override_qkv_sharding required when tp_size > 1"
+            )
 
             def range_size(r):
                 return r[1] - r[0]
