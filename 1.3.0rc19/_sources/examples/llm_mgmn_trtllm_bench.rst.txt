@@ -1,0 +1,8 @@
+Run trtllm-bench with pytorch backend on Slurm
+==============================================
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/a8c595521e306b8fa60ddeaa533152f8052e1ac1/examples/llm-api/llm_mgmn_trtllm_bench.sh.
+
+.. literalinclude:: ../../../examples/llm-api/llm_mgmn_trtllm_bench.sh
+    :lines: 1-46,50-130
+    :language: bash
+    :linenos:
