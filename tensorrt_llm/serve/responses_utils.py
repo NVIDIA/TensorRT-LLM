@@ -836,7 +836,9 @@ async def _create_input_tokens(
         mm_placeholder_counts=mm_placeholder_counts,
         enable_tokenize=True,
     )
-    token_ids, mm_data = await asyncio.gather(token_task, mm_coroutines)
+    token_ids, (mm_data,
+                _mm_embeddings) = await asyncio.gather(token_task,
+                                                       mm_coroutines)
 
     return token_ids, mm_data
 
