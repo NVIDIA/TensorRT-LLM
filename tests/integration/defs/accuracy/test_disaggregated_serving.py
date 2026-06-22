@@ -737,6 +737,49 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    @parametrize_with_ids("chunk_size_blocks", [64])
+    @parametrize_with_ids("enable_block_reuse", [False, True])
+    def test_chunked_kv_transfer_nixl_python_accuracy(self,
+                                                      chunk_size_blocks: int,
+                                                      enable_block_reuse: bool):
+        """Test chunked KV transfer accuracy using Python transceiver and C++ KVCacheManager."""
+        kv_cache_config = {
+            "use_kv_cache_manager_v2": False,
+            "enable_block_reuse": enable_block_reuse,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+            "chunk_size_blocks": chunk_size_blocks,
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+            },
+            "generation_servers": {
+                "num_instances": 1,
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     @pytest.mark.skip_less_device(2)
     def test_ngram(self):
         speculative_decoding_config = {

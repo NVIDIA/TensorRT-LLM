@@ -369,6 +369,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         release_queue = self._pending_prefix_releases
 
         def _on_chunk_transferred(request_id: int, chunk_block_offset: int, num_blocks: int):
+            logger.debug(
+                f"Early release _on_chunk_transferred: request_id: {request_id}, "
+                f"chunk_block_offset: {chunk_block_offset}, num_blocks: {num_blocks}"
+            )
             cumulative_blocks = chunk_block_offset + num_blocks
             release_queue.put((request_id, cumulative_blocks))
 

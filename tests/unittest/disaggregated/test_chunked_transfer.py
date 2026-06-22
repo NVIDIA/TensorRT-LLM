@@ -67,7 +67,6 @@ def _make_tx_session(num_slices: int, rid: int = 42, **kwargs) -> TxSession:
         request_id=rid,
         params=params,
         sender=_stub_sender(),
-        aux_slot=None,
         **kwargs,
     )
     for i in range(num_slices):
@@ -87,7 +86,6 @@ def _make_rx_session(num_slices: int, rid: int = 42) -> RxSession:
         request_id=rid,
         params=params,
         receiver=_stub_receiver(),
-        aux_slot=None,
     )
     for i in range(num_slices):
         s = KVSlice(
@@ -152,24 +150,20 @@ def test_tx_session_wait_complete_all_tasks():
     """TxSession.wait_complete blocks on all task futures."""
     session = _make_tx_session(3)
     for task in session.kv_tasks:
-        task.future.set_result(AgentResult.SUCCESS)
-        task.status = TaskStatus.TRANSFERRED
+        task.complete()
 
-    result = session.wait_complete(need_aux=False, timeout=1.0)
+    result = session.wait_complete()
     assert result == WaitResult.COMPLETED
 
 
 def test_tx_session_wait_complete_fails_on_partial_failure():
     """TxSession.wait_complete returns FAILED if any task fails."""
     session = _make_tx_session(3)
-    session.kv_tasks[0].future.set_result(AgentResult.SUCCESS)
-    session.kv_tasks[0].status = TaskStatus.TRANSFERRED
-    session.kv_tasks[1].future.set_result(AgentResult.FAILED)
-    session.kv_tasks[1].status = TaskStatus.ERROR
-    session.kv_tasks[2].future.set_result(AgentResult.SUCCESS)
-    session.kv_tasks[2].status = TaskStatus.TRANSFERRED
+    session.kv_tasks[0].complete()
+    session.kv_tasks[1].fail(RuntimeError("transfer failed"))
+    session.kv_tasks[2].complete()
 
-    result = session.wait_complete(need_aux=False, timeout=1.0)
+    result = session.wait_complete()
     assert result == WaitResult.FAILED
 
 
@@ -215,22 +209,19 @@ def test_rx_session_wait_complete_all_tasks():
     """RxSession.wait_complete blocks on all task futures."""
     session = _make_rx_session(3)
     for task in session._kv_tasks:
-        task.future.set_result(AgentResult.SUCCESS)
-        task.status = TaskStatus.TRANSFERRED
+        task.complete()
 
-    result = session.wait_complete(need_aux=False)
+    result = session.wait_complete()
     assert result == WaitResult.COMPLETED
 
 
 def test_rx_session_wait_complete_fails_on_partial_failure():
     """RxSession.wait_complete returns FAILED if any task fails."""
     session = _make_rx_session(2)
-    session._kv_tasks[0].future.set_result(AgentResult.SUCCESS)
-    session._kv_tasks[0].status = TaskStatus.TRANSFERRED
-    session._kv_tasks[1].future.set_exception(RuntimeError("transfer failed"))
-    session._kv_tasks[1].status = TaskStatus.ERROR
+    session._kv_tasks[0].complete()
+    session._kv_tasks[1].fail(RuntimeError("transfer failed"))
 
-    result = session.wait_complete(need_aux=False)
+    result = session.wait_complete()
     assert result == WaitResult.FAILED
 
 
@@ -383,17 +374,13 @@ def test_tx_session_mid_chunk_failure():
     """If one chunk fails mid-transfer, the session reports ERROR."""
     session = _make_tx_session(4)
 
-    session.kv_tasks[0].future.set_result(AgentResult.SUCCESS)
-    session.kv_tasks[0].status = TaskStatus.TRANSFERRED
-    session.kv_tasks[1].future.set_result(AgentResult.SUCCESS)
-    session.kv_tasks[1].status = TaskStatus.TRANSFERRED
-    session.kv_tasks[2].future.set_exception(RuntimeError("RDMA failed"))
-    session.kv_tasks[2].status = TaskStatus.ERROR
-    session.kv_tasks[3].future.set_result(AgentResult.SUCCESS)
-    session.kv_tasks[3].status = TaskStatus.TRANSFERRED
+    session.kv_tasks[0].complete()
+    session.kv_tasks[1].complete()
+    session.kv_tasks[2].fail(RuntimeError("RDMA failed"))
+    session.kv_tasks[3].complete()
 
     assert session.status == SessionStatus.ERROR
-    result = session.wait_complete(need_aux=False, timeout=1.0)
+    result = session.wait_complete()
     assert result == WaitResult.FAILED
 
 
@@ -401,15 +388,11 @@ def test_rx_session_mid_chunk_failure():
     """If one chunk fails mid-transfer on receiver, the session reports ERROR."""
     session = _make_rx_session(4)
 
-    session._kv_tasks[0].future.set_result(AgentResult.SUCCESS)
-    session._kv_tasks[0].status = TaskStatus.TRANSFERRED
-    session._kv_tasks[1].future.set_exception(RuntimeError("RDMA failed"))
-    session._kv_tasks[1].status = TaskStatus.ERROR
-    session._kv_tasks[2].future.set_result(AgentResult.SUCCESS)
-    session._kv_tasks[2].status = TaskStatus.TRANSFERRED
-    session._kv_tasks[3].future.set_result(AgentResult.SUCCESS)
-    session._kv_tasks[3].status = TaskStatus.TRANSFERRED
+    session._kv_tasks[0].complete()
+    session._kv_tasks[1].fail(RuntimeError("RDMA failed"))
+    session._kv_tasks[2].complete()
+    session._kv_tasks[3].complete()
 
     assert session.status == SessionStatus.ERROR
-    result = session.wait_complete(need_aux=False)
+    result = session.wait_complete()
     assert result == WaitResult.FAILED

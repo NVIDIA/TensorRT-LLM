@@ -2906,22 +2906,22 @@ void BlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 n
     // today (gated by should_store_blocks: not is_vswa in the executor and
     // beamWidth == 1 assertion in WindowBlockManager::releasePrefixBlocks).
     //
+    auto const windowSize = mWindowBlockManagers.cbegin()->first;
     // Snapshot the counter before iterating so that every WindowBlockManager
     // releases the same range.  Without this, the first manager would advance
-    // the shared mNumFrontBlocksRemoved counter and subsequent managers would
-    // see the counter already at the target, skipping their own blocks.
-    SizeType32 const startIdx = sequence.getNumFrontBlocksRemoved();
+    // the single-window front-block counter and subsequent managers would see
+    // the counter already at the target, skipping their own blocks.
+    SizeType32 const startIdx = sequence.getNumFrontBlocksRemoved(windowSize);
     for (auto& [_, manager] : mWindowBlockManagers)
     {
         manager.releasePrefixBlocks(sequence, startIdx, numBlocks);
     }
-    // Advance the shared counter once, after all managers have released.
+    // Advance the single-window counter once, after all managers have released.
     // Uses incrementNumFrontBlocksRemoved (counter-only) instead of
-    // removeFrontBlock so the intent is explicit and we do not depend on
-    // removeFrontBlock ignoring its windowSize argument.
-    while (sequence.getNumFrontBlocksRemoved() < numBlocks)
+    // removeFrontBlock so the intent is explicit.
+    while (sequence.getNumFrontBlocksRemoved(windowSize) < numBlocks)
     {
-        sequence.incrementNumFrontBlocksRemoved();
+        sequence.incrementNumFrontBlocksRemoved(windowSize);
     }
 }
 
@@ -3746,23 +3746,30 @@ void WindowBlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeTy
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     SizeType32 const target = std::min(numBlocks, static_cast<SizeType32>(allocatedBlocks.size()));
 
-    // Release blocks in range [startIdx, target).  The shared
-    // mNumFrontBlocksRemoved counter is advanced by BlockManager after
+    // Release blocks in range [startIdx, target).  The single-window
+    // front-block counter is advanced by BlockManager after
     // all WindowBlockManagers have processed the same range.
     for (SizeType32 blockIdx = startIdx; blockIdx < target; ++blockIdx)
     {
         auto& block = allocatedBlocks.at(blockIdx);
+        auto releasedBlock = block;
 
         TLLM_LOG_DEBUG("%s::releasePrefixBlocks - Releasing block %d from sequence %lu", mLogPrefix.c_str(),
-            block->getBlockId(), requestId);
+            releasedBlock->getBlockId(), requestId);
 
-        if (block->hasRefs())
+        // Replace the sequence slot with a placeholder, matching detachFrontBlock().
+        // removeSequence later walks allocatedBlocks in releaseBlocks(); leaving the
+        // real block here would release it a second time and corrupt the eviction
+        // policy's free-block count.
+        block = KVCacheBlock::createPlaceholder();
+
+        if (releasedBlock->hasRefs())
         {
-            block->decRefCount();
+            releasedBlock->decRefCount();
         }
-        if (!block->hasRefs())
+        if (!releasedBlock->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            mEvictionPolicy->releaseBlock(releasedBlock);
         }
     }
 }
@@ -3945,8 +3952,8 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
 
 void KVCacheManager::releasePrefixBlocks(RequestIdType requestId, SizeType32 numBlocks)
 {
-    // Hard precondition: BlockManager::releasePrefixBlocks advances the shared
-    // mNumFrontBlocksRemoved counter to numBlocks for every WindowBlockManager,
+    // Hard precondition: BlockManager::releasePrefixBlocks advances the
+    // single-window front-block counter to numBlocks for every WindowBlockManager,
     // even when a window has fewer than numBlocks allocated.  Under variable
     // sliding window attention (VSWA), that would cause WindowBlockManager::
     // releaseBlocks (called during removeSequence) to underrun rbegin() and

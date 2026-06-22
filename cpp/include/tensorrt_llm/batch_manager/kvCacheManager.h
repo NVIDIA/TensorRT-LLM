@@ -681,15 +681,13 @@ public:
         ++mNumFrontBlocksRemovedPerWindow.at(windowSize);
     }
 
-    //! \brief Advance ``mNumFrontBlocksRemoved`` without touching cache blocks.
+    //! \brief Advance the per-window front-block counter without touching cache blocks.
     //! \details Used by ``BlockManager::releasePrefixBlocks`` to advance the
-    //! shared front-block counter once after every ``WindowBlockManager`` has
-    //! processed the same prefix range.  Has clearer intent than calling
-    //! ``removeFrontBlock`` with a sentinel ``windowSize`` value, and is robust
-    //! to future changes that consume the ``windowSize`` argument.
-    void incrementNumFrontBlocksRemoved()
+    //! single-window front-block counter once after every ``WindowBlockManager`` has
+    //! processed the same prefix range.
+    void incrementNumFrontBlocksRemoved(SizeType32 windowSize)
     {
-        ++mNumFrontBlocksRemoved;
+        ++mNumFrontBlocksRemovedPerWindow.at(windowSize);
     }
 
     void removeLastBlock(SizeType32 windowSize)
@@ -989,7 +987,7 @@ public:
     //! for blocks whose data has already been transferred.  Reuses the
     //! detachFrontBlock mechanism (decRefCount + eviction policy release).
     //! Called by BlockManager::releasePrefixBlocks which coordinates the
-    //! shared mNumFrontBlocksRemoved counter across all window managers.
+    //! single-window front-block counter across all window managers.
     void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 startIdx, SizeType32 numBlocks);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
@@ -1535,7 +1533,7 @@ public:
 
     //! \brief Release the first numBlocks prefix blocks of a sequence.
     //! \details Mirrors detachFrontBlock logic: decRefCount + eviction policy
-    //! release for each prefix block.  The mNumFrontBlocksRemoved counter on
+    //! release for each prefix block.  The front-block counter on
     //! GenerationRequest ensures releaseBlocks (called during removeSequence)
     //! skips already-freed prefix blocks.
     void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks);
