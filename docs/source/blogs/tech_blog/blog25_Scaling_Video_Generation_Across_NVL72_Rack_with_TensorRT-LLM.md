@@ -456,7 +456,7 @@ Serving Diffusion Transformers for video generation is a different scaling probl
 
 The result is near-ideal scaling of the DiT denoising steps. On Wan 2.2 T2V-A14B, the `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe shrinks the DiT denoise loop ~53× from a single B200 to a full GB200 NVL72 rack (~41× end-to-end), and the *same* recipe applies unchanged to the 64B Cosmos3-Super (~49× denoise), confirming that the sequence-length sharding pattern generalizes across very different model sizes and sequence lengths. Concretely, a video clip that once took over five minutes to generate now finishes in ~9 seconds on the full GB200 NVL72 rack — and we expect the same approach to carry over to the next generation of longer, higher-resolution video models.
 
-## Picking the Right Configuration
+## Picking the Performant Configuration
 
 We allocate GPUs in order of how cleanly each axis scales. **CFG** comes first: it splits the two guidance streams, halving per-rank compute for a roughly 2× gain. **Ulysses** follows, sharding the sequence until it saturates the model's head count. The remaining GPUs go to **Attention2D**, kept as a symmetric grid so neither axis becomes the bottleneck. Finding the right balance between Ulysses and Attention2D is a matter of tuning: going from 64 to 72 GPUs, for instance, Ulysses drops from 8 to 4 and Attention2D widens to keep the grid square. Finally, VAE decode is tuned separately and scaled out only once it surfaces as the end-to-end bottleneck — a degree of 4 or 8 usually gives the best scaling.
 
