@@ -74,9 +74,7 @@ def submit_source_code_vulns(
                 risks_to_report.append(doc)
 
             bulk_documents.append(doc)
-
-        vulnerability_count = len(bulk_documents)
-        if vulnerability_count:
+        if bulk_documents:
             _, errors = es_post(ES_POST_URL, bulk_documents)
             if errors:
                 raise RuntimeError(
@@ -160,7 +158,7 @@ def submit_source_code_licenses(
                 map_preapproved, package_name, (component.get("type") or "").lower()
             ):
                 risks_to_report.append(doc)
-                sbom_documents.append(doc)
+            sbom_documents.append(doc)
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
             if sbom_errors:
@@ -296,7 +294,7 @@ def submit_container_licenses(
             map_preapproved, package_name, (v.get("type") or "").lower()
         ):
             risks_to_report.append(doc)
-            docs.append(doc)
+        docs.append(doc)
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
         if errors:
