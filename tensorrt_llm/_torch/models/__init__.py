@@ -7,6 +7,8 @@ import tensorrt_llm._torch.configs  # noqa: F401
 
 from .modeling_afmoe import AfmoeForCausalLM
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_bart import (BartForConditionalGeneration,
+                            MBartForConditionalGeneration)
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
@@ -26,6 +28,8 @@ from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
+from .modeling_minimaxm3 import (MiniMaxM3ForCausalLM,
+                                 MiniMaxM3VLForConditionalGeneration)
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
@@ -49,6 +53,7 @@ from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
 from .modeling_step3p7 import Step3p7ForCausalLM
 from .modeling_step3p7vl import Step3p7VLForConditionalGeneration
+from .modeling_t5 import T5ForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
@@ -56,6 +61,7 @@ from .modeling_vila import VilaModel
 __all__ = [
     "AfmoeForCausalLM",
     "AutoModelForCausalLM",
+    "BartForConditionalGeneration",
     "BertForSequenceClassification",
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
@@ -86,6 +92,8 @@ __all__ = [
     "Qwen2MoeForCausalLM",
     "SiglipVisionModel",
     "Starcoder2ForCausalLM",
+    "T5ForConditionalGeneration",
+    "MBartForConditionalGeneration",
     "get_model_architecture",
     "VilaModel",
     "Qwen2VLModel",
@@ -101,6 +109,8 @@ __all__ = [
     "Glm4MoeForCausalLM",
     "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
+    "MiniMaxM3ForCausalLM",
+    "MiniMaxM3VLForConditionalGeneration",
     "Cohere2ForCausalLM",
     "Step3p7ForCausalLM",
     "Step3p7VLForConditionalGeneration",

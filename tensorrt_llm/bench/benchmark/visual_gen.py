@@ -57,8 +57,6 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 @click.command(name="visual-gen", context_settings={"show_default": True})
 @click.option(
     "--visual_gen_args",
-    "--extra_visual_gen_options",
-    "visual_gen_args",
     type=str,
     default=None,
     help="Path to a YAML file with VisualGen engine args "
@@ -199,8 +197,8 @@ def visual_gen_command(
     """Benchmark VisualGen (image/video generation) models offline."""
     import yaml
 
-    from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     if prompt is None and prompt_file is None:
         raise click.UsageError("Either --prompt or --prompt_file must be specified.")

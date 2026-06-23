@@ -146,10 +146,10 @@ LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (Mo
 |---|---|
 | MoE backend | `CUTLASS` only (other backends raise an error at construction). |
 | Base-weight dtype | bf16 / fp16. Quantized base weights (FP8, NVFP4, INT4, INT8) are not yet supported. |
-| Adapter modules | `moe_h_to_4h` (gate side of SwiGLU), `moe_gate` (up side), `moe_4h_to_h` (down). At minimum, `moe_gate` and `moe_4h_to_h` must be present together. |
+| Adapter modules | `moe_h_to_4h` (gate side of SwiGLU), `moe_gate` (up side), `moe_4h_to_h` (down). `moe_h_to_4h` and `moe_4h_to_h` must both be present; `moe_gate` is optional (gated activations only). |
 | Adapter layout | Per-expert (stacked `[num_experts, ...]`). |
 | Multi-LoRA in flight | Yes. Reuses the existing slot manager. |
-| Execution paths | Eager only (CUDA-graph capture is rejected; see below). |
+| Execution paths | Eager, plus CUDA-graph capture/replay via the slot-indexed device path (see below). |
 | min-latency mode | Not supported with MoE LoRA. |
 | Alltoall (WideEP) | Not supported with MoE LoRA. |
 | DoRA on MoE modules | Not supported (and rejected at load time). |
@@ -164,9 +164,9 @@ from tensorrt_llm.lora_manager import LoraConfig
 lora_config = LoraConfig(
     lora_target_modules=[
         "attn_q", "attn_k", "attn_v",  # optional: standard attention LoRA
-        "moe_gate",                    # up projection (required for MoE LoRA)
+        "moe_h_to_4h",                 # gate/SiLU projection (required for MoE LoRA)
         "moe_4h_to_h",                 # down projection (required for MoE LoRA)
-        "moe_h_to_4h",                 # gate projection (SwiGLU; optional)
+        "moe_gate",                    # up/linear projection (optional; gated activations)
     ],
     max_lora_rank=16,
     max_loras=8,
@@ -203,11 +203,11 @@ fc1_adapter = make_per_expert_lora(
 
 #### CUDA-graph decode
 
-MoE LoRA runs in eager mode. CUDA-graph capture of a LoRA-active routed-expert MoE layer is not supported: the fused MoE kernel's LoRA path performs a host-side `cudaEventSynchronize` after a device-to-host pointer-expansion copy, which is not capturable. When CUDA-graph decode is enabled and an MoE LoRA is active, the fused MoE op detects the capturing stream and raises a clear error, so disable CUDA-graph capture when running MoE LoRA.
+CUDA-graph capture/replay of a LoRA-active routed-expert MoE layer is supported via the slot-indexed device path. In CUDA-graph decode, `CudaGraphLoraManager` drives a fully on-device slot→token expansion (no host-side `cudaEventSynchronize`), so the per-token `(rank, A, B)` tables are produced on the stream and reassigning a slot's adapter is reflected on replay without re-capture. The legacy per-request host path is not capturable: it performs a host-side `cudaEventSynchronize` after a device-to-host pointer-expansion copy, so when an MoE LoRA is active on that path the fused MoE op detects the capturing stream and raises a clear error.
 
 #### What is rejected, and where
 
-If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and CUDA-graph capture + LoRA.
+If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and CUDA-graph capture on the non-capturable per-request host path (use the slot-indexed device path for capture).
 
 ### Cache Management
 
