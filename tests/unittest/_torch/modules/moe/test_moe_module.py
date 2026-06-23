@@ -94,6 +94,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
     FP8QDQFusedMoEMethod,
     INT8WoqPerChannelFusedMoEMethod,
+    NVFP4CuteDslFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
@@ -350,7 +351,12 @@ def _run_eplb_test(
         "initial_expert_ids should be recorded before any forward pass"
     )
 
-    extra_steps = 1
+    # Run multiple iterations so online EPLB actually migrates several layers'
+    # experts between slots (roughly layer_updates_per_iter layers per step). A
+    # single step can pass even when migrated experts are laid out incorrectly,
+    # because few/no experts have moved yet -- exercise enough steps for the
+    # migration path (and any layout bug in it) to take effect.
+    extra_steps = 8
     for _ in range(extra_steps):
         output = run_forward_fn()
         ref_fused_moe.check_accuracy(output, ref_output)
@@ -1749,10 +1755,13 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
         }
         return method_map.get(quant_algo)
 
-    # CUTEDSL backend uses same methods as CUTLASS for quantization
+    # CUTEDSL backend shares the CUTLASS NVFP4 pipeline but applies an extra
+    # gate/up interleave on top, so it has its own quant method class. Using the
+    # Cutlass class here would hide CuteDsl-specific behavior (e.g. its online
+    # EPLB shared-weight layout handling).
     if backend_str == "CUTEDSL":
         method_map = {
-            QuantAlgo.NVFP4: NVFP4CutlassFusedMoEMethod,
+            QuantAlgo.NVFP4: NVFP4CuteDslFusedMoEMethod,
         }
         return method_map.get(quant_algo)
 
