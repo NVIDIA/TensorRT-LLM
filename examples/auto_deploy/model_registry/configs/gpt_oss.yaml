@@ -13,12 +13,12 @@ model_kwargs:
 attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false
-max_batch_size: 64
+max_batch_size: 128
 # Use higher max_num_tokens (e.g., 16384) for high throughput case (e.g., >= 128)
 max_num_tokens: 8192
 enable_chunked_prefill: true
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
@@ -47,4 +47,3 @@ transforms:
   fuse_add_rms_norm:
     enabled: true
 stream_interval: 20
-num_postprocess_workers: 4
