@@ -364,6 +364,11 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
   - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
+  # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
+  - examples/visual_gen/test_visual_gen.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
