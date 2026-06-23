@@ -97,6 +97,10 @@ class DisaggServerConfig():
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
     allow_request_chat_template: bool = False
+    # Drop conversation history from generation_only requests to shrink the gen
+    # worker's request body / JSON-parse GIL cost at high concurrency. Enable
+    # ONLY for text-only, non-harmony deployments (see _get_gen_request).
+    gen_strip_message_history: bool = False
 
 
 @dataclass
@@ -181,6 +185,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                            'context_first',
                            'generation_first'] = 'context_first',
                        allow_request_chat_template: bool = False,
+                       gen_strip_message_history: bool = False,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -230,6 +235,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.schedule_style = schedule_style
     config.allow_request_chat_template = validate_config_bool(
         allow_request_chat_template, "allow_request_chat_template")
+    config.gen_strip_message_history = gen_strip_message_history
     return config
 
 
