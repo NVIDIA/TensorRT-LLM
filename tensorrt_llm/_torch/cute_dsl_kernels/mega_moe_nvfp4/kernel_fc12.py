@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel for SM100."""
 
 from typing import Literal, Optional, Tuple, Type
@@ -55,31 +57,32 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
     _SmemMiscBudget = 1024
 
     def __init__(
-        self,
-        # Geometry.
-        mma_tiler_mnk: Tuple[int, int, int],
-        cluster_shape_mnk: Tuple[int, int, int],
-        use_2cta_instrs: bool,
-        # Fused fc1+fc2 scheduler knobs.
-        group_hint: int,
-        token_padding_block: int,
-        sf_padding_block: int,
-        load_balance_mode: Literal["static", "atomic_counter"] = "static",
-        # Optional scheduler/codegen knobs.
-        static_expert_shape: Optional[Tuple[int, int, int]] = None,
-        force_static_sched: bool = True,
-        clc_bundle_size: Optional[int] = None,
-        num_sched_stages: Optional[int] = None,
-        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        sf_vec_size: int = 16,
-        scenario: Literal["2Dx3D"] = "2Dx3D",
-        *,
-        fc2_output_dtype: Type[cutlass.Numeric],
-        non_ubulk_fc2_store: bool = True,
-        in_kernel_fc2_reduce: bool = False,
-        token_back_by_dispatch: bool = False,
-        apply_topk_in_fc1: bool = True,
-        gate_up_clamp: Optional[float] = None,
+            self,
+            # Geometry.
+            mma_tiler_mnk: Tuple[int, int, int],
+            cluster_shape_mnk: Tuple[int, int, int],
+            use_2cta_instrs: bool,
+            # Fused fc1+fc2 scheduler knobs.
+            group_hint: int,
+            token_padding_block: int,
+            sf_padding_block: int,
+            load_balance_mode: Literal["static", "atomic_counter"] = "static",
+            # Optional scheduler/codegen knobs.
+            static_expert_shape: Optional[Tuple[int, int, int]] = None,
+            force_static_sched: bool = True,
+            clc_bundle_size: Optional[int] = None,
+            num_sched_stages: Optional[int] = None,
+            acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+            sf_vec_size: int = 16,
+            scenario: Literal["2Dx3D"] = "2Dx3D",
+            *,
+            fc2_output_dtype: Type[cutlass.Numeric],
+            non_ubulk_fc2_store: bool = True,
+            in_kernel_fc2_reduce: bool = False,
+            token_back_by_dispatch: bool = False,
+            apply_topk_in_fc1: bool = True,
+            gate_up_clamp: Optional[float] = None,
+            epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -123,6 +126,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.token_back_by_dispatch = token_back_by_dispatch
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.gate_up_clamp = gate_up_clamp
+        self.epi_flag_batch = epi_flag_batch
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
@@ -142,6 +146,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.sched_warp_id = 7
         # Installed by token-comm subclasses.
         self.dispatch_warp_id: Optional[Tuple[int, int, int, int]] = None
+        self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
+        self.token_back_standalone: bool = False
         self.threads_per_cta = 32 * len((
             self.mma_warp_id,
             self.tma_a_warp_id,
@@ -161,7 +167,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # register allocation because setmaxnreg emission is gated by
         # ``self.enable_token_comm`` inside the device kernel.
         self.epi_reg_cnt = 256
-        self.task_reg_cnt = 96
+        self.task_reg_cnt = 72
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
@@ -322,6 +328,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             non_ubulk_fc2_store=self.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
             token_back_by_dispatch=self.token_back_by_dispatch,
+            epi_flag_batch=self.epi_flag_batch,
             acc_dtype=self.acc_dtype,
             allow_overlap_acc=True,
             static_expert_shape=self.static_expert_shape,
@@ -597,6 +604,18 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         tidx,
     ):
         """Subclass dispatch warp body; no-op in the lean kernel."""
+
+    @cute.jit
+    def token_comm_hook_token_back_warp_body(
+        self,
+        token_comm_args,
+        token_comm_storage,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        """Subclass standalone token-back warp body; no-op in the lean kernel."""
 
     @cute.jit
     def token_comm_hook_kernel_tail(
@@ -1834,7 +1853,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         spin_wait(
                             counter_ptr,
                             lambda v: v >= fc2_spin_threshold,
-                            fail_sleep_cycles=20,
+                            fail_sleep_cycles=500,
                         )
                         iket.range_pop()
 
@@ -2023,8 +2042,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     ab_consumer.reset()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if k_tile_cnt > 0:
+                        iket.range_push("mma_acquire")
                         peek_ab_full_status = ab_consumer.try_wait()
                         acc_pipeline.producer_acquire(acc_producer_state)
+                        iket.range_pop()
 
                     # Apply TMEM pointer offset hack when mma_tiler_n == 64.
                     tCtSFB_mma = tCtSFB
@@ -2151,13 +2172,31 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
 
                 lane_idx_for_dispatch = cute.arch.lane_idx()
-                self.token_comm_hook_dispatch_warp_body(
-                    token_comm_args,
-                    token_comm_storage,
-                    warp_idx=warp_idx,
-                    lane_idx=lane_idx_for_dispatch,
-                    tidx=tidx,
-                )
+                if cutlass.const_expr(self.token_back_standalone):
+                    if warp_idx < self.token_back_warp_id[0]:
+                        self.token_comm_hook_dispatch_warp_body(
+                            token_comm_args,
+                            token_comm_storage,
+                            warp_idx=warp_idx,
+                            lane_idx=lane_idx_for_dispatch,
+                            tidx=tidx,
+                        )
+                    else:
+                        self.token_comm_hook_token_back_warp_body(
+                            token_comm_args,
+                            token_comm_storage,
+                            warp_idx=warp_idx,
+                            lane_idx=lane_idx_for_dispatch,
+                            tidx=tidx,
+                        )
+                else:
+                    self.token_comm_hook_dispatch_warp_body(
+                        token_comm_args,
+                        token_comm_storage,
+                        warp_idx=warp_idx,
+                        lane_idx=lane_idx_for_dispatch,
+                        tidx=tidx,
+                    )
 
         # ════════════════════════════════════════════════════════════════════
         # Kernel tail hook (MegaMoE-only path; lean base = no-op)

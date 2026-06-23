@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Sched extension for fused fc1+fc2 work-tile enrichment and GMEM slicing."""
 
 from typing import List, Optional, Tuple, Union
@@ -39,6 +41,9 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         cumulative_token_block_count: Int32,
         valid_tokens_in_tile: Int32,
         phase_and_peek: Int32,
+        # Transient scheduler field — carried through MLIR serialization but
+        # NOT written to SMEM.  Default: tile_n_idx (correct for swap-AB).
+        fc1_counter_index: Int32,
     ):
         # Slot 3 reuses base k_tile_cnt storage.
         super().__init__(
@@ -56,6 +61,7 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         # consumers call them directly so the codebase reads as if the
         # two pieces were separate fields.
         self.phase_and_peek = phase_and_peek
+        self.fc1_counter_index = fc1_counter_index
 
     @property
     def phase(self) -> Int32:
@@ -83,11 +89,12 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
         values.extend(extract_mlir_values(self.cumulative_token_block_count))
         values.extend(extract_mlir_values(self.valid_tokens_in_tile))
         values.extend(extract_mlir_values(self.phase_and_peek))
+        values.extend(extract_mlir_values(self.fc1_counter_index))
         return values
 
     def __new_from_mlir_values__(
             self, values: List[ir.Value]) -> "SwapABSwigluFp4Fc12WorkTileInfo":
-        assert len(values) == 8
+        assert len(values) == 9
         return SwapABSwigluFp4Fc12WorkTileInfo(
             expert_idx=new_from_mlir_values(self.expert_idx, [values[0]]),
             tile_m_idx=new_from_mlir_values(self.tile_m_idx, [values[1]]),
@@ -102,6 +109,8 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
                                                       [values[6]]),
             phase_and_peek=new_from_mlir_values(self.phase_and_peek,
                                                 [values[7]]),
+            fc1_counter_index=new_from_mlir_values(self.fc1_counter_index,
+                                                   [values[8]]),
         )
 
     def to_rmem(self) -> cute.Tensor:
@@ -127,6 +136,7 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
             cumulative_token_block_count=rmem[5],  # type: ignore[arg-type]
             valid_tokens_in_tile=rmem[6],  # type: ignore[arg-type]
             phase_and_peek=rmem[7],  # type: ignore[arg-type]
+            fc1_counter_index=rmem[2],  # type: ignore[arg-type]
         )
 
 
@@ -248,9 +258,9 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             # Same slot index for both phases -- fc1 release-add (dispatch
             # pull) and fc2 release-add (fc1 epi) target the per-task-tile
             # counter slot indexed by ``cumulative_token_block_count +
-            # tile_n_idx``.
+            # fc1_counter_index``.
             counter_slot = (base_work.cumulative_token_block_count +
-                            base_work.tile_n_idx)
+                            base_work.fc1_counter_index)
             is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
             is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
 
@@ -301,6 +311,7 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
             cumulative_token_block_count=base_work.cumulative_token_block_count,
             valid_tokens_in_tile=base_work.valid_tokens_in_tile,
             phase_and_peek=new_phase_and_peek,
+            fc1_counter_index=base_work.fc1_counter_index,
         )
 
     # --------------------------------------------------------------
@@ -408,3 +419,152 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
     @cute.jit
     def prefetch_for_expert(self, expert_idx: Int32) -> None:
         """No-op: swap-AB makes every TMA desc tile-invariant in both phases."""
+
+
+class GluMxFp8Fc12SchedExtension(SwapABSwigluFp4Fc12SchedExtension):
+    """Sched extension for the fused fc1+fc2 GLU MXFP8 kernel.
+    """
+
+    def __init__(
+        self,
+        sf_vec_size: int,
+        fc1_done_counter_ptr: Pointer,
+        fc2_spin_threshold: Union[int, Int32],
+        fc1_ready_counter_ptr: Optional[Pointer] = None,
+    ):
+        super().__init__(
+            sf_vec_size=sf_vec_size,
+            fc1_done_counter_ptr=fc1_done_counter_ptr,
+            fc2_spin_threshold=fc2_spin_threshold,
+            fc1_ready_counter_ptr=fc1_ready_counter_ptr,
+        )
+
+    def __new_from_mlir_values__(
+            self, values: List[ir.Value]) -> "GluMxFp8Fc12SchedExtension":
+        base = super().__new_from_mlir_values__(values)
+        result = GluMxFp8Fc12SchedExtension.__new__(GluMxFp8Fc12SchedExtension)
+        result.workspace = base.workspace
+        result.sf_vec_size = base.sf_vec_size
+        result.fc1_done_counter_ptr = base.fc1_done_counter_ptr
+        result.fc2_spin_threshold = base.fc2_spin_threshold
+        result.fc1_ready_counter_ptr = base.fc1_ready_counter_ptr
+        return result
+
+    @cute.jit
+    def enrich_work_tile_info(
+        self,
+        base_work: SwapABSwigluFp4Fc12WorkTileInfo,
+    ) -> SwapABSwigluFp4Fc12WorkTileInfo:
+        """Delegate to base; defined here so ``ext`` keeps one MLIR struct across warps."""
+        return SwapABSwigluFp4Fc12SchedExtension.enrich_work_tile_info(
+            self, base_work)
+
+    @cute.jit
+    def prefetch_for_expert(self, expert_idx: Int32) -> None:
+        """No-op on subclass for the same reason as ``enrich_work_tile_info``."""
+
+    @cute.jit
+    def get_gmem_tensor(
+        self,
+        tensor_name: str,
+        gmem_tensor_in_moe_view: cute.Tensor,
+        work_tile_info: SwapABSwigluFp4Fc12WorkTileInfo,
+    ) -> Tuple[cute.Tensor, Optional[Pointer]]:
+        """Phase-invariant GMEM slice for the operands."""
+        expert_idx = work_tile_info.expert_idx
+        data_token_offset = work_tile_info.cumulative_data_physical_row
+        sf_token_offset = work_tile_info.cumulative_sf_physical_row
+
+        shape = gmem_tensor_in_moe_view.shape
+        stride = gmem_tensor_in_moe_view.stride
+        c1 = cutlass.Int32(1)
+        sf_vec_size = self.sf_vec_size
+
+        if cutlass.const_expr(tensor_name == "fc1_activation"):
+            real = cute.domain_offset((data_token_offset, 0, 0),
+                                      gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(
+                real, (shape[0], shape[1], c1))  # type: ignore[index]
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc1_weight"):
+            real = cute.domain_offset((0, 0, expert_idx),
+                                      gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(
+                real, (shape[0], shape[1], c1))  # type: ignore[index]
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc1_activation_sf"):
+            real = cute.domain_offset((sf_token_offset, 0, 0),
+                                      gmem_tensor_in_moe_view)
+            per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc1_weight_sf"):
+            real = cute.domain_offset((0, 0, expert_idx),
+                                      gmem_tensor_in_moe_view)
+            per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "d"):
+            real = cute.domain_offset((data_token_offset, 0, 0),
+                                      gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(
+                real, (shape[0], shape[1], c1))  # type: ignore[index]
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "sfd"):
+            real = cute.domain_offset((sf_token_offset, 0, 0),
+                                      gmem_tensor_in_moe_view)
+            per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "topk"):
+            real = cute.domain_offset((data_token_offset, ),
+                                      gmem_tensor_in_moe_view)
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc2_activation"):
+            # fc2 A-side = fc1_output (token-indexed, same formula as "b")
+            real = cute.domain_offset((data_token_offset, 0, 0),
+                                      gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc2_activation_sf"):
+            # fc2 SFA = fc1_output_sf (token-indexed sf)
+            real = cute.domain_offset((sf_token_offset, 0, 0),
+                                      gmem_tensor_in_moe_view)
+            per_expert_shape = (shape[0], shape[1], c1)
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc2_weight"):
+            # fc2 B-side = fc2_weight (expert-indexed)
+            real = cute.domain_offset((0, 0, expert_idx),
+                                      gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "fc2_weight_sf"):
+            # fc2 SFB = fc2_weight_sf (expert-indexed)
+            real = cute.domain_offset((0, 0, expert_idx),
+                                      gmem_tensor_in_moe_view)
+            per_expert_shape = (shape[0], shape[1], c1)
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride))
+            return (real, None)
+
+        raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")
