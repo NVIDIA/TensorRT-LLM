@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
@@ -114,6 +115,19 @@ bool beneficialToSkip(std::optional<kv_cache_manager::PrefixReuseSummary> const&
     return false;
 }
 
+template <typename KVCacheManagerT>
+void checkRequiredCrossKvCacheManager(
+    LlmRequestState noScheduleUntilState, OptionalRef<KVCacheManagerT> crossKvCacheManager)
+{
+    if (noScheduleUntilState != LlmRequestState::kENCODER_INIT)
+    {
+        return;
+    }
+
+    TLLM_CHECK_WITH_INFO(
+        static_cast<bool>(crossKvCacheManager), "Encoder-decoder scheduling requires a cross_kv_cache_manager.");
+}
+
 } // namespace
 
 MaxRequestsScheduler::MaxRequestsScheduler(
@@ -191,6 +205,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
     RequestVector scheduledRequests;
+
+    checkRequiredCrossKvCacheManager(getNoScheduleUntilState(), crossKvCacheManager);
 
     // Now check if we can add pending requests
     auto const maxPeftCachePages
@@ -287,6 +303,12 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 // eliminating 2 redundant walks per request.
                 bool const isFirstChunkContext
                     = req->isContextInitState() && req->isFirstContextChunk() && !req->isDisaggGenerationInitState();
+                // Encoder-init requests do not consume self- or cross-KV
+                // blocks. We still keep the cross reuse summary available for
+                // beneficial-to-skip so duplicate encoder inputs can be ordered
+                // consistently before their decoder-context admission budgets
+                // the cross pool.
+                bool const isEncoderInit = req->isEncoderInitState();
                 std::optional<kv_cache_manager::PrefixReuseSummary> summary;
                 std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;
                 if (isFirstChunkContext)
@@ -305,9 +327,15 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                         crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                     }
                 }
-
+                else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                    && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                {
+                    // Encoder admission only needs the cross summary for reuse ordering.
+                    auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
+                    crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                }
                 // Beneficial-to-skip check using the cached summary
-                if (!StaticBatchScheduling && skippingIsRelevant && isFirstChunkContext
+                if (!StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit)
                     && beneficialToSkip(
                         summary, crossSummary, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
                 {
@@ -319,7 +347,23 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     break;
                 }
 
-                if (req->isContextInitState() || req->isDisaggGenerationInitState())
+                if (isEncoderInit)
+                {
+                    bool reqHasLora = req->getLoraTaskId().has_value();
+                    bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
+                    auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+
+                    if (neededPeftPages <= availablePeftPages)
+                    {
+                        scheduledRequests.emplace_back(req);
+                        availablePeftPages -= neededPeftPages;
+                        if (isNewTask)
+                        {
+                            uniqTaskIds.insert(req->getLoraTaskId().value());
+                        }
+                    }
+                }
+                else if (req->isContextInitState() || req->isDisaggGenerationInitState())
                 {
                     // Check block availability using the cached summary when available.
                     // enoughAvailableBlocks is check-only (no decrement) — safe if cross check fails.
@@ -364,15 +408,23 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 // the remote diff is easier to look at/rebase conflicts
 bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, SizeType32 maxNumRequests,
     RequestVector& scheduledRequests, kv_cache_manager::MaxUtilizationScheduledBlocksManager& blocksManager,
+    std::optional<kv_cache_manager::MaxUtilizationScheduledBlocksManager>& crossBlocksManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
     std::unordered_set<uint64_t>& seenTaskIds,
     std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary);
 
 std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
-    kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
-    RequestList const& activeRequests) const
+    kv_cache_manager::BaseKVCacheManager& kvCacheManager,
+    OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager,
+    OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
+    checkRequiredCrossKvCacheManager(getNoScheduleUntilState(), crossKvCacheManager);
+
     kvCacheManager.startScheduling();
+    if (crossKvCacheManager)
+    {
+        crossKvCacheManager->startScheduling();
+    }
 
     // The optimization of delaying requests won't work for variable window attention
     bool skippingIsRelevant = !kvCacheManager.getBlockManager().isVariableWindow();
@@ -380,6 +432,14 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     // Keep track of number of requests and block needed for the scheduled requests
     auto scheduledBlocksManager
         = kv_cache_manager::MaxUtilizationScheduledBlocksManager(kvCacheManager, mTwoStepsLookAhead);
+    // Mirror the budget tracker for the cross pool when present.
+    // Encoder-init requests do not consume either tracker; decoder
+    // context/generation requests update both trackers in lockstep.
+    std::optional<kv_cache_manager::MaxUtilizationScheduledBlocksManager> scheduledCrossBlocksManager;
+    if (crossKvCacheManager)
+    {
+        scheduledCrossBlocksManager.emplace(*crossKvCacheManager, mTwoStepsLookAhead);
+    }
     SizeType32 numScheduledPeftPages{0};
     std::unordered_set<uint64_t> seenTaskIds;
 
@@ -391,7 +451,9 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager);
     }
 
-    // Find last active in case we need to evict
+    // Find last active in case we need to evict.  Encoder-init requests are
+    // intentionally excluded here: they hold no started self- or cross-pool
+    // blocks, so pausing them would not free any KV budget.
     auto startedReqLambda = [this](std::shared_ptr<LlmRequest> const& req)
     {
         return (req->hasReachedState(getNoScheduleUntilState()) && !req->hasReachedState(getNoScheduleAfterState())
@@ -441,8 +503,9 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
             continue;
         }
 
-        bool const wasScheduled = trySchedulingRequestMaxUtilization(req, mMaxNumRequests, scheduledRequests,
-            scheduledBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds, summary);
+        bool const wasScheduled
+            = trySchedulingRequestMaxUtilization(req, mMaxNumRequests, scheduledRequests, scheduledBlocksManager,
+                scheduledCrossBlocksManager, peftCacheManager, numScheduledPeftPages, seenTaskIds, summary);
         if (wasScheduled)
         {
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu -> start", req->mRequestId);
@@ -459,6 +522,13 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
                 // from the end of the vector and try again
                 // Here we simulate freeing the kvCache blocks associated with that sequence
                 kvCacheManager.schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
+                if (crossKvCacheManager)
+                {
+                    // Mirror self-pool eviction on the cross pool so any cross
+                    // blocks held by the paused request are released for reuse
+                    // by other admissions in this iteration.
+                    crossKvCacheManager->schedulingRemoveSequence((*lastStartedReqIt)->mRequestId);
+                }
                 pausedRequests.emplace_back(*lastStartedReqIt);
                 TLLM_LOG_INFO("MaxUtilizationScheduler: request ID %lu -> pause", (*lastStartedReqIt)->mRequestId);
                 reqItEnd = std::next(lastStartedReqIt).base();
@@ -475,6 +545,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 
 bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, SizeType32 maxNumRequests,
     RequestVector& scheduledRequests, kv_cache_manager::MaxUtilizationScheduledBlocksManager& blocksManager,
+    std::optional<kv_cache_manager::MaxUtilizationScheduledBlocksManager>& crossBlocksManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32& numScheduledPeftPages,
     std::unordered_set<uint64_t>& seenTaskIds, std::optional<kv_cache_manager::PrefixReuseSummary> const& cachedSummary)
 {
@@ -486,16 +557,51 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
             = (isNewTask && peftCacheManager) ? peftCacheManager->determineNumPages(req) : 0;
         TLLM_LOG_DEBUG(
             "MaxUtilizationScheduler: request ID %lu required peft pages: %i", req->mRequestId, numRequiredPeftPages);
-        // Use the cached summary when available to avoid a redundant tree walk
-        auto const scheduledBlocksIfFitsKvCache
-            = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(*req, cachedSummary);
         bool fitsPeft
             = (peftCacheManager ? numRequiredPeftPages + numScheduledPeftPages <= peftCacheManager->getMaxDevicePages()
                                 : true);
 
+        if (req->isEncoderInitState())
+        {
+            // Encoder admission does not reserve KV blocks. The scheduler
+            // entry point verifies the cross manager globally before encoder
+            // work can be admitted.
+            if (fitsPeft)
+            {
+                numScheduledPeftPages += numRequiredPeftPages;
+                scheduledRequests.emplace_back(req);
+                if (isNewTask)
+                {
+                    seenTaskIds.insert(req->getLoraTaskId().value());
+                }
+                return true;
+            }
+            return false;
+        }
+
+        // Use the cached summary when available to avoid a redundant tree walk
+        auto const scheduledBlocksIfFitsKvCache
+            = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(*req, cachedSummary);
+        // Context/generation requests must fit in both pools when a cross
+        // manager is present.  Self-pool fit is checked first so that the
+        // budget probe is cheap when self is already saturated.
+        std::optional<std::map<SizeType32, SizeType32>> crossScheduledIfFits;
+        if (crossBlocksManager)
+        {
+            crossScheduledIfFits = crossBlocksManager->prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);
+            if (!crossScheduledIfFits)
+            {
+                return false;
+            }
+        }
+
         if (scheduledBlocksIfFitsKvCache && fitsPeft)
         {
             blocksManager.updateScheduledBlocks(scheduledBlocksIfFitsKvCache.value());
+            if (crossScheduledIfFits)
+            {
+                crossBlocksManager->updateScheduledBlocks(crossScheduledIfFits.value());
+            }
             numScheduledPeftPages += numRequiredPeftPages;
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: scheduled peft pages: %i", numRequiredPeftPages);
             scheduledRequests.emplace_back(req);
@@ -550,7 +656,7 @@ void CapacityScheduler::setAgentTreeReorderPolicy(
 std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::operator()(RequestList const& activeRequests,
     OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager,
-    OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager) const
+    OptionalRef<kv_cache_manager::BaseKVCacheManager> crossKvCacheManager) const
 {
     NVTX3_SCOPED_RANGE(capacitySchedulerScheduling);
 
@@ -570,7 +676,7 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, MaxUtilizationScheduler>)
             {
                 std::tie(tmpFittingRequests, pausedRequests)
-                    = scheduler(*kvCacheManager, peftCacheManager, requestsToSchedule);
+                    = scheduler(*kvCacheManager, crossKvCacheManager, peftCacheManager, requestsToSchedule);
             }
             else if constexpr (std::is_same_v<std::decay_t<decltype(scheduler)>, GuaranteedNoEvictScheduler>
                 || std::is_same_v<std::decay_t<decltype(scheduler)>, StaticBatchScheduler>)

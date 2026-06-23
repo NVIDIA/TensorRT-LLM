@@ -526,7 +526,6 @@ def get_model_yaml_config(model_label: str,
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3,
-                    'allow_advanced_sampling': True,
                 },
             }
         },

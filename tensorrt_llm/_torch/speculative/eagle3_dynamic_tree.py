@@ -904,6 +904,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         offset=self.offset,
                         d2t=self._d2t,
                         skip_all_sampling_params=skip_all_sampling_params,
+                        # During CUDA graph capture bake top_k_max=0 so the
+                        # full-sort (always-correct) path is captured. Outside
+                        # capture, pass the pre-computed value for the fast
+                        # topk(kMax) path.
+                        top_k_max=(
+                            0
+                            if torch.cuda.is_current_stream_capturing()
+                            else getattr(spec_metadata, "top_k_max", None)
+                        ),
                     )
                 )
 
@@ -967,7 +976,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         Returns:
             True if rejection sampling is enabled and the draft logit buffer is allocated
         """
-        return spec_metadata.use_rejection_sampling and self._draft_depth_logits_cat is not None
+        # Skip rejection sampling when the whole batch is greedy: argmax is
+        # equivalent and avoids the rejection kernel cost.
+        # Also skip during CUDA graph capture/replay: the rejection ops use
+        # dynamic memory allocation (full-sort fallback) which is incompatible
+        # with stream capture.
+        return (
+            spec_metadata.use_rejection_sampling
+            and self._draft_depth_logits_cat is not None
+            and not spec_metadata.is_all_greedy_sample
+            and not spec_metadata.is_cuda_graph
+        )
 
     def _finalize_dynamic_tree_verify_outputs(
         self,
