@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Static sync test for the inline ``thop.attention(...)`` call in
-``TrtllmAttention._run``.
+"""Static sync test for the fallback ``thop.attention(...)`` call in
+``FallbackFmha.forward``.
 
 That call is the single explicit-kwarg call site for the C++ ``thop.attention``
 binding. This test parses both the call site (Python AST) and the C++
@@ -20,7 +20,7 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
 
 1. Every C++ parameter name appears at the call site (and nothing extra).
 2. Every call-site kwarg sourced as ``root.attr[.attr...]`` resolves on
-   exactly one of ``self`` / ``metadata`` / ``forward_args``, and its
+   exactly one of ``attn`` / ``metadata`` / ``forward_args``, and its
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
@@ -42,27 +42,28 @@ import textwrap
 import typing
 from dataclasses import fields
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
-from tensorrt_llm._torch.attention_backend.trtllm import (
+from tensorrt_llm._torch.attention_backend.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
+    FallbackFmha,
 )
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 # Roots used as the LHS of attribute chains at the call site. Match the
-# parameter names inside ``TrtllmAttention._run``.
+# names inside ``FallbackFmha.forward``.
 _SOURCE_CLASSES = {
-    "self": TrtllmAttention,
+    "attn": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
     "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
 }
 
 _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "beam_width": ("metadata", ("effective_beam_width",)),
     "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
-    "head_size": ("self", ("head_dim",)),
+    "head_size": ("attn", ("head_dim",)),
     "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
     "host_past_key_value_lengths": ("metadata", ("kv_lens_runtime",)),
     "host_request_types": ("metadata", ("host_request_types_runtime",)),
@@ -199,8 +200,9 @@ def _binding_types() -> dict[str, str]:
 
 
 def _parse_thop_attention_call() -> ast.Call:
-    """Locate the single ``thop.attention(...)`` call inside ``_run``."""
-    src = textwrap.dedent(inspect.getsource(TrtllmAttention._run))
+    """Locate the single ``thop.attention(...)`` call inside
+    ``FallbackFmha.forward``."""
+    src = textwrap.dedent(inspect.getsource(FallbackFmha.forward))
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if (
@@ -211,7 +213,7 @@ def _parse_thop_attention_call() -> ast.Call:
             and node.func.value.id == "thop"
         ):
             return node
-    raise AssertionError("Could not find thop.attention(...) call in TrtllmAttention._run")
+    raise AssertionError("Could not find thop.attention(...) call in FallbackFmha.forward")
 
 
 def _attribute_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
@@ -504,8 +506,9 @@ def _self_attrs_in_property(prop: property) -> set[str]:
 
 
 def _collect_chains(root: str) -> set[tuple[str, ...]]:
-    """All attribute paths in ``_run`` that start with ``Name(root).``."""
-    src = textwrap.dedent(inspect.getsource(TrtllmAttention._run))
+    """All attribute paths in ``FallbackFmha.forward`` that start with
+    ``Name(root).``."""
+    src = textwrap.dedent(inspect.getsource(FallbackFmha.forward))
     chains: set[tuple[str, ...]] = set()
     for node in ast.walk(ast.parse(src)):
         if not isinstance(node, ast.Attribute):
@@ -568,7 +571,7 @@ def test_every_forward_args_field_is_consumed():
 
 def test_no_unexpected_other_kwargs():
     """The only call-site kwargs that aren't ``source.attr`` chains or
-    allowlisted literals are the ``_run`` positional parameters."""
+    allowlisted literals are the ``FallbackFmha.forward`` parameters."""
     _, _, other_kwargs = _classify_kwargs()
     expected = {"q", "k", "v"}
     unexpected = other_kwargs - expected

@@ -32,6 +32,7 @@ The following is a table of supported models for the PyTorch backend:
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
 | `MiniMaxM2ForCausalLM` [^5]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
+| `MiniMaxM3SparseForConditionalGeneration` [^11]| MiniMax-M3                       | `MiniMaxAI/MiniMax-M3`                      |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
@@ -72,6 +73,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Yes            | N/A                      | Untested              | Untested        |
 | `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | No  | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | Yes | No               | No                | No     | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
+| `MiniMaxM3SparseForConditionalGeneration` [^11] | Yes               | Yes        | Yes                        | Untested              | Untested        | No  | No               | No                | No     | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
@@ -82,6 +84,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^8]: Supports text and image inputs. The vision tower runs in BF16 even when the text decoder is quantized (FP8 block-scale or NVFP4). The text decoder is also usable standalone (text-only) via the `Step3p5ForCausalLM` architecture.
 [^9]: Audio modality only supported on E2B/E4B variants.
 [^10]: Audio requires a checkpoint with a `sound_config` and is supported only on the full (non-disaggregated) model path, not the EPD disaggregated path.
+[^11]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
@@ -103,6 +106,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
 | `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested         | Untested       | Untested              | Untested                  | L + I     |
 | `Cosmos3ForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Untested              | Untested                  | L + I + V |
+| `MiniMaxM3SparseForConditionalGeneration` [^11] | Yes               | Yes        | Untested        | Yes           | Untested         | No             | Untested              | Untested                  | L + I + V |
 
 Note:
 - L: Language
