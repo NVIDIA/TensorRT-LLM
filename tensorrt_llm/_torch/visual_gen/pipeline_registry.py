@@ -57,6 +57,7 @@ class PipelineComponent(str, Enum):
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
     SOUND_TOKENIZER = "sound_tokenizer"
+    GUIDER = "guider"
 
 
 @dataclass
@@ -187,6 +188,9 @@ class AutoPipeline:
 
             if "Cosmos3" in class_name:
                 return "Cosmos3OmniMoTPipeline"
+
+            if "HunyuanVideo15" in class_name:
+                return "HunyuanVideo15Pipeline"
 
         #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2 specific)
