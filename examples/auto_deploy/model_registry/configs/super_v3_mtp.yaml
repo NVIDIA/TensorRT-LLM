@@ -19,6 +19,9 @@ speculative_config:
   num_nextn_predict_layers: 6
   mtp_eagle_one_model: true
 transforms:
+  compile_model:
+    # MTP speculative decoding does not support piecewise CUDA graph capture yet.
+    piecewise_enabled: false
   detect_sharding:
     allreduce_strategy: NCCL
     # NOTE: add 'tp' to sharding dims only for high-throughput runs

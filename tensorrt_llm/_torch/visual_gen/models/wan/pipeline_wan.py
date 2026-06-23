@@ -1,3 +1,4 @@
+import os
 import time
 from typing import List, Optional, Union
 
@@ -112,6 +113,18 @@ class WanPipeline(BasePipeline):
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
+        # Fixed latent for reproducible benchmarking (e.g. MLPerf).
+        # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
+        # noise tensor; it will be used in place of freshly sampled random latents for
+        # all T2V requests.  Loaded once at server startup, reused across requests.
+        self._fixed_latent: Optional[torch.Tensor] = None
+        _fixed_latent_path = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
+        if _fixed_latent_path:
+            self._fixed_latent = torch.load(_fixed_latent_path, weights_only=True)
+            logger.warning(
+                f"Loaded fixed latent from {_fixed_latent_path}, shape={self._fixed_latent.shape}"
+            )
+
         super().__init__(pipeline_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
@@ -122,7 +135,10 @@ class WanPipeline(BasePipeline):
         calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
-        t_freq = ce.timesteps_proj(timestep)
+        # The forward path receives normalized timesteps. TeaCache coefficients
+        # were calibrated against WAN's raw scheduler timestep scale.
+        timestep_for_embedding = timestep * self.scheduler.config.num_train_timesteps
+        t_freq = ce.timesteps_proj(timestep_for_embedding)
 
         # Cast to embedder's dtype (avoid int8 quantized layers)
         te_dtype = next(iter(ce.time_embedder.parameters())).dtype
@@ -487,6 +503,8 @@ class WanPipeline(BasePipeline):
             latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
                 batch_size, image, height, width, num_frames, generator
             )
+        elif self._fixed_latent is not None:
+            latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
@@ -520,7 +538,12 @@ class WanPipeline(BasePipeline):
         _vsa_step_counter = [0]
 
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for Wan transformer with two-stage support.
 
@@ -581,7 +604,7 @@ class WanPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latents,
-                timestep=timestep,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
             )
 

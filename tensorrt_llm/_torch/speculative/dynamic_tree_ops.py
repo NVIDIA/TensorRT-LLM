@@ -237,6 +237,7 @@ class DynamicTreeOpsConverter:
         offset: int | torch.Tensor = 0,
         d2t: torch.Tensor | None = None,
         skip_all_sampling_params: bool = False,
+        top_k_max: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tree-aware rejection sampling from logits (three CUDA ops).
 
@@ -266,9 +267,13 @@ class DynamicTreeOpsConverter:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
         tree_valid = tree_valid.contiguous()
 
-        if top_k is None:
+        if top_k_max is not None:
+            # Pre-computed CPU-side (CUDA-graph-safe): use as-is.
+            pass
+        elif top_k is None:
             top_k_max = 0
         else:
+            # Fallback path (non-CUDA-graph contexts): compute from tensor.
             enabled_top_k = top_k[(top_k > 0) & (top_k < target_vocab_size)]
             top_k_max = int(enabled_top_k.max().item()) if enabled_top_k.numel() > 0 else 0
 

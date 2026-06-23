@@ -20,7 +20,13 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from .scheduler import RequestList, RequestScheduler, SchedulerOutput
+from .scheduler import (
+    RequestList,
+    RequestScheduler,
+    SchedulerOutput,
+    _get_lora_task_id,
+    drop_decoder_context_requests_waiting_for_encoder_output,
+)
 
 
 class ScheduleAction(enum.Enum):
@@ -143,6 +149,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
         draft_kv_cache_manager=None,  # KVCacheManagerV2 for MTP draft layers
+        cross_kv_cache_manager=None,  # KVCacheManagerV2 for enc-dec cross-attn
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -155,6 +162,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
@@ -172,10 +180,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         draft_mgr_name = (
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
         )
+        cross_mgr_name = (
+            type(cross_kv_cache_manager).__name__ if cross_kv_cache_manager is not None else "None"
+        )
         logger.info(
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
-            f"draft_mgr={draft_mgr_name}"
+            f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -196,26 +207,35 @@ class KVCacheV2Scheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
-        (scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking) = (
-            self._schedule_loop(active_requests, inflight_request_ids)
-        )
+        (
+            scheduled_encoder,
+            scheduled_ctx,
+            scheduled_gen,
+            evicted,
+            disagg_candidates,
+            has_chunking,
+        ) = self._schedule_loop(active_requests, inflight_request_ids)
 
         # Sort by LoRA task ID
+        scheduled_encoder.sort(key=_get_lora_task_id)
         self._sort_requests(scheduled_ctx, scheduled_gen, has_chunking)
 
         return SchedulerOutput(
+            encoder_requests=scheduled_encoder,
             context_requests=scheduled_ctx,
             generation_requests=scheduled_gen,
             paused_requests=evicted,
             fitting_disagg_gen_init_requests=disagg_candidates,
-            num_fitting_requests=len(scheduled_ctx) + len(scheduled_gen),
+            num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
 
     # ---- Main scheduling loop ----
 
     def _schedule_loop(self, active_requests, inflight_request_ids):
         scheduled_ctx: RequestList = []
+        scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
         evicted: RequestList = []
         disagg_candidates: RequestList = []
@@ -362,7 +382,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 action, tokens = self._try_schedule_encoder(req, budget)
                 if action is ScheduleAction.STOP:
                     break
-                scheduled_ctx.append(req)
+                scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
                 action, tokens, chunking_flag = self._try_schedule_context(req, budget)
@@ -397,7 +417,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"kv_cache_config.max_tokens."
                 )
 
-        return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
+        return (
+            scheduled_encoder,
+            scheduled_ctx,
+            scheduled_gen,
+            evicted,
+            disagg_candidates,
+            has_chunking,
+        )
 
     # ---- Per-type scheduling methods ----
 
@@ -406,20 +433,28 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> tuple[ScheduleAction, int]:
         """Try to schedule an encoder request.
 
+        Encoder admission does not need KV blocks for decoder work. Decoder
+        context is the first step that reserves self- and cross-KV blocks and
+        writes K/V projections into the cross cache.
+
         Returns ``(action, tokens)`` where *tokens* is meaningful only
         when *action* is ``SCHEDULED``.
         """
+        # Encoder-decoder runtime requires a cross pool for the later decoder
+        # context step. If the runtime did not plumb one through, surface this
+        # loudly rather than silently routing to the self pool, which would
+        # corrupt the dual-pool contract.
+        if self.cross_kv_cache_manager is None:
+            raise RuntimeError(
+                f"Encoder-init request {req.py_request_id} requires a cross_kv_cache_manager."
+            )
+
         req_tokens = req.encoder_output_len
         if not budget.can_fit_tokens(req_tokens):
             return ScheduleAction.STOP, 0
         assert self.max_context_length is None or req_tokens <= self.max_context_length, (
             f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
         )
-        if not self.kv_cache_manager.prepare_context(req):
-            logger.debug(f"prepare_context failed for encoder request {req.py_request_id}")
-            return ScheduleAction.STOP, 0
-        if not self.kv_cache_manager.resize_context(req, req_tokens):
-            return ScheduleAction.STOP, 0
         return ScheduleAction.SCHEDULED, req_tokens
 
     def _try_schedule_disagg_gen_init(
@@ -487,6 +522,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # prepareResources for main cache), so include draft tokens.
         if not self.kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.SKIP, 0, False
+
+        cross_action = self._try_schedule_cross_context(req)
+        if cross_action is not ScheduleAction.SCHEDULED:
+            self._suspend_request(req)
+            return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
 
@@ -558,6 +598,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # draft tokens for last chunk.
         if not self.kv_cache_manager.resize_context(req, chunk_tokens):
             return ScheduleAction.SKIP, 0, False
+
+        cross_action = self._try_schedule_cross_context(req)
+        if cross_action is not ScheduleAction.SCHEDULED:
+            self._suspend_request(req)
+            return cross_action, 0, False
+
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
@@ -725,6 +771,98 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return down_block_start - lo
 
+    @staticmethod
+    def _get_optional_encoder_output_len(req: LlmRequest) -> Optional[int]:
+        get_encoder_output_len = getattr(type(req), "try_get_encoder_output_len", None)
+        encoder_output_len = (
+            get_encoder_output_len(req)
+            if get_encoder_output_len is not None
+            else getattr(req, "encoder_output_len", None)
+        )
+        if encoder_output_len is None:
+            return None
+        return int(encoder_output_len)
+
+    @classmethod
+    def _needs_cross_context_allocation(cls, req: LlmRequest) -> bool:
+        """Return whether decoder context must reserve cross-KV for *req*."""
+        if cls._get_optional_encoder_output_len(req) is None:
+            return False
+        skip_projection = getattr(req, "py_skip_cross_kv_projection", False)
+        return not (isinstance(skip_projection, bool) and skip_projection)
+
+    def _try_schedule_cross_context(self, req: LlmRequest) -> ScheduleAction:
+        """Reserve cross-KV blocks for the first decoder context step."""
+        if not self._needs_cross_context_allocation(req):
+            return ScheduleAction.SCHEDULED
+
+        if self.cross_kv_cache_manager is None:
+            logger.warning(
+                "Decoder context request %s requires cross-KV cache but "
+                "no cross_kv_cache_manager is configured. Skipping.",
+                req.py_request_id,
+            )
+            return ScheduleAction.STOP
+
+        req_tokens = self._get_optional_encoder_output_len(req)
+        if req_tokens is None:
+            return ScheduleAction.SCHEDULED
+        from ..kv_cache_manager_v2 import KVCacheManagerV2
+
+        if isinstance(self.cross_kv_cache_manager, KVCacheManagerV2):
+            if not self._try_schedule_cross_context_v2(
+                self.cross_kv_cache_manager, req, req_tokens
+            ):
+                return ScheduleAction.SKIP
+            return ScheduleAction.SCHEDULED
+
+        if not self.cross_kv_cache_manager.prepare_context(req):
+            logger.debug(
+                "cross prepare_context failed for decoder context request %s",
+                req.py_request_id,
+            )
+            return ScheduleAction.SKIP
+        if not self.cross_kv_cache_manager.resize_context(req, req_tokens):
+            return ScheduleAction.SKIP
+        return ScheduleAction.SCHEDULED
+
+    @staticmethod
+    def _try_schedule_cross_context_v2(
+        cross_kv_cache_manager, req: LlmRequest, req_tokens: int
+    ) -> bool:
+        """Reserve V2 cross-KV without mutating decoder context position."""
+        kv_cache = cross_kv_cache_manager.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            if not req.is_first_context_chunk:
+                logger.debug(
+                    "cross KV cache missing for non-first context chunk, request %s",
+                    req.py_request_id,
+                )
+                return False
+            input_tokens = (
+                req.get_encoder_unique_tokens()
+                if cross_kv_cache_manager.enable_block_reuse
+                else None
+            )
+            kv_cache = cross_kv_cache_manager._create_kv_cache(
+                req.py_request_id, req.lora_task_id, input_tokens
+            )
+            kv_cache.cuda_stream = cross_kv_cache_manager._stream.cuda_stream
+
+        if not cross_kv_cache_manager.enable_block_reuse:
+            kv_cache.stop_committing()
+
+        if not cross_kv_cache_manager._resume_and_restore(req.py_request_id, kv_cache):
+            return False
+
+        target_capacity = req_tokens + cross_kv_cache_manager.num_extra_kv_tokens
+        if not kv_cache.resize(max(kv_cache.capacity, target_capacity)):
+            if req.is_first_context_chunk:
+                kv_cache.suspend()
+            return False
+
+        return True
+
     def _try_schedule_generation(
         self,
         req: LlmRequest,
@@ -856,10 +994,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     @staticmethod
     def _lora_key(req: LlmRequest):
-        lora_id = getattr(req, "lora_task_id", None)
-        if lora_id is None:
-            return (0, 0)
-        return (1, lora_id)
+        return _get_lora_task_id(req)
 
     def _sort_requests(self, context_requests, generation_requests, has_chunks):
         """Sort by LoRA task ID. Non-last chunks before last chunks."""

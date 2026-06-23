@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxConfig, VideoSparseAttentionConfig
+from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
 
 # =============================================================================
 # Type aliases
@@ -86,7 +86,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxConfig, VideoSparseAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -114,14 +114,6 @@ class AttentionConfig(StrictBaseModel):
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
             "skip_softmax (TRTLLM backend) or VSA (CUTEDSL backend)."
-        ),
-    )
-    sparse_config_path: Optional[str] = Field(
-        None,
-        status="prototype",
-        description=(
-            "Path to a ModelOpt sparse attention YAML config file. "
-            "Overrides auto-detection from the checkpoint directory."
         ),
     )
 
@@ -650,7 +642,7 @@ class VisualGenArgs(StrictBaseModel):
 __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
-    "SkipSoftmaxConfig",
+    "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
