@@ -51,12 +51,12 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     gen_multimodal_cache_key_tokens,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, GPU_LEVEL
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, CACHE_LEVEL1, GPU_LEVEL
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import exact_div, typed_range
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import nvtx_range
+from ..._utils import binding_to_torch_dtype, nvtx_range, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -83,6 +83,12 @@ class Role:
     VALUE = DataRole("value")
     KEY_BLOCK_SCALE = DataRole("key_block_scale")
     VALUE_BLOCK_SCALE = DataRole("value_block_scale")
+    # Sparse-attention per-layer index-K cache (MiniMax-M3 and similar
+    # sparse-block-selection backends). Registered as a native V2
+    # BufferConfig on sparse layers via the extra_buffers_per_layer hook on
+    # _build_cache_config, so allocation, free, slot reuse, and prefix
+    # reuse share the lifecycle of the main K/V buffers for the same layer.
+    INDEX_KEY = DataRole("index_key")
     ALL = DataRole("all")
 
 
@@ -695,6 +701,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -842,32 +849,68 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
-        return KVCacheManagerConfigPy(
-            tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
-            cache_tiers=cache_tiers,
-            max_util_for_resume=kv_cache_config.max_util_for_resume,
-            layers=[
+        # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
+        # per-layer BufferConfig entries — for example a sparse index-K
+        # buffer — without overriding the K/V/NVFP4 scale wiring above.
+        # The dict maps local layer id -> list of extra BufferConfig. Each
+        # extra buffer's role must be unique within the layer (asserted by
+        # AttentionLayerConfig.__post_init__) and its size must be in bytes
+        # per block (= bytes_per_token * tokens_per_block).
+        extra_buffers_per_layer = (
+            self._extra_buffers_per_layer(tokens_per_block=tokens_per_block) or {}
+        )
+
+        layer_configs: List[AttentionLayerConfig] = []
+        for layer_id in typed_range(LayerId(self.num_local_layers)):
+            buffers = [
+                BufferConfig(
+                    role=role,
+                    size=self.get_layer_bytes_per_token(local_layer_idx=layer_id, data_role=role)
+                    * tokens_per_block,
+                )
+                for role in buffer_type
+            ]
+            for extra in extra_buffers_per_layer.get(int(layer_id), ()):
+                assert extra.role not in buffer_type, (
+                    f"extra buffer role {extra.role!r} for layer "
+                    f"{int(layer_id)} duplicates a standard K/V/scale role"
+                )
+                buffers.append(extra)
+            layer_configs.append(
                 AttentionLayerConfig(
                     layer_id=layer_id,
-                    buffers=[
-                        BufferConfig(
-                            role=role,
-                            size=self.get_layer_bytes_per_token(
-                                local_layer_idx=layer_id, data_role=role
-                            )
-                            * tokens_per_block,
-                        )
-                        for role in buffer_type
-                    ],
+                    buffers=buffers,
                     sliding_window_size=self.max_attention_window_vec[
                         self.pp_layers[layer_id] % len(self.max_attention_window_vec)
                     ],
                     num_sink_tokens=None,
                 )
-                for layer_id in typed_range(LayerId(self.num_local_layers))
-            ],
+            )
+
+        return KVCacheManagerConfigPy(
+            tokens_per_block=tokens_per_block,
+            vocab_size=vocab_size,
+            cache_tiers=cache_tiers,
+            max_util_for_resume=kv_cache_config.max_util_for_resume,
+            layers=layer_configs,
         )
+
+    def _extra_buffers_per_layer(
+        self, *, tokens_per_block: int
+    ) -> Optional[dict[int, List[BufferConfig]]]:
+        """Return per-local-layer extra BufferConfig entries to register
+        alongside the standard K/V/NVFP4 scale buffers.
+
+        Default implementation returns ``None``. Subclasses override this
+        to register additional buffers — for example, MiniMax-M3 registers
+        a sparse index-K buffer for each sparse local layer. Each
+        ``BufferConfig.size`` is interpreted as bytes per block (i.e.,
+        ``bytes_per_token * tokens_per_block``), matching the standard
+        buffers built in :meth:`_build_cache_config`. The block storage
+        groups buffers by lifecycle and size with an opaque role key, so
+        new roles do not require C++ changes.
+        """
+        return None
 
     @property
     def blocks_in_primary_pool(self) -> int:
@@ -919,6 +962,115 @@ class KVCacheManagerV2(BaseResourceManager):
                 shape,
             )
         )
+
+    def get_index_k_buffer(
+        self,
+        layer_idx: int,
+        *,
+        num_heads: int = 1,
+        head_dim: int,
+        dtype: Union[torch.dtype, "DataType", str] = torch.bfloat16,
+    ) -> Optional[torch.Tensor]:
+        """Return a torch view over the V2-managed paged ``Role.INDEX_KEY``
+        buffer for ``layer_idx``, or ``None`` when the layer has no
+        INDEX_KEY buffer registered (e.g. dense layers in a sparse model,
+        or non-local layers on the current PP rank).
+
+        The view has shape ``[num_pages, tokens_per_block, num_heads,
+        head_dim]`` where ``num_pages == impl.get_page_index_upper_bound(
+        layer_idx, Role.INDEX_KEY)``. Sparse modeling code addresses
+        entries by ``(page, within_page, head, dim)`` after decomposing
+        the per-token slot id used by the main paged K/V cache into
+        ``(page, within_page)``.
+
+        Because :class:`BufferConfig` only carries an opaque byte ``size``
+        per block, the dtype and head shape are caller-side contracts.
+        The caller must pass the same ``num_heads``, ``head_dim``, and
+        ``dtype`` it used to compute the registered
+        ``size = num_heads * head_dim * dtype_bytes * tokens_per_block``
+        in ``_extra_buffers_per_layer``. The accessor validates
+        ``num_heads * head_dim * dtype_bytes * tokens_per_block ==
+        page_stride`` so a wiring mismatch fails loudly instead of
+        returning a view with silently wrong stride.
+
+        Follows the same ``TensorWrapper`` / ``convert_to_torch_tensor``
+        pattern as :meth:`get_buffers`. The returned tensor is a
+        zero-copy view over V2-managed pool memory and stays valid for
+        the lifetime of the cache manager — writes through the view
+        propagate to the pool, and successive calls return views over
+        the same backing storage.
+        """
+        if layer_idx not in self.layer_offsets:
+            return None
+        layer_offset = self.layer_offsets[layer_idx]
+        try:
+            addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
+            page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
+            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
+            converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
+        except KeyError:
+            # INDEX_KEY not registered for this layer (default V2 manager
+            # registers only K/V/scale; sparse subclasses register
+            # INDEX_KEY only on sparse layers via
+            # ``_extra_buffers_per_layer``).
+            return None
+
+        if isinstance(dtype, DataType):
+            torch_dtype = binding_to_torch_dtype(dtype)
+        elif isinstance(dtype, str):
+            torch_dtype = str_dtype_to_torch(dtype)
+        else:
+            torch_dtype = dtype
+
+        elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
+        expected_stride = num_heads * head_dim * elem_bytes * self.tokens_per_block
+        assert page_stride == expected_stride, (
+            f"INDEX_KEY page stride mismatch for layer {layer_idx}: "
+            f"V2 reports page_stride={page_stride}, but the caller "
+            f"supplied num_heads={num_heads} * head_dim={head_dim} * "
+            f"elem_bytes={elem_bytes} * tokens_per_block="
+            f"{self.tokens_per_block} = {expected_stride}. Re-check "
+            f"the BufferConfig.size used to register Role.INDEX_KEY "
+            f"in _extra_buffers_per_layer."
+        )
+
+        # Multi-layer coalescing: when INDEX_KEY shares the V2 storage
+        # pool with K/V (production MiniMax-M3 at TP=8 makes K, V, and
+        # INDEX_KEY all 256 bytes/token so V2 coalesces them by
+        # ``(life_cycle_id, single_buffer_size)``), ``page_upper`` is
+        # not the per-layer page count — it is the max page index from
+        # this buffer's base in the coalesced pool. Decompose it into
+        # ``num_slots = (page_upper + layer_offset_pages) // scale`` so
+        # the per-layer view has the right shape. ``scale`` here is the
+        # buffers-per-slot count; for a non-coalesced INDEX_KEY pool it
+        # equals 1 and ``num_slots == page_upper``, matching the legacy
+        # ``shape[0] == page_upper`` behavior.
+        scale = int(converter.scale)
+        layer_offset_pages = int(converter.layer_offset)
+        num_slots_total = page_upper + layer_offset_pages
+        assert num_slots_total % scale == 0, (
+            f"V2 storage inconsistency for INDEX_KEY of layer "
+            f"{layer_idx}: page_upper + layer_offset_pages = "
+            f"{num_slots_total} is not divisible by scale = {scale}."
+        )
+        num_slots = num_slots_total // scale
+
+        if scale == 1:
+            # Non-coalesced INDEX_KEY pool: the per-buffer stride is
+            # the entire page, so ``[page_upper, tokens_per_block,
+            # num_heads, head_dim]`` is the correct contiguous view.
+            shape = [page_upper, self.tokens_per_block, num_heads, head_dim]
+            return convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, shape))
+
+        # Coalesced pool: build a ``[num_slots, scale, tokens_per_block,
+        # num_heads, head_dim]`` view at INDEX_KEY's base, then slice
+        # ``[:, 0]`` to extract this layer's INDEX_KEY data. The slice
+        # preserves dim-0 stride = ``scale * page_stride`` bytes, so
+        # ``view[s, w, h, d]`` lands on the correct byte for any
+        # ``s`` in [0, num_slots).
+        full_slot_shape = [num_slots, scale, self.tokens_per_block, num_heads, head_dim]
+        full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
+        return full_view[:, 0]
 
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
@@ -1828,6 +1980,40 @@ class KVCacheManagerV2(BaseResourceManager):
                 ]
                 kv_cache.set_base_page_index_buf(i, pool_idx, memoryview(buffer.numpy()))
         return kv_cache
+
+    def prefetch_for_context_tokens(self, requests: list) -> bool:
+        """Prefetch radix-tree blocks from disk→host for upcoming context requests.
+
+        Returns True if all prefetches succeeded, False if any failed.
+        """
+        if not self.enable_block_reuse:
+            return False
+        # Prefetch via a transient KV cache that holds the reuse-matched blocks,
+        # prefetches disk->host, then closes. Holding blocks costs no GPU space
+        # (never resumed) and close() needs no stream sync. The transient cache
+        # is NOT registered in kv_cache_map / IndexMapper.
+        success = True
+        for req in requests:
+            all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+            tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
+            # Match the ReuseScope salt derivation used in _create_kv_cache so
+            # the transient cache hits the same radix-tree blocks.
+            cache_salt = req.cache_salt
+            salt_int = (
+                int.from_bytes(hashlib.sha256(cache_salt.encode("utf-8")).digest()[:8], "little")
+                if cache_salt is not None
+                else None
+            )
+            kv_cache = self.impl.create_kv_cache(
+                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+            )
+            # Prefetch to the first tier below GPU (host if present, otherwise
+            # disk). prefetch() is a best-effort hint either way.
+            if not kv_cache.prefetch(CACHE_LEVEL1):
+                logger.warning("prefetch failed for request %s", req.py_request_id)
+                success = False
+            kv_cache.close()
+        return success
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
