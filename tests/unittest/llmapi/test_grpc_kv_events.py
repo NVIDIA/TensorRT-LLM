@@ -8,7 +8,8 @@ import pytest
 
 pytest.importorskip("smg_grpc_proto")
 from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
-from tensorrt_llm.grpc.kv_events import convert_batch, convert_event, to_int64
+from tensorrt_llm.grpc.kv_events import (convert_batch, convert_event,
+                                         convert_events, to_int64)
 
 
 def test_to_int64_small_positive_unchanged():
@@ -95,6 +96,26 @@ def test_convert_batch_returns_none_for_skipped_event():
     assert convert_batch(created, seq_num=0) is None
 
 
+def test_convert_events_packs_many_into_one_batch_skipping_created():
+    events = [
+        {"event_id": 0, "data": {"type": "created", "num_blocks_per_cache_level": [1, 0]}},
+        {"event_id": 1, "data": {"type": "stored", "parent_hash": None,
+            "blocks": [{"block_hash": 10, "tokens": [{"token_id": 1, "token_extra_id": 0}]}]}},
+        {"event_id": 2, "data": {"type": "removed", "block_hashes": [20]}},
+    ]
+    batch = convert_events(events, seq_num=5)
+    assert batch.sequence_number == 5
+    assert len(batch.events) == 2  # created skipped, stored + removed packed together
+    assert [e.event_id for e in batch.events] == [1, 2]
+    assert [e.WhichOneof("data") for e in batch.events] == ["stored", "removed"]
+
+
+def test_convert_events_all_skipped_returns_none():
+    events = [{"event_id": 0, "data": {"type": "created"}},
+              {"event_id": 1, "data": {"type": "updated", "block_hash": 1}}]
+    assert convert_events(events, seq_num=0) is None
+
+
 class _Cfg:
     def __init__(self, enable_block_reuse, event_buffer_max_size):
         self.enable_block_reuse = enable_block_reuse
@@ -110,10 +131,14 @@ class _FakeLLM:
     def __init__(self, cfg, events):
         self.args = _Args(cfg)
         self._events = events
+        self._drained = False
 
-    async def get_kv_cache_events_async(self, timeout=2):
-        for e in self._events:
-            yield e
+    def get_kv_cache_events(self, timeout=2):
+        # One drain returns the whole queued list; subsequent calls are empty.
+        if self._drained:
+            return []
+        self._drained = True
+        return list(self._events)
 
 
 class _FakeRM:
@@ -154,7 +179,7 @@ async def _collect(servicer, ctx):
     return out
 
 
-def test_subscribe_streams_stored_and_removed_skips_created():
+def test_subscribe_batches_drain_into_one_message_skips_created():
     events = [
         {"event_id": 0, "data": {"type": "created", "num_blocks_per_cache_level": [2231, 0]}},
         {"event_id": 1, "data": {"type": "stored", "parent_hash": None,
@@ -165,9 +190,11 @@ def test_subscribe_streams_stored_and_removed_skips_created():
     ctx = _FakeCtx()
     batches = asyncio.run(_collect(servicer, ctx))
     assert ctx.metadata_sent is True
-    assert [b.events[0].WhichOneof("data") for b in batches] == ["stored", "removed"]
-    assert [b.sequence_number for b in batches] == [0, 1]
-    assert [b.events[0].event_id for b in batches] == [1, 151]
+    # The whole drain cycle is packed into ONE batch message (created skipped).
+    assert len(batches) == 1
+    assert batches[0].sequence_number == 0
+    assert [e.WhichOneof("data") for e in batches[0].events] == ["stored", "removed"]
+    assert [e.event_id for e in batches[0].events] == [1, 151]
 
 
 def test_subscribe_unimplemented_when_events_disabled():
@@ -189,6 +216,8 @@ def test_subscribe_seq_persists_across_reconnects():
     servicer = TrtllmServiceServicer(_FakeRM(llm))
     first = asyncio.run(_collect(servicer, _FakeCtx()))
     llm._events = [stored(12), stored(13)]  # new events on the reconnected stream
+    llm._drained = False
     second = asyncio.run(_collect(servicer, _FakeCtx()))
-    assert [b.sequence_number for b in first] == [0, 1]
-    assert [b.sequence_number for b in second] == [2, 3]  # continues, not reset to 0
+    assert [b.sequence_number for b in first] == [0]   # one batch per drain cycle
+    assert [b.sequence_number for b in second] == [1]  # continues, not reset to 0
+    assert len(second[0].events) == 2

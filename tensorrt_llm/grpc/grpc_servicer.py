@@ -33,13 +33,17 @@ from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
-from .kv_events import convert_batch
+from .kv_events import convert_events
 from .grpc_request_manager import (
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,
     create_sampling_params_from_proto,
 )
+
+# Cap KvCacheEvents per streamed batch so a heavy drain cycle is split into a
+# few bounded messages rather than one oversized one.
+_MAX_EVENTS_PER_BATCH = 1024
 
 
 class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
@@ -335,9 +339,15 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
     ):
         """Stream KV-cache events for the gateway's cache-aware router.
 
-        Bridges TRT-LLM's ``get_kv_cache_events_async`` to the engine-neutral
+        Bridges TRT-LLM's KV-cache event queue to the engine-neutral
         ``common.KvEventBatch`` stream. ``start_sequence_number`` (replay) is
         not honored — the stream starts from the current queue position.
+
+        Each drain cycle is folded into as few ``KvEventBatch`` messages as
+        possible (one per cycle, capped at ``_MAX_EVENTS_PER_BATCH``): emitting
+        one message per event saturates the serving process under load. The
+        blocking drain runs in a worker thread so the inference event loop is
+        not stalled while waiting on the queue.
         """
         args = getattr(getattr(self.request_manager, "llm", None), "args", None)
         cfg = getattr(args, "kv_cache_config", None)
@@ -352,10 +362,16 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             return
 
         await context.send_initial_metadata(())
+        loop = asyncio.get_running_loop()
         try:
             while not context.cancelled():
-                async for event in self.request_manager.llm.get_kv_cache_events_async(timeout=1):
-                    batch = convert_batch(event, self._kv_seq)
+                events = await loop.run_in_executor(
+                    None, self.request_manager.llm.get_kv_cache_events, 1)
+                if not events:
+                    continue
+                for start in range(0, len(events), _MAX_EVENTS_PER_BATCH):
+                    batch = convert_events(
+                        events[start:start + _MAX_EVENTS_PER_BATCH], self._kv_seq)
                     if batch is not None and len(batch.events) > 0:
                         batch.timestamp = time.time()
                         yield batch

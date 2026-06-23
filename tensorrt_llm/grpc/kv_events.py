@@ -20,7 +20,7 @@ dicts produced by ``LLM.get_kv_cache_events*`` and produces
 Only ``stored`` and ``removed`` events have a wire equivalent; ``created`` and
 ``updated`` are skipped.
 """
-from typing import Optional
+from typing import Iterable, Optional
 
 from smg_grpc_proto.generated import common_pb2
 
@@ -72,17 +72,36 @@ def convert_event(event: dict, event_id: int) -> Optional[common_pb2.KvCacheEven
     return None
 
 
-def convert_batch(event: dict, seq_num: int) -> Optional[common_pb2.KvEventBatch]:
-    """Wrap one converted event in a KvEventBatch, or None if it has no wire form.
+def convert_events(events: Iterable[dict], seq_num: int) -> Optional[common_pb2.KvEventBatch]:
+    """Pack a drain cycle's events into ONE KvEventBatch (multiple KvCacheEvents).
 
-    ``seq_num`` is a gateway-facing monotonic counter (the batch sequence
-    number); the proto ``event_id`` keeps TRT-LLM's own monotonic id.
+    Emitting one message per event saturates the serving process under load, so
+    every event drained in a single cycle is folded into one batch message --
+    the same shape the ZMQ-based bridges send. ``created`` / ``updated`` events
+    are skipped; returns None if nothing in the cycle has a wire form.
+
+    ``seq_num`` is the gateway-facing monotonic batch counter; each proto
+    ``event_id`` keeps TRT-LLM's own monotonic id.
     """
-    proto_event = convert_event(event, int(event["event_id"]))
-    if proto_event is None:
+    proto_events = []
+    dp_rank = None
+    for event in events:
+        proto_event = convert_event(event, int(event["event_id"]))
+        if proto_event is None:
+            continue
+        proto_events.append(proto_event)
+        if dp_rank is None:
+            rank = event.get("attention_dp_rank")
+            if rank is not None:
+                dp_rank = rank
+    if not proto_events:
         return None
-    batch = common_pb2.KvEventBatch(sequence_number=seq_num, events=[proto_event])
-    dp_rank = event.get("attention_dp_rank")
+    batch = common_pb2.KvEventBatch(sequence_number=seq_num, events=proto_events)
     if dp_rank is not None:
         batch.dp_rank = dp_rank
     return batch
+
+
+def convert_batch(event: dict, seq_num: int) -> Optional[common_pb2.KvEventBatch]:
+    """Single-event convenience wrapper around :func:`convert_events`."""
+    return convert_events([event], seq_num)
