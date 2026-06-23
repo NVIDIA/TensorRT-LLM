@@ -865,10 +865,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         if attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
-                "`setup_attn_metadata` (engine-driven via "
-                "`_set_up_multimodal_encoder_attn_metadata`, or called "
-                "explicitly in standalone tests) must run before the encoder "
-                "forward."
+                "It must be set up before the encoder forward runs."
             )
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 

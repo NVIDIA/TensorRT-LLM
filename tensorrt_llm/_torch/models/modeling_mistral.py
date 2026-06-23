@@ -478,14 +478,14 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
     def _vision_geometry(self) -> Tuple[int, int, int, int]:
         """``(patch_size, spatial_merge_size, num_channels, max_image_size)``,
         read from the processor (mistral_common) or the HF ``vision_config``."""
-        vcfg = getattr(self.config, "vision_config", None)
+
+        vcfg = self.config.vision_config
         proc = self.processor
-        patch = getattr(proc, "patch_size", None) or getattr(
-            vcfg, "patch_size", None)
+        patch = getattr(proc, "patch_size", None) or vcfg.patch_size
         max_size = getattr(proc, "image_size", None) or getattr(
             vcfg, "image_size", None)
         merge = (getattr(self.config, "spatial_merge_size", None)
-                 or getattr(vcfg, "spatial_merge_size", None) or 1)
+                 or vcfg.spatial_merge_size)
         channels = getattr(vcfg, "num_channels", None) or 3
         return int(patch), int(merge), int(channels), int(max_size)
 

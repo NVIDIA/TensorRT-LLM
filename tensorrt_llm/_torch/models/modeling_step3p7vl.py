@@ -582,8 +582,7 @@ class Step3p7VisionEncoder(nn.Module, MultimodalEncoderMixin):
         if md is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
-                "`setup_attn_metadata` (engine-driven) must run before the "
-                "encoder forward."
+                "It must be set up before the encoder forward runs."
             )
         batch_size = len(seq_lens)
         md.num_contexts = batch_size

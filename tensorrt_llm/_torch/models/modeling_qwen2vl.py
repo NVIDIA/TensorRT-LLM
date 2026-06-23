@@ -115,15 +115,11 @@ def _prepare_qwen_vl_vision_attn_metadata(
     attn_metadata.cu_kv_seqlens = cu_seqlens
     attn_metadata.max_seq_len = max(seq_lens)
     # The vision tower runs no-cache, context-only attention and supplies its
-    # own ``cu_seqlens`` above, so the heavy KV-oriented ``prepare()`` (kv_lens
-    # / prompt_lens / host_request_types setup) is unnecessary host work. Use
-    # the lean encoder-only path when the backend exposes it; fall back to the
-    # full ``prepare()`` for backends that do not (e.g. non-TRTLLM metadata).
-    prepare_encoder_only = getattr(attn_metadata, "prepare_encoder_only", None)
-    if prepare_encoder_only is not None:
-        prepare_encoder_only()
-    else:
-        attn_metadata.prepare()
+    # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
+    # prompt_lens / host_request_types setup) is unnecessary host work.
+    # `prepare_encoder_only` runs the lean path on backends that have one
+    # (TRTLLM) and falls back to the full `prepare()` elsewhere.
+    attn_metadata.prepare_encoder_only()
     return attn_metadata
 
 
@@ -1560,10 +1556,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         if attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
-                "`setup_attn_metadata` (engine-driven via "
-                "`_set_up_multimodal_encoder_attn_metadata`, or called "
-                "explicitly in standalone tests) must run before the encoder "
-                "forward.")
+                "It must be set up before the encoder forward runs.")
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
     @property
