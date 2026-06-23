@@ -149,7 +149,13 @@ class EagleConfig(PretrainedConfig):
             "load_embedding_from_target": True,
             "load_lm_head_from_target": True,
             "num_capture_layers": 1,
-            "normalize_target_hidden_state": False,
+            # DeepSeek-V3/R1 MTP consumes the target's *final-normalized* hidden state:
+            # in the PyTorch backend the main model returns hidden states with model.norm
+            # already applied (fused as the last layer's next_layer_layernorm), and the MTP
+            # layer then applies its own hnorm on top. AutoDeploy captures the pre-norm
+            # residual-add output, so the wrapper must apply the target's final norm before
+            # the drafter to match the backend (same convention as NemotronH MTP).
+            "normalize_target_hidden_state": True,
             "layers_handle_final_norm": True,
         },
     }
