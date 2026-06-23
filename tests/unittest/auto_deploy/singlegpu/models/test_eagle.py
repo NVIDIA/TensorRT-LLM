@@ -16,29 +16,35 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, Dict
 
 import pytest
 import torch
+import torch.nn as nn
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 from test_common.llm_data import hf_id_to_local_model_dir
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DraftOutput,
     EagleConfig,
     EagleDrafterForCausalLM,
     EagleRMSNorm,
+    EagleWrapper,
 )
-from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory, EagleOneModelFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     get_weight_shape,
     infer_draft_embedding_size,
     is_any_lin_op,
 )
+from tensorrt_llm.llmapi import MTPDecodingConfig
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 NEMOTRON_SUPER_MODEL_HUB_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -102,7 +108,7 @@ class MockEagle3ModelForCausalLM(EagleDrafterForCausalLM):
         self._dtype = config.dtype
 
     def forward(self, input_ids, position_ids, input_embeds=None, **kwargs):
-        assert self.model.embed_tokens is not None, (
+        assert self.eagle_drafter.embed_tokens is not None, (
             "embed_tokens must be set before running standalone Eagle model."
         )
         assert self.lm_head is not None, (
@@ -110,7 +116,7 @@ class MockEagle3ModelForCausalLM(EagleDrafterForCausalLM):
         )
 
         if input_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self.eagle_drafter.embed_tokens(input_ids)
 
         # Inject mock hidden states if not provided
         if "hidden_states" not in kwargs:
@@ -178,6 +184,82 @@ def test_eagle_rmsnorm_keeps_fp32_weights():
     norm = EagleRMSNorm(hidden_size=16)
 
     assert norm.weight.dtype == torch.float32
+
+
+def _mtp_speculative_config() -> MTPDecodingConfig:
+    return MTPDecodingConfig(
+        max_draft_len=1,
+        mtp_eagle_one_model=True,
+        speculative_model="test-model",
+    )
+
+
+class _StaticTargetFactory:
+    def __init__(self, model: nn.Module, export_infos: list) -> None:
+        self.model = model
+        self.export_infos = export_infos
+
+    def build_model(self, device: str) -> nn.Module:
+        return self.model
+
+    def get_export_infos(self, model: nn.Module) -> list:
+        assert model is self.model
+        return self.export_infos
+
+
+class _StaticDraftFactory:
+    def __init__(self, model: nn.Module) -> None:
+        self.model = model
+
+    def build_model(self, device: str) -> nn.Module:
+        return self.model
+
+
+def test_mtp_llm_args_preserves_target_factory_for_one_model():
+    args = LlmArgs(
+        model="test-model",
+        model_factory="AutoModelForCausalLM",
+        max_seq_len=64,
+        speculative_config=_mtp_speculative_config(),
+    )
+
+    factory = args.create_factory()
+
+    assert args.model_factory == "eagle_one_model"
+    assert args.target_model_factory == "AutoModelForCausalLM"
+    assert isinstance(factory, EagleOneModelFactory)
+    assert isinstance(factory.target_factory, AutoModelForCausalLMFactory)
+
+
+def test_mtp_one_model_factory_honors_draft_config():
+    target_model = nn.Module()
+    draft_model = nn.Module()
+    draft_model.config = SimpleNamespace(
+        load_embedding_from_target=False,
+        load_lm_head_from_target=False,
+        normalize_target_hidden_state=True,
+    )
+    export_info = SimpleNamespace(submodule_name="model.language_model")
+    factory = EagleOneModelFactory(
+        model="test-model",
+        skip_loading_weights=True,
+        max_seq_len=64,
+        speculative_config=_mtp_speculative_config(),
+        target_model_factory="AutoModelForCausalLM",
+    )
+    factory.target_factory = _StaticTargetFactory(target_model, [export_info])
+    factory.draft_factory = _StaticDraftFactory(draft_model)
+
+    wrapper = factory._build_model("meta")
+
+    assert isinstance(wrapper, EagleWrapper)
+    assert wrapper.target_model is target_model
+    assert wrapper.draft_model is draft_model
+    assert wrapper.max_draft_len == 1
+    assert wrapper.load_embedding_from_target is False
+    assert wrapper.load_lm_head_from_target is False
+    assert wrapper.normalize_target_hidden_state is True
+    assert factory._target_export_submodule_name == "model.language_model"
 
 
 @pytest.fixture
@@ -298,7 +380,7 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
 ):
     factory = _build_small_draft_factory(model_hub_id, model_kwargs=model_kwargs)
     model = factory.build_model("cuda")
-    inner_model = model.model.eval()
+    inner_model = model.eagle_drafter.eval()
     hidden_size = model.config.hidden_size
     dtype = model.config.torch_dtype
 
@@ -324,3 +406,167 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
     embd, in_eagle_drafter = infer_draft_embedding_size(gm, linear_nodes)
     assert embd == hidden_size
     assert in_eagle_drafter is expected_is_eagle
+
+
+# Draft exclude remap fixture used by the quant-config unit tests below. This keeps the tests
+# focused on EagleOneModelFactory.get_quant_config without depending on a production config factory.
+_MTP_DRAFT_EXCLUDE_MAP = {
+    r"^mtp\.layers\.0(?=\.|\*)": "eagle_drafter.layers",
+}
+
+
+def _eagle_quant_stub(target_excludes, draft_map, export_submodule_name):
+    """A stand-in EagleOneModelFactory exposing only what get_quant_config reads (no model build)."""
+    return SimpleNamespace(
+        target_factory=SimpleNamespace(
+            get_quant_config=lambda: {"exclude_modules": list(target_excludes)}
+        ),
+        draft_factory=SimpleNamespace(_quant_exclude_conversion_mapping=draft_map),
+        _target_export_submodule_name=export_submodule_name,
+    )
+
+
+def test_eagle_get_quant_config_aliases_target_excludes():
+    """VLM target (non-trivial submodule name): target excludes are re-rooted, draft remap maps MTP.
+
+    The target text model is exported rooted at its own submodule, so its graph node names are
+    relative (e.g. ``layers.0.linear_attn*``) while the checkpoint exclude patterns are full paths
+    (e.g. ``model.language_model.layers.0.linear_attn*``). The factory must rewrite the target
+    patterns into the relative namespace so the excluded bf16 modules are skipped, while applying
+    the draft-namespace remap (``mtp.layers.0* -> eagle_drafter.layers*``) only to the draft head
+    and not over-matching the target graph.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+    from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import should_skip_quantization
+
+    # Glob forms as they appear in the NVFP4 hf_quant_config.json exclude_modules.
+    target_excludes = [
+        "lm_head",
+        "model.language_model.layers.0.linear_attn*",
+        "model.language_model.layers.11.self_attn*",
+        "model.language_model.layers.0.mlp.shared_expert_gate",
+        "model.visual*",  # irrelevant to the text export; must survive untouched
+        "mtp.layers.0*",  # the unquantized MTP head; mapped to draft namespace
+    ]
+    stub = _eagle_quant_stub(target_excludes, _MTP_DRAFT_EXCLUDE_MAP, "model.language_model")
+
+    result = EagleOneModelFactory.get_quant_config(stub)["exclude_modules"]
+
+    # Text-model excludes are rewritten in place into the relative graph namespace...
+    assert "layers.0.linear_attn*" in result
+    assert "layers.11.self_attn*" in result
+    assert "layers.0.mlp.shared_expert_gate" in result
+    # ...with the checkpoint-namespace originals dropped (not kept), and the draft-namespace
+    # mapping applied into the dedicated eagle_drafter namespace.
+    assert "model.language_model.layers.0.linear_attn*" not in result
+    assert "eagle_drafter.layers*" in result  # mtp.layers.0* -> eagle_drafter.layers*
+    # Unrelated entries are preserved.
+    assert "lm_head" in result
+    assert "model.visual*" in result
+
+    # Behavioral checks against the FULL resulting list: the alias skips the relative target
+    # self_attn module that the checkpoint excludes...
+    assert should_skip_quantization("layers.11.self_attn.q_proj", result)
+    # ...while a relative target module that is NOT excluded stays quantized. This guards against
+    # the draft pattern (or any over-broad alias) accidentally skipping the whole target graph --
+    # the reason we add namespaced aliases instead of globally stripping prefixes.
+    assert not should_skip_quantization("layers.5.self_attn.q_proj", result)
+
+
+def test_eagle_get_quant_config_full_model_export_no_target_collision():
+    """Non-VLM target (trivial submodule ""): the draft's eagle_drafter excludes don't collide.
+
+    This is the non-VLM NVFP4 MTP case (e.g. Ultra): the target is exported at the root, so its
+    node names are full ``model.layers.N.*``. Because the draft is rooted at the dedicated
+    ``eagle_drafter.*`` namespace, its remapped excludes can never over-match the target -- even a
+    broad ``mtp.layers.0*`` exclude maps to ``eagle_drafter.layers*`` and stays disjoint from
+    ``model.layers.*``. (Before the eagle_drafter rename, ``mtp.layers.0* -> model.layers*`` and
+    this collided, wrongly skipping the whole target.)
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+    from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import should_skip_quantization
+
+    target_excludes = [
+        "lm_head",
+        "model.embed_tokens*",  # full-path target module; kept verbatim (no prefix to strip)
+        "model.layers.0.linear_attn*",  # a specific target-layer exclude
+        "mtp.layers.0*",  # broad MTP head exclude -> eagle_drafter.layers*
+    ]
+    stub = _eagle_quant_stub(target_excludes, _MTP_DRAFT_EXCLUDE_MAP, "")
+
+    result = EagleOneModelFactory.get_quant_config(stub)["exclude_modules"]
+
+    # No prefix to strip -> target full-path patterns survive verbatim (they match the full-model
+    # graph), and the draft remap maps the MTP head into the *distinct* eagle_drafter namespace.
+    assert "model.embed_tokens*" in result
+    assert "model.layers.0.linear_attn*" in result
+    assert "lm_head" in result
+    # Non-triviality anchor for the collision check below: this confirms the MTP head WAS remapped
+    # (into "eagle_drafter.layers*"). Without it, the "stays quantizable" assertion could be
+    # satisfied by simply dropping the draft exclude rather than by it landing in a disjoint
+    # namespace.
+    assert "eagle_drafter.layers*" in result
+    assert "model.layers*" not in result  # crucially NOT the generic target namespace
+    assert "mtp.layers.0*" not in result
+
+    # The collision regression itself: the target's own layers stay quantizable -- the draft's broad
+    # "eagle_drafter.layers*" does NOT over-match a full-model target node "model.layers.5...".
+    # (This is a non-triviality check: meaningful only together with the "eagle_drafter.layers*"
+    # assertion above, which proves the remap actually ran.)
+    assert not should_skip_quantization("model.layers.5.self_attn.q_proj.weight", result)
+    # ...while the specific target exclude and the full-path target module still apply.
+    assert should_skip_quantization("model.layers.0.linear_attn.q_proj.weight", result)
+    assert should_skip_quantization("model.embed_tokens.weight", result)
+
+
+def test_eagle_get_quant_config_rejects_target_in_draft_namespace():
+    """A target exclude that strips into the draft's reserved "eagle_drafter.*" namespace must fail.
+
+    That is the core no-collision assumption: targets live under "model.*"/etc., never
+    "eagle_drafter.*". If a target's own (stripped) names land in the draft namespace the two
+    sub-graphs' excludes overlap and the partition is unsafe -- fail loudly rather than mis-quantize.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+
+    # VLM target whose checkpoint (hypothetically) names a module in the draft's reserved namespace:
+    # after stripping the "model.language_model." prefix it becomes "eagle_drafter.foo*", colliding
+    # with the draft sub-graph's namespace.
+    stub = _eagle_quant_stub(
+        ["model.language_model.eagle_drafter.foo*"],
+        _MTP_DRAFT_EXCLUDE_MAP,
+        "model.language_model",
+    )
+    with pytest.raises(AssertionError):
+        EagleOneModelFactory.get_quant_config(stub)
+
+
+def test_eagle_single_target_export_info_rejects_multiple_submodules():
+    """The one-model path assumes a single target export root; >1 must fail loudly.
+
+    Otherwise the code would silently use the first export info, mis-namespacing the prefix strip
+    in get_quant_config.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
+
+    def stub_with(infos):
+        return SimpleNamespace(
+            target_factory=SimpleNamespace(get_export_infos=lambda _model: infos)
+        )
+
+    # Real target factories always return exactly one export info: full-model export is
+    # [FullModelExportInfo()] (submodule_name ""), a VLM is one TextModelExportInfo
+    # (submodule_name "model.language_model"). Both are returned as-is.
+    full_model = SimpleNamespace(submodule_name="")
+    got = EagleOneModelFactory._single_target_export_info(stub_with([full_model]), object())
+    assert got is full_model
+    vlm = SimpleNamespace(submodule_name="model.language_model")
+    got = EagleOneModelFactory._single_target_export_info(stub_with([vlm]), object())
+    assert got is vlm
+
+    # >1 export infos -> assert (the prefix-strip logic only threads a single export root).
+    two = [
+        SimpleNamespace(submodule_name="model.language_model"),
+        SimpleNamespace(submodule_name="model.vision_model"),
+    ]
+    with pytest.raises(AssertionError):
+        EagleOneModelFactory._single_target_export_info(stub_with(two), object())

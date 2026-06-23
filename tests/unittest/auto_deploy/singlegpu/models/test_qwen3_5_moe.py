@@ -45,25 +45,36 @@ Mixed batch position handling (mRoPE computed in forward):
  21. Decode-only with deltas (Case 2)
 """
 
+import re
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from torch.export import Dim
 
 # Register autodeploy custom ops (torch_moe, torch_causal_conv1d, etc.)
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
+    EagleConfig,
+    EagleDrafterForCausalLM,
+)
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     Qwen3_5MoeADInputProcessor,
     Qwen3_5MoeAttention,
     Qwen3_5MoeConfig,
     Qwen3_5MoeDecoderLayer,
+    Qwen3_5MoeEagleLayer,
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeGatedDeltaNet,
     Qwen3_5MoeModel,
     Qwen3_5MoeSparseMoeBlock,
     Qwen3_5MoeTextConfig,
+    Qwen3_5MoeTextExportInfo,
     Qwen3_5MoeTextModel,
     Qwen3_5MoeTextRotaryEmbedding,
     Qwen3_5MoeTopKRouter,
@@ -77,6 +88,13 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     qwen3_mrope_delta,
     qwen3_mrope_delta_with_cache,
 )
+from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory, TargetModelExportInfo
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
+    DetectHiddenStatesForCapture,
+)
+from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -1668,6 +1686,85 @@ def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
     torch.testing.assert_close(cache[slot : slot + 1], expected_delta_i32)
 
 
+def test_qwen3_mrope_delta_with_cache_extend_reads_and_preserves():
+    """MTP extend must READ the persistent vision delta like decode -- not recompute and clobber it.
+
+    The vision-derived mRoPE delta is computed once at prefill and is persistent. An MTP extend step
+    (verifying drafted tokens) continues an existing sequence with no new vision input, so it carries
+    no mm metadata and must read the cached delta back. The regression (using get_absorbed_info,
+    which folds extend into prefill) sent extend down the write path and overwrote the cached delta
+    with a recomputed zero -> wrong mRoPE positions for vision + MTP.
+    """
+    slot = 3
+    cached_delta = 7  # a nonzero vision-derived delta, as if written during a prior vision prefill
+    cache = torch.zeros((8, 1), dtype=torch.int32, device="cuda")
+    cache[slot, 0] = cached_delta
+
+    out = qwen3_mrope_delta_with_cache(
+        # batch_info_host layout: [n_prefill, pf_tokens, n_extend, ext_tokens, n_decode, dec_tokens].
+        # One extend request, no prefill/decode -- and no multimodal metadata (a generation step).
+        batch_info_host=torch.tensor([0, 0, 1, 4, 0, 0], dtype=torch.int32),
+        slot_idx=torch.tensor([slot], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=None,
+        mm_item_types=None,
+        mm_token_lengths=None,
+        mm_special_offsets_cu_seqlen=None,
+        mm_special_offsets=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mrope_delta_cache=cache,
+        spatial_merge_size=2,
+    )
+
+    expected = torch.tensor([[cached_delta]], dtype=torch.int32, device="cuda")
+    # Extend reads the persistent delta...
+    torch.testing.assert_close(out[0:1], expected)
+    # ...and leaves the cache untouched (the regression clobbered it to 0).
+    torch.testing.assert_close(cache[slot : slot + 1], expected)
+
+
+def test_qwen3_mrope_delta_with_cache_mixed_prefill_and_extend():
+    """A mixed batch must WRITE the prefill slot while READING -- not clobbering -- the extend slot.
+
+    The real one-model MTP scenario: a fresh request prefilling alongside an in-flight request
+    verifying drafted tokens (extend). Both slots are pre-seeded with distinct nonzero values so the
+    paths are distinguishable: the prefill slot must be OVERWRITTEN with its (here zero) computed
+    delta -- proving the write path ran, not a read -- while the extend slot must be READ back
+    unchanged. The regression (get_absorbed_info folds extend into prefill) sent BOTH down the write
+    path, clobbering the extend slot's persistent vision delta.
+    """
+    prefill_slot, extend_slot = 2, 5
+    cache = torch.zeros((8, 1), dtype=torch.int32, device="cuda")
+    cache[prefill_slot, 0] = 99  # stale value; the prefill WRITE must overwrite it (-> computed 0)
+    cache[extend_slot, 0] = 7  # persistent vision delta; the extend READ must preserve it
+
+    out = qwen3_mrope_delta_with_cache(
+        # [n_prefill, pf_tokens, n_extend, ext_tokens, n_decode, dec_tokens]: 1 prefill + 1 extend.
+        # No mm metadata here: the prefill carries no vision (computed delta 0); extend is generation.
+        batch_info_host=torch.tensor([1, 4, 1, 4, 0, 0], dtype=torch.int32),
+        slot_idx=torch.tensor([prefill_slot, extend_slot], dtype=torch.int32, device="cuda"),
+        mm_item_cu_seqlen=None,
+        mm_item_types=None,
+        mm_token_lengths=None,
+        mm_special_offsets_cu_seqlen=None,
+        mm_special_offsets=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mrope_delta_cache=cache,
+        spatial_merge_size=2,
+    )
+
+    zero = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    seven = torch.tensor([[7]], dtype=torch.int32, device="cuda")
+    # Prefill slot: WRITTEN with its computed delta (0), overwriting the stale 99 (a read would
+    # have returned 99) -- this is the evidence the write path ran for the prefill request.
+    torch.testing.assert_close(out[0:1], zero)
+    torch.testing.assert_close(cache[prefill_slot : prefill_slot + 1], zero)
+    # Extend slot: READ back unchanged (the regression clobbered it to 0).
+    torch.testing.assert_close(out[1:2], seven)
+    torch.testing.assert_close(cache[extend_slot : extend_slot + 1], seven)
+
+
 class _DummyQwenProcessor:
     def __init__(self, config):
         self.image_token_id = config.image_token_id
@@ -2753,3 +2850,520 @@ def test_vlm_wrapper_flattened_prefill_without_request_deltas():
         atol=1e-5,
         msg="Flattened cached prefill without deltas should preserve plain positions",
     )
+
+
+# =============================================================================
+# MTP modeling definitions and utilities
+# =============================================================================
+
+
+def _build_mtp_one_model_factory(**kwargs) -> EagleOneModelFactory:
+    return EagleOneModelFactory(
+        model="test-model",
+        skip_loading_weights=True,
+        max_seq_len=64,
+        speculative_config=MTPDecodingConfig(
+            max_draft_len=1,
+            mtp_eagle_one_model=True,
+            speculative_model="test-model",
+        ),
+        **kwargs,
+    )
+
+
+def _dynamic_shapes_for_mtp_target_export():
+    return {
+        "inputs_embeds": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    }
+
+
+def _export_mtp_target_for_capture(num_hidden_layers: int = 3):
+    config = _make_small_config(
+        num_hidden_layers=num_hidden_layers,
+        layer_types=["full_attention"] * num_hidden_layers,
+        mtp_num_hidden_layers=1,
+    )
+    model = Qwen3_5MoeForCausalLM(config).eval()
+
+    inputs_embeds = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(4).view(1, 4).expand(2, -1)
+    gm = torch_export_to_gm(
+        model,
+        args=(),
+        kwargs={
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
+        },
+        dynamic_shapes=_dynamic_shapes_for_mtp_target_export(),
+        strict=False,
+        num_moe_experts_for_export=2,
+    )
+    return gm, config
+
+
+def _init_mtp_module_weights(module: torch.nn.Module):
+    for submodule in module.modules():
+        if isinstance(submodule, torch.nn.Linear):
+            submodule.weight.data.normal_(mean=0.0, std=0.02)
+            if submodule.bias is not None:
+                submodule.bias.data.zero_()
+        elif isinstance(submodule, Qwen3_5MoeTopKRouter):
+            submodule.weight.data.normal_(mean=0.0, std=0.5)
+
+
+def _get_mtp_layer(drafter: EagleDrafterForCausalLM) -> Qwen3_5MoeEagleLayer:
+    assert isinstance(drafter.eagle_drafter.layers, Qwen3_5MoeEagleLayer)
+    return drafter.eagle_drafter.layers
+
+
+def _mtp_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    input_dtype = x.dtype
+    output = x.float()
+    output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + eps)
+    return (weight.float() * output).to(input_dtype)
+
+
+def _mtp_mlp(module, x: torch.Tensor) -> torch.Tensor:
+    return module.down_proj(F.silu(module.gate_proj(x)) * module.up_proj(x))
+
+
+def _manual_mtp_moe(moe, hidden_states: torch.Tensor) -> torch.Tensor:
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_flat = hidden_states.view(-1, hidden_dim)
+    router_logits = F.linear(hidden_states_flat, moe.gate.weight)
+    routing_weights = F.softmax(router_logits, dtype=torch.float, dim=-1)
+    routing_weights, selected_experts = torch.topk(routing_weights, moe.gate.top_k, dim=-1)
+    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    expert_output = torch.zeros_like(hidden_states_flat)
+    for slot in range(moe.gate.top_k):
+        slot_experts = selected_experts[:, slot]
+        slot_weights = routing_weights[:, slot]
+        for expert_idx, expert in enumerate(moe.experts):
+            mask = slot_experts == expert_idx
+            if mask.any():
+                expert_output[mask] += _mtp_mlp(expert, hidden_states_flat[mask]) * slot_weights[
+                    mask
+                ].unsqueeze(-1)
+
+    shared_output = _mtp_mlp(moe.shared_expert, hidden_states_flat)
+    shared_output = torch.sigmoid(moe.shared_expert_gate(hidden_states_flat)) * shared_output
+    return (expert_output + shared_output).view(batch_size, sequence_length, hidden_dim)
+
+
+def _manual_mtp_attention(
+    layer: Qwen3_5MoeEagleLayer, hidden_states: torch.Tensor, inputs_embeds: torch.Tensor
+):
+    batch_size, sequence_length, _ = hidden_states.shape
+    position_ids = torch.arange(sequence_length).view(1, sequence_length)
+    position_ids = position_ids.expand(batch_size, -1)
+    position_ids = position_ids[None, ...].expand(3, batch_size, -1)
+    position_embeddings = layer.rotary_emb(inputs_embeds, position_ids)
+
+    attention = layer.self_attn
+    qg = attention.q_proj(hidden_states).view(
+        batch_size, sequence_length, -1, attention.head_dim * 2
+    )
+    query_states, gate = torch.chunk(qg, 2, dim=-1)
+    gate = gate.reshape(batch_size, sequence_length, -1)
+    key_states = attention.k_proj(hidden_states).view(
+        batch_size, sequence_length, attention.num_key_value_heads, attention.head_dim
+    )
+    value_states = attention.v_proj(hidden_states).view(
+        batch_size, sequence_length, attention.num_key_value_heads, attention.head_dim
+    )
+
+    query_states = _mtp_rms_norm(query_states, attention.q_norm.weight, attention.q_norm.eps)
+    key_states = _mtp_rms_norm(key_states, attention.k_norm.weight, attention.k_norm.eps)
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states, *position_embeddings, unsqueeze_dim=2
+    )
+
+    repeats = attention.num_heads // attention.num_key_value_heads
+    key_states = key_states.repeat_interleave(repeats, dim=2)
+    value_states = value_states.repeat_interleave(repeats, dim=2)
+    attn_output = F.scaled_dot_product_attention(
+        query_states.transpose(1, 2),
+        key_states.transpose(1, 2),
+        value_states.transpose(1, 2),
+        is_causal=True,
+    )
+    attn_output = attn_output.transpose(1, 2).reshape(batch_size, sequence_length, -1)
+    return attention.o_proj(attn_output * torch.sigmoid(gate))
+
+
+def _manual_mtp_layer(
+    layer: Qwen3_5MoeEagleLayer,
+    hidden_states: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+) -> torch.Tensor:
+    inputs_embeds_norm = _mtp_rms_norm(
+        inputs_embeds, layer.pre_fc_norm_embedding.weight, layer.pre_fc_norm_embedding.eps
+    )
+    hidden_states_norm = _mtp_rms_norm(
+        hidden_states, layer.pre_fc_norm_hidden.weight, layer.pre_fc_norm_hidden.eps
+    )
+    hidden_states = layer.fc(torch.cat([inputs_embeds_norm, hidden_states_norm], dim=-1))
+
+    residual = hidden_states
+    hidden_states = _mtp_rms_norm(
+        hidden_states, layer.input_layernorm.weight, layer.input_layernorm.eps
+    )
+    hidden_states = residual + _manual_mtp_attention(layer, hidden_states, inputs_embeds)
+
+    residual = hidden_states
+    hidden_states = _mtp_rms_norm(
+        hidden_states, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps
+    )
+    hidden_states = residual + _manual_mtp_moe(layer.mlp, hidden_states)
+    return _mtp_rms_norm(hidden_states, layer.norm.weight, layer.norm.eps)
+
+
+def _remap_mtp_key(mapping: dict[str, str], key: str) -> str:
+    for pattern, replacement in mapping.items():
+        key = re.sub(pattern, replacement, key)
+    return key
+
+
+def _to_hf_mtp_key(key: str) -> str:
+    # Inverse of the qwen3_5_moe_text _checkpoint_conversion_mapping: turn a drafter param name
+    # (rooted at "eagle_drafter.layers.*") back into the HF MTP checkpoint name ("mtp.*"), so the
+    # strict-load test below actually exercises the mtp.* -> eagle_drafter.* conversion path.
+    if key.startswith("eagle_drafter.layers.fc."):
+        return key.replace("eagle_drafter.layers.fc.", "mtp.fc.", 1)
+    if key.startswith("eagle_drafter.layers.pre_fc_norm_embedding."):
+        return key.replace(
+            "eagle_drafter.layers.pre_fc_norm_embedding.", "mtp.pre_fc_norm_embedding.", 1
+        )
+    if key.startswith("eagle_drafter.layers.pre_fc_norm_hidden."):
+        return key.replace("eagle_drafter.layers.pre_fc_norm_hidden.", "mtp.pre_fc_norm_hidden.", 1)
+    if key.startswith("eagle_drafter.layers.norm."):
+        return key.replace("eagle_drafter.layers.norm.", "mtp.norm.", 1)
+    if key.startswith("eagle_drafter.layers."):
+        return key.replace("eagle_drafter.layers.", "mtp.layers.0.", 1)
+    return key
+
+
+def test_mtp_config_defaults_and_checkpoint_mapping():
+    config = _make_small_config(mtp_num_hidden_layers=1)
+    eagle_config = EagleConfig.from_base_config(config, config.model_type)
+
+    assert eagle_config.load_embedding_from_target is True
+    assert eagle_config.load_lm_head_from_target is True
+    assert eagle_config.num_capture_layers == 1
+    assert eagle_config.normalize_target_hidden_state is True
+    assert eagle_config.layers_handle_final_norm is True
+
+    mapping = eagle_config._checkpoint_conversion_mapping
+    assert _remap_mtp_key(mapping, "mtp.fc.weight") == "eagle_drafter.layers.fc.weight"
+    assert (
+        _remap_mtp_key(mapping, "mtp.pre_fc_norm_embedding.weight")
+        == "eagle_drafter.layers.pre_fc_norm_embedding.weight"
+    )
+    assert (
+        _remap_mtp_key(mapping, "mtp.layers.0.self_attn.q_proj.weight")
+        == "eagle_drafter.layers.self_attn.q_proj.weight"
+    )
+    assert _remap_mtp_key(mapping, "mtp.norm.weight") == "eagle_drafter.layers.norm.weight"
+
+
+def test_qwen3_5_full_config_causal_factory_uses_conditional_wrapper():
+    assert (
+        AutoModelForCausalLMFactory._custom_model_mapping["Qwen3_5MoeConfig"]
+        is Qwen3_5MoeForConditionalGeneration
+    )
+
+
+def test_mtp_layer_matches_manual_reference():
+    torch.manual_seed(0)
+    config = _make_small_config(mtp_num_hidden_layers=1)
+    layer = Qwen3_5MoeEagleLayer(config, layer_idx=0)
+    _init_mtp_module_weights(layer)
+
+    hidden_states = torch.randn(2, 5, config.hidden_size)
+    inputs_embeds = torch.randn(2, 5, config.hidden_size)
+    position_ids = torch.arange(5).view(1, 5).expand(2, -1)
+
+    actual = layer(hidden_states, inputs_embeds, position_ids)
+    expected = _manual_mtp_layer(layer, hidden_states, inputs_embeds)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+
+    actual_with_1d_position_ids = layer(hidden_states, inputs_embeds, torch.arange(5))
+    torch.testing.assert_close(actual_with_1d_position_ids, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_mtp_layer_attention_and_moe_components_match_manual_reference():
+    torch.manual_seed(1)
+    config = _make_small_config(mtp_num_hidden_layers=1)
+    layer = Qwen3_5MoeEagleLayer(config, layer_idx=0)
+    _init_mtp_module_weights(layer)
+
+    hidden_states = torch.randn(2, 5, config.hidden_size)
+    inputs_embeds = torch.randn(2, 5, config.hidden_size)
+    position_ids = torch.arange(5).view(1, 5).expand(2, -1)
+
+    actual_prologue = layer.fc(
+        torch.cat(
+            [
+                layer.pre_fc_norm_embedding(inputs_embeds),
+                layer.pre_fc_norm_hidden(hidden_states),
+            ],
+            dim=-1,
+        )
+    )
+    expected_prologue = layer.fc(
+        torch.cat(
+            [
+                _mtp_rms_norm(
+                    inputs_embeds,
+                    layer.pre_fc_norm_embedding.weight,
+                    layer.pre_fc_norm_embedding.eps,
+                ),
+                _mtp_rms_norm(
+                    hidden_states,
+                    layer.pre_fc_norm_hidden.weight,
+                    layer.pre_fc_norm_hidden.eps,
+                ),
+            ],
+            dim=-1,
+        )
+    )
+    torch.testing.assert_close(actual_prologue, expected_prologue)
+
+    normed = layer.input_layernorm(actual_prologue)
+    position_embeddings = layer.rotary_emb(
+        inputs_embeds, position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+    )
+    actual_attention = layer.self_attn(normed, position_embeddings=position_embeddings)
+    expected_attention = _manual_mtp_attention(layer, normed, inputs_embeds)
+    torch.testing.assert_close(actual_attention, expected_attention, rtol=2e-4, atol=2e-4)
+
+    normed_after_attention = layer.post_attention_layernorm(actual_prologue + actual_attention)
+    actual_moe = layer.mlp(normed_after_attention)
+    expected_moe = _manual_mtp_moe(layer.mlp, normed_after_attention)
+    torch.testing.assert_close(actual_moe, expected_moe, rtol=2e-4, atol=2e-4)
+
+
+def test_mtp_drafter_accepts_unused_hf_kwargs():
+    config = _make_small_config(mtp_num_hidden_layers=1)
+    eagle_config = EagleConfig.from_base_config(config, config.model_type)
+
+    model = Qwen3_5MoeForCausalLM._from_config(config)
+    assert model.config.model_type == "qwen3_5_moe_text"
+
+    drafter = EagleDrafterForCausalLM._from_config(eagle_config, use_cache=False)
+    assert drafter.config.model_type == "qwen3_5_moe_text"
+
+
+def test_mtp_drafter_export_uses_eagle_io_contract():
+    """Eagle drafter export must expose the IO contract consumed by EagleWrapper.
+
+    The wrapper feeds token embeddings, positions, and captured target hidden states into the
+    exported draft graph. The graph must return both normalized hidden states for lm_head logits and
+    raw last hidden states for the next speculative step.
+    """
+    config = _make_small_config(mtp_num_hidden_layers=1)
+    eagle_config = EagleConfig.from_base_config(config, config.model_type)
+    drafter = EagleDrafterForCausalLM._from_config(eagle_config, use_cache=False).eval()
+
+    inputs_embeds = torch.randn(2, 4, config.hidden_size)
+    hidden_states = torch.randn(2, 4, config.hidden_size)
+    position_ids = torch.arange(4).view(1, 4).expand(2, -1)
+
+    gm = torch_export_to_gm(
+        drafter,
+        args=(),
+        kwargs={
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
+            "hidden_states": hidden_states,
+        },
+        dynamic_shapes=None,
+        strict=False,
+        num_moe_experts_for_export=2,
+    )
+
+    placeholder_names = {node.target for node in gm.graph.nodes if node.op == "placeholder"}
+    assert {"inputs_embeds", "position_ids", "hidden_states"}.issubset(placeholder_names)
+
+    with torch.inference_mode():
+        outputs = gm(
+            inputs_embeds=torch.randn(2, 4, config.hidden_size),
+            position_ids=torch.arange(4).view(1, 4).expand(2, -1),
+            hidden_states=torch.randn(2, 4, config.hidden_size),
+        )
+
+    assert outputs["norm_hidden_state"].shape == (2, 4, config.hidden_size)
+    assert outputs["last_hidden_state"].shape == (2, 4, config.hidden_size)
+    assert torch.isfinite(outputs["norm_hidden_state"]).all()
+    assert torch.isfinite(outputs["last_hidden_state"]).all()
+
+
+def test_mtp_vlm_one_model_factory_exports_inner_language_model():
+    config = _make_small_composite_config(
+        text_config=_make_small_config(
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            mtp_num_hidden_layers=1,
+        )
+    )
+    factory = _build_mtp_one_model_factory(
+        target_model_factory="Qwen3_5MoeForConditionalGeneration",
+    )
+    wrapper = SimpleNamespace(
+        target_model=Qwen3_5MoeForConditionalGeneration(config),
+        draft_model=EagleDrafterForCausalLM._from_config(
+            EagleConfig.from_base_config(config.text_config, config.text_config.model_type)
+        ),
+    )
+
+    export_infos = factory.get_export_infos(wrapper)
+
+    assert isinstance(wrapper.target_model, Qwen3_5MoeForConditionalGeneration)
+    assert isinstance(wrapper.draft_model, EagleDrafterForCausalLM)
+    assert export_infos[0].submodule_name == "target_model.model.language_model"
+    assert export_infos[1].submodule_name == "draft_model"
+    assert export_infos[0].dynamic_shape_lookup["inputs_embeds"] == {
+        0: Dim.DYNAMIC,
+        1: Dim.DYNAMIC,
+    }
+    assert export_infos[0].dynamic_shape_lookup["position_ids"] == {
+        1: Dim.DYNAMIC,
+        2: Dim.DYNAMIC,
+    }
+
+
+def test_mtp_vlm_target_export():
+    config = _make_small_composite_config(
+        text_config=_make_small_config(
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            mtp_num_hidden_layers=1,
+        )
+    )
+    model = Qwen3_5MoeForConditionalGeneration(config).eval()
+    text_model = model.model.language_model
+    assert text_model.get_final_normalization() is text_model.norm
+    inputs_embeds = torch.randn(2, 4, config.text_config.hidden_size)
+    position_ids = torch.arange(4).view(1, 4).expand(2, -1)
+
+    gm = torch_export_to_gm(
+        text_model,
+        args=(),
+        kwargs={
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
+        },
+        dynamic_shapes=_dynamic_shapes_for_mtp_target_export(),
+        strict=False,
+        num_moe_experts_for_export=2,
+    )
+    target_export_info = Qwen3_5MoeTextExportInfo.from_autoinferred(model)
+    TargetModelExportInfo(
+        load_lm_head_from_target=True,
+        target_export_info=target_export_info,
+    ).post_process(text_model, gm)
+
+    assert gm.get_input_embeddings() is text_model.get_input_embeddings()
+    assert gm.get_output_embeddings() is text_model.get_output_embeddings()
+    assert gm.get_final_normalization() is text_model.get_final_normalization()
+
+
+def test_mtp_vlm_wrapper_accepts_text_only_inputs_embeds():
+    config = _make_small_composite_config(
+        text_config=_make_small_config(
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            mtp_num_hidden_layers=1,
+        )
+    )
+    model = Qwen3_5MoeForConditionalGeneration(config).eval()
+    inputs_embeds = torch.randn(2, 4, config.text_config.hidden_size)
+    position_ids = torch.arange(4).view(1, 4).expand(2, -1)
+
+    wrapper_logits = model(inputs_embeds=inputs_embeds, position_ids=position_ids).logits
+    text_out = model.model.language_model(
+        inputs_embeds=inputs_embeds,
+        position_ids=position_ids[None, ...].expand(3, position_ids.shape[0], -1),
+    )
+    expected_logits = model.lm_head(
+        text_out.last_hidden_state.to(model.lm_head.weight.dtype)
+    ).float()
+
+    torch.testing.assert_close(wrapper_logits, expected_logits)
+
+
+@pytest.mark.parametrize("num_hidden_layers", [1, 3])
+def test_mtp_target_hidden_state_capture_finds_expected_layers(num_hidden_layers):
+    gm, config = _export_mtp_target_for_capture(num_hidden_layers)
+    transform = DetectHiddenStatesForCapture(
+        config=TransformConfig(
+            stage="pattern_matcher",
+            eagle3_layers_to_capture={-1},
+        )
+    )
+
+    residual_nodes = transform.collect_residual_add_nodes(gm)
+
+    assert sorted(residual_nodes) == list(range(num_hidden_layers))
+    for residual_node in residual_nodes.values():
+        assert residual_node.meta["val"].shape[-1] == config.hidden_size
+
+    last_layer = max(residual_nodes)
+    expected_arg_names = tuple(
+        arg.name if isinstance(arg, torch.fx.Node) else arg
+        for arg in residual_nodes[last_layer].args
+    )
+
+    gm, info = transform._apply(gm, None, None, None)
+    capture_nodes = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target == torch.ops.auto_deploy.residual_add_for_capture.default
+    ]
+
+    assert info.num_matches == 1
+    assert len(capture_nodes) == 1
+    capture_arg_names = tuple(
+        arg.name if isinstance(arg, torch.fx.Node) else arg for arg in capture_nodes[0].args
+    )
+    assert capture_arg_names == expected_arg_names
+
+
+def test_mtp_target_export_uses_inputs_embeds_as_live_seed():
+    gm, _ = _export_mtp_target_for_capture(num_hidden_layers=1)
+
+    placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
+
+    assert "inputs_embeds" in placeholder_names
+    assert "position_ids" in placeholder_names
+    assert "input_ids" not in placeholder_names
+    assert placeholder_names.index("inputs_embeds") < placeholder_names.index("position_ids")
+    assert not any(
+        node.op == "call_module" and "embed_tokens" in str(node.target) for node in gm.graph.nodes
+    )
+
+
+def test_mtp_hf_checkpoint_keys_load_strictly():
+    config = _make_small_config(mtp_num_hidden_layers=1)
+    eagle_config = EagleConfig.from_base_config(config, config.model_type)
+
+    drafter = EagleDrafterForCausalLM._from_config(eagle_config)
+    state_dict = {
+        _to_hf_mtp_key(key): torch.randn_like(value) for key, value in drafter.state_dict().items()
+    }
+
+    factory = object.__new__(AutoModelForCausalLMFactory)
+    factory._checkpoint_conversion_mapping = eagle_config._checkpoint_conversion_mapping
+    hook = drafter.register_load_state_dict_pre_hook(factory._remap_param_names_load_hook)
+    try:
+        incompatible_keys = drafter.load_state_dict(state_dict, strict=True)
+    finally:
+        hook.remove()
+
+    assert incompatible_keys.missing_keys == []
+    assert incompatible_keys.unexpected_keys == []

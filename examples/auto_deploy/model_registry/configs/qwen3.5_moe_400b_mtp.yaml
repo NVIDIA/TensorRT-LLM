@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.5 MoE 397B NVFP4 one-model MTP speculative decoding (GSM8K-sized).
+# This is base qwen3.5_moe_400b.yaml + MTP deltas only. Framework defaults
+# (runtime=trtllm, compile_backend=torch-cudagraph, attn_backend=trtllm) are
+# omitted, as is world_size (provided by the test's world_size_4.yaml overlay).
+# The MTP head shipped in the checkpoint is unquantized (bf16); it is excluded
+# from quantization via the draft quant-exclude remap (see
+# EagleConfig._quant_exclude_conversion_mapping for qwen3_5_moe_text).
+# Modest sizing for GSM8K accuracy eval (vs the large production 400b config).
+max_seq_len: 8192
+max_num_tokens: 4096
+max_batch_size: 32
+cuda_graph_config:
+  max_batch_size: 32
+  batch_sizes: [1, 2, 4, 8, 16, 32]
+# Speculative decoding does not support chunked prefill.
+enable_chunked_prefill: false
+# One-model MTP requires the conditional-generation factory (custom modeling):
+# validate_speculative_model_factory moves this into target_model_factory and
+# sets model_factory=eagle_one_model, so the draft factory resolves the
+# qwen3_5_moe_text model_type and builds the MTP eagle layer.
+model_factory: Qwen3_5MoeForConditionalGeneration
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+model_kwargs:
+  torch_dtype: bfloat16
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 6
+  mtp_eagle_one_model: true
+transforms:
+  initialize_mrope_delta_cache:
+    enabled: true
+  export_to_gm:
+    num_moe_experts_for_export: 2
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_nvfp4_moe:
+    backend: trtllm_gen
+  insert_cached_gated_delta_rule:
+    backend: fla_gated_delta
+  insert_cached_causal_conv:
+    backend: triton_causal_conv
+  apply_sharding_hints:
+    allreduce_strategy: SYMM_MEM
+    # Shared expert is excluded from sharding for performance purpose
+    shard_layers: ["moe", "delta", "mha"]
+  multi_stream_moe:
+    stage: compile
+    enabled: true
+  multi_stream_gemm:
+    stage: compile
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
+  compile_model:
+    # piecewise cudagraph disabled for MTP
+    piecewise_enabled: false
