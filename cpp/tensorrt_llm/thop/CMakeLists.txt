@@ -66,6 +66,7 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekV4QNormOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
@@ -99,6 +100,7 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
