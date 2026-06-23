@@ -314,6 +314,17 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def cuda_graph_replay_signature(self) -> Optional[Tuple[Any, ...]]:
+        """
+        Returns backend-specific metadata that must match the captured CUDA graph
+        before replay.
+
+        CUDA graph keys cover the model-level batch shape. Attention backends
+        can add values that affect their graph-captured kernel launches but are
+        not represented in the model-level key.
+        """
+        return None
+
     def _prepare_mamba_metadata(self):
         if self.mamba_metadata is False:
             return

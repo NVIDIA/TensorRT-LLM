@@ -61,6 +61,71 @@ class CUDAGraphTestScenario:
 
 class TestFlashInferAttention(unittest.TestCase):
 
+    def test_cuda_graph_replay_signature_tracks_decode_page_counts(
+            self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        batch_size = 3
+        tokens_per_block = 4
+        max_blocks_per_seq = 4
+        max_seq_len = tokens_per_block * max_blocks_per_seq
+        request_ids = list(range(batch_size))
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=batch_size * max_seq_len),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=8,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        kv_cache_manager.add_dummy_requests(request_ids,
+                                            [max_seq_len] * batch_size)
+
+        try:
+            metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=torch.ones((batch_size, ), dtype=torch.int),
+                num_contexts=0,
+                is_cuda_graph=True,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[0, 3, 4],
+                ),
+                max_num_requests=batch_size,
+                max_num_tokens=batch_size,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+
+            metadata.prepare()
+
+            self.assertEqual(metadata.num_blocks, [1, 1, 2])
+            self.assertEqual(metadata.cuda_graph_replay_signature(), (1, 1, 2))
+            self.assertEqual(
+                metadata.paged_kv_indptr_decode[:batch_size + 1].cpu().tolist(),
+                [0, 1, 2, 4],
+            )
+
+            metadata.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[12, 0, 7],
+            )
+            metadata.prepare()
+
+            self.assertEqual(metadata.num_blocks, [4, 1, 2])
+            self.assertEqual(metadata.cuda_graph_replay_signature(), (4, 1, 2))
+            self.assertEqual(
+                metadata.paged_kv_indptr_decode[:batch_size + 1].cpu().tolist(),
+                [0, 4, 5, 7],
+            )
+        finally:
+            kv_cache_manager.shutdown()
+
     @parameterized.expand([
         Scenario(num_layers=1,
                  num_heads=32,

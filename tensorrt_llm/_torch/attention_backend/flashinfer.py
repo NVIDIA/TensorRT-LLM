@@ -612,6 +612,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         metadata.__post_init__()
         return metadata
 
+    def cuda_graph_replay_signature(self):
+        num_blocks = getattr(self, "num_blocks", None)
+        if num_blocks is None:
+            return None
+        return tuple(int(num_block) for num_block in num_blocks)
+
     @property
     def page_size(self) -> int:
         """
