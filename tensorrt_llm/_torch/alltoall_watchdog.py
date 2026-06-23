@@ -26,8 +26,9 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Callable, Deque, Mapping, Optional, Protocol, Sequence
+from typing import Protocol
 
 import torch
 
@@ -110,6 +111,8 @@ class _TorchCompletionFlagReader:
         }
         self._device_copy_timeout_s = float(device_copy_timeout_s)
         self._copy_stream: torch.cuda.Stream | None = None
+        self._host_flags: torch.Tensor | None = None
+        self._copy_event: torch.cuda.Event | None = None
         self._retired_copies: list[tuple[torch.Tensor, torch.cuda.Event]] = []
         if workspace.device.type == "cuda":
             self._copy_stream = torch.cuda.Stream(device=workspace.device)
@@ -123,13 +126,17 @@ class _TorchCompletionFlagReader:
         assert self._copy_stream is not None
         self._prune_retired_copies()
 
-        host_flags = torch.empty(
-            (self._ep_size,),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=prefer_pinned(),
-        )
-        event = torch.cuda.Event(blocking=False)
+        if self._host_flags is None:
+            self._host_flags = torch.empty(
+                (self._ep_size,),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+        if self._copy_event is None:
+            self._copy_event = torch.cuda.Event(blocking=False)
+        host_flags = self._host_flags
+        event = self._copy_event
         with torch.cuda.device(flags.device), torch.cuda.stream(self._copy_stream):
             host_flags.copy_(flags.detach(), non_blocking=True)
             event.record(self._copy_stream)
@@ -139,6 +146,8 @@ class _TorchCompletionFlagReader:
             remaining_s = deadline_s - time.monotonic()
             if remaining_s <= 0:
                 self._retired_copies.append((host_flags, event))
+                self._host_flags = None
+                self._copy_event = None
                 raise CompletionFlagReadTimeout(
                     "timed out copying AlltoAll completion flags to host"
                 )
@@ -175,8 +184,8 @@ class AlltoAllWatchdog:
         completion_reader: CompletionFlagReader,
         timeout_s: float = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
         poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
-        health: Optional[EPGroupHealthLike] = None,
-        on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+        health: EPGroupHealthLike | None = None,
+        on_timeout: Callable[[AlltoAllWatchdogTimeout], None] | None = None,
     ) -> None:
         if ep_size <= 0:
             raise ValueError(f"ep_size must be > 0, got {ep_size}")
@@ -196,7 +205,7 @@ class AlltoAllWatchdog:
         self._on_timeout = on_timeout
 
         self._cv = threading.Condition()
-        self._queue: Deque[_CollectiveWatch] = deque()
+        self._queue: deque[_CollectiveWatch] = deque()
         self._closed = False
         self._stopping = False
         self._thread: threading.Thread | None = None
@@ -213,8 +222,8 @@ class AlltoAllWatchdog:
         ep_size: int,
         timeout_s: float = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
         poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
-        health: Optional[EPGroupHealthLike] = None,
-        on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+        health: EPGroupHealthLike | None = None,
+        on_timeout: Callable[[AlltoAllWatchdogTimeout], None] | None = None,
     ) -> "AlltoAllWatchdog":
         """Build a watchdog from the MoE AlltoAll workspace and metainfo."""
         dispatch_offset = int(
@@ -421,7 +430,7 @@ class AlltoAllWatchdog:
             except CompletionFlagReadTimeout:
                 observed_flags = last_observed_flags
                 poll_timed_out = True
-            except BaseException as exc:  # noqa: BLE001 - keep watchdog failures visible.
+            except Exception as exc:  # noqa: BLE001 - keep watchdog failures visible.
                 with self._cv:
                     self._last_error = exc
                     self._queue.clear()

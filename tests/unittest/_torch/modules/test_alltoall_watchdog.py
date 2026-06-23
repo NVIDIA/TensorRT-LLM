@@ -16,6 +16,7 @@
 
 import threading
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -69,7 +70,7 @@ class OneGoodReadThenTimeoutReader:
         raise CompletionFlagReadTimeout("blocked")
 
 
-def _wait_for(predicate, timeout_s: float = 1.0) -> None:
+def _wait_for(predicate: Callable[[], bool], timeout_s: float = 1.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if predicate():
@@ -126,7 +127,9 @@ def test_watchdog_stop_is_terminal() -> None:
         watchdog.watch(phase="dispatch", expected_flag=1)
 
 
-def test_wide_ep_ft_options_create_shared_health_when_enabled(monkeypatch) -> None:
+def test_wide_ep_ft_options_create_shared_health_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
