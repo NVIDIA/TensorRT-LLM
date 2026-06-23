@@ -337,6 +337,10 @@ class KvCacheCreator:
                                 manager_cls,
                                 model_config,
                                 kv_cache_config: Optional[KvCacheConfig] = None,
+    def kv_cache_manager_cls(self):
+        return self._kv_cache_manager_cls
+
+    def _per_manager_cache_cost(self, manager_cls, model_config,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -659,7 +663,8 @@ class KvCacheCreator:
         mapping = self._mapping
 
         # TODO: support CP by generating dummy requests for it.
-        assert 'cp_type' not in mapping.cp_config
+        if not self._skip_est:
+            assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
 
