@@ -17,7 +17,7 @@ This feature is a prototype and its interface may change in a future release.
 ```
 
 For the interface definitions referenced below, see
-[`tensorrt_llm/executor/postprocessor_hook.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/executor/postprocessor_hook.py).
+[`tensorrt_llm/executor/postprocessor_hook.py`](../../../tensorrt_llm/executor/postprocessor_hook.py).
 
 ## Enabling the hook
 
@@ -49,8 +49,8 @@ A hook implements a single method, `__call__(self, chunk) -> verdict`:
 
 ```python
 from tensorrt_llm.executor.postprocessor_hook import (
-    PostProcChunk,
-    PostProcVerdict,
+    PostProcessorHookChunk,
+    PostProcessorHookVerdict,
     emit,
     suppress,
     terminate,
@@ -58,24 +58,16 @@ from tensorrt_llm.executor.postprocessor_hook import (
 
 
 class MyPostProcessor:
-    def __call__(self, chunk: PostProcChunk) -> PostProcVerdict:
+    def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict:
         return emit(chunk.text_diff)  # pass through unchanged
 ```
 
-### `PostProcChunk`
+### `PostProcessorHookChunk`
 
-The payload handed to the hook for one output chunk:
-
-| Field | Description |
-|-------|-------------|
-| `request_id` | Stable identifier for the request; the same value is passed for every chunk of a response, so the hook can key its per-request state on it. |
-| `output_index` | Index of the output/beam within the request. |
-| `text_diff` | Newly detokenized text produced by this chunk (streaming). For non-streaming requests this equals `text`. |
-| `text` | Full accumulated detokenized text so far for this output. |
-| `token_ids_diff` | Newly generated token ids for this chunk. |
-| `is_final` | `True` on the terminating call for this output. |
-| `aborted` | `True` if the request has been marked aborted in this process. Output-side observation only. |
-| `streaming` | `True` for streaming requests. |
+The payload handed to the hook for one output chunk — `request_id`, `output_index`, `text_diff`,
+`text`, `token_ids_diff`, `is_final`, `aborted`, and `streaming`. See the `PostProcessorHookChunk`
+dataclass in [`postprocessor_hook.py`](../../../tensorrt_llm/executor/postprocessor_hook.py)
+for the authoritative field-by-field descriptions.
 
 ### Verdicts
 
@@ -96,11 +88,11 @@ Verdicts are **per chunk**: `suppress()` withholds the current chunk, and `termi
 A stateless hook that upper-cases every chunk:
 
 ```python
-from tensorrt_llm.executor.postprocessor_hook import PostProcChunk, PostProcVerdict, emit
+from tensorrt_llm.executor.postprocessor_hook import PostProcessorHookChunk, PostProcessorHookVerdict, emit
 
 
 class UpperCaseHook:
-    def __call__(self, chunk: PostProcChunk) -> PostProcVerdict:
+    def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict:
         return emit(chunk.text_diff.upper())
 ```
 
@@ -111,7 +103,7 @@ phrase appears, and releases its state when the request finishes:
 
 ```python
 from tensorrt_llm.executor.postprocessor_hook import (
-    PostProcChunk, PostProcVerdict, emit, terminate,
+    PostProcessorHookChunk, PostProcessorHookVerdict, emit, terminate,
 )
 
 
@@ -122,7 +114,7 @@ class BannedPhraseGuard:
         # Per-request accumulators owned entirely by the hook.
         self._buffers: dict[int, str] = {}
 
-    def __call__(self, chunk: PostProcChunk) -> PostProcVerdict:
+    def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict:
         buffer = self._buffers.get(chunk.request_id, "") + chunk.text_diff.lower()
         self._buffers[chunk.request_id] = buffer
 
@@ -140,11 +132,11 @@ class BannedPhraseGuard:
 A hook that withholds all client-visible text:
 
 ```python
-from tensorrt_llm.executor.postprocessor_hook import PostProcChunk, PostProcVerdict, suppress
+from tensorrt_llm.executor.postprocessor_hook import PostProcessorHookChunk, PostProcessorHookVerdict, suppress
 
 
 class SuppressHook:
-    def __call__(self, chunk: PostProcChunk) -> PostProcVerdict:
+    def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict:
         return suppress()
 ```
 

@@ -19,9 +19,9 @@ import logging
 from typing import List, Optional, Protocol, runtime_checkable
 
 __all__ = [
-    "PostProcAction",
-    "PostProcChunk",
-    "PostProcVerdict",
+    "PostProcessorHookAction",
+    "PostProcessorHookChunk",
+    "PostProcessorHookVerdict",
     "PostProcessorHook",
     "emit",
     "suppress",
@@ -65,7 +65,7 @@ def load_post_processor_hook(import_path: str) -> "PostProcessorHook":
 
 
 @dataclasses.dataclass
-class PostProcChunk:
+class PostProcessorHookChunk:
     """The payload handed to the post-processing hook for one output chunk.
 
     Attributes:
@@ -95,7 +95,7 @@ class PostProcChunk:
     streaming: bool
 
 
-class PostProcAction(str, enum.Enum):
+class PostProcessorHookAction(str, enum.Enum):
     """The kind of decision a hook returns for one chunk."""
 
     EMIT = "emit"
@@ -104,35 +104,35 @@ class PostProcAction(str, enum.Enum):
 
 
 @dataclasses.dataclass
-class PostProcVerdict:
+class PostProcessorHookVerdict:
     """The hook's decision for one chunk.
 
     Use the :func:`emit`, :func:`suppress`, and :func:`terminate` helpers rather
     than constructing this directly.
     """
 
-    action: PostProcAction
+    action: PostProcessorHookAction
     text: str = ""
     reason: Optional[str] = None
 
     def __post_init__(self):
         # Coerce/validate so a hook can never smuggle an unknown action.
-        self.action = PostProcAction(self.action)
+        self.action = PostProcessorHookAction(self.action)
 
 
-def emit(text: str) -> PostProcVerdict:
+def emit(text: str) -> PostProcessorHookVerdict:
     """Emit ``text`` for this chunk (use to rewrite/redact, or pass through)."""
-    return PostProcVerdict(action=PostProcAction.EMIT, text=text)
+    return PostProcessorHookVerdict(action=PostProcessorHookAction.EMIT, text=text)
 
 
-def suppress() -> PostProcVerdict:
+def suppress() -> PostProcessorHookVerdict:
     """Withhold this chunk entirely (no client-visible output)."""
-    return PostProcVerdict(action=PostProcAction.SUPPRESS)
+    return PostProcessorHookVerdict(action=PostProcessorHookAction.SUPPRESS)
 
 
-def terminate(reason: str) -> PostProcVerdict:
+def terminate(reason: str) -> PostProcessorHookVerdict:
     """Stop the stream for this request. ``reason`` is surfaced as stop_reason."""
-    return PostProcVerdict(action=PostProcAction.TERMINATE, reason=reason)
+    return PostProcessorHookVerdict(action=PostProcessorHookAction.TERMINATE, reason=reason)
 
 
 @runtime_checkable
@@ -144,7 +144,7 @@ class PostProcessorHook(Protocol):
     and is responsible for releasing it on ``chunk.is_final``.
     """
 
-    def __call__(self, chunk: PostProcChunk) -> PostProcVerdict: ...
+    def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...
 
 
 def _withhold_token_channel(output, streaming: bool) -> None:
@@ -185,7 +185,7 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     # should key on (request_id, output_index).
     is_final = result._done
     for output in result.outputs:
-        chunk = PostProcChunk(
+        chunk = PostProcessorHookChunk(
             request_id=result.id,
             output_index=output.index,
             text_diff=output.text_diff,
@@ -204,12 +204,12 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             )
             raise
         prefix = output.text[: output._last_text_len]
-        if verdict.action is PostProcAction.EMIT:
+        if verdict.action is PostProcessorHookAction.EMIT:
             output.text = prefix + verdict.text
-        elif verdict.action is PostProcAction.SUPPRESS:
+        elif verdict.action is PostProcessorHookAction.SUPPRESS:
             output.text = prefix
             _withhold_token_channel(output, streaming)
-        elif verdict.action is PostProcAction.TERMINATE:
+        elif verdict.action is PostProcessorHookAction.TERMINATE:
             output.text = prefix + verdict.text
             _withhold_token_channel(output, streaming)
             output.finish_reason = "stop"

@@ -5,7 +5,7 @@
 import pytest
 
 from tensorrt_llm.executor.postprocessor_hook import (
-    PostProcChunk,
+    PostProcessorHookChunk,
     apply_post_processor_hook,
     emit,
     load_post_processor_hook,
@@ -57,7 +57,7 @@ def test_rewrite_streaming_diff_replaces_only_the_diff():
     out = _make_output("hello world", last_text_len=len("hello"))
     result = _FakeResult([out])
 
-    def hook(chunk: PostProcChunk):
+    def hook(chunk: PostProcessorHookChunk):
         assert chunk.text_diff == " world"
         assert chunk.text == "hello world"
         return emit(chunk.text_diff.upper())
@@ -175,7 +175,7 @@ def test_non_streaming_rewrites_full_text():
     out = _make_output("the full answer", last_text_len=0)
     result = _FakeResult([out], done=True)
 
-    def hook(chunk: PostProcChunk):
+    def hook(chunk: PostProcessorHookChunk):
         assert chunk.text_diff == chunk.text == "the full answer"
         return emit("REDACTED")
 
@@ -201,7 +201,7 @@ def test_per_request_state_is_keyed_by_request_id():
         def __init__(self):
             self.state = {}
 
-        def __call__(self, chunk: PostProcChunk):
+        def __call__(self, chunk: PostProcessorHookChunk):
             n = self.state.get(chunk.request_id, 0) + 1
             self.state[chunk.request_id] = n
             if chunk.is_final:
@@ -227,20 +227,22 @@ def test_per_request_state_is_keyed_by_request_id():
 
 def test_unknown_verdict_action_rejected_at_construction():
     """An unknown action cannot be smuggled: the verdict rejects it on build."""
-    from tensorrt_llm.executor.postprocessor_hook import PostProcVerdict
+    from tensorrt_llm.executor.postprocessor_hook import PostProcessorHookVerdict
 
     with pytest.raises(ValueError):
-        PostProcVerdict(action="bogus")
+        PostProcessorHookVerdict(action="bogus")
 
 
 def test_unknown_action_fails_closed_through_apply():
     """A hook constructing a bad verdict fails the request closed (re-raised)."""
-    from tensorrt_llm.executor.postprocessor_hook import PostProcVerdict
+    from tensorrt_llm.executor.postprocessor_hook import PostProcessorHookVerdict
 
     out = _make_output("x", 0)
     result = _FakeResult([out])
     with pytest.raises(ValueError):
-        apply_post_processor_hook(lambda c: PostProcVerdict(action="bogus"), result, streaming=True)
+        apply_post_processor_hook(
+            lambda c: PostProcessorHookVerdict(action="bogus"), result, streaming=True
+        )
 
 
 def test_loader_resolves_import_path():
