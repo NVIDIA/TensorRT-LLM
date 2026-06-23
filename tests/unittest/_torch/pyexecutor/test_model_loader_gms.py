@@ -15,6 +15,16 @@ from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
+_SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
+    format_version=1,
+    model_fingerprint="model",
+    quant_fingerprint="quant",
+    backend_fingerprint="backend",
+    parallel_fingerprint="parallel",
+    rank=0,
+    shard_fingerprint="shard",
+)
+
 
 class _TinyModel(nn.Module):
     def __init__(self, events, *, include_draft=False):
@@ -71,6 +81,13 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
+    # These tests stub ModelConfig, while SourceIdentity has dedicated
+    # coverage. Keep this file focused on ModelLoader GMS branch behavior.
+    monkeypatch.setattr(
+        model_loader_mod.SourceIdentity,
+        "from_model_config",
+        classmethod(lambda cls, *_args, **_kwargs: _SOURCE_IDENTITY),
+    )
     monkeypatch.setattr(
         model_loader_mod.AutoModelForCausalLM,
         "from_config",
@@ -93,6 +110,7 @@ def _build_gms_backend(*, is_rw, events):
     if is_rw:
         backend.mem_pool_scope.side_effect = lambda _device: _pool_scope(events)
     else:
+        backend.get_source_identity.return_value = _SOURCE_IDENTITY
 
         def _materialize(_model):
             events.append("materialize")
@@ -169,7 +187,10 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         # path (see model_loader.py); HF ignores it, MX uses it for direct
         # P2P writes when MX+GMS composition eventually lands.
         checkpoint_loader.load_weights.assert_called_once_with(
-            "/ckpt", mapping=loader.mapping, model=model
+            "/ckpt",
+            mapping=loader.mapping,
+            model=model,
+            source_identity=loader._source_identity,
         )
         loader._call_load_weights.assert_called_once()
         backend.move_untracked_params.assert_called_once_with(model)
