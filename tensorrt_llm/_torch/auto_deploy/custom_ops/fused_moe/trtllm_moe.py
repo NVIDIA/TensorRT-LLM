@@ -28,14 +28,6 @@ from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 _f32_scale_cache: dict = {}
 
-# Router GEMM uses TRT-LLM tinygemm2 (single-kernel tall-skinny GEMM, no cuBLAS
-# split-K + splitKreduce) for small-M decode, matching PT's compute_gate_output.
-# Above this token count cuBLAS GEMM is preferred (tinygemm2 specialization no longer
-# wins and its accumulation diverges); same threshold PT uses.
-_MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
-# tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
-_TINYGEMM_SM = (90, 100, 103)
-
 
 def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
     """Whether the router GEMM may use tinygemm2 (else fall back to F.linear).
@@ -45,6 +37,12 @@ def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
     Any unmet condition (prefill, non-bf16, non-contiguous, no bias, other arch)
     silently falls back to F.linear — no hard failure.
     """
+    # Router GEMM uses TRT-LLM tinygemm2 (single-kernel tall-skinny GEMM, no cuBLAS split-K + splitKreduce) for small-M
+    # decode, matching PT's compute_gate_output. Above this token count cuBLAS GEMM is preferred (tinygemm2
+    # specialization no longer wins and its accumulation diverges); same threshold PT uses.
+    _MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+    # tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
+    _TINYGEMM_SM = (90, 100, 103)
     return (
         bias is not None
         and get_sm_version() in _TINYGEMM_SM
@@ -1425,10 +1423,9 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
     # Routing: compute router logits and hand them to the C++ runner which performs
     # fused topk + softmax + cast internally. routing_bias is None — the linear-layer
     # bias is fused into router_logits here.
-    # For the small-M (decode) router GEMM, TRT-LLM tinygemm2 is a single-kernel
-    # tall-skinny GEMM that avoids cuBLAS's split-K + splitKreduce round-trip (matches
-    # PT's compute_gate_output). Router-only (small N=num_experts); attention/lm_head
-    # keep their cublas_mm path. See _router_use_tinygemm for the support guard.
+    # For the small-M (decode) router GEMM, TRT-LLM tinygemm2 is a single-kernel tall-skinny GEMM that avoids cuBLAS's
+    # split-K + splitKreduce round-trip (matches PT's compute_gate_output). Router-only (small N=num_experts);
+    # attention/lm_head keep their cublas_mm path. See _router_use_tinygemm for the support guard.
     if _router_use_tinygemm(x2d, router_weight, router_bias):
         router_logits = torch.ops.trtllm.tinygemm2(x2d, router_weight, router_bias)
     else:

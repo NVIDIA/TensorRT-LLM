@@ -50,9 +50,10 @@ deterministic, node-local sharding.
     head-count dimension scales with TP.
   * MoE router + experts stay replicated under sharding-IR; EP/TP-MoE for the
     trtllm-gen path is applied later by a separate ``ShardableNode``.
-  * ``lm_head`` stays as a plain ``nn.Linear`` — no canonical sharding-IR pattern
-    for col-parallel-linear-then-all-gather, and the gain is marginal
-    (~80 us/token at TP=4 for gpt-oss-120b).
+  * ``lm_head`` is emitted as ``torch_linear_simple`` (NOT a plain ``nn.Linear``): the hint-driven
+    sharder only recognizes canonical ops, so a plain ``aten.linear`` would be invisible to it.
+    ``simple_shard_filter: "lm_head"`` then column-splits the vocab dim + all_gathers
+    (vocab-parallel), matching PT's COLUMN ``ParallelLMHead``.
 """
 
 import math
@@ -548,7 +549,8 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = GptOssModel(config)
-        # lm_head stays as plain nn.Linear; see module docstring for rationale.
+        # lm_head module is a plain nn.Linear; the forward emits it as torch_linear_simple
+        # for vocab-parallel sharding (see forward + module docstring).
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
