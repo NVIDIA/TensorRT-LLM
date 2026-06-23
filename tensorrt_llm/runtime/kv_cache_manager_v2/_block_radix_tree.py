@@ -256,7 +256,7 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "reuse_scope", "__rawref__")
+    __slots__ = ("__rawref__", "_prev", "key", "next", "reuse_scope")
     key: BlockKey
     reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
@@ -301,7 +301,7 @@ class Block:
     A block of tokens. Manages data for all layers.
     """
 
-    __slots__ = ("key", "tokens", "ordinal", "_prev", "next", "storage", "__rawref__")
+    __slots__ = ("__rawref__", "_prev", "key", "next", "ordinal", "storage", "tokens")
     key: BlockKey
     tokens: Sequence[TokenIdExt]
     ordinal: BlockOrdinal
@@ -426,11 +426,11 @@ class Block:
 
 class BlockRadixTree:
     __slots__ = (
+        "__rawref__",
+        "_event_manager",
         "_life_cycles",
         "_tokens_per_block",
-        "_event_manager",
         "next",
-        "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
     _tokens_per_block: int
