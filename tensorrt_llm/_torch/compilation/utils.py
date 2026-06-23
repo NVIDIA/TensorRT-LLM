@@ -122,44 +122,44 @@ def inplace_info():
             1: "output"
         },
         torch.ops.trtllm.compressor_paged_kv_compress.default: {
-            3: "paged_kv",
-            4: "paged_score",
-            7: "output"
+            1: "paged_kv",
+            2: "paged_score",
+            3: "output"
         },
         torch.ops.trtllm.compressor_prefill_reduction.default: {
-            3: "paged_kv",
-            4: "paged_score",
-            7: "output"
+            1: "paged_kv",
+            2: "paged_score",
+            3: "output"
         },
         torch.ops.trtllm.compressor_postprocess_scatter.default: {
-            2: "kv_out",
-            9: "kv_cache",
-            18: "quant_output",
-            19: "scale_output"
+            1: "kv_out",
+            2: "kv_cache",
+            3: "quant_output",
+            4: "scale_output"
         },
         torch.ops.trtllm.mhc_big_fuse.default: {
-            6: "post_mix",
-            7: "comb_mix",
-            8: "layer_input"
+            1: "post_mix",
+            2: "comb_mix",
+            3: "layer_input"
         },
         torch.ops.trtllm.mhc_gemm_sqrsum_fma.default: {
-            3: "y",
-            4: "r"
+            1: "y",
+            2: "r"
         },
         torch.ops.trtllm.mhc_hc_head_apply.default: {
-            4: "out"
+            1: "out"
         },
         torch.ops.trtllm.mhc_post_mapping.default: {
-            5: "out"
+            1: "out"
         },
         torch.ops.trtllm.mhc_fused_hc.default: {
-            8: "residual_cur",
-            9: "post_mix_cur",
-            10: "comb_mix_cur",
-            11: "layer_input_cur",
-            12: "y_acc_workspace",
-            13: "r_acc_workspace",
-            14: "done_counter_workspace"
+            1: "residual_cur",
+            2: "post_mix_cur",
+            3: "comb_mix_cur",
+            4: "layer_input_cur",
+            5: "y_acc_workspace",
+            6: "r_acc_workspace",
+            7: "done_counter_workspace"
         },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
