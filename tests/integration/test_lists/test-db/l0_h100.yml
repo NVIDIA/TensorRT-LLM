@@ -96,6 +96,7 @@ l0_h100:
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
+  - unittest/scaffolding
   - unittest/usage/test_collectors.py
   - unittest/usage/test_config.py
   - unittest/usage/test_opt_out.py
