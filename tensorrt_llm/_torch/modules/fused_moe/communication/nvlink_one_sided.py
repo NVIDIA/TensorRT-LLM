@@ -25,6 +25,7 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import threading
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -287,6 +288,8 @@ class NVLinkOneSided(Communication):
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "watchdog_flag_generation": 0,
+                "watchdog_flag_generation_lock": threading.Lock(),
             }
             NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         else:
@@ -312,17 +315,20 @@ class NVLinkOneSided(Communication):
             NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
         )
         self._destroyed = False
+        self._workspace_state = workspace_state
         self.mnnvl_mem = workspace_state["mnnvl_mem"]
         self.workspace = workspace_state["workspace"]
         self.moe_a2a_metainfo = workspace_state["metainfo"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
+        if "watchdog_flag_generation_lock" not in workspace_state:
+            workspace_state["watchdog_flag_generation_lock"] = threading.Lock()
+            workspace_state["watchdog_flag_generation"] = self._read_current_flag_val()
         self.ep_group_health = ep_group_health
-        self._watchdog_flag_generation = 0
         self._alltoall_watchdog: AlltoAllWatchdog | None = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         if alltoall_watchdog_timeout_s is not None:
-            self._watchdog_flag_generation = self._read_current_flag_val()
+            self._sync_watchdog_flag_generation()
             self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
                 workspace=self.workspace,
                 metainfo=self.moe_a2a_metainfo,
@@ -354,6 +360,22 @@ class NVLinkOneSided(Communication):
             flag_val = flag_val.detach().cpu()
         return int(flag_val.item())
 
+    def _sync_watchdog_flag_generation(self) -> None:
+        lock = self._workspace_state["watchdog_flag_generation_lock"]
+        with lock:
+            self._workspace_state["watchdog_flag_generation"] = max(
+                int(self._workspace_state["watchdog_flag_generation"]),
+                self._read_current_flag_val(),
+            )
+
+    def _next_watchdog_flag_generation(self) -> int:
+        lock = self._workspace_state["watchdog_flag_generation_lock"]
+        with lock:
+            self._workspace_state["watchdog_flag_generation"] = (
+                int(self._workspace_state["watchdog_flag_generation"]) + 1
+            )
+            return int(self._workspace_state["watchdog_flag_generation"])
+
     def _get_active_rank_mask_tensor(
         self, active_rank_mask: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
@@ -374,10 +396,9 @@ class NVLinkOneSided(Communication):
     def _watch_collective(self, phase: str, active_rank_mask: Optional[torch.Tensor]) -> None:
         if self._alltoall_watchdog is None:
             return
-        self._watchdog_flag_generation += 1
         self._alltoall_watchdog.watch(
             phase=phase,
-            expected_flag=self._watchdog_flag_generation,
+            expected_flag=self._next_watchdog_flag_generation(),
             active_mask=self._active_mask_int(active_rank_mask),
         )
 
@@ -424,6 +445,7 @@ class NVLinkOneSided(Communication):
         self.mnnvl_mem = None
         self.workspace = None
         self.moe_a2a_metainfo = None
+        self._workspace_state = None
         self._dispatch_state = {"phase": "destroyed"}
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:

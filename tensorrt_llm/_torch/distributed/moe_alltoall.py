@@ -9,6 +9,7 @@ with proper workspace management and synchronization.
 
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -212,6 +213,8 @@ class MoeAlltoAll:
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "watchdog_flag_generation": 0,
+                "watchdog_flag_generation_lock": threading.Lock(),
             }
         else:
             assert self._WORKSPACE[
@@ -229,17 +232,20 @@ class MoeAlltoAll:
         self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
+        if "watchdog_flag_generation_lock" not in self._WORKSPACE:
+            self._WORKSPACE["watchdog_flag_generation_lock"] = threading.Lock()
+            self._WORKSPACE[
+                "watchdog_flag_generation"] = self._read_current_flag_val()
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
         self._destroyed = False
-        self._watchdog_flag_generation = 0
         self._alltoall_watchdog: AlltoAllWatchdog | None = None
         if (alltoall_watchdog_timeout_s is None
                 and self.ep_group_health is not None):
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         if alltoall_watchdog_timeout_s is not None:
-            self._watchdog_flag_generation = self._read_current_flag_val()
+            self._sync_watchdog_flag_generation()
             self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
                 workspace=self.workspace,
                 metainfo=self.metainfo,
@@ -276,6 +282,25 @@ class MoeAlltoAll:
             flag_val = flag_val.detach().cpu()
         return int(flag_val.item())
 
+    def _sync_watchdog_flag_generation(self) -> None:
+        workspace_state = self._WORKSPACE
+        assert workspace_state is not None
+        lock = workspace_state["watchdog_flag_generation_lock"]
+        with lock:
+            workspace_state["watchdog_flag_generation"] = max(
+                int(workspace_state["watchdog_flag_generation"]),
+                self._read_current_flag_val(),
+            )
+
+    def _next_watchdog_flag_generation(self) -> int:
+        workspace_state = self._WORKSPACE
+        assert workspace_state is not None
+        lock = workspace_state["watchdog_flag_generation_lock"]
+        with lock:
+            workspace_state["watchdog_flag_generation"] = (
+                int(workspace_state["watchdog_flag_generation"]) + 1)
+            return int(workspace_state["watchdog_flag_generation"])
+
     def _get_active_rank_mask_tensor(
             self,
             active_rank_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -302,10 +327,9 @@ class MoeAlltoAll:
                           active_rank_mask: Optional[torch.Tensor]) -> None:
         if self._alltoall_watchdog is None:
             return
-        self._watchdog_flag_generation += 1
         self._alltoall_watchdog.watch(
             phase=phase,
-            expected_flag=self._watchdog_flag_generation,
+            expected_flag=self._next_watchdog_flag_generation(),
             active_mask=self._active_mask_int(active_rank_mask),
         )
 
