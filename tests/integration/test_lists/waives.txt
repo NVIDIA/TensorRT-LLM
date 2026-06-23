@@ -228,7 +228,7 @@ full:H100/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[in
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache SKIP (https://nvbugs/5682551)
 full:H100_PCIe/unittest/llmapi/test_llm_pytorch.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks SKIP (https://nvbugs/6335726)
 full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False] SKIP (https://nvbugs/6345827)
-full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] SKIP (https://nvbugs/6345829)
+full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] SKIP (https://nvbugs/6345827)
 full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2] SKIP (https://nvbugs/6313314)
 full:H20/accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=3-block_reuse=True-use_py_transceiver=False] SKIP (https://nvbugs/6344108)
 full:H20/accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4 SKIP (https://nvbugs/6344108)
