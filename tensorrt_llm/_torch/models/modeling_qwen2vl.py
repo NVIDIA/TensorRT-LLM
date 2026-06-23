@@ -235,7 +235,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
     #
-    # `get_num_mm_tokens` / `get_size_for_max_tokens` are the encoder-
+    # `_num_vision_tokens` / `get_size_for_max_tokens` are the encoder-
     # side counterpart to the LLM's `max_num_tokens`: they report (and
     # invert) the exact number of attention tokens the vision encoder will
     # process for a given input size. The unit is **pre-merger patches** so
@@ -271,7 +271,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # HF `smart_resize` defaults.
         return 3136, 1003520
 
-    def get_num_mm_tokens(
+    def _num_vision_tokens(
         self,
         *,
         width: int,
@@ -293,6 +293,33 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                                          num_frames=num_frames)
         return grid_t * grid_h * grid_w
 
+    def get_num_tokens_per_image(self, *, image, **kwargs) -> int:
+        """Prompt-side image token count: the encoder tokens for the image size
+        divided by ``spatial_merge_unit`` (the post-merger placeholder count)."""
+        if isinstance(image, torch.Tensor):
+            image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        else:
+            image_h, image_w = image.height, image.width
+        encoder_tokens = self._num_vision_tokens(width=image_w,
+                                                 height=image_h,
+                                                 num_frames=1)
+        return encoder_tokens // self.spatial_merge_unit
+
+    def get_num_tokens_per_video(self, *, video, **kwargs) -> int:
+        """Prompt-side video token count: the encoder tokens for the frame stack
+        divided by ``spatial_merge_unit``."""
+        num_frames = len(video)
+        first_frame = video[0]
+        if isinstance(first_frame, torch.Tensor):
+            frame_h = int(first_frame.shape[-2])
+            frame_w = int(first_frame.shape[-1])
+        else:
+            frame_h, frame_w = first_frame.height, first_frame.width
+        encoder_tokens = self._num_vision_tokens(width=frame_w,
+                                                 height=frame_h,
+                                                 num_frames=num_frames)
+        return encoder_tokens // self.spatial_merge_unit
+
     def _grid_thw_for_size(
         self,
         *,
@@ -303,7 +330,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """``(grid_t, grid_h, grid_w)`` patch-grid dimensions the processor would
         produce for an image/video of the given pixel size, after HF
         ``smart_resize`` (so the ``[min_pixels, max_pixels]`` clamp is honored).
-        Shared by :meth:`get_num_mm_tokens` (product) and
+        Shared by :meth:`_num_vision_tokens` (product) and
         :meth:`get_dummy_mm_data_for_size` (tensor shapes)."""
         cfg = self.config.vision_config
         patch_size = cfg.patch_size
@@ -331,17 +358,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         *,
         max_tokens: int,
     ) -> Dict[str, int]:
-        """Invert ``get_num_mm_tokens``: pick the ``(width, height)`` whose
+        """Invert ``_num_vision_tokens``: pick the ``(width, height)`` whose
         attention-token count is the largest value ≤ ``max_tokens`` while
         keeping the aspect ratio bounded.
 
-        ``max_tokens`` is in the same unit as ``get_num_mm_tokens`` /
+        ``max_tokens`` is in the same unit as ``_num_vision_tokens`` /
         ``encoder_max_num_tokens`` (pre-merger).
 
         Returns a single-image geometry (``num_frames=1``). This is a valid
         worst case for the *whole* vision encoder regardless of the runtime
         modality: the ViT cost is a function of the total pre-merger patch
-        count (the token unit), and ``get_num_mm_tokens`` already folds video
+        count (the token unit), and ``_num_vision_tokens`` already folds video
         frames into that same count — so an image saturating ``max_tokens``
         hits the same attention workspace as any video with the same token
         count. Non-visual modalities (e.g. audio) live on a different input
@@ -368,7 +395,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # familiar near-square factor pair for aspect ratio bounds.
         post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
         # A single image can't exceed the processor's ``max_pixels`` -- past
-        # that, ``smart_resize`` (in ``get_num_mm_tokens``) clamps the image
+        # that, ``smart_resize`` (in ``_num_vision_tokens``) clamps the image
         # back down, so an uncapped budget would produce a size whose real
         # token count falls short of ``max_tokens``. Cap so the chosen size
         # round-trips exactly (size the worst case by ``max_pixels``).
@@ -396,7 +423,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         size = self.get_size_for_max_tokens(max_tokens=_MAX_PIXELS_TOKEN_PROBE)
         return {
             "image":
-            self.get_num_mm_tokens(width=size["width"], height=size["height"])
+            self._num_vision_tokens(width=size["width"], height=size["height"])
         }
 
     def get_dummy_mm_data_for_tokens(
@@ -419,9 +446,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         size = self.get_size_for_max_tokens(max_tokens=max_tokens)
         tokens_per_image = max(
             1,
-            self.get_num_mm_tokens(width=size["width"],
-                                   height=size["height"],
-                                   num_frames=size.get("num_frames", 1)))
+            self._num_vision_tokens(width=size["width"],
+                                    height=size["height"],
+                                    num_frames=size.get("num_frames", 1)))
         num_images = max(1, max_tokens // tokens_per_image)
         return self.get_dummy_mm_data_for_size(width=size["width"],
                                                height=size["height"],

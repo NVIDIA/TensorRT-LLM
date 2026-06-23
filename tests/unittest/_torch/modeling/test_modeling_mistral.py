@@ -639,8 +639,8 @@ def test_mistral_attention_swa_layer_types():
 # CPU-only unit tests for the encoder-profiling dummy contract: reach into
 # Mistral3InputProcessor directly (no model load) and stub the geometry the
 # dummy math reads. The ViT token unit is the pre-merge patch count
-# ``(h//patch)*(w//patch)`` -- deliberately *not* ``get_num_mm_tokens`` (which
-# the hashing path uses for the LLM-side Pixtral count with framing tokens).
+# ``(h//patch)*(w//patch)`` -- deliberately *not* the hashing path's LLM-side
+# Pixtral count with framing tokens.
 # ---------------------------------------------------------------------------
 def _make_dummy_processor(*, patch_size=14, spatial_merge_size=2, image_size=1540, num_channels=3):
     """Construct a processor stub with just the geometry the dummy math reads.

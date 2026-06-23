@@ -204,9 +204,10 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
 
     # Deterministic dummy-input sizing (`spatial_merge_unit`,
-    # `get_num_mm_tokens`, `get_size_for_max_tokens`) is inherited
-    # unchanged from `Qwen2VLInputProcessorBase` -- the grid math and the HF
-    # `smart_resize` it defers to are identical for Qwen3-VL.
+    # `_num_vision_tokens`, `get_size_for_max_tokens`) and the
+    # `get_num_tokens_per_image` override are inherited unchanged from
+    # `Qwen2VLInputProcessorBase` -- the grid math and the HF `smart_resize`
+    # it defers to are identical for Qwen3-VL.
 
     @classmethod
     def get_rope_index(

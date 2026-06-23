@@ -435,7 +435,7 @@ def test_prepare_qwen_vl_mrope_config_pure_generation_reads_deltas_only():
 #
 # CPU-only unit tests that reach into the InputProcessorBase classes directly
 # (no model load) and stub just enough of the HF config so the encoder-side
-# ``get_num_mm_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data_*``
+# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data_*``
 # math runs. Token unit is pre-merger encoder attention, matching
 # ``encoder_max_num_tokens``.
 # ---------------------------------------------------------------------------
@@ -452,7 +452,7 @@ def _make_dummy_processor(
 
     Bypasses the real ``__init__`` (which loads tokenizers/processors) and pins
     just the fields the deterministic math reads. ``min_pixels`` / ``max_pixels``
-    stub the HF image processor's ``size`` config that ``get_num_mm_tokens``
+    stub the HF image processor's ``size`` config that ``_num_vision_tokens``
     reads for its ``smart_resize`` clamp; the default ``max_pixels`` is generous
     so the factor-pair tests aren't clamped (the clamp itself is covered by
     ``test_dummy_size_capped_at_max_pixels``).
@@ -486,35 +486,35 @@ def test_spatial_merge_unit_is_merge_size_squared(processor_cls):
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_num_mm_tokens_matches_manual_grid(processor_cls):
+def test_num_vision_tokens_matches_manual_grid(processor_cls):
     proc = _make_dummy_processor(processor_cls,
                                  patch_size=16,
                                  spatial_merge_size=2,
                                  temporal_patch_size=2)
     # 224x224 image, patch=16, merge=2 -> resize-to-multiple-of-(16*2=32)
     # 224/32 -> rounds to 224 (already a multiple), grid 14*14 = 196.
-    assert proc.get_num_mm_tokens(width=224, height=224) == 14 * 14
+    assert proc._num_vision_tokens(width=224, height=224) == 14 * 14
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_num_mm_tokens_rounds_to_unit(processor_cls):
+def test_num_vision_tokens_rounds_to_unit(processor_cls):
     proc = _make_dummy_processor(processor_cls,
                                  patch_size=16,
                                  spatial_merge_size=2,
                                  temporal_patch_size=2)
     # 220x220 -> rounds half-up to nearest multiple of 32 = 224 -> 14*14.
-    assert proc.get_num_mm_tokens(width=220, height=220) == 14 * 14
+    assert proc._num_vision_tokens(width=220, height=220) == 14 * 14
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_num_mm_tokens_temporal_padding(processor_cls):
+def test_num_vision_tokens_temporal_padding(processor_cls):
     proc = _make_dummy_processor(processor_cls,
                                  patch_size=16,
                                  spatial_merge_size=2,
                                  temporal_patch_size=2)
     # Single frame still pads to temporal_patch_size, grid_t = 1.
-    single = proc.get_num_mm_tokens(width=224, height=224, num_frames=1)
-    three = proc.get_num_mm_tokens(width=224, height=224, num_frames=3)
+    single = proc._num_vision_tokens(width=224, height=224, num_frames=1)
+    three = proc._num_vision_tokens(width=224, height=224, num_frames=3)
     # 3 frames -> pad to 4 -> grid_t = 2.
     assert three == 2 * single
 
@@ -524,9 +524,9 @@ def test_get_num_mm_tokens_temporal_padding(processor_cls):
 def test_invertibility_fits_within_budget(processor_cls, budget):
     proc = _make_dummy_processor(processor_cls)
     size = proc.get_size_for_max_tokens(max_tokens=budget)
-    actual = proc.get_num_mm_tokens(width=size["width"],
-                                    height=size["height"],
-                                    num_frames=size["num_frames"])
+    actual = proc._num_vision_tokens(width=size["width"],
+                                     height=size["height"],
+                                     num_frames=size["num_frames"])
     assert actual <= budget, f"Got {actual} tokens for size {size}, budget was {budget}"
 
 
@@ -536,9 +536,9 @@ def test_invertibility_saturates_budget(processor_cls, budget):
     """Power-of-2 budgets fit the encoder's unit grid exactly."""
     proc = _make_dummy_processor(processor_cls)
     size = proc.get_size_for_max_tokens(max_tokens=budget)
-    actual = proc.get_num_mm_tokens(width=size["width"],
-                                    height=size["height"],
-                                    num_frames=size["num_frames"])
+    actual = proc._num_vision_tokens(width=size["width"],
+                                     height=size["height"],
+                                     num_frames=size["num_frames"])
     # Budgets above are all powers of 2 with merge_size=2 squared as a factor,
     # so saturation should be exact.
     assert actual == budget
@@ -564,9 +564,9 @@ def test_dummy_size_capped_at_max_pixels(processor_cls):
     # The chosen image must fit within max_pixels and round-trip exactly, so the
     # realized token count is the single-image max, below the huge budget.
     assert size["width"] * size["height"] <= max_pixels, size
-    actual = proc.get_num_mm_tokens(width=size["width"],
-                                    height=size["height"],
-                                    num_frames=size["num_frames"])
+    actual = proc._num_vision_tokens(width=size["width"],
+                                     height=size["height"],
+                                     num_frames=size["num_frames"])
     assert 0 < actual < 1_000_000
 
 
@@ -581,11 +581,11 @@ def test_get_size_rejects_non_positive_budget(processor_cls):
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 def test_get_dummy_mm_data_shapes_match_token_count(processor_cls):
-    """Direct tensor build: pixel_values rows and the grid_thw product match ``get_num_mm_tokens`` per image."""
+    """Direct tensor build: pixel_values rows and the grid_thw product match ``_num_vision_tokens`` per image."""
     proc = _make_dummy_processor(processor_cls)
     cfg = proc._config.vision_config
     width = height = 224
-    per_image = proc.get_num_mm_tokens(width=width, height=height)
+    per_image = proc._num_vision_tokens(width=width, height=height)
     in_dim = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
 
     data = proc.get_dummy_mm_data_for_size(width=width,
@@ -621,8 +621,8 @@ def test_mm_max_tokens_per_item_is_image_only(processor_cls):
     assert set(demand) == {"image"}
     # The declared per-item demand is exactly the max single-image token count.
     cap_size = proc.get_size_for_max_tokens(max_tokens=10**9)
-    assert demand["image"] == proc.get_num_mm_tokens(width=cap_size["width"],
-                                                     height=cap_size["height"])
+    assert demand["image"] == proc._num_vision_tokens(width=cap_size["width"],
+                                                      height=cap_size["height"])
     assert demand["image"] > 0
 
 

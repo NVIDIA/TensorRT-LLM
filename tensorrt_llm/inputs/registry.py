@@ -485,52 +485,6 @@ class BaseMultimodalInputProcessor(ABC):
                 "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
             )
 
-    # ------------------------------------------------------------------
-    # Canonical encoder-side math.
-    #
-    # ``get_num_mm_tokens`` is the single source of truth for the
-    # input-size → token-count mapping. Two consumer paths share it:
-    #
-    #   * Vision dummy sizing (the size trio on the concrete processor, e.g.
-    #       Qwen-VL's ``get_size_for_max_tokens`` / ``get_dummy_mm_data_for_size``
-    #       behind ``get_dummy_mm_data_for_tokens``): uses pre-merger tokens
-    #       directly to size the encoder workspace against ``encoder_max_num_tokens``.
-    #   * Prompt-side hashing (get_num_tokens_per_image / _video):
-    #       divides by ``spatial_merge_unit`` to get the placeholder count
-    #       the prompt will carry.
-    #
-    # Models that have not opted in keep the legacy behavior — the default
-    # raises NotImplementedError and the hashing path falls back to the HF
-    # processor delegation it already used.
-    # ------------------------------------------------------------------
-    @property
-    def spatial_merge_unit(self) -> int:
-        """Encoder→LLM token ratio.
-
-        Default 1 (no spatial merging). Override on encoders that downsample
-        their output before the LLM (e.g. Qwen-VL family returns
-        ``spatial_merge_size ** 2``).
-        """
-        return 1
-
-    def get_num_mm_tokens(
-        self,
-        *,
-        width: int,
-        height: int,
-        num_frames: int = 1,
-    ) -> int:
-        """Return encoder attention tokens (pre-merger) for given media size.
-
-        Single source of truth for the encoder-side math, in the same unit
-        as ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
-        Subclasses opt in by overriding this method; default raises
-        ``NotImplementedError`` so the legacy HF-processor delegation in
-        :meth:`get_num_tokens_per_image` / :meth:`get_num_tokens_per_video`
-        remains the fallback.
-        """
-        raise NotImplementedError
-
     def get_num_tokens_per_image(
         self,
         *,
@@ -540,11 +494,7 @@ class BaseMultimodalInputProcessor(ABC):
         """
         Calculate the number of tokens generated for an image.
 
-        Tries the deterministic ``get_num_mm_tokens`` path first
-        (encoder-side math, divided by ``spatial_merge_unit`` to land in
-        LLM-visible / post-merger units). Falls back to the Hugging Face
-        processor's ``_get_num_multimodal_tokens`` method when the model
-        has not implemented the deterministic math.
+        Delegates to the Hugging Face processor's ``_get_num_multimodal_tokens``.
 
         Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
         in `find_mm_token_lengths` feeds tensors directly to avoid a costly
@@ -560,15 +510,8 @@ class BaseMultimodalInputProcessor(ABC):
             image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
         else:
             image_h, image_w = image.height, image.width
-
-        try:
-            encoder_tokens = self.get_num_mm_tokens(width=image_w,
-                                                    height=image_h,
-                                                    num_frames=1)
-            return encoder_tokens // self.spatial_merge_unit
-        except NotImplementedError:
-            return self.get_num_multimodal_tokens(
-                [(image_h, image_w)], **kwargs)["num_image_tokens"][0]
+        return self.get_num_multimodal_tokens([(image_h, image_w)],
+                                              **kwargs)["num_image_tokens"][0]
 
     def get_num_tokens_per_video(
         self,
@@ -581,12 +524,9 @@ class BaseMultimodalInputProcessor(ABC):
         """
         Calculate the number of tokens generated for a video.
 
-        Tries the deterministic ``get_num_mm_tokens`` path first (passing
-        ``num_frames`` so subclasses can account for temporal patching).
-        Falls back to the Hugging Face processor's
-        ``_get_num_multimodal_tokens`` method on ``NotImplementedError``;
-        a further fallback treats the video as a stack of frames if the HF
-        processor lacks a video-aware path.
+        Delegates to the Hugging Face processor's ``_get_num_multimodal_tokens``;
+        a fallback treats the video as a stack of frames if the HF processor
+        lacks a video-aware path.
 
         Accepts a list of PIL Images or CHW `torch.Tensor` frames.
 
@@ -607,14 +547,6 @@ class BaseMultimodalInputProcessor(ABC):
             frame_w = int(first_frame.shape[-1])
         else:
             frame_h, frame_w = first_frame.height, first_frame.width
-
-        try:
-            encoder_tokens = self.get_num_mm_tokens(width=frame_w,
-                                                    height=frame_h,
-                                                    num_frames=num_frames)
-            return encoder_tokens // self.spatial_merge_unit
-        except NotImplementedError:
-            pass
 
         video_size = (num_frames, frame_h, frame_w)
         try:
@@ -647,14 +579,9 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     Token unit is **encoder attention** (pre-merger), matching
     ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
 
-    Note: ``get_num_mm_tokens`` and ``spatial_merge_unit`` live on
-    :class:`BaseMultimodalInputProcessor` (shared with the hashing path
-    ``get_num_tokens_per_image`` / ``..._video`` / ``..._audio``); a concrete
-    multimodal processor inherits from both mixins.
+    Note: a concrete multimodal processor inherits both this builder and
+    ``BaseMultimodalInputProcessor`` (the prompt-side token-counting path).
     """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
     @property
     @abstractmethod
@@ -697,17 +624,6 @@ class BaseMultimodalDummyInputsBuilder(ABC):
 
         The modality-agnostic entry the KV-cache encoder profiler calls, sizing
         each modality to saturate its share of the token budget.
-
-        ``max_tokens_per_modality`` maps each modality from
-        :meth:`get_mm_max_tokens_per_item` to its share of the (shared)
-        ``encoder_max_num_tokens`` budget. The implementation owns every
-        modality-specific choice: a vision processor inverts the budget to a
-        media size and materializes ``pixel_values`` / ``grid_thw``; an audio
-        processor sizes mel frames from its own duration math. Each modality's
-        tensors are built directly (no PIL image / HF-processor round-trip — only
-        their *shape* matters for memory profiling) and **merged into one**
-        ``multimodal_data`` dict so a single ``encode_multimodal_inputs`` forward
-        profiles the combined peak.
 
         Returns the ``multimodal_data`` dict the model's encoder consumes (e.g.
         ``{"image": {"pixel_values": ..., "image_grid_thw": ...}}`` for Qwen-VL).
