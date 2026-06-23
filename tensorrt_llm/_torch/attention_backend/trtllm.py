@@ -186,16 +186,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return min(self.max_seq_len, self.max_num_tokens)
 
     @property
-    def effective_beam_width(self) -> int:
-        """Beam width visible to the kernel.
-
-        Cross-attention K/V storage is request-scoped, but its metadata is
-        expanded to one row per decoder beam so kernels still need the active
-        decoder beam width.
-        """
-        return self.beam_width
-
-    @property
     def max_seq_len(self) -> int:
         """
         Returns the max sequence length.
