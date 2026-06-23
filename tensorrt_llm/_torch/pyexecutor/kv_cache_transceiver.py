@@ -74,8 +74,9 @@ def create_kv_cache_transceiver(
     # since the C++ transceiver does not support chunked transfer.
     # Only applies to NIXL/DEFAULT backends (the Python transceiver
     # does not support UCX, MPI, or MOONCAKE).
-    use_python = cache_transceiver_config.transceiver_runtime == "PYTHON"
-    if (not use_python
+    runtime = cache_transceiver_config.transceiver_runtime
+    use_python = runtime == "PYTHON"
+    if (runtime is None
             and cache_transceiver_config.chunk_size_blocks is not None):
         if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
             # Use warning (not info) so users notice the transceiver swap and
@@ -95,6 +96,12 @@ def create_kv_cache_transceiver(
                 f"transceiver, which does not support chunked transfer. "
                 f"chunk_size_blocks will be ignored. Use NIXL backend to "
                 f"enable chunked transfer.")
+    elif (runtime == "CPP"
+          and cache_transceiver_config.chunk_size_blocks is not None):
+        logger.warning(
+            "chunk_size_blocks is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection; "
+            "chunk_size_blocks will be ignored.")
 
     # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
     # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA

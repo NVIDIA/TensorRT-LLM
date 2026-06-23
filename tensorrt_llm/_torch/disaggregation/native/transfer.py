@@ -750,10 +750,14 @@ class Sender(SenderBase):
                 # When sender uses chunking, the receiver sends all dst
                 # blocks in a single RecvReqInfo.  Slice dst to match
                 # this task's src chunk position.
-                if chunk_offset > 0 or len(src_block_ids) < len(full_dst_block_ids):
-                    dst_block_ids = full_dst_block_ids[
-                        chunk_offset : chunk_offset + len(src_block_ids)
-                    ]
+                if chunk_offset > 0 or not task._slice.is_last_slice:
+                    chunk_end = chunk_offset + len(src_block_ids)
+                    if chunk_end > full_dst_block_ids.size:
+                        raise ValueError(
+                            f"dst chunk range out of bounds: offset={chunk_offset}, "
+                            f"len={len(src_block_ids)}, dst_blocks={full_dst_block_ids.size}"
+                        )
+                    dst_block_ids = full_dst_block_ids[chunk_offset:chunk_end]
                 else:
                     dst_block_ids = full_dst_block_ids
 
@@ -765,10 +769,10 @@ class Sender(SenderBase):
                         f"src={src_block_ids.size}, dst={dst_block_ids.size}"
                     )
                     dst_block_ids = dst_block_ids[:-1]
-                elif block_diff > 1:
+                elif block_diff != 0:
                     raise ValueError(
                         f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (expected diff <= 1)"
+                        f"{dst_block_ids.size} (expected 0 <= diff <= 1)"
                     )
                 tpb = extractor.page_table.tokens_per_block
                 token_range = task._slice.token_range
