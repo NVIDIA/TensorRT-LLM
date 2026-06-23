@@ -23,16 +23,18 @@ at various QPS levels, exercising the prefix-aware scheduler's reuse
 estimation logic under realistic serving conditions.
 """
 
+import contextlib
 import csv
 import json
 import math
 import os
 import queue
 import re
+import socket
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TypeAlias
 
@@ -59,6 +61,13 @@ _LMBENCHMARK_INSTALL_SPEC = (
     f"{_LMBENCHMARK_PACKAGE} @ git+https://github.com/LMCache/LMBenchmark.git@{LMBENCHMARK_SHA}"
 )
 CsvMetrics: TypeAlias = dict[str, int | float]
+_SERVER_HOST = "0.0.0.0"
+_SERVER_START_MAX_ATTEMPTS = 5
+_PORT_CONFLICT_SUBSTRINGS = (
+    "address already in use",
+    "eaddrinuse",
+    "errno 98",
+)
 
 # ---------------------------------------------------------------------------
 # Scheduler / KV-cache config combinations
@@ -264,6 +273,75 @@ def _wait_for_server_ready(
     raise TimeoutError(f"trtllm-serve not ready within {timeout}s")
 
 
+def _is_port_available_for_server(port: int) -> bool:
+    """Return whether trtllm-serve can bind its configured host/port pair now."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((_SERVER_HOST, port))
+            return True
+    except OSError:
+        return False
+
+
+def _is_port_conflict_error(message: str) -> bool:
+    """Return whether a startup failure came from an occupied server port."""
+    lowered = message.lower()
+    return "bind" in lowered and any(pattern in lowered for pattern in _PORT_CONFLICT_SUBSTRINGS)
+
+
+def _server_attempt_log_path(server_log: str, attempt: int) -> str:
+    """Return an isolated log path for one server startup attempt."""
+    path = Path(server_log)
+    return str(path.with_name(f"{path.name}.attempt{attempt}"))
+
+
+@contextlib.contextmanager
+def _start_server_until_ready(
+    config_path: str,
+    server_log: str,
+    env: Mapping[str, str],
+    max_attempts: int = _SERVER_START_MAX_ATTEMPTS,
+) -> Iterator[tuple[subprocess.Popen, int, str]]:
+    """Start trtllm-serve, retrying only when the selected port races."""
+    last_port_conflict: BaseException | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        port = get_free_port_in_ci()
+        attempt_log = _server_attempt_log_path(server_log, attempt)
+
+        if not _is_port_available_for_server(port):
+            last_port_conflict = RuntimeError(f"Port {_SERVER_HOST}:{port} is already in use")
+            action = "retrying" if attempt < max_attempts else "no attempts remain"
+            print_info(
+                f"trtllm-serve startup attempt {attempt}/{max_attempts} "
+                f"selected occupied port {port}; {action}"
+            )
+            continue
+
+        cmd = _make_server_cmd(port, config_path)
+        with open(attempt_log, "w") as log_f:
+            with popen(cmd, stderr=log_f, stdout=log_f, env=env) as proc:
+                try:
+                    _wait_for_server_ready(proc, port, server_log=attempt_log)
+                except RuntimeError as exc:
+                    if _is_port_conflict_error(str(exc)):
+                        last_port_conflict = exc
+                        action = "retrying" if attempt < max_attempts else "no attempts remain"
+                        print_info(
+                            f"trtllm-serve startup attempt {attempt}/{max_attempts} "
+                            f"lost port {port} before bind; {action}"
+                        )
+                        continue
+                    raise
+
+                yield proc, port, attempt_log
+                return
+
+    raise RuntimeError(
+        f"Failed to start trtllm-serve after {max_attempts} attempts due to repeated port conflicts"
+    ) from last_port_conflict
+
+
 def _make_server_cmd(port: int, config_path: str) -> list[str]:
     """Build the trtllm-serve command used by all tests."""
     return [
@@ -271,7 +349,7 @@ def _make_server_cmd(port: int, config_path: str) -> list[str]:
         "serve",
         MODEL_PATH,
         "--host",
-        "0.0.0.0",
+        _SERVER_HOST,
         "--port",
         str(port),
         "--config",
@@ -710,53 +788,52 @@ class TestServePrefixAwareScheduling:
             "print_iter_log": True,
         }
         config_path = _write_config(tmp_path, baseline_cfg)
-        port = get_free_port_in_ci()
-        cmd = _make_server_cmd(port, config_path)
-        server_log = str(tmp_path / "server.log")
+        server_log_base = str(tmp_path / "server.log")
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
-        with open(server_log, "w") as log_f:
-            with popen(cmd, stderr=log_f, stdout=log_f, env=env) as proc:
-                _wait_for_server_ready(proc, port, server_log=server_log)
+        with _start_server_until_ready(config_path, server_log_base, env) as (
+            proc,
+            port,
+            server_log,
+        ):
+            # Stage 1: seed radix tree (mimics the low-QPS warmup that
+            # accumulated state before the crash in the original report).
+            print_info("Smoke stage 1: seeding radix tree...")
+            _run_and_assert_stage(
+                "Smoke warmup",
+                ensure_lmbenchmark,
+                port,
+                str(tmp_path / "smoke_warmup.csv"),
+                server_log,
+                qps=4,
+                num_users=3,
+                num_rounds=3,
+                system_prompt=1000,
+                chat_history=20000,
+                answer_len=10,
+                duration=20,
+            )
 
-                # Stage 1: seed radix tree (mimics the low-QPS warmup that
-                # accumulated state before the crash in the original report).
-                print_info("Smoke stage 1: seeding radix tree...")
-                _run_and_assert_stage(
-                    "Smoke warmup",
-                    ensure_lmbenchmark,
-                    port,
-                    str(tmp_path / "smoke_warmup.csv"),
-                    server_log,
-                    qps=4,
-                    num_users=3,
-                    num_rounds=3,
-                    system_prompt=1000,
-                    chat_history=20000,
-                    answer_len=10,
-                    duration=20,
-                )
+            # Stage 2: main load at QPS=32 (the originally failing level).
+            print_info("Smoke stage 2: main load at QPS=32...")
+            _run_and_assert_stage(
+                "Smoke main stage",
+                ensure_lmbenchmark,
+                port,
+                str(tmp_path / "smoke_main.csv"),
+                server_log,
+                qps=32,
+                num_users=8,
+                num_rounds=5,
+                system_prompt=1000,
+                chat_history=20000,
+                answer_len=10,
+                duration=45,
+            )
 
-                # Stage 2: main load at QPS=32 (the originally failing level).
-                print_info("Smoke stage 2: main load at QPS=32...")
-                _run_and_assert_stage(
-                    "Smoke main stage",
-                    ensure_lmbenchmark,
-                    port,
-                    str(tmp_path / "smoke_main.csv"),
-                    server_log,
-                    qps=32,
-                    num_users=8,
-                    num_rounds=5,
-                    system_prompt=1000,
-                    chat_history=20000,
-                    answer_len=10,
-                    duration=45,
-                )
-
-                assert proc.poll() is None, (
-                    f"Server exited unexpectedly. See {server_log}\n{_tail_log(server_log)}"
-                )
+            assert proc.poll() is None, (
+                f"Server exited unexpectedly. See {server_log}\n{_tail_log(server_log)}"
+            )
 
         _assert_no_server_errors(server_log)
 
@@ -803,63 +880,62 @@ class TestServePrefixAwareScheduling:
         ~10 min runtime per config.
         """
         config_path = _write_config(tmp_path, sched_cfg)
-        port = get_free_port_in_ci()
-        cmd = _make_server_cmd(port, config_path)
-        server_log = str(tmp_path / "server.log")
+        server_log_base = str(tmp_path / "server.log")
         # Parameters match the long_input_short_output workload that
         # originally surfaced the bug: 1000-token shared system prompt,
         # 20000-token per-user chat history, 100-token answers.
         qps_values = [8, 32]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
-        with open(server_log, "w") as log_f:
-            with popen(cmd, stderr=log_f, stdout=log_f, env=env) as proc:
-                _wait_for_server_ready(proc, port, server_log=server_log)
+        with _start_server_until_ready(config_path, server_log_base, env) as (
+            proc,
+            port,
+            server_log,
+        ):
+            # Warmup: seed the radix tree with the shared system prompt.
+            print_info("Warmup to seed the radix tree with the shared system prompt.")
+            _run_and_assert_stage(
+                "Warmup to seed the radix tree with the shared system prompt.",
+                ensure_lmbenchmark,
+                port,
+                str(tmp_path / "warmup_1u_qps2.csv"),
+                server_log,
+                qps=2,
+                num_users=1,
+                num_rounds=2,
+                system_prompt=1000,
+                chat_history=20000,
+                answer_len=100,
+                duration=10,
+            )
 
-                # Warmup: seed the radix tree with the shared system prompt.
-                print_info("Warmup to seed the radix tree with the shared system prompt.")
-                _run_and_assert_stage(
-                    "Warmup to seed the radix tree with the shared system prompt.",
+            for qps in qps_values:
+                print_info(f"Benchmark: 15 users, QPS={qps}...")
+                metrics = _run_and_assert_stage(
+                    f"Benchmark at QPS={qps}",
                     ensure_lmbenchmark,
                     port,
-                    str(tmp_path / "warmup_1u_qps2.csv"),
+                    str(tmp_path / f"benchmark_15u_qps{qps}.csv"),
                     server_log,
-                    qps=2,
-                    num_users=1,
-                    num_rounds=2,
+                    qps=qps,
+                    num_users=15,
+                    num_rounds=3,
                     system_prompt=1000,
                     chat_history=20000,
                     answer_len=100,
-                    duration=10,
+                    duration=30,
+                )
+                print_info(
+                    f"QPS={qps}: {metrics['num_requests']} requests, "
+                    f"ttft_p50={metrics.get('ttft_p50', float('nan')):.3f}s, "
+                    f"ttft_p99={metrics.get('ttft_p99', float('nan')):.3f}s"
                 )
 
-                for qps in qps_values:
-                    print_info(f"Benchmark: 15 users, QPS={qps}...")
-                    metrics = _run_and_assert_stage(
-                        f"Benchmark at QPS={qps}",
-                        ensure_lmbenchmark,
-                        port,
-                        str(tmp_path / f"benchmark_15u_qps{qps}.csv"),
-                        server_log,
-                        qps=qps,
-                        num_users=15,
-                        num_rounds=3,
-                        system_prompt=1000,
-                        chat_history=20000,
-                        answer_len=100,
-                        duration=30,
-                    )
-                    print_info(
-                        f"QPS={qps}: {metrics['num_requests']} requests, "
-                        f"ttft_p50={metrics.get('ttft_p50', float('nan')):.3f}s, "
-                        f"ttft_p99={metrics.get('ttft_p99', float('nan')):.3f}s"
-                    )
-
-                    _assert_no_server_errors(server_log)
-                    assert proc.poll() is None, (
-                        f"Server exited unexpectedly during QPS={qps}. "
-                        f"See {server_log}\n{_tail_log(server_log)}"
-                    )
+                _assert_no_server_errors(server_log)
+                assert proc.poll() is None, (
+                    f"Server exited unexpectedly during QPS={qps}. "
+                    f"See {server_log}\n{_tail_log(server_log)}"
+                )
 
         # Final server-log sanity check across the full sweep.
         _assert_no_server_errors(server_log)
