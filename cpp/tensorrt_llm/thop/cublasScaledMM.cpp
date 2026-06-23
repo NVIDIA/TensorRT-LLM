@@ -26,6 +26,7 @@
 #include "userbuffersTensor.h"
 #include <cublasLt.h>
 #include <torch/extension.h>
+#include <unordered_map>
 
 using torch::Tensor;
 
@@ -189,10 +190,27 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     cudaDataType_t scaleType = CUDA_R_32F;
     cublasWrapper->setGemmConfig(aType, bType, outType, /*computeType=*/scaleType);
 
-    auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
-    auto workspace = torch::empty(CUBLAS_WORKSPACE_SIZE, workspace_options);
-
     auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+
+    // Persistent per-stream cublasLt workspace. The cublasLt kernel records a
+    // fixed pointer to this workspace; if we destruct the workspace storage at
+    // function return (the previous behavior), the CUDA caching allocator may
+    // hand the same block out to a later allocation while a captured CUDA
+    // graph still references the workspace pointer -> use-after-free that
+    // surfaces as free-block-tree corruption on the next allocator operation
+    // (e.g. FusedMoeRunner::getWorkspaceInfo's first torch::empty destructor).
+    //
+    // Keyed by (device, stream) so that concurrent GEMMs on different streams
+    // don't race on the same scratch bytes. Mirrors PyTorch's per-stream
+    // cublasLt workspace cache in at::cuda.
+    thread_local std::unordered_map<cudaStream_t, at::Tensor> workspace_cache;
+    auto stream_ptr = stream.stream();
+    auto& workspace = workspace_cache[stream_ptr];
+    if (!workspace.defined() || workspace.device() != a.device())
+    {
+        auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
+        workspace = torch::empty(CUBLAS_WORKSPACE_SIZE, workspace_options);
+    }
 
     auto* a_ptr = static_cast<void*>(a.data_ptr());
     auto* b_ptr = static_cast<void*>(b.data_ptr());
