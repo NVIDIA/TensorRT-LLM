@@ -27,6 +27,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #ifndef _WIN32
@@ -96,6 +97,7 @@ namespace
 
 bool mpiInitialized = false;
 std::recursive_mutex mpiMutex;
+using SignalHandler = void (*)(int);
 
 MpiComm initLocalSession()
 {
@@ -161,6 +163,26 @@ int getNumNodes()
 #endif
 }
 
+bool isFaultToleranceModeEnabled()
+{
+    char const* val = std::getenv("TLLM_FAULT_TOLERANCE_MODE");
+    return val != nullptr && std::string_view(val) == "1";
+}
+
+void installFaultToleranceSignalHandlers()
+{
+    // Exit code mirrors the SIGKILL convention (128 + 9 = 137) so logs distinguish
+    // "rank died in WideEP FT mode" from generic crashes (typical EXIT_FAILURE = 1).
+    static constexpr int kFtRankAbortExitCode = 137;
+    for (int sig : {SIGABRT, SIGSEGV})
+    {
+        // Async-signal-safe: _exit() is in POSIX's safe set; MPI_Abort and printf are not.
+        // No logging from inside the handler; survivors log the dead-peer event.
+        SignalHandler previousHandler = std::signal(sig, [](int /*signal*/) { _exit(kFtRankAbortExitCode); });
+        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "WideEP FT signal handler setup failed");
+    }
+}
+
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 {
     // double-checked locking
@@ -190,26 +212,40 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
          * signals. Signals like SIGINT and SIGTERM should be issued to the parent and should terminate MPI workers
          * correctly.
          */
-        for (int sig : {SIGABRT, SIGSEGV})
+        if (isFaultToleranceModeEnabled())
         {
-            __sighandler_t previousHandler = nullptr;
-            if (forwardAbortToParent)
+            // WideEP FT mode (PR 1d.0): replace the MPI_Abort/SIGKILL handlers with a non-propagating
+            // _exit(137). FT mode also overrides forwardAbortToParent: killing the parent would defeat
+            // the entire purpose of letting survivors outlive a peer death.
+            installFaultToleranceSignalHandlers();
+            TLLM_LOG_INFO(
+                "WideEP fault-tolerance MPI signal handler mode enabled (TLLM_FAULT_TOLERANCE_MODE=1). "
+                "Reminder: launch mpirun with --mca orte_enable_recovery 1 for the handler to be effective; "
+                "see WideEP FT design §5.4 and audit-1a-findings.md Day 2.");
+        }
+        else
+        {
+            for (int sig : {SIGABRT, SIGSEGV})
             {
-                previousHandler = std::signal(sig,
-                    [](int signal)
-                    {
+                SignalHandler previousHandler = nullptr;
+                if (forwardAbortToParent)
+                {
+                    previousHandler = std::signal(sig,
+                        [](int signal)
+                        {
 #ifndef _WIN32
-                        pid_t parentProcessId = getppid();
-                        kill(parentProcessId, SIGKILL);
+                            pid_t parentProcessId = getppid();
+                            kill(parentProcessId, SIGKILL);
 #endif
-                        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-                    });
+                            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+                        });
+                }
+                else
+                {
+                    previousHandler = std::signal(sig, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
+                }
+                TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
             }
-            else
-            {
-                previousHandler = std::signal(sig, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
-            }
-            TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
         }
 
         // ensure local MPI communicator is initialized
