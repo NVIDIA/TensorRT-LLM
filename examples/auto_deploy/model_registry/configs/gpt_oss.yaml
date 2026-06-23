@@ -14,6 +14,7 @@ attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false
 max_batch_size: 64
+# Use higher max_num_tokens (e.g., 16384) for high throughput case (e.g., >= 128)
 max_num_tokens: 8192
 enable_chunked_prefill: true
 cuda_graph_config:
