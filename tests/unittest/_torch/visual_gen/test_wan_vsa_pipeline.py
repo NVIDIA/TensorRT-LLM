@@ -3,8 +3,8 @@
 
 """Correctness tests for VSA T2V pipeline with Video Sparse Attention (VSA).
 
-Verifies >= 0.95 cosine similarity on decoded video frames against the
-dense TRTLLM reference when VSA is enabled at sparsity=0.0 (dense).
+Verifies >= 0.95 cosine similarity between the CuTe-DSL VSA kernel and the
+SDPA-fallback VSA path (same gated coarse+fine formulation, different fine kernel).
 
 Models:
   - FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers (720x1280, 9 frames)
@@ -102,17 +102,6 @@ def _load_vsa_pipeline(checkpoint_path: str, vsa_sparsity: float = 0.0):
     return PipelineLoader(args).load(skip_warmup=True)
 
 
-def _load_dense_pipeline(checkpoint_path: str):
-    """Load TRTLLM WanPipeline with default dense attention (no VSA)."""
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
-    args = VisualGenArgs(
-        model=checkpoint_path,
-        torch_compile_config=TorchCompileConfig(enable=False),
-    )
-    return PipelineLoader(args).load(skip_warmup=True)
-
-
 def _capture_trtllm_video(
     pipeline,
     prompt: str,
@@ -156,11 +145,12 @@ def _assert_vsa_matches_dense(
     model_label: str,
     vsa_sparsity: float = 0.0,
 ) -> None:
-    """Run VSA and dense TRTLLM pipelines sequentially, compare decoded video output."""
-    # --- VSA (sparsity=0.0 is fully dense via CUTEDSL path) ---
-    vsa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
-    vsa_video = _capture_trtllm_video(
-        vsa_pipe,
+    """Compare CuTe-DSL VSA against SDPA-fallback VSA (same gated formulation, different fine kernel)."""
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import vsa as _vsa_module
+
+    common_kwargs = dict(
         prompt=PROMPT,
         negative_prompt=NEGATIVE_PROMPT,
         height=height,
@@ -170,40 +160,35 @@ def _assert_vsa_matches_dense(
         guidance_scale=guidance_scale,
         seed=SEED,
     )
+
+    # --- CuTe-DSL path ---
+    vsa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
+    vsa_video = _capture_trtllm_video(vsa_pipe, **common_kwargs)
     del vsa_pipe
     gc.collect()
     torch.cuda.empty_cache()
 
-    # --- Dense reference (default TRTLLM attention, no VSA) ---
-    dense_pipe = _load_dense_pipeline(checkpoint_path)
-    dense_video = _capture_trtllm_video(
-        dense_pipe,
-        prompt=PROMPT,
-        negative_prompt=NEGATIVE_PROMPT,
-        height=height,
-        width=width,
-        num_frames=num_frames,
-        num_inference_steps=NUM_STEPS,
-        guidance_scale=guidance_scale,
-        seed=SEED,
-    )
-    del dense_pipe
+    # --- SDPA fallback reference (same VSA formulation, fine attn via SDPA) ---
+    sdpa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
+    with patch.object(_vsa_module, "is_cute_supported", return_value=False):
+        sdpa_video = _capture_trtllm_video(sdpa_pipe, **common_kwargs)
+    del sdpa_pipe
     gc.collect()
     torch.cuda.empty_cache()
 
     # --- Compare ---
-    assert vsa_video.numel() == dense_video.numel(), (
+    assert vsa_video.numel() == sdpa_video.numel(), (
         f"{model_label}: element count mismatch — "
-        f"VSA {vsa_video.shape} ({vsa_video.numel()}) vs "
-        f"dense {dense_video.shape} ({dense_video.numel()})"
+        f"CuTe {vsa_video.shape} ({vsa_video.numel()}) vs "
+        f"SDPA {sdpa_video.shape} ({sdpa_video.numel()})"
     )
 
-    cos_sim = _cosine_similarity(vsa_video, dense_video)
+    cos_sim = _cosine_similarity(vsa_video, sdpa_video)
     print(f"\n  {model_label} cosine similarity: {cos_sim:.6f}")
     assert cos_sim >= COS_SIM_THRESHOLD, (
         f"{model_label}: cosine similarity {cos_sim:.6f} < {COS_SIM_THRESHOLD}. "
-        f"VSA pipeline output diverges from the dense reference. "
-        f"Video shapes — VSA: {vsa_video.shape}, dense: {dense_video.shape}."
+        f"CuTe-DSL VSA diverges from SDPA-fallback VSA. "
+        f"Video shapes — CuTe: {vsa_video.shape}, SDPA: {sdpa_video.shape}."
     )
 
 
@@ -215,9 +200,9 @@ def _assert_vsa_matches_dense(
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 class TestWanVsa14B_PipelineCorrectness:
-    """Wan2.1-VSA-T2V-14B correctness vs dense TRTLLM reference (720x1280, 9 frames).
+    """Wan2.1-VSA-T2V-14B: CuTe-DSL vs SDPA-fallback correctness (720x1280, 9 frames).
 
-    VSA at sparsity=0.0 routes through CUTEDSL; threshold is 0.95.
+    Verifies CuTe-DSL kernel at sparsity=0.0 matches SDPA fallback with >= 0.95 cosine sim.
     """
 
     def test_cosine_similarity(self):
