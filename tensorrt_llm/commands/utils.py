@@ -7,8 +7,8 @@ from typing import Iterable, Mapping, Optional, Set
 import click
 from click.core import ParameterSource
 
-from tensorrt_llm._torch.visual_gen.config import ParallelConfig
 from tensorrt_llm.llmapi.utils import download_hf_partial
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
 logger = logging.getLogger(__name__)
 

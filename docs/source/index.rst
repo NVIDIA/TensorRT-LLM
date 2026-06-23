@@ -98,6 +98,8 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
+   developer-guide/telemetry.md
+   developer-guide/sparse-attention-development-guide.md
 
 
 .. toctree::
