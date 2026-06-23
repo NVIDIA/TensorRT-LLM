@@ -25,11 +25,15 @@ slurm_install_setup() {
         python3 --version
         retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
-        if [[ $pytestCommand == *--run-ray* ]]; then
-            retry_command pip3 install --retries 10 "ray[default]==2.54.1"
+        if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
+            echo "SKIP_INSTALL=1: skipping pip installs (packages pre-installed in fat sqsh)"
+        else
+            if [[ ${pytestCommand:-} == *--run-ray* ]]; then
+                retry_command pip3 install --retries 10 "ray[default]==2.54.1"
+            fi
+            retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
+            retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         fi
-        retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
-        retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"
         echo "HOST_NODE_NAME = $hostNodeName ; GPU_UUIDS = $gpuUuids ; STAGE_NAME = $stageName"
