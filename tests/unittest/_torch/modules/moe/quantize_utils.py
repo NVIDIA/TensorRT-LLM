@@ -2011,21 +2011,21 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
                 w1_weight, None, scaling_vector_size, True
             )
             w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w1_sf_block.cpu().view(intermediate_size, -1)
+                w1_sf_block.view(intermediate_size, -1)
             )
 
             w2_weight_mxfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
                 w2_weight, None, scaling_vector_size, True
             )
             w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w2_sf_block.cpu().view(hidden_size_out, -1)
+                w2_sf_block.view(hidden_size_out, -1)
             )
 
             w3_weight_mxfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
                 w3_weight, None, scaling_vector_size, True
             )
             w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w3_sf_block.cpu().view(intermediate_size, -1)
+                w3_sf_block.view(intermediate_size, -1)
             )
 
             weights[f"{expert_id}.w1.weight"] = w1_weight_mxfp4

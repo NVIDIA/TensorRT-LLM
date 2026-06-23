@@ -27,7 +27,7 @@ import torch
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, get_backend_class
-from .mapping import _resolve_mapping_layout
+from .mapping import _PARALLEL_MODE_LAYOUTS, _resolve_mapping_layout
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM"})
@@ -65,6 +65,23 @@ def _comm_axis_for_backend(backend: Any, comm_methods: Tuple[Any, ...]) -> Tuple
     return comm_methods
 
 
+def _comm_axis_for_parallel_mode(pmode: str, comm_methods: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Collapse comm axis to AUTO for parallel modes without attention DP.
+
+    Non-AUTO forced comm methods require enable_attention_dp=True (see
+    is_candidate_valid). TEP and TTP have enable_dp=False, so only AUTO
+    is ever valid for them. Generating forced-comm candidates for these
+    modes only produces prune rows — handle it at generation time instead.
+    CUSTOM mode is passed through unchanged (validated separately).
+    """
+    layout = _PARALLEL_MODE_LAYOUTS.get(str(pmode).upper())
+    if layout is None:
+        return comm_methods  # CUSTOM: unknown layout, keep as-is
+    if not layout["enable_attention_dp"]:
+        return ("AUTO",)
+    return comm_methods
+
+
 def expand_search(
     base_config: ConfigSpec,
     search: SearchSpec,
@@ -88,7 +105,13 @@ def expand_search(
     for backend, pmode, cgraph, combine in itertools.product(
         backends, parallel_modes, cuda_graph_options, combine_options
     ):
-        for comm in _comm_axis_for_backend(backend, comm_methods):
+        effective_comm = _comm_axis_for_backend(backend, comm_methods)
+        # For non-fused backends apply parallel-mode comm constraint at
+        # generation time so TEP/TTP always get comm=AUTO instead of
+        # generating forced-comm candidates that are immediately pruned.
+        if effective_comm != ("NONE",):
+            effective_comm = _comm_axis_for_parallel_mode(pmode, effective_comm)
+        for comm in effective_comm:
             candidate = replace(
                 base_config,
                 backend=str(backend).upper(),
@@ -120,6 +143,13 @@ def is_candidate_valid(
         moe_ep, moe_tp, enable_dp = _resolve_mapping_layout(config, world_size)
     except ValueError as exc:
         return False, str(exc)
+
+    # DenseGEMM only supports TP; any EP configuration (TEP, DEP, custom ep>1) is unsupported.
+    if config.backend.upper() == "DENSEGEMM" and moe_ep > 1:
+        return False, (
+            f"DENSEGEMM does not support EP (ep_size={moe_ep}); "
+            "use TEP/DEP only with other backends"
+        )
 
     # Forced communication on non-DP / MoE-TP paths.
     forced = config.comm_method.upper()
