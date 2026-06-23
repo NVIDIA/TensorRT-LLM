@@ -307,6 +307,10 @@ def test_linear_transform_weights_is_idempotent():
     linear.post_load_weights()
     assert linear.quant_method.transform_weights.call_count == 2
 
+    linear._weights_transformed = False
+    linear.cache_derived_state()
+    assert linear._weights_transformed is True
+
 
 def test_mla_transform_weights_is_idempotent(monkeypatch):
     monkeypatch.setattr(attention_mod, "get_sm_version", lambda: 120)
@@ -337,4 +341,8 @@ def test_mla_transform_weights_is_idempotent(monkeypatch):
     assert mla.k_b_proj_trans_scale == "k_scale_transformed"
     assert mla.v_b_proj == "v_weight_transformed"
     assert mla.v_b_proj_scale == "v_scale_transformed"
+    assert mla._weights_transformed is True
+
+    mla._weights_transformed = False
+    MLA.cache_derived_state(mla)
     assert mla._weights_transformed is True

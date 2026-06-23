@@ -382,7 +382,7 @@ class LinearMethodBase(ABC):
             self.process_weights_after_loading(module)
 
     def transform_weights(self, module: Linear) -> None:
-        pass
+        ...
 
     def post_load_weights(self, module: Linear) -> None:
         self.transform_weights(module)
@@ -3267,6 +3267,9 @@ class Linear(nn.Module):
         if self._weights_transformed:
             return
         self.quant_method.transform_weights(self)
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:

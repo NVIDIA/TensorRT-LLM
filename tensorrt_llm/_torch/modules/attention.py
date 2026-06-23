@@ -3027,5 +3027,8 @@ class MLA(nn.Module):
                 self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
         self._weights_transformed = True
 
+    def cache_derived_state(self) -> None:
+        self._weights_transformed = True
+
     def post_load_weights(self) -> None:
         self.transform_weights()
