@@ -39,7 +39,7 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
-    MEGAMOE = "MEGAMOE_DEEPGEMM"
+    MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
 
 
 @dataclass
@@ -118,7 +118,7 @@ def get_backend_class(backend_type: MoeBackendType):
         from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 
         return DenseGEMMFusedMoE
-    if backend_type == MoeBackendType.MEGAMOE:
+    if backend_type == MoeBackendType.MEGAMOE_DEEPGEMM:
         from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
 
         return MegaMoEDeepGemm

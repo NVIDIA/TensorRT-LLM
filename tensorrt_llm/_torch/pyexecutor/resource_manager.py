@@ -53,6 +53,7 @@ WorldConfig = tensorrt_llm.bindings.WorldConfig
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -78,6 +79,7 @@ class PoolConfiguration:
 class ResourceManagerType(enum.Enum):
     KV_CACHE_MANAGER = "KV_CACHE_MANAGER"
     DRAFT_KV_CACHE_MANAGER = "DRAFT_KV_CACHE_MANAGER"
+    CROSS_KV_CACHE_MANAGER = "CROSS_KV_CACHE_MANAGER"
     PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
     SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
     SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
@@ -91,6 +93,7 @@ class BaseResourceManager(ABC):
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
+        """Return the maximum number of real requests this manager can admit."""
         raise NotImplementedError
 
     @abstractmethod
@@ -188,9 +191,8 @@ _MROPE_NUM_AXES = 3
 
 def _make_warmup_mrope_position_ids(token_num: int) -> torch.Tensor:
     """Build (_MROPE_NUM_AXES, 1, token_num) mrope_position_ids for warmup."""
-    return (torch.arange(0, token_num,
-                         dtype=torch.int32).expand(_MROPE_NUM_AXES, 1,
-                                                   -1).clone())
+    return (torch.arange(0, token_num, dtype=torch.int32,
+                         device="cuda").expand(_MROPE_NUM_AXES, 1, -1).clone())
 
 
 def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
@@ -209,7 +211,7 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
     }
     if is_gen:
         mrope_config["mrope_position_deltas"] = torch.zeros(
-            1, dtype=torch.int32).unsqueeze(0)
+            1, dtype=torch.int32, device="cuda").unsqueeze(0)
     if req.py_multimodal_data is None:
         req.py_multimodal_data = {}
     req.py_multimodal_data["mrope_config"] = mrope_config
@@ -554,6 +556,8 @@ class KVCacheManager(BaseResourceManager):
             'chunk_size': min(max_num_tokens, self.max_seq_len),
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'cache_type': kv_cache_type,
+            'secondary_offload_min_priority':
+            kv_cache_config.secondary_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
@@ -667,49 +671,54 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
+    def _context_seq_len(self, req: LlmRequest, is_cross: bool,
+                         is_star_cp: bool) -> Optional[int]:
+        """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
+        if is_cross:
+            if (getattr(req, "py_skip_cross_kv_projection", False)
+                    or not req.is_first_context_chunk
+                    or not self._kv_connector_should_add_sequence(req)):
+                return None
+            encoder_output_len = getattr(req, "encoder_output_len", None)
+            if encoder_output_len is None:
+                raise RuntimeError(
+                    "Cross KV cache allocation requires "
+                    f"encoder_output_len for request {req.py_request_id}.")
+            return int(encoder_output_len)
+        if is_star_cp:
+            if req.ctx_iters != 0:
+                return None
+            seq_len = sum(len(ctx_block) for ctx_block in req.ctx_blocks)
+            return seq_len + (len(req.query_id) if self.mapping.cp_rank
+                              == self.mapping.cp_size - 1 else 0)
+        if not req.is_first_context_chunk or not self._kv_connector_should_add_sequence(
+                req):
+            return None
+        return req.prompt_len
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        # Cross/encoder K/V is allocated once and never grows; handle it on a
+        # dedicated path so the self-attention flow below stays unconditional.
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            return self._prepare_cross_resources(scheduled_batch)
+
+        is_star_cp = ('cp_type' in self.mapping.cp_config
+                      and CpType.STAR == self.mapping.cp_config['cp_type'])
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
-            # Collect first-chunk requests eligible for add_sequence_batch.
+            # Collect first-chunk requests eligible for batch add_sequence_batch.
             # When block reuse is enabled, addSequenceBatch uses a two-phase
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
-            batch_request_infos = []
-            batch_llm_requests = []
-            batch_ctx_requests = []
-
-            # allocate KV Cache
-            is_star_cp = 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
-                'cp_type']
-
-            for req in scheduled_batch.context_requests:
-                req_beam_width = req.py_beam_width
-                if is_star_cp:
-                    if req.ctx_iters == 0:
-                        seq_len = sum(
-                            len(ctx_block) for ctx_block in req.ctx_blocks)
-                        prompt_len = seq_len + (
-                            len(req.query_id) if self.mapping.cp_rank
-                            == self.mapping.cp_size - 1 else 0)
-                        batch_request_infos.append(
-                            (req.py_request_id, prompt_len, req_beam_width))
-                        batch_llm_requests.append(req)
-                        batch_ctx_requests.append(req)
-                else:
-                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
-                            req):
-                        # Batch path: two-phase claim-then-onboard
-                        batch_request_infos.append(
-                            (req.py_request_id, req.prompt_len, req_beam_width))
-                        batch_llm_requests.append(req)
-                        batch_ctx_requests.append(req)
+            batch_request_infos, batch_llm_requests = self._collect_context_sequences(
+                scheduled_batch, is_cross=False, is_star_cp=is_star_cp)
 
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
-                for req in batch_ctx_requests:
+                for req in batch_llm_requests:
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     for _ in range(get_draft_token_length(req)):
@@ -748,6 +757,44 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
+
+    def _collect_context_sequences(self, scheduled_batch: ScheduledRequests,
+                                   is_cross: bool, is_star_cp: bool):
+        """Build the (request_info, llm_request) lists for add_sequence_batch.
+
+        Cross (encoder) sequences are sized from encoder_output_len with a beam
+        width of 1 (request-scoped); self-attention sequences use the request's
+        own beam width.
+        """
+        batch_request_infos = []
+        batch_llm_requests = []
+        for req in scheduled_batch.context_requests:
+            seq_len = self._context_seq_len(req, is_cross, is_star_cp)
+            if seq_len is None:
+                continue
+            beam_width = 1 if is_cross else req.py_beam_width
+            batch_request_infos.append((req.py_request_id, seq_len, beam_width))
+            batch_llm_requests.append(req)
+        return batch_request_infos, batch_llm_requests
+
+    def _prepare_cross_resources(self, scheduled_batch: ScheduledRequests):
+        """Allocate cross (encoder) K/V blocks.
+
+        Encoder K/V is written once at the first decoder context step and read
+        unchanged on every generation step, so it never grows: this skips the
+        decode-time token growth, draft-token reserve, and scheduler bookkeeping
+        that the self-attention path performs.
+        """
+        with request_context(self.is_draft, scheduled_batch):
+            # wait for all pending work to finish before launching offload/onboarding/partial copy
+            self.impl.sync_transfer_manager_with_buffer_manager()
+            batch_request_infos, batch_llm_requests = self._collect_context_sequences(
+                scheduled_batch, is_cross=True, is_star_cp=False)
+            if batch_request_infos:
+                self.impl.add_sequence_batch(batch_request_infos,
+                                             batch_llm_requests)
+            # kernels wait for scheduled offload/onboard/partial copy work before launching
+            self.impl.refresh_blocks()
 
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """No-op for V1; interface kept consistent with V2."""
@@ -892,29 +939,41 @@ class KVCacheManager(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        # Rewind KV cache for requests with rejected draft tokens.
-        # Skip:
-        # - GENERATION_COMPLETE: finished requests
-        # - CONTEXT_INIT: requests whose state was reset after being paused with KV cache freed.
-        #   With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
-        #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
-        for request in scheduled_batch.generation_requests:
-            if request.state in (LlmRequestState.GENERATION_COMPLETE,
-                                 LlmRequestState.CONTEXT_INIT):
-                continue
-            if request.py_rewind_len > 0:
-                self.rewind_kv_cache(request, request.py_rewind_len)
-            # Symmetric companion to prepare_resources's reserve_slack
-            # add_token loop: when _kv_reserve_draft_tokens (e.g. dynamic
-            # tree's K*max_draft_len) exceeds the runtime draft length,
-            # those extra slots must also be rewound, otherwise the draft
-            # KV cache leaks reserve_slack tokens per generation iteration
-            # and eventually overflows mCacheBlockIndices.
-            runtime_draft_len = (request.py_rewind_len +
-                                 request.py_num_accepted_draft_tokens)
-            extra_rewind = self._kv_reserve_draft_tokens - runtime_draft_len
-            if extra_rewind > 0:
-                self.rewind_kv_cache(request, extra_rewind)
+        # Self-attention pools rewind rejected speculative tokens each step;
+        # cross/encoder K/V is immutable, so only the context-block commit below
+        # applies to it.
+        if self.kv_cache_type != CacheTypeCpp.CROSS:
+            if not self.is_draft:
+                from .kv_cache_manager_v2 import \
+                    _update_kv_cache_draft_token_location
+
+                _update_kv_cache_draft_token_location(self, scheduled_batch,
+                                                      attn_metadata,
+                                                      kv_cache_dtype_byte_size)
+
+            # Rewind KV cache for requests with rejected draft tokens.
+            # Skip:
+            # - GENERATION_COMPLETE: finished requests
+            # - CONTEXT_INIT: requests whose state was reset after being paused with KV cache freed.
+            #   With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
+            #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
+            for request in scheduled_batch.generation_requests:
+                if request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                     LlmRequestState.CONTEXT_INIT):
+                    continue
+                if request.py_rewind_len > 0:
+                    self.rewind_kv_cache(request, request.py_rewind_len)
+                # Symmetric companion to prepare_resources's reserve_slack
+                # add_token loop: when _kv_reserve_draft_tokens (e.g. dynamic
+                # tree's K*max_draft_len) exceeds the runtime draft length,
+                # those extra slots must also be rewound, otherwise the draft
+                # KV cache leaks reserve_slack tokens per generation iteration
+                # and eventually overflows mCacheBlockIndices.
+                runtime_draft_len = (request.py_rewind_len +
+                                     request.py_num_accepted_draft_tokens)
+                extra_rewind = self._kv_reserve_draft_tokens - runtime_draft_len
+                if extra_rewind > 0:
+                    self.rewind_kv_cache(request, extra_rewind)
 
         # For context requests, store completed context blocks for KV cache reuse.
         # We wait until context_remaining_length == 0 (all chunks processed) before
@@ -1239,7 +1298,9 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
+        beam_width: Optional[int] = 1,
     ) -> List[List[int]]:
+        beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
                 if len(self.max_attention_window_vec) > 1:
@@ -1255,9 +1316,29 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
-            assert (len(result[i])) == 1
-            result[i] = result[i][0]
+            beams = [list(beam) for beam in result[i]]
+            assert len(beams) == beam_width, (
+                f"Expected {beam_width} index arrays per request, got {len(beams)}"
+            )
+            result[i] = beams[
+                0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
         return result
+
+    @staticmethod
+    def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:
+        """Pack beam-search blocks into a flat beam-0 layout.
+
+        The first beam owns the shared prompt blocks. For every other beam,
+        append only the final block when it differs from beam 0's final block.
+        """
+        if not beams:
+            return []
+        packed = list(beams[0])
+        beam0_last = beams[0][-1] if beams[0] else None
+        for beam in beams[1:]:
+            if beam and beam[-1] != beam0_last:
+                packed.append(beam[-1])
+        return packed
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:
@@ -1989,6 +2070,42 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
+        if self.kv_cache_type == CacheTypeCpp.CROSS and beam_width > 1:
+            # This branch is reached only via attribute aliasing, never a
+            # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
+            # AttentionMetadata.create_cross_metadata() sets
+            # cross_md.kv_cache_manager = cross_kv_cache_manager
+            # (attention_backend/interface.py), and then
+            # TrtllmAttentionMetadata.prepare() calls
+            # self.kv_cache_manager.copy_batch_block_offsets(...)
+            # (attention_backend/trtllm.py), which dispatches here on the
+            # cross manager.
+            num_gen_requests = len(request_ids) - num_context
+            expected_num_seqs = num_context + num_gen_requests * beam_width
+            assert num_seqs == expected_num_seqs, (
+                f"Cross KV cache block offsets expected {expected_num_seqs} "
+                f"decoder rows, got {num_seqs}.")
+
+            # Cross KV is request-scoped: all decoder beams read the same
+            # encoder K/V blocks. Populate one host row per request, then
+            # expand generation rows across beams in the attention metadata
+            # tensor whose rows are decoder-sequence scoped.
+            self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                               request_ids, 1, 0)
+            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+                if num_context > 0:
+                    dst_tensor[pool_idx, :num_context].copy_(
+                        self.host_kv_cache_block_offsets[
+                            pool_idx, :num_context],
+                        non_blocking=True)
+                if num_gen_requests > 0:
+                    gen_block_offsets = self.host_kv_cache_block_offsets[
+                        pool_idx, num_context:num_context + num_gen_requests]
+                    dst_tensor[pool_idx, num_context:num_seqs].copy_(
+                        gen_block_offsets.repeat_interleave(beam_width, dim=0),
+                        non_blocking=True)
+            return
+
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                            request_ids[:num_context], 1, 0)
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,

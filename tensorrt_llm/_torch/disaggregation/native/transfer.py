@@ -208,12 +208,14 @@ class KVSendTask(SendTaskBase):
         params: DisaggregatedParams,
         slice_id: int,
         prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
         self._prompt_len = prompt_len
+        self._beam_width = beam_width
 
 
 class Sender(SenderBase):
@@ -645,6 +647,13 @@ class Sender(SenderBase):
             dst_block_ids[dst_skip : dst_skip + n_transfer],
         )
 
+    @staticmethod
+    def _beam0_block_count(block_ids: np.ndarray, total_blocks: int, beam_width: int) -> int:
+        """Return the number of beam-0 blocks in a packed 1-D beam layout."""
+        if beam_width <= 1 or block_ids.size <= total_blocks:
+            return block_ids.size
+        return max(0, block_ids.size - (beam_width - 1))
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -701,16 +710,22 @@ class Sender(SenderBase):
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.
                 slice_end = token_range.end if token_range is not None else 0
                 total_blocks = (slice_end + tpb - 1) // tpb
-                assert src_block_ids.size <= total_blocks, (
-                    f"src block list ({src_block_ids.size}) exceeds total slice "
+                src_beam0_blocks = Sender._beam0_block_count(
+                    src_block_ids, total_blocks, task._beam_width
+                )
+                dst_beam0_blocks = Sender._beam0_block_count(
+                    dst_block_ids, total_blocks, task._beam_width
+                )
+                assert src_beam0_blocks <= total_blocks, (
+                    f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                assert dst_block_ids.size <= total_blocks, (
-                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
+                assert dst_beam0_blocks <= total_blocks, (
+                    f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                src_start = (total_blocks - src_block_ids.size) * tpb
-                dst_start = (total_blocks - dst_block_ids.size) * tpb
+                src_start = (total_blocks - src_beam0_blocks) * tpb
+                dst_start = (total_blocks - dst_beam0_blocks) * tpb
                 if req_info.dst_start_token is not None:
                     dst_start = max(dst_start, req_info.dst_start_token)
                 if window_size is not None:
@@ -1060,8 +1075,12 @@ class TxSession(TxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
-        super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
+        super().__init__(
+            sender,
+            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+        )
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
@@ -1111,7 +1130,13 @@ class TxSession(TxSessionBase):
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id, prompt_len=self._base_args.prompt_len)
+            task = KVSendTask(
+                slice,
+                params,
+                slice_id,
+                prompt_len=self._base_args.prompt_len,
+                beam_width=self._base_args.beam_width,
+            )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
@@ -1572,8 +1597,12 @@ class RxSession(RxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
-        super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
+        super().__init__(
+            receiver,
+            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+        )
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._receiver: Receiver  # narrow base class type for Pylance
@@ -1963,6 +1992,7 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
+            beam_width=request.py_beam_width,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -1975,6 +2005,7 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
             prompt_len=request.prompt_len,
+            beam_width=request.py_beam_width,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:

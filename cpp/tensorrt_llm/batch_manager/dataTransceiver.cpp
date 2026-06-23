@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -351,7 +352,7 @@ public:
         mRequestToSession.erase(it);
     }
 
-    [[nodiscard]] RequestInfo recvRequestInfo()
+    [[nodiscard]] std::optional<RequestInfo> recvRequestInfo()
     {
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
@@ -361,10 +362,10 @@ public:
         auto const* connection = isAgent
             ? agentConnectionManager->recvConnectionAndRequestInfo(info, mTerminate)
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
-        if (connection == nullptr && !mManager->isRunning())
+        if (connection == nullptr)
         {
-            TLLM_LOG_WARNING(" recvRequestInfo connection is nullptr, maybe the server is terminating");
-            return info;
+            TLLM_LOG_WARNING("recvRequestInfo connection is nullptr, maybe the server is terminating");
+            return std::nullopt;
         }
 
         if (!isAgent)
@@ -639,12 +640,12 @@ private:
                 }
                 if (!mReadyResponses.empty())
                 {
-                    auto const& requestInfo = recvRequestInfo();
-                    if (mTerminate || !mManager->isRunning())
+                    auto requestInfo = recvRequestInfo();
+                    if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
                     {
                         return;
                     }
-                    auto reqId = requestInfo.getRequestId();
+                    auto reqId = requestInfo->getRequestId();
 
                     {
                         std::scoped_lock lk(mSenderMutex);
@@ -673,6 +674,10 @@ private:
                             break;
                         }
                         it = getCurrentResponse();
+                    }
+                    if (mTerminate || it == mReadyResponses.end())
+                    {
+                        break;
                     }
                     sendResponse(it);
                 }
@@ -1288,7 +1293,9 @@ void CacheSender::sendSync(LlmRequest const& llmRequest)
 
 RequestInfo CacheSender::recvRequestInfo()
 {
-    return mImpl->recvRequestInfo();
+    auto requestInfo = mImpl->recvRequestInfo();
+    TLLM_CHECK(requestInfo.has_value());
+    return *requestInfo;
 }
 
 bool CacheSender::cancelRequest(LlmRequest const& llmRequest)
