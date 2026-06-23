@@ -260,12 +260,39 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
-        config = model_config.pretrained_config
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
+        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            cls, model_config, kv_cache_config)
+        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
+        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
+        # state in a separate cache that doesn't honor block reuse. Warn at
+        # the routing site so users see the warning where the decision is
+        # actually made.
+        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
+                and kv_cache_config.enable_block_reuse:
+            uses_v1_mamba_route = self._is_disagg \
+                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
+                or self._speculative_config is not None
+            if uses_v1_mamba_route:
+                logger.warning(
+                    "Block reuse does not work with MTP for hybrid linear models "
+                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
+                )
+        return cls
+
+    def _fallback_if_unsupported_kv_cache_manager_v2(
+            self,
+            kv_cache_manager_cls,
+            model_config: ModelConfig,
+            kv_cache_config: Optional[KvCacheConfig] = None):
+        kv_cache_config = (kv_cache_config if kv_cache_config is not None else
+                           self._kv_cache_config)
+        config = model_config.pretrained_config
         # Use ``issubclass`` rather than identity equality so V2 subclasses
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
         # also go through the V2-incompatible-feature gate below. The earlier
@@ -273,7 +300,7 @@ class KvCacheCreator:
         # and let the bare ``assert event_buffer_max_size == 0`` in
         # ``KVCacheManagerV2.__init__`` trip at executor construction with
         # a useless error message.
-        if issubclass(cls, KVCacheManagerV2):
+        if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
@@ -314,24 +341,8 @@ class KvCacheCreator:
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
-                cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
-        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
-        # state in a separate cache that doesn't honor block reuse. Warn at
-        # the routing site so users see the warning where the decision is
-        # actually made.
-        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
-                and kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
-                or self._speculative_config is not None
-            if uses_v1_mamba_route:
-                logger.warning(
-                    "Block reuse does not work with MTP for hybrid linear models "
-                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
-                )
-        return cls
+                return KVCacheManager
+        return kv_cache_manager_cls
 
     def _per_manager_cache_cost(self,
                                 manager_cls,
@@ -942,18 +953,8 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-
-        # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
-                    "Falling back to KVCacheManager for draft model.")
-                draft_kv_cache_manager_cls = KVCacheManager
+        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
