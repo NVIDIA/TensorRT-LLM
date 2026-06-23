@@ -918,10 +918,12 @@ def test_expected_v2_kv_cache_events():
                    for event in events if event)
 
         created_events = [
-            event for event in events if event["data"]["type"] == "created"
+            event for event in events
+            if event and event["data"]["type"] == "created"
         ]
         stored_events = [
-            event for event in events if event["data"]["type"] == "stored"
+            event for event in events
+            if event and event["data"]["type"] == "stored"
         ]
         assert created_events
         assert stored_events
