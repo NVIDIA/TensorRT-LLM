@@ -691,12 +691,16 @@ class ModelLoader:
                             checkpoint_loader.post_load_apply(
                                 model, weights_preloaded=weights_preloaded)
 
-                            for module in model.modules():
-                                if hasattr(
-                                        module,
-                                        'post_load_weights') and not getattr(
-                                            module, '_weights_removed', False):
-                                    module.post_load_weights()
+                            mx_staged_receiver_path = self._should_run_mx_staged_receiver_path(
+                                checkpoint_loader,
+                                model,
+                                weights_preloaded=weights_preloaded)
+                            if mx_staged_receiver_path:
+                                self._setup_aliases(model)
+                                self._mark_weights_transformed(model)
+                                self._walk_cache_state(model)
+                            else:
+                                self._walk_full_post_load(model)
 
                             # Defensive last-mile sweep: catches strays from
                             # C++ ops that bypassed the active torch
