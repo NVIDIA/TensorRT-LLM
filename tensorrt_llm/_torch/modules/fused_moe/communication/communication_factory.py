@@ -32,6 +32,7 @@ from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
+from .nccl_ep import NcclEP
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
@@ -67,6 +68,7 @@ class CommunicationFactory:
         2. Auto-selection (tries in order):
            - NVLinkOneSided (highest priority for throughput)
            - NVLinkTwoSided (high priority for latency)
+           - NcclEP (if nccl-ep is available)
            - DeepEP (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - DeepEPLowLatency (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - AllGather + ReduceScatter (fallback, always works)
@@ -180,6 +182,23 @@ class CommunicationFactory:
             return strategy
         except Exception as e:
             logger.info(f"NVLinkTwoSided not available: {e}")
+
+        # Try NCCL EP (rank-major LL). Falls through to DeepEP/AllGather if
+        # libnccl_ep.so is not available. bfloat16-only on the wire.
+        if act_dtype == torch.bfloat16:
+            try:
+                strategy = NcclEP(
+                    mapping,
+                    num_slots,
+                    hidden_size,
+                    max_num_tokens,
+                    moe_max_num_tokens,
+                    top_k=top_k,
+                )
+                logger.info("Selected communication strategy: NcclEP")
+                return strategy
+            except RuntimeError as e:
+                logger.debug(f"NcclEP not available: {e}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
@@ -317,6 +336,15 @@ class CommunicationFactory:
                 max_num_tokens,
                 use_low_precision_combine,
                 moe_max_num_tokens,
+            )
+        elif method == "NCCL_EP":
+            return NcclEP(
+                mapping,
+                num_slots,
+                hidden_size,
+                max_num_tokens,
+                moe_max_num_tokens,
+                top_k=top_k,
             )
         elif method == "ALLGATHER":
             return AllGatherReduceScatter(mapping)

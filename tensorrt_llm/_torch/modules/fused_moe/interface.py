@@ -103,6 +103,8 @@ class AlltoallMethodType(IntEnum):
     DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 4
+    # NCCL EP: Low-latency expert parallelism via NCCL EP library
+    NcclEP = 5
 
 
 class MoESchedulerKind(Enum):
