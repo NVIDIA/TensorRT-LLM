@@ -1213,8 +1213,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         ]
 
         scales = [
-            module.load_shard(s, scale_span=128) if s is not None else None
-            for s in full_scales_squeezed
+            module.load_shard(s, scale_span=128, name=name)
+            if s is not None else None
+            for s, name in zip(full_scales_squeezed, ('q', 'k', 'v'))
         ]
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
             module.fused_weight_shard_indices_mapping, 128)
@@ -1241,9 +1242,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             for s in full_scales
         ]
         scales = [
-            module.load_shard(s, scale_span=128) if s is not None else None
-            for s in full_scales_squeezed
+            module.load_shard(s, scale_span=128, name=name)
+            if s is not None else None
+            for s, name in zip(full_scales_squeezed, ('gate', 'up'))
         ]
+
         processed_mapping = self.remap_fused_shard_indices_by_divisible_factor(
             module.fused_weight_shard_indices_mapping, 128)
         for shard_key, scale in zip(processed_mapping.keys(), scales):
@@ -2943,7 +2946,8 @@ class Linear(nn.Module):
             self.tp_sharding = override_tp_sharding
         elif self.tp_size > 1 and self.tp_mode is not None \
                 and self.weights_loading_config.weight_mode == WeightMode.VANILLA \
-                and _quant_algo not in _uneven_tp_unsupported:
+                and _quant_algo not in _uneven_tp_unsupported \
+                and not skip_create_weights_in_init:
             features = in_features if self.tp_mode == TensorParallelMode.ROW else out_features
             self.tp_sharding = self._auto_tp_sharding(features, quant_config)
         else:
