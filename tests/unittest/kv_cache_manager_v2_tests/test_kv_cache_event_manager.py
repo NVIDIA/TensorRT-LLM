@@ -63,8 +63,11 @@ except ImportError:
     torch = None
 
 
+_DEFAULT_CACHE_LEVEL = CacheLevel(0)
+
+
 class _FakePage:
-    def __init__(self, cache_level=CacheLevel(0), priority=0):
+    def __init__(self, cache_level=_DEFAULT_CACHE_LEVEL, priority=0):
         self.cache_level = cache_level
         self.priority = priority
 
