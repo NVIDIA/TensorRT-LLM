@@ -275,9 +275,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
-    rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
+    std::vector<SizeType32> const& rnnLayerNumPerPP)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
-    , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (useMPI())
@@ -346,28 +345,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }
 
-    // RNN specific setup
-    if (mRnnStateManager != nullptr)
-    {
-        TLLM_LOG_DEBUG("Setting up RNN cache transfer components.");
-        TLLM_CHECK(!rnnLayerNumPerPP.empty());
-
-        mRnnCacheTransBufferManager
-            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(mRnnStateManager, maxNumTokens);
-
-        auto rnnModelCfg = mRnnStateManager->getRnnCacheStateModelConfig();
-
-        auto const convStateDataType = mRnnStateManager->getConvStateDataType();
-        auto const ssmStateDataType = mRnnStateManager->getSsmStateDataType();
-
-        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
-
-        TLLM_LOG_INFO("RNN cache transfer components initialized.");
-    }
-
     // Unified pool path (CppMambaHybridCacheManager): build RnnModelConfig from
-    // LinearAttentionMetadata. Detected by rnnLayerNumPerPP set but no RnnStateManager.
-    if (mRnnStateManager == nullptr && !rnnLayerNumPerPP.empty())
+    // LinearAttentionMetadata. Detected by rnnLayerNumPerPP being non-empty.
+    if (!rnnLayerNumPerPP.empty())
     {
         auto const& blockManager = cacheManager->getBlockManager();
         auto const& linearMeta = blockManager.getLinearAttentionMetadata();
@@ -484,11 +464,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
     {
-        if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
-        {
-            // Slot-based path (CppMambaCacheManager)
-            return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
-        }
         // Unified pool path (CppMambaHybridCacheManager)
         if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
         {

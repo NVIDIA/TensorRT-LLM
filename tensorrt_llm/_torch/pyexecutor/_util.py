@@ -43,7 +43,6 @@ from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
-                                  use_cpp_mamba_cache_manager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -79,13 +78,13 @@ def get_kv_cache_manager_cls(
         cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
-    For hybrid mamba models the choice between ``Mixed`` ( TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
-    ``Cpp`` (unified pool with block reuse) is made here. Callers that don't
-    care about disagg can omit ``is_disagg`` and get the unified-pool default.
+    For hybrid mamba models the choice between ``Mixed`` (TRTLLM_USE_PY_MAMBA)
+    and ``Cpp`` (unified pool with block reuse) is made here. Callers that
+    don't care about disagg can omit ``is_disagg`` and get the unified-pool
+    default.
 
     Env-var overrides (agg mode only — disagg picks its inner impl via
     ``cache_transceiver_config.transceiver_runtime``):
-      * ``TRTLLM_USE_CPP_MAMBA=1`` — Mixed manager with CppMambaCacheManager.
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
@@ -111,10 +110,6 @@ def get_kv_cache_manager_cls(
             return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if use_cpp_mamba_cache_manager():
-            logger.info(
-                "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
         if (cache_transceiver_config is not None
                 and cache_transceiver_config.transceiver_runtime == "PYTHON"):
             logger.info("Python transceiver detected; using "
@@ -331,8 +326,8 @@ class KvCacheCreator:
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
-                return KVCacheManager
-        return kv_cache_manager_cls
+                cls = KVCacheManager
+        return cls
 
     def _per_manager_cache_cost(self,
                                 manager_cls,

@@ -6775,17 +6775,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(
-        "use_cpp_mamba",
-        [
-            False,
-            True,
-        ],
-        ids=[
-            "python_mamba_cache",
-            "cpp_mamba_cache",
-        ],
-    )
-    @pytest.mark.parametrize(
         "attention_dp",
         [
             False,
@@ -6796,9 +6785,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             "attention_dp_on",
         ],
     )
-    def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
-        monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA",
-                           "1" if use_cpp_mamba else "0")
+    def test_fp8_4gpus(self, attention_dp):
 
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",

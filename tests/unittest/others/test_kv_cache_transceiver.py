@@ -555,9 +555,7 @@ def hybrid_dtypes(request):
     ],
     indirect=["hybrid_dtypes"],
 )
-def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
-                                                 monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes):
     mapping = Mapping(world_size=1, rank=0)
     kv_dtype, mamba_conv_dtype, mamba_ssm_dtype = hybrid_dtypes
 
@@ -656,8 +654,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
-def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+def test_hybrid_cache_transceiver_cancel_request(backend):
 
     mapping = Mapping(world_size=1, rank=0)
     dtype = DataType.HALF

@@ -964,8 +964,7 @@ void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
 //     SSM portion: [numHeads, headDim, dState] — split by heads
 //     Conv portion: [section0_dim, section1_dim, ...] x [dConv-1] — section-aware split
 //
-// The input/output pointer arrays follow the same pattern as the existing
-// RnnStateManager kernels: input pointers → output pointers → prefixLayerNum.
+// The input/output pointer arrays follow the pattern: input pointers → output pointers → prefixLayerNum.
 
 /**
  * @brief Kernel to split SSM state from unified pool blocks to per-target buffers.

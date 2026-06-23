@@ -329,8 +329,7 @@ def _read_actual(gen_managers, gen_request_ids) -> Dict:
 # ---------------------------------------------------------------------------
 # Main test logic
 # ---------------------------------------------------------------------------
-def test_mamba_disagg_attention_dp_dummy_with_batch_size_one(monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "0")
+def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
     mgr = _create_managers(1, max_batch_size=1, enable_attention_dp=True)[0]
     try:
         req = LlmRequest(

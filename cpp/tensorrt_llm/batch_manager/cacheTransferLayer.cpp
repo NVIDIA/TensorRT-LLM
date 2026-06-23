@@ -54,8 +54,7 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
 
     if (mRnnFormatter && selfHasRnn)
     {
-        // Both slot-based (CppMambaCacheManager) and unified pool (CppMambaHybridCacheManager)
-        // paths now use RnnCacheFormatter.
+        // Unified pool path (CppMambaHybridCacheManager) uses RnnCacheFormatter.
         if (peerHasRnn)
         {
             TLLM_CHECK_WITH_INFO(mRnnFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),

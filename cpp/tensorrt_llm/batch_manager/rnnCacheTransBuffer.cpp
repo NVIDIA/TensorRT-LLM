@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,52 +26,6 @@
 
 namespace tensorrt_llm::batch_manager::rnn_state_manager
 {
-
-size_t RnnCacheTransBufferManager::computeTransferBufferSize(
-    RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens)
-{
-    SizeType32 numLocalLayers = rnnStateManager->getNumLocalLayers();
-
-    // Get the tensor for one layer to determine per-slot dimensions
-    // Conv state shape per layer: [maxBatchSize, convDim_local, dConv-1]
-    // SSM state shape per layer:  [maxBatchSize, numHeads_local, headDim, dState]
-    // The tensors are shaped [maxBatchSize, ...], so one slot = total_size / maxBatchSize
-    auto convState = rnnStateManager->getConvStates(rnnStateManager->getGlobalLayerNum(0)); // Get first layer's tensor
-    auto ssmState = rnnStateManager->getSsmStates(rnnStateManager->getGlobalLayerNum(0));
-
-    auto convShape = convState->getShape();
-    auto ssmShape = ssmState->getShape();
-
-    // Compute elements per slot per layer (divide total volume by batch size)
-    size_t convElemsPerSlotPerLayer = runtime::ITensor::volume(convShape) / convShape.d[0];
-    size_t ssmElemsPerSlotPerLayer = runtime::ITensor::volume(ssmShape) / ssmShape.d[0];
-
-    size_t convDtypeSize = common::getDTypeSize(rnnStateManager->getConvStateDataType());
-    size_t ssmDtypeSize = common::getDTypeSize(rnnStateManager->getSsmStateDataType());
-
-    size_t convBytesPerSlotPerLayer = convElemsPerSlotPerLayer * convDtypeSize;
-    size_t ssmBytesPerSlotPerLayer = ssmElemsPerSlotPerLayer * ssmDtypeSize;
-
-    size_t bufferSizePerSlot = numLocalLayers * (convBytesPerSlotPerLayer + ssmBytesPerSlotPerLayer);
-
-    TLLM_LOG_DEBUG(
-        "RNN computeTransferBufferSize: numLocalLayers=%d, convBytesPerLayer=%lu, ssmBytesPerLayer=%lu, "
-        "totalPerSlot=%lu",
-        numLocalLayers, convBytesPerSlotPerLayer, ssmBytesPerSlotPerLayer, bufferSizePerSlot);
-
-    return bufferSizePerSlot > 0 ? bufferSizePerSlot : common::getEnvMemSizeForKVCacheTransferBuffer();
-}
-
-RnnCacheTransBufferManager::RnnCacheTransBufferManager(
-    RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens)
-    : BaseTransBufferManager(computeTransferBufferSize(rnnStateManager, maxNumTokens),
-        nvinfer1::DataType::kUINT8, // Use byte buffer for mixed dtypes
-        maxNumTokens)
-    , mRnnStateManager{rnnStateManager}
-{
-    TLLM_CHECK(mRnnStateManager != nullptr);
-    TLLM_LOG_INFO("RnnCacheTransBufferManager created for RNN cache");
-}
 
 size_t RnnCacheTransBufferManager::computeTransferBufferSizeFromPool(
     kv_cache_manager::BaseKVCacheManager* kvCacheManager, executor::kv_cache::CacheState const& cacheState,
@@ -142,7 +96,6 @@ RnnCacheTransBufferManager::RnnCacheTransBufferManager(kv_cache_manager::BaseKVC
     executor::kv_cache::CacheState const& cacheState, std::optional<size_t> maxNumTokens)
     : BaseTransBufferManager(computeTransferBufferSizeFromPool(kvCacheManager, cacheState, maxNumTokens),
         nvinfer1::DataType::kUINT8, maxNumTokens)
-    , mRnnStateManager{nullptr}
 {
     TLLM_CHECK(kvCacheManager != nullptr);
     TLLM_LOG_INFO("RnnCacheTransBufferManager created for unified pool RNN cache");

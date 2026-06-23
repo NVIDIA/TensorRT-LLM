@@ -5,7 +5,6 @@ CppMambaHybridCacheManager PP-sharding edge cases."""
 
 import os
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -14,7 +13,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_RE
 from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
-    CppMambaCacheManager,
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
@@ -341,45 +339,6 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
         mgr.mamba_cache_index[402],
         mgr.mamba_cache_index[CUDA_GRAPH_DUMMY_REQUEST_ID],
     ]
-
-
-def test_cpp_add_dummy_requests_noop_on_empty_list():
-    stub = SimpleNamespace(mamba_impl=MagicMock())
-    CppMambaCacheManager.add_dummy_requests(stub, [])
-    stub.mamba_impl.allocate_cache_blocks.assert_not_called()
-
-
-@skip_no_cuda
-def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
-    """End-to-end C++ path: add_dummy_requests + getStateIndices must
-    resolve the CUDA-graph sentinel to its reserved slot, distinct from
-    every live request's slot — guards the C++ mCacheIndex lookup, not
-    just the Python forwarder."""
-    mgr = CppMambaCacheManager(
-        d_state=8,
-        d_conv=4,
-        num_heads=4,
-        n_groups=1,
-        head_dim=8,
-        num_layers=2,
-        max_num_sequences=8,
-        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
-        dtype=torch.float16,
-        ssm_cache_dtype=torch.float16,
-    )
-    mgr.add_dummy_requests([100, 101, CUDA_GRAPH_DUMMY_REQUEST_ID])
-
-    request_ids = [100, 101, CUDA_GRAPH_DUMMY_REQUEST_ID]
-    is_padding = [False, False, True]
-    indices = mgr.get_state_indices(request_ids, is_padding)
-
-    sentinel_slot = indices[2]
-    real_slots = {indices[0], indices[1]}
-    assert sentinel_slot not in real_slots, (
-        f"sentinel slot {sentinel_slot} aliases a real request's slot {real_slots}"
-    )
-    # Resolve again — reserved slot must be stable across calls.
-    assert mgr.get_state_indices(request_ids, is_padding) == indices
 
 
 # ---------------------------------------------------------------------------
