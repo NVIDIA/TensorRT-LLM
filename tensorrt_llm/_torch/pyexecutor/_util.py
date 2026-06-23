@@ -290,27 +290,16 @@ class KvCacheCreator:
             kv_cache_manager_cls,
             model_config: ModelConfig,
             kv_cache_config: Optional[KvCacheConfig] = None):
-        kv_cache_config = (kv_cache_config if kv_cache_config is not None else
-                           self._kv_cache_config)
         config = model_config.pretrained_config
         # Use ``issubclass`` rather than identity equality so V2 subclasses
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
-        # also go through the V2-incompatible-feature gate below. The earlier
-        # ``cls == KVCacheManagerV2`` check silently bypassed all V2 subclasses
-        # and let the bare ``assert event_buffer_max_size == 0`` in
-        # ``KVCacheManagerV2.__init__`` trip at executor construction with
-        # a useless error message.
+        # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("beam_width > 1")
-            if kv_cache_config.event_buffer_max_size > 0:
-                incompat.append("event_buffer_max_size > 0")
-            if (self._cache_transceiver_config is not None
-                    and self._cache_transceiver_config.backend is not None):
-                incompat.append("cache_transceiver")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall
