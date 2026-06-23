@@ -123,12 +123,15 @@ class CompileModel(BaseTransform):
         cm.info.reset()
         spec_config = cm._spec_config
 
-        def _get_args_kwargs(bs: int) -> ArgsKwargs:
+        def _named_args() -> dict:
             if spec_config is not None:
-                cm.info.set_capture_batch(batch_size=bs, max_draft_len=spec_config.max_draft_len)
-                return (), {**cm.named_args, "cache_seq_interface": cm}
-            cm.info.set_capture_batch(batch_size=bs)
-            return (), cm.named_args
+                return {**cm.named_args, "cache_seq_interface": cm}
+            return cm.named_args
+
+        def _get_args_kwargs(bs: int) -> ArgsKwargs:
+            max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+            cm.info.set_capture_batch(batch_size=bs, max_draft_len=max_draft_len)
+            return (), _named_args()
 
         resource_input_names = list(cm.resource_names)
         if spec_config is not None and "cache_seq_interface" not in resource_input_names:
@@ -137,7 +140,7 @@ class CompileModel(BaseTransform):
         config_overrides = {}
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info
-            extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
+            extra_kwargs["piecewise_named_args_fn"] = _named_args
 
             max_seq = cm.info.max_seq_len
             max_batch = cm.info.max_batch_size
