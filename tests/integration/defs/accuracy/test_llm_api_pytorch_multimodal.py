@@ -714,6 +714,10 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         ],
     )
     # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
+    # The test exercises a 30B Mamba/attention-hybrid VLM under aggressive chunked
+    # prefill (max_num_tokens=512) over the full 900-question MMMU benchmark; very
+    # rare CI hangs have been observed historically (e.g., nvbugs/6336406,
+    # nvbugs/6336747) without a deterministic reproducer.
     @pytest.mark.threadleak(enabled=False)
     def test_auto_dtype(
         self,
