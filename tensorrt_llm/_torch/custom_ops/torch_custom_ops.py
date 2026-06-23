@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import enum
 import os
+import platform
 import threading
+from ctypes.util import find_library
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -55,6 +58,66 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+_NCCL_GB10_SYMMETRIC_FIXED_VERSION = 23004  # NCCL 2.30.4
+_NCCL_MNNVL_ENABLE = "NCCL_MNNVL_ENABLE"
+_NCCL_NVLS_ENABLE = "NCCL_NVLS_ENABLE"
+
+
+@lru_cache(maxsize=None)
+def _is_gb10() -> bool:
+    """Return True on GB10 (DGX Spark)."""
+    return "GB10" in torch.cuda.get_device_name()
+
+
+@lru_cache(maxsize=None)
+def _get_nccl_runtime_version_code() -> Optional[int]:
+    lib_names = ["libnccl.so.2", "libnccl.so"]
+    nccl_lib = find_library("nccl")
+    if nccl_lib is not None and nccl_lib not in lib_names:
+        lib_names.append(nccl_lib)
+
+    for lib_name in lib_names:
+        try:
+            nccl = ctypes.CDLL(lib_name)
+            nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            nccl.ncclGetVersion.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            continue
+
+        version = ctypes.c_int()
+        if nccl.ncclGetVersion(ctypes.byref(version)) == 0:
+            return version.value
+
+    return None
+
+
+@lru_cache(maxsize=None)
+def _nccl_runtime_predates_symmetric_fix() -> bool:
+    runtime_version = _get_nccl_runtime_version_code()
+    return (runtime_version is None
+            or runtime_version < _NCCL_GB10_SYMMETRIC_FIXED_VERSION)
+
+
+@lru_cache(maxsize=None)
+def _init_nccl_init_workaround() -> bool:
+    """Disable NCCL NVLS/MNNVL before ncclCommInitRank where they can deadlock.
+
+    NCCL <2.30.4 NVLS/MNNVL static-connection setup (forced by
+    NCCL_RUNTIME_CONNECT=0 in opUtils.cpp::getComm) deadlocks during
+    ncclCommInitRank on GB10 (DGX Spark) and on x86_64 hosts that have no
+    MNNVL/IMEX fabric (B200/B300/H20). No-op on NCCL >= 2.30.4 and on other
+    platforms. Honors user-set values via os.environ.setdefault.
+    """
+    if not _nccl_runtime_predates_symmetric_fix():
+        return False
+    on_x86_64 = platform.machine() == "x86_64"
+    if not (on_x86_64 or _is_gb10()):
+        return False
+    os.environ.setdefault(_NCCL_MNNVL_ENABLE, "0")
+    if on_x86_64:
+        os.environ.setdefault(_NCCL_NVLS_ENABLE, "0")
+    return True
 
 
 def _init_deep_gemm_pdl() -> None:
