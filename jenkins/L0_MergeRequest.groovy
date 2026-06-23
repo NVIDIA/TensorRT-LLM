@@ -1514,19 +1514,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
                     try {
                         def params = [
-                            string(name: 'ref', value: ref),
+                            string(name: 'ref', value: env.gitlabCommit),
                             string(name: 'repoUrlKey', value: repoUrlKey),
                             string(name: 'forkOwner', value: ''),
                             string(name: 'postMergePipelineName', value: ''),
                             string(name: 'postMergeBuildNumber', value: ''),
                             string(name: 'scanMode', value: 'monitor'),
-                            string(name: 'runSourceCodeScanning', value: true),
-                            string(name: 'runContainerScanning', value: false),
-                            string(name: 'runSonarQube', value: false),
+                            string(name: 'runSourceCodeScanning', value: 'true'),
+                            string(name: 'runContainerScanning', value: 'false'),
+                            string(name: 'runSonarQube', value: 'false'),
                         ]
                         def logger = new Logger(pipeline)
-                        def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, "Source Code PLC Scanning", params, 1, false)
-                        if (buildStatus != "SUCCESS") {
+                        def handle = build(
+                            job: "/LLM/helpers/PLCScanningSetup",
+                            parameters: params,
+                            propagate: false
+                        )
+                        if (handle.result != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     } catch (InterruptedException e) {
