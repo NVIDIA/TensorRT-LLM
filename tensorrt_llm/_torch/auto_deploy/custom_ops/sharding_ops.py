@@ -150,25 +150,3 @@ def all_reduce(x: torch.Tensor, layer_type: str = "unknown") -> torch.Tensor:
 @all_reduce.register_fake
 def _all_reduce_fake(x: torch.Tensor, layer_type: str = "unknown") -> torch.Tensor:
     return x.clone()
-
-
-@torch.library.custom_op("auto_deploy::all_gather", mutates_args=())
-def all_gather(x: torch.Tensor, dim: int = -1, layer_type: str = "unknown") -> torch.Tensor:
-    """Sharding-aware all-gather placeholder.
-
-    Identity (``x.clone()``) until ``apply_sharding_hints`` swaps it to a real
-    ``dist`` all-gather concatenating across TP ranks on ``dim`` (used to
-    reconstruct the full output of a column-parallel linear, e.g. a vocab-parallel
-    lm_head). Stays identity when ``tp_size <= 1``.
-
-    Args:
-        x: Activation tensor to gather across TP ranks.
-        dim: Concatenation dimension for the gathered shards.
-        layer_type: Layer classification for selective sharding via ``shard_layers``.
-    """
-    return x.clone()
-
-
-@all_gather.register_fake
-def _all_gather_fake(x: torch.Tensor, dim: int = -1, layer_type: str = "unknown") -> torch.Tensor:
-    return x.clone()

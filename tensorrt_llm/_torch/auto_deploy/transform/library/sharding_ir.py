@@ -537,37 +537,6 @@ class AllReduceShardableNode(ShardableNode):
         return 1
 
 
-@ShardableNode.register(torch.ops.auto_deploy.all_gather)
-class AllGatherShardableNode(ShardableNode):
-    """all_gather placeholder: replace with real dist all_gather or identity.
-
-    Used after a column-parallel linear (e.g. vocab-parallel lm_head) to gather the
-    per-rank output shards back to the full width on ``dim``.
-    """
-
-    @classmethod
-    def _strip_node_hints(cls, node: Node) -> bool:
-        """Remove the all_gather placeholder entirely (passthrough to input)."""
-        node.replace_all_uses_with(node.args[0])
-        node.graph.erase_node(node)
-        return True
-
-    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        if dc.tp_size <= 1:
-            return 0
-
-        all_gather_op, _ = _get_dist_ops("auto")
-        [x, dim] = extract_op_args(self.node, "x", "dim")
-        self.node.target = all_gather_op
-        # trtllm/torch dist all_gather signature: (tensor, [strategy,] dim, sizes)
-        if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
-            self.node.args = (x, dc.allreduce_strategy, dim, None)
-        else:
-            self.node.args = (x, dim, None)
-        ad_logger.debug(f"  inserted real all_gather ({all_gather_op.__name__})")
-        return 1
-
-
 @ShardableNode.register(torch.ops.auto_deploy.torch_causal_conv1d)
 class Conv1dShardableNode(ShardableNode):
     """Conv1d op: shard weight/bias with fused dims, update groups."""
