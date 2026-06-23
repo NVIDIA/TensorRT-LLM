@@ -206,7 +206,6 @@ full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_
 full:GB200/test_e2e.py::test_openai_chat_harmony_perf_metrics SKIP (https://nvbugs/6317601)
 full:GB300/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-False-False] SKIP (https://nvbugs/6316984)
 full:GB300/accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm] SKIP (https://nvbugs/6329165)
-full:GB300/accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm] SKIP (https://nvbugs/6329165)
 full:GB300/accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[bf16_ws4_180gb-trtllm] SKIP (https://nvbugs/6316981)
 full:GB300/accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm] SKIP (https://nvbugs/6316981)
 full:GB300/accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[nvfp4_ws4_80gb-trtllm] SKIP (https://nvbugs/6316981)
