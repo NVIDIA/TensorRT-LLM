@@ -197,8 +197,8 @@ def visual_gen_command(
     """Benchmark VisualGen (image/video generation) models offline."""
     import yaml
 
-    from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     if prompt is None and prompt_file is None:
         raise click.UsageError("Either --prompt or --prompt_file must be specified.")
