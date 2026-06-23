@@ -1,6 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared constants for the fused fc1+fc2 MegaMoE path."""
+"""Shared constants for the fused fc1+fc2 MegaMoE path.
+
+Deliberately cutlass-free (a TRT-LLM-local trim of the upstream
+``common/megamoe_constants.py``): the package ``__init__`` imports these for
+capability probing on non-SM100 / no-cutlass-dsl hosts, so this module must NOT
+``from cutlass...`` import. Only the constants actually consumed by the ported
+kernel package are kept; the cutlass-typed ``Log2E`` / ``Fp32Max`` upstream
+constants are unused here (the kernels inline their own ``cutlass.Float32``).
+"""
 
 Nvfp4BlockSize = 16
 SfPaddingBlock = 128
