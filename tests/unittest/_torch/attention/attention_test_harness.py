@@ -22,6 +22,7 @@ from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionInputType,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
@@ -29,7 +30,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -60,8 +62,9 @@ _BINDINGS_DTYPE = {
     torch.float8_e4m3fn: tensorrt_llm.bindings.DataType.FP8,
 }
 
-# Backends compared against the VanillaAttention golden.
-BACKENDS_UNDER_TEST = ("TRTLLM", "FLASHINFER")
+# Backends compared against the VanillaAttention golden. FlashInfer is only
+# included when available, so callers can iterate this list unconditionally.
+BACKENDS_UNDER_TEST = ("TRTLLM",) + (("FLASHINFER",) if IS_FLASHINFER_AVAILABLE else ())
 
 
 @dataclass(kw_only=True)
@@ -99,14 +102,19 @@ class BackendCase:
     # receives pre-RoPE q/k + pos_embd_params and rotates internally, while the
     # Vanilla golden / FlashInfer get harness-applied RoPE. Only affects TRTLLM.
     fused_rope: bool = False
+    # Paged KV-cache block layout for the backends under test: "NHD" or "HND".
+    # None lets each backend use its native layout (Vanilla/TRTLLM are fixed;
+    # FlashInfer defaults to HND). A backend that cannot store the requested
+    # layout is skipped via the capability matrix.
+    kv_layout: Optional[str] = None
     is_mla: bool = False
-    # MLA latent dims (only meaningful when is_mla). Carried for capture/replay
-    # schema completeness so captured MLA cases round-trip. MLA *numerical*
-    # validation lives in test_attention_mla.py: the MLA backend's latent
-    # interface (compressed_kv / k_pe / fused_q / latent_cache, with separate
-    # ctx/gen references) does not fit run_backend's standard q/k/v path, so the
-    # unified harness does not execute MLA cases (run_case is never given one;
-    # the replay suite skips is_mla).
+    # MLA latent dims (only meaningful when is_mla). The unified harness runs the
+    # *absorbed generation* MLA path: fused_q does MQA over a single-latent cache
+    # ([compressed_kv | k_pe]); value is the kv_lora_rank slice. Validated as the
+    # Vanilla golden vs FlashInfer (the non-fusion backends). TRTLLM MLA fuses
+    # RoPE + appends in mla_rope_generation, so it is validated in
+    # test_attention_mla.py instead. MLA *context* (up-projected K/V) also lives
+    # there.
     v_head_dim: Optional[int] = None
     q_lora_rank: Optional[int] = None
     kv_lora_rank: Optional[int] = None
@@ -125,6 +133,20 @@ class BackendCase:
     @property
     def is_cross(self) -> bool:
         return self.seq_lens_kv is not None
+
+    @property
+    def is_gen_only(self) -> bool:
+        """A uniform pure-decode batch eligible for a captured CUDA graph.
+
+        CUDA graphs require a fixed batch and shape at capture; production only
+        captures the generation phase. So a case qualifies only when it is paged,
+        has no context requests.
+        """
+        return self.cache != "none" and self.num_contexts == 0 and not self.is_cross
+
+    @property
+    def is_context_only(self) -> bool:
+        return self.num_contexts == self.num_seqs
 
     @property
     def kv_new_lens(self) -> List[int]:
@@ -174,6 +196,11 @@ def _rope_params_from_dict(d: dict) -> RopeParams:
     return RopeParams(**kwargs)
 
 
+def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
+    """Seeded random tensor on cuda in ``dtype`` (shared by all input builders)."""
+    return torch.randn(*shape, generator=gen, device="cuda").to(dtype)
+
+
 def generate_inputs(case: BackendCase, seed: int) -> Dict[str, object]:
     """Generate seeded, reproducible pre-RoPE inputs in compute dtype.
 
@@ -183,15 +210,12 @@ def generate_inputs(case: BackendCase, seed: int) -> Dict[str, object]:
     cdt = case.compute_dtype
     H, Hkv, D = case.num_heads, case.num_kv_heads, case.head_dim
 
-    def randn(*shape):
-        return torch.randn(*shape, generator=gen, device="cuda").to(cdt)
-
-    q = randn(case.nnz_q, H * D)
+    q = _randn(gen, cdt, case.nnz_q, H * D)
     # New KV tokens: == q tokens for self-attention, encoder length for cross.
-    new_k = randn(case.nnz_kv, Hkv * D)
-    new_v = randn(case.nnz_kv, Hkv * D)
-    cached_k = [randn(c, Hkv, D) for c in case.num_cached_tokens]
-    cached_v = [randn(c, Hkv, D) for c in case.num_cached_tokens]
+    new_k = _randn(gen, cdt, case.nnz_kv, Hkv * D)
+    new_v = _randn(gen, cdt, case.nnz_kv, Hkv * D)
+    cached_k = [_randn(gen, cdt, c, Hkv, D) for c in case.num_cached_tokens]
+    cached_v = [_randn(gen, cdt, c, Hkv, D) for c in case.num_cached_tokens]
     return dict(q=q, new_k=new_k, new_v=new_v, cached_k=cached_k, cached_v=cached_v)
 
 
@@ -233,6 +257,224 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
     return mgr
 
 
+# ---------------------------------------------------------------------------
+# MLA (DeepSeek-style absorbed latent attention) generation.
+#
+# The MLA module's absorbed-generation step is module-orchestrated: a
+# q_nope @ W_UK absorption BMM produces fused_q's lora part, RoPE is applied to
+# q_pe / k_pe, and the backend then does MQA of fused_q over a single-latent KV
+# cache ([compressed_kv | k_pe], head_dim kv_lora_rank + qk_rope_head_dim) with
+# value = the kv_lora_rank slice. We do not test the BMM/projection here -- the
+# harness feeds the *absorbed* fused_q + latent directly (random), exercising
+# only the MQA. Because the identical inputs go to both the Vanilla golden and
+# FlashInfer, the comparison validates the absorbed-MQA math regardless of the
+# RoPE values (RoPE correctness is covered by test_attention_mla.py).
+# ---------------------------------------------------------------------------
+def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
+    """A SELFKONLY KV cache for MLA: one latent head, head_dim kv_lora+qk_rope."""
+    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    paged = BACKEND_CAPS[backend]["paged"]
+    max_total = max(case.token_nums)
+    if paged:
+        tokens_per_block = case.page_size
+        pages_per_seq = math.ceil(max_total / tokens_per_block)
+    else:
+        tokens_per_block = max(max_total, 1)
+        pages_per_seq = 1
+    num_blocks = case.num_seqs * pages_per_seq
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    cache_types = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
+    return cls(
+        KvCacheConfig(max_tokens=num_blocks * tokens_per_block, enable_block_reuse=False),
+        cache_types.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=d_latent,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=pages_per_seq * tokens_per_block,
+        max_batch_size=case.num_seqs,
+        mapping=mapping,
+        dtype=_BINDINGS_DTYPE[case.compute_dtype],
+    )
+
+
+def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
+    """Random absorbed-MLA generation inputs (shared by all backends).
+
+    ``fused_q`` already contains the rope slot (the would-be ``q_pe``) so the
+    harness never calls ``mla_rope_generation`` -- that op ropes inside the
+    kernel for fusing backends but not for non-fusing ones, which would desync
+    the comparison. Feeding identical pre-formed ``fused_q`` to every backend
+    keeps them aligned.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    cdt = case.compute_dtype
+    H = case.num_heads
+    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    return dict(
+        # [num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim)].
+        fused_q=_randn(gen, cdt, case.nnz_q, H * d_latent),
+        # New latent token per query token: [compressed_kv | k_pe].
+        latent_cache=_randn(gen, cdt, case.nnz_q, d_latent),
+        # Cached latent prefix per request.
+        cached_latent=[_randn(gen, cdt, c, d_latent) for c in case.num_cached_tokens],
+    )
+
+
+def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent):
+    """Write the per-request cached latent prefix into the MLA cache pool."""
+    if all(c.shape[0] == 0 for c in cached_latent):
+        return
+    buf = mgr.get_buffers(layer_idx)  # [pages, 1, page_size, 1, d_latent]
+    tokens_per_block = buf.shape[2]
+    blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), layer_idx)
+    for i, blocks in enumerate(blocks_per_req):
+        blocks = [b for b in blocks if b != -1]
+        lat = cached_latent[i]
+        written = 0
+        for blk in blocks:
+            if written >= lat.shape[0]:
+                break
+            n = min(tokens_per_block, lat.shape[0] - written)
+            buf[blk, 0, :n, 0, :].copy_(lat[written : written + n].to(buf.dtype))
+            written += n
+
+
+def _mla_metadata(AttentionCls, case, mgr):
+    return AttentionCls.Metadata(
+        num_contexts=0,
+        kv_cache_params=KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
+        ),
+        seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+        max_num_requests=case.num_seqs,
+        max_num_tokens=8192,
+        kv_cache_manager=mgr,
+        request_ids=list(range(case.num_seqs)),
+        prompt_lens=case.token_nums,
+    )
+
+
+def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Tensor:
+    """Run one backend's absorbed-MLA generation; return [nnz_q, heads*kv_lora].
+
+    No ``mla_rope_generation`` call (see ``generate_mla_gen_inputs``): ``fused_q``
+    is passed as-is and the backend's ``forward`` appends the new latent + MQA.
+    """
+    AttentionCls = get_attention_backend(backend)
+    H = case.num_heads
+    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    request_ids = list(range(case.num_seqs))
+    attn = create_attention(
+        backend,
+        layer_idx=0,
+        num_heads=H,
+        head_dim=d_latent,
+        num_kv_heads=1,
+        q_scaling=case.q_scaling,
+        is_mla_enable=True,
+        q_lora_rank=case.q_lora_rank,
+        kv_lora_rank=case.kv_lora_rank,
+        qk_nope_head_dim=case.qk_nope_head_dim,
+        qk_rope_head_dim=case.qk_rope_head_dim,
+        v_head_dim=case.v_head_dim,
+    )
+    mgr = _build_mla_kv_cache_manager(case, backend)
+    mgr.add_dummy_requests(request_ids, case.token_nums)
+    _fill_mla_cache(mgr, 0, request_ids, inputs["cached_latent"])
+    fused_q = inputs["fused_q"]
+    latent_cache = inputs["latent_cache"]
+    fwd_kwargs = dict(
+        latent_cache=latent_cache, attention_input_type=AttentionInputType.generation_only
+    )
+
+    def _forward(metadata, q):
+        out = attn.forward(q, None, None, metadata, **fwd_kwargs)
+        return out[0] if isinstance(out, tuple) else out
+
+    try:
+        if cuda_graph:
+            return _capture_replay(
+                AttentionCls,
+                case,
+                mgr,
+                _mla_metadata,
+                {"q": fused_q},
+                lambda md, bufs: _forward(md, bufs["q"]),
+            )
+        metadata = _mla_metadata(AttentionCls, case, mgr)
+        metadata.prepare()
+        return _forward(metadata, fused_q)[: case.nnz_q].contiguous()
+    finally:
+        mgr.shutdown()
+
+
+def generate_mla_context_inputs(case: BackendCase, seed: int = 0) -> Dict:
+    """Random up-projected MLA context inputs (asymmetric K/V)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    cdt = case.compute_dtype
+    H, Hkv = case.num_heads, case.num_kv_heads
+    qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
+    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    return dict(
+        q=_randn(gen, cdt, case.nnz_q, H * qk_head),
+        k=_randn(gen, cdt, case.nnz_q, Hkv * qk_head),
+        v=_randn(gen, cdt, case.nnz_q, Hkv * case.v_head_dim),
+        latent_cache=_randn(gen, cdt, case.nnz_q, d_latent),  # appended for later gen
+    )
+
+
+def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
+    """Run one backend's up-projected MLA context; return [nnz_q, heads*v_head]."""
+    AttentionCls = get_attention_backend(backend)
+    qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
+    request_ids = list(range(case.num_seqs))
+    attn = create_attention(
+        backend,
+        layer_idx=0,
+        num_heads=case.num_heads,
+        head_dim=qk_head,
+        num_kv_heads=case.num_kv_heads,
+        q_scaling=case.q_scaling,
+        is_mla_enable=True,
+        q_lora_rank=case.q_lora_rank,
+        kv_lora_rank=case.kv_lora_rank,
+        qk_nope_head_dim=case.qk_nope_head_dim,
+        qk_rope_head_dim=case.qk_rope_head_dim,
+        v_head_dim=case.v_head_dim,
+    )
+    mgr = _build_mla_kv_cache_manager(case, backend)
+    mgr.add_dummy_requests(request_ids, case.token_nums)
+    metadata = AttentionCls.Metadata(
+        num_contexts=case.num_contexts,
+        kv_cache_params=KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
+        ),
+        seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+        max_num_requests=case.num_seqs,
+        max_num_tokens=8192,
+        kv_cache_manager=mgr,
+        request_ids=request_ids,
+        prompt_lens=case.token_nums,
+    )
+    metadata.prepare()
+    try:
+        out = attn.forward(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            metadata,
+            latent_cache=inputs["latent_cache"],
+            attention_input_type=AttentionInputType.context_only,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        return out[: case.nnz_q].contiguous()
+    finally:
+        mgr.shutdown()
+
+
 def _quant_config(kv_dtype) -> Optional[QuantConfig]:
     # Quantize only the KV cache (not activations) — there are no projection
     # layers in the standalone backend, and activation FP8 QDQ here yields NaNs.
@@ -244,12 +486,18 @@ def _quant_config(kv_dtype) -> Optional[QuantConfig]:
 
 
 def _tolerances(case: "BackendCase", kv_dtype) -> tuple:
-    """Dtype-appropriate (atol, rtol). fp8/fp4 dominate; else bf16 is looser."""
+    """Dtype-appropriate (atol, rtol).
+
+    fp8/fp4 quantization error dominates, so it sets the atol. When the compute
+    dtype is bf16 its coarser mantissa compounds with the quant error, so the
+    quantized atol gets extra headroom and the rtol relaxes to the bf16 rtol.
+    """
+    bf16 = case.compute_dtype == torch.bfloat16
     if kv_dtype == torch.float8_e4m3fn:
-        return FP8_ATOL, RTOL
+        return (FP8_ATOL + BF16_ATOL, BF16_RTOL) if bf16 else (FP8_ATOL, RTOL)
     if kv_dtype == "nvfp4":
-        return FP4_ATOL, RTOL
-    if case.compute_dtype == torch.bfloat16:
+        return (FP4_ATOL + BF16_ATOL, BF16_RTOL) if bf16 else (FP4_ATOL, RTOL)
+    if bf16:
         return BF16_ATOL, BF16_RTOL
     return ATOL, RTOL
 
@@ -281,14 +529,83 @@ def _maybe_rope(case: BackendCase, inputs, *, fuse_rope: bool):
     if not fuse_rope:
         q_pos = make_position_ids(case.seq_lens, case.num_cached_tokens)
         q = apply_rope(q, q_pos, rope_params, D, is_neox=is_neox)
-        new_k = apply_rope(new_k, q_pos, rope_params, D, is_neox=is_neox)
+        # Self-attention K shares the query positions; cross-attention K is the
+        # encoder side (its own positions, length seq_lens_kv), so it must be
+        # roped at encoder positions -- otherwise q_len != kv_len mismatches.
+        if case.is_cross:
+            k_pos = make_position_ids(case.seq_lens_kv, [0] * case.num_seqs)
+        else:
+            k_pos = q_pos
+        new_k = apply_rope(new_k, k_pos, rope_params, D, is_neox=is_neox)
     return q, new_k, cached_eff
 
 
-def run_backend(
-    case: BackendCase, backend: str, inputs, *, kv_dtype: torch.dtype, fuse_rope: bool = False
+def _capture_replay(
+    AttentionCls, case, mgr, make_metadata, static_inputs, forward_fn, *, kv_layout=None
 ) -> torch.Tensor:
-    """Run one backend on ``case`` and return ``[nnz_q, num_heads*head_dim]``."""
+    """Capture a gen-phase graph once and replay it with the case's inputs.
+
+    Mirrors production graph reuse: the cuda-graph metadata holds pre-allocated,
+    fixed-address buffers (seq_lens refreshed via ``copy_``, never reallocated);
+    inputs are copied into static buffers. The decode kernel appends the new K/V
+    to the same fixed cache slot on every warmup/capture/replay pass, so the
+    repeated append is idempotent. Shared by the standard decode and the absorbed
+    MLA generation paths -- they differ only in ``static_inputs`` / ``forward_fn``.
+    """
+    cg_md = make_metadata(AttentionCls, case, mgr).create_cuda_graph_metadata(case.num_seqs)
+    cg_md.seq_lens = torch.tensor(case.seq_lens, dtype=torch.int)
+    cg_md.num_contexts = 0
+    if kv_layout is not None:
+        cg_md.kv_layout = kv_layout  # FlashInfer reads this; others ignore it.
+    cg_md.prepare()
+
+    bufs = {k: torch.zeros_like(v) for k, v in static_inputs.items()}
+    for k, v in static_inputs.items():
+        bufs[k].copy_(v)
+
+    def _fwd():
+        return forward_fn(cg_md, bufs)
+
+    # Warm up on a side stream so metadata-dependent host work that host-syncs
+    # (e.g. FlashInfer ``plan()``) runs OUTSIDE the capture region.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            _fwd()
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = _fwd()
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph_out[: case.nnz_q].contiguous().clone()
+
+
+def run_backend(
+    case: BackendCase,
+    backend: str,
+    inputs,
+    *,
+    kv_dtype: torch.dtype,
+    fuse_rope: bool = False,
+    cuda_graph: bool = False,
+    kv_layout: str = "NHD",
+) -> torch.Tensor:
+    """Run one backend on ``case`` and return ``[nnz_q, num_heads*head_dim]``.
+
+    With ``cuda_graph=True`` (only valid for a gen-only batch) the forward is
+    captured into a CUDA graph and replayed, exercising the graph-reuse path.
+    ``kv_layout`` is the paged-cache block layout to fill + read ("NHD"/"HND");
+    the caller passes a layout the backend supports (gated by the capability
+    matrix). MLA cases are dispatched to the absorbed-generation path.
+    """
+    if case.is_mla:
+        if case.is_context_only:
+            return _run_mla_context_backend(case, backend, inputs)
+        return _run_mla_gen_backend(case, backend, inputs, cuda_graph=cuda_graph)
+
     AttentionCls = get_attention_backend(backend)
     H, Hkv, D = case.num_heads, case.num_kv_heads, case.head_dim
     request_ids = list(range(case.num_seqs))
@@ -324,7 +641,9 @@ def run_backend(
     if case.sliding_window:
         fwd_kwargs["attention_window_size"] = case.sliding_window
 
-    use_fused_qkv = AttentionCls.support_fused_qkv()
+    # TRTLLM fuses QKV for self-attention, but cross-attention needs separate
+    # q/k/v (it sets is_fused_qkv = not is_cross and k is None).
+    use_fused_qkv = AttentionCls.support_fused_qkv() and not case.is_cross
 
     mgr = None
     if case.cache == "none":
@@ -343,11 +662,41 @@ def run_backend(
     else:
         mgr = _build_kv_cache_manager(case, backend, kv_dtype)
         mgr.add_dummy_requests(request_ids, case.token_nums)
-        # Vanilla reads the cache via the NHD ``get_buffers`` view; TRTLLM (C++
-        # paged FMHA/XQA) and FlashInfer use the HND head-major block layout.
-        # The cached prefix must be filled in the layout the backend reads.
-        layout = "NHD" if backend == "VANILLA" else "HND"
-        fill_kv_cache_logical(mgr, 0, request_ids, cached_k, cached_v, kv_layout=layout)
+        # The cached prefix must be filled in the layout the backend reads:
+        # Vanilla uses NHD, TRTLLM HND, FlashInfer whatever metadata.kv_layout
+        # says. The caller passes a supported ``kv_layout`` (capability-gated).
+        fill_kv_cache_logical(mgr, 0, request_ids, cached_k, cached_v, kv_layout=kv_layout)
+        if cuda_graph:
+            static = (
+                {"q": torch.cat([q, new_k, new_v], dim=-1)}
+                if use_fused_qkv
+                else {"q": q, "k": new_k, "v": new_v}
+            )
+
+            def _decode_md(AttentionCls, case, mgr):
+                return AttentionCls.Metadata(
+                    num_contexts=0,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
+                    ),
+                    seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+                    max_num_requests=case.num_seqs,
+                    max_num_tokens=8192,
+                    kv_cache_manager=mgr,
+                    request_ids=list(range(case.num_seqs)),
+                    prompt_lens=case.token_nums,
+                )
+
+            def _cg_fwd(md, b):
+                out = attn.forward(b["q"], b.get("k"), b.get("v"), md, **fwd_kwargs)
+                return out[0] if isinstance(out, tuple) else out
+
+            try:
+                return _capture_replay(
+                    AttentionCls, case, mgr, _decode_md, static, _cg_fwd, kv_layout=kv_layout
+                )
+            finally:
+                mgr.shutdown()
         seq_lens_kv = torch.tensor(case.seq_lens_kv, dtype=torch.int) if case.is_cross else None
         metadata = AttentionCls.Metadata(
             num_contexts=case.num_contexts,
@@ -362,7 +711,25 @@ def run_backend(
             request_ids=request_ids,
             prompt_lens=case.token_nums,
         )
+        # FlashInfer chooses its KV block layout from metadata.kv_layout; fill
+        # used the matching layout above. (TRTLLM/Vanilla ignore this field.)
+        if backend == "FLASHINFER":
+            metadata.kv_layout = kv_layout
         metadata.prepare()
+        if case.is_cross:
+            # TRTLLM cross reads metadata.cu_q_seqlens / cu_kv_seqlens (indptr,
+            # num_seqs+1). The model engine sets these; the standalone harness
+            # must too, else kv indexing falls back to q lengths and breaks when
+            # q_len != kv_len. cu_kv uses total KV per seq (cached + new encoder).
+            def _cu(lengths):
+                return torch.tensor(
+                    [0, *torch.tensor(lengths).cumsum(0).tolist()],
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+
+            metadata.cu_q_seqlens = _cu(case.seq_lens)
+            metadata.cu_kv_seqlens = _cu(case.token_nums)
 
     try:
         if use_fused_qkv:
@@ -381,11 +748,23 @@ def run_backend(
 def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     """Run the VanillaAttention golden and every supported backend; assert match.
 
+    Handles both standard attention and absorbed-MLA generation (dispatched
+    inside ``run_backend``). The Vanilla golden always runs in its native NHD
+    layout; each backend under test runs in the case's requested layout (or HND).
+    A gen-only batch is additionally replayed through a captured CUDA graph.
+
     Returns the per-backend outputs (including ``"VANILLA"`` golden) for callers
     that want the raw tensors (e.g. the minimizer).
     """
-    inputs = generate_inputs(case, seed)
-    golden = run_backend(case, "VANILLA", inputs, kv_dtype=case.compute_dtype)
+    is_mla = case.is_mla
+    if is_mla:
+        if case.is_context_only:
+            inputs = generate_mla_context_inputs(case, seed)
+        else:
+            inputs = generate_mla_gen_inputs(case, seed)
+    else:
+        inputs = generate_inputs(case, seed)
+    golden = run_backend(case, "VANILLA", inputs, kv_dtype=case.compute_dtype, kv_layout="NHD")
     results = {"VANILLA": golden}
 
     # Evaluate every supported backend before asserting, so one backend's
@@ -394,12 +773,13 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     for backend in BACKENDS_UNDER_TEST:
         if unsupported_reason(backend, case) is not None:
             continue
-        if backend == "FLASHINFER" and not IS_FLASHINFER_AVAILABLE:
-            continue
-        kv_dtype = case.compute_dtype if case.cache == "none" else case.kv_torch_dtype
+        kv_dtype = case.compute_dtype if (is_mla or case.cache == "none") else case.kv_torch_dtype
         # Fused RoPE only applies to TRTLLM (the sole support_fused_rope backend).
         fuse_rope = case.fused_rope and backend == "TRTLLM"
-        out = run_backend(case, backend, inputs, kv_dtype=kv_dtype, fuse_rope=fuse_rope)
+        layout = case.kv_layout or "HND"  # native for TRTLLM/FlashInfer
+        out = run_backend(
+            case, backend, inputs, kv_dtype=kv_dtype, fuse_rope=fuse_rope, kv_layout=layout
+        )
         results[backend] = out
 
         atol, rtol = _tolerances(case, kv_dtype)
@@ -407,6 +787,25 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
             torch.testing.assert_close(out, golden, atol=atol, rtol=rtol)
         except AssertionError as exc:
             failures.append(f"[{backend} vs VANILLA golden]\n{exc}")
+
+        # A gen-only batch also exercises the captured-CUDA-graph path
+        # (production replays a captured decode graph); it must still match the
+        # eager golden.
+        if case.is_gen_only:
+            cg_out = run_backend(
+                case,
+                backend,
+                inputs,
+                kv_dtype=kv_dtype,
+                fuse_rope=fuse_rope,
+                kv_layout=layout,
+                cuda_graph=True,
+            )
+            results[f"{backend}+cudagraph"] = cg_out
+            try:
+                torch.testing.assert_close(cg_out, golden, atol=atol, rtol=rtol)
+            except AssertionError as exc:
+                failures.append(f"[{backend}+cudagraph vs VANILLA golden]\n{exc}")
 
     if failures:
         raise AssertionError("\n\n".join(failures))

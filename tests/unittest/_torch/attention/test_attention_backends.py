@@ -5,276 +5,188 @@
 Every case runs the VanillaAttention golden plus each supported backend
 (TRTLLM, FlashInfer) through a real KVCacheManager and asserts they match.
 
-Coverage spans head dims, GQA/MQA, dtypes, fp8/fp4 KV cache, mask types,
-RoPE, sliding window, paged vs no-cache, and context/decode/mixed batches.
+The breadth sweep is **model-derived**: it enumerates the distinct attention
+configurations actually used by the supported models (``model_configs.py``), so
+each case maps to a real workload. The orthogonal dimensions are bounded:
 
-Sampling: the full product is large; ``TRTLLM_ATTN_TEST_SAMPLE`` controls how
-many sweep cases run (``full`` for everything, else an int count; default 80).
+* default cross on every cacheable config: phase {ctx, dec, mix} x
+  precision {bf16, fp8-KV} x KV-manager {v1, v2}, at page_size=32, layout=HND.
+* the non-default dimension values (page_size=64, layout=NHD, dtype=fp16) are
+  exercised on a small representative set (GQA / MHA / MQA) to avoid a full
+  cross blow-up -- page/manager/layout are head-config-independent.
+
+Gen-only batches are also replayed through a captured CUDA graph; backends that
+cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
+(``unsupported_reason``), which also gates sm-dependent dtypes.
 """
-
-import itertools
-import os
-import random
 
 import pytest
 import torch
-from attention_test_harness import BackendCase, generate_inputs, run_backend, run_case
-from utils.util import getSMVersion
+from attention_test_harness import (
+    BACKENDS_UNDER_TEST,
+    BackendCase,
+    generate_inputs,
+    run_backend,
+    run_case,
+)
+from model_configs import MODEL_CONFIGS, ModelAttnConfig
 
-# A simple neox RoPE config used by rope-on cases.
-_ROPE_NEOX = dict(dim=None, theta=10000.0, max_positions=8192, is_neox=True)
+# Sliding-window models ship a 4096 window; at the small sequence lengths used
+# here that would never mask, so the test shrinks it to exercise the windowing
+# logic (the real window is recorded in model_configs).
+_TEST_SLIDING_WINDOW = 48
 
+# Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
+# fp8 KV cache with bf16 compute.
+_BF16 = ("bfloat16", None)
+_FP16 = ("float16", None)
+_FP8 = ("bfloat16", "float8_e4m3fn")
 
-def _rope_for(head_dim: int):
-    cfg = dict(_ROPE_NEOX)
-    cfg["dim"] = head_dim
-    return cfg
+# Core dimensions crossed on EVERY config; non-default values (page=64, NHD,
+# fp16) are added only for the representative configs below.
+_CORE_PRECISIONS, _CORE_LAYOUTS, _CORE_PAGES = [_BF16, _FP8], ["HND"], [32]
+_EXTRA_PRECISIONS = [_FP16, _BF16, _FP8]
+_EXTRA_LAYOUTS, _EXTRA_PAGES = ["HND", "NHD"], [32, 64]
+_EXTRA_CONFIG_IDS = ("llama3_gqa", "qwen3_mha", "mqa_synthetic")
 
-
-def _needs_skip(case: BackendCase) -> str | None:
-    """Return an sm-gating skip reason for the case, if any."""
-    if case.kv_dtype == "float8_e4m3fn" and getSMVersion() < 89:
-        return "FP8 KV cache requires sm>=89"
-    if case.kv_dtype == "nvfp4" and getSMVersion() < 100:
-        return "NVFP4 KV cache requires sm>=100 (Blackwell)"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Curated core cases: explicit, fast, cover the key dimensions individually.
-# ---------------------------------------------------------------------------
-def _core_cases():
-    cases = {}
-
-    def add(name, **kw):
-        kw.setdefault("num_heads", 8)
-        kw.setdefault("num_kv_heads", 2)
-        kw.setdefault("head_dim", 128)
-        cases[name] = BackendCase(**kw)
-
-    # Pure prefill (context only).
-    add("ctx_causal", seq_lens=[16, 24], num_cached_tokens=[0, 0], num_contexts=2)
-    add("ctx_full", seq_lens=[16, 24], num_cached_tokens=[0, 0], num_contexts=2, causal=False)
-    # Pure decode (generation only): 1 new token, multi-block cached prefix.
-    add("decode", seq_lens=[1, 1, 1], num_cached_tokens=[20, 130, 8], num_contexts=0, page_size=64)
-    # Mixed in-flight batch: contexts + generations together.
-    add(
-        "mixed_ifb",
-        seq_lens=[16, 1, 1],
-        num_cached_tokens=[0, 30, 70],
-        num_contexts=1,
-        page_size=64,
-    )
-    # GQA / MQA / MHA.
-    add(
-        "mha",
-        num_heads=8,
-        num_kv_heads=8,
-        seq_lens=[12, 1],
-        num_cached_tokens=[0, 40],
-        num_contexts=1,
-    )
-    add(
-        "mqa",
-        num_heads=16,
-        num_kv_heads=1,
-        seq_lens=[12, 1],
-        num_cached_tokens=[0, 40],
-        num_contexts=1,
-    )
-    # head_dim variations.
-    add("hd64", head_dim=64, seq_lens=[16, 1], num_cached_tokens=[0, 40], num_contexts=1)
-    # bf16.
-    add("bf16", dtype="bfloat16", seq_lens=[16, 1], num_cached_tokens=[0, 40], num_contexts=1)
-    # FP8 KV cache: context (prefill) exercises TRTLLM + FlashInfer; the mixed
-    # case below validates FlashInfer fp8 decode (TRTLLM fp8 decode w/ manual
-    # prefill is a documented limitation, skipped via the capability matrix).
-    add(
-        "fp8_ctx",
-        kv_dtype="float8_e4m3fn",
-        seq_lens=[16, 24],
-        num_cached_tokens=[0, 0],
-        num_contexts=2,
-    )
-    add(
-        "fp8",
-        kv_dtype="float8_e4m3fn",
-        seq_lens=[16, 1, 1],
-        num_cached_tokens=[0, 40, 8],
-        num_contexts=1,
-    )
-    # FP4 (NVFP4) KV cache is intentionally NOT exercised here: it cannot be
-    # tested in a standalone backend harness. See capability_matrix.BACKEND_CAPS
-    # (fp4_kv=False) for the rationale -- the NVFP4 attention op needs the full
-    # model's scale plumbing, and the packed cache cannot be manually prefilled.
-    # Sliding window.
-    add("sliding", seq_lens=[1, 1], num_cached_tokens=[100, 130], num_contexts=0, sliding_window=32)
-    # RoPE on (non-fused; harness applies rope, all backends compare).
-    add(
-        "rope_ctx", seq_lens=[24, 16], num_cached_tokens=[0, 0], num_contexts=2, rope=_rope_for(128)
-    )
-    add(
-        "rope_decode",
-        seq_lens=[1, 1],
-        num_cached_tokens=[40, 90],
-        num_contexts=0,
-        rope=_rope_for(128),
-    )
-    # Fused RoPE: TRTLLM rotates q/k in-kernel (pre-RoPE inputs + pos_embd_params)
-    # vs the Vanilla golden's harness-applied RoPE.
-    add(
-        "fused_rope_ctx",
-        seq_lens=[24, 16],
-        num_cached_tokens=[0, 0],
-        num_contexts=2,
-        rope=_rope_for(128),
-        fused_rope=True,
-    )
-    add(
-        "fused_rope_decode",
-        seq_lens=[1, 1],
-        num_cached_tokens=[40, 90],
-        num_contexts=0,
-        rope=_rope_for(128),
-        fused_rope=True,
-    )
-    # No KV cache (ragged prefill).
-    add(
-        "no_cache_causal",
-        cache="none",
-        seq_lens=[16, 24, 5],
-        num_cached_tokens=[0, 0, 0],
-        num_contexts=3,
-    )
-    add(
-        "no_cache_full",
-        cache="none",
-        seq_lens=[16, 24, 5],
-        num_cached_tokens=[0, 0, 0],
-        num_contexts=3,
-        causal=False,
-    )
-    # Cross-attention (encoder-decoder): decoder query attends to encoder KV.
-    # Non-causal; TRTLLM skipped (asserts no cross), FlashInfer vs Vanilla golden.
-    add(
-        "cross_prefill",
-        seq_lens=[16, 24],
-        seq_lens_kv=[16, 24],
-        num_cached_tokens=[0, 0],
-        num_contexts=2,
-        causal=False,
-    )
-    add(
-        "cross_diff_kv",
-        seq_lens=[16, 8],
-        seq_lens_kv=[32, 40],
-        num_cached_tokens=[0, 0],
-        num_contexts=2,
-        causal=False,
-    )
-    # KVCacheManagerV2.
-    add(
-        "decode_v2",
-        seq_lens=[1, 1],
-        num_cached_tokens=[20, 50],
-        num_contexts=0,
-        use_kv_cache_manager_v2=True,
-    )
-    # Small page size (more blocks per sequence).
-    add("page16", seq_lens=[1], num_cached_tokens=[40], num_contexts=0, page_size=16)
-    return cases
-
-
-CORE_CASES = _core_cases()
-
-
-@pytest.mark.parametrize("name", list(CORE_CASES), ids=lambda n: n)
-def test_attention_backend_core(name):
-    case = CORE_CASES[name]
-    skip = _needs_skip(case)
-    if skip:
-        pytest.skip(skip)
-    run_case(case)
-
-
-# ---------------------------------------------------------------------------
-# Sampled product sweep for breadth.
-# ---------------------------------------------------------------------------
-_SEQ_MIXES = {
-    "context": dict(seq_lens=[16, 24], num_cached_tokens=[0, 0], num_contexts=2),
-    "decode": dict(seq_lens=[1, 1, 1], num_cached_tokens=[20, 70, 8], num_contexts=0),
-    "mixed": dict(seq_lens=[16, 1, 1], num_cached_tokens=[0, 30, 70], num_contexts=1),
+# Standard self-attention batch phases.
+_PHASES = {
+    "ctx": dict(seq_lens=[16, 24, 5], num_cached_tokens=[0, 0, 0], num_contexts=3),
+    "gen": dict(seq_lens=[1, 1, 1], num_cached_tokens=[20, 130, 8], num_contexts=0),
+    "mix": dict(seq_lens=[16, 1, 1], num_cached_tokens=[0, 30, 70], num_contexts=1),
 }
 
 
-def _build_sweep_cases():
-    cases = []
-    grid = itertools.product(
-        [(8, 8), (8, 2), (16, 1)],  # (num_heads, num_kv_heads)
-        [64, 128],  # head_dim
-        ["float16", "bfloat16"],  # dtype
-        ["same", "float8_e4m3fn"],  # kv_dtype
-        [16, 64],  # page_size
-        ["causal", "full", "sliding"],  # mask
-        [None, "neox"],  # rope
-        list(_SEQ_MIXES),  # seq mix
+def _rope_dict(cfg: ModelAttnConfig):
+    if cfg.rope is None:
+        return None
+    return dict(dim=cfg.head_dim, theta=10000.0, max_positions=8192, is_neox=(cfg.rope == "neox"))
+
+
+def _common(cfg: ModelAttnConfig) -> dict:
+    common = dict(
+        num_heads=cfg.num_heads,
+        num_kv_heads=cfg.num_kv_heads,
+        head_dim=cfg.head_dim,
+        rope=_rope_dict(cfg),
+        causal=cfg.mask in ("causal", "sliding"),
+        sliding_window=_TEST_SLIDING_WINDOW if cfg.mask == "sliding" else None,
     )
-    for heads, hd, dtype, kvd, page, mask, rope, mix in grid:
-        layout = _SEQ_MIXES[mix]
-        # Coherence filters.
-        if mask == "full" and mix != "context":
-            continue  # non-causal only meaningful for prefill here
-        num_heads, num_kv_heads = heads
-        max_total = max(c + s for c, s in zip(layout["num_cached_tokens"], layout["seq_lens"]))
-        sliding = 32 if mask == "sliding" else None
-        if sliding is not None and sliding >= max_total:
-            continue
-        cases.append(
-            BackendCase(
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=hd,
-                dtype=dtype,
-                kv_dtype=None if kvd == "same" else kvd,
-                causal=(mask != "full"),
-                sliding_window=sliding,
-                page_size=page,
-                rope=_rope_for(hd) if rope == "neox" else None,
-                **layout,
-            )
+    if cfg.is_mla:
+        common.update(
+            is_mla=True,
+            kv_lora_rank=cfg.kv_lora_rank,
+            q_lora_rank=cfg.q_lora_rank,
+            qk_nope_head_dim=cfg.qk_nope_head_dim,
+            qk_rope_head_dim=cfg.qk_rope_head_dim,
+            v_head_dim=cfg.v_head_dim,
         )
+    return common
+
+
+def _prec_tag(dtype, kvd) -> str:
+    return "fp8" if kvd is not None else ("bf16" if dtype == "bfloat16" else "fp16")
+
+
+def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
+    """Yield ``(id, BackendCase)`` for one config over the given dimensions.
+
+    ``precisions`` / ``kv_layouts`` / ``page_sizes`` (plus KV-manager v1/v2) are
+    the outer loops, shared by the mla-context, mla-generation and standard
+    cases. Used to generate both the core slice (default dims on every config)
+    and the feature slice (non-default dims on representative configs); callers
+    dedup by id. Dimensions that don't apply to a case type are filtered:
+    no-cache encoders take only the compute-dtype precisions; MLA uses its
+    NHD-internal latent cache in bf16; cross skips fp8.
+    """
+    common = _common(cfg)
+
+    # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.
+    if cfg.no_cache:
+        for dtype, kvd in precisions:
+            if kvd is not None:
+                continue  # no KV cache to quantize
+            yield (
+                f"{cfg.id}-{_prec_tag(dtype, kvd)}",
+                BackendCase(
+                    cache="none",
+                    seq_lens=[16, 24, 5],
+                    num_cached_tokens=[0, 0, 0],
+                    num_contexts=3,
+                    dtype=dtype,
+                    **common,
+                ),
+            )
+        return
+
+    # Filter dims to those meaningful for this case type.
+    if cfg.is_mla:
+        precisions = [(d, k) for d, k in precisions if k is None]  # bf16 latent
+        kv_layouts = ["NHD"]  # MLA reads its latent cache NHD-internally
+    elif cfg.is_cross:
+        precisions = [(d, k) for d, k in precisions if k is None]  # no fp8 cross
+
+    for dtype, kvd in precisions:
+        for layout in kv_layouts:
+            for page in page_sizes:
+                for v2 in (False, True):
+                    tag = f"{_prec_tag(dtype, kvd)}-{layout}-p{page}-{'v2' if v2 else 'v1'}"
+                    base = dict(
+                        page_size=page,
+                        kv_layout=layout,
+                        dtype=dtype,
+                        kv_dtype=kvd,
+                        use_kv_cache_manager_v2=v2,
+                        **common,
+                    )
+                    if cfg.is_cross:
+                        yield (
+                            f"{cfg.id}-same_kv_{tag}",
+                            BackendCase(
+                                seq_lens_kv=_PHASES["ctx"]["seq_lens"], **_PHASES["ctx"], **base
+                            ),
+                        )
+                        yield (
+                            f"{cfg.id}-diff_kv_{tag}",
+                            BackendCase(
+                                seq_lens_kv=[
+                                    x * y for x, y in zip(_PHASES["ctx"]["seq_lens"], [2, 3, 6])
+                                ],
+                                **_PHASES["ctx"],
+                                **base,
+                            ),
+                        )
+                    elif cfg.is_mla and cfg.mla_context:
+                        yield f"{cfg.id}-ctx-{tag}", BackendCase(**_PHASES["ctx"], **base)
+                    elif cfg.is_mla:
+                        yield f"{cfg.id}-gen-{tag}", BackendCase(**_PHASES["gen"], **base)
+                    else:
+                        for phase_name, phase in _PHASES.items():
+                            yield f"{cfg.id}-{phase_name}-{tag}", BackendCase(**phase, **base)
+
+
+def _model_cases():
+    cases = {}
+    cfg_by_id = {cfg.id: cfg for cfg in MODEL_CONFIGS}
+    # Core slice on every config, then the feature slice (non-default page /
+    # layout / precision) on the representative configs.
+    for cfg in MODEL_CONFIGS:
+        for case_id, case in _expand(cfg, _CORE_PRECISIONS, _CORE_LAYOUTS, _CORE_PAGES):
+            cases[case_id] = case
+    for cfg_id in _EXTRA_CONFIG_IDS:
+        for case_id, case in _expand(
+            cfg_by_id[cfg_id], _EXTRA_PRECISIONS, _EXTRA_LAYOUTS, _EXTRA_PAGES
+        ):
+            cases[case_id] = case
     return cases
 
 
-def _sampled_sweep_cases():
-    cases = _build_sweep_cases()
-    sample = os.environ.get("TRTLLM_ATTN_TEST_SAMPLE", "80")
-    if sample.lower() == "full":
-        return cases
-    n = min(int(sample), len(cases))
-    return random.Random(42).sample(cases, n)
+MODEL_CASES = _model_cases()
 
 
-_SWEEP_CASES = _sampled_sweep_cases()
-
-
-def _sweep_id(case: BackendCase) -> str:
-    mask = "full" if not case.causal else ("sliding" if case.sliding_window else "causal")
-    rope = "rope" if case.rope else "norope"
-    kvd = case.kv_dtype or "samekv"
-    return (
-        f"h{case.num_heads}kv{case.num_kv_heads}_d{case.head_dim}_"
-        f"{case.dtype}_{kvd}_p{case.page_size}_{mask}_{rope}_"
-        f"nq{case.nnz_q}_nc{sum(case.num_cached_tokens)}"
-    )
-
-
-@pytest.mark.parametrize("case", _SWEEP_CASES, ids=_sweep_id)
-def test_attention_backend_sweep(case):
-    skip = _needs_skip(case)
-    if skip:
-        pytest.skip(skip)
-    run_case(case)
+@pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
+def test_attention_backend_model(name):
+    run_case(MODEL_CASES[name])
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +195,9 @@ def test_attention_backend_sweep(case):
 # flashinfer/vanilla tests). Catches batch-indexing bugs a golden comparison
 # may miss.
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("backend", ["VANILLA", *BACKENDS_UNDER_TEST])
 def test_split_consistency(backend):
     from capability_matrix import unsupported_reason
-
-    from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-
-    if backend == "FLASHINFER" and not IS_FLASHINFER_AVAILABLE:
-        pytest.skip("flashinfer not available")
 
     # Two context + two generation requests.
     full = BackendCase(
@@ -309,7 +216,6 @@ def test_split_consistency(backend):
 
     # Run request 0 (ctx) + request 2 (gen) as a sub-batch with the SAME inputs.
     # The per-request slices of the packed tensors must reproduce the full run.
-    # We validate request 0's context-token outputs are stable under batching.
     sub = BackendCase(
         num_heads=8,
         num_kv_heads=2,
