@@ -121,6 +121,46 @@ def inplace_info():
         torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell.default: {
             1: "output"
         },
+        torch.ops.trtllm.compressor_paged_kv_compress.default: {
+            3: "paged_kv",
+            4: "paged_score",
+            7: "output"
+        },
+        torch.ops.trtllm.compressor_prefill_reduction.default: {
+            3: "paged_kv",
+            4: "paged_score",
+            7: "output"
+        },
+        torch.ops.trtllm.compressor_postprocess_scatter.default: {
+            2: "kv_out",
+            9: "kv_cache",
+            18: "quant_output",
+            19: "scale_output"
+        },
+        torch.ops.trtllm.mhc_big_fuse.default: {
+            6: "post_mix",
+            7: "comb_mix",
+            8: "layer_input"
+        },
+        torch.ops.trtllm.mhc_gemm_sqrsum_fma.default: {
+            3: "y",
+            4: "r"
+        },
+        torch.ops.trtllm.mhc_hc_head_apply.default: {
+            4: "out"
+        },
+        torch.ops.trtllm.mhc_post_mapping.default: {
+            5: "out"
+        },
+        torch.ops.trtllm.mhc_fused_hc.default: {
+            8: "residual_cur",
+            9: "post_mix_cur",
+            10: "comb_mix_cur",
+            11: "layer_input_cur",
+            12: "y_acc_workspace",
+            13: "r_acc_workspace",
+            14: "done_counter_workspace"
+        },
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
         }
