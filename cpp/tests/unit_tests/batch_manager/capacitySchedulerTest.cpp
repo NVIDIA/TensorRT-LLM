@@ -143,6 +143,32 @@ protected:
             streamPtr, maxNumTokensPerSeq, maxNumTokensPerSeq, enableReuse, cacheType);
     }
 
+    static std::shared_ptr<kv_cache_manager::BaseKVCacheManager> getVariableWindowKvCacheManager(
+        SizeType32 maxNumRequests, bool enableReuse)
+    {
+        auto const numLayers = 2;
+        auto const nbKvHeads = 2;
+        auto constexpr sizePerHead = 64;
+        auto constexpr tokensPerBlock = 4;
+        auto constexpr minAttentionWindow = 8;
+        auto constexpr maxAttentionWindow = 16;
+        auto constexpr maxNumTokensPerSeq = 128;
+        auto constexpr blocksInPrimaryPoolPerWindow = 16;
+        auto constexpr blocksInSecondaryPoolPerWindow = 16;
+        auto const kvDtype = nvinfer1::DataType::kHALF;
+        CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+
+        using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        auto const blocksPerWindow
+            = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPoolPerWindow, blocksInSecondaryPoolPerWindow}},
+                {minAttentionWindow, {blocksInPrimaryPoolPerWindow, blocksInSecondaryPoolPerWindow}}};
+        auto const maxAttentionWindowVec = std::vector<SizeType32>{maxAttentionWindow, minAttentionWindow};
+
+        return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
+            blocksPerWindow, maxNumRequests, 1, maxAttentionWindowVec, kvDtype, 0, streamPtr, maxNumTokensPerSeq,
+            tokensPerBlock, enableReuse);
+    }
+
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()
     {
         return std::make_shared<MockPeftCacheManager>();
@@ -1768,6 +1794,40 @@ TEST_F(CapacitySchedulerTest, DelayDuplicateRequestChunked)
             EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), 4);
         }
     }
+}
+
+TEST_F(CapacitySchedulerTest, MaxUtilizationVariableWindowSkipsChunkedContextReuseAnalysis)
+{
+    SizeType32 maxNumRequests = 2;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getVariableWindowKvCacheManager(maxNumRequests, enableReuse);
+    ASSERT_TRUE(kvCacheManager->getBlockManager().isVariableWindow());
+    ASSERT_TRUE(kvCacheManager->isEnableBlockReuse());
+
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+
+    auto constexpr promptLen = 12;
+    auto constexpr maxNewTokens = 4;
+    auto request = createRequest(promptLen, maxNewTokens, 0);
+    request->setContextCurrentPosition(kvCacheManager->getTokensPerBlock());
+    request->setContextChunkSize(kvCacheManager->getTokensPerBlock());
+    ASSERT_FALSE(request->isFirstContextChunk());
+
+    RequestList activeRequests;
+    activeRequests.push_back(request);
+
+    RequestVector scheduledRequests;
+    RequestVector scheduledDisaggGenInitRequests;
+    RequestVector pausedRequests;
+    EXPECT_NO_THROW(std::tie(scheduledRequests, scheduledDisaggGenInitRequests, pausedRequests)
+        = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager));
+    EXPECT_EQ(scheduledRequests.size(), 1);
+    EXPECT_EQ(scheduledRequests.front()->mRequestId, request->mRequestId);
+    EXPECT_TRUE(scheduledDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
 }
 
 TEST_F(CapacitySchedulerTest, DelayFiveRequestsComplicated)

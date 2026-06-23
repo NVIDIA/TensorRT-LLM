@@ -445,6 +445,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 
     // Keep track of blocks contributed by requests in context phase
     std::unordered_set<BlockKey, BlockKeyHasher> newlyContributedContextBlocks, newlyContributedCrossContextBlocks;
+    // analyzePrefixReuse asserts on variable-window managers, so this guard prevents a crash for VSWA/hybrid models.
     if (skippingIsRelevant)
     {
         std::tie(newlyContributedContextBlocks, newlyContributedCrossContextBlocks)
