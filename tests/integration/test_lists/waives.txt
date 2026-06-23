@@ -198,7 +198,6 @@ full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm] SKIP (https://nvbugs/6316981)
-full:GB200/accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm] SKIP (https://nvbugs/6316981)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestQwen3NextThinking::test_auto_dtype[tp4ep4] SKIP (https://nvbugs/6317600)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8_moe_dflash SKIP (https://nvbugs/6316985)
 full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype SKIP (https://nvbugs/6316983)
