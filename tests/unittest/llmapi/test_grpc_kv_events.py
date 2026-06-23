@@ -128,13 +128,18 @@ class _Args:
 
 
 class _FakeLLM:
-    def __init__(self, cfg, events):
+    def __init__(self, cfg, events, repeat=False):
         self.args = _Args(cfg)
         self._events = events
         self._drained = False
+        self._repeat = repeat
 
     def get_kv_cache_events(self, timeout=2):
         # One drain returns the whole queued list; subsequent calls are empty.
+        # With repeat=True every drain returns the list (used to test fan-out
+        # to subscribers that register at different times).
+        if self._repeat:
+            return list(self._events)
         if self._drained:
             return []
         self._drained = True
@@ -221,3 +226,28 @@ def test_subscribe_seq_persists_across_reconnects():
     assert [b.sequence_number for b in first] == [0]   # one batch per drain cycle
     assert [b.sequence_number for b in second] == [1]  # continues, not reset to 0
     assert len(second[0].events) == 2
+
+
+def test_subscribe_fans_out_full_stream_to_all_subscribers():
+    # Two concurrent subscribers on one servicer must EACH receive the full
+    # event stream, not a single-consumer split of it -- the point of the
+    # in-process drain-once/fan-out over TRT-LLM's single-consumer queue.
+    events = [
+        {"event_id": 1, "data": {"type": "stored", "parent_hash": None,
+            "blocks": [{"block_hash": 10, "tokens": [{"token_id": 1, "token_extra_id": 0}]}]}},
+        {"event_id": 2, "data": {"type": "stored", "parent_hash": None,
+            "blocks": [{"block_hash": 11, "tokens": [{"token_id": 2, "token_extra_id": 0}]}]}},
+    ]
+    # repeat=True: every drain returns the events, so a subscriber that registers
+    # after the first drain cycle still receives them on a later cycle.
+    servicer = TrtllmServiceServicer(_FakeRM(_FakeLLM(_Cfg(True, 1024), events, repeat=True)))
+
+    async def run_two():
+        return await asyncio.gather(_collect(servicer, _FakeCtx()),
+                                    _collect(servicer, _FakeCtx()))
+
+    first, second = asyncio.run(run_two())
+    # Each subscriber saw a batch carrying BOTH events (full stream, not split).
+    assert first and second
+    assert [e.event_id for e in first[0].events] == [1, 2]
+    assert [e.event_id for e in second[0].events] == [1, 2]
