@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end tests for the trtllm-serve post-processing hook.
 
-Launches a real ``trtllm-serve`` with ``--post_processor`` pointing at one of
+Launches a real ``trtllm-serve`` with ``--post_processor_hook`` pointing at one of
 the sample hooks in ``_postproc_hook_samples`` and asserts the client-visible
 effect (rewrite / suppress / terminate) across the chat and completions
 endpoints, streaming and non-streaming, with the postproc worker pool both
@@ -59,7 +59,7 @@ def server(model_name: str, num_postprocess_workers: int, hook: str):
         "0.2",
         "--num_postprocess_workers",
         f"{num_postprocess_workers}",
-        "--post_processor",
+        "--post_processor_hook",
         _HOOKS[hook],
     ]
     # Make the sample-hook module importable by the server (and its postproc

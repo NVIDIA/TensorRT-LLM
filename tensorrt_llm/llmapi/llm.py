@@ -317,7 +317,7 @@ class BaseLLM:
         # Build this LLM's post-processing hook for the in-proxy detok path (each
         # postproc worker builds its own). Resolving here fails fast on a bad
         # import path at startup rather than per-request.
-        _post_processor_path = getattr(self.args, "post_processor", None)
+        _post_processor_path = getattr(self.args, "post_processor_hook", None)
         self._post_processor_hook = (
             load_post_processor_hook(_post_processor_path)
             if _post_processor_path else None)
@@ -1699,7 +1699,7 @@ class _TrtLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
-                post_processor_hook=self.args.post_processor,
+                post_processor_hook=self.args.post_processor_hook,
             ),
             is_llm_executor=True)
 
@@ -1848,7 +1848,7 @@ class _TorchLLM(BaseLLM):
             postproc_worker_config=PostprocWorkerConfig(
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
-                post_processor_hook=self.args.post_processor,
+                post_processor_hook=self.args.post_processor_hook,
             ),
             is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,

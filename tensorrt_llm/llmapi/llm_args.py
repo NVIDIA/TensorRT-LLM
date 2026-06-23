@@ -3394,12 +3394,12 @@ class BaseLlmArgs(StrictBaseModel):
         "The tokenizer class must implement 'from_pretrained(path, **kwargs)' and the TokenizerBase interface.",
         status="prototype")
 
-    post_processor: Optional[str] = Field(
+    post_processor_hook: Optional[str] = Field(
         default=None,
         description=
         "Python import path of a user post-processing hook applied after "
         "detokenization and before the per-endpoint response formatter (e.g. "
-        "'my_pkg.guardrail.MyPostProcessor'). The class must be importable and "
+        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable and "
         "picklable, take no constructor arguments, and be callable as "
         "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
         "It runs once per output, per streaming chunk, and may rewrite, "
@@ -3764,9 +3764,9 @@ class BaseLlmArgs(StrictBaseModel):
             # and needs detokenized text to inspect; without a tokenizer it could
             # never run, so reject the combination rather than silently disabling
             # the guardrail (mirrors the harmony fail-fast in OpenAIServer).
-            if self.post_processor is not None:
+            if self.post_processor_hook is not None:
                 raise ValueError(
-                    "post_processor is not supported together with "
+                    "post_processor_hook is not supported together with "
                     "skip_tokenizer_init: the post-processing hook operates on "
                     "detokenized text, which is unavailable when the tokenizer "
                     "is skipped.")

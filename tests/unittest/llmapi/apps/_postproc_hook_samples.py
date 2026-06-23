@@ -5,7 +5,7 @@
 These are deliberately stateless and deterministic so the test can assert the
 client-visible effect regardless of the (non-deterministic) model output. Each
 class is a top-level, no-arg-constructible, importable callable so it can be
-supplied to ``trtllm-serve --post_processor`` and reconstructed by reference in
+supplied to ``trtllm-serve --post_processor_hook`` and reconstructed by reference in
 the post-processing worker process.
 """
 

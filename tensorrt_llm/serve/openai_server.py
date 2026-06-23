@@ -403,9 +403,9 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
-        self._ensure_post_processor_supported(
+        self._ensure_post_processor_hook_supported(
             self.use_harmony,
-            getattr(self.generator.args, "post_processor", None))
+            getattr(self.generator.args, "post_processor_hook", None))
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
@@ -452,16 +452,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.perf_metrics_lock = asyncio.Lock()
 
     @staticmethod
-    def _ensure_post_processor_supported(use_harmony: bool,
-                                         post_processor: Optional[str]) -> None:
-        """Reject ``--post_processor`` combined with a harmony/gpt-oss model.
+    def _ensure_post_processor_hook_supported(
+            use_harmony: bool, post_processor_hook: Optional[str]) -> None:
+        """Reject ``--post_processor_hook`` combined with a harmony/gpt-oss model.
 
         The harmony output path is rebuilt from raw token ids, not detokenized
         text, so the text-based hook cannot act there.
         """
-        if use_harmony and post_processor:
+        if use_harmony and post_processor_hook:
             raise ValueError(
-                "--post_processor is not supported with harmony/gpt-oss models "
+                "--post_processor_hook is not supported with harmony/gpt-oss models "
                 "in this version: the harmony output path is reconstructed from "
                 "raw token ids and would bypass the text-based hook. Disable the "
                 "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "

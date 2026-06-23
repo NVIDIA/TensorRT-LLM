@@ -21,16 +21,16 @@ For the interface definitions referenced below, see
 
 ## Enabling the hook
 
-Pass the dotted import path of your hook class to `--post_processor`:
+Pass the dotted import path of your hook class to `--post_processor_hook`:
 
 ```bash
-trtllm-serve <model> --post_processor my_pkg.guardrail.MyPostProcessor
+trtllm-serve <model> --post_processor_hook my_pkg.guardrail.MyPostProcessorHook
 ```
 
 Equivalently, set it in a YAML config passed via `--extra_llm_api_options`:
 
 ```yaml
-post_processor: my_pkg.guardrail.MyPostProcessor
+post_processor_hook: my_pkg.guardrail.MyPostProcessorHook
 ```
 
 The class must be:
@@ -57,7 +57,7 @@ from tensorrt_llm.executor.postprocessor_hook import (
 )
 
 
-class MyPostProcessor:
+class MyPostProcessorHook:
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict:
         return emit(chunk.text_diff)  # pass through unchanged
 ```
@@ -164,11 +164,11 @@ form — so keying state on `chunk.request_id` is sufficient to keep concurrent 
   `suppress`/`terminate` verdict withholds **all** client-visible channels — text, `token_ids`, and
   `logprobs` — on both the streaming and non-streaming paths, so a client cannot recover withheld
   content through any channel.
-- **Requires a tokenizer**: the hook needs detokenized text to inspect, so `--post_processor` combined
+- **Requires a tokenizer**: the hook needs detokenized text to inspect, so `--post_processor_hook` combined
   with `skip_tokenizer_init` is rejected at startup rather than silently disabled.
 - **harmony / gpt-oss models**: not supported. Because the harmony output path is reconstructed from
   raw token ids, it would bypass the text-based hook, so the server fails fast at startup when
-  `--post_processor` is combined with a harmony model.
+  `--post_processor_hook` is combined with a harmony model.
 - **Disaggregated serving**: the context and generation servers are separate processes, each running
   the hook on its own phase under a different `request_id`; per-request state cannot be correlated
   across the two. A `terminate` on one phase does not propagate to the other.

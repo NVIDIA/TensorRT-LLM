@@ -3,7 +3,7 @@
 """User-pluggable post-processing hook for ``trtllm-serve`` (TRTLLM-12622).
 
 A user supplies a picklable, importable callable class via the
-``--post_processor`` import path. One instance is built per owner (the ``LLM``
+``--post_processor_hook`` import path. One instance is built per owner (the ``LLM``
 for the in-proxy detok path, and each post-processing worker process when
 enabled) and invoked once per output, per streaming chunk (plus a final call),
 *after* detokenization and *before* the per-endpoint response formatter. The
