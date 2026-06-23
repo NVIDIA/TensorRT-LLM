@@ -33,11 +33,13 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     ReplayCacheBufIdxHandler,
+    ReplayNWritesHandler,
     ReplayOldBHandler,
     ReplayOldDAcumsumHandler,
     ReplayOldDtHandler,
     ReplayOldXHandler,
     ReplayPrevNumAcceptedHandler,
+    ReplayWorkItemsHandler,
     SequenceInfo,
     SSMResourceHandler,
     StateResourceHandler,
@@ -1390,6 +1392,10 @@ def _add_managed_spec_replay_resources(interface, num_layers=2):
         replay_names.append(
             interface.add_resource(f"replay_prev_num_accepted_{i}", ReplayPrevNumAcceptedHandler())
         )
+        replay_names.append(
+            interface.add_resource(f"replay_work_items_{i}", ReplayWorkItemsHandler())
+        )
+        replay_names.append(interface.add_resource(f"replay_n_writes_{i}", ReplayNWritesHandler()))
 
     return replay_names
 

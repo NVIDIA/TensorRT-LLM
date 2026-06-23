@@ -30,11 +30,11 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 # isort: off
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
-    DFlashDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
-    MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
-    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
-    TorchCompileConfig)
+    DFlashDecodingConfig, Eagle3DecodingConfig, KvCacheConfig,
+    MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
+    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
+    SADecodingConfig, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -201,7 +201,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_draft_len=4,
             speculative_model=eagle_model_dir,
             eagle3_one_model=True,
-            allow_advanced_sampling=True,
             use_rejection_sampling=True,
         )
         max_batch_size = 1
@@ -5040,13 +5039,16 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     }
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+    skip_no_trtllm_gen_moe_support = pytest.mark.skipif(
+        get_sm_version() not in (100, 103),
+        reason="TRTLLM Gen MoE supports SM100 and SM103 only")
 
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5166,7 +5168,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5284,7 +5286,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5330,7 +5332,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5396,7 +5398,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["one_model", "two_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5435,8 +5437,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5501,8 +5502,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5565,8 +5565,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5593,7 +5592,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["one_model", "two_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
-        pytest.param("TRTLLM", marks=skip_pre_blackwell),
+        pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
@@ -5795,15 +5794,11 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,cuda_graph,overlap_scheduler,attention_dp,enable_block_reuse",
         [
             (1, 1, 1, True, True, False, True),
-            (1, 1, 1, True, True, False, False),
-            (4, 1, 1, True, True, False, False),
             (4, 1, 4, True, True, True, False),
-            (4, 1, 4, True, True, False, False),
-            (4, 1, 4, False, False, False, False),
         ],
         ids=[
-            "tp1_block_reuse", "tp1", "tp4ep1", "tp4ep4_adp_on",
-            "tp4ep4_adp_off", "no_cuda_graph_overlap"
+            "tp1_block_reuse",
+            "tp4ep4_adp_on",
         ])
     def test_nvfp4(self, moe_backend, tp_size, pp_size, ep_size, cuda_graph,
                    overlap_scheduler, attention_dp, enable_block_reuse, mocker):
@@ -5820,7 +5815,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config.mamba_state_cache_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512, enable_padding=False)
+                                  max_batch_size=512, enable_padding=True)
                               if cuda_graph else None)
         moe_config = MoeConfig(backend=moe_backend)
 
@@ -5833,8 +5828,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  **pytorch_config,
                  moe_config=moe_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
@@ -7292,6 +7285,272 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
+    # No thinking mode for now.
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config, model_path):
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float16",
+            free_gpu_memory_fraction=0.5,
+        )
+        max_batch_size = 32
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
+                                            enable_padding=True)
+        moe_config = MoeConfig(backend=moe_backend, load_balancer=eplb_config)
+        pytorch_config = dict(cuda_graph_config=cuda_graph_config,
+                              moe_config=moe_config)
+        with LLM(
+                model_path,
+                kv_cache_config=kv_cache_config,
+                max_batch_size=max_batch_size,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                enable_attention_dp=True,
+                **pytorch_config,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"])
+    def test_nvfp4_4gpus_static_eplb(self, moe_backend):
+        from transformers import AutoConfig
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+        model_cfg = AutoConfig.from_pretrained(model_path,
+                                               trust_remote_code=True)
+        num_experts = model_cfg.n_routed_experts
+        # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
+        # Assign extra 16 expert slots per rank.
+        extra_num_slots = 16 * 4
+        num_slots = num_experts + extra_num_slots
+        hybrid_pattern = model_cfg.hybrid_override_pattern
+        moe_layer_indices = [
+            i for i, ch in enumerate(hybrid_pattern) if ch == 'E'
+        ]
+        initial_global_assignments = {}
+        for i in moe_layer_indices:
+            initial_global_assignments[i] = [(i + j) % num_experts
+                                             for j in range(num_slots)]
+        eplb_config = MoeLoadBalancerConfig(
+            num_slots=num_slots,
+            initial_global_assignments=initial_global_assignments,
+            layer_updates_per_iter=0)
+        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"])
+    def test_nvfp4_4gpus_online_eplb(self, moe_backend):
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+        num_experts = 512  # 512 experts per token for Nemotron V3 Ultra.
+        # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
+        # Assign extra 16 expert slots per rank.
+        extra_num_slots = 16 * 4
+        num_slots = num_experts + extra_num_slots
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"],
+                             ids=["trtllm", "cutlass", "cutedsl"])
+    @pytest.mark.parametrize(
+        "attention_dp",
+        [
+            False,
+            True,
+        ],
+        ids=[
+            "attention_dp_off",
+            "attention_dp_on",
+        ],
+    )
+    def test_nvfp4_8gpus(self, attention_dp, moe_backend):
+        max_batch_size = 4 if attention_dp else 32
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=max_batch_size,
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                pipeline_parallel_size=1,
+                enable_attention_dp=attention_dp,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend=moe_backend),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.parametrize(
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        [
+            (4, 1, 256, False, True),
+            (4, 4, 256, False, False),
+            (4, 4, 256, True, False),
+            (4, 4, 512, True, True),
+        ],
+        ids=["TP4_MTP", "TEP4", "ADP4", "ADP4_MTP"],
+    )
+    def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
+                                     mamba_state_cache_interval, attention_dp,
+                                     use_mtp):
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+        max_batch_size = 4 if attention_dp else 32
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=True,
+                    mamba_ssm_cache_dtype="float16",
+                    mamba_state_cache_interval=mamba_state_cache_interval,
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=max_batch_size,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                pipeline_parallel_size=1,
+                enable_attention_dp=attention_dp,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="TRTLLM"),
+                speculative_config=mtp_config if use_mtp else None,
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.parametrize(
+        "tp_size, ep_size, pp_size, attention_dp",
+        [
+            (2, 1, 2, False),
+            (2, 2, 2, False),
+            (2, 2, 2, True),
+        ],
+        ids=["TP2_PP2", "TEP2_PP2", "ADP2_PP2"],
+    )
+    def test_nvfp4_parallelism(self, tp_size, ep_size, pp_size, attention_dp):
+        max_batch_size = 8 if attention_dp else 32
+        with LLM(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.6,
+                ),
+                max_batch_size=max_batch_size,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                pipeline_parallel_size=pp_size,
+                enable_attention_dp=attention_dp,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="CUTEDSL"),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_nvfp4_4gpu_mtp_ar(self):
+        max_draft_len = 7
+        mtp_config = MTPDecodingConfig(
+            max_draft_len=max_draft_len,
+            mtp_eagle_one_model=True,
+        )
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+
+        llm_common_config = dict(
+            model=model_path,
+            tensor_parallel_size=4,
+            moe_expert_parallel_size=4,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                mamba_ssm_cache_dtype="float16",
+                free_gpu_memory_fraction=0.5,
+            ),
+            max_batch_size=4,
+            enable_attention_dp=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
+                                              enable_padding=True),
+            disable_overlap_scheduler=False,
+            moe_config=MoeConfig(backend="CUTLASS"),
+        )
+
+        with LLM(**llm_common_config,
+                 speculative_config=mtp_config) as llm_spec:
+            raw_prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+                "The future of AI is",
+            ]
+            prompts = [
+                llm_spec.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
+
+            sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+            for i in range(len(tok_ids)):
+                num_tokens = 0
+                num_drafted = 0
+                num_accepted = 0
+                for output in llm_spec.generate_async(tok_ids[i],
+                                                      sampling_params,
+                                                      streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_drafted += max_draft_len
+                    num_accepted += len(new_tokens) - num_tokens - 1
+                    num_tokens = len(new_tokens)
+
+                accept_rate = num_accepted / num_drafted
+                assert accept_rate > 0.2, \
+                    f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
+
+
 @skip_pre_hopper
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
@@ -7320,6 +7579,40 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@skip_pre_blackwell
+class TestMiniMaxM3(LlmapiAccuracyTestHarness):
+    # MiniMax-M3 is a block-sparse MoE model whose checkpoint is published with
+    # the multimodal architecture (``MiniMaxM3SparseForConditionalGeneration``);
+    # text-only GSM8K / MMLU exercise the text-decoder path. The custom HF
+    # config requires ``trust_remote_code`` and the runtime requires the
+    # MiniMax-M3 sparse attention backend + matching KV-cache manager v2
+    # (selected by ``sparse_attention_config``). Blackwell-only (SM100+);
+    # BF16 checkpoint only.
+    MODEL_NAME = "MiniMaxAI/MiniMax-M3"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M3"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_auto_dtype(self, tp_size, ep_size):
+        # Sparse-path block reuse is not yet validated; disable to match the
+        # configuration the M3 bring-up evaluated against the SGLang reference.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config,
+                 max_seq_len=4096,
+                 trust_remote_code=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

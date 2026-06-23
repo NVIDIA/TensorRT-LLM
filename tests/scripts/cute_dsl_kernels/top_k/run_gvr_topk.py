@@ -60,6 +60,7 @@ def _compile(
     enable_warp_parallel_reduce: bool,
     compress_ratio: int,
     return_output_values: bool,
+    cluster_size: int = 1,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -120,6 +121,7 @@ def _compile(
         enable_warp_parallel_reduce=enable_warp_parallel_reduce,
         compress_ratio=compress_ratio,
         return_output_values=return_output_values,
+        cluster_size=cluster_size,
     )
     return cute.compile(
         kernel,
@@ -152,6 +154,7 @@ def gvr_topk_decode(
     compress_ratio: int = 1,
     max_seq_len: Optional[int] = None,
     return_output_values: bool = False,
+    cluster_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -247,6 +250,7 @@ def gvr_topk_decode(
         enable_warp_parallel_reduce,
         compress_ratio,
         return_output_values,
+        cluster_size,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -290,15 +294,16 @@ def _make_inputs(
     ``preIdxCount == topK`` is a dispatch precondition).
     """
     torch.manual_seed(seed)
-    device = "cuda"
-    logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device=device) * 2.0
+    torch.cuda.manual_seed(seed)
+
+    logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0
     logits = logits_f32.to(dtype)
     num_groups = num_rows // next_n
     # argmax must come from the effective scan range, not full N — for
     # next_n>1 the kernel's row-0 N_eff is only (N - next_n + 1) cols.
     effective_len = N - next_n + 1
     argmax_idx = logits[::next_n, :effective_len].argmax(dim=-1).int()
-    pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device=device)
+    pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device="cuda")
     pre_idx[:, 0] = argmax_idx
     for j in range(1, top_k):
         pre_idx[:, j] = j
@@ -307,7 +312,7 @@ def _make_inputs(
     # ``N_eff = N - next_n + ofs + 1`` for next_n in {1, 2}. (For cr=1
     # this reduces to seq_lens = N.)
     seq_lens_val = N * compress_ratio
-    seq_lens = torch.full((num_groups,), seq_lens_val, dtype=torch.int32, device=device)
+    seq_lens = torch.full((num_groups,), seq_lens_val, dtype=torch.int32, device="cuda")
     return logits, pre_idx, seq_lens
 
 
@@ -367,14 +372,26 @@ def _tie_aware_correct(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        # Production cells: (bf16, K=512/1024) and (fp32, K=2048) match
+        # the deployed K -> dtype mapping. (fp16, K=1024) is added to keep
+        # the fp16 convert-to-fp32 tail path under test even though it is
+        # not a current production cell.
+        (torch.bfloat16, 512),
+        (torch.bfloat16, 1024),
+        (torch.float16, 1024),
+        (torch.float32, 2048),
+    ],
+)
 @pytest.mark.parametrize("N", [4096, 65536])
 @pytest.mark.parametrize("next_n", [1])
 @pytest.mark.parametrize("batch_size", [1, 32])
 @pytest.mark.parametrize("use_256bit_load", [False, True])
 @pytest.mark.parametrize("num_threads_per_block", [512, 1024])
 @pytest.mark.parametrize("enable_warp_parallel_reduce", [False, True])
+@pytest.mark.parametrize("cluster_size", [1, 4])
 def test_gvr_topk_decode(
     dtype: torch.dtype,
     top_k: int,
@@ -384,6 +401,7 @@ def test_gvr_topk_decode(
     use_256bit_load: bool,
     num_threads_per_block: int,
     enable_warp_parallel_reduce: bool,
+    cluster_size: int,
 ) -> None:
     # Kernel scans `N_eff = seq_lens[0] - next_n + (row_idx % next_n) + 1`
     # columns. Smallest row's N_eff = N - next_n + 1. Degenerate path
@@ -413,6 +431,7 @@ def test_gvr_topk_decode(
         num_threads_per_block=num_threads_per_block,
         enable_warp_parallel_reduce=enable_warp_parallel_reduce,
         return_output_values=False,
+        cluster_size=cluster_size,
     )
     torch.cuda.synchronize()
     ok, msg = _tie_aware_correct(out_idxs, logits, seq_lens, top_k, next_n)
@@ -420,7 +439,8 @@ def test_gvr_topk_decode(
         f"dtype={dtype} K={top_k} N={N} seed={seed} next_n={next_n} "
         f"batch_size={batch_size} use_256bit_load={use_256bit_load} "
         f"num_threads_per_block={num_threads_per_block} "
-        f"enable_warp_parallel_reduce={enable_warp_parallel_reduce}: {msg}"
+        f"enable_warp_parallel_reduce={enable_warp_parallel_reduce} "
+        f"cluster_size={cluster_size}: {msg}"
     )
 
 
@@ -441,6 +461,12 @@ def main() -> None:
     p.add_argument("--disable_phase3_unroll", action="store_true")
     p.add_argument("--use_constant_hint", action="store_true")
     p.add_argument("--max_seq_len", type=int, default=None)
+    p.add_argument(
+        "--cluster_size",
+        type=int,
+        default=1,
+        help="CTAs per row (1=V5 single-CTA, 2/4=DSMEM cluster).",
+    )
     args = p.parse_args()
 
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
@@ -472,6 +498,7 @@ def main() -> None:
         compress_ratio=args.compress_ratio,
         max_seq_len=args.max_seq_len,
         return_output_values=False,
+        cluster_size=args.cluster_size,
     )
     print(
         f"config: dtype={args.dtype} top_k={args.top_k} N={args.N} "

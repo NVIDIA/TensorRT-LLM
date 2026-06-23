@@ -81,15 +81,21 @@ def _test_attention_trtllm_sage(
     v = v * ((torch.rand_like(v) - 0.5) * amp_mul_v).exp()
 
     # Obtain Op and run
-    attention_cls = attention_backend_utils.get_attention_backend("TRTLLM")
+    sparse_attention_config = (
+        None if not skip_softmax else SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3)
+    )
+    sparse_params = (
+        sparse_attention_config.to_sparse_params() if sparse_attention_config is not None else None
+    )
+    attention_cls = attention_backend_utils.get_attention_backend(
+        "TRTLLM", sparse_attention_config=sparse_attention_config
+    )
     attention = attention_cls(
         layer_idx=0,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        sparse_attention_config=(
-            None if not skip_softmax else SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3)
-        ),
+        sparse_params=sparse_params,
     )
 
     metadata = attention_cls.Metadata(

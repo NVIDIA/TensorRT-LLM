@@ -494,6 +494,11 @@ class ADEngine(ModelEngine):
         else:
             self.max_total_draft_tokens = 0
 
+        # ADEngine skips PyTorchModelEngine.__init__, so set the spec-decode
+        # flags that shared PyExecutor code expects on a ModelEngine.
+        self.is_spec_decode = self.spec_config is not None
+        self.enable_spec_decode = self.is_spec_decode
+
         # For compatibility with PyTorchModelEngine utilities
         self.batch_size = cache_seq_interface.info.max_batch_size
 
@@ -988,6 +993,7 @@ class ADEngine(ModelEngine):
             _ungathered_new_lens=new_tokens_lens,
             **extra_args,
         )
+        self.cache_seq_interface.prepare_replay_metadata()
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
