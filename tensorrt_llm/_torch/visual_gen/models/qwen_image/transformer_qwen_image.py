@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -50,6 +50,71 @@ _QUANT_DERIVED_PARAM_SUFFIXES = (
     ".kv_scales",
     ".inv_kv_scales",
 )
+
+# SVDQuant (NVFP4_SVD) checkpoints carry, per quantized Linear, three tensors on
+# top of the NVFP4 residual: a per-input-channel smoothing scale and the two
+# low-rank LoRA factors. They are consumed by NVFP4SVDLinearMethod, not by the
+# module's named parameters, so they are excluded from the strict key check.
+_SVDQUANT_PROVIDED_SUFFIXES = (
+    ".pre_quant_scale",
+    ".svdquant_lora_a",
+    ".svdquant_lora_b",
+)
+
+
+class NVFP4SVDLinearMethod(NVFP4LinearMethod):
+    """SVDQuant: NVFP4 residual GEMM + rank-r BF16 LoRA correction.
+
+    ModelOpt SVDQuant factorizes ``W ≈ R + L1·L2`` with per-input-channel
+    activation smoothing ``s`` (``pre_quant_scale``). With ``X̂ = X · s``, the
+    smoothed-space residual ``R`` (NVFP4) and low-rank term give::
+
+        Y = nvfp4_gemm(quant(X̂), R) · scales + (X̂ @ L2ᵀ) @ L1ᵀ  [+ bias]
+
+    where ``svdquant_lora_a`` = L2 ``[r, in]`` and ``svdquant_lora_b`` = L1
+    ``[out, r]``. The NVFP4 residual reuses the base method; this subclass adds
+    the smoothing + LoRA correction. Functional path (BF16 matmuls for the
+    LoRA); the fused FlashInfer SVDQuant kernel is a separate perf optimization.
+    """
+
+    def create_weights(self, module, in_features, out_features, bias, dtype):
+        super().create_weights(module, in_features, out_features, bias, dtype)
+        # Materialized lazily in load_weights_vanilla (rank comes from the ckpt).
+        module.svdquant_lora_a = None
+        module.svdquant_lora_b = None
+
+    def load_weights_vanilla(self, module, weights, allow_partial_loading: bool = False) -> None:
+        super().load_weights_vanilla(module, weights, allow_partial_loading)
+        w = weights[0]
+        device = module.weight.device
+        # pre_quant_scale ([in_features]) may already be loaded by the base NVFP4
+        # method on newer releases; load it here too for robustness.
+        if getattr(module, "pre_quant_scale", None) is None and "pre_quant_scale" in w:
+            module.pre_quant_scale = nn.Parameter(
+                w["pre_quant_scale"].to(device), requires_grad=False)
+        if "svdquant_lora_a" in w:
+            module.svdquant_lora_a = nn.Parameter(
+                w["svdquant_lora_a"].to(device), requires_grad=False)
+            module.svdquant_lora_b = nn.Parameter(
+                w["svdquant_lora_b"].to(device), requires_grad=False)
+
+    def apply(self, module, input, bias):
+        pqs = getattr(module, "pre_quant_scale", None)
+        x_hat = input * pqs if pqs is not None else input
+        # Residual NVFP4 GEMM on the already-smoothed activation; clear
+        # pre_quant_scale so the base method does not smooth a second time.
+        saved = getattr(module, "pre_quant_scale", None)
+        module.pre_quant_scale = None
+        try:
+            out = super().apply(module, x_hat, bias)
+        finally:
+            module.pre_quant_scale = saved
+        a = getattr(module, "svdquant_lora_a", None)
+        b = getattr(module, "svdquant_lora_b", None)
+        if a is not None and b is not None:
+            lora = torch.matmul(torch.matmul(x_hat, a.t()), b.t())
+            out = out + lora.to(out.dtype)
+        return out
 
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -931,13 +996,28 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         # statically pre-quantized ModelOpt checkpoint passes the key check.
         missing = sorted(k for k in (expected - provided)
                          if not k.endswith(_QUANT_DERIVED_PARAM_SUFFIXES))
-        unexpected = sorted(provided - expected)
+        # SVDQuant LoRA factors + pre_quant_scale are loaded by the quant method
+        # (not module params at this point), so they are not "unexpected".
+        unexpected = sorted(k for k in (provided - expected)
+                            if not k.endswith(_SVDQUANT_PROVIDED_SUFFIXES))
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
         if missing and not self.model_config.dynamic_weight_quant:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
+
+        # SVDQuant: the residual loaded above is plain NVFP4; swap in the method
+        # that also loads + applies the rank-r BF16 LoRA correction. Detected by
+        # the presence of LoRA factors in the checkpoint (config maps
+        # NVFP4_SVD -> NVFP4 so the residual uses the NVFP4 path).
+        if any(k.endswith(".svdquant_lora_a") for k in provided):
+            for _, module in self.named_modules():
+                if (isinstance(module, Linear) and module.quant_config is not None
+                        and module.quant_config.quant_algo is not None):
+                    module.quant_method = NVFP4SVDLinearMethod()
+                    module.svdquant_lora_a = None
+                    module.svdquant_lora_b = None
 
         loader = DynamicLinearWeightLoader(self.model_config)
         for name, module in self.named_modules():

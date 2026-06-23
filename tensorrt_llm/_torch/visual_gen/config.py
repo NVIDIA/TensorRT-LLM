@@ -273,6 +273,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 "FP8": QuantAlgo.FP8,
                 "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
                 "NVFP4": QuantAlgo.NVFP4,
+                # SVDQuant: the NVFP4 residual loads on the standard NVFP4 path;
+                # the rank-r BF16 LoRA correction + pre_quant_scale are handled
+                # by the model's NVFP4SVDLinearMethod (detected from the ckpt).
+                "NVFP4_SVD": QuantAlgo.NVFP4,
                 "W4A16_AWQ": QuantAlgo.W4A16_AWQ,
                 "W4A8_AWQ": QuantAlgo.W4A8_AWQ,
                 "W8A8_SQ_PER_CHANNEL": QuantAlgo.W8A8_SQ_PER_CHANNEL,
