@@ -1,0 +1,14 @@
+# 1-GPU HunyuanVideo 1.5 text-to-video with FP8 dynamic quantization.
+# Model: hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v (or 720p_t2v)
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+#
+# HunyuanVideo 1.5 constraints: single-GPU text-to-video only. Sequence/CFG
+# parallelism, parallel VAE, and caching are not yet supported.
+quant_config:
+  quant_algo: FP8
+  dynamic: true
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+cuda_graph_config:
+  enable: false
