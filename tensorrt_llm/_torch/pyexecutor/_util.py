@@ -88,9 +88,9 @@ def get_kv_cache_manager_cls(
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
-    sparse_attn_config = model_config.sparse_attention_config
-    if sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+    sparse_attention_config = model_config.sparse_attention_config
+    if sparse_attention_config is not None:
+        return get_sparse_attn_kv_cache_manager(sparse_attention_config)
     elif is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid manager.
@@ -98,9 +98,19 @@ def get_kv_cache_manager_cls(
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+        if use_py_mamba_cache_manager():
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "TRTLLM_USE_PY_MAMBA=1 forces "
+                    "MixedMambaHybridCacheManager, which does not support "
+                    "block reuse. Disable block reuse or unset "
+                    "TRTLLM_USE_PY_MAMBA to use CppMambaHybridCacheManager.")
+            logger.info(
+                "Using MixedMambaHybridCacheManager for hybrid mamba model")
+            return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if use_cpp_mamba_cache_manager() or use_py_mamba_cache_manager():
+        if use_cpp_mamba_cache_manager():
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
@@ -249,13 +259,62 @@ class KvCacheCreator:
     ):
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
+        model_config = model_engine.model.model_config
+        config = model_config.pretrained_config
         cls = get_kv_cache_manager_cls(
-            model_engine.model.model_config,
+            model_config,
             kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
-        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
-            cls, model_engine.model.model_config, kv_cache_config)
+        # Use ``issubclass`` rather than identity equality so V2 subclasses
+        # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
+        # also go through the V2-incompatible-feature gate below. The earlier
+        # ``cls == KVCacheManagerV2`` check silently bypassed all V2 subclasses
+        # and let the bare ``assert event_buffer_max_size == 0`` in
+        # ``KVCacheManagerV2.__init__`` trip at executor construction with
+        # a useless error message.
+        if issubclass(cls, KVCacheManagerV2):
+            incompat: List[str] = []
+            if self._kv_connector_manager is not None:
+                incompat.append("kv_connector_manager")
+            if self._max_beam_width is not None and self._max_beam_width > 1:
+                incompat.append("beam_width > 1")
+            if kv_cache_config.event_buffer_max_size > 0:
+                incompat.append("event_buffer_max_size > 0")
+            if (self._cache_transceiver_config is not None
+                    and self._cache_transceiver_config.backend is not None):
+                incompat.append("cache_transceiver")
+            if incompat:
+                incompat_str = ", ".join(incompat)
+                # Some models are structurally bound to V2 and cannot fall
+                # back to V1 without producing wrong outputs:
+                #   * Sparse-attention models (e.g. MiniMax-M3) need V2's
+                #     per-layer split-pool to allocate the per-sparse-layer
+                #     INDEX_KEY pool with a different stride than the main
+                #     K/V pool. V1's unified pool cannot represent that.
+                #   * Gemma4 hybrid uses per-layer head_dim that V1 would
+                #     coerce to ``max(head_dim)``, changing per-layer KV
+                #     byte sizes — correctness bug, not just efficiency.
+                sparse_attn_config = model_config.sparse_attention_config
+                if sparse_attn_config is not None:
+                    raise NotImplementedError(
+                        f"Sparse-attention models "
+                        f"(algorithm={sparse_attn_config.algorithm!r}) require "
+                        f"KVCacheManagerV2, which is not yet supported with "
+                        f"{incompat_str}. Disable these KvCacheConfig features "
+                        f"to run sparse-attention models.")
+                if is_gemma4_hybrid(config):
+                    raise NotImplementedError(
+                        f"Gemma4 hybrid attention requires KVCacheManagerV2, "
+                        f"which is not yet supported with {incompat_str}. "
+                        f"Disable these features to run Gemma4 hybrid models.")
+                # Plain V2 (user opt-in via ``use_kv_cache_manager_v2=True``):
+                # V2 was a preference, not a structural requirement, so we
+                # can safely fall back to V1.
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with %s. "
+                    "Falling back to KVCacheManager.", incompat_str)
+                cls = KVCacheManager
         # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
         # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
@@ -273,38 +332,6 @@ class KvCacheCreator:
                     "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
                 )
         return cls
-
-    def _fallback_if_unsupported_kv_cache_manager_v2(
-            self,
-            kv_cache_manager_cls,
-            model_config: Optional[ModelConfig] = None,
-            kv_cache_config: Optional[KvCacheConfig] = None):
-        kv_cache_config = (kv_cache_config if kv_cache_config is not None else
-                           self._kv_cache_config)
-        if kv_cache_manager_cls == KVCacheManagerV2:
-            unsupported_v2_features = (
-                self._kv_connector_manager is not None or
-                (self._max_beam_width is not None and self._max_beam_width > 1)
-                or (self._cache_transceiver_config is not None
-                    and self._cache_transceiver_config.backend is not None))
-            if unsupported_v2_features:
-                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
-                # split-pool layout. KVCacheManager (V1) coerces head_dim list
-                # to max(head_dim), changing per-layer KV byte sizes — which
-                # breaks correctness, not just efficiency. Fail fast here
-                # rather than silently producing wrong outputs.
-                if (model_config is not None
-                        and is_gemma4_hybrid(model_config.pretrained_config)):
-                    raise NotImplementedError(
-                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
-                        "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, or cache_transceiver. Disable these "
-                        "features to run Gemma4 hybrid models.")
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "or cache transceiver. Falling back to KVCacheManager.")
-                return KVCacheManager
-        return kv_cache_manager_cls
 
     def _per_manager_cache_cost(self,
                                 manager_cls,
@@ -804,7 +831,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=self._sparse_attention_config,
+            sparse_attention_config=self._sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
@@ -915,8 +942,18 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
-            draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
+
+        # Use V2 if enabled and the base class is KVCacheManager
+        if draft_kv_cache_manager_cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "Falling back to KVCacheManager for draft model.")
+                draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
@@ -933,7 +970,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=sparse_attn_config,
+            sparse_attention_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
@@ -1300,7 +1337,7 @@ class KvCacheCreator:
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=None,
-            sparse_attn_config=None,
+            sparse_attention_config=None,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=1,
             kv_connector_manager=None,
@@ -1471,7 +1508,7 @@ def _create_kv_cache_manager(
         max_seq_len: int,
         max_batch_size: int,
         spec_config: Optional[SpeculativeConfig],
-        sparse_attn_config: Optional[SparseAttentionConfig],
+        sparse_attention_config: Optional[SparseAttentionConfig],
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -1620,7 +1657,8 @@ def _create_kv_cache_manager(
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
-            sparse_attn_config=sparse_attn_config,
+            sparse_attention_config=sparse_attention_config,
+            pretrained_config=config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
@@ -1652,7 +1690,11 @@ def _create_kv_cache_manager(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
 
-        use_replay = sm >= 80
+        use_replay = spec_config is not None and sm >= 80
+        if spec_config is None:
+            logger.info(
+                "Replay kernel requires speculative decoding; using non-replay path"
+            )
 
         # Block reuse (prefix caching): replay leaves SSM state at a
         # checkpoint after speculation. The next decode step replays forward
@@ -1806,7 +1848,8 @@ def _create_kv_cache_manager(
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
-            sparse_attn_config=sparse_attn_config,
+            sparse_attention_config=sparse_attention_config,
+            pretrained_config=config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,

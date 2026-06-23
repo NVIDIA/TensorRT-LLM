@@ -38,6 +38,7 @@ from torch.types import Number
 from .._compat import KvCacheConfig, nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
+from .mamba.replay_metadata import REPLAY_WORK_ITEM_WIDTH
 
 Constant = Union[int, float, str, None]
 
@@ -2204,10 +2205,9 @@ class IntermediateSSMStateHandler(SpeculativeOnly, StateResourceHandler):
 
 
 class ReplayOldXHandler(SpeculativeOnly, StateResourceHandler):
-    """Per-layer old_x cache for the replay SSM kernel (single-buffered, bf16).
+    """Per-layer old_x cache for the replay SSM kernel (double-buffered, bf16).
 
-    Shape: (max_batch, T, num_heads, head_dim) — T is determined by the manager's
-    spec_config (max_draft_len + 1), not by this handler.  Acts as a type marker.
+    Shape: (max_batch, 2, replay_history_size, num_heads, head_dim).
     Routes to MambaHybridCacheManager via get_replay_old_x(layer_idx).
     """
 
@@ -2235,7 +2235,7 @@ class ReplayOldXHandler(SpeculativeOnly, StateResourceHandler):
 class ReplayOldBHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_B cache for the replay SSM kernel (double-buffered, bf16).
 
-    Shape: (max_batch, 2, T, n_groups, d_state) — T from manager.
+    Shape: (max_batch, 2, replay_history_size, n_groups, d_state).
     Routes to MambaHybridCacheManager via get_replay_old_B(layer_idx).
     """
 
@@ -2263,7 +2263,7 @@ class ReplayOldBHandler(SpeculativeOnly, StateResourceHandler):
 class ReplayOldDtHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_dt cache for the replay SSM kernel (double-buffered, fp32).
 
-    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Shape: (max_batch, 2, num_heads, replay_history_size).
     Routes to MambaHybridCacheManager via get_replay_old_dt(layer_idx).
     """
 
@@ -2285,7 +2285,7 @@ class ReplayOldDtHandler(SpeculativeOnly, StateResourceHandler):
 class ReplayOldDAcumsumHandler(SpeculativeOnly, StateResourceHandler):
     """Per-layer old_dA_cumsum cache for the replay SSM kernel (double-buffered, fp32).
 
-    Shape: (max_batch, 2, num_heads, T) — T from manager.
+    Shape: (max_batch, 2, num_heads, replay_history_size).
     Routes to MambaHybridCacheManager via get_replay_old_dA_cumsum(layer_idx).
     """
 
@@ -2344,6 +2344,35 @@ class ReplayPrevNumAcceptedHandler(SpeculativeOnly, StateResourceHandler):
 
     def __eq__(self, other) -> bool:
         return isinstance(other, ReplayPrevNumAcceptedHandler)
+
+
+class ReplayWorkItemsHandler(ResourceHandler):
+    """Shared per-forward replay work items for the checkpoint replay SSM kernel.
+
+    Shape: (max_batch, REPLAY_WORK_ITEM_WIDTH) int32.  Each row is
+    (position_in_decode_batch, cache_slot, prev_num_accepted_tokens, cache_buf_idx).
+    """
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        return torch.empty(
+            sequence_info.max_num_state_slots,
+            REPLAY_WORK_ITEM_WIDTH,
+            device=sequence_info.device,
+            dtype=torch.int32,
+        )
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayWorkItemsHandler)
+
+
+class ReplayNWritesHandler(ResourceHandler):
+    """Shared single-element device tensor holding the replay write-count."""
+
+    def allocate(self, sequence_info) -> torch.Tensor:
+        return torch.empty(1, device=sequence_info.device, dtype=torch.int32)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ReplayNWritesHandler)
 
 
 class IntermediateConvStateHandler(SpeculativeOnly, StateResourceHandler):

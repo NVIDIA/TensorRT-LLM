@@ -145,16 +145,19 @@ l0_b200:
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
@@ -248,13 +251,13 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
-  - examples/test_visual_gen.py::test_wan_t2v_example
-  - examples/test_visual_gen.py::test_flux1_example
-  - examples/test_visual_gen.py::test_flux2_example
-  - examples/test_visual_gen.py::test_ltx2_example
-  - examples/test_visual_gen.py::test_wan_i2v_example
-  - examples/test_visual_gen.py::test_cosmos3_example
-  # - examples/test_visual_gen.py
+  - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
+  - examples/visual_gen/test_visual_gen.py::test_flux1_example
+  - examples/visual_gen/test_visual_gen.py::test_flux2_example
+  - examples/visual_gen/test_visual_gen.py::test_ltx2_example
+  - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
+  # - examples/visual_gen/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -350,13 +353,13 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
   # ------------- VisualGen single-GPU tests ---------------
-  - examples/test_visual_gen.py::test_visual_gen_quickstart
-  - examples/test_visual_gen.py::test_visual_gen_api_walkthrough
-  - examples/test_visual_gen.py::test_flux1_lpips_against_golden
-  - examples/test_visual_gen.py::test_flux2_lpips_against_golden
-  - examples/test_visual_gen.py::test_ltx2_lpips_against_golden
-  - examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
+  - examples/visual_gen/test_visual_gen.py::test_flux1_lpips_against_golden
+  - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
 # ------------- AutoDeploy Backend Stages ---------------

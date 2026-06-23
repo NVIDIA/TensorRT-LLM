@@ -115,6 +115,7 @@ class BaseResourceManager(ABC):
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
+        """Return the maximum number of real requests this manager can admit."""
         raise NotImplementedError
 
     @abstractmethod
