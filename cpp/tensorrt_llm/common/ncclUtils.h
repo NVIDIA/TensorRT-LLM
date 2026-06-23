@@ -164,21 +164,14 @@ private:
 // NCCL Version Check
 //==============================================================================
 
+// Returns true if NCCL window buffers (ncclMemAlloc / ncclCommWindowRegister)
+// are supported for the given real SM version, integrated-device flag, and runtime NCCL version.
+// Exposed for focused unit testing of platform/version gates.
+bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion);
+
 // Returns true if the compile-time and runtime NCCL versions support window buffers
-// (ncclMemAlloc / ncclCommWindowRegister).
-inline bool isNcclWindowSupported()
-{
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
-    int version = 0;
-    if (ncclGetVersion(&version) != ncclSuccess)
-    {
-        return false;
-    }
-    return version >= NCCL_VERSION(2, 28, 0);
-#else
-    return false;
-#endif
-}
+// and the current CUDA device is not in a known-unsupported platform/version set.
+bool isNcclWindowSupported();
 
 //==============================================================================
 // NCCL Window Buffer Allocation
