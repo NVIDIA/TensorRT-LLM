@@ -27,6 +27,7 @@ The transform should:
   5. Be compatible with CUDA graph capture & replay.
 """
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.fx import Graph, GraphModule, Node
@@ -40,6 +41,12 @@ from tensorrt_llm._torch.auto_deploy.transform.library.multi_stream_attn import 
 )
 from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import cuda_stream_manager
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+_TRTLLM_AG_AVAILABLE = getattr(torch.ops.auto_deploy, "trtllm_dist_all_gather", None) is not None
+_skip_no_trtllm_ag = pytest.mark.skipif(
+    not _TRTLLM_AG_AVAILABLE,
+    reason="trtllm_dist_all_gather not registered (standalone mode)",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers -- mock MLA-like module
@@ -142,6 +149,7 @@ def _make_unfused_mla_graph(backend: str) -> tuple[GraphModule, Node, Node]:
     return GraphModule(weights, graph), kv_ag, ag_op
 
 
+@_skip_no_trtllm_ag
 def test_build_aux_stream_all_gather_args_trtllm():
     gm, kv_ag, _ = _make_unfused_mla_graph("trtllm")
     new_input = gm.graph.call_function(
@@ -162,6 +170,7 @@ def test_build_aux_stream_all_gather_args_torch():
     assert args == (new_input, -1, None)
 
 
+@_skip_no_trtllm_ag
 def test_pattern0_kv_path_rewrite_trtllm_all_gather_args():
     gm, kv_ag, ag_op = _make_unfused_mla_graph("trtllm")
     kv_ag.args = (kv_ag.args[0], "AUTO", -1, None)

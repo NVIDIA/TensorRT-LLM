@@ -179,7 +179,8 @@ def _build_aux_stream_all_gather_args(kv_ag: Node, new_input: Node) -> tuple:
     ``torch_dist_all_gather`` signature:
         (tensor, dim=0, sizes=None)
     """
-    if is_op(kv_ag, torch.ops.auto_deploy.trtllm_dist_all_gather):
+    _trtllm_ag_op = getattr(torch.ops.auto_deploy, "trtllm_dist_all_gather", None)
+    if _trtllm_ag_op is not None and is_op(kv_ag, _trtllm_ag_op):
         ag_strategy = kv_ag.args[1] if len(kv_ag.args) > 1 else "AUTO"
         ag_dim = kv_ag.args[2] if len(kv_ag.args) > 2 else -1
         ag_sizes = kv_ag.args[3] if len(kv_ag.args) > 3 else None
