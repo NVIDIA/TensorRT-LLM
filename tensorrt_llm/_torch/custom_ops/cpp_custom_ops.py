@@ -1210,6 +1210,23 @@ def _register_fake():
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
 
+    @torch.library.register_fake("trtllm::silu_and_mul_nvfp4_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input: 2D tensor [M, 2N] (gate||up, bf16 or fp16)
+        # output_fp4: [M, N/2] (packed FP4 values, 2 per byte)
+        # output_sf: swizzled scale factors for the [M, N] post-SwiGLU activation
+        m, two_n = input.shape
+        n = two_n // 2
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            (m, n), sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf
+
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
