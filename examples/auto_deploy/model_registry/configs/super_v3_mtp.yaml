@@ -55,9 +55,15 @@ transforms:
     enabled: true
   # FlashInfer SSM is used for the MTP extend path; Triton causal conv is still required
   # for speculative Mamba state caching in this configuration.
+  # NOTE: ssm_replay is disabled because the replay SSM kernel
+  # (_persistent_main_kernel in replay_selective_state_update.py) hits an illegal
+  # memory access during CUDA-graph capture for bf16 and nvfp4 on Blackwell (fp8 is
+  # unaffected). See https://nvbugs/6316981. Re-enable (ssm_replay: true) once the
+  # replay kernel is fixed to restore the Mamba state fast-forward optimization.
+  # Tracking issue: https://github.com/NVIDIA/TensorRT-LLM/issues/15565
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
-    ssm_replay: true
+    ssm_replay: false
   insert_cached_causal_conv:
     backend: triton_causal_conv
   fuse_nvfp4_moe:
