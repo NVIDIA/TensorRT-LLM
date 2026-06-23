@@ -290,6 +290,109 @@ INSTANTIATE_TEST_SUITE_P(PlacementTests, MoePlacementTest,
         return name;
     });
 
+TEST(MoeLoadBalancerMaskOnlyTest, DynamicPlacementHonorsDeadRankMask)
+{
+    constexpr int kExpertCount = 4;
+    constexpr int kTopK = 2;
+    constexpr int kEpRank = 0;
+    constexpr int kEpSize = 4;
+    constexpr int kSlotCountPerRank = 2;
+    constexpr int kDeadRank = 2;
+    constexpr int kActiveSlotCount = (kEpSize - 1) * kSlotCountPerRank;
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo{kExpertCount, kTopK, kEpRank, kEpSize, kSlotCountPerRank};
+    std::vector<float> expertLoadFactor{8.0F, 4.0F, 2.0F, 1.0F};
+    std::vector<uint8_t> deadRankMask{0, 0, 1, 0};
+
+    MoePlacementCpuInfo cpuPlacement;
+    doReplication(metaInfo, expertLoadFactor.data(), &cpuPlacement, &deadRankMask);
+
+    int replicaSum = 0;
+    for (int replicaCount : cpuPlacement.expertReplicaCount)
+    {
+        replicaSum += replicaCount;
+    }
+    EXPECT_EQ(replicaSum, kActiveSlotCount);
+
+    cpuPlacement.rankExpertIds.resize(kEpSize);
+    for (int rank = 0; rank < kEpSize; ++rank)
+    {
+        cpuPlacement.rankExpertIds[rank].resize(kSlotCountPerRank, 99);
+    }
+
+    doPlacement(metaInfo, expertLoadFactor.data(), &cpuPlacement, &deadRankMask);
+
+    std::vector<int> placedReplicas(kExpertCount, 0);
+    int assignedSlotCount = 0;
+    for (int rank = 0; rank < kEpSize; ++rank)
+    {
+        for (int slot = 0; slot < kSlotCountPerRank; ++slot)
+        {
+            int const expertId = cpuPlacement.rankExpertIds[rank][slot];
+            if (rank == kDeadRank)
+            {
+                EXPECT_EQ(expertId, -1);
+                continue;
+            }
+
+            EXPECT_GE(expertId, 0);
+            EXPECT_LT(expertId, kExpertCount);
+            if (expertId >= 0 && expertId < kExpertCount)
+            {
+                ++placedReplicas[expertId];
+                ++assignedSlotCount;
+            }
+        }
+    }
+
+    EXPECT_EQ(assignedSlotCount, kActiveSlotCount);
+    for (int expertId = 0; expertId < kExpertCount; ++expertId)
+    {
+        EXPECT_EQ(placedReplicas[expertId], cpuPlacement.expertReplicaCount[expertId]);
+    }
+}
+
+TEST(MoeLoadBalancerMaskOnlyTest, DynamicPlacementRejectsMismatchedDeadRankMask)
+{
+    constexpr int kExpertCount = 4;
+    constexpr int kTopK = 2;
+    constexpr int kEpRank = 0;
+    constexpr int kEpSize = 4;
+    constexpr int kSlotCountPerRank = 2;
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo{kExpertCount, kTopK, kEpRank, kEpSize, kSlotCountPerRank};
+    std::vector<float> expertLoadFactor{1.0F, 1.0F, 1.0F, 1.0F};
+    std::vector<uint8_t> deadRankMask{0, 1};
+
+    MoePlacementCpuInfo cpuPlacement;
+    EXPECT_THROW(doReplication(metaInfo, expertLoadFactor.data(), &cpuPlacement, &deadRankMask),
+        tensorrt_llm::common::TllmException);
+}
+
+TEST(MoeLoadBalancerMaskOnlyTest, DynamicPlacementRejectsReplicaCountMismatch)
+{
+    constexpr int kExpertCount = 4;
+    constexpr int kTopK = 2;
+    constexpr int kEpRank = 0;
+    constexpr int kEpSize = 4;
+    constexpr int kSlotCountPerRank = 2;
+
+    tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo{kExpertCount, kTopK, kEpRank, kEpSize, kSlotCountPerRank};
+    std::vector<float> expertLoadFactor{1.0F, 1.0F, 1.0F, 1.0F};
+    std::vector<uint8_t> deadRankMask{0, 0, 1, 0};
+
+    MoePlacementCpuInfo cpuPlacement;
+    cpuPlacement.expertReplicaCount = {1, 1, 1, 1};
+    cpuPlacement.rankExpertIds.resize(kEpSize);
+    for (int rank = 0; rank < kEpSize; ++rank)
+    {
+        cpuPlacement.rankExpertIds[rank].resize(kSlotCountPerRank, -1);
+    }
+
+    EXPECT_THROW(doPlacement(metaInfo, expertLoadFactor.data(), &cpuPlacement, &deadRankMask),
+        tensorrt_llm::common::TllmException);
+}
+
 TEST(MoeLoadBalancerMaskOnlyTest, ReconfigureMaskOnlyRemovesDeadRankSlots)
 {
     setenv("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1", 1);

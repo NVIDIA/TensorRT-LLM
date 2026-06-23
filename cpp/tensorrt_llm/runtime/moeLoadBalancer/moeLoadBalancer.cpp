@@ -59,13 +59,16 @@ namespace
 
 bool isRankMasked(std::vector<uint8_t> const* deadRankMask, int rank)
 {
-    return deadRankMask != nullptr && rank >= 0 && rank < static_cast<int>(deadRankMask->size())
-        && ((*deadRankMask)[rank] != 0);
+    return deadRankMask != nullptr && ((*deadRankMask)[rank] != 0);
 }
 
 int getActiveSlotCount(
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo const& metaInfo, std::vector<uint8_t> const* deadRankMask)
 {
+    TLLM_CHECK_WITH_INFO(deadRankMask == nullptr || static_cast<int>(deadRankMask->size()) == metaInfo.epSize,
+        "deadRankMask size (%ld) must match epSize (%d)",
+        deadRankMask == nullptr ? 0L : static_cast<long>(deadRankMask->size()), metaInfo.epSize);
+
     int activeRankCount = 0;
     for (int rank = 0; rank < metaInfo.epSize; ++rank)
     {
@@ -163,7 +166,8 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
 
     for (int expertId = 0; expertId < metaInfo.expertCount; ++expertId)
     {
-        assert(replicaCount[expertId] > 0); // Ensure replica count is positive
+        TLLM_CHECK_WITH_INFO(replicaCount[expertId] > 0, "Replica count (%d) for expert %d must be positive",
+            replicaCount[expertId], expertId);
         double slotSize = expertLoadFactor[expertId] / static_cast<double>(replicaCount[expertId]);
         for (int replicaId = 0; replicaId < replicaCount[expertId]; ++replicaId)
         {
@@ -172,7 +176,9 @@ void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* 
         }
     }
 
-    assert(static_cast<int>(allReplicas.size()) == totalSlotCount);
+    TLLM_CHECK_WITH_INFO(static_cast<int>(allReplicas.size()) == totalSlotCount,
+        "Replica count sum (%ld) must match active slot count (%d)", static_cast<long>(allReplicas.size()),
+        totalSlotCount);
 
     // 2. Sort replicas by slotSize descending
     std::sort(allReplicas.begin(), allReplicas.end());
@@ -1124,13 +1130,13 @@ void MoeLoadBalancer::reconfigureMaskOnly(std::vector<int> const& deadRanks)
     {
         layer->validateMaskOnly(candidateDeadRankMask);
     }
-    {
-        std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
-        mDeadRankMask = candidateDeadRankMask;
-    }
     for (auto& layer : mLayers)
     {
         layer->reconfigureMaskOnly(candidateDeadRankMask);
+    }
+    {
+        std::lock_guard<std::mutex> maskLock(mDeadRankMaskMutex);
+        mDeadRankMask = candidateDeadRankMask;
     }
 }
 
