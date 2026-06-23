@@ -6127,8 +6127,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
     # (device-side, graph-safe) into the LJF row-reorder branch when
-    # ``num_rows > num_sms AND max_seq_len >= 64K``. Only meaningful
-    # when a wave-2 exists — short rows can regress a few percent.
+    # ``num_rows >= 2 * num_sms``. Physical meaning: wave-2 must fit a
+    # full SM-row's worth of CTAs so the sort has long-vs-short rows to
+    # swap. Below that threshold the win is noise / can regress a few
+    # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
