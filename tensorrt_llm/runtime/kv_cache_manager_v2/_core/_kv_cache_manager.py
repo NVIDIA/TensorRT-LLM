@@ -687,7 +687,7 @@ class KVCacheManager:
             b: TypedIndexList[PoolGroupIndex, float],
             thres: float,
         ) -> bool:
-            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b))
+            return any(not (1 / thres < x / y < thres) for x, y in zip(a, b, strict=True))
 
         if level == GPU_LEVEL:
             return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, 1.25)
@@ -803,7 +803,9 @@ class KVCacheManager:
         def is_enough(num_blocks: int) -> bool:
             return all(
                 cnt <= rem
-                for cnt, rem in zip(get_num_slots(num_blocks * tokens_per_block), remaining_slots)
+                for cnt, rem in zip(
+                    get_num_slots(num_blocks * tokens_per_block), remaining_slots, strict=True
+                )
             )
 
         if not is_enough(1):
