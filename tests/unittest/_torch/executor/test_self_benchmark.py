@@ -33,21 +33,25 @@ class _FakeRequest:
 
 
 class _FakeKvStats:
-    tokens_per_block = 32
-    max_num_blocks = 128
+
+    def __init__(self, tokens_per_block=32):
+        self.tokens_per_block = tokens_per_block
+        self.max_num_blocks = 128
 
 
 class _FakeKvCacheManager:
 
-    def __init__(self):
+    def __init__(self, tokens_per_block=32, enable_block_reuse=True):
         self.add_dummy_calls = []
+        self._tokens_per_block = tokens_per_block
+        self.enable_block_reuse = enable_block_reuse
 
     def add_dummy_requests(self, **kwargs):
         self.add_dummy_calls.append(kwargs)
         return [_FakeRequest() for _ in kwargs["request_ids"]]
 
     def get_kv_cache_stats(self):
-        return _FakeKvStats()
+        return _FakeKvStats(tokens_per_block=self._tokens_per_block)
 
 
 class _FakeResourceManager:
@@ -70,8 +74,12 @@ class _FakeScheduledBatch:
         return self._requests
 
 
-def _make_executor(config: SelfBenchmarkConfig) -> types.SimpleNamespace:
-    kv_cache_manager = _FakeKvCacheManager()
+def _make_executor(config: SelfBenchmarkConfig,
+                   tokens_per_block=32,
+                   enable_block_reuse=True) -> types.SimpleNamespace:
+    kv_cache_manager = _FakeKvCacheManager(
+        tokens_per_block=tokens_per_block,
+        enable_block_reuse=enable_block_reuse)
     return types.SimpleNamespace(
         llm_args=types.SimpleNamespace(self_benchmark_config=config),
         max_input_len=16,
@@ -131,6 +139,8 @@ def test_grid_generation_uses_executor_limits():
     ]
     assert [point.isl for point in benchmark._grid
             if point.point_type == "prefill"] == [1, 8]
+    assert [point.kv_read_tokens for point in benchmark._grid
+            if point.point_type == "prefill"] == [0, 0]
     assert {(point.context_length, point.batch_size)
             for point in benchmark._grid if point.point_type == "decode"} == {
                 (1, 1),
@@ -138,6 +148,45 @@ def test_grid_generation_uses_executor_limits():
                 (7, 1),
                 (7, 4),
             }
+
+
+def test_prefill_grid_includes_block_aligned_kv_read_axis():
+    config = SelfBenchmarkConfig(
+        mode="prefill",
+        prefill_isl_granularity=2,
+        prefill_kv_read_granularity=4,
+        warmup_iterations=0,
+    )
+
+    benchmark = SelfBenchmark(_make_executor(config, tokens_per_block=4))
+
+    assert [(point.point_type, point.isl, point.kv_read_tokens)
+            for point in benchmark._grid] == [
+                ("prefill", 1, 0),
+                ("prefill", 8, 0),
+                ("prefill_seed", 4, 4),
+                ("prefill", 8, 4),
+            ]
+    assert benchmark._grid[2].cache_salt_id == benchmark._grid[
+        3].cache_salt_id
+
+
+def test_prefill_grid_omits_kv_read_axis_when_block_reuse_disabled():
+    config = SelfBenchmarkConfig(
+        mode="prefill",
+        prefill_isl_granularity=2,
+        prefill_kv_read_granularity=4,
+        warmup_iterations=0,
+    )
+
+    benchmark = SelfBenchmark(
+        _make_executor(config, tokens_per_block=4, enable_block_reuse=False))
+
+    assert [(point.point_type, point.isl, point.kv_read_tokens)
+            for point in benchmark._grid] == [
+                ("prefill", 1, 0),
+                ("prefill", 8, 0),
+            ]
 
 
 def test_prefill_queue_item_marks_executor_request():
@@ -152,6 +201,32 @@ def test_prefill_queue_item_marks_executor_request():
     assert items[0].id == 900_000_000
     assert items[0].request.py_is_self_benchmark_request is True
     assert items[0].request.py_self_benchmark_point_id == 0
+
+
+def test_prefill_seed_and_measure_requests_share_cache_salt():
+    config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
+    benchmark = SelfBenchmark(_make_executor(config))
+    benchmark._grid = [
+        BenchmarkPoint(point_type="prefill_seed",
+                       index=0,
+                       isl=4,
+                       kv_read_tokens=4,
+                       cache_salt_id=123),
+        BenchmarkPoint(point_type="prefill",
+                       index=1,
+                       isl=8,
+                       kv_read_tokens=4,
+                       cache_salt_id=123),
+    ]
+
+    seed_items = benchmark.make_prefill_queue_items([], [])
+    benchmark._finish_current_point()
+    measure_items = benchmark.make_prefill_queue_items([], [])
+
+    assert seed_items[0].request.input_token_ids == [1, 1, 1, 1]
+    assert seed_items[0].request.cache_salt_id == 123
+    assert measure_items[0].request.input_token_ids == [1] * 8
+    assert measure_items[0].request.cache_salt_id == 123
 
 
 def test_decode_injection_uses_dummy_kv_path():
@@ -211,6 +286,39 @@ def test_observe_iteration_sanitizes_queue_counters_and_records_result():
     assert recorded_stats["inflightBatchingStats"]["numQueuedGenKvTokens"] == 0
 
 
+def test_observe_iteration_records_cache_hit_validation():
+    config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
+    benchmark = SelfBenchmark(_make_executor(config))
+    point = BenchmarkPoint(point_type="prefill",
+                           index=0,
+                           isl=8,
+                           kv_read_tokens=4)
+    benchmark._current = BenchmarkPointResult(point=point)
+    request = types.SimpleNamespace(is_self_benchmark_request=True,
+                                    py_self_benchmark_point_id=0,
+                                    cached_tokens=4,
+                                    is_dummy=False)
+    stats = {
+        "numQueuedRequests": 0,
+        "inflightBatchingStats": {
+            "numContextRequests": 1,
+        },
+    }
+
+    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]),
+                                           stats)
+
+    assert consumed is True
+    result = benchmark._results[0]
+    assert result.observed_kv_read_tokens == 4
+    assert result.cache_hit_validated is True
+    assert result.stats[0]["selfBenchmark"] == {
+        "expectedKvReadTokens": 4,
+        "observedCachedTokens": 4,
+        "cacheHitValidated": True,
+    }
+
+
 def test_write_output(tmp_path):
     output_path = tmp_path / "benchmark.json"
     config = SelfBenchmarkConfig(mode="prefill",
@@ -225,6 +333,8 @@ def test_write_output(tmp_path):
                     "numContextRequests": 1
                 }
             }],
+            observed_kv_read_tokens=0,
+            cache_hit_validated=True,
         ))
 
     benchmark.write_output()
@@ -236,5 +346,7 @@ def test_write_output(tmp_path):
     assert data["limits"]["max_num_scheduled_tokens"] == 8
     assert data["limits"]["tokens_per_block"] == 32
     assert data["results"][0]["point"]["isl"] == 8
+    assert data["results"][0]["observed_kv_read_tokens"] == 0
+    assert data["results"][0]["cache_hit_validated"] is True
     assert data["results"][0]["iteration_stats"][0][
         "inflightBatchingStats"]["numContextRequests"] == 1

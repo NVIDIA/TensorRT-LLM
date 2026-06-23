@@ -2687,6 +2687,13 @@ class SelfBenchmarkConfig(StrictBaseModel):
         "Number of input sequence length sample points in the prefill sweep.",
         status="prototype")
 
+    prefill_kv_read_granularity: PositiveInt = Field(
+        default=4,
+        description=
+        "Number of block-aligned KV-read sample points per input sequence "
+        "length in the prefill sweep.",
+        status="prototype")
+
     decode_context_granularity: PositiveInt = Field(
         default=6,
         description=
