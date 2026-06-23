@@ -316,22 +316,18 @@ class KvCacheCreator:
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
                 cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
-        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
-        # state in a separate cache that doesn't honor block reuse. Warn at
-        # the routing site so users see the warning where the decision is
-        # actually made.
+        # Block reuse isn't honored by the legacy Mixed mamba manager (the unified
+        # CppMambaHybridCacheManager is, even under MTP). Fail fast if reuse was
+        # requested but routing still resolved to Mixed, rather than dropping it.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
-                and kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
-                or self._speculative_config is not None
-            if uses_v1_mamba_route:
-                logger.warning(
-                    "Block reuse does not work with MTP for hybrid linear models "
-                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
-                )
+                and kv_cache_config.enable_block_reuse \
+                and issubclass(cls, MixedMambaHybridCacheManager):
+            raise ValueError(
+                "enable_block_reuse=True is not supported by the legacy "
+                "MixedMambaHybridCacheManager selected for this hybrid linear "
+                "model. Unset TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA to use "
+                "the unified CppMambaHybridCacheManager, which supports block "
+                "reuse (including under MTP).")
         return cls
 
     def _per_manager_cache_cost(self,
