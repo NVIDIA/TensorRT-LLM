@@ -270,59 +270,6 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         std::runtime_error);
 }
 
-TEST_F(KVCacheManagerTest, BlockManagerReleasePrefixBlocksDoesNotDoubleFreeOnTeardown)
-{
-    auto constexpr numLayers = 12;
-    auto constexpr numKvHeads = 6;
-    auto constexpr sizePerHead = 128;
-    auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 8;
-    auto constexpr blocksInSecondaryPool = 0;
-    auto constexpr maxNumSequences = 8;
-    auto const stream = std::make_shared<tr::CudaStream>();
-
-    auto constexpr beamWidth = 1;
-    auto constexpr numBlocksPerBeam = 4;
-    auto constexpr numTokens = tokensPerBlock * numBlocksPerBeam;
-    auto constexpr maxAttentionWindow = numTokens;
-
-    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
-
-    BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
-        maxNumSequences, stream, maxAttentionWindow, beamWidth,
-        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, nvinfer1::DataType::kHALF, 0, maxAttentionWindow);
-    blockManager.allocatePools(false);
-
-    SizeType32 constexpr maxNewTokens{0};
-    tr::SamplingConfig const samplingConfig{beamWidth};
-    bool constexpr isStreaming{false};
-
-    auto tokens = std::make_shared<VecTokens>();
-    for (SizeType32 i = 0; i < numTokens; ++i)
-    {
-        tokens->push_back(i);
-    }
-
-    LlmRequest::RequestIdType constexpr requestId{42};
-    auto llmReq = std::make_shared<LlmRequest>(requestId, maxNewTokens, tokens, samplingConfig, isStreaming);
-    GenerationRequest seq{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-
-    (void) blockManager.addSequenceBatch(
-        {&seq}, {numTokens}, {numBlocksPerBeam}, {std::ref(*llmReq)}, maxAttentionWindow, /*isEnableBlockReuse=*/false);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocksPerBeam);
-
-    blockManager.releasePrefixBlocks(seq, 2);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - 2);
-
-    // releasePrefixBlocks has cumulative semantics. This should release only
-    // one additional block rather than releasing the first two again.
-    blockManager.releasePrefixBlocks(seq, 3);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - 1);
-
-    blockManager.releaseBlocks(seq);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
-}
-
 template <typename T>
 void writePatternToOffloadedBlocksDRAM(T* rawBlockPtr, int blockSize, int mask)
 {

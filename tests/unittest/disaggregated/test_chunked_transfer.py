@@ -14,15 +14,11 @@
 # limitations under the License.
 """Unit tests for chunked KV cache transfer (sender-only chunking).
 
-These tests validate the session state machine, callback plumbing, and
-release queue mechanics using the real TxSession/RxSession classes with
-lightweight stub sender/receiver objects.
+These tests validate the session state machine using the real
+TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
-import queue
 from unittest.mock import MagicMock
-
-import pytest
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
@@ -223,146 +219,6 @@ def test_rx_session_wait_complete_fails_on_partial_failure():
 
     result = session.wait_complete()
     assert result == WaitResult.FAILED
-
-
-# ---------------------------------------------------------------------------
-# Chunk completion callback tests
-# ---------------------------------------------------------------------------
-
-
-def test_chunk_callback_enqueues_release():
-    """Callback from _make_chunk_callback enqueues the correct release entries."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = MagicMock()
-    transceiver._chunk_size_blocks = 64
-    transceiver._pending_prefix_releases = queue.Queue()
-    transceiver._kv_cache_manager.release_prefix_blocks = MagicMock()
-
-    callback = KvCacheTransceiverV2._make_chunk_callback(transceiver)
-    assert callback is not None
-
-    callback(request_id=7, chunk_block_offset=0, num_blocks=64)
-    callback(request_id=7, chunk_block_offset=64, num_blocks=64)
-    callback(request_id=7, chunk_block_offset=128, num_blocks=64)
-
-    results = []
-    while not transceiver._pending_prefix_releases.empty():
-        results.append(transceiver._pending_prefix_releases.get_nowait())
-
-    assert results == [(7, 64), (7, 128), (7, 192)]
-
-
-def test_drain_pending_releases():
-    """_drain_pending_releases calls release_prefix_blocks for each entry."""
-    transceiver = MagicMock()
-    transceiver._pending_prefix_releases = queue.Queue()
-    transceiver._kv_cache_manager = MagicMock()
-    transceiver._pending_prefix_releases.put((10, 64))
-    transceiver._pending_prefix_releases.put((10, 128))
-    transceiver._pending_prefix_releases.put((20, 32))
-
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    KvCacheTransceiverV2._drain_pending_releases(transceiver)
-
-    calls = transceiver._kv_cache_manager.release_prefix_blocks.call_args_list
-    assert len(calls) == 3
-    assert calls[0].args == (10, 64)
-    assert calls[1].args == (10, 128)
-    assert calls[2].args == (20, 32)
-
-
-def test_drain_pending_releases_tolerates_stale_rid():
-    """A pending release for a request that was already removed must be a no-op.
-
-    Models the production race where the sender worker enqueues a release
-    after the main thread has already torn the sequence down via
-    ``removeSequence``.  ``KVCacheManager.release_prefix_blocks`` returns
-    early in that case, so ``_drain_pending_releases`` must not raise.
-    """
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = MagicMock()
-    transceiver._pending_prefix_releases = queue.Queue()
-    transceiver._kv_cache_manager = MagicMock()
-    # Manager wrapper is a no-op for unknown rids; drain must propagate that
-    # no-op semantics rather than crashing.
-    transceiver._kv_cache_manager.release_prefix_blocks = MagicMock(return_value=None)
-
-    transceiver._pending_prefix_releases.put((9999, 64))  # unknown rid
-    transceiver._pending_prefix_releases.put((9999, 128))
-
-    KvCacheTransceiverV2._drain_pending_releases(transceiver)
-
-    calls = transceiver._kv_cache_manager.release_prefix_blocks.call_args_list
-    assert len(calls) == 2
-    assert calls[0].args == (9999, 64)
-    assert calls[1].args == (9999, 128)
-
-
-def test_drain_pending_releases_empty_queue_is_noop():
-    """Drain on an empty queue is a no-op and never calls the manager."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = MagicMock()
-    transceiver._pending_prefix_releases = queue.Queue()
-    transceiver._kv_cache_manager = MagicMock()
-
-    KvCacheTransceiverV2._drain_pending_releases(transceiver)
-
-    transceiver._kv_cache_manager.release_prefix_blocks.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "has_release,chunk_size,expected_none",
-    [
-        (False, 64, True),
-        (True, None, True),
-        (False, None, True),
-        (True, 64, False),
-    ],
-    ids=["no_release_api", "no_chunking", "neither", "with_release_and_chunking"],
-)
-def test_make_chunk_callback_conditions(has_release, chunk_size, expected_none):
-    """_make_chunk_callback returns None unless both release API and chunking enabled."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = MagicMock()
-    transceiver._chunk_size_blocks = chunk_size
-    transceiver._pending_prefix_releases = queue.Queue()
-    if has_release:
-        transceiver._kv_cache_manager.release_prefix_blocks = MagicMock()
-    else:
-        del transceiver._kv_cache_manager.release_prefix_blocks
-
-    result = KvCacheTransceiverV2._make_chunk_callback(transceiver)
-    assert (result is None) == expected_none
-
-
-def test_chunk_callback_then_drain():
-    """End-to-end: callback enqueues, drain calls release_prefix_blocks."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-
-    transceiver = MagicMock()
-    transceiver._chunk_size_blocks = 4
-    transceiver._pending_prefix_releases = queue.Queue()
-    transceiver._kv_cache_manager.release_prefix_blocks = MagicMock()
-
-    callback = KvCacheTransceiverV2._make_chunk_callback(transceiver)
-    assert callback is not None
-
-    callback(request_id=1, chunk_block_offset=0, num_blocks=4)
-    callback(request_id=1, chunk_block_offset=4, num_blocks=4)
-    callback(request_id=1, chunk_block_offset=8, num_blocks=2)
-
-    KvCacheTransceiverV2._drain_pending_releases(transceiver)
-
-    calls = transceiver._kv_cache_manager.release_prefix_blocks.call_args_list
-    assert len(calls) == 3
-    assert calls[0].args == (1, 4)
-    assert calls[1].args == (1, 8)
-    assert calls[2].args == (1, 10)
 
 
 # ---------------------------------------------------------------------------

@@ -66,9 +66,9 @@ def create_kv_cache_transceiver(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
     elif cache_transceiver_config.backend == "UCX":
         logger.info(
-            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
-            f"hangs or lower-than-expected performance.")
+            "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
+            "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            "hangs or lower-than-expected performance.")
 
     # Auto-select Python transceiver when chunk_size_blocks is set,
     # since the C++ transceiver does not support chunked transfer.
@@ -82,11 +82,11 @@ def create_kv_cache_transceiver(
             # Use warning (not info) so users notice the transceiver swap and
             # the implied perf / staging-buffer characteristics change.  Set
             # transceiver_runtime='CPP' explicitly to opt out (and lose
-            # chunked transfer + early block release).
+            # chunked transfer).
             logger.warning(
                 "chunk_size_blocks is set; auto-selecting the Python "
                 "transceiver instead of the C++ transceiver to enable "
-                "chunked KV cache transfer + early block release. "
+                "chunked KV cache transfer. "
                 "Set transceiver_runtime='CPP' to disable this auto-selection.")
             use_python = True
         else:
@@ -98,10 +98,9 @@ def create_kv_cache_transceiver(
                 f"enable chunked transfer.")
     elif (runtime == "CPP"
           and cache_transceiver_config.chunk_size_blocks is not None):
-        logger.warning(
-            "chunk_size_blocks is set but transceiver_runtime='CPP' "
-            "explicitly disables Python auto-selection; "
-            "chunk_size_blocks will be ignored.")
+        logger.warning("chunk_size_blocks is set but transceiver_runtime='CPP' "
+                       "explicitly disables Python auto-selection; "
+                       "chunk_size_blocks will be ignored.")
 
     # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
     # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA

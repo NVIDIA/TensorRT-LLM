@@ -7,7 +7,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -56,8 +56,6 @@ from tensorrt_llm.runtime.generation import CUASSERT
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
-
-OnChunkTransferredCallback = Callable[[int, int, int], None]
 
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
@@ -587,29 +585,6 @@ class Sender(SenderBase):
                 )
             else:
                 task.complete()
-                if session._on_chunk_transferred is not None:
-                    try:
-                        # Use the max across layer groups as the
-                        # cumulative release count.  For asymmetric
-                        # layer groups (e.g., sliding window), shorter
-                        # groups may have fewer blocks per chunk, but
-                        # each WindowBlockManager independently clamps
-                        # to its own allocated block count via
-                        # min(numBlocks, allocatedBlocks.size()).
-                        num_blocks = max(
-                            (len(ids) for ids in task._slice.block_ids_per_layer_groups),
-                            default=0,
-                        )
-                        session._on_chunk_transferred(
-                            request_id=session.request_id,
-                            chunk_block_offset=task._slice.chunk_block_offset,
-                            num_blocks=num_blocks,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"on_chunk_transferred callback failed for "
-                            f"request {session.request_id} slice {write_meta.slice_id}: {e}"
-                        )
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -769,10 +744,10 @@ class Sender(SenderBase):
                         f"src={src_block_ids.size}, dst={dst_block_ids.size}"
                     )
                     dst_block_ids = dst_block_ids[:-1]
-                elif block_diff != 0:
+                elif block_diff > 1:
                     raise ValueError(
                         f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (expected 0 <= diff <= 1)"
+                        f"{dst_block_ids.size} (expected diff <= 1)"
                     )
                 tpb = extractor.page_table.tokens_per_block
                 token_range = task._slice.token_range
@@ -1159,7 +1134,6 @@ class TxSession(TxSessionBase):
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
-        on_chunk_transferred: Optional[OnChunkTransferredCallback] = None,
     ):
         super().__init__(
             sender,
@@ -1175,7 +1149,6 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
-        self._on_chunk_transferred = on_chunk_transferred
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -2088,16 +2061,11 @@ class TransferWorker:
     def create_tx_session(
         self,
         request: LlmRequest,
-        on_chunk_transferred: Optional[OnChunkTransferredCallback] = None,
     ) -> TxSession:
         """Create a TxSession for the given request.
 
         Args:
             request: The LLM request to create a send session for.
-            on_chunk_transferred: Optional callback invoked on the
-                sender worker thread after each chunk's RDMA completes.
-                Signature: ``(request_id: int, chunk_block_offset: int,
-                num_blocks: int) -> None``.
 
         Returns:
             A new ``TxSession`` ready to accept ``send()`` calls.
@@ -2112,7 +2080,6 @@ class TransferWorker:
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
             beam_width=request.py_beam_width,
-            on_chunk_transferred=on_chunk_transferred,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
