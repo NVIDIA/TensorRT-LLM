@@ -28,6 +28,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
@@ -472,10 +473,13 @@ class KvCacheCreator:
         model with the encoder entry but no dummy builder just yields an empty
         batch (no encoder profiling) until the builder is implemented.
         """
-        # ``MultimodalModelMixin`` is the uniform ``encode_multimodal_inputs``
-        # entry; imported locally to avoid a pyexecutor -> models import cycle.
-        from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
-            MultimodalModelMixin
+        # Gate on `MultimodalModelMixin`: the dummy-data sizing below only
+        # needs the input processor, but `_encode_dummy_inputs` then calls
+        # `model.encode_multimodal_inputs` (the mixin contract), so the model
+        # must provide it. This also intentionally scopes direct encoder
+        # profiling to mixin-migrated models (Qwen2-VL and Mistral are the
+        # pilots; future models opt in by inheriting the mixin and implementing
+        # the processor dummy hooks).
         if not isinstance(self._model_engine.model, MultimodalModelMixin):
             return []
         if isinstance(

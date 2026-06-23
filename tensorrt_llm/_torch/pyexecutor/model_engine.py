@@ -1885,11 +1885,11 @@ class PyTorchModelEngine(ModelEngine):
     def is_multimodal(self) -> bool:
         """True iff this engine drives a multimodal model.
 
-        Primary signal: :class:`MultimodalModelMixin` is the
+        Primary signal: ``MultimodalModelMixin`` is the
         canonical marker — multimodal LM classes inherit from it. Until
         every model has migrated (Mistral done; Qwen-VL, Nemotron, Gemma,
         Phi-4-MM, etc. pending), fall back to whether the input processor
-        subclasses :class:`BaseMultimodalInputProcessor`, which every
+        subclasses ``BaseMultimodalInputProcessor``, which every
         multimodal model necessarily provides at the data boundary.
 
         TODO: Once all multimodal models inherit ``MultimodalModelMixin``

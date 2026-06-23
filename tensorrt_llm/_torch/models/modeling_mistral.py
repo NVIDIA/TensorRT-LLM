@@ -468,12 +468,12 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
     #
     # These power the modality-agnostic dummy contract
     # (``get_mm_max_tokens_per_item`` / ``get_dummy_mm_data_for_tokens``) and
-    # are deliberately kept off ``get_num_mm_tokens``: the hashing path
-    # (``get_num_tokens_per_image``) must keep using the processor's LLM-side
+    # are deliberately kept separate from the hashing path: the hashing path
+    # (``get_num_tokens_per_image``) keeps using the processor's LLM-side
     # token count (Pixtral grid + ``[IMG_BREAK]``/``[IMG_END]`` framing), while
     # encoder profiling needs the ViT attention-sequence length (pre-merge patch
     # count). Different units, so the dummy path uses the private ``_vit_*``
-    # helpers below instead of ``get_num_mm_tokens``.
+    # helpers below.
     # ------------------------------------------------------------------
     def _vision_geometry(self) -> Tuple[int, int, int, int]:
         """``(patch_size, spatial_merge_size, num_channels, max_image_size)``,
