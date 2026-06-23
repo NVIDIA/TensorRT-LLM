@@ -1,4 +1,3 @@
-import os
 from typing import TYPE_CHECKING, Optional, Type, Union
 
 import torch
@@ -119,21 +118,10 @@ def create_attention(
     if sparse_params is not None:
         kwargs["sparse_params"] = sparse_params
 
-    attn = attn_cls(
+    return attn_cls(
         layer_idx,
         num_heads,
         head_dim,
         num_kv_heads,
         **kwargs,
     )
-
-    # Env-gated capture for the attention test suite. Wrapping here (the single
-    # factory used by both the Attention and MLA modules) records every
-    # backend.forward call from any model run. Gated at construction so the
-    # forward path is untouched when capture is disabled.
-    capture_dir = os.environ.get("TRTLLM_ATTN_CAPTURE_DIR")
-    if capture_dir:
-        from ._capture import wrap_backend_for_capture
-        attn = wrap_backend_for_capture(attn, backend_name.upper(), capture_dir)
-
-    return attn
