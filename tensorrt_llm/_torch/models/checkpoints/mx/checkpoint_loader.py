@@ -223,6 +223,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         model = kwargs.pop("model", None)
         # Popped here so it never leaks into the disk-fallback signature.
         self._local_source_identity = kwargs.pop("source_identity", None)
+        allow_post_transform_weights = kwargs.pop("allow_post_transform_weights", True)
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
@@ -270,6 +271,15 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._post_transform_weights_preloaded = self._source_metadata_is_post_transform(
             checkpoint_dir, MxClient, _build_trtllm_identity
         )
+        if self._post_transform_weights_preloaded and not allow_post_transform_weights:
+            self._post_transform_weights_preloaded = False
+            self._source_identity_compatible_for_last_load = False
+            return self._fallback_to_disk(
+                checkpoint_dir,
+                mapping,
+                reason="post-transform MX source is not allowed for this load",
+                **kwargs,
+            )
 
         timeout_override = self._resolve_query_timeout_override(
             checkpoint_dir,

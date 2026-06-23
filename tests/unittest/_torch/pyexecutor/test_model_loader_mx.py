@@ -198,14 +198,29 @@ class _PostTransformMxLoader:
 
     def __init__(self, *, post_transform: bool) -> None:
         self._post_transform = post_transform
-        self.load_weights = MagicMock(return_value={})
-        self.is_weights_preloaded = MagicMock(return_value=True)
+        self._weights_preloaded = True
+        self.load_weights = MagicMock(side_effect=self._load_weights)
+        self.is_weights_preloaded = MagicMock(side_effect=lambda: self._weights_preloaded)
         self.get_initialized_weight_mapper = MagicMock(return_value=MagicMock())
         self.post_load_apply = MagicMock()
         self.post_load_publish = MagicMock()
 
+    def _load_weights(self, *_args, **kwargs):
+        if self._post_transform and kwargs.get("allow_post_transform_weights") is False:
+            self._post_transform = False
+            self._weights_preloaded = False
+            return {"disk.weight": MagicMock()}
+        return {}
+
     def is_post_transform_weights_preloaded(self) -> bool:
         return self._post_transform
+
+
+def _spec_config_needing_draft_weights():
+    return SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(need_load_draft_weights=lambda: True),
+        speculative_model="/draft",
+    )
 
 
 def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatch):
@@ -221,6 +236,7 @@ def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatc
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
     loader._call_load_weights.assert_not_called()
+    assert checkpoint_loader.load_weights.call_args.kwargs["allow_post_transform_weights"] is True
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model, checkpoint_dir="/ckpt", weights_preloaded=True
     )
@@ -231,6 +247,33 @@ def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatc
     assert model.linear._weights_transformed is True
     assert model.draft_model.linear._weights_transformed is True
     assert events == ["setup_aliases", "cache_derived_state"]
+
+
+def test_mx_post_transform_receiver_with_draft_weights_forces_disk_fallback(monkeypatch):
+    events = []
+    loader = _make_loader(
+        monkeypatch,
+        events=events,
+        spec_config=_spec_config_needing_draft_weights(),
+    )
+    monkeypatch.setattr(
+        ModelLoader,
+        "_MX_STAGED_RECEIVER_ALLOWLIST",
+        frozenset({(_TinyModel, ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION)}),
+    )
+    checkpoint_loader = _PostTransformMxLoader(post_transform=True)
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    primary_kwargs = checkpoint_loader.load_weights.call_args_list[0].kwargs
+    assert primary_kwargs["allow_post_transform_weights"] is False
+    assert loader._call_load_weights.call_count == 2
+    checkpoint_loader.post_load_publish.assert_called_once_with(
+        model, checkpoint_dir="/ckpt", weights_preloaded=False
+    )
+    assert model._weights_transformed is False
+    assert model.linear._weights_transformed is False
+    assert events == ["load_weights", "load_draft_weights", "post_load_weights"]
 
 
 def test_mx_post_transform_receiver_falls_back_when_allowlist_empty(monkeypatch):

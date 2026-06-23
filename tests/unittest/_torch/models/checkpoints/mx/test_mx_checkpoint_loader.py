@@ -280,6 +280,36 @@ class TestLoadWeightsMxPath:
         assert loader.is_post_transform_weights_preloaded() is False
         mock_super_load.assert_called_once()
 
+    def test_post_transform_source_can_be_disallowed_before_p2p(self):
+        # Some receiver shapes, such as target+draft speculative decoding, are
+        # not ready to mix post-transform target bytes with separately loaded
+        # raw draft bytes. Let ModelLoader force a disk fallback before MX
+        # starts RDMA, rather than accepting bytes it cannot safely stage.
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        loader._source_identity_compatible = MagicMock(return_value=True)
+        loader._source_metadata_is_post_transform = MagicMock(return_value=True)
+        disk_weights = {"disk.weight": MagicMock()}
+        fake_mx = _build_fake_modelexpress(load_weights_return={})
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                allow_post_transform_weights=False,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        fake_mx.trtllm_live_transfer.MxLiveWeightLoader.assert_not_called()
+        mock_super_load.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # publish_as_source — env-var dance and graceful no-op
