@@ -25,7 +25,7 @@ from tensorrt_llm._torch.models.modeling_mistral_large3 import (
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderOutput, MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    _MULTIMODAL_ENV_NAME, _is_disagg)
+    _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -414,7 +414,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         return self._dtype
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")
@@ -567,7 +567,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
-        if _is_disagg():
+        # No MM E/P handoff here yet. Fail before partial model setup.
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
@@ -611,7 +612,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         # NOTE: attn_backend: Pixtral head size not always divisible by 128
         vision_model_config = self._get_sub_model_config(model_config_cp,
                                                          "vision_config",
-                                                         attn_backend="VANILLA",
+                                                         attn_backend="TRTLLM",
                                                          quant_config=None)
 
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
@@ -704,7 +705,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
-        **encoder_kwargs: Any,
     ) -> MultimodalEncoderOutput:
         mm_embeds = self._vision_forward(list(multimodal_params))
         return MultimodalEncoderOutput(embeddings=mm_embeds[0])

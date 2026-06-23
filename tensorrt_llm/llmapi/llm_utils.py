@@ -35,12 +35,14 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 # yapf: disable
-from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
-                       Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
-                       LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
-                       TorchLlmArgs, UserProvidedDecodingConfig,
-                       _ModelFormatKind, _ModelWrapper, _ParallelConfig,
+from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
+                       DraftTargetDecodingConfig, Eagle3DecodingConfig,
+                       EagleDecodingConfig, EncodeCudaGraphConfig,
+                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
+                       MedusaDecodingConfig, MTPDecodingConfig,
+                       NGramDecodingConfig, SchedulerConfig, TorchLlmArgs,
+                       UserProvidedDecodingConfig, _ModelFormatKind,
+                       _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 # yapf: enable
@@ -85,10 +87,10 @@ class _ModelInfo:
 
 @dataclass
 class _ModelRuntimeContext:
-    ''' _ModelRuntimeContext holds the minimum runtime resources for running a model.
+    """_ModelRuntimeContext holds the minimum runtime resources for running a model.
 
     It could be a runtime cache in MPI nodes.
-    '''
+    """
     engine: Optional[Engine] = None
     mapping: Optional[Mapping] = None
     model_info: Optional[_ModelInfo] = None
@@ -103,10 +105,10 @@ class _ModelRuntimeContext:
 
 
 class ModelLoader:
-    ''' The ModelLoader is used to build an end-to-end model for a single-gpu.
+    """The ModelLoader is used to build an end-to-end model for a single-gpu.
 
     It accepts model name or a local model dir, and will download the model if necessary.
-    '''
+    """
 
     def __init__(self,
                  llm_args: LlmArgs,
@@ -246,9 +248,8 @@ class ModelLoader:
             self.counter += 1
 
     def __call__(self, engine_dir: Optional[Path] = None) -> Path:
-        '''
-        The engine_dir is the path to save the built engine.
-        '''
+        """The engine_dir is the path to save the built engine.
+        """
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
             return self.model_obj.model_dir
 
@@ -299,7 +300,7 @@ class ModelLoader:
         model_dir: str,
         engine_dir: str,
     ):
-        ''' Save the built engine on a single GPU to the given path. '''
+        """Save the built engine on a single GPU to the given path."""
         model.engine.save(engine_dir)
         if model.mapping.rank == 0:
             tokenizer = ModelLoader.load_hf_tokenizer(
@@ -310,7 +311,7 @@ class ModelLoader:
                 tokenizer.save_pretrained(engine_dir)
 
     def _download_hf_model(self):
-        ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
+        """Download HF model from third-party model hub like www.modelscope.cn or huggingface."""
         model_dir = None
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
@@ -470,6 +471,9 @@ class ModelLoader:
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                     'embedding', 'unembedding'
                 ]
+            elif hf_quant_config.get("quant_method") == "mxfp8":
+                raise NotImplementedError(
+                    "MXFP8 quantization is not supported yet.")
             # NOTE: This is for llm-compressor's quantized checkpoints.
             elif hf_quant_config.get("quant_method") == "compressed-tensors":
                 update_quant_config_from_compressed_tensors(
@@ -501,7 +505,7 @@ class ModelLoader:
         return False
 
     def _load_model_from_hf(self):
-        ''' Load a TRT-LLM model from a HF model. '''
+        """Load a TRT-LLM model from a HF model."""
         assert self._model_dir is not None
 
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
@@ -564,7 +568,7 @@ class ModelLoader:
 
     @print_traceback_on_error
     def _load_model_from_ckpt(self):
-        ''' Load a TRT-LLM model from checkpoint. '''
+        """Load a TRT-LLM model from checkpoint."""
         self.pretrained_config = PretrainedConfig.from_json_file(
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
@@ -613,14 +617,14 @@ class ModelLoader:
         logger_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
-        '''Persist the engine to disk for the cpp runtime.
+        """Persist the engine to disk for the cpp runtime.
 
         Currently, the cpp runtime can accept an engine path,
         that requires the engine should always be saved to disk.
 
         This explicit saving will be removed in the future when the cpp runtime can accept the engine buffer directly.
         But this is necessary for a build cache, but it can be optimized to async IO.
-        '''
+        """
         if self.build_cache_enabled:
             self._model_dir = self.engine_cache_stage.cache_dir
             self._model_format = _ModelFormatKind.TLLM_ENGINE
@@ -677,9 +681,8 @@ class ModelLoader:
 
 
 class CachedModelLoader:
-    '''
-    The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
-    '''
+    """The CachedModelLoader is used to build the model in both single or multi-gpu, with optional caching.
+    """
 
     def __init__(
         self,
@@ -816,7 +819,7 @@ class CachedModelLoader:
                                              is _ModelFormatKind.HF)
 
     def _get_engine_cache_stage(self) -> CachedStage:
-        ''' Get the cache stage for engine building. '''
+        """Get the cache stage for engine building."""
         build_cache = BuildCache(self.llm_args.enable_build_cache)
 
         assert self._hf_model_dir is not None, "HF model dir is required for cache key."
@@ -849,10 +852,11 @@ class CachedModelLoader:
         )
 
     def get_pretrained_config(self) -> PretrainedConfig:
-        ''' Get the PretrainedConfig for cache key.
+        """Get the PretrainedConfig for cache key.
 
         NOTE, this is not the HF model's config, but the TRT-LLM's config. We use this as a generic information for
-        HF and other models. '''
+        HF and other models.
+        """
         assert self._hf_model_dir is not None
         return AutoConfig.from_hugging_face(
             self._hf_model_dir,
@@ -907,7 +911,7 @@ class CachedModelLoader:
 
                     if not has_storage:
                         print_colored(
-                            f"Build cache is disabled since the cache storage is too small.\n ",
+                            "Build cache is disabled since the cache storage is too small.\n ",
                             'yellow')
                         print_colored(
                             f"Free storage: {free_storage}GB, Required storage: {require_size}GB\n",
@@ -973,7 +977,7 @@ class CachedModelLoader:
 
 @dataclass
 class LlmBuildStats:
-    ''' LlmBuildStats is the statistics for the LLM model building. '''
+    """LlmBuildStats is the statistics for the LLM model building."""
     # Whether the cache is hit for the engine
     cache_hitted: bool = False
     cache_info: Optional[str] = None
@@ -1015,6 +1019,8 @@ __all__ = [
     'QuantConfig',
     'CalibConfig',
     'CudaGraphConfig',
+    'DecodeCudaGraphConfig',
+    'EncodeCudaGraphConfig',
     'KvCacheConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',

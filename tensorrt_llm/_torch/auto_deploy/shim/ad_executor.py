@@ -25,6 +25,10 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor._util import get_decoding_mode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    AttentionTypeCpp,
+    create_kv_cache_transceiver,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
@@ -51,19 +55,29 @@ from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
+from ..custom_ops.attention_interface import AttentionType
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
+from ..utils.cuda_graph import BypassCapturedGraphs
 from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
-# Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
+_ATTENTION_TYPE_TO_CPP = {
+    AttentionType.mha: AttentionTypeCpp.DEFAULT,
+    AttentionType.mla: AttentionTypeCpp.MLA,
+}
+
+# Non-model multimodal metadata consumed before the exported graph or ignored by AD.
 # These keys must NOT leak into the generic extra_args dict — entries there
-# are expected to be tensors, and these are lists or nested dicts.
+# are expected to be tensors, and these may be scalars, lists, or nested dicts.
 _RESERVED_MM_DATA_KEYS = frozenset(
     {
         "layout_metadata",
+        "mm_bidirectional_blocks",
+        "multimodal_embedding",
+        "multimodal_embedding_lengths",
         "special_token_offsets",
         "multimodal_embed_mask_cumsum",
     }
@@ -126,6 +140,15 @@ def maybe_pad_for_cuda_graph(func):
         def _call_func():
             return func(self, scheduled_requests, resource_manager, *args, **kwargs)
 
+        def _call_func_eager():
+            # When this wrapper has decided that all ranks must run eager, also force
+            # the inner cudagraph backend to bypass captured graphs. Otherwise, ranks
+            # whose shapes happen to match a captured graph would still replay and
+            # use stale capture-time scalar kernel args (e.g. runtime_max_tokens_per_rank
+            # baked from local total at capture, vs cross-rank max read fresh in eager).
+            with BypassCapturedGraphs():
+                return _call_func()
+
         # check conditions for current rank
         can_run_cuda_graph = self.cuda_graph_used and scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
@@ -157,7 +180,7 @@ def maybe_pad_for_cuda_graph(func):
         can_run_cuda_graph_all = all(r_info[0] for r_info in all_rank_info)
 
         if not can_run_cuda_graph_all:
-            return _call_func()
+            return _call_func_eager()
 
         # get closest cudagraph batch size based on max_batch_size across ALL ranks
         # NOTE: we assume uniform cudagraph batch sizes across all ranks ensuring all ranks get the
@@ -166,14 +189,14 @@ def maybe_pad_for_cuda_graph(func):
         cg_batch_size = _round_up_to_closest(self.cuda_graph_batch_sizes, max_batch_size)
 
         if cg_batch_size is None:
-            return _call_func()
+            return _call_func_eager()
 
         # let's check if all ranks can pad the batch if they need to
         can_pad_all = all(r_info[1] or (r_info[2] == cg_batch_size) for r_info in all_rank_info)
 
         # fall back if we cannot run cudagraph due to padding issues
         if not can_pad_all:
-            return _call_func()
+            return _call_func_eager()
 
         # check actual amount of padding needed
         num_padding = cg_batch_size - batch_size
@@ -301,6 +324,40 @@ def _compute_window_local_view(
     return active_indices, extra_page, active_token_count, last_page_len
 
 
+def _compute_cyclic_full_view(
+    all_indices: Sequence[int],
+    end_compute_i: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the metadata view for a cyclic-SWA kernel (trtllm).
+
+    Unlike ``_compute_window_local_view`` (which slices the block table down to
+    the live sliding window for kernels that cannot cyclic-index), the trtllm
+    ``thop.attention`` kernel applies the sliding-window mask itself by wrapping
+    KV reads modulo the attention window. It therefore needs:
+
+      * the FULL per-window block table (``all_indices`` verbatim, including any
+        stale front-evicted entries -- the kernel's modulo indexing skips them),
+        and
+      * the GLOBAL (un-window-capped) KV length ``end_compute_i``.
+
+    This mirrors the PyTorch backend, which copies the manager's full block list
+    from index 0 and passes ``host_past_key_value_lengths == total KV length``.
+
+    Returns the same 4-tuple shape as ``_compute_window_local_view``:
+    ``(active_indices, extra_page, seq_len_with_cache, last_page_len)``.
+    ``extra_page`` is always -1: the full table already contains the next page,
+    so the overlap scheduler needs no deferred-page insertion.
+    """
+    active_indices = list(all_indices)
+    seq_len_with_cache = end_compute_i
+    if seq_len_with_cache > 0:
+        last_page_len = (seq_len_with_cache - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, -1, seq_len_with_cache, last_page_len
+
+
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
@@ -343,6 +400,7 @@ class ADEngine(ModelEngine):
             vocab_size_padded=factory.vocab_size_padded,
             spec_config=ad_config.speculative_config,
             requires_uniform_kv_caches=ad_config.requires_uniform_kv_caches,
+            reject_unmanaged_persistent_caches=ad_config.reject_unmanaged_persistent_caches,
         )
 
         reporting_info = ReportingInfo(
@@ -393,11 +451,6 @@ class ADEngine(ModelEngine):
         self.llm_args.print_iter_log = reporting_info.print_log
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
-        self.llm_args.stream_interval = 1
-        self.llm_args.attention_dp_config = None
-        self.llm_args.batch_wait_timeout_ms = 0
-        self.llm_args.batch_wait_timeout_iters = 0
-        self.llm_args.batch_wait_max_tokens_ratio = 0.0
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
@@ -407,15 +460,31 @@ class ADEngine(ModelEngine):
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
 
         if ad_config is not None:
+            self.llm_args.stream_interval = ad_config.stream_interval
+            self.llm_args.attention_dp_config = ad_config.attention_dp_config
+            self.llm_args.batch_wait_timeout_ms = ad_config.batch_wait_timeout_ms
+            self.llm_args.batch_wait_timeout_iters = ad_config.batch_wait_timeout_iters
+            self.llm_args.batch_wait_max_tokens_ratio = ad_config.batch_wait_max_tokens_ratio
             self.max_beam_width = ad_config.max_beam_width
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
+            cache_transceiver_config = ad_config.cache_transceiver_config
+            self._cache_transceiver_enabled = (
+                cache_transceiver_config is not None
+                and cache_transceiver_config.backend is not None
+            )
             self.llm_args.max_stats_len = ad_config.max_stats_len
             self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
+            self.llm_args.stream_interval = 1
+            self.llm_args.attention_dp_config = None
+            self.llm_args.batch_wait_timeout_ms = 0
+            self.llm_args.batch_wait_timeout_iters = 0
+            self.llm_args.batch_wait_max_tokens_ratio = 0.0
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
+            self._cache_transceiver_enabled = False
             self.llm_args.max_stats_len = 1000
             self._enable_chunked_prefill = False
 
@@ -424,6 +493,11 @@ class ADEngine(ModelEngine):
             self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
         else:
             self.max_total_draft_tokens = 0
+
+        # ADEngine skips PyTorchModelEngine.__init__, so set the spec-decode
+        # flags that shared PyExecutor code expects on a ModelEngine.
+        self.is_spec_decode = self.spec_config is not None
+        self.enable_spec_decode = self.is_spec_decode
 
         # For compatibility with PyTorchModelEngine utilities
         self.batch_size = cache_seq_interface.info.max_batch_size
@@ -648,12 +722,23 @@ class ADEngine(ModelEngine):
         gather_context_logits: bool = False,
     ) -> None:
         """Prepare inputs for AD Model from scheduled requests."""
+        context_requests = scheduled_requests.context_requests
+        if (
+            context_requests
+            and self._cache_transceiver_enabled
+            and not self._disable_overlap_scheduler
+        ):
+            raise RuntimeError(
+                "AutoDeploy disaggregated context workers do not support overlap scheduling. "
+                "Set disable_overlap_scheduler=True, or use "
+                "examples/auto_deploy/model_registry/configs/disagg_ctx.yaml when starting "
+                "a context worker with cache_transceiver_config."
+            )
+
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        # requests in order of context, generate
-        context_requests = scheduled_requests.context_requests
         extend_requests = [
             r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
         ]
@@ -668,6 +753,7 @@ class ADEngine(ModelEngine):
         assert len(extend_requests) == 0 or len(generation_requests) == 0
 
         gen_requests = extend_requests + generation_requests
+        # Requests in order of context, extend, generation.
         ordered_requests = context_requests + gen_requests
 
         # sequence information
@@ -724,8 +810,15 @@ class ADEngine(ModelEngine):
         num_prefill_tokens = len(input_ids)
 
         for request in gen_requests:
-            # check if need overlap and draft length
-            is_overlap = not self._disable_overlap_scheduler and not request.is_dummy
+            # Use overlap only for non-dummy requests with a previous batch slot.
+            # Dummy requests do not need sampled tokens from the previous iteration.
+            # First-step disagg decode requests have not appeared in a previous batch yet,
+            # so their py_batch_idx is None.
+            is_overlap = (
+                not self._disable_overlap_scheduler
+                and not request.is_dummy
+                and request.py_batch_idx is not None
+            )
 
             # check draft length
             draft_len = get_draft_token_length(request)
@@ -764,6 +857,12 @@ class ADEngine(ModelEngine):
         # on SequenceInfo).  Per-window queries on the manager route to the
         # correct C++ pool via mLayerToWindowSize.
         kv_group_windows = self.cache_seq_interface.kv_group_windows
+        # When the attention kernel applies the sliding-window mask itself via
+        # cyclic KV indexing (trtllm), the executor must hand it the full
+        # per-window block table and a global (un-window-capped) KV length --
+        # the same contract as the PyTorch backend. Otherwise (triton /
+        # flashinfer) host-slice the block table to the live window below.
+        cyclic_swa = self.cache_seq_interface.kernel_handles_cyclic_swa
         # Cache hot lookups so the per-request loop avoids repeated C++
         # dispatch / hasattr calls.
         _tokens_per_block = kv_cache_manager.tokens_per_block
@@ -803,40 +902,56 @@ class ADEngine(ModelEngine):
 
             for pool_idx, group_window in enumerate(kv_group_windows):
                 all_indices = batch_cache_indices_per_pool[pool_idx][i]
-                # SWA front-eviction: get_batch_cache_indices returns the FULL
-                # historical page list including front-evicted entries (the
-                # C++ side bumps a counter rather than popping mCacheBlockIds).
-                # _compute_window_local_view slices it down to the live window
-                # in window-local coords.
-                front_removed = kv_cache_manager.get_num_front_blocks_removed(
-                    request.py_request_id, window_size=group_window
-                )
-                (
-                    active_indices,
-                    extra_page,
-                    active_token_count,
-                    lpl_i,
-                ) = _compute_window_local_view(
-                    all_indices,
-                    front_removed=front_removed,
-                    end_compute_i=end_compute_i,
-                    group_window=group_window,
-                    tokens_per_block=_tokens_per_block,
-                )
-                num_active = len(active_indices)
+                if cyclic_swa:
+                    # Cyclic-SWA kernels (trtllm) want the FULL per-window block
+                    # table and the GLOBAL KV length; the kernel masks the window
+                    # internally. No front-eviction slicing, so the
+                    # get_num_front_blocks_removed C++ dispatch is skipped here.
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_cyclic_full_view(
+                        all_indices,
+                        end_compute_i=end_compute_i,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
+                else:
+                    # SWA front-eviction: get_batch_cache_indices returns the FULL
+                    # historical page list including front-evicted entries (the
+                    # C++ side bumps a counter rather than popping mCacheBlockIds).
+                    # _compute_window_local_view slices it down to the live window
+                    # in window-local coords.
+                    front_removed = kv_cache_manager.get_num_front_blocks_removed(
+                        request.py_request_id, window_size=group_window
+                    )
+                    (
+                        active_indices,
+                        extra_page,
+                        active_token_count,
+                        lpl_i,
+                    ) = _compute_window_local_view(
+                        all_indices,
+                        front_removed=front_removed,
+                        end_compute_i=end_compute_i,
+                        group_window=group_window,
+                        tokens_per_block=_tokens_per_block,
+                    )
+                    num_active = len(active_indices)
 
                 cache_loc_per_pool[pool_idx].extend(active_indices)
                 cu_num_pages_per_pool[pool_idx].append(
                     cu_num_pages_per_pool[pool_idx][i] + num_active
                 )
                 extra_page_per_seq_per_pool[pool_idx].append(extra_page)
-                # Window-local seq_len_with_cache / last_page_len for every
-                # pool (including 0).  For full-attention pools the helper
-                # returns the unclamped global value (group_window equals
-                # max_seq_len, no clamping kicks in), so this is identical to
-                # the legacy single-pool path for non-SWA models.  For SWA
-                # pools (whether pool 0 or pool 1+), it carries the
-                # window-local coords the kernel needs under front-eviction.
+                # seq_len_with_cache / last_page_len per pool (including 0).
+                # Cyclic-SWA (trtllm): the global KV length for every pool.
+                # Host-sliced (triton/flashinfer): the unclamped global value for
+                # full-attention pools (window == max_seq_len, no clamping), and
+                # the window-local coords for SWA pools under front-eviction --
+                # identical to the legacy single-pool path for non-SWA models.
                 seq_len_with_cache_per_pool[pool_idx].append(active_token_count)
                 last_page_len_per_pool[pool_idx].append(lpl_i)
 
@@ -878,6 +993,7 @@ class ADEngine(ModelEngine):
             _ungathered_new_lens=new_tokens_lens,
             **extra_args,
         )
+        self.cache_seq_interface.prepare_replay_metadata()
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
@@ -941,6 +1057,20 @@ class ADEngine(ModelEngine):
             scheduled_requests, resource_manager, new_tokens, new_tokens_lens, gather_context_logits
         )
         self.iter_counter += 1
+
+        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 14
+        # (``max_dp_num_tokens``). Mirrors base TRT-LLM's pattern in
+        # ``model_engine._get_all_rank_num_tokens``: MoE all-to-all needs the
+        # cross-rank max to size dispatch padding without over-padding to the
+        # static config ``max_num_tokens``. ``nest_sequences`` already
+        # initialized slot 14 to the local ``total_num_tokens``; this overrides
+        # with the cross-rank max only when attention-DP requires it.
+        if self.enable_attention_dp and self.dist_config.tp_size > 1:
+            assert self.dist is not None, "Distributed object is required for attention DP mode"
+            info = self.cache_seq_interface.info
+            local_total_num_tokens = info.batch_info.get_total_num_tokens()
+            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
+            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
 
         # compute outputs
         outputs = self._run_forward()
@@ -1119,6 +1249,42 @@ def create_autodeploy_executor(
         engine=engine,
     )
 
+    cache_transceiver_config = ad_config.cache_transceiver_config
+    kv_cache_transceiver = None
+    if cache_transceiver_config is not None and cache_transceiver_config.backend is not None:
+        if isinstance(kv_cache_manager, BaseMambaCacheManager):
+            # See https://github.com/NVIDIA/TensorRT-LLM/issues/14320.
+            raise RuntimeError(
+                "AutoDeploy disaggregated serving does not currently support Mamba/hybrid cache "
+                "managers. A prerequisite for disaggregated serving of hybrid models is to use "
+                "the C++ MambaCacheManager, which is currently not supported in AutoDeploy."
+            )
+        if cache_transceiver_config.max_tokens_in_buffer is None:
+            # The buffer must hold the prompt's KV state (full prefill length).
+            # We use max_seq_len as a safe upper bound on max ISL.
+            cache_transceiver_config.max_tokens_in_buffer = (
+                engine.cache_seq_interface.info.max_seq_len
+            )
+
+        cache_attention_type = engine.cache_seq_interface.attention_type
+        if cache_attention_type is None:
+            raise RuntimeError(
+                "Cache transceiver is enabled, but AutoDeploy did not find a managed paged KV "
+                "resource to provide attention_type."
+            )
+        if not isinstance(cache_attention_type, AttentionType):
+            raise TypeError(f"attention_type must be AttentionType, got {cache_attention_type!r}")
+        attention_type_cpp = _ATTENTION_TYPE_TO_CPP[cache_attention_type]
+
+        kv_cache_transceiver = create_kv_cache_transceiver(
+            dist_mapping,
+            dist,
+            kv_cache_manager,
+            attention_type_cpp,
+            cache_transceiver_config,
+            mamba_cache_manager=None,
+        )
+
     # Guided (structured) decoding.
     guided_decoder = None
     if (
@@ -1163,6 +1329,7 @@ def create_autodeploy_executor(
         max_batch_size=ad_config.max_batch_size,
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
+        kv_cache_transceiver=kv_cache_transceiver,
         resource_governor_queue=resource_governor_queue,
         garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
     )

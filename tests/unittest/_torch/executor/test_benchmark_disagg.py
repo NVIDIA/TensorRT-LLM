@@ -17,11 +17,11 @@
 In benchmark disagg mode the GEN executor must defer the forward pass
 until all benchmark requests have completed KV transfer.  These tests
 cover:
-- State-based ``_is_benchmark_disagg_fill_complete`` predicate
-- ``can_forward`` gating initialisation and transitions
+- State-based `_is_benchmark_disagg_fill_complete` predicate
+- `can_forward` gating initialisation and transitions
 - ADP dummy suppression during fill vs taper-down
 - ADP router imbalance regression (nvbug 6071070)
-- Non-blocking behaviour of ``_prepare_and_schedule_batch``
+- Non-blocking behaviour of `_prepare_and_schedule_batch`
 """
 
 from unittest.mock import Mock, patch
@@ -59,8 +59,8 @@ def _make_transceiver(transfer_complete: bool = True) -> Mock:
 
 class MockBenchmarkExecutor:
     """Minimal stub mirroring the PyExecutor attributes used by
-    ``_is_benchmark_disagg_fill_complete``, ``_check_benchmark_disagg_gate``,
-    and the ``can_forward`` gate.
+    `_is_benchmark_disagg_fill_complete`, `_check_benchmark_disagg_gate`,
+    and the `can_forward` gate.
 
     Binds the real production methods so tests exercise actual logic
     without needing a fully-initialised executor.
@@ -83,6 +83,7 @@ class MockBenchmarkExecutor:
             benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
         )
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
         self.num_fetch_requests = num_fetch_requests
         self.is_warmup = is_warmup
@@ -365,7 +366,7 @@ class TestCheckBenchmarkDisaggGate:
 
 class MockPadDummyExecutor:
     """Stub mirroring the PyExecutor attributes used by
-    ``_pad_attention_dp_dummy_request``.
+    `_pad_attention_dp_dummy_request`.
     """
 
     def __init__(
@@ -491,7 +492,7 @@ class TestPadAttentionDpDummyBenchmarkDisagg:
 class TestPrepareAndScheduleBatchNoBlock:
     """_prepare_and_schedule_batch must not block on request fetching.
 
-    NOTE: This test uses ``object.__new__(PyExecutor)`` to bypass __init__
+    NOTE: This test uses `object.__new__(PyExecutor)` to bypass __init__
     and manually sets internal attributes.  Keep the attribute list in sync
     with the method's implementation.
     """
@@ -504,9 +505,11 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex.kv_cache_transceiver = Mock()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
+        ex._fill_admit_cap = 0
         ex.enable_attention_dp = False
         ex.num_fetch_requests = 0
         ex.dist = Mock(rank=0, tp_size=1)
+        ex.dist.allreduce = Mock(side_effect=lambda v, op=None: v)
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
@@ -539,16 +542,7 @@ class TestPrepareAndScheduleBatchNoBlock:
 
 
 class TestBenchmarkFillAdmissionFlowControl:
-    """Verify benchmark disagg fill admits requests gradually.
-
-    The failing wide-EP Kimi case has ``benchmark_req_queues_size`` equal to
-    ``tp_size * max_batch_size``.  Without an explicit fill-phase cap, GEN can
-    admit the entire benchmark queue in one iteration, prepare too many KV
-    receives before the first forward pass, and hit process-level memory
-    pressure.  The desired invariant is non-blocking flow control: each
-    executor iteration should still return to the outer loop, but it should
-    only admit a small bounded number of new requests during the fill phase.
-    """
+    """Verify benchmark disagg fill admits requests via a slow-start ramp."""
 
     @staticmethod
     def _make_executor(tp_size: int = 4, fill_phase_active: bool = True):
@@ -558,6 +552,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex.enable_attention_dp = True
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
+        ex._fill_admit_cap = 0
         ex.benchmark_req_queues_size = 32
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = 8
@@ -566,9 +561,23 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex.dist.tp_size = tp_size
         return ex
 
+    @staticmethod
+    def _expected_ramp(tp_size: int, total_max: int) -> list:
+        """Build the expected admission-cap sequence: tp_size, 2*tp_size, ...,
+        clamped to total_max, then steady at total_max."""
+        seq = []
+        cap = tp_size
+        while cap < total_max:
+            seq.append(cap)
+            cap = min(cap * 2, total_max)
+        seq.append(total_max)
+        return seq
+
     @pytest.mark.parametrize("tp_size", [1, 4, 32])
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_fill_phase_caps_admission_to_tp_size(self, mock_get_from_waiting_queue, tp_size):
+    def test_first_iter_caps_at_tp_size(self, mock_get_from_waiting_queue, tp_size):
+        """Iter 0 of the ramp must still cap at tp_size — this is the
+        load-bearing iter-0 burst protection (PR #12206 fail-fast)."""
         ex = self._make_executor(tp_size=tp_size)
         waiting_queue = Mock()
         all_ranks_num_active_requests = [0] * tp_size
@@ -582,12 +591,45 @@ class TestBenchmarkFillAdmissionFlowControl:
         mock_get_from_waiting_queue.assert_called_once()
         _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
 
-        assert max_new_requests == ex.dist.tp_size, (
-            "Benchmark disagg fill should admit at most tp_size requests per "
-            "executor iteration.  Using full global capacity would admit "
-            "tp_size * max_batch_size requests at once and recreate the "
-            "fill-phase memory-pressure failure."
+        assert max_new_requests == tp_size, (
+            "Iter 0 of the benchmark-fill admission ramp must cap at tp_size "
+            "to protect against the simultaneous-DISAGG_GENERATION_INIT burst "
+            "that trips PR #12206's fail-fast under ADP router imbalance."
         )
+        assert ex._fill_admit_cap == tp_size
+
+    @pytest.mark.parametrize("tp_size", [1, 4, 8, 32])
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
+    def test_ramp_doubles_each_iter_and_saturates_at_total_max(
+        self, mock_get_from_waiting_queue, tp_size
+    ):
+        """Each subsequent fill-phase iter doubles the admission cap, and the
+        cap saturates at `total_max` (never exceeds the global capacity)."""
+        ex = self._make_executor(tp_size=tp_size)
+        total_max = ex.dist.tp_size * ex.max_num_active_requests
+        expected = self._expected_ramp(tp_size, total_max)
+
+        observed = []
+        # Walk a few iters past saturation to confirm the cap stays put.
+        for _ in range(len(expected) + 3):
+            ex._pop_from_waiting_queue(
+                Mock(),
+                total_num_active_requests=0,
+                all_ranks_num_active_requests=[0] * tp_size,
+            )
+            _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+            observed.append(max_new_requests)
+
+        # The ramp matches tp_size, 2*tp_size, ..., total_max.
+        assert observed[: len(expected)] == expected, (
+            f"ramp mismatch: expected {expected}, observed {observed}"
+        )
+        # Cap stays at total_max thereafter.
+        assert all(c == total_max for c in observed[len(expected) - 1 :])
+        # Convergence is logarithmic in total_max / tp_size.
+        # (Allow +1 for the saturating final entry.)
+        max_iters = (total_max // tp_size).bit_length() + 1
+        assert len(expected) <= max_iters
 
     @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
     def test_no_fill_phase_uses_full_available_capacity(self, mock_get_from_waiting_queue):
@@ -604,6 +646,62 @@ class TestBenchmarkFillAdmissionFlowControl:
         _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
 
         assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
+        assert ex._fill_admit_cap == 0, (
+            "When fill phase is inactive, the slow-start cap must remain "
+            "untouched so a future fill phase starts the ramp from tp_size."
+        )
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
+    def test_ramp_state_resets_when_fill_phase_ends(self, mock_get_from_waiting_queue):
+        """After the fill gate opens (`_fill_admit_cap` reset to 0 by
+        `_check_benchmark_disagg_gate`), a *subsequent* fill phase starts
+        the ramp from tp_size again rather than wherever the previous ramp
+        ended.  Matters for back-to-back benchmarks (e.g. after warmup)."""
+        ex = self._make_executor(tp_size=4)
+
+        # Walk a couple of iters into the ramp.
+        for _ in range(3):
+            ex._pop_from_waiting_queue(
+                Mock(),
+                total_num_active_requests=0,
+                all_ranks_num_active_requests=[0] * 4,
+            )
+        assert ex._fill_admit_cap > 4
+
+        # Simulate the gate-open path that `_check_benchmark_disagg_gate`
+        # takes when fill completes.
+        ex._benchmark_fill_phase_active = False
+        ex._fill_admit_cap = 0
+
+        # New fill phase starts; the next throttled iter must reseed at tp_size.
+        ex._benchmark_fill_phase_active = True
+        ex._pop_from_waiting_queue(
+            Mock(),
+            total_num_active_requests=0,
+            all_ranks_num_active_requests=[0] * 4,
+        )
+        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        assert max_new_requests == 4
+        assert ex._fill_admit_cap == 4
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
+    def test_warmup_skips_throttle(self, mock_get_from_waiting_queue):
+        """Warmup must bypass the slow-start ramp so warmup iters are not
+        artificially throttled and `_fill_admit_cap` stays unchanged."""
+        ex = self._make_executor(tp_size=4)
+        # Bypass the is_warmup property setter (which also pokes model_engine,
+        # not present on this stub).
+        ex._is_warmup = True
+
+        ex._pop_from_waiting_queue(
+            Mock(),
+            total_num_active_requests=0,
+            all_ranks_num_active_requests=[0] * 4,
+        )
+
+        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
+        assert ex._fill_admit_cap == 0
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +876,7 @@ class TestFailFastDuringBenchmarkFill:
 
     This covers the CI regression where the fill-phase guard suppressed the
     fail-fast forever and
-    ``test_disaggregated_benchmark_gen_only_insufficient_kv`` timed out.
+    `test_disaggregated_benchmark_gen_only_insufficient_kv` timed out.
     """
 
     def _make_executor(
@@ -797,9 +895,11 @@ class TestFailFastDuringBenchmarkFill:
         ex.kv_cache_transceiver = Mock()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
+        ex._fill_admit_cap = 0
         ex.enable_attention_dp = False
         ex.num_fetch_requests = num_fetch_requests
         ex.dist = Mock(rank=0, tp_size=1)
+        ex.dist.allreduce.return_value = 0
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
@@ -941,10 +1041,12 @@ class TestFillPhaseEndToEnd:
         ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
+        ex._fill_admit_cap = 0
         ex.enable_attention_dp = True
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
+        ex.dist.tp_allreduce.return_value = 0
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False

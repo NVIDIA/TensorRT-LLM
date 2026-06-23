@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Static sync test for the inline ``thop.attention(...)`` call in
-``TrtllmAttention._run``.
+"""Static sync test for the fallback ``thop.attention(...)`` call in
+``FallbackFmha.forward``.
 
 That call is the single explicit-kwarg call site for the C++ ``thop.attention``
 binding. This test parses both the call site (Python AST) and the C++
@@ -20,11 +20,11 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
 
 1. Every C++ parameter name appears at the call site (and nothing extra).
 2. Every call-site kwarg sourced as ``root.attr[.attr...]`` resolves on
-   exactly one of ``self`` / ``metadata`` / ``forward_args``, and its
+   exactly one of ``attn`` / ``metadata`` / ``forward_args``, and its
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
-   nested dataclass sub-bags like ``AttentionSparseArgs``) is consumed at
+   nested dataclass sub-bags like ``SparsePrediction``) is consumed at
    the call site — directly, transitively via a @property of the
    containing class, or listed in ``_THOP_EXCLUDED_FIELDS``.
 4. Every kwarg passed as a literal constant matches an entry in
@@ -42,20 +42,37 @@ import textwrap
 import typing
 from dataclasses import fields
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.trtllm import (
+from tensorrt_llm._torch.attention_backend.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
+    FallbackFmha,
 )
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 # Roots used as the LHS of attribute chains at the call site. Match the
-# parameter names inside ``TrtllmAttention._run``.
+# names inside ``FallbackFmha.forward``.
 _SOURCE_CLASSES = {
-    "self": TrtllmAttention,
+    "attn": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
+    "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
+}
+
+_THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "beam_width": ("metadata", ("effective_beam_width",)),
+    "context_lengths": ("metadata", ("prompt_lens_cuda_runtime",)),
+    "head_size": ("attn", ("head_dim",)),
+    "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
+    "host_past_key_value_lengths": ("metadata", ("kv_lens_runtime",)),
+    "host_request_types": ("metadata", ("host_request_types_runtime",)),
+    "sequence_length": ("metadata", ("kv_lens_cuda_runtime",)),
+    "spec_decoding_target_max_draft_tokens": (
+        "metadata",
+        ("max_total_draft_tokens",),
+    ),
+    "workspace_": ("metadata", ("effective_workspace",)),
 }
 
 # The C++ attention() declaration is the single source of truth for kwarg
@@ -183,8 +200,9 @@ def _binding_types() -> dict[str, str]:
 
 
 def _parse_thop_attention_call() -> ast.Call:
-    """Locate the single ``thop.attention(...)`` call inside ``_run``."""
-    src = textwrap.dedent(inspect.getsource(TrtllmAttention._run))
+    """Locate the single ``thop.attention(...)`` call inside
+    ``FallbackFmha.forward``."""
+    src = textwrap.dedent(inspect.getsource(FallbackFmha.forward))
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if (
@@ -195,7 +213,7 @@ def _parse_thop_attention_call() -> ast.Call:
             and node.func.value.id == "thop"
         ):
             return node
-    raise AssertionError("Could not find thop.attention(...) call in TrtllmAttention._run")
+    raise AssertionError("Could not find thop.attention(...) call in FallbackFmha.forward")
 
 
 def _attribute_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
@@ -214,13 +232,39 @@ def _attribute_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
     return current.id, tuple(reversed(attrs))
 
 
+def _getattr_path(node: ast.AST) -> tuple[str, tuple[str, ...]] | None:
+    """If ``node`` is ``getattr(Name.attr..., "leaf", <default>)``, return
+    ``(root_name_id, (attr1, ..., leaf))``. Otherwise return ``None``.
+    """
+    if (
+        not isinstance(node, ast.Call)
+        or not isinstance(node.func, ast.Name)
+        or node.func.id != "getattr"
+        or len(node.args) not in (2, 3)
+        or not isinstance(node.args[1], ast.Constant)
+        or not isinstance(node.args[1].value, str)
+    ):
+        return None
+    root_path: tuple[str, tuple[str, ...]]
+    if isinstance(node.args[0], ast.Name):
+        root_path = (node.args[0].id, ())
+    else:
+        path = _attribute_path(node.args[0])
+        if path is None:
+            return None
+        root_path = path
+    root, attrs = root_path
+    return root, (*attrs, node.args[1].value)
+
+
 def _classify_kwargs() -> tuple[
     dict[str, tuple[str, tuple[str, ...]]], dict[str, object], set[str]
 ]:
     """Split the call site's kwargs into three buckets:
 
-    - ``attr_kwargs``: ``kwarg=source.attr[...]`` (or
-      ``kwarg=int(source.attr)``) → ``{kwarg: (root, path)}``.
+    - ``attr_kwargs``: ``kwarg=source.attr[...]``,
+      ``kwarg=int(source.attr)``, or ``kwarg=getattr(source, "attr", ...)``
+      → ``{kwarg: (root, path)}``.
     - ``literal_kwargs``: ``kwarg=<constant>`` → ``{kwarg: value}``.
     - ``other_kwargs``: kwargs whose value is anything else (e.g. a bare
       Name like ``q``).
@@ -246,6 +290,10 @@ def _classify_kwargs() -> tuple[
             continue
         if isinstance(v, ast.Constant):
             literal_kwargs[kw.arg] = v.value
+            continue
+        path = _getattr_path(v)
+        if path is not None:
+            attr_kwargs[kw.arg] = path
             continue
         path = _attribute_path(v)
         if path is not None:
@@ -408,6 +456,20 @@ def test_each_source_attr_kwarg_resolves_uniquely():
                 )
 
 
+def test_attr_kwarg_names_match_source_leaf_attrs_except_allowlisted_aliases():
+    """Most ``thop.attention`` kwargs should bind to a source attribute with
+    the same name. Existing aliases must stay explicit so new semantic
+    mismatches cannot slip in under a broad type-compatible mapping.
+    """
+    attr_kwargs, _, _ = _classify_kwargs()
+    aliases = {kwarg: source for kwarg, source in attr_kwargs.items() if kwarg != source[1][-1]}
+    assert aliases == _THOP_KWARG_SOURCE_ALIASES, (
+        "Unexpected thop kwarg/source attribute aliases.\n"
+        f"new or changed aliases: {aliases.items() - _THOP_KWARG_SOURCE_ALIASES.items()}\n"
+        f"stale allowlist entries: {_THOP_KWARG_SOURCE_ALIASES.items() - aliases.items()}"
+    )
+
+
 def test_literal_kwargs_match_allowlist():
     """Every literal-constant kwarg at the call site must appear in
     ``_THOP_LITERALS`` with the matching value, and every entry in
@@ -444,8 +506,9 @@ def _self_attrs_in_property(prop: property) -> set[str]:
 
 
 def _collect_chains(root: str) -> set[tuple[str, ...]]:
-    """All attribute paths in ``_run`` that start with ``Name(root).``."""
-    src = textwrap.dedent(inspect.getsource(TrtllmAttention._run))
+    """All attribute paths in ``FallbackFmha.forward`` that start with
+    ``Name(root).``."""
+    src = textwrap.dedent(inspect.getsource(FallbackFmha.forward))
     chains: set[tuple[str, ...]] = set()
     for node in ast.walk(ast.parse(src)):
         if not isinstance(node, ast.Attribute):
@@ -496,7 +559,7 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
 def test_every_forward_args_field_is_consumed():
     """Recursively check that every dataclass field reachable from
     ``AttentionForwardArgs`` (including nested sub-bags such as
-    ``AttentionSparseArgs``) is consumed at the call site, transitively
+    ``SparsePrediction``) is consumed at the call site, transitively
     via @property where applicable, or listed in ``_THOP_EXCLUDED_FIELDS``.
     """
     _verify_consumed(
@@ -508,7 +571,7 @@ def test_every_forward_args_field_is_consumed():
 
 def test_no_unexpected_other_kwargs():
     """The only call-site kwargs that aren't ``source.attr`` chains or
-    allowlisted literals are the ``_run`` positional parameters."""
+    allowlisted literals are the ``FallbackFmha.forward`` parameters."""
     _, _, other_kwargs = _classify_kwargs()
     expected = {"q", "k", "v"}
     unexpected = other_kwargs - expected
@@ -545,4 +608,36 @@ def test_excluded_fields_match_real_fields():
         f"_THOP_EXCLUDED_FIELDS entries that don't match any "
         f"AttentionForwardArgs field: {sorted(stale)}. Drop them or "
         f"restore the field."
+    )
+
+
+def test_no_sequence_kwargs_at_thop_attention_boundary():
+    """``thop.attention`` must not accept ``std::vector<...>`` /
+    ``c10::ArrayRef<...>`` / ``std::array<...>`` parameters.
+
+    Sequence params couple list position to semantic meaning, which the
+    other sync tests in this file cannot verify element-by-element. Flat
+    named params let every slot be checked individually (name, type,
+    source). If a new sequence param creeps back in, flatten it the same
+    way ``rotary_embedding_scales`` / ``helix_tensor_params`` /
+    ``spec_decoding_*_params`` were flattened.
+    """
+    sequence_params = []
+    for name, cpp_type in _parse_attention_decl():
+        bare = cpp_type.strip()
+        # _strip_inner_type only strips trailing const/&/*; we want to
+        # detect outer container types regardless of qualifiers, so look
+        # at the raw type string with leading qualifiers stripped.
+        outer = re.sub(r"^(const\s+|volatile\s+)+", "", bare)
+        outer = re.sub(r"\s*(const|&|\*)\s*$", "", outer)
+        if (
+            outer.startswith("std::vector<")
+            or outer.startswith("c10::ArrayRef<")
+            or outer.startswith("std::array<")
+        ):
+            sequence_params.append((name, cpp_type))
+    assert not sequence_params, (
+        "thop.attention must not accept Sequence-typed kwargs. Flatten "
+        "the following params into their named scalar/tensor components:\n"
+        + "\n".join(f"  - {name}: {t}" for name, t in sequence_params)
     )

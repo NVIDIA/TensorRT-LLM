@@ -1097,7 +1097,7 @@ TEST(SerializeUtilsTest, BlockKeyWithExtras)
     VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
     std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
 
-    // Note: cacheSaltID is intentionally not set since it is not serialized
+    // Note: cacheSalt is intentionally not set; round-tripping with it set is covered separately.
     BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
 
     testSerializeDeserialize(key);

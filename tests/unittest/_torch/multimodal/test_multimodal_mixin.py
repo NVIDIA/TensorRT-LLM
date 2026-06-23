@@ -44,12 +44,23 @@ class DummyMultimodalModel(MultimodalModelMixin):
     def text_embedding_layer(self) -> Embedding:
         return self.embedding
 
-    def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs):
+    def encode_multimodal_inputs(self, multimodal_params):
         raise AssertionError("Tests use cached multimodal embeddings and should not encode.")
 
 
 def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:
     return MultimodalParams(multimodal_data={"multimodal_embedding": mm_embeds})
+
+
+def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
+    module = torch.nn.Linear(4, 4, device="meta")
+
+    MultimodalModelMixin._cast_multimodal_encoder_dtype(module, torch.float16)
+
+    assert module.weight.device.type == "meta"
+    assert module.weight.dtype == torch.float16
+    assert module.bias.device.type == "meta"
+    assert module.bias.dtype == torch.float16
 
 
 @pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))

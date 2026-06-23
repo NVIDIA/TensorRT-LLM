@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -406,12 +406,6 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        if not spec_config.allow_advanced_sampling:
-            logger.warning(
-                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
-                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
-            )
         # Check FLASHINFER compatibility with one-engine speculative decoding
         if llm_args.attn_backend == "FLASHINFER":
             raise ValueError(
@@ -432,6 +426,24 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+
+    # Bridge DwdpConfig -> Mapping: ParallelConfig.to_mapping() doesn't know
+    # about dwdp_size/dwdp_rank, so inject them here (before anything reads
+    # mapping.dwdp_enabled / moe_ep_rank).
+    #
+    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # in disaggregated serving each context worker is its own TP=1 instance
+    # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
+    # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
+    # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
+    if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
+        dwdp_size = llm_args.dwdp_config.dwdp_size
+        dwdp_rank = global_mpi_rank() % dwdp_size
+        mapping = Mapping(**{
+            **mapping.to_dict(), "dwdp_size": dwdp_size,
+            "dwdp_rank": dwdp_rank
+        })
+
     dist = Distributed.get(mapping)
 
     vm_pools = {}
@@ -473,7 +485,9 @@ def create_py_executor(
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
-        dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
+                                   dist=dist,
+                                   mapping=mapping)
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
@@ -659,6 +673,8 @@ def create_py_executor(
                 f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
                 f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         if kv_cache_config.enable_block_reuse and not (
@@ -669,6 +685,8 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
         if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
             logger.warning(
                 "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
@@ -882,10 +900,10 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-    # Exchange IPC Handles and Initialize Dwdp Prefetch Buffer
+    # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
+    # weight manager + MoE backend fixup (single entry point).
     if dwdp_manager is not None:
-        dwdp_manager.exchange_all_handles()
-        dwdp_manager.initialize_prefetch_buffer()
+        dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -968,6 +986,7 @@ def create_py_executor(
 
         del py_executor  # free before constructing new
         gc.collect()
+        torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using

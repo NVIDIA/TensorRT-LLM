@@ -190,6 +190,16 @@ class ConfigurableMoE(MoE):
             **kwargs,
         )
 
+        # ========== Optional DWDP integration ==========
+        # Must run BEFORE _create_comm_strategy_auto so the factory can skip
+        # alltoall strategies for DWDP (VA path swaps param.data; the backend
+        # reads from its own weight attrs, no comm strategy needed).
+        self.dwdp_manager = get_global_dwdp_manager()
+        self.enable_dwdp = False
+        if self.dwdp_manager is not None and self._should_enable_dwdp():
+            self.enable_dwdp = True
+            self.dwdp_manager.add_layer(layer_idx=self.layer_idx)
+
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
 
@@ -215,19 +225,7 @@ class ConfigurableMoE(MoE):
 
         # Validate configuration
         self.validate_config()
-
-        # ========== Optional DWDP integration ==========
-        self.dwdp_manager = get_global_dwdp_manager()
-        self.dwdp_handle_collector = None
-        self.dwdp_rank = None
-        self.enable_dwdp = False
-        if self.dwdp_manager is not None and self._should_enable_dwdp():
-            self.enable_dwdp = True
-            self.dwdp_handle_collector = self.dwdp_manager.add_layer(
-                layer_idx=self.layer_idx,
-            )
-            self.dwdp_rank = self.dwdp_manager.dwdp_rank
-            self.backend.dwdp_handle_collector = self.dwdp_handle_collector
+        self.validate_backend(self.backend)
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -329,7 +327,11 @@ class ConfigurableMoE(MoE):
                 activation_type=self.activation_type,
             )
 
-        self.validate_backend(backend)
+        # Backend acceptance is validated at the end of ``__init__`` instead
+        # of here so the validation hook can inspect ``self.comm`` and
+        # ``self.moe_max_num_tokens`` (assigned only after this method
+        # returns). Backends like ``MegaMoECuteDsl`` rely on that to
+        # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
@@ -503,7 +505,7 @@ class ConfigurableMoE(MoE):
     def __exit__(self, *exc_info):
         self.destroy()
 
-    def _create_comm_strategy_auto(self) -> Communication:
+    def _create_comm_strategy_auto(self) -> Optional[Communication]:
         """
         Auto-create the best communication strategy based on hardware and configuration
 
@@ -512,8 +514,14 @@ class ConfigurableMoE(MoE):
         host-side comm entirely; layering Communication.dispatch / combine
         on top of the fused exchange would double-count traffic and break
         the in-kernel NVLink barrier semantics.
+
+        DWDP VA path: returns None — there is no expert parallelism from the
+        backend's perspective (fixup_moe_backends sets ep_size=1 / slot_start=0
+        so the kernel sees full weights via param.data pointer swap).
         """
         if self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM:
+            return None
+        if self.enable_dwdp:
             return None
         return CommunicationFactory.create_strategy(
             model_config=self.model_config,
@@ -538,6 +546,7 @@ class ConfigurableMoE(MoE):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        lora_params: Optional[Dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -559,6 +568,13 @@ class ConfigurableMoE(MoE):
         else:
             output_dtype = x.dtype
 
+        # DWDP: wait for prefetch to complete and swap backend weight param.data
+        # to the composite (full-experts) tensor. Per-layer, not per-chunk —
+        # owned at the wrapper so the scheduler does not run it twice (e.g.
+        # external-comm may enter via single- or multi-chunk paths).
+        if self.enable_dwdp:
+            self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
+
         outputs = self.scheduler.forward(
             x,
             router_logits,
@@ -566,6 +582,7 @@ class ConfigurableMoE(MoE):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            lora_params=lora_params,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
@@ -593,9 +610,15 @@ class ConfigurableMoE(MoE):
         Backend-specific checks are delegated to
         ``backend.validate_configurable_moe(self)``; backends with extra
         constraints (e.g. fused-comm backends rejecting dynamic
-        EPLB) override that hook. EPLB / num_slots / ep_size are already
-        populated on ``self`` by ``MoE.__init__`` -> ``_init_load_balancer``
-        before this is called, so backends may inspect them directly.
+        EPLB) override that hook.
+
+        Call site contract: invoked from ``__init__`` *after* every
+        wrapper-owned attribute is assigned (EPLB / num_slots /
+        ep_size via ``MoE.__init__`` -> ``_init_load_balancer``,
+        ``self.comm`` from ``_create_comm_strategy_auto``, and
+        ``self.moe_max_num_tokens`` from ``model_config``). Backend
+        hooks can therefore inspect them directly without ``getattr``
+        guards or sentinel defaults.
         """
         if backend is None:
             raise ValueError("Backend cannot be None")

@@ -18,6 +18,30 @@ import torch
 from tensorrt_llm.llmapi.utils import set_api_status
 
 
+def _infer_format_from_path(
+    path: Union[str, Path, List[Union[str, Path]]],
+) -> Optional[str]:
+    """Return the tensor format implied by *path*'s suffix, or ``None``.
+
+    For a list of paths, every entry must share the same recognized
+    tensor suffix; mixed or unrecognized suffixes return ``None`` and
+    let the image/video encoder dispatch handle them.
+    """
+    from tensorrt_llm.media.tensor_payload import TENSOR_FORMATS
+
+    def _suffix_format(p) -> Optional[str]:
+        suffix = Path(p).suffix
+        fmt = suffix[1:] if suffix.startswith(".") else suffix
+        return fmt if fmt in TENSOR_FORMATS else None
+
+    if isinstance(path, list):
+        if not path:
+            return None
+        formats = {_suffix_format(p) for p in path}
+        return next(iter(formats)) if len(formats) == 1 else None
+    return _suffix_format(path)
+
+
 @set_api_status("prototype")
 @dataclass
 class VisualGenMetrics:
@@ -86,18 +110,19 @@ class VisualGenOutput:
         audio_sample_rate: Optional[int] = None,
         quality: int = 95,
     ) -> Union[Path, List[Path]]:
-        """Encode this output to disk via :mod:`tensorrt_llm.media.encoding`.
+        """Encode this output to disk.
 
         Args:
             path: Where to write. A single :class:`str`/:class:`pathlib.Path`
                 writes one file (batched tensors collapse to the first
-                slice); a list of paths writes one file per batch item via
-                :func:`~tensorrt_llm.media.encoding.save_images` /
-                :func:`~tensorrt_llm.media.encoding.save_videos`. In both
-                cases format is inferred from the extension unless
-                ``format`` is given.
-            format: Explicit format override (``'png'``/``'jpg'``/``'webp'``
-                for images, ``'mp4'``/``'avi'`` for video).
+                slice); a list of paths writes one file per batch item.
+                Format is inferred from the extension unless ``format``
+                is given.
+            format: Explicit format. Image encoders: ``"png"``, ``"jpg"``,
+                ``"webp"``. Video encoders: ``"mp4"``, ``"avi"``. Tensor
+                payloads: ``"safetensors"``, ``"pt"`` — these carry every
+                populated modality (image/video/audio) plus scalar
+                metadata (frame_rate, audio_sample_rate) in one file.
             frame_rate: Override the frame rate for video output. Defaults to
                 ``self.frame_rate`` when not provided.
             audio_sample_rate: Override the audio sample rate. Defaults to
@@ -113,9 +138,11 @@ class VisualGenOutput:
             ValueError: When video output lacks a frame rate, when the
                 output carries no media tensor at all, or when the list
                 length does not match the batch size.
-            NotImplementedError: When the output is audio-only.
+            NotImplementedError: When the output is audio-only and a
+                non-tensor format is requested.
         """
         from tensorrt_llm.media.encoding import save_image, save_images, save_video, save_videos
+        from tensorrt_llm.media.tensor_payload import is_tensor_format
 
         if self.error is not None:
             raise RuntimeError(
@@ -123,6 +150,21 @@ class VisualGenOutput:
             )
 
         is_batch = isinstance(path, list)
+
+        # Tensor formats carry every populated modality in one payload,
+        # so the dispatch table for image/video/audio below does not
+        # apply. When ``format`` is omitted, infer it from the path
+        # suffix so callers using the documented extension convention
+        # (``out.safetensors``/``out.pt``) reach the tensor path.
+        resolved_format = format if format is not None else _infer_format_from_path(path)
+        if is_tensor_format(resolved_format):
+            return self._save_tensor_payload(
+                path,
+                resolved_format,
+                is_batch=is_batch,
+                frame_rate=frame_rate,
+                audio_sample_rate=audio_sample_rate,
+            )
 
         if self.image is not None:
             if is_batch:
@@ -168,4 +210,100 @@ class VisualGenOutput:
         raise ValueError(
             f"Cannot save output: request {self.request_id} carries no media "
             "(image/video/audio are all None)."
+        )
+
+    def _save_tensor_payload(
+        self,
+        path: Union[str, Path, List[Union[str, Path]]],
+        fmt: str,
+        *,
+        is_batch: bool,
+        frame_rate: Optional[float] = None,
+        audio_sample_rate: Optional[int] = None,
+    ) -> Union[Path, List[Path]]:
+        """Write the safetensors/pt payload for this output to *path*.
+
+        A single path writes one logical output: when the populated
+        media tensor is batched the payload corresponds to the first
+        item, matching the image/video encoder paths
+        (:func:`~tensorrt_llm.media.encoding.save_image` /
+        :func:`~tensorrt_llm.media.encoding.save_video`). A list of
+        paths writes one payload per batch item by slicing the
+        populated tensors along their leading batch axis.
+
+        ``frame_rate`` and ``audio_sample_rate`` override the
+        corresponding fields on ``self`` when present, matching the
+        encoder path's override semantics.
+        """
+        from tensorrt_llm.media.tensor_payload import (
+            infer_batch_size,
+            save_visual_gen_output_payload,
+        )
+
+        batch_size = infer_batch_size(self)
+
+        if not is_batch:
+            if batch_size > 1:
+                raise ValueError(
+                    f"save received a single path but the output carries a batched "
+                    f"tensor of size {batch_size}; pass a list of {batch_size} paths "
+                    "(one per item)."
+                )
+            slice_index = 0 if batch_size > 0 else None
+            return save_visual_gen_output_payload(
+                self,
+                path,
+                fmt,
+                batch_index=slice_index,
+                frame_rate=frame_rate,
+                audio_sample_rate=audio_sample_rate,
+            )
+
+        if len(path) != batch_size:
+            raise ValueError(
+                f"Number of paths ({len(path)}) does not match batch size ({batch_size})."
+            )
+        return [
+            save_visual_gen_output_payload(
+                self,
+                p,
+                fmt,
+                batch_index=i,
+                frame_rate=frame_rate,
+                audio_sample_rate=audio_sample_rate,
+            )
+            for i, p in enumerate(path)
+        ]
+
+    def _save_bytes(
+        self,
+        format: str,
+        *,
+        batch_index: Optional[int] = None,
+        frame_rate: Optional[float] = None,
+        audio_sample_rate: Optional[int] = None,
+    ) -> bytes:
+        """Serialize this output to bytes for in-memory transport.
+
+        Internal counterpart to :meth:`save`. The public output API
+        exposes only :meth:`save` (file-based); the in-memory bytes
+        path is reserved for trtllm-serve's ``b64_json`` transport,
+        which derives ``batch_index`` from
+        :func:`tensorrt_llm.media.tensor_payload.infer_batch_size`
+        before iterating. Only tensor formats are supported today.
+        """
+        from tensorrt_llm.media.tensor_payload import is_tensor_format, serialize_visual_gen_output
+
+        if self.error is not None:
+            raise RuntimeError(
+                f"Cannot save output: request {self.request_id} failed with error: {self.error}"
+            )
+        if not is_tensor_format(format):
+            raise ValueError(f"_save_bytes supports only tensor formats today; got {format!r}.")
+        return serialize_visual_gen_output(
+            self,
+            format,
+            batch_index=batch_index,
+            frame_rate=frame_rate,
+            audio_sample_rate=audio_sample_rate,
         )

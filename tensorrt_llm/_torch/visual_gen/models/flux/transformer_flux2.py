@@ -32,11 +32,16 @@ from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
     FluxJointAttention,
 )
+from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
+    FluxJointAttnMLPProj,
+    FluxJointQKVMLPProj,
+)
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
     _remap_checkpoint_keys,
 )
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -222,6 +227,8 @@ class Flux2TransformerBlock(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
 
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
+
         # Layer norms (TRT-LLM - without elementwise affine, modulation provides scale/shift)
         self.norm1 = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
         self.norm1_context = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
@@ -236,6 +243,7 @@ class Flux2TransformerBlock(nn.Module):
             eps=eps,
             config=config,
             layer_idx=layer_idx,
+            module_name=f"transformer_blocks.{layer_idx}.attn",
         )
 
         # FFN for image stream (shared GatedMLP from _torch/modules)
@@ -247,7 +255,7 @@ class Flux2TransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
         # FFN for text stream
         self.ff_context = GatedMLP(
@@ -257,7 +265,7 @@ class Flux2TransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(tp_size != 1),
         )
 
     def forward(
@@ -267,6 +275,7 @@ class Flux2TransformerBlock(nn.Module):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         img_mod: Tuple[Tuple[torch.Tensor, ...], ...],
         txt_mod: Tuple[Tuple[torch.Tensor, ...], ...],
+        timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -299,6 +308,7 @@ class Flux2TransformerBlock(nn.Module):
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            timestep=timestep,
         )
 
         # Attention residual with gate
@@ -371,6 +381,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             config=config,
             layer_idx=layer_idx,
+            module_name=f"single_transformer_blocks.{layer_idx}.attn",
         )
 
     def forward(
@@ -378,6 +389,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         mod: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -398,7 +410,11 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states = hidden_states * (1 + mod_scale) + mod_shift
 
         # Parallel attention + MLP
-        hidden_states = self.attn(hidden_states, image_rotary_emb=image_rotary_emb)
+        hidden_states = self.attn(
+            hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            timestep=timestep,
+        )
 
         # Residual with gate
         hidden_states = residual + hidden_states * mod_gate
@@ -411,7 +427,7 @@ class Flux2SingleTransformerBlock(nn.Module):
 # =============================================================================
 
 
-class Flux2Transformer2DModel(nn.Module):
+class Flux2Transformer2DModel(BaseDiffusionModel):
     """FLUX.2 Transformer model for image generation (Native TRT-LLM).
 
     This implements the full FLUX.2 architecture matching HuggingFace diffusers:
@@ -427,8 +443,7 @@ class Flux2Transformer2DModel(nn.Module):
         Args:
             model_config: DiffusionModelConfig instance (from DiffusionModelLoader)
         """
-        super().__init__()
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
@@ -663,9 +678,9 @@ class Flux2Transformer2DModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        img_ids: torch.Tensor,
-        txt_ids: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+        img_ids: Optional[torch.Tensor] = None,
+        txt_ids: Optional[torch.Tensor] = None,
         guidance: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
@@ -675,7 +690,7 @@ class Flux2Transformer2DModel(nn.Module):
         Args:
             hidden_states: Latent image features [batch, img_seq, in_channels]
             encoder_hidden_states: Text features [batch, txt_seq, joint_attention_dim]
-            timestep: Diffusion timestep [batch]
+            timestep: Normalized diffusion timestep in [0, 1], shape [batch]
             img_ids: Image position IDs [img_seq, num_axes] or [batch, img_seq, num_axes]
             txt_ids: Text position IDs [txt_seq, num_axes] or [batch, txt_seq, num_axes]
             guidance: Guidance scale [batch]
@@ -730,6 +745,7 @@ class Flux2Transformer2DModel(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 img_mod=img_mod,
                 txt_mod=txt_mod,
+                timestep=timestep,
             )
 
         # Concatenate for single-stream blocks
@@ -741,6 +757,7 @@ class Flux2Transformer2DModel(nn.Module):
                 hidden_states=hidden_states,
                 image_rotary_emb=image_rotary_emb,
                 mod=single_mod[0],  # Single tuple of (shift, scale, gate)
+                timestep=timestep,
             )
 
         # Extract image features (discard text)
@@ -807,10 +824,26 @@ class Flux2Transformer2DModel(nn.Module):
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
+        # Track prefixes of wrapper projectors whose sub-Linears are loaded
+        # by the parent's load_weights — the generic Linear loader must skip
+        # them (their FUSED weight modes would look for nonexistent checkpoint
+        # keys via params_map and error).
+        managed_prefixes = set()
+
         for name, module in tqdm(self.named_modules(), desc="Loading FLUX.2 weights"):
+            # Skip sub-modules of wrapper projectors (loaded by parent above)
+            if any(name.startswith(p) for p in managed_prefixes):
+                continue
+
             # Create weights for modules with skip_create_weights_in_init=True
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
+
+            if isinstance(module, (FluxJointAttnMLPProj, FluxJointQKVMLPProj)):
+                managed_prefixes.add(name + ".")
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights, loader)
+                continue
 
             if len(module._parameters) == 0:
                 continue

@@ -26,8 +26,8 @@ from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
-                            get_accuracy_task)
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail,
+                            LlmapiAccuracyTestHarness, get_accuracy_task)
 
 
 class Result(GenerationResultBase):
@@ -114,6 +114,8 @@ def run_accuracy_test(llm: "DuckLLM",
                       extra_evaluator_kwargs: Optional[Dict[Union[str, type],
                                                             Dict[str,
                                                                  Any]]] = None,
+                      extra_acc_spec: Optional[str] = None,
+                      sampling_params: Optional[SamplingParams] = None,
                       timeout: int = DEFAULT_ACC_EVALUATION_TIMEOUT):
     start_time = time.time()
     for test_set in test_sets:
@@ -125,7 +127,10 @@ def run_accuracy_test(llm: "DuckLLM",
             kwargs = extra_evaluator_kwargs.get(test_set, {})
         else:
             kwargs = {}
-        task.evaluate(llm, extra_evaluator_kwargs=kwargs)
+        task.evaluate(llm,
+                      extra_acc_spec=extra_acc_spec,
+                      extra_evaluator_kwargs=kwargs,
+                      sampling_params=sampling_params)
     elapsed_time = time.time() - start_time
     if elapsed_time > timeout:
         pytest.fail(
@@ -404,8 +409,10 @@ def launch_disaggregated_llm(
                          streaming: bool):
             kwargs = {}
             if sampling_params is not None:
+                extra_body = {}
                 kwargs.update(
                     max_tokens=sampling_params.max_tokens,
+                    n=sampling_params.n,
                     # NB: 'LLM' (cf. SamplingParams) and OpenAI API
                     #     defaults differ (top_p=0 vs. top_p=1).
                     # FIXME: Because 'LLM' does not permit expressly setting
@@ -415,9 +422,10 @@ def launch_disaggregated_llm(
                     top_p=sampling_params.top_p,
                     stop=sampling_params.stop,
                     seed=sampling_params.seed)
+                if sampling_params.use_beam_search:
+                    extra_body.update(use_beam_search=True)
                 if (guided_decoding_params :=
                         sampling_params.guided_decoding) is not None:
-                    extra_body = {}
                     if (schema := guided_decoding_params.json) is not None:
                         extra_body.update(response_format={
                             "type": "json",
@@ -431,6 +439,7 @@ def launch_disaggregated_llm(
                         raise ValueError(
                             f"Unsupported guided decoding params: {guided_decoding_params}."
                         )
+                if extra_body:
                     kwargs.update(extra_body=extra_body)
 
             response = client.completions.create(model=model_name,
@@ -440,8 +449,8 @@ def launch_disaggregated_llm(
             result = Result(id=0,
                             sampling_params=sampling_params,
                             outputs=[
-                                CompletionOutput(text=response.choices[0].text,
-                                                 index=0)
+                                CompletionOutput(text=choice.text, index=idx)
+                                for idx, choice in enumerate(response.choices)
                             ])
             requested_output = RequestOutput._from_generation_result(
                 result, prompt=prompt)
@@ -634,6 +643,54 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
+    def test_beam_search(self):
+        max_beam_width = 2
+        sampling_params = SamplingParams(n=max_beam_width,
+                                         best_of=max_beam_width,
+                                         use_beam_search=True)
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": True,
+            "enable_partial_reuse": True,
+            "use_kv_cache_manager_v2": False,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_beam_width": max_beam_width,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_beam_width": max_beam_width,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm,
+                              self.MODEL_NAME, [CnnDailymail],
+                              extra_acc_spec=f"beam_width={max_beam_width}",
+                              sampling_params=sampling_params)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
     def test_kv_cache_v2_nixl_python(self):
         """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
@@ -762,6 +819,63 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
+            },
+            "cuda_graph_config": None,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(2)
+    @skip_pre_hopper
+    def test_gen_only_spec_dec(self):
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 4,
+            "speculative_model":
+            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            "eagle3_one_model": True,
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler":
+            True,  # BS=1 does not need overlap scheduling
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": True  # reuse on context requests
+            },
+            "max_num_tokens": 13393 * 2,
+            "max_batch_size": 1,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096,
+            },
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False
+            },
+            "max_num_tokens": 13393 * 2,
+            "max_batch_size": 16,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096,
             },
             "cuda_graph_config": None,
         }
@@ -916,46 +1030,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                  test_sets=[get_accuracy_task(testset)])
 
 
-class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
-
-    @pytest.mark.skip_less_device_memory(140000)
-    @pytest.mark.timeout(3600)
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
-        ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 4096
-        }
-        gen_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
-            "max_tokens_in_buffer": 4096
-        }
-        # Keep this low to avoid warmup OOM in CI
-        ctx_server_config["max_seq_len"] = 8192
-        gen_server_config["max_seq_len"] = 8192
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      tensor_parallel_size=4) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
-
-
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
@@ -1040,6 +1114,39 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 extra_env={"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"},
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(8)
+    @skip_pre_hopper
+    def test_gen_only_spec_dec(self):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": False}
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "max_tokens_in_buffer": 4096,
+            "transceiver_runtime": "PYTHON",
+        }
+        ctx_server_config["cache_transceiver_config"] = cache_transceiver_config
+        gen_server_config["cache_transceiver_config"] = cache_transceiver_config
+        gen_server_config["speculative_config"] = {
+            "decoding_type": "MTP",
+            "max_draft_len": 2
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      tensor_parallel_size=4) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
@@ -1978,7 +2085,6 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-@skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
@@ -2069,9 +2175,11 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
             use_py_transceiver=False)
+        # corner case: max_batch_size = 1 + dp for ctx to check if dp dummy requests are handled correctly
+        ctx_cfg["max_batch_size"] = 1
+        ctx_cfg["enable_attention_dp"] = True
         ctx_cfg["tensor_parallel_size"] = 2
         ctx_cfg["moe_expert_parallel_size"] = 2
-        ctx_cfg["enable_attention_dp"] = True
         gen_cfg["tensor_parallel_size"] = 4
         gen_cfg["moe_expert_parallel_size"] = 4
         gen_cfg["pipeline_parallel_size"] = 1

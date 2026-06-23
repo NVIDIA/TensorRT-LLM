@@ -864,7 +864,6 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         eagle3_one_model=True,
-        allow_advanced_sampling=True,
         use_rejection_sampling=True,
     )
     if use_dynamic_tree:
@@ -954,7 +953,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
 @pytest.mark.parametrize("disable_overlap_scheduler", [False])
 @pytest.mark.parametrize("use_cuda_graph", [True])
 @pytest.mark.high_cuda_memory
-@skip_blackwell
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
                                    disable_overlap_scheduler: bool):

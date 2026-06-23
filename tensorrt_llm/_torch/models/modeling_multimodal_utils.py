@@ -16,7 +16,7 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
-import contextlib
+import functools
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
@@ -35,8 +35,16 @@ _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
+# MM E/P split flag. Not generic disaggregated serving.
+def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+
+
+def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
+    multimodal_data = param.multimodal_data or {}
+    modality_type = multimodal_data.get("modality_type")
+    return (modality_type in ("image", "video", "audio")
+            and multimodal_data.get(modality_type) is not None)
 
 
 # Processor *output* keys that transformers 5.x's
@@ -55,31 +63,32 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
 })
 
 
-@contextlib.contextmanager
-def bypass_processor_output_validation():
-    """Filter processor-output keys out of ``validate_typed_dict`` for the
-    duration of an HF processor call.
+@functools.lru_cache(maxsize=None)
+def _install_processor_output_validation_filter():
+    """Install a process-wide filter over transformers' ``validate_typed_dict``.
 
     transformers 5.x added strict per-modality TypedDict validation in
-    ``ProcessorMixin._merge_kwargs``. The leak is an upstream bug: e.g.
-    ``Qwen2_5_VLProcessor._get_num_multimodal_tokens`` does
-    ``Qwen2_5_VLProcessorKwargs._defaults["videos_kwargs"].update(kwargs)``
-    on the class-level default dict (instead of a copy), so once any caller
-    passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets baked
-    into the per-modality default and leaks into every subsequent processor
-    call's ``output_kwargs[<modality>]`` — tripping the validator with
-    ``TypeError: merged_typed_dict.__init__() got an unexpected keyword
-    argument 'video_grid_thw'`` even when no caller passes such keys.
+    ``ProcessorMixin._merge_kwargs``. The keys in ``_PROCESSOR_OUTPUT_KEYS``
+    are processor *outputs* that leak into ``output_kwargs[<modality>]`` via
+    upstream bugs — e.g. ``Qwen2_5_VLProcessor._get_num_multimodal_tokens``
+    mutates the class-level default dict instead of a copy, so once any
+    caller passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets
+    baked into the per-modality default and trips ``validate_typed_dict`` on
+    every subsequent processor call. We filter those keys out before calling
+    the genuine huggingface_hub implementation.
 
-    Patches ``validate_typed_dict`` in *all* transformers modules that bind
-    it — each module has its own ``from huggingface_hub.dataclasses import
-    validate_typed_dict``, so patching only one is insufficient to cover
-    sub-processor validation paths. The set of binder modules differs
-    across transformers versions (5.3.x re-binds it on
-    ``image_processing_utils_fast``; 5.5.x dropped that module and re-binds
-    it on ``image_processing_utils`` instead), so we discover the binders
-    by ``hasattr`` rather than hard-coding the list. The originals are
-    restored on exit.
+    Called from each Qwen VL input processor's ``__init__``. ``@lru_cache``
+    guarantees the patch runs at most once per process: ``base_orig`` is
+    captured exactly once from the genuine HF function, so concurrent
+    ``trtllm-serve`` workers dispatched via ``asyncio.to_thread`` cannot
+    observe a partially-patched state or chain filters recursively.
+
+    Patches every transformers module that binds ``validate_typed_dict`` —
+    each does its own ``from huggingface_hub.dataclasses import …``, so
+    patching only one is insufficient. The set of binders differs across
+    transformers versions (5.3.x rebinds it on ``image_processing_utils_fast``;
+    5.5.x dropped that module and rebinds it on ``image_processing_utils``
+    instead), so we discover binders by ``hasattr`` rather than hard-coding.
     """
     import transformers.processing_utils as _pu
     import transformers.video_processing_utils as _vpu
@@ -97,8 +106,7 @@ def bypass_processor_output_validation():
         raise RuntimeError(
             "No transformers module exposes validate_typed_dict; "
             "cannot patch processor output validation.")
-    originals = {b: b.validate_typed_dict for b in binders}
-    base_orig = next(iter(originals.values()))
+    base_orig = binders[0].validate_typed_dict
 
     def _filtered_validate(schema, data):
         if isinstance(data, dict):
@@ -110,11 +118,6 @@ def bypass_processor_output_validation():
 
     for b in binders:
         b.validate_typed_dict = _filtered_validate
-    try:
-        yield
-    finally:
-        for b, orig in originals.items():
-            b.validate_typed_dict = orig
 
 
 def _get_uncached_multimodal_params(
@@ -180,7 +183,7 @@ def _cache_multimodal_embeddings(
     logger.debug(
         f"Caching {len(split_embeddings)} multimodal embedding chunks in {len(multimodal_params)} params"
     )
-    for param, embed_chunk in zip(valid_params, split_embeddings):
+    for param, embed_chunk in zip(valid_params, split_embeddings, strict=True):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
 
     logger.debug(
@@ -215,6 +218,13 @@ def get_multimodal_embeddings(
     """
     if not multimodal_params:
         return []
+
+    # Wait before touching tensors produced on the MM side stream. Do not
+    # clear the event here; repeated stream-side waits are cheap, and leaving
+    # the event field untouched avoids races if a caller accidentally reuses it.
+    for param in multimodal_params:
+        if param.encoder_event is not None:
+            torch.cuda.current_stream().wait_event(param.encoder_event)
 
     # Step 1: Find uncached multimodal params that need encoder processing
     uncached_multimodal_params = _get_uncached_multimodal_params(
@@ -270,6 +280,34 @@ def get_multimodal_embeddings(
     return [all_embeddings]
 
 
+def get_attached_multimodal_embeddings(
+        multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    """Gather embeddings already stored on MultimodalParams.
+
+    Use this on E/P prefill workers and cached-only paths. The encoder already
+    ran somewhere else. This only makes the tensor list that
+    find_input_mm_embeds slices.
+    """
+    attached_embeddings = []
+    for param in multimodal_params:
+        embeds = param.multimodal_data.get("multimodal_embedding")
+        # No attached embedding for this request.
+        if embeds is None:
+            continue
+        # Some paths stash chunks. Slicer expects one tensor.
+        if isinstance(embeds, list):
+            embeds = torch.cat(embeds, dim=0)
+            param.multimodal_data["multimodal_embedding"] = embeds
+        if not isinstance(embeds, torch.Tensor):
+            raise TypeError("multimodal_embedding must be a torch.Tensor")
+        attached_embeddings.append(embeds)
+
+    if not attached_embeddings:
+        return []
+    # Match get_multimodal_embeddings output: one concatenated tensor.
+    return [torch.cat(attached_embeddings, dim=0)]
+
+
 def find_input_mm_embeds(
         mm_embeds: List[torch.Tensor],
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
@@ -291,10 +329,15 @@ def find_input_mm_embeds(
     Note:
         - Supports both individual batching (len(mm_embeds) == len(multimodal_params))
           and pre-concatenated batching (len(mm_embeds) == 1)
+        - Call get_attached_multimodal_embeddings before this helper when
+          embeddings are already attached to multimodal_params.
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
         - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
           in the current chunk, this keeps rows [2:5].
     """
+    if not isinstance(mm_embeds, list):
+        raise TypeError("mm_embeds must be a list")
+
     # Current support two batching modes:
     # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
     # 2. Individual mm_embeds for each multimodal param, i.e., len(mm_embeds) == len(multimodal_params)
@@ -316,6 +359,11 @@ def find_input_mm_embeds(
             "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
         )
         return []
+
+    if not mm_embeds:
+        raise ValueError(
+            "No multimodal embeddings were provided or cached for active multimodal tokens."
+        )
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
         return mm_embeds
@@ -423,9 +471,7 @@ def fuse_input_embeds(
     if mm_token_indices.shape[0] != mm_embed.shape[0]:
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings. "
-            "This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
-            "cause token count mismatches within the inference batch.")
+            f"but received {mm_embed.shape[0]} image embeddings.")
 
     text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
@@ -909,7 +955,7 @@ def multiscale_forward(model,
     num_splits = [math.ceil(size / max_split_size)
                   for size in img_sizes]  # number of splits each scale
     input_multiscale = []
-    for size, num_split in zip(img_sizes, num_splits):
+    for size, num_split in zip(img_sizes, num_splits, strict=True):
         x = F.interpolate(input.to(torch.float32), size=size,
                           mode='bicubic').to(input.dtype)
         x = s2_split_chessboard(x, num_split=num_split)
@@ -936,7 +982,7 @@ def multiscale_forward(model,
     # merge outputs of different splits for each scale separately
     outs_multiscale = [
         s2_merge_chessboard(out, num_split=num_split)
-        for num_split, out in zip(num_splits, outs_multiscale)
+        for num_split, out in zip(num_splits, outs_multiscale, strict=True)
     ]
 
     # interpolate outputs from different scales and concat together
