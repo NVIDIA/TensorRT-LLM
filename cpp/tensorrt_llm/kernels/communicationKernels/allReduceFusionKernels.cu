@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -287,7 +287,8 @@ public:
 protected:
     __device__ __forceinline__ float4 rms_norm(float4 const& residual, float4 const& gamma)
     {
-        __shared__ float s_val;
+        __shared__ float block_acc;
+        __shared__ float scale;
         float4 norm_out;
         float acc = 0.f;
 #pragma unroll
@@ -303,7 +304,7 @@ protected:
         {
             if (threadIdx.x == 0)
             {
-                s_val = acc;
+                block_acc = acc;
                 acc = 0.f;
             }
             cluster.sync();
@@ -311,22 +312,21 @@ protected:
             {
                 for (int i = 0; i < cluster.num_blocks(); ++i)
                 {
-                    acc += *cluster.map_shared_rank(&s_val, i);
+                    acc += *cluster.map_shared_rank(&block_acc, i);
                 }
             }
-            cluster.sync();
         }
 #endif
         if (threadIdx.x == 0)
         {
-            s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+            scale = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
         }
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < kMathCount; ++i)
         {
             reinterpret_cast<DType*>(&norm_out)[i]
-                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
+                = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * scale
                     * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
         }
         return norm_out;
