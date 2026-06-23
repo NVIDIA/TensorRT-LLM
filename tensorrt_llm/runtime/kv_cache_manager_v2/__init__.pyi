@@ -134,6 +134,10 @@ class BatchDesc:
     system_prompt_length: int = 0
 
 @dataclass(slots=True)
+class SwaScratchReuseConfig:
+    max_rewind_len: int = 0
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     vocab_size: int
@@ -144,8 +148,10 @@ class KVCacheManagerConfig:
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     ssm_reuse_interval: int = 512
+    swa_scratch_reuse: SwaScratchReuseConfig | None = None
     helix_config: HelixConfig | None = None
-    enable_swa_scratch_reuse: bool = False
+    @property
+    def enable_swa_scratch_reuse(self) -> bool: ...
 
 # From _block_radix_tree.py
 def gen_multimodal_cache_key_tokens(
@@ -220,6 +226,7 @@ class _KVCache:
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
     def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
+    def prefetch(self, target: CacheLevel) -> bool: ...
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
     @property
     def has_scratch_slots(self) -> bool: ...

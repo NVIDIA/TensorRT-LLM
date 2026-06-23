@@ -35,7 +35,7 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.mla.trtllm_mla import _TRTLLM_MLA_ROPE_INFO_KEY
+from ...custom_ops.mla.rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -231,14 +231,18 @@ def _compute_rotary_cos_sin_from_config(
 
     max_position = getattr(model_config, "max_position_embeddings", 8192)
     half_dim = qk_rope_head_dim // 2
+    # Match the custom model's expression order; fused MLA is sensitive to RoPE table drift.
+    dim_indices = torch.arange(0, qk_rope_head_dim, 2, dtype=torch.float32)
 
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim))
+    inv_freq = 1.0 / (rope_theta ** (dim_indices / qk_rope_head_dim))
 
     # Handle YaRN scaling if present
     rope_scaling = getattr(model_config, "rope_scaling", None)
     mscale = 1.0
     if rope_scaling is not None:
-        scaling_type = rope_scaling.get("type", "")
+        scaling_type = rope_scaling.get(
+            "type", rope_scaling.get("rope_type", "yarn" if "factor" in rope_scaling else "")
+        )
         if scaling_type == "yarn":
             factor = rope_scaling.get("factor", 1.0)
             mscale_factor = rope_scaling.get("mscale", 1.0)
@@ -253,7 +257,7 @@ def _compute_rotary_cos_sin_from_config(
             # The model's softmax_scale already includes mscale^2, so the
             # cos/sin table must NOT duplicate it.
             numerator = _yarn_get_mscale(factor, mscale_factor)
-            denominator = _yarn_get_mscale(factor, mscale_all_dim) if mscale_all_dim else 1.0
+            denominator = _yarn_get_mscale(factor, mscale_all_dim)
             mscale = numerator / denominator if denominator != 0 else 1.0
             original_max = rope_scaling.get("original_max_position_embeddings", max_position)
             beta_fast = rope_scaling.get("beta_fast", 32)
@@ -271,18 +275,20 @@ def _compute_rotary_cos_sin_from_config(
                 _yarn_find_correction_dim(beta_slow, half_dim * 2, rope_theta, original_max)
             )
             low = max(low, 0)
-            high = min(high, half_dim - 1)
+            high = min(high, qk_rope_head_dim - 1)
+            if low == high:
+                high += 0.001
 
-            if low < high:
-                smooth = (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low)
-                smooth = smooth.clamp(0, 1)
-                inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
-            else:
-                inv_freq = inv_freq / factor
+            inv_freq_mask = 1.0 - torch.clamp(
+                (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low), 0, 1
+            )
+            freq_extra = 1.0 / (rope_theta ** (dim_indices / qk_rope_head_dim))
+            freq_inter = 1.0 / (factor * rope_theta ** (dim_indices / qk_rope_head_dim))
+            inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
 
     t = torch.arange(max_position, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    emb = torch.cat([freqs, freqs], dim=-1)
+    emb = torch.cat((freqs, freqs), dim=-1)
     cos_vals = emb.cos() * mscale
     sin_vals = emb.sin() * mscale
     result = torch.stack([cos_vals, sin_vals], dim=-1)

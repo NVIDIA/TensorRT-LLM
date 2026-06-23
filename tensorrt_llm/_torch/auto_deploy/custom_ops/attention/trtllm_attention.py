@@ -26,7 +26,7 @@ following the same design pattern as the FlashInfer backend:
 """
 
 import math
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -45,6 +45,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -94,7 +95,19 @@ class _TrtllmPlanner:
         self.context_lengths_gpu: Optional[torch.Tensor] = None  # [max_batch] int32 device
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
+        # ``self.block_offsets`` is the group-0 buffer (kept for the spec-dec
+        # scratch path and backward compatibility); additional KV window groups
+        # (VSWA / non-uniform sliding window, e.g. gpt-oss) get their own
+        # persistent buffer keyed by the group's ``cache_loc`` input pointer in
+        # ``_block_offsets_by_cache_loc``. The transform invokes
+        # ``prepare_trtllm_metadata`` once per group with that group's
+        # ``cache_loc_g{i}`` / ``cu_num_pages_g{i}`` inputs, so without per-group
+        # buffers the groups would clobber a single shared buffer.
         self.block_offsets: Optional[torch.Tensor] = None
+        self._block_offsets_by_cache_loc: dict[int, torch.Tensor] = {}
+        # Shapes for lazy per-group buffer allocation (set in ``reset``).
+        self._max_batch: int = 0
+        self._max_blocks_per_seq: int = 0
         # Per-layer cache for tensors that must survive CUDA graph replay.
         # Keyed by kv_cache.data_ptr() (stable and unique per layer).
         self._layer_cache: dict[
@@ -107,10 +120,10 @@ class _TrtllmPlanner:
         #   - ``is_spec_dec_active``: spec-dec has been initialized for this planner.
         #     Used as the idempotency guard for ``init_spec_decoding`` and gates
         #     planner-level per-graph work (see use sites for why).
-        #   - ``is_spec_decoding_enabled``: the attention kernel uses spec-dec mode (i.e.
-        #     ``spec_decoding_bool_params[0]`` is True). Mirrors the PyTorch backend's
-        #     ``is_spec_decoding_enabled`` (see ``tensorrt_llm/_torch/attention_backend/
-        #     trtllm.py:1567-1570``). Forced False on Blackwell (SM100+, except 120/121)
+        #   - ``is_spec_decoding_enabled``: the attention kernel uses spec-dec mode
+        #     (passed as the ``is_spec_decoding_enabled`` kwarg to thop.attention).
+        #     Mirrors the PyTorch backend's ``is_spec_decoding_enabled``.
+        #     Forced False on Blackwell (SM100+, except 120/121)
         #     because thop.attention routes through a trtllm-Gen FMHA spec-dec branch
         #     (``cpp/tensorrt_llm/thop/attentionOp.cpp:499-526``) that requires extra
         #     bl_tree mask tensors AutoDeploy does not produce for Eagle linear chains.
@@ -119,22 +132,13 @@ class _TrtllmPlanner:
         self.spec_decoding_generation_lengths: Optional[torch.Tensor] = None
         self.spec_decoding_position_offsets: Optional[torch.Tensor] = None
         self.spec_decoding_packed_mask: Optional[torch.Tensor] = None
-        # Pre-packed arg lists for thop.attention's spec-dec parameters. Sized in ``reset()``
-        # based on SM version and populated in ``init_spec_decoding`` / per-graph in
-        # ``prepare_trtllm_metadata``. The attention op reads these directly to avoid the
-        # per-layer list-building overhead.
-        #
-        # spec_decoding_bool_params:
-        #   [0] is_spec_decoding_enabled: kernel enters spec-dec branch (False on Blackwell)
-        #   [1] use_spec_decoding: use spec-dec THIS forward
-        #   [2] is_spec_dec_tree: draft is a tree structure (False for linear Eagle chain)
-        #
-        # spec_decoding_tensor_params (first 3 slots; Blackwell+ adds 3 trailing None tree-mask slots):
-        #   [0] generation_lengths: [max_requests] tokens per request this step
-        #   [1] position_offsets: [max_requests, draft_len+1] position offsets per token
-        #   [2] packed_mask: [max_requests, draft_len+1, ceil((draft_len+1)/32)] causal mask
-        self.spec_decoding_bool_params: List[Any] = [False, False, False]
-        self.spec_decoding_tensor_params: List[Optional[torch.Tensor]] = []
+        # Spec-dec scalars passed directly as thop.attention kwargs.
+        # - use_spec_decoding gates use of spec-dec THIS forward; set per-batch
+        #   in ``prepare_trtllm_metadata``.
+        # - The trtllm-Gen FMHA bl_tree mask tensors (last 3 spec_decoding_*
+        #   slots in thop.attention) are always None for AutoDeploy linear
+        #   Eagle chains.
+        self.use_spec_decoding: bool = False
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers.
@@ -157,9 +161,13 @@ class _TrtllmPlanner:
         self.host_request_types = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        self._max_batch = max_batch
+        self._max_blocks_per_seq = max_blocks_per_seq
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
+        # Group 0 reuses ``self.block_offsets``; it is registered under its
+        # ``cache_loc`` pointer on first use in ``_get_block_offsets_buffer``.
         self.host_past_kv_lengths = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
@@ -167,13 +175,6 @@ class _TrtllmPlanner:
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.context_lengths_gpu = torch.zeros(max_batch, dtype=torch.int32, device=device)
-
-        # Blackwell+ SMs (excluding 120/121 consumer variants) expect an extended spec-dec tensor
-        # list with three trailing tree-mask Nones. Size the list accordingly. Contents stay as
-        # Nones until init_spec_decoding populates the first three entries.
-        self.spec_decoding_tensor_params = [None] * (
-            6 if _is_blackwell_trtllm_gen_kernel(get_sm_version()) else 3
-        )
 
     def init_spec_decoding(self, max_batch: int, max_draft_len: int) -> None:
         """Initialize persistent spec-decoding tensors once when configured.
@@ -204,19 +205,12 @@ class _TrtllmPlanner:
         )
         self.spec_decoding_packed_mask = _generate_spec_decoding_packed_mask(max_batch, draft_len)
 
-        # Populate the pre-packed spec-dec params (static references). Only do this when
-        # the kernel actually enters the spec-dec branch; on Blackwell we leave the bools
-        # False and the tensor slots None so attentionOp.cpp's spec-dec block is skipped.
+        # On Blackwell, ``is_spec_decoding_enabled`` stays False so attentionOp.cpp's
+        # spec-dec block is skipped (the trtllm-Gen FMHA path requires bl_tree mask
+        # tensors AutoDeploy does not produce). ``use_spec_decoding`` is flipped to
+        # True per-batch during target model forward to match the PyTorch backend.
         if self.is_spec_decoding_enabled:
-            # spec_decoding_bool_params[0] gates the C++ spec-dec branch.
-            # spec_decoding_bool_params[1] is set to True during target model forward to
-            # match the PyTorch backend.
-            self.spec_decoding_bool_params[0] = True
-            self.spec_decoding_bool_params[1] = True
-
-            self.spec_decoding_tensor_params[0] = self.spec_decoding_generation_lengths
-            self.spec_decoding_tensor_params[1] = self.spec_decoding_position_offsets
-            self.spec_decoding_tensor_params[2] = self.spec_decoding_packed_mask
+            self.use_spec_decoding = True
 
     def get_layer_tensors(
         self,
@@ -313,23 +307,71 @@ class _TrtllmPlanner:
         self.num_contexts = num_prefill
         self.num_ctx_tokens = batch_info.get_num_tokens()[0]
 
+    def _get_block_offsets_buffer(self, cache_loc: torch.Tensor) -> torch.Tensor:
+        """Return the persistent block_offsets buffer for this KV window group.
+
+        Each KV window group is driven by its own ``cache_loc`` input tensor
+        (group 0 uses ``cache_loc``; groups 1..N-1 use ``cache_loc_g{i}``), which
+        are persistent buffers with stable ``data_ptr()`` across CUDA-graph
+        replays. Keying by that pointer (same pattern as ``_layer_cache`` keyed
+        by ``kv_cache.data_ptr()``) gives each group an independent, address-stable
+        block_offsets buffer so per-group ``prepare_trtllm_metadata`` invocations
+        do not clobber each other.
+
+        Lazily allocates a buffer on first sight of a group's ``cache_loc``. This
+        must happen during warm-up (never mid-capture) so the tensor address is
+        stable for graph replay; group 0's buffer reuses the one already
+        allocated in ``reset``.
+        """
+        key = cache_loc.data_ptr()
+        buf = self._block_offsets_by_cache_loc.get(key)
+        if buf is None:
+            assert self.block_offsets is not None, (
+                "planner.reset() must run before _get_block_offsets_buffer()"
+            )
+            if not self._block_offsets_by_cache_loc:
+                # First group seen this run is group 0: reuse the reset() buffer.
+                buf = self.block_offsets
+            else:
+                assert (
+                    not torch.cuda.is_current_stream_capturing()
+                ) or cuda_graph_state.in_warm_up(), (
+                    "block_offsets buffer for a new KV window group must be "
+                    "allocated during warm-up, not during CUDA graph capture. "
+                    "Ensure warm-up exercises every KV pool."
+                )
+                buf = torch.zeros(
+                    1,
+                    self._max_batch,
+                    2,
+                    self._max_blocks_per_seq,
+                    dtype=torch.int32,
+                    device=self.block_offsets.device,
+                )
+            self._block_offsets_by_cache_loc[key] = buf
+        return buf
+
     def plan_device(
         self,
         num_seq: int,
         block_offset_multiplier: int,
         cu_num_pages: torch.Tensor,
         cache_loc: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         """Per-forward DEVICE metadata: block_offsets via Triton kernel (pure GPU).
 
         Called from the ``prepare_trtllm_metadata`` custom op (in the graph).
+        Returns the per-group block_offsets buffer that was populated, so the op
+        can flow it through the graph to that group's attention layers.
         """
-        k_slice = self.block_offsets[0, :, 0, :]  # [max_batch, M], stride [2*M, 1]
+        block_offsets = self._get_block_offsets_buffer(cache_loc)
+        k_slice = block_offsets[0, :, 0, :]  # [max_batch, M], stride [2*M, 1]
         torch.ops.auto_deploy.ragged_to_block_table_triton(
             cache_loc, cu_num_pages, k_slice, num_seq
         )
-        self.block_offsets[0, :num_seq, 0, :].mul_(block_offset_multiplier)
-        self.block_offsets[0, :num_seq, 1, :] = self.block_offsets[0, :num_seq, 0, :] + 1
+        block_offsets[0, :num_seq, 0, :].mul_(block_offset_multiplier)
+        block_offsets[0, :num_seq, 1, :] = block_offsets[0, :num_seq, 0, :] + 1
+        return block_offsets
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
@@ -499,19 +541,19 @@ def prepare_trtllm_metadata(
     if _GlobalTrtllmPlanner.is_spec_dec_active:
         _GlobalTrtllmPlanner.refresh_batch_state(batch_info)
         if _GlobalTrtllmPlanner.is_spec_decoding_enabled:
-            _GlobalTrtllmPlanner.spec_decoding_bool_params[1] = (
-                batch_info.get_num_sequences()[2] == 0
-            )
+            _GlobalTrtllmPlanner.use_spec_decoding = batch_info.get_num_sequences()[2] == 0
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
-    _GlobalTrtllmPlanner.plan_device(
+    block_offsets = _GlobalTrtllmPlanner.plan_device(
         num_seq=batch_info.get_total_num_sequences(),
         block_offset_multiplier=block_offset_multiplier,
         cu_num_pages=cu_num_pages,
         cache_loc=cache_loc,
     )
 
-    return [_GlobalTrtllmPlanner.block_offsets]
+    # Return this group's buffer (keyed by ``cache_loc``) so multi-pool
+    # (VSWA) deployments flow the correct block_offsets to each group's layers.
+    return [block_offsets]
 
 
 @prepare_trtllm_metadata.register_fake
@@ -594,9 +636,13 @@ def trtllm_mha_with_cache(
     batch_info = BatchInfo(batch_info_host)
     num_seq = batch_info.get_total_num_sequences()
     num_tokens = batch_info.get_total_num_tokens()
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
-    # Use sliding_window for attention_window_size if provided, else full context length
+    # Use sliding_window for attention_window_size if provided, else full context length.
+    # The mask stays ``causal`` (matching the PyTorch backend, which never uses
+    # sliding_window_causal): the kernel honors the window via the cyclic
+    # attention-window handling driven by ``attention_window_size``.
     attention_window_size = (
         sliding_window
         if isinstance(sliding_window, int) and sliding_window > 0
@@ -659,12 +705,6 @@ def trtllm_mha_with_cache(
     # Pool mapping (shared, always zeros since layer offset is in pool_pointers)
     host_kv_cache_pool_mapping = _GlobalTrtllmPlanner.host_pool_mapping
 
-    # Pack parameters for thop.attention
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
-
-    mla_tensor_params = [None, None]
-
     # For Llama + Eagle3 + torch-cudagraph, we observe a crash without the following
     # use of _scratch_block_offsets. See:
     # https://github.com/NVIDIA/TensorRT-LLM/issues/13100
@@ -686,6 +726,7 @@ def trtllm_mha_with_cache(
         context_lengths,  # context_lengths
         _GlobalTrtllmPlanner.host_context_lengths[:num_seq],  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -702,25 +743,28 @@ def trtllm_mha_with_cache(
         True,  # is_fused_qkv
         True,  # update_kv_cache
         1,  # predicted_tokens_per_seq (always 1 except for MLA kernel)
-        0,  # layer_idx (always 0; pool_pointers already encodes the layer offset)
+        0,  # local_layer_idx (always 0; pool_pointers already encodes the layer offset)
         num_heads,  # num_heads
         num_kv_heads,  # num_kv_heads
         head_dim,  # head_size
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         attention_window_size,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
         scale * math.sqrt(head_dim) if scale is not None else 1.0,  # q_scaling
         position_embedding_type,  # position_embedding_type
-        rotary_embedding_dim,  # rotary_embedding_dim
-        10000.0,  # rotary_embedding_base
-        0,  # rotary_embedding_scale_type
-        rotary_embedding_scales,  # rotary_embedding_scales
-        rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
+        rotary_embedding_dim,  # rope_dim
+        10000.0,  # rope_base
+        0,  # rope_scale_type
+        1.0,  # rope_scale
+        1.0,  # rope_short_m_scale
+        1.0,  # rope_long_m_scale
+        max_context_length,  # rope_max_positions
+        max_context_length,  # rope_original_max_positions
         True,  # use_paged_context_fmha
         0,  # attention_input_type
         False,  # is_mla_enable
@@ -733,11 +777,19 @@ def trtllm_mha_with_cache(
         None,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
-        mla_tensor_params,  # mla_tensor_params
+        None,  # helix_position_offsets
+        None,  # helix_is_inactive_rank
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
-        _GlobalTrtllmPlanner.spec_decoding_bool_params,  # spec_decoding_bool_params
-        _GlobalTrtllmPlanner.spec_decoding_tensor_params,  # spec_decoding_tensor_params
+        _GlobalTrtllmPlanner.is_spec_decoding_enabled,  # is_spec_decoding_enabled
+        _GlobalTrtllmPlanner.use_spec_decoding,  # use_spec_decoding
+        False,  # is_spec_dec_tree (always False for AutoDeploy linear Eagle chains)
+        _GlobalTrtllmPlanner.spec_decoding_generation_lengths,
+        _GlobalTrtllmPlanner.spec_decoding_position_offsets,
+        _GlobalTrtllmPlanner.spec_decoding_packed_mask,
+        None,  # spec_decoding_bl_tree_mask_offset (None for AutoDeploy linear Eagle chains)
+        None,  # spec_decoding_bl_tree_mask
+        None,  # spec_bl_tree_first_sparse_mask_offset_kv
         None,  # sparse_kv_indices
         None,  # sparse_kv_offsets
         None,  # sparse_attn_indices
@@ -821,6 +873,13 @@ class TrtllmAttention(AttentionDescriptor):
     """
 
     @classmethod
+    def kernel_handles_cyclic_swa(cls) -> bool:
+        """thop.attention applies the sliding-window mask internally via cyclic
+        KV indexing, so the executor passes the full per-window block table and
+        global KV lengths (no host-side window slicing). See base class."""
+        return True
+
+    @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
         """Get the attention layout expected by the backend."""
         return "bsnd"
@@ -853,7 +912,7 @@ class TrtllmAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
+        """Return only the KV cache handler (no workspace handler; managed like flashinfer)."""
         # In fused QKV mode, K arg is the same as Q (flat fused tensor), so use hints.
         if source_attn_node.meta.get("_trtllm_fused_qkv"):
             num_kv_heads = source_attn_node.meta["_trtllm_num_kv_heads"]
@@ -877,6 +936,10 @@ class TrtllmAttention(AttentionDescriptor):
             num_kv_heads = k_fake.shape[2]
             head_dim = k_fake.shape[3]
             kv_dtype = k_fake.dtype
+        # ``sliding_window`` is propagated into the handler so layers
+        # with different windows land in separate pools.
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
@@ -885,6 +948,8 @@ class TrtllmAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_dtype),
                 kv_factor=2,
                 kv_layout="HND",
+                sliding_window=sliding_window,
+                attention_type=AttentionType.mha,
             )
         }
 
@@ -990,7 +1055,7 @@ class TrtllmAttention(AttentionDescriptor):
         if rope_info is not None:
             rope_cos_sin = rope_info["cos_sin_node"]
             pos_emb_type = rope_info["position_embedding_type"]
-            rot_emb_dim = rope_info["rotary_embedding_dim"]
+            rot_emb_dim = rope_info["rope_dim"]
         else:
             rope_cos_sin = None
             pos_emb_type = 0

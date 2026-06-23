@@ -14,14 +14,14 @@ files = [
 
 [[package]]
 name = "anyio"
-version = "4.13.0"
+version = "4.14.0"
 description = "High-level concurrency and networking framework on top of asyncio or Trio"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "anyio-4.13.0-py3-none-any.whl", hash = "sha256:08b310f9e24a9594186fd75b4f73f4a4152069e3853f1ed8bfbf58369f4ad708"},
-    {file = "anyio-4.13.0.tar.gz", hash = "sha256:334b70e641fd2221c1505b3890c69882fe4a2df910cba14d97019b90b24439dc"},
+    {file = "anyio-4.14.0-py3-none-any.whl", hash = "sha256:dd9b7a2a9799ed6552fde617b2c5df02b7fdd7d88392fc48101e51bae46164d9"},
+    {file = "anyio-4.14.0.tar.gz", hash = "sha256:b47c1f9ccf73e67021df785332508f99379c68fa7d0684e8e3492cb1d4b23f89"},
 ]
 
 [package.dependencies]
@@ -34,14 +34,14 @@ trio = ["trio (>=0.32.0)"]
 
 [[package]]
 name = "certifi"
-version = "2026.5.20"
+version = "2026.6.17"
 description = "Python package for providing Mozilla's CA Bundle."
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "certifi-2026.5.20-py3-none-any.whl", hash = "sha256:3c52e209ba0a4ad7aebe60436a4ab349c39e1e602e8c134221e546902ad25897"},
-    {file = "certifi-2026.5.20.tar.gz", hash = "sha256:69dea482ab64caa7b9f6aba1c6bf48bb6a5448d1c0f1b17ab42ad8c763a5344d"},
+    {file = "certifi-2026.6.17-py3-none-any.whl", hash = "sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"},
+    {file = "certifi-2026.6.17.tar.gz", hash = "sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"},
 ]
 
 [[package]]
@@ -148,14 +148,14 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "idna"
-version = "3.16"
+version = "3.18"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "idna-3.16-py3-none-any.whl", hash = "sha256:cc246e3a3f89580c3a951b5ad298ca4638078b2cdd4f115654332b5c26daded5"},
-    {file = "idna-3.16.tar.gz", hash = "sha256:d7a6da03db833450fca25d2358ac9ff06cd624577a4aea3a596d5c0f77b8e03d"},
+    {file = "idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"},
+    {file = "idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"},
 ]
 
 [package.extras]
@@ -282,14 +282,14 @@ files = [
 
 [[package]]
 name = "openai"
-version = "2.38.0"
+version = "2.43.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "openai-2.38.0-py3-none-any.whl", hash = "sha256:ec6661c57b2dcc47414a767e6e3335c7ed3d19c9696999283a3c82e95c756a3c"},
-    {file = "openai-2.38.0.tar.gz", hash = "sha256:798694c6cf74145541fda94325b6f8f72d8e1fd0262cc137c8d728177a6a4ce3"},
+    {file = "openai-2.43.0-py3-none-any.whl", hash = "sha256:65a670b54fadf2268c9e1330133373c963eb779ee969e5cbad419ec2c21dce97"},
+    {file = "openai-2.43.0.tar.gz", hash = "sha256:e74d238200a26868977002190fb6631613480a93dfe0c9c982e77021ed60a017"},
 ]
 
 [package.dependencies]
@@ -477,25 +477,24 @@ files = [
 
 [[package]]
 name = "tqdm"
-version = "4.67.3"
+version = "4.68.3"
 description = "Fast, Extensible Progress Meter"
 optional = false
-python-versions = ">=3.7"
+python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "tqdm-4.67.3-py3-none-any.whl", hash = "sha256:ee1e4c0e59148062281c49d80b25b67771a127c85fc9676d3be5f243206826bf"},
-    {file = "tqdm-4.67.3.tar.gz", hash = "sha256:7d825f03f89244ef73f1d4ce193cb1774a8179fd96f31d7e1dcde62092b960bb"},
+    {file = "tqdm-4.68.3-py3-none-any.whl", hash = "sha256:39832cc2def2789a6f29df83f172db7416cea70052c0907a57801c5f2fdccb03"},
+    {file = "tqdm-4.68.3.tar.gz", hash = "sha256:00dfa48452b6b6cfae3dd9885636c23d3422d1ec97c66d96818cbd5e0821d482"},
 ]
 
 [package.dependencies]
 colorama = {version = "*", markers = "platform_system == \"Windows\""}
 
 [package.extras]
-dev = ["nbval", "pytest (>=6)", "pytest-asyncio (>=0.24)", "pytest-cov", "pytest-timeout"]
-discord = ["requests"]
+discord = ["envwrap", "requests"]
 notebook = ["ipywidgets (>=6)"]
-slack = ["slack-sdk"]
-telegram = ["requests"]
+slack = ["envwrap", "slack-sdk"]
+telegram = ["envwrap", "requests"]
 
 [[package]]
 name = "typing-extensions"

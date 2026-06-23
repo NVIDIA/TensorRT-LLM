@@ -591,3 +591,97 @@ class TestMediaIoKwargsLoaderForwarding:
             result = parse_chat_message_content_part(part, tracker)
             await result["data"]
         mock_load.assert_called_once_with("data:audio/wav;base64,AAAA")
+
+
+class TestChatCompletionRequestSchemaValidation:
+    """Tests that ChatCompletionRequest pydantic schema accepts valid payloads.
+
+    Regression tests for NVBUG 6143579: multi-turn messages with
+    reasoning_content and content: null were rejected by the schema.
+    """
+
+    def test_reasoning_content_with_null_content_and_tool_calls(self):
+        """Round-tripping an assistant message with reasoning_content.
+
+        content: null must be accepted (OpenAI spec allows null content
+        when tool_calls is present).
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a coding assistant."},
+                {"role": "user", "content": "List files."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "User wants me to list files.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path":"/tmp"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+                {"role": "user", "content": "thanks"},
+            ],
+            "max_tokens": 16,
+        }
+
+        request = ChatCompletionRequest(**payload)
+        assert len(request.messages) == 5
+
+    def test_reasoning_field_with_null_content(self):
+        """The 'reasoning' field name (OpenAI SDK style) with content: null.
+
+        Should be accepted since CustomChatCompletionMessageParam allows
+        extra fields and content: null.
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "Let me think about this.",
+                },
+            ],
+        }
+
+        request = ChatCompletionRequest(**payload)
+        assert len(request.messages) == 2
+
+    def test_null_content_without_reasoning_fields(self):
+        """Plain assistant message with content: null and no reasoning fields.
+
+        Valid per OpenAI spec for tool_calls messages.
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "What's the weather?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"NYC"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "72F sunny"},
+            ],
+        }
+
+        request = ChatCompletionRequest(**payload)
+        assert len(request.messages) == 3

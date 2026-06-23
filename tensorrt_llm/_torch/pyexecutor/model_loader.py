@@ -9,9 +9,12 @@ import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
+from tensorrt_llm._torch.weight_sharing import (
+    IdentityCheckPolicy, SourceIdentity, check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
-                                          ModelExpressConfig, TorchLlmArgs)
+                                          ModelExpressConfig,
+                                          SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -29,7 +32,6 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import resolve_hf_torch_dtype, resolve_mamba_ssm_cache_dtype
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -45,10 +47,12 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = (
-            resolve_mamba_ssm_cache_dtype(config.pretrained_config)
-            or resolve_hf_torch_dtype(config.pretrained_config)
-            or config.torch_dtype)
+        hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
+                           None)
+        if hf_dtype is not None:
+            mamba_ssm_cache_dtype = str_dtype_to_torch(hf_dtype)
+        else:
+            mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
@@ -94,6 +98,28 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
+def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
+                                             kv_cache_config) -> None:
+    """Validate encoder-decoder KV-cache requirements for the PyTorch runtime.
+
+    Both V1 (``KVCacheManager``, default and production target) and V2
+    (``KVCacheManagerV2``, additive secondary path) are supported for
+    encoder-decoder models.  Both paths require ``cross_kv_cache_fraction``
+    so the cross-attention pool can be sized.
+    """
+    if model_config.is_encoder_decoder:
+        if kv_cache_config.cross_kv_cache_fraction is None:
+            raise ValueError(
+                "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
+            )
+        return
+
+    if kv_cache_config.cross_kv_cache_fraction is not None:
+        raise ValueError(
+            "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
+        )
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -112,7 +138,7 @@ def initialize_dummy_weights(
     """
 
     def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
-        """Return safe (min, max) bounds for uniform sampling of ``dtype``."""
+        """Return safe (min, max) bounds for uniform sampling of `dtype`."""
         # These values are not necessarily the largest possible min/max,
         # they need to be small enough to avoid NaNs.
         if dtype in (torch.float8_e4m3fn, torch.int8):
@@ -260,7 +286,7 @@ class ModelLoader:
             max_seq_len: The maximum sequence length.
             lora_config: Configuration for LoRA.
             model_weights_memory_tag: When set, parameter allocations during
-                ``load()`` are placed under a separate virtual-memory tag so
+                `load()` are placed under a separate virtual-memory tag so
                 they can be released/materialized independently of buffers.
             model_weights_restore_mode: RestoreMode for the model weights
                 virtual-memory scope.
@@ -274,7 +300,9 @@ class ModelLoader:
         self.lora_config = lora_config
         self.model_weights_memory_tag = model_weights_memory_tag
         self.model_weights_restore_mode = model_weights_restore_mode
+        self.weight_mapper = None
         self._weight_pool_proxy = None
+        self._gms_backend = None
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -285,7 +313,7 @@ class ModelLoader:
             return llm_args
 
         config_kwargs = {
-            'trust_remote_code': True,
+            'trust_remote_code': llm_args.trust_remote_code,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
         if llm_args.parallel_config:
@@ -295,6 +323,13 @@ class ModelLoader:
             config_kwargs['spec_config'] = llm_args.speculative_config
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        if llm_args.speculative_config is not None:
+            from tensorrt_llm._torch.speculative import \
+                update_spec_config_from_model_config
+
+            update_spec_config_from_model_config(llm_args.speculative_config,
+                                                 config.pretrained_config)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
@@ -310,6 +345,17 @@ class ModelLoader:
                     )
 
         return llm_args
+
+    @staticmethod
+    def _needs_source_identity(checkpoint_loader: BaseCheckpointLoader,
+                               load_format: LoadFormat) -> bool:
+        """Whether this load path can consume a SourceIdentity gate.
+
+        Keep ordinary loading a strict no-op: SourceIdentity is currently used
+        only by MX (pre-transfer fallback gate) and GMS (pre-materialize
+        strict gate), so default HF/AUTO paths should not even build one.
+        """
+        return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
 
     def load(
         self,
@@ -346,9 +392,26 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
+            self._source_identity: Optional[SourceIdentity] = None
+            if self._needs_source_identity(checkpoint_loader, load_format):
+                # Receiver's local SourceIdentity, built once from the final
+                # ModelConfig and the freshly constructed module. The module's
+                # realized parameter/buffer (shape, dtype) map is the layout
+                # ground truth; building it here (post-construction,
+                # pre-weight-load) gives producer and consumer a common,
+                # comparable lifecycle point.
+                self._source_identity = SourceIdentity.from_model_config(
+                    config,
+                    model,
+                    model_name=str(
+                        getattr(self.llm_args, "model", None)
+                        or checkpoint_dir),
+                )
+
             memo = dict()
 
-            if self.model_weights_memory_tag is not None:
+            if (self.model_weights_memory_tag is not None
+                    and load_format != LoadFormat.GMS):
                 # Allocate buffers to the outer virtual_memory_scope,
                 # but parameters (weights) to the dedicated inner virtual_memory_scope.
 
@@ -395,7 +458,7 @@ class ModelLoader:
                         self.model_weights_restore_mode) as pool:
                     model._apply(allocate_weights_on_cuda)
                 self._weight_pool_proxy = pool
-            elif is_meta_init:
+            elif is_meta_init and load_format != LoadFormat.GMS:
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
@@ -409,7 +472,8 @@ class ModelLoader:
 
             # Ensure everything is at least on CUDA
             # No-op if worked as expected
-            model.to("cuda")
+            if load_format != LoadFormat.GMS:
+                model.to("cuda")
             del memo
 
             rank_model_storage = get_rank_model_storage(model)
@@ -417,6 +481,13 @@ class ModelLoader:
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             weights_preloaded = False
+            # Set when either GMS RW or GMS RO branch has already run the
+            # post_load_* hooks itself, so the shared post-load block below
+            # must skip them. RW handles them inside `mem_pool_scope` so the
+            # committed pool reflects the post-post_load layout; RO runs
+            # `module.post_load_weights()` before `materialize_module` to
+            # wire aliases prior to zero-copy mapping.
+            gms_post_load_handled = False
             if load_format == LoadFormat.AUTO:
                 # Pass model= so format-specific loaders (e.g. MX) can
                 # write weights directly into parameter buffers via P2P.
@@ -425,6 +496,8 @@ class ModelLoader:
                 load_weights_kwargs: dict = {
                     "mapping": self.mapping,
                     "model": model,
+                    # Generic loaders ignore it; MXCheckpointLoader pops it.
+                    "source_identity": self._source_identity,
                 }
 
                 if hasattr(model, 'llm_checkpoint_dir'):
@@ -461,6 +534,230 @@ class ModelLoader:
                     self._call_load_weights(model.load_draft_weights, weights,
                                             draft_weight_mapper)
 
+            elif load_format == LoadFormat.GMS:
+                # GPU Memory Service path: weight tensors live in a
+                # node-shared GPU memory pool so multiple TRT-LLM instances
+                # zero-copy share the same weight bytes. Two roles:
+                #   - RW (writer): opens `mem_pool_scope` BEFORE meta-
+                #     materialization and to(cuda), runs the entire model
+                #     bring-up (load + draft load + post_load_*) inside the
+                #     pool, then commits via `finalize_write` so RO peers
+                #     receive the post-post_load layout.
+                #   - RO (reader): zero-copy materializes weights from the
+                #     pool into the model via `materialize_module`; no
+                #     disk I/O, no per-instance copies.
+                # Imported lazily so the optional `gpu_memory_service`
+                # dependency only loads when GMS is actually selected.
+                from tensorrt_llm._torch.memory import GMSBackend
+
+                gms_backend = GMSBackend(
+                    socket_path=self.llm_args.gms_config.socket_path,
+                    mapping=self.mapping,
+                    mode=self.llm_args.gms_config.mode,
+                    tag=self.llm_args.gms_config.tag,
+                )
+
+                if not gms_backend.connect():
+                    raise RuntimeError(
+                        "Failed to connect to GMS at "
+                        f"{self.llm_args.gms_config.socket_path}")
+
+                self._gms_backend = gms_backend
+                try:
+                    # `is_rw` is `Optional[bool]` on the GPU memory backend
+                    # protocol: True = RW lock granted, False = RO lock granted,
+                    # None = unset. After a successful `connect()` it must be
+                    # True or False; `None` is treated as an adapter bug and
+                    # surfaces as a hard error rather than silently falling
+                    # through to the RO path.
+                    if gms_backend.is_rw is True:
+                        # RW path: open the GMS pool BEFORE meta-tensor
+                        # materialization and to(cuda), so every CUDA
+                        # allocation needed to bring the model up — meta
+                        # materialization, to(cuda), checkpoint load, draft
+                        # load, post_load hooks — lands in the GMS pool. After
+                        # the pool is closed, finalize_write commits the
+                        # post-post_load layout for RO peers to map zero-copy.
+                        # Mirrors the upstream Dynamo TRT-LLM shim pattern.
+                        with gms_backend.mem_pool_scope(torch.device("cuda")):
+                            # Materialize meta tensors inside the pool. Local
+                            # memo because the outer one was deleted (and the
+                            # outer `init_meta_tensor` branch is gated off
+                            # for GMS so it never ran).
+                            if is_meta_init:
+                                gms_memo: dict = {}
+
+                                def init_meta_tensor_in_pool(t: torch.Tensor):
+                                    if t.device != torch.device('meta'):
+                                        return t
+                                    if t not in gms_memo:
+                                        gms_memo[t] = torch.empty_like(
+                                            t, device='cuda')
+                                    return gms_memo[t]
+
+                                model._apply(init_meta_tensor_in_pool)
+
+                            # Catch-all for any tensors not on CUDA yet.
+                            model.to("cuda")
+
+                            weight_source = (model.llm_checkpoint_dir
+                                             if hasattr(model,
+                                                        'llm_checkpoint_dir')
+                                             else checkpoint_dir)
+                            # Pass model= for symmetry with the LoadFormat.AUTO
+                            # primary load above. Generic loaders (HF) ignore
+                            # this kwarg; loaders that consume a live module
+                            # reference (MX) use it for direct P2P writes into
+                            # parameter buffers. Keeping the call shape
+                            # consistent here avoids forgetting it when MX+GMS
+                            # composition lands later.
+                            weights = checkpoint_loader.load_weights(
+                                weight_source,
+                                mapping=self.mapping,
+                                model=model,
+                                source_identity=self._source_identity)
+
+                            # `weights` may be:
+                            #   - non-empty dict: standard mapping pipeline runs
+                            #   - empty/None + `is_weights_preloaded()=True`:
+                            #     the loader populated the model directly
+                            #     (e.g. MX P2P), so no mapping is needed
+                            #   - empty/None + `is_weights_preloaded()=False`:
+                            #     loader returned nothing AND didn't preload —
+                            #     the model would be committed in an
+                            #     uninitialized state, so abort. Per-tensor
+                            #     partial loads (missing keys in a non-empty
+                            #     dict) are caught downstream by
+                            #     `model.load_weights` strict checking.
+                            weights_preloaded = checkpoint_loader.is_weights_preloaded(
+                            )
+                            if weights:
+                                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                                    model, config)
+                                self._call_load_weights(model.load_weights,
+                                                        weights,
+                                                        self.weight_mapper)
+                            elif not weights_preloaded:
+                                raise RuntimeError(
+                                    f"GMS RW: checkpoint loader "
+                                    f"'{checkpoint_loader.checkpoint_format}' "
+                                    f"returned empty weights ({weights!r}) and "
+                                    "did not preload the model. Refusing to "
+                                    "commit an unpopulated model to the GMS "
+                                    "pool.")
+
+                            if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                            ):
+                                draft_weights = checkpoint_loader.load_weights(
+                                    self.spec_config.speculative_model,
+                                    mapping=self.mapping)
+
+                                draft_model_arch = model.draft_config.pretrained_config.architectures[
+                                    0]
+                                draft_weight_mapper = AutoCheckpointMapper.get(
+                                    checkpoint_loader.checkpoint_format,
+                                    draft_model_arch)
+                                draft_weight_mapper.init_model_and_config(
+                                    model.draft_model, model.draft_config)
+
+                                self._call_load_weights(
+                                    model.load_draft_weights, draft_weights,
+                                    draft_weight_mapper)
+
+                            # Run post_load hooks INSIDE the pool so any
+                            # tensors they create or rebind (fused QKV,
+                            # quantization scales, derived aliases) land in
+                            # GMS and become part of the committed layout
+                            # that RO peers receive. Closes hhzhang16's
+                            # narrow-scope and commit-ordering concerns.
+                            checkpoint_loader.post_load_apply(
+                                model, weights_preloaded=weights_preloaded)
+                            checkpoint_loader.post_load_publish(
+                                model,
+                                checkpoint_dir=checkpoint_dir,
+                                weights_preloaded=weights_preloaded)
+
+                            for module in model.modules():
+                                if hasattr(
+                                        module,
+                                        'post_load_weights') and not getattr(
+                                            module, '_weights_removed', False):
+                                    module.post_load_weights()
+
+                            # Defensive last-mile sweep: catches strays from
+                            # C++ ops that bypassed the active torch
+                            # allocator (e.g. native cudaMalloc).
+                            gms_backend.move_untracked_params(model)
+                            # Safe with active GMS mappings: GMSBackend.connect()
+                            # installed upstream's patch_empty_cache(), which makes
+                            # torch.cuda.empty_cache() skip GMS-backed VMM regions.
+                            # Frees the non-GMS originals dropped by
+                            # move_untracked_params (tensor.data was rebound to
+                            # GMS-backed replacements above) before commit so the
+                            # cached size doesn't show as live in memory accounting.
+                            torch.cuda.empty_cache()
+
+                        # Pool closed. Commit the post-post_load layout.
+                        gms_backend.finalize_write(model)
+                        gms_post_load_handled = True
+                        logger.info(
+                            "LoadFormat.GMS (RW): loaded and committed weights via %s",
+                            checkpoint_loader.checkpoint_format)
+                    elif gms_backend.is_rw is False:
+                        # RO path: weights are coming from a GMS donor that
+                        # has already committed the post-post_load layout, so
+                        # the receiver flags `weights_preloaded=True` on the
+                        # checkpoint-loader hooks. `MXCheckpointLoader.post_load_publish`
+                        # (and any other format-aware loader) honors this flag
+                        # to early-return and not re-publish, while still
+                        # letting `post_load_apply` perform any
+                        # receiver-side per-format work (e.g., marking
+                        # presharded modules).
+                        #
+                        # Hook order:
+                        #   1. `post_load_apply`: format-specific apply
+                        #      work (e.g., MX preshard markers).
+                        #   2. Per-module `post_load_weights`: creates
+                        #      aliases/derived parameter attributes BEFORE
+                        #      `materialize_module` walks the final module
+                        #      tree (including `draft_model` for spec dec).
+                        #   3. `materialize_module`: zero-copy bind GMS
+                        #      pool storage onto the model parameters.
+                        #   4. `post_load_publish`: any receiver-side
+                        #      publish (no-op via the receiver guard).
+                        checkpoint_loader.post_load_apply(
+                            model, weights_preloaded=True)
+
+                        for module in model.modules():
+                            if hasattr(module,
+                                       'post_load_weights') and not getattr(
+                                           module, '_weights_removed', False):
+                                module.post_load_weights()
+
+                        # Pre-materialize compatibility gate. GMS has no
+                        # disk-fallback path, so a mismatch raises under STRICT
+                        # rather than falling back.
+                        self._check_gms_source_identity(gms_backend)
+
+                        gms_backend.materialize_module(model)
+
+                        checkpoint_loader.post_load_publish(
+                            model,
+                            checkpoint_dir=checkpoint_dir,
+                            weights_preloaded=True)
+                        gms_post_load_handled = True
+                        logger.info("LoadFormat.GMS (RO): materialized weights")
+                    else:
+                        raise RuntimeError(
+                            f"GMS backend connected but lock state is unset "
+                            f"(is_rw={gms_backend.is_rw!r}); expected True (RW) "
+                            "or False (RO). This indicates a bug in the GMS "
+                            "adapter or a protocol violation.")
+                except Exception:
+                    gms_backend.cleanup()
+                    self._gms_backend = None
+                    raise
+
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
@@ -479,18 +776,27 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
-            checkpoint_loader.post_load_apply(
-                model, weights_preloaded=weights_preloaded)
-            checkpoint_loader.post_load_publish(
-                model,
-                checkpoint_dir=checkpoint_dir,
-                weights_preloaded=weights_preloaded)
+            if not gms_post_load_handled:
+                checkpoint_loader.post_load_apply(
+                    model, weights_preloaded=weights_preloaded)
+                checkpoint_loader.post_load_publish(
+                    model,
+                    checkpoint_dir=checkpoint_dir,
+                    weights_preloaded=weights_preloaded)
 
-            for module in model.modules():
-                if hasattr(module, 'post_load_weights') and not getattr(
-                        module, '_weights_removed', False):
-                    module.post_load_weights()
+                self._walk_full_post_load(model)
 
+            # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
+            # `register_weight_slots_after_to_cuda` and `finalize_model`
+            # must run INSIDE `mem_pool_scope` and BEFORE `finalize_write`
+            # so MoE allocations become part of the committed layout that
+            # RO peers receive. Today they run outside the pool and after
+            # commit, which would silently produce a broken MoE routing
+            # state on RO peers — that combination is REJECTED at config
+            # time by `TorchLlmArgs.validate_gms_moe_compat` in
+            # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
+            # follow-up, drop the validator gate AFTER moving these calls
+            # into the pool scope.
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
                 logger.info("moe_load_balancer finalizing model...")
@@ -501,15 +807,176 @@ class ModelLoader:
 
         return model, moe_load_balancer
 
+    def _check_gms_source_identity(self, gms_backend) -> None:
+        """Pre-materialize SourceIdentity gate for the GMS read-only path.
+
+        GMS has no disk-fallback path, so a missing or mismatched identity
+        raises under `STRICT` rather than falling back.
+
+        Args:
+            gms_backend: The connected GMS backend (RO role) exposing
+                `get_source_identity()`.
+
+        Raises:
+            SourceIdentityMismatchError: When the writer's identity is
+                available and incompatible with this receiver's identity.
+        """
+        check_weight_sharing_compatibility(
+            self._source_identity,
+            gms_backend.get_source_identity(),
+            IdentityCheckPolicy.STRICT,
+        )
+
+    @staticmethod
+    def _setup_aliases(model: DecoderModelForCausalLM) -> None:
+        """Run top-level structural alias setup if the model defines it.
+
+        Alias wiring is a model-level concern. It is intentionally not a
+        recursive module walk, because migrated aliases are expected to be set
+        by the root model that owns the layer graph.
+
+        Args:
+            model: Root decoder model whose top-level alias hook should run.
+
+        Returns:
+            None.
+        """
+        setup_aliases: Optional[Callable[[], None]] = getattr(
+            model, 'setup_aliases', None)
+        if setup_aliases is not None:
+            setup_aliases()
+
+    @staticmethod
+    def _walk_transform(model: DecoderModelForCausalLM) -> None:
+        """Run one-shot weight transforms on eligible modules.
+
+        The walk is duck-typed so modules can opt in without inheriting a shared
+        base class. Modules whose weights were removed are skipped, and modules
+        already marked `_weights_transformed` are left untouched until an
+        orchestrator resets the flag after rebinding fresh weight bytes.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            transform_weights: Optional[Callable[[], None]] = getattr(
+                module, 'transform_weights', None)
+            if transform_weights is not None and not getattr(
+                    module, '_weights_removed', False) and not getattr(
+                        module, '_weights_transformed', False):
+                transform_weights()
+
+    @staticmethod
+    def _walk_cache_state(model: DecoderModelForCausalLM) -> None:
+        """Recompute derived Python-side state on eligible modules.
+
+        This walk is separate from weight transforms so callers that already
+        have transformed weight bytes can refresh local Python state without
+        mutating tensor layouts again.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            cache_derived_state: Optional[Callable[[], None]] = getattr(
+                module, 'cache_derived_state', None)
+            if cache_derived_state is not None and not getattr(
+                    module, '_weights_removed', False):
+                cache_derived_state()
+
+    @staticmethod
+    def _walk_full_post_load(model: DecoderModelForCausalLM) -> None:
+        """Run the backward-compatible post-load hook on eligible modules.
+
+        This preserves the previous `ModelLoader` behavior for standard load
+        paths while staged-hook migration proceeds incrementally.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            post_load_weights: Optional[Callable[[], None]] = getattr(
+                module, 'post_load_weights', None)
+            if post_load_weights is not None and not getattr(
+                    module, '_weights_removed', False):
+                post_load_weights()
+
+    @staticmethod
+    def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:
+        """Mark transformed modules as needing a new transform pass.
+
+        Orchestrators call this before rebinding fresh, untransformed weights.
+        The reset only touches modules that already carry the flag so unrelated
+        modules do not grow staged-hook state eagerly.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            if hasattr(module, '_weights_transformed'):
+                module._weights_transformed = False
+
     def reload(self,
                model: DecoderModelForCausalLM,
                weights: dict,
-               allow_partial_loading: bool = False):
+               allow_partial_loading: bool = False) -> None:
+        """Reload model weights without running post-load hooks.
+
+        Reload is used by incremental update paths that may provide only a
+        partial set of replacement weights. The owner of the update lifecycle is
+        responsible for running post-load processing once all bytes are present.
+
+        Args:
+            model: Model instance receiving the replacement weights.
+            weights: Checkpoint weights to pass to `model.load_weights`.
+            allow_partial_loading: Whether missing replacement weights are
+                allowed by models that support partial loading.
+
+        Returns:
+            None.
+        """
+        if self.weight_mapper is None:
+            raise RuntimeError(
+                "Cannot reload weights: weight_mapper was not initialized. "
+                "This can happen when the initial load used GMS, MX P2P, or "
+                "VISION_ONLY, which bypass the standard weight mapping path.")
         self._call_load_weights(model.load_weights,
                                 weights,
                                 self.weight_mapper,
                                 allow_partial_loading=allow_partial_loading)
         torch.cuda.current_stream().synchronize()
+
+    def cleanup(self) -> None:
+        """Release backend resources acquired during :meth:`load`.
+
+        Currently the only backend held by `ModelLoader` is the
+        optional GMS client, established by the `LoadFormat.GMS`
+        branch. Releasing it disconnects from the GMS daemon and evicts
+        the per-tag client registry entry; weights remain alive
+        on-device for any other process holding an RO lock on the same
+        `tag`.
+
+        Idempotent: a second call after a successful cleanup is a no-op
+        because the backend handle is dropped. Best-effort: any failure
+        in the underlying `GMSBackend.cleanup()` is swallowed there
+        and logged, so this method never raises — safe to call from
+        :meth:`PyTorchModelEngine.cleanup` and `__del__` paths.
+        """
+        if self._gms_backend is not None:
+            self._gms_backend.cleanup()
+            self._gms_backend = None
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,
@@ -517,7 +984,7 @@ class ModelLoader:
         """Loads and validates the model configuration."""
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
-            trust_remote_code=True,
+            trust_remote_code=self.llm_args.trust_remote_code,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
             use_cuda_graph=self.llm_args.cuda_graph_config is not None,
@@ -577,6 +1044,8 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_kv_cache_config(config,
+                                                 self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
@@ -597,6 +1066,45 @@ class ModelLoader:
                 if hasattr(config.pretrained_config, sub_config):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
+
+        # Shared-weights vanilla MTP: build extra MTP layer instances beyond
+        # what the checkpoint provides (one ckpt MTP layer, multiple draft
+        # tokens, one KV cache per draft position) by sharing the single
+        # ckpt MTP layer's weights via mod-indexing in
+        # DeepseekV3WeightLoader. We expand
+        # pretrained_config.num_nextn_predict_layers to max_draft_len before
+        # model construction and preserve the original ckpt count as
+        # `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
+        #
+        # NOTE: this is a very special MTP mode that has not been used in
+        # any real-world workload to date; only DeepSeek has indicated they
+        # want to keep the path alive for their model. We therefore only
+        # support it on DeepSeek model_types for now. Other MTP-capable
+        # model families don't need this mode -- when their users request
+        # vanilla with max_draft_len > ckpt count, the natural
+        # `min(max_draft_len, ckpt_nextn)` clamp inside MTPForCausalLM
+        # silently caps the draft length to ckpt_nextn, which is the
+        # expected behavior for them.
+        _DEEPSEEK_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32"}
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+        spec_config = self.spec_config
+        if (isinstance(spec_config, MTPDecodingConfig)
+                and spec_config.use_mtp_vanilla
+                and spec_config.max_draft_len is not None
+                and getattr(config.pretrained_config, 'model_type',
+                            None) in _DEEPSEEK_MTP_MODEL_TYPES
+                and getattr(config.pretrained_config,
+                            'num_nextn_predict_layers', None)):
+            ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
+            if spec_config.max_draft_len > ckpt_nextn:
+                config.pretrained_config._ckpt_num_nextn_predict_layers = ckpt_nextn
+                config.pretrained_config.num_nextn_predict_layers = \
+                    spec_config.max_draft_len
+                logger.warning(
+                    f"MTP vanilla: expanding num_nextn_predict_layers from "
+                    f"{ckpt_nextn} to {spec_config.max_draft_len} to match "
+                    f"max_draft_len. Extra MTP layer instances will share "
+                    f"checkpoint weights via mod-indexing.")
         return config
 
     def _call_load_weights(self,

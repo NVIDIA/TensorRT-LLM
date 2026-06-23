@@ -490,7 +490,10 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.self_attn = Qwen3NextAttention(
             model_config,
             layer_idx=layer_idx,
-            fuse_qk_norm_rope=False,
+            # Gemma-style QK-norm is now supported by the fused qk_norm_rope
+            # kernel (use_gemma path), so fuse instead of running separate
+            # split + q/k RMSNorm + RoPE kernels.
+            fuse_qk_norm_rope=True,
         )
 
         self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
@@ -973,18 +976,9 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
-    def load_weights(self,
-                     weights: dict,
-                     weight_mapper: BaseWeightMapper,
-                     params_map: Optional[Dict[str, str]] = None,
-                     allow_partial_loading: bool = False):
+    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(
-            new_weights,
-            weight_mapper=weight_mapper,
-            params_map=params_map,
-            allow_partial_loading=allow_partial_loading,
-        )
+        super().load_weights(new_weights, weight_mapper)
 
     def post_load_weights(self):
         for idx, layer in enumerate(

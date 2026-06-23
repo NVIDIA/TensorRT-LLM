@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,11 +25,12 @@ import torch
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
+from ...attention_backend.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
-from ..config import SageAttentionConfig
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -184,10 +185,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     TRTLLM Attention wrapper for diffusion models.
 
     Handles:
-    - Fused QKV requirement for TRTLLM kernel (when sage params are not provided)
+    - Fused QKV requirement for TRTLLM kernel (used when no quant_attention_config is provided)
     - Metadata creation and preparation
     - No KV cache operation
-    - SageAttention per-block QKV quantization (when sage params are provided. requires unfused QKV)
+    - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
     """
 
     def __init__(
@@ -200,8 +201,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         dtype: Optional[torch.dtype] = None,
         max_batch_size: int = 16,
         max_seq_len: int = 4096,
-        sage_attention_config: Optional[SageAttentionConfig] = None,
+        quant_attention_config: Optional[QuantAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
+        sparse_params: Optional[SkipSoftmaxParams] = None,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -211,6 +213,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             quant_config=quant_config,
+            sparse_params=sparse_params,
             dtype=dtype,
         )
 
@@ -223,8 +226,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             attention_metadata_state=attention_metadata_state,
         )
 
-        # SageAttention: presence of config object implies enablement
-        self.sage_attention_config = sage_attention_config
+        self.quant_attention_config = quant_attention_config
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
@@ -286,12 +288,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
+        timestep = kwargs.pop("timestep", None)
 
-        if self.sage_attention_config is not None:
+        if self.quant_attention_config is not None:
             assert k is not None and v is not None, (
                 "SageAttention requires separate Q, K, V tensors"
             )
-            sage_cfg = self.sage_attention_config
+            quant_cfg = self.quant_attention_config
             q = q.reshape(batch_size * seq_len, -1).contiguous()
             k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
             v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
@@ -301,10 +304,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 v=v,
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
-                sage_attn_num_elts_per_blk_q=sage_cfg.num_elts_per_blk_q,
-                sage_attn_num_elts_per_blk_k=sage_cfg.num_elts_per_blk_k,
-                sage_attn_num_elts_per_blk_v=sage_cfg.num_elts_per_blk_v,
-                sage_attn_qk_int8=sage_cfg.qk_int8,
+                timestep=timestep,
+                sage_attn_num_elts_per_blk_q=quant_cfg.q_block_size,
+                sage_attn_num_elts_per_blk_k=quant_cfg.k_block_size,
+                sage_attn_num_elts_per_blk_v=quant_cfg.v_block_size,
+                sage_attn_qk_int8=(quant_cfg.qk_dtype == "int8"),
             )
         else:
             if k is None and v is None:
@@ -317,6 +321,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 v=None,
                 metadata=prepared_metadata,
                 attention_mask=attention_mask,
+                timestep=timestep,
             )
         output = output.view(batch_size, seq_len, -1)
         return output
@@ -328,4 +333,4 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     def support_fused_qkv(self) -> bool:
         """Standard path fuses QKV; SageAttention path does not."""
-        return self.sage_attention_config is None
+        return self.quant_attention_config is None

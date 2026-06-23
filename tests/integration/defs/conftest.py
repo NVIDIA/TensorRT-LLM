@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -293,33 +293,6 @@ def disaggregated_example_root(llm_root, llm_venv):
     return example_root
 
 
-@pytest.fixture(scope="module")
-def gemma_example_root(llm_root, llm_venv):
-    "Get gemma example root"
-
-    example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="function")
-def gemma_model_root(request):
-    "Get gemma model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if hasattr(request, "param"):
-        gemma_model_root = os.path.join(models_root, f"gemma/{request.param}")
-
-    assert exists(gemma_model_root), f"{gemma_model_root} does not exist!"
-
-    return gemma_model_root
-
-
 @pytest.fixture(scope="function")
 def minitron_model_root(request):
     "Get minitron model root"
@@ -536,26 +509,6 @@ def eagle_example_root(llm_root, llm_venv):
 def mamba_example_root(llm_root, llm_venv):
     "Get mamba example root"
     example_root = os.path.join(llm_root, "examples", "models", "core", "mamba")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    yield example_root
-
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(llm_root, "requirements.txt")
-    ])
-
-
-@pytest.fixture(scope="module")
-def recurrentgemma_example_root(llm_root, llm_venv):
-    "Get recurrentgemma example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "recurrentgemma")
-
-    # install requirements
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -950,16 +903,6 @@ def llm_gpt2b_lora_model_root(request):
 
 
 @pytest.fixture(scope="module")
-def llama_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    # Use llama-7b-hf to load tokenizer
-    llama_tokenzier_model_root = os.path.join(models_root, "llama-models",
-                                              "llama-7b-hf")
-    return llama_tokenzier_model_root
-
-
-@pytest.fixture(scope="module")
 def llama_v2_tokenizer_model_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -975,37 +918,12 @@ def llama_v2_tokenizer_model_root():
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "llama-7b":
-        llama_model_root = os.path.join(models_root, "llama-models",
-                                        "llama-7b-hf")
-    elif request.param == "llama-30b":
+    if request.param == "llama-30b":
         llama_model_root = os.path.join(models_root, "llama-models",
                                         "llama-30b-hf")
     elif request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-v2-7b":
-        llama_model_root = os.path.join(models_root, "llama-models-v2", "7B")
-    elif request.param == "llama-v2-70b":
-        llama_model_root = os.path.join(models_root, "llama-models-v2", "70B")
-    elif request.param == "llama-v2-70b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-70b-hf")
-    elif request.param == "Llama-2-7B-AWQ":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "Llama-2-7B-AWQ")
-    elif request.param == "Llama-2-7B-GPTQ":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "Llama-2-7B-GPTQ")
-    elif request.param == "llama-v2-13b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-13b-hf")
-    elif request.param == "llama-v2-7b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-7b-hf")
-    elif request.param == "llama-v2-70b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-70b-hf")
     elif request.param == "llama-v3-8b-hf":
         llama_model_root = os.path.join(models_root, "llama-models-v3", "8B")
     elif request.param == "llama-v3-8b-instruct-hf":
@@ -1017,15 +935,6 @@ def llama_model_root(request):
     elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
         llama_model_root = os.path.join(models_root, "llama-models-v3",
                                         "Llama-3-70B-Instruct-Gradient-1048k")
-    elif request.param == "llama-3.1-405b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-405B")
-    elif request.param == "llama-3.1-405b-fp8":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-405B-FP8")
-    elif request.param == "llama-3.1-70b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-70B")
     elif request.param == "llama-3.1-8b":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Meta-Llama-3.1-8B")
@@ -1038,9 +947,6 @@ def llama_model_root(request):
     elif request.param == "llama-3.1-8b-hf-nvfp4":
         llama_model_root = os.path.join(models_root, "nvfp4-quantized",
                                         "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.1-70b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-70B-Instruct")
     elif request.param == "llama-3.2-1b":
         llama_model_root = os.path.join(models_root, "llama-3.2-models",
                                         "Llama-3.2-1B")
@@ -1091,11 +997,6 @@ def draft_target_model_roots(request):
     if request.param == "gpt2":
         draft_model_root = os.path.join(models_root, "gpt2-medium")
         target_model_root = os.path.join(models_root, "gpt2-medium")
-    elif request.param == "llama_v2":
-        draft_model_root = os.path.join(models_root,
-                                        "llama-models-v2/llama-v2-7b-hf")
-        target_model_root = os.path.join(models_root,
-                                         "llama-models-v2/llama-v2-13b-hf")
 
     assert os.path.exists(
         draft_model_root
@@ -1112,9 +1013,6 @@ def ngram_root(request):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
     if request.param == "gpt2":
         models_root = os.path.join(models_root, "gpt2-medium")
-    elif request.param == "llama_v2":
-        models_root = os.path.join(models_root,
-                                   "llama-models-v2/llama-v2-13b-hf")
     assert os.path.exists(
         models_root
     ), f"NGram model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -1259,33 +1157,6 @@ def mamba_model_root(request):
 
 
 @pytest.fixture(scope="function")
-def recurrentgemma_model_root(request):
-    "get recurrentgemma model data"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-
-    if request.param == "recurrentgemma-2b":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b")
-    elif request.param == "recurrentgemma-2b-it":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b-it")
-    elif request.param == "recurrentgemma-2b-flax":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b-flax", "2b")
-    elif request.param == "recurrentgemma-2b-it-flax":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b-it-flax",
-                                                 "2b-it")
-
-    assert exists(recurrentgemma_model_root
-                  ), f"{recurrentgemma_model_root} does not exist!"
-
-    return recurrentgemma_model_root
-
-
-@pytest.fixture(scope="function")
 def nemotron_nas_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -1314,11 +1185,7 @@ def llm_lora_model_root(request):
         model_list = [request.param]
 
     for item in model_list:
-        if item == "chinese-llama-2-lora-13b":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models-v2",
-                             "chinese-llama-2-lora-13b"))
-        elif item == "Japanese-Alpaca-LoRA-7b-v0":
+        if item == "Japanese-Alpaca-LoRA-7b-v0":
             model_root_list.append(
                 os.path.join(models_root, "llama-models",
                              "Japanese-Alpaca-LoRA-7b-v0"))
@@ -2260,6 +2127,14 @@ def pytest_collection_modifyitems(session, config, items):
     if waives_file:
         apply_waives(waives_file, items, config)
 
+    # Skip tests with pytest.mark.ray unless --run-ray is passed.
+    if not config.getoption("--run-ray"):
+        skip_marker = pytest.mark.skip(
+            reason="Ray tests skipped; pass --run-ray to enable")
+        for item in items:
+            if item.get_closest_marker("ray") is not None:
+                item.add_marker(skip_marker)
+
     # We have to remove prefix temporarily before splitting the test list
     # After that change back the test id.
     for item in items:
@@ -2281,6 +2156,13 @@ def pytest_configure(config):
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
         os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
+    # xdist worker processes must not register PeriodicJUnitXML: all worker
+    # reports are forwarded to the controller via xdist and processed there,
+    # so registering on workers causes concurrent writers to the same
+    # unfinished_test.txt and races out cleanup entries.
+    if hasattr(config, "workerinput"):
+        return
+
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
     output_dir = config.getoption("--output-dir", default=None)
@@ -2299,93 +2181,6 @@ def pytest_configure(config):
         # Create the reporter with logger
         xmlpath = periodic_junit_xmlpath or os.path.join(
             output_dir, "results.xml")
-        reporter = PeriodicJUnitXML(
-            xmlpath=xmlpath,
-            interval=periodic_interval,
-            batch_size=periodic_batch_size,
-            logger={
-                'info': print_info,
-                'warning': print_warning
-            },
-            save_unfinished_test=periodic_save_unfinished_test,
-        )
-
-        # Configure and register the reporter
-        reporter.pytest_configure(config)
-        config.pluginmanager.register(reporter, 'periodic_junit')
-
-        print_info("PeriodicJUnitXML reporter registered")
-        print_info(
-            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
-        )
-        print_info(f"  Batch size: {periodic_batch_size} tests")
-        print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
-    elif periodic and not output_dir:
-        print_warning(
-            "Warning: --periodic-junit requires --output-dir to be set. "
-            "Periodic reporting disabled.")
-
-
-def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
-                                  config):
-    """Filter tests based on the test model suites specified.
-    If a test matches any of the test model suite names, it is considered selected.
-
-    Args:
-        test_model_suites: String containing test model suite names separated by semicolons
-        items: List of pytest items to filter
-        test_prefix: Test prefix if any
-        config: Pytest config object
-    """
-    if not test_model_suites:
-        return
-
-    # Split by semicolon or space and strip whitespace
-    suite_names = [
-        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
-        if suite.strip()
-    ]
-
-    if not suite_names:
-        return
-
-    selected = []
-    deselected = []
-
-    for item in items:
-        # Get the test name without prefix for comparison
-        test_name = item.nodeid
-        if test_prefix and test_name.startswith(f"{test_prefix}/"):
-            test_name = test_name[len(f"{test_prefix}/"):]
-
-        # Check if any suite name matches the test name
-        found = False
-        for suite_name in suite_names:
-            if suite_name in test_name or test_name.endswith(suite_name):
-                found = True
-                break
-
-        if found:
-            selected.append(item)
-        else:
-            deselected.append(item)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-    items[:] = selected
-
-    # Initialize PeriodicJUnitXML reporter if enabled
-    periodic = config.getoption("--periodic-junit", default=False)
-    output_dir = config.getoption("--output-dir", default=None)
-
-    if periodic and output_dir:
-        periodic_interval = config.getoption("--periodic-interval")
-        periodic_batch_size = config.getoption("--periodic-batch-size")
-        periodic_save_unfinished_test = config.getoption(
-            "--periodic-save-unfinished-test", default=False)
-
-        # Create the reporter with logger
-        xmlpath = os.path.join(output_dir, "results.xml")
         reporter = PeriodicJUnitXML(
             xmlpath=xmlpath,
             interval=periodic_interval,

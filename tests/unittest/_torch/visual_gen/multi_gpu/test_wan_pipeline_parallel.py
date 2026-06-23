@@ -39,17 +39,30 @@ import torch.nn.functional as F
 try:
     from diffusers import DiffusionPipeline
 
-    from tensorrt_llm._torch.visual_gen.config import (
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
         ParallelConfig,
         TorchCompileConfig,
         VisualGenArgs,
     )
-    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
+
+try:
+    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+        _flash_attn_fwd as _fa4_fwd,
+    )
+    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+        _flash_attn_combine as _fa_combine,
+    )
+
+    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+except ImportError:
+    _ATTN2D_AVAILABLE = False
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -153,14 +166,29 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
 def _build_parallel_args(checkpoint_path: str) -> "VisualGenArgs":
     """Build VisualGenArgs with cfg=2, ulysses=2, parallel_vae=2."""
     return VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        device="cuda",
-        dtype="bfloat16",
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
-        parallel=ParallelConfig(
-            dit_cfg_size=2,
-            dit_ulysses_size=2,
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+        parallel_config=ParallelConfig(
+            cfg_size=2,
+            ulysses_size=2,
             parallel_vae_size=2,
+            parallel_vae_split_dim="width",
+        ),
+    )
+
+
+def _build_cfg2_attn2d2x1_ulysses2_pvae8_args(checkpoint_path: str) -> "VisualGenArgs":
+    """Build VisualGenArgs with cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 (FA4)."""
+    return VisualGenArgs(
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(backend="FA4"),
+        parallel_config=ParallelConfig(
+            cfg_size=2,
+            ulysses_size=2,
+            attn2d_size=(2, 1),
+            async_ulysses=True,
+            parallel_vae_size=8,
             parallel_vae_split_dim="width",
         ),
     )
@@ -311,6 +339,69 @@ def _logic_wan_cfg_ulysses_pvae(rank: int, world_size: int, *, checkpoint_path: 
     )
 
 
+def _logic_wan_cfg2_attn2d2x1_ulysses2_pvae8(
+    rank: int, world_size: int, *, checkpoint_path: str
+) -> None:
+    """End-to-end pipeline: cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 (8 GPUs)."""
+    assert world_size == 8, f"This test is hardcoded to world_size=8, got {world_size}"
+
+    trtllm_pipe = PipelineLoader(_build_cfg2_attn2d2x1_ulysses2_pvae8_args(checkpoint_path)).load(
+        skip_warmup=True
+    )
+    trtllm_video = _capture_trtllm_video(
+        trtllm_pipe,
+        height=HEIGHT,
+        width=WIDTH,
+        num_frames=NUM_FRAMES,
+        num_inference_steps=NUM_STEPS,
+        guidance_scale=GUIDANCE_SCALE,
+        seed=SEED,
+    )
+
+    if rank == 0:
+        assert trtllm_video is not None, (
+            "Rank 0 unexpectedly produced no video — parallel VAE decode ownership is broken."
+        )
+
+    _free(trtllm_pipe)
+    if rank != 0:
+        trtllm_video = None
+    dist.barrier()
+
+    if rank != 0:
+        return
+
+    hf_pipe = DiffusionPipeline.from_pretrained(checkpoint_path, torch_dtype=torch.bfloat16)
+    hf_pipe = hf_pipe.to("cuda")
+    hf_pipe.set_progress_bar_config(disable=True)
+    hf_video = _capture_hf_video(
+        hf_pipe,
+        height=HEIGHT,
+        width=WIDTH,
+        num_frames=NUM_FRAMES,
+        num_inference_steps=NUM_STEPS,
+        guidance_scale=GUIDANCE_SCALE,
+        seed=SEED,
+    )
+    _free(hf_pipe)
+
+    assert trtllm_video.numel() == hf_video.numel(), (
+        f"Element count mismatch — TRTLLM {tuple(trtllm_video.shape)} "
+        f"({trtllm_video.numel()}) vs HF {tuple(hf_video.shape)} ({hf_video.numel()})"
+    )
+
+    cos_sim = _cosine_similarity(trtllm_video, hf_video)
+    print(
+        "\n  Wan2.1-T2V-1.3B (cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8) "
+        f"cosine similarity: {cos_sim:.6f}"
+    )
+    assert cos_sim >= COS_SIM_THRESHOLD, (
+        f"Multi-GPU TRTLLM pipeline diverges from HF reference: "
+        f"cosine similarity {cos_sim:.6f} < {COS_SIM_THRESHOLD}. "
+        f"Shapes — TRTLLM: {tuple(trtllm_video.shape)}, HF: {tuple(hf_video.shape)}."
+    )
+
+
 # =============================================================================
 # Test class
 # =============================================================================
@@ -332,6 +423,22 @@ class TestWanPipelineParallel:
         run_test_in_distributed(
             world_size=4,
             test_fn=_logic_wan_cfg_ulysses_pvae,
+            checkpoint_path=WAN21_1_3B_PATH,
+        )
+
+    def test_cfg2_attn2d2x1_ulysses2_pvae8(self):
+        """world=8, cfg=2, ulysses=2, attn2d=2×1, async_ulysses, parallel_vae=8 vs HF reference."""
+        if not MODULES_AVAILABLE:
+            pytest.skip("Required modules not available")
+        if not _ATTN2D_AVAILABLE:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        if not os.path.exists(WAN21_1_3B_PATH):
+            pytest.skip(
+                f"Checkpoint not found: {WAN21_1_3B_PATH}. Set DIFFUSION_MODEL_PATH_WAN21_1_3B."
+            )
+        run_test_in_distributed(
+            world_size=8,
+            test_fn=_logic_wan_cfg2_attn2d2x1_ulysses2_pvae8,
             checkpoint_path=WAN21_1_3B_PATH,
         )
 

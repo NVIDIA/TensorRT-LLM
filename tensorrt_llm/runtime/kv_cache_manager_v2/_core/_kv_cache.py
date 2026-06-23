@@ -54,6 +54,7 @@ from .._page import (
     BatchedLockTarget,
     BlockPage,
     CommittedPage,
+    Page,
     ScratchSlotLock,
     UncommittedPage,
     _PageHolder,
@@ -69,6 +70,7 @@ from .._utils import (
     div_up,
     expect_type,
     filled_list,
+    intersect,
     make_typed,
     map_optional,
     stream_wait_events,
@@ -497,11 +499,16 @@ class _KVCache:
             raise ValueError("History length cannot be decreased")
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
+        manager = self.manager
         # Scratch reuse: compute scratch ranges and slot delta
         enable_scratch = self.enable_swa_scratch_reuse
         if enable_scratch and capacity != self._capacity:
-            assert history_length == self._capacity, (
-                f"SWA scratch requires history_length ({history_length}) == "
+            max_rewind_len = self._swa_scratch_max_rewind_len()
+            min_history_length = max(0, self._capacity - max_rewind_len)
+            assert min_history_length <= history_length <= self._capacity, (
+                "SWA scratch requires "
+                f"old_capacity - max_rewind_len ({min_history_length}) <= "
+                f"history_length ({history_length}) <= "
                 f"old_capacity ({self._capacity})"
             )
         if (
@@ -510,12 +517,12 @@ class _KVCache:
             and self._shortcut_set_history_length(history_length)
         ):
             return True
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        ssm_lc_id = manager._life_cycles.ssm_life_cycle_id
         beam_width = self.beam_width
         backup_holders = self._unlock_stale_blocks(history_length)
         old_num_blocks = BlockOrdinal(div_up(self._capacity, tokens_per_block))
         new_num_blocks = BlockOrdinal(div_up(capacity, tokens_per_block))
-        num_life_cycles = self.manager._life_cycles.size
+        num_life_cycles = manager._life_cycles.size
         if new_num_blocks < old_num_blocks:
             assert not self.has_scratch_slots, "Cannot shrink while scratch slots exist"
             with self._record_event():
@@ -538,15 +545,20 @@ class _KVCache:
             num_new_slots = filled_list(0, num_life_cycles)
             stale_ranges = [
                 _KVCache._get_stale_range(tokens_per_block, history_length, lc)
-                for _, lc in self.manager._life_cycles.items()
+                for _, lc in manager._life_cycles.items()
             ]
             for lc in typed_range(num_life_cycles):
                 if lc == ssm_lc_id:
                     continue
                 stale_beg, stale_end = stale_ranges[lc]
                 if enable_scratch:
-                    num_scratch_blocks = len(scratch_ranges[lc])
-                    num_new_normal_blocks = (new_num_blocks - old_num_blocks) - num_scratch_blocks
+                    # Only newly added blocks consume slots below; scratch range may
+                    # extend before old_num_blocks when history_length < old_capacity.
+                    new_block_range = HalfOpenRange(old_num_blocks, new_num_blocks)
+                    num_new_blocks_using_scratch = len(
+                        intersect(scratch_ranges[lc], new_block_range)
+                    )
+                    num_new_normal_blocks = len(new_block_range) - num_new_blocks_using_scratch
                     num_new_slots[lc] = num_new_normal_blocks * beam_width
                 else:
                     if old_num_blocks < stale_beg:
@@ -927,6 +939,49 @@ class _KVCache:
         self._status = self.Status.ACTIVE
         return True
 
+    def prefetch(self, target: CacheLevel) -> bool:
+        """Best-effort prefetch active pages to the target cache level.
+
+        The cache must be suspended. Prefetch is only a performance hint: a False
+        return value means the requested pages could not be recalled due to cache
+        pressure, but the cache remains functionally valid.
+
+        Args:
+            target: Destination cache level for active pages in lower tiers.
+
+        Returns:
+            True if the prefetch was dispatched, False if storage could not reserve enough pages.
+        """
+        assert self.status == self.Status.SUSPENDED
+        manager = self.manager
+        storage = manager._storage
+        num_tiers = storage.num_cache_levels
+        assert CacheLevel(0) <= target < num_tiers
+
+        num_pool_groups = storage.num_pool_groups
+        lc2pg = storage.get_pool_group_index
+
+        all_pages = make_typed(
+            lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
+        )
+
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            page = expect_type(_PageHolder, holder).page
+            lvl = page.cache_level
+            if lvl < target:
+                continue
+            pg_idx = lc2pg(lc_idx)
+            all_pages[pg_idx][lvl].append(page)
+
+        try:
+            storage.prefetch(target, all_pages)
+        except OutOfPagesError:
+            return False
+        return True
+
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
         """Yields (ordinal, beam_idx, lc_idx) for all active pages.
 
@@ -970,12 +1025,25 @@ class _KVCache:
     def _page(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex, life_cycle: LifeCycleId
     ) -> BlockPage:
-        return self._blocks[block_ordinal].pages[beam_index][life_cycle]
+        """Return the page holder for an attention block or the SSM block."""
+        is_ssm = block_ordinal == BAD_BLOCK_ORDINAL
+        assert (life_cycle == self.manager._life_cycles.ssm_life_cycle_id) == is_ssm
+        return (
+            self._ssm_blocks[beam_index][life_cycle]
+            if is_ssm
+            else self._blocks[block_ordinal].pages[beam_index][life_cycle]
+        )
 
     def _block(
         self, block_ordinal: BlockOrdinal, beam_index: BeamIndex
     ) -> TypedIndexList[LifeCycleId, BlockPage]:
-        return self._blocks[block_ordinal].pages[beam_index]
+        """Return the life-cycle page list for an attention block or the SSM block."""
+        is_ssm = block_ordinal == BAD_BLOCK_ORDINAL
+        return (
+            self._ssm_blocks[beam_index]
+            if is_ssm
+            else self._blocks[block_ordinal].pages[beam_index]
+        )
 
     def _snapshot_ssm_to_tree_block(
         self, tree_block: Block, ssm_lc_id: LifeCycleId, beam_idx: BeamIndex
@@ -1119,6 +1187,13 @@ class _KVCache:
         else:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP
+
+        if seq_block.is_committed:
+            for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
+                stale_range = _KVCache._get_stale_range(tokens_per_block, self.history_length, lc)
+                if ordinal in stale_range:
+                    for beam_block in seq_block.pages:
+                        beam_block[lc_idx] = None
 
         if is_last or self._commit_state == self.CommitState.VIRTUAL_STOP:
             self._commit_state = self.CommitState.USER_STOP
@@ -1361,22 +1436,42 @@ class _KVCache:
         Range of blocks that should use scratch (shared) slots during SWA prefill.
 
         Scratch = stale_at_capacity ∩ input_blocks, where:
-        - stale_at_capacity: blocks out-of-window when all capacity tokens become history.
+        - stale_at_capacity: blocks out-of-window when all non-rewindable capacity tokens
+          become history.
         - input_blocks: [div_up(history_length, tpb), div_up(capacity, tpb)) — new blocks
           for the current chunk. Blocks before this range already contain real KV data
           from previous chunks and must not be overwritten.
+
+        The configured max_rewind_len excludes a speculative tail from scratch reuse.
         """
         if not self.enable_swa_scratch_reuse:
             return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(0))
         history_length = value_or(history_length_override, self.history_length)
         capacity = value_or(capacity_override, self.capacity)
-        return compute_scratch_range(life_cycle, history_length, capacity, self.tokens_per_block)
+        max_rewind_len = self._swa_scratch_max_rewind_len()
+        return compute_scratch_range(
+            life_cycle,
+            history_length,
+            capacity,
+            self.tokens_per_block,
+            max_rewind_len,
+        )
 
     def _would_use_swa_scratch_blocks(self) -> bool:
+        max_rewind_len = self._swa_scratch_max_rewind_len()
         return any(
-            compute_scratch_range(lc, self.history_length, self.capacity, self.tokens_per_block)
+            compute_scratch_range(
+                lc,
+                self.history_length,
+                self.capacity,
+                self.tokens_per_block,
+                max_rewind_len,
+            )
             for lc in self.manager._life_cycles
         )
+
+    def _swa_scratch_max_rewind_len(self) -> int:
+        return unwrap_optional(self.manager.init_config.swa_scratch_reuse).max_rewind_len
 
     @staticmethod
     def _get_stale_range(

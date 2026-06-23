@@ -141,7 +141,7 @@ class _StubQueueItem:
         self.id = _StubQueueItem._next_id
 
 
-def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
+def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention_dp=False):
     """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
 
     Stubs only the ``self.*`` attributes the method actually reads:
@@ -160,10 +160,9 @@ def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
     Per-request aggregation reads:
       * ``executor_request_queue.get_request_queue().queue`` — source for
         ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
-      * ``model_engine.iter_states`` — stubbed but not read by the
-        request-aggregate fields under test here; the regression test
-        ``test_num_ctx_kv_tokens_ignores_iter_states_side_channel``
-        verifies the populate block does not read it
+      * ``model_engine.iter_states`` — stubbed as the post-forward side
+        channel so regression tests can verify ``_update_iter_stats`` uses
+        the explicit scheduled-batch stats argument instead.
     """
     fake = MagicMock()
     fake.max_num_active_requests = 64
@@ -172,13 +171,18 @@ def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
     fake.executor_request_queue.get_request_queue.return_value.queue = queued_items
     fake.resource_manager.resource_managers.get.return_value = None
     fake.drafter = None
-    fake.model_engine = types.SimpleNamespace(iter_states=iter_states)
+    fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
     return fake
 
 
 def _invoke_update_iter_stats(
-    scheduled_batch, queued_items, *, num_ctx_tokens, enable_attention_dp=False
+    scheduled_batch,
+    queued_items,
+    *,
+    num_ctx_tokens,
+    enable_attention_dp=False,
+    scheduled_batch_stats=None,
 ):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
@@ -192,16 +196,25 @@ def _invoke_update_iter_stats(
     scheduled_batch : _StubScheduledBatch
     queued_items    : list[_StubQueueItem]
     num_ctx_tokens  : int | None
-        If int, wired into ``model_engine.iter_states = {"num_ctx_tokens": num_ctx_tokens}``.
-        If None, ``iter_states`` is set to None. The populate block under
-        test does not consume this value; it is plumbed so regression
-        tests can verify the side channel remains unread.
+        If int, wired into the fake ``model_engine.iter_states`` side channel.
+    scheduled_batch_stats : ScheduledBatchStats | None
+        Explicit scheduled-batch counters passed to ``_update_iter_stats``.
+        When None, defaults to the same partial ``num_ctx_tokens`` payload used
+        by older tests.
     """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
 
-    iter_states = None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
+    model_engine_iter_states = (
+        None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
+    )
+    if scheduled_batch_stats is None:
+        scheduled_batch_stats = ScheduledBatchStats(num_ctx_tokens=num_ctx_tokens)
 
-    fake_self = _build_fake_self(queued_items, iter_states, enable_attention_dp=enable_attention_dp)
+    fake_self = _build_fake_self(
+        queued_items,
+        model_engine_iter_states,
+        enable_attention_dp=enable_attention_dp,
+    )
 
     stats = IterationStats()
     # The method reads ``stats.inflight_batching_stats.*`` unconditionally;
@@ -219,6 +232,7 @@ def _invoke_update_iter_stats(
             num_completed_requests=0,
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
+            scheduled_batch_stats=scheduled_batch_stats,
         )
     return stats
 
@@ -535,6 +549,38 @@ def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
     assert ifb.num_ctx_kv_tokens == 256
 
 
+def test_num_ctx_tokens_uses_scheduled_batch_stats_not_model_engine_side_channel():
+    """Regression guard: num_ctx_tokens must come from scheduled-batch stats."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
+    ctx = [_StubRequest(context_chunk_size=744, context_current_position=256)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx),
+        [],
+        num_ctx_tokens=99999,
+        scheduled_batch_stats=ScheduledBatchStats(num_ctx_tokens=744),
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_ctx_tokens == 744
+
+
+def test_num_gen_kv_tokens_uses_scheduled_batch_stats():
+    """Regression guard: decode KV must not include post-sample token growth."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
+    gen = [_StubRequest(num_tokens=1025)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=gen),
+        [],
+        num_ctx_tokens=0,
+        scheduled_batch_stats=ScheduledBatchStats(num_gen_kv_tokens=1024),
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_gen_kv_tokens == 1024
+
+
 # ---------------------------------------------------------------------------
 # Attention-DP fanout tests: completed rank-local payloads are carried by the
 # next ADP allgather, then rank 0 appends one row per ADP rank.
@@ -583,6 +629,9 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
         ["req-stats"] if is_rank0 else None,
         kv_iter_stats={0: "pending-kv"} if is_rank0 else None,
         is_rank0=is_rank0,
+        host_step_time_ms=11.0 if is_rank0 else None,
+        prev_device_step_time_ms=9.0 if is_rank0 else None,
+        gpu_forward_time_ms=7.0 if is_rank0 else None,
     )
     return buffer
 
@@ -647,6 +696,9 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_ifb.num_queued_gen_kv_tokens == 800
     assert rank0_record.req_stats == ["req-stats"]
     assert rank0_record.kv_iter_stats == {0: "pending-kv"}
+    assert rank0_record.host_step_time_ms == 11.0
+    assert rank0_record.prev_device_step_time_ms == 9.0
+    assert rank0_record.gpu_forward_time_ms == 7.0
 
     rank1_record = records[1]
     rank1_row = rank1_record.stats
@@ -669,6 +721,9 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_ifb.num_queued_gen_kv_tokens == 0
     assert rank1_record.req_stats is None
     assert rank1_record.kv_iter_stats is None
+    assert rank1_record.host_step_time_ms == 11.0
+    assert rank1_record.prev_device_step_time_ms == 9.0
+    assert rank1_record.gpu_forward_time_ms == 7.0
 
     assert buffer._payloads == {}
     assert buffer.next_payload() is None
@@ -834,3 +889,52 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     assert ifb_d["numQueuedGenRequests"] == 6
     assert ifb_d["numQueuedGenKvTokens"] == 2345
     assert ifb_d["numPausedKvTokens"] == 1500
+
+
+# ---------------------------------------------------------------------------
+# Iter labeling: stats.iter is stamped at batch CONSTRUCTION time in
+# _get_init_iter_stats, and _update_iter_stats must NOT overwrite it from the
+# live self.iter_counter. Under the overlap and PP schedulers _update_iter_stats
+# runs in a later loop than the one that built the batch, so re-stamping from
+# the live counter mislabels the record by 1+ iterations.
+# ---------------------------------------------------------------------------
+
+
+def test_update_iter_stats_does_not_overwrite_construction_iter():
+    """Regression guard: ``_update_iter_stats`` must not re-stamp ``stats.iter``.
+
+    Before the fix this method assigned ``stats.iter = self.iter_counter``,
+    which under the overlap and PP schedulers reflected the loop CONSUMING
+    the batch rather than the one that BUILT it — mislabeling the record by
+    1+ iterations. Construct an ``IterationStats`` with a known iter, pass it
+    through ``_update_iter_stats`` with a deliberately different live counter,
+    and confirm the construction-time stamp survives.
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self(queued_items=[], model_engine_iter_states={"num_ctx_tokens": 0})
+    # Live counter is several loops ahead of when the batch was built; any
+    # accidental re-stamp would surface here.
+    fake_self.iter_counter = 999
+
+    stats = IterationStats()
+    stats.inflight_batching_stats = InflightBatchingStats()
+    # Construction-time stamp (what _get_init_iter_stats would have written
+    # at iter 17, several loops ago under overlap scheduling).
+    stats.iter = 17
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(1 << 30, 1 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+        )
+
+    # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
+    assert stats.iter == 17

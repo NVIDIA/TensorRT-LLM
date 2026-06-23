@@ -80,7 +80,7 @@ methods:
         default: pytorch
         status: deprecated
       cuda_graph_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
       attention_dp_config:
@@ -101,6 +101,10 @@ methods:
         status: prototype
       mx_config:
         annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
+      gms_config:
+        annotation: tensorrt_llm.llmapi.llm_args.GmsConfig
         default: null
         status: prototype
       mm_encoder_only:
@@ -224,7 +228,7 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:
@@ -348,10 +352,19 @@ methods:
       add_special_tokens:
         annotation: bool
         default: True
+      return_raw_logits:
+        annotation: bool
+        default: False
       model_kwargs:
         annotation: Any
         default: inspect._empty
-    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+      batch_indexed_model_output:
+        annotation: bool
+        default: True
+      copy_logits_to_host:
+        annotation: bool
+        default: True
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
     status: prototype
   preprocess:
     parameters:

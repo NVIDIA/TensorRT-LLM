@@ -84,14 +84,14 @@ dev = ["backports.zoneinfo ; python_version < \"3.9\"", "freezegun (>=1.0,<2.0)"
 
 [[package]]
 name = "beautifulsoup4"
-version = "4.14.3"
+version = "4.15.0"
 description = "Screen-scraping library"
 optional = false
 python-versions = ">=3.7.0"
 groups = ["main"]
 files = [
-    {file = "beautifulsoup4-4.14.3-py3-none-any.whl", hash = "sha256:0918bfe44902e6ad8d57732ba310582e98da931428d231a5ecb9e7c703a735bb"},
-    {file = "beautifulsoup4-4.14.3.tar.gz", hash = "sha256:6292b1c5186d356bba669ef9f7f051757099565ad9ada5dd630bd9de5fa7fb86"},
+    {file = "beautifulsoup4-4.15.0-py3-none-any.whl", hash = "sha256:d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9"},
+    {file = "beautifulsoup4-4.15.0.tar.gz", hash = "sha256:288e3ca7d54b06f2ac191970bc275c1939cb46d450b255bf6718b04aa37ab4f7"},
 ]
 
 [package.dependencies]
@@ -127,14 +127,14 @@ test = ["pytest (>=8.0)"]
 
 [[package]]
 name = "certifi"
-version = "2026.5.20"
+version = "2026.6.17"
 description = "Python package for providing Mozilla's CA Bundle."
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "certifi-2026.5.20-py3-none-any.whl", hash = "sha256:3c52e209ba0a4ad7aebe60436a4ab349c39e1e602e8c134221e546902ad25897"},
-    {file = "certifi-2026.5.20.tar.gz", hash = "sha256:69dea482ab64caa7b9f6aba1c6bf48bb6a5448d1c0f1b17ab42ad8c763a5344d"},
+    {file = "certifi-2026.6.17-py3-none-any.whl", hash = "sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"},
+    {file = "certifi-2026.6.17.tar.gz", hash = "sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"},
 ]
 
 [[package]]
@@ -318,14 +318,14 @@ files = [
 
 [[package]]
 name = "idna"
-version = "3.16"
+version = "3.18"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "idna-3.16-py3-none-any.whl", hash = "sha256:cc246e3a3f89580c3a951b5ad298ca4638078b2cdd4f115654332b5c26daded5"},
-    {file = "idna-3.16.tar.gz", hash = "sha256:d7a6da03db833450fca25d2358ac9ff06cd624577a4aea3a596d5c0f77b8e03d"},
+    {file = "idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2"},
+    {file = "idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848"},
 ]
 
 [package.extras]
@@ -644,14 +644,14 @@ typing-extensions = ">=4.14.1"
 
 [[package]]
 name = "pydantic-settings"
-version = "2.14.1"
+version = "2.14.2"
 description = "Settings management using Pydantic"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pydantic_settings-2.14.1-py3-none-any.whl", hash = "sha256:6e3c7edfd8277687cdc598f56e5cff0e9bfff0910a3749deaa8d4401c3a2b9de"},
-    {file = "pydantic_settings-2.14.1.tar.gz", hash = "sha256:e874d3bec7e787b0c9958277956ed9b4dd5de6a80e162188fdaff7c5e26fd5fa"},
+    {file = "pydantic_settings-2.14.2-py3-none-any.whl", hash = "sha256:a20c97b37910b6550d5ea50fbcc2d4187defe58cd57070b73863d069419c9440"},
+    {file = "pydantic_settings-2.14.2.tar.gz", hash = "sha256:c19dd64b19097f1de80184f0cc7b0272a13ae6e170cbf240a3e27e381ed14a5f"},
 ]
 
 [package.dependencies]
@@ -668,14 +668,14 @@ yaml = ["pyyaml (>=6.0.1)"]
 
 [[package]]
 name = "pydata-sphinx-theme"
-version = "0.18.0"
+version = "0.19.0"
 description = "Bootstrap-based Sphinx theme from the PyData community"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pydata_sphinx_theme-0.18.0-py3-none-any.whl", hash = "sha256:fbe5401f26642d487e3c5b6dfcbf69b3b1d579e80dcc479a429632abe0a13929"},
-    {file = "pydata_sphinx_theme-0.18.0.tar.gz", hash = "sha256:b4abc95ab02600872e060db07c79e056e87b7ea653ab1ffd0e0b1fa75a3003d4"},
+    {file = "pydata_sphinx_theme-0.19.0-py3-none-any.whl", hash = "sha256:5d7dfe3beb0facc88b5d78ff4a4c948f214cc0e03aae27e7fc58286e963b588b"},
+    {file = "pydata_sphinx_theme-0.19.0.tar.gz", hash = "sha256:148ba092bd6937b3321385dc482cc69a29ad2ede36547b4f010ade782bc6a062"},
 ]
 
 [package.dependencies]
@@ -852,26 +852,26 @@ type = ["importlib_metadata (>=7.0.2) ; python_version < \"3.10\"", "jaraco.deve
 
 [[package]]
 name = "snowballstemmer"
-version = "3.0.1"
-description = "This package provides 32 stemmers for 30 languages generated from Snowball algorithms."
+version = "3.1.1"
+description = "This package provides 36 stemmers for 34 languages generated from Snowball algorithms."
 optional = false
-python-versions = "!=3.0.*,!=3.1.*,!=3.2.*"
+python-versions = ">=3.3"
 groups = ["main"]
 files = [
-    {file = "snowballstemmer-3.0.1-py3-none-any.whl", hash = "sha256:6cd7b3897da8d6c9ffb968a6781fa6532dce9c3618a4b127d920dab764a19064"},
-    {file = "snowballstemmer-3.0.1.tar.gz", hash = "sha256:6d5eeeec8e9f84d4d56b847692bacf79bc2c8e90c7f80ca4444ff8b6f2e52895"},
+    {file = "snowballstemmer-3.1.1-py3-none-any.whl", hash = "sha256:7e207fa178741da09cdee59d3ecec3827ad5f92b1fc5c9ff3755b639f71f5752"},
+    {file = "snowballstemmer-3.1.1.tar.gz", hash = "sha256:e07bbc54a0d798fe6010a12398422e62a8bfbba95c394fd0956ef58cb4d3e260"},
 ]
 
 [[package]]
 name = "soupsieve"
-version = "2.8.3"
+version = "2.8.4"
 description = "A modern CSS selector implementation for Beautiful Soup."
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "soupsieve-2.8.3-py3-none-any.whl", hash = "sha256:ed64f2ba4eebeab06cc4962affce381647455978ffc1e36bb79a545b91f45a95"},
-    {file = "soupsieve-2.8.3.tar.gz", hash = "sha256:3267f1eeea4251fb42728b6dfb746edc9acaffc4a45b27e19450b676586e8349"},
+    {file = "soupsieve-2.8.4-py3-none-any.whl", hash = "sha256:e7e6b0769c8f51ed59acab6e994b00621096cfb1c640a7509295987388fbaf65"},
+    {file = "soupsieve-2.8.4.tar.gz", hash = "sha256:e121fd02e975c695e4e9e8774a5ee35d74714b59307868dcc5319ad2d9e3328e"},
 ]
 
 [[package]]

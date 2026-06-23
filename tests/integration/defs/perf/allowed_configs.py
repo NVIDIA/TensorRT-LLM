@@ -374,24 +374,6 @@ _allowed_configs = {
                position_embedding_type='rope_gpt_neox',
                rotary_pct=1.0,
            )),
-    "llama_7b":
-    Config(name="llama_7b",
-           family="llama",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=128,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               hidden_size=4096,
-               vocab_size=32000,
-               hidden_act='silu',
-               n_positions=4096,
-               inter_size=11008,
-           )),
     "llama_13b":
     Config(name="llama_13b",
            family="llama",

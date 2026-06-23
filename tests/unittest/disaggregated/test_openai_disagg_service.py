@@ -13,13 +13,13 @@
 # limitations under the License.
 
 import asyncio
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import torch
 
+from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
     DisaggClusterConfig,
@@ -30,6 +30,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -41,6 +42,12 @@ from tensorrt_llm.serve.openai_protocol import (
     _deserialize_first_gen_logits,
     _serialize_first_gen_log_probs,
     _serialize_first_gen_logits,
+)
+from tensorrt_llm.serve.postprocess_handlers import (
+    ChatPostprocArgs,
+    CompletionPostprocArgs,
+    chat_response_post_processor,
+    completion_response_post_processor,
 )
 from tensorrt_llm.serve.router import Router
 
@@ -185,9 +192,9 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
                 finish_reason="stop",
                 disagg_request_id=request.disaggregated_params.disagg_request_id,
                 context_only=False,
-                prompt_tokens=101,
+                prompt_tokens=3,
                 completion_tokens=13,
-                cached_tokens=101,
+                cached_tokens=3,
             )
 
         service._ctx_client.send_request = AsyncMock(side_effect=_delayed_ctx_response)
@@ -203,6 +210,17 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
         assert gen_req.disaggregated_params.request_type == "generation_only"
         if schedule_style == "generation_first":
             assert gen_req.disaggregated_params.encoded_opaque_state == opaque_state
+            assert gen_req.disaggregated_params.ctx_usage is None
+            print("[usage_check] generation_first: ctx_usage=None (expected)")
+        else:
+            print(
+                f"[usage_check] context_first: gen_req ctx_usage="
+                f"prompt_tokens={gen_req.disaggregated_params.ctx_usage.prompt_tokens}, "
+                f"cached_tokens="
+                f"{gen_req.disaggregated_params.ctx_usage.prompt_tokens_details.cached_tokens}"
+            )
+            assert gen_req.disaggregated_params.ctx_usage.prompt_tokens == 101
+            assert gen_req.disaggregated_params.ctx_usage.prompt_tokens_details.cached_tokens == 7
         assert (
             gen_req.disaggregated_params.ctx_request_id
             == ctx_req.disaggregated_params.disagg_request_id
@@ -213,11 +231,18 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
             chunks = [chunk async for chunk in result]
             assert chunks == stream_chunks
         else:
+            print(
+                f"[usage_check] disagg service result: "
+                f"prompt_tokens={result.usage.prompt_tokens}, "
+                f"completion_tokens={result.usage.completion_tokens}, "
+                f"total_tokens={result.usage.total_tokens}, "
+                f"cached_tokens={result.usage.prompt_tokens_details.cached_tokens}"
+            )
             assert result.model == "test-model"
-            assert result.usage.prompt_tokens == 101
+            assert result.usage.prompt_tokens == 3
             assert result.usage.completion_tokens == 13
-            assert result.usage.total_tokens == 114
-            assert result.usage.prompt_tokens_details.cached_tokens == 7
+            assert result.usage.total_tokens == 16
+            assert result.usage.prompt_tokens_details.cached_tokens == 3
             assert len(result.choices) == 1
             assert result.choices[0].text == resp_text
             assert result.choices[0].finish_reason == "stop"
@@ -229,7 +254,7 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
-async def test_send_disagg_request_rewrites_streaming_usage(schedule_style):
+async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule_style):
     service = _make_service(schedule_style)
     service._ctx_client = AsyncMock()
     service._gen_client = AsyncMock()
@@ -248,25 +273,17 @@ async def test_send_disagg_request_rewrites_streaming_usage(schedule_style):
         )
 
     async def _gen_response(*_args, **_kwargs):
-        usage_chunk = {
-            "choices": [],
-            "model": "test-model",
-            "usage": {
-                "prompt_tokens": 128,
-                "completion_tokens": 5,
-                "total_tokens": 133,
-                "prompt_tokens_details": {
-                    "cached_tokens": 128,
-                },
-            },
-        }
         return _mock_streaming_response(
             [
                 (
                     b'data: {"choices":[{"delta":{"content":"hello"},"index":0}],'
                     b'"model":"test-model"}\n\n'
                 ),
-                f"data: {json.dumps(usage_chunk)}\n\n".encode(),
+                (
+                    b'data: {"choices":[],"model":"test-model","usage":'
+                    b'{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,'
+                    b'"prompt_tokens_details":{"cached_tokens":3}}}\n\n'
+                ),
                 b"data: [DONE]\n\n",
             ]
         )
@@ -278,11 +295,116 @@ async def test_send_disagg_request_rewrites_streaming_usage(schedule_style):
     result = await service._send_disagg_request(request)
     chunks = [chunk async for chunk in result]
 
-    usage = json.loads(chunks[1].decode().removeprefix("data: "))["usage"]
-    assert usage["prompt_tokens"] == 128
-    assert usage["completion_tokens"] == 5
-    assert usage["total_tokens"] == 133
-    assert usage["prompt_tokens_details"]["cached_tokens"] == 9
+    assert chunks[1] == (
+        b'data: {"choices":[],"model":"test-model","usage":'
+        b'{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,'
+        b'"prompt_tokens_details":{"cached_tokens":3}}}\n\n'
+    )
+
+
+def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
+    ctx_usage = UsageInfo(
+        prompt_tokens=128,
+        completion_tokens=0,
+        total_tokens=128,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=9),
+    )
+    request = CompletionRequest(
+        model="test-model",
+        prompt=[1, 2, 3],
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only",
+            ctx_usage=ctx_usage,
+        ),
+    )
+    args = CompletionPostprocArgs.from_request(request)
+    args.num_prompt_tokens = 3
+    rsp = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                text="hello",
+                token_ids=[10, 11, 12, 13, 14],
+                index=0,
+                disaggregated_params=LlmDisaggregatedParams(
+                    request_type="generation_only",
+                    ctx_usage=ctx_usage.model_dump(),
+                ),
+                context_logits=None,
+                stop_reason=None,
+                finish_reason="stop",
+                length=5,
+            )
+        ],
+        context_logits=None,
+        cached_tokens=3,
+    )
+
+    response = completion_response_post_processor(rsp, args)
+
+    print(
+        f"[usage_check] completion postprocessor: "
+        f"prompt_tokens={response.usage.prompt_tokens}, "
+        f"completion_tokens={response.usage.completion_tokens}, "
+        f"total_tokens={response.usage.total_tokens}, "
+        f"cached_tokens={response.usage.prompt_tokens_details.cached_tokens}"
+    )
+    assert response.usage.prompt_tokens == 128
+    assert response.usage.completion_tokens == 5
+    assert response.usage.total_tokens == 133
+    assert response.usage.prompt_tokens_details.cached_tokens == 9
+
+
+def test_generation_chat_postprocessor_rewrites_usage_from_output_disaggregated_params():
+    ctx_usage = {
+        "prompt_tokens": 128,
+        "completion_tokens": 0,
+        "total_tokens": 128,
+        "prompt_tokens_details": {
+            "cached_tokens": 9,
+        },
+    }
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        disaggregated_params=DisaggregatedParams(request_type="generation_only"),
+    )
+    args = ChatPostprocArgs.from_request(request)
+    args.num_prompt_tokens = 3
+    rsp = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                text="hello",
+                token_ids=[10, 11, 12, 13, 14],
+                index=0,
+                disaggregated_params=LlmDisaggregatedParams(
+                    request_type="generation_only",
+                    ctx_usage=ctx_usage,
+                ),
+                stop_reason=None,
+                finish_reason="stop",
+            )
+        ],
+        cached_tokens=3,
+    )
+
+    response = chat_response_post_processor(rsp, args)
+
+    print(
+        f"[usage_check] chat postprocessor: "
+        f"prompt_tokens={response.usage.prompt_tokens}, "
+        f"completion_tokens={response.usage.completion_tokens}, "
+        f"total_tokens={response.usage.total_tokens}, "
+        f"cached_tokens={response.usage.prompt_tokens_details.cached_tokens}"
+    )
+    assert response.usage.prompt_tokens == 128
+    assert response.usage.completion_tokens == 5
+    assert response.usage.total_tokens == 133
+    assert response.usage.prompt_tokens_details.cached_tokens == 9
 
 
 class TestVerifyCtxResponseDiagnostics:
@@ -307,7 +429,7 @@ class TestVerifyCtxResponseDiagnostics:
     @pytest.mark.asyncio
     async def test_missing_disagg_request_id_includes_ctx_id(self):
         svc = _make_service("context_first")
-        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=555)
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=555)
         resp.choices[0].disaggregated_params.disagg_request_id = None
         resp.choices[0].disaggregated_params.ctx_request_id = 555
         with pytest.raises(ValueError, match=r"disagg_request_id is None.*555"):
@@ -317,6 +439,24 @@ class TestVerifyCtxResponseDiagnostics:
     async def test_valid_response_passes(self):
         svc = _make_service("context_first")
         resp = _make_completion_response("ok", finish_reason="stop", disagg_request_id=42)
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+    @pytest.mark.asyncio
+    async def test_completed_response_with_null_ctx_request_id_passes(self):
+        # CTX finished early (finish_reason='stop'): no GEN handoff was set up,
+        # so ctx_request_id is None. The verifier must accept it (NVBug 6245861).
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=42)
+        resp.choices[0].disaggregated_params.ctx_request_id = None
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+    @pytest.mark.asyncio
+    async def test_completed_response_with_null_disagg_request_id_passes(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=42)
+        resp.choices[0].disaggregated_params.disagg_request_id = None
         result = await svc._verify_ctx_response(resp)
         assert result is resp
 
@@ -381,6 +521,26 @@ class TestFirstGenLogProbsSerializeRoundtrip:
     def test_deserialize_rejects_non_list_entry(self):
         with pytest.raises(ValueError, match="must be a list"):
             _deserialize_first_gen_log_probs(["not_a_list"])
+
+    def test_simple_format_roundtrip(self):
+        # Simple format: each position is a plain float (sampled-token logprob).
+        original = [-0.5, -1.25, -2.0]
+        serialized = _serialize_first_gen_log_probs(original)
+        # Serialized payload preserves floats verbatim so it remains JSON-safe.
+        assert serialized == [pytest.approx(v) for v in original]
+        recovered = _deserialize_first_gen_log_probs(serialized)
+        assert recovered == [pytest.approx(v) for v in original]
+        assert all(isinstance(v, float) for v in recovered)
+
+    def test_simple_and_dict_formats_kept_disjoint(self):
+        # Each call uses one format; mixing within a single payload is unusual
+        # but the serdes round-trips them independently.
+        simple = _deserialize_first_gen_log_probs(_serialize_first_gen_log_probs([-0.5]))
+        dict_payload = _deserialize_first_gen_log_probs(
+            _serialize_first_gen_log_probs([{1: Logprob(logprob=-0.5, rank=1)}])
+        )
+        assert isinstance(simple[0], float)
+        assert isinstance(dict_payload[0], dict)
 
     def test_deserialize_rejects_missing_keys(self):
         with pytest.raises(ValueError, match="missing required keys"):
