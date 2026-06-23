@@ -138,13 +138,15 @@ def test_dimensions_rejected_for_non_matryoshka_model(server: RemoteEmbeddingSer
 
 
 def test_dimensions_must_be_positive(server: RemoteEmbeddingServer):
-    # Pydantic PositiveInt constraint: a non-positive `dimensions` is a 422
-    # validation error (FastAPI request-model validation).
+    # `dimensions` is a Pydantic PositiveInt, so a non-positive value fails
+    # request-model validation. The server's RequestValidationError handler
+    # renders that as a 400 (consistent `{"error": ...}` envelope) rather than
+    # FastAPI's default 422 — see openai_server.validation_exception_handler.
     resp = requests.post(
         server.url_for("v1", "embeddings"),
         json={"model": BERT_MODEL, "input": "x", "dimensions": 0},
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 400
 
 
 def test_empty_input_returns_400(server: RemoteEmbeddingServer):
