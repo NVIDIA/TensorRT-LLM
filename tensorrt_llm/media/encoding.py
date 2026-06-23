@@ -11,7 +11,7 @@ import wave
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image
@@ -472,8 +472,10 @@ def save_image(
     """Encode and save an image tensor to disk.
 
     Args:
-        image: Image as ``torch.Tensor`` ``(H, W, C)`` or ``(B, H, W, C)``,
-            dtype ``uint8``. If batched, the first image is saved.
+        image: Image as ``torch.Tensor`` ``(H, W, C)`` or ``(B, H, W, C)``
+            with ``B == 1``, dtype ``uint8``. Batched inputs with
+            ``B > 1`` are rejected — pass a single tensor or use
+            :func:`save_images` with one path per batch item.
         output_path: Output file path (``str`` or :class:`pathlib.Path`).
         format: Image format (``'png'``/``'jpg'``/``'webp'``). If ``None``,
             inferred from the path extension; defaults to PNG when unknown.
@@ -481,11 +483,20 @@ def save_image(
 
     Returns:
         Path string where the image was actually saved.
+
+    Raises:
+        ValueError: When ``image`` is a 4-D tensor with ``B > 1``.
     """
     if isinstance(output_path, Path):
         output_path = str(output_path)
 
     if hasattr(image, "dim") and image.dim() == 4:
+        if image.shape[0] > 1:
+            raise ValueError(
+                f"save_image received a batched tensor of size {image.shape[0]}; "
+                "pass a single (H, W, C) tensor, or use save_images(images, paths) "
+                "with one path per batch item."
+            )
         image = image[0]
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -530,8 +541,10 @@ def save_video(
     """Encode and save a video tensor (with optional audio) to disk.
 
     Args:
-        video: Video as ``torch.Tensor`` ``(T, H, W, C)`` or ``(B, T, H, W, C)``,
-            dtype ``uint8``. If batched, the first video is saved.
+        video: Video as ``torch.Tensor`` ``(T, H, W, C)`` or ``(B, T, H, W, C)``
+            with ``B == 1``, dtype ``uint8``. Batched inputs with
+            ``B > 1`` are rejected — pass a single tensor or use
+            :func:`save_videos` with one path per batch item.
         output_path: Output file path (``str`` or :class:`pathlib.Path`).
         audio: Optional audio tensor; ignored by the pure-Python AVI fallback.
         frame_rate: Frames per second.
@@ -542,10 +555,19 @@ def save_video(
 
     Returns:
         Path string where the video was actually saved.
+
+    Raises:
+        ValueError: When ``video`` is a 5-D tensor with ``B > 1``.
     """
     if isinstance(output_path, Path):
         output_path = str(output_path)
     if hasattr(video, "dim") and video.dim() == 5:
+        if video.shape[0] > 1:
+            raise ValueError(
+                f"save_video received a batched tensor of size {video.shape[0]}; "
+                "pass a single (T, H, W, C) tensor, or use save_videos(videos, paths) "
+                "with one path per batch item."
+            )
         video = video[0]
 
     output_dir = os.path.dirname(output_path)
@@ -584,3 +606,136 @@ def video_to_bytes(
         for path in (tmp_path, actual_path):
             if path and os.path.exists(path):
                 os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Batch save helpers (used by serve endpoints when n > 1)
+# ---------------------------------------------------------------------------
+
+_IMAGE_EXT_MAP = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "JPG": ".jpg",
+    "WEBP": ".webp",
+}
+
+
+def _image_ext_for_format(format: Optional[str]) -> str:
+    """Return the file extension (including leading dot) for an image format."""
+    if format is None:
+        return ".png"
+    return _IMAGE_EXT_MAP.get(format.upper(), ".png")
+
+
+def _resolve_batch_paths(
+    output_paths: Union[str, List[str]],
+    batch_size: int,
+    ext: str,
+) -> List[str]:
+    """Build per-item output paths for a batch save operation.
+
+    When *output_paths* is a string it is used as a prefix and each item is
+    written to ``{prefix}_{i}{ext}``. When it is a list, each entry is used
+    as-is; missing extensions are filled in from *ext*. The list length
+    must equal *batch_size*.
+    """
+    if isinstance(output_paths, list):
+        if len(output_paths) != batch_size:
+            raise ValueError(
+                f"Length of output_paths ({len(output_paths)}) does not "
+                f"match batch size ({batch_size})"
+            )
+        resolved = []
+        for p in output_paths:
+            if not os.path.splitext(p)[1]:
+                p = p + ext
+            resolved.append(p)
+        return resolved
+    return [f"{output_paths}_{i}{ext}" for i in range(batch_size)]
+
+
+def save_images(
+    images: torch.Tensor,
+    output_paths: Union[str, List[str]],
+    format: Optional[str] = None,
+    quality: int = 95,
+) -> List[str]:
+    """Save a batch of images to individual files.
+
+    Args:
+        images: ``torch.Tensor`` of shape ``(B, H, W, C)`` or ``(H, W, C)``,
+            dtype ``uint8``.
+        output_paths: Either a path prefix string (each image is saved as
+            ``{prefix}_{i}.{ext}``) or an explicit list of per-image paths.
+        format: Image format (``'png'``/``'jpg'``/``'webp'``). Defaults to PNG.
+        quality: Quality for lossy formats (1-100).
+
+    Returns:
+        List of paths where the images were saved.
+    """
+    ext = _image_ext_for_format(format)
+
+    if hasattr(images, "dim") and images.dim() == 3:
+        images = images.unsqueeze(0)
+
+    batch_size = images.shape[0]
+    resolved = _resolve_batch_paths(output_paths, batch_size, ext)
+
+    paths: List[str] = []
+    for i in range(batch_size):
+        save_image(images[i], resolved[i], format, quality)
+        paths.append(resolved[i])
+    return paths
+
+
+def save_videos(
+    videos: torch.Tensor,
+    output_paths: Union[str, List[str]],
+    audios: Optional[torch.Tensor] = None,
+    frame_rate: float = 24.0,
+    format: Optional[str] = None,
+    audio_sample_rate: int = 24000,
+) -> List[str]:
+    """Save a batch of videos to individual files.
+
+    Args:
+        videos: ``torch.Tensor`` of shape ``(B, T, H, W, C)`` or
+            ``(T, H, W, C)``, dtype ``uint8``.
+        output_paths: Either a path prefix string (each video is saved as
+            ``{prefix}_{i}.{ext}``) or an explicit list of per-video paths.
+        audios: Optional audio tensor. When batched with a matching leading
+            dimension, each slice is paired with the corresponding video;
+            an unbatched audio tensor is attached to the first video only.
+        frame_rate: Frames per second.
+        format: Container (``'mp4'``/``'avi'``). Defaults to ``mp4``.
+        audio_sample_rate: Audio sample rate (Hz).
+
+    Returns:
+        List of paths where the videos were actually saved.
+    """
+    ext = f".{format}" if format else ".mp4"
+
+    if hasattr(videos, "dim") and videos.dim() == 4:
+        videos = videos.unsqueeze(0)
+
+    batch_size = videos.shape[0]
+    resolved = _resolve_batch_paths(output_paths, batch_size, ext)
+
+    paths: List[str] = []
+    for i in range(batch_size):
+        audio_i = None
+        if audios is not None:
+            if hasattr(audios, "dim") and audios.dim() >= 2 and audios.shape[0] == batch_size:
+                audio_i = audios[i]
+            elif i == 0:
+                audio_i = audios
+        actual_path = save_video(
+            videos[i],
+            resolved[i],
+            audio_i,
+            frame_rate,
+            format,
+            audio_sample_rate,
+        )
+        paths.append(actual_path)
+    return paths

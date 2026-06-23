@@ -311,13 +311,13 @@ class TestProtoMessages:
     def test_model_info_response(self):
         """Test GetModelInfoResponse message."""
         response = pb2.GetModelInfoResponse(
-            model_id="meta-llama/Llama-2-7b",
+            model_id="meta-llama/Meta-Llama-3-8B",
             max_input_len=4096,
             max_seq_len=8192,
             vocab_size=32000,
         )
 
-        assert response.model_id == "meta-llama/Llama-2-7b"
+        assert response.model_id == "meta-llama/Meta-Llama-3-8B"
         assert response.max_input_len == 4096
         assert response.max_seq_len == 8192
         assert response.vocab_size == 32000
@@ -470,6 +470,17 @@ class TestComprehensiveSamplingParamsConversion:
         # Embedding bias converted to torch.Tensor
         assert params.embedding_bias is not None
         assert len(params.embedding_bias) == 12
+
+    def test_embedding_bias_must_match_vocab_size(self):
+        """Embedding bias is rejected when it cannot match model vocabulary."""
+        with pytest.raises(ValueError, match="embedding_bias length"):
+            create_sampling_params_from_proto(
+                proto_config=pb2.SamplingConfig(),
+                output_config=pb2.OutputConfig(),
+                max_tokens=16,
+                embedding_bias=[0.0, 0.0, 0.0],
+                vocab_size=4,
+            )
 
     def test_ignore_eos_flag(self):
         """Test that ignore_eos=True correctly sets ignore_eos on SamplingParams."""

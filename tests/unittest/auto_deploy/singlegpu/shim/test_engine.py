@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from types import SimpleNamespace
 from typing import List, Optional, Type
 
 import pytest
@@ -7,10 +22,19 @@ from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoEngine
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.llmapi import AttentionDpConfig
 
 
 class TransformerLikeModelwithFakeCachePool(nn.Module):
@@ -93,6 +117,82 @@ def test_engine(engine_cls: Type[ADEngine], tokens_per_block: int):
     cache_seq_interface.shutdown()
 
 
+def _make_cache_seq_interface(device, max_seq_len=64, max_batch_size=8):
+    return CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, max_batch_size),
+        device=device,
+        kv_cache_config=KvCacheConfig(tokens_per_block=max_seq_len),
+    )
+
+
+def test_ad_engine_propagates_pyexecutor_scheduling_config():
+    """ADEngine must copy PyExecutor scheduling/streaming knobs from ad_config.
+
+    Regression: these were hardcoded stubs (stream_interval=1,
+    attention_dp_config=None, batch_wait_*=0), silently dropping the yaml settings.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("ADEngine construction builds the model on CUDA")
+
+    device = torch.device("cuda")
+    max_seq_len, max_batch_size = 64, 8
+    cache_seq_interface = _make_cache_seq_interface(device, max_seq_len, max_batch_size)
+    cache_seq_interface.to(device)
+
+    ad_config = LlmArgs(
+        model="test-model",
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        max_input_len=32,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": max_batch_size},
+        stream_interval=20,
+        attention_dp_config=AttentionDpConfig(
+            enable_balance=True, batching_wait_iters=50, timeout_iters=1
+        ),
+        batch_wait_timeout_ms=5.0,
+        batch_wait_timeout_iters=3,
+        batch_wait_max_tokens_ratio=0.5,
+    )
+
+    try:
+        engine = ADEngine(get_inference_model, cache_seq_interface, ad_config=ad_config)
+
+        assert engine.llm_args.stream_interval == 20
+        assert engine.llm_args.attention_dp_config is not None
+        assert engine.llm_args.attention_dp_config.enable_balance is True
+        assert engine.llm_args.attention_dp_config.batching_wait_iters == 50
+        assert engine.llm_args.attention_dp_config.timeout_iters == 1
+        assert engine.llm_args.batch_wait_timeout_ms == 5.0
+        assert engine.llm_args.batch_wait_timeout_iters == 3
+        assert engine.llm_args.batch_wait_max_tokens_ratio == 0.5
+    finally:
+        cache_seq_interface.shutdown()
+
+
+def test_ad_engine_scheduling_config_defaults_without_ad_config():
+    """Without ad_config, ADEngine falls back to the previous stub defaults."""
+    if not torch.cuda.is_available():
+        pytest.skip("ADEngine construction builds the model on CUDA")
+
+    device = torch.device("cuda")
+    cache_seq_interface = _make_cache_seq_interface(device)
+    cache_seq_interface.to(device)
+
+    try:
+        engine = ADEngine(get_inference_model, cache_seq_interface)
+
+        assert engine.llm_args.stream_interval == 1
+        assert engine.llm_args.attention_dp_config is None
+        assert engine.llm_args.batch_wait_timeout_ms == 0
+        assert engine.llm_args.batch_wait_timeout_iters == 0
+        assert engine.llm_args.batch_wait_max_tokens_ratio == 0.0
+    finally:
+        cache_seq_interface.shutdown()
+
+
 @pytest.mark.parametrize("tokens_per_block", [0, 2])
 def test_demo_engine_sampling(tokens_per_block: int):
     """Test sampling logic specific to DemoEngine."""
@@ -161,6 +261,9 @@ class _DummyKVCacheManager:
         # Return many dummy page IDs; ADEngine will truncate as needed
         return list(range(1024))
 
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
+        return [list(range(1024)) for _ in request_ids]
+
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:
             return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -182,6 +285,7 @@ class _DummyRequest:
         self.context_chunk_size = size
         self.seq_slot = seq_slot
         self.py_seq_slot = seq_slot
+        self.py_request_id = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
         self.multimodal_positions = None
@@ -279,6 +383,8 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     req.multimodal_lengths = [4]
     # Flat prompt-length mask: text at [0,1,6,7], embeds at [2..5].
     req.py_multimodal_data = {
+        "mm_bidirectional_blocks": False,
+        "multimodal_embedding": {"handle": "not-a-forward-tensor"},
         "multimodal_embed_mask_cumsum": torch.tensor(
             [False, False, True, True, True, True, False, False]
         )
@@ -295,8 +401,11 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     assert "mm_item_cu_seqlen" in named_args
     assert "mm_token_positions" in named_args
     assert "mm_token_lengths" in named_args
+    assert "mm_bidirectional_blocks" not in named_args
     assert "mm_special_offsets_cu_seqlen" in named_args
     assert "mm_special_offsets" in named_args
+    assert "multimodal_embedding_lengths" not in named_args
+    assert "multimodal_embed_mask_cumsum" not in named_args
 
     torch.testing.assert_close(
         named_args["mm_item_cu_seqlen"].cpu(), torch.tensor([0, 1], dtype=torch.int32)
@@ -543,6 +652,9 @@ class _DummyHybridKVCacheManager:
             return list(range(num_blocks))
         return list(range(1024))
 
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
+        return [list(range(1024)) for _ in request_ids]
+
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:
             return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -574,6 +686,72 @@ class _DummyRequestWithRequestId:
 
     def get_tokens(self, _beam: int) -> List[int]:
         return self._tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cached_sequence_interface_prepare_replay_metadata_write_first():
+    device = torch.device("cuda")
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=64,
+        max_batch_size=4,
+        max_num_tokens=64,
+        device=device,
+        kv_cache_config=KvCacheConfig(tokens_per_block=16),
+    )
+    cache_seq_interface.to(device)
+
+    prev_num_accepted_tokens = torch.zeros(6, dtype=torch.int32, device=device)
+    cache_buf_idx = torch.zeros(6, dtype=torch.int32, device=device)
+    slot_idx = torch.tensor([3, 1, 5, 0], dtype=torch.long, device=device)
+    prev_num_accepted_tokens[slot_idx] = torch.tensor(
+        [13, 7, 14, 2], dtype=torch.int32, device=device
+    )
+    cache_buf_idx[slot_idx] = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device=device)
+
+    cache_seq_interface._replay_work_items = torch.empty(
+        cache_seq_interface.info.max_num_state_slots,
+        REPLAY_WORK_ITEM_WIDTH,
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_seq_interface._replay_n_writes = torch.zeros(1, dtype=torch.int32, device=device)
+    cache_seq_interface._kv_cache_manager = SimpleNamespace(
+        shutdown=lambda: None,
+        get_replay_state_update_metadata=lambda: SimpleNamespace(
+            prev_num_accepted_tokens=prev_num_accepted_tokens,
+            cache_buf_idx=cache_buf_idx,
+            replay_step_width=6,
+            replay_history_size=16,
+        ),
+    )
+
+    cache_seq_interface.info.batch_info.update([0, 0, 4, 4, 0, 0])
+    cache_seq_interface.info.batch_info.update_use_replay(True)
+    cache_seq_interface.info._input_buffer.copy_("slot_idx", slot_idx)
+
+    cache_seq_interface.prepare_replay_metadata()
+
+    expected = torch.tensor(
+        [
+            [0, 3, 13, 1],
+            [2, 5, 14, 1],
+            [1, 1, 7, 0],
+            [3, 0, 2, 0],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    actual = cache_seq_interface._replay_work_items[:4]
+    assert cache_seq_interface._replay_n_writes.item() == 2
+    assert torch.equal(
+        actual[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH],
+        expected[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH],
+    )
+    assert torch.equal(actual[:, REPLAY_WORK_CACHE_SLOT], expected[:, REPLAY_WORK_CACHE_SLOT])
+    assert torch.equal(actual[:, REPLAY_WORK_PNAT], expected[:, REPLAY_WORK_PNAT])
+    assert torch.equal(actual[:, REPLAY_WORK_CACHE_BUF_IDX], expected[:, REPLAY_WORK_CACHE_BUF_IDX])
+
+    cache_seq_interface.shutdown()
 
 
 def test_ad_engine_prepare_inputs_with_hybrid_cache_manager():

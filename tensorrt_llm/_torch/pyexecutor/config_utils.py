@@ -1,10 +1,20 @@
+import dataclasses
 import re
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
+import torch
 import transformers
 
 from tensorrt_llm.logger import logger
+
+
+def is_gemma4_hybrid(config):
+    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
+    global_head_dim = getattr(config, 'global_head_dim', None)
+    head_dim = getattr(config, 'head_dim', None)
+    return (global_head_dim is not None and isinstance(head_dim, int)
+            and global_head_dim != head_dim)
 
 
 def is_hybrid_linear(config):
@@ -99,6 +109,179 @@ def get_qwen3_hybrid_layer_masks(config):
 def get_qwen3_hybrid_num_attention_layers(config):
     layer_mask, _ = get_qwen3_hybrid_layer_masks(config)
     return sum(layer_mask)
+
+
+@dataclasses.dataclass
+class MambaKVCacheParams:
+    """Normalized mamba-related inputs for kv_cache_manager_cls.
+
+    Field naming is consistent across the Nemotron-hybrid and Qwen3-hybrid
+    families so call sites don't special-case per family.
+    """
+    # Mamba / linear-attention state dimensions
+    state_size: int  # ssm_state_size      | linear_key_head_dim
+    conv_kernel: int  # conv_kernel         | linear_conv_kernel_dim
+    num_heads: int  # mamba_num_heads     | linear_num_value_heads
+    n_groups: int  # n_groups            | linear_num_key_heads
+    head_dim: int  # mamba_head_dim      | linear_value_head_dim
+
+    # Per-layer masks and counts (trailing entries cover MTP/draft layers,
+    # which are attention-only and carry no Mamba state).
+    mamba_layer_mask: List[bool]
+    full_attention_layer_mask: List[bool]
+    num_mamba_layers: int
+    num_full_attention_layers: int
+
+    # Dtypes
+    dtype: torch.dtype  # config.torch_dtype
+    mamba_ssm_cache_dtype: Optional[
+        torch.dtype]  # quant_config.mamba_ssm_cache_dtype
+
+    def get_states_bytes_per_layer(self, mapping) -> int:
+        """Return the total bytes of Mamba state per layer, used for budgeting."""
+        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        d_inner = self.head_dim * self.num_heads
+        conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
+        nheads = self.num_heads // tp_size
+
+        conv_dtype = self.dtype
+        ssm_dtype = (self.mamba_ssm_cache_dtype
+                     if self.mamba_ssm_cache_dtype is not None else self.dtype)
+        conv_bytes = conv_dim * (self.conv_kernel - 1) * conv_dtype.itemsize
+        ssm_bytes = (nheads * self.head_dim * self.state_size *
+                     ssm_dtype.itemsize)
+        state_bytes_per_layer = conv_bytes + ssm_bytes
+        return state_bytes_per_layer
+
+
+def _nemotron_hybrid_layer_masks(config, layer_mask):
+    pattern = config.hybrid_override_pattern
+    if layer_mask is None:
+        return ([c == "*" for c in pattern], [c == "M" for c in pattern])
+
+    # One-model speculative decoding: layer_mask may extend past the hybrid
+    # pattern; treat trailing positions as attention-only draft layers.
+    full_attn, mamba = [], []
+    for i, include in enumerate(layer_mask):
+        if i < len(pattern):
+            is_attn = pattern[i] == "*"
+            is_mamba = pattern[i] == "M"
+        else:
+            is_attn, is_mamba = True, False
+        full_attn.append(is_attn and include)
+        mamba.append(is_mamba and include)
+    return full_attn, mamba
+
+
+def _qwen3_hybrid_layer_masks(config, layer_mask):
+    full_attn, mamba = get_qwen3_hybrid_layer_masks(config)
+    if layer_mask is None:
+        return full_attn, mamba
+
+    if len(layer_mask) < len(full_attn):
+        raise ValueError(
+            "layer_mask is shorter than the Qwen3 hybrid layer pattern")
+    base_len = len(full_attn)
+    new_full_attn, new_mamba = [], []
+    for i, include in enumerate(layer_mask):
+        if i < base_len:
+            new_full_attn.append(full_attn[i] and include)
+            new_mamba.append(mamba[i] and include)
+        else:
+            new_full_attn.append(include)
+            new_mamba.append(False)
+    return new_full_attn, new_mamba
+
+
+def extract_mamba_kv_cache_params(
+    config,
+    layer_mask: Optional[List[bool]] = None,
+    spec_config=None,
+    quant_config=None,
+) -> MambaKVCacheParams:
+    """Build the mamba-related inputs for kv_cache_manager_cls.
+
+    Supports Nemotron-hybrid and Qwen3-hybrid (Qwen3-Next + Qwen3.5).
+
+    Args:
+        config: HuggingFace model config of a hybrid Mamba model.
+        layer_mask: Optional per-layer keep mask used by one-model speculative
+            decoding. Entries past the underlying hybrid pattern length are
+            treated as attention-only draft layers. When provided, the caller
+            is responsible for already including spec layers in the mask.
+        spec_config: When `layer_mask` is None, used to extend the masks with
+            MTP/draft attention layers (no Mamba state) so they receive KV
+            cache entries.
+        quant_config: Optional, used only to surface `mamba_ssm_cache_dtype`.
+
+    Returns:
+        MambaKVCacheParams with normalized field names.
+    """
+    if is_nemotron_hybrid(config):
+        state_size = config.ssm_state_size
+        conv_kernel = config.conv_kernel
+        num_heads = config.mamba_num_heads
+        n_groups = config.n_groups
+        head_dim = config.mamba_head_dim
+        full_attn_mask, mamba_mask = _nemotron_hybrid_layer_masks(
+            config, layer_mask)
+    elif is_qwen3_hybrid(config):
+        state_size = config.linear_key_head_dim
+        conv_kernel = config.linear_conv_kernel_dim
+        num_heads = config.linear_num_value_heads
+        n_groups = config.linear_num_key_heads
+        head_dim = config.linear_value_head_dim
+        full_attn_mask, mamba_mask = _qwen3_hybrid_layer_masks(
+            config, layer_mask)
+    else:
+        raise ValueError(
+            f"{type(config).__name__} is not a supported hybrid Mamba config")
+
+    # When no explicit layer_mask is given, extend the masks here so MTP/draft
+    # layers (attention-only, no Mamba state) get KV cache entries. With an
+    # explicit layer_mask, the caller already encoded those entries.
+    if layer_mask is None and spec_config is not None:
+        # Imported lazily to avoid a circular dependency between
+        # config_utils and tensorrt_llm._torch.speculative.
+        from ..speculative.utils import get_num_spec_layers
+        num_spec_layers = get_num_spec_layers(spec_config)
+        if num_spec_layers > 0:
+            full_attn_mask.extend([True] * num_spec_layers)
+            mamba_mask.extend([False] * num_spec_layers)
+
+    mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
+                             if quant_config is not None else None)
+
+    return MambaKVCacheParams(
+        state_size=state_size,
+        conv_kernel=conv_kernel,
+        num_heads=num_heads,
+        n_groups=n_groups,
+        head_dim=head_dim,
+        mamba_layer_mask=mamba_mask,
+        full_attention_layer_mask=full_attn_mask,
+        num_mamba_layers=sum(mamba_mask),
+        num_full_attention_layers=sum(full_attn_mask),
+        dtype=config.torch_dtype,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
+
+
+class _Qwen35MoeVLMConfig(transformers.Qwen3NextConfig):
+    """Thin subclass that restores the top-level model_type for Qwen3.5 MoE.
+
+    ``_Qwen35ConfigCompat`` normalizes the HF config into Qwen3NextConfig
+    (needed by the PyTorch backend model), but that loses the original
+    ``model_type``.  The serving layer needs ``model_type = "qwen3_5_moe"``
+    for ``MULTIMODAL_PLACEHOLDER_REGISTRY`` lookup; without it,
+    ``resolve_top_level_model_type`` returns ``"qwen3_next"`` and multimodal
+    requests fail with "Unknown modality".
+
+    To remove: when ``_Qwen35ConfigCompat`` is removed and the PyTorch backend
+    consumes ``Qwen3_5MoeConfig`` directly.
+    """
+
+    model_type = "qwen3_5_moe"
 
 
 class _Qwen35ConfigCompat:
@@ -261,6 +444,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
+    laguna="LagunaConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 
@@ -290,8 +474,27 @@ def load_pretrained_config(model_name_or_path: str,
                                 "Qwen3_5ForCausalLM",
                                 "Qwen3_5ForConditionalGeneration",
                             )):
-        model_config = transformers.Qwen3NextConfig.from_dict(
-            _Qwen35ConfigCompat.normalize(config_dict))
+        normalized = _Qwen35ConfigCompat.normalize(config_dict)
+        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_config = _Qwen35MoeVLMConfig.from_dict(normalized)
+        else:
+            model_config = transformers.Qwen3NextConfig.from_dict(normalized)
+    elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
+          and config_dict.get("layer_types") is None):
+        # transformers 5.5.x Exaone4Config.__post_init__ first forces
+        # `sliding_window_pattern = 0` when `sliding_window is None`, then
+        # synthesizes `layer_types` via `(i + 1) % sliding_window_pattern`,
+        # which raises ZeroDivisionError. The released EXAONE-4.0 ckpts
+        # publish both fields as `null`. Inject layer_types directly into
+        # the config dict (all full attention, since sliding_window is null
+        # means no sliding) and bypass AutoConfig.from_pretrained's kwargs
+        # filtering by going through CONFIG_MAPPING + from_dict.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        n_layers = config_dict.get("num_hidden_layers") or 32
+        patched_dict = {
+            **config_dict, "layer_types": ["full_attention"] * n_layers
+        }
+        model_config = CONFIG_MAPPING[model_type].from_dict(patched_dict)
     else:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
@@ -313,18 +516,26 @@ def load_pretrained_config(model_name_or_path: str,
             # needed — model_config.rope_theta (if any) is already canonical.
             rope_theta = rope_scaling.get("rope_theta")
             if rope_theta is not None:
-                existing = getattr(model_config, "rope_theta", None)
-                if existing is None:
-                    model_config.rope_theta = rope_theta
-                elif existing != rope_theta:
-                    # Both values are set but disagree. Keep the top-level value
-                    # (canonical in transformers 4.x and 5.x), but warn loudly
-                    # so that any future transformers upgrade that breaks this
-                    # invariant is easy to spot.
+                # `rope_scaling.rope_theta` mirrors `rope_parameters.rope_theta`
+                # and is the canonical value in transformers 5.x. Adopt it as
+                # `model_config.rope_theta` so downstream code can read it.
+                # Note: `model_config.rope_theta` may be absent entirely
+                # (transformers 5.x dropped it from some configs) or may be a
+                # config-class default that does NOT reflect the user's
+                # config.json (e.g. DeepseekV3Config default 10000 vs. user's
+                # 1000000 — the original bug).
+                user_top_level = config_dict.get("rope_theta")
+                if user_top_level is not None and user_top_level != rope_theta:
+                    # User explicitly set both top-level rope_theta and
+                    # rope_parameters.rope_theta to disagreeing values — keep
+                    # the top-level value but warn loudly.
                     logger.warning(
                         f"rope_scaling.rope_theta ({rope_theta}) differs from "
-                        f"model_config.rope_theta ({existing}); keeping the "
+                        f"config rope_theta ({user_top_level}); keeping the "
                         f"top-level value.")
+                    model_config.rope_theta = user_top_level
+                else:
+                    model_config.rope_theta = rope_theta
             model_config.rope_scaling = None
 
     return model_config

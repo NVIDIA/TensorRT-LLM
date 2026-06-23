@@ -79,6 +79,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     """
     extra_llm_api_options = params.get("extra_llm_api_options")
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
+    enable_attention_dp = False
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
@@ -86,15 +87,20 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            kv_cache_config = llm_args_dict.get("kv_cache_config", {
-                "dtype": "auto",
-            })
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
-                                                        mamba_ssm_cache_dtype)
+        if not isinstance(llm_args_dict, dict):
+            raise TypeError(
+                f"extra_llm_api_options must contain a YAML mapping, "
+                f"got {type(llm_args_dict)}")
+        kv_cache_config = llm_args_dict.get("kv_cache_config", {
+            "dtype": "auto",
+        })
+        kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+        mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
+                                                    mamba_ssm_cache_dtype)
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
+        enable_attention_dp = llm_args_dict.get("enable_attention_dp", False)
 
     mapping = {
         "pp_size": params.get("pp"),
@@ -105,10 +111,14 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "gpus_per_node": params.get("gpus_per_node"),
     }
 
-    if params.get("max_batch_size") and params.get("max_num_tokens"):
-        logger.info("Use user-provided max batch size and max num tokens.")
-        max_batch_size, max_num_tokens = params.get(
-            "max_batch_size"), params.get("max_num_tokens")
+    user_max_batch_size = params.get("max_batch_size")
+    user_max_num_tokens = params.get("max_num_tokens")
+
+    if user_max_batch_size is not None and user_max_num_tokens is not None:
+        max_batch_size, max_num_tokens = user_max_batch_size, user_max_num_tokens
+        logger.info(
+            f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
+            f"max_num_tokens={max_num_tokens} (user-provided).")
     else:
         model_config = get_model_config(model, model_path)
 
@@ -137,25 +147,35 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             dataset_metadata.avg_isl,
             dataset_metadata.avg_osl,
             params.get("kv_cache_free_gpu_mem_fraction"),
+            enable_attention_dp=enable_attention_dp,
         )
 
-        logger.info(
-            f"Max batch size and max num tokens not provided. "
-            f"Using heuristics or pre-defined settings: max_batch_size={max_batch_size}, max_num_tokens={max_num_tokens}."
-        )
-
-        # If chunked prefill is disabled, we need to ensure that the max_num_tokens is at least the max_isl
-        if not enable_chunked_prefill:
-            logger.warning(
-                f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) is less than the max ISL ({dataset_metadata.max_isl}). "
-                f"Forcing max_num_tokens to {dataset_metadata.max_isl + max_batch_size}."
-            )
-            max_num_tokens = max(max_num_tokens,
-                                 dataset_metadata.max_isl + max_batch_size)
+        if user_max_batch_size is not None:
+            max_batch_size = user_max_batch_size
+            logger.info(
+                f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
+                f"max_num_tokens={max_num_tokens} (heuristic).")
+        elif user_max_num_tokens is not None:
+            max_num_tokens = user_max_num_tokens
+            logger.info(
+                f"Initial settings: max_batch_size={max_batch_size} (heuristic), "
+                f"max_num_tokens={max_num_tokens} (user-provided).")
         else:
-            # TODO: Figure out how to handle chunked block size.
-            # Expecting this to be the max of chunk block and max_num_tokens.
-            pass
+            logger.info(
+                f"Initial settings: max_batch_size={max_batch_size} (heuristic), "
+                f"max_num_tokens={max_num_tokens} (heuristic).")
+
+    # If chunked prefill is disabled, enforce a max_num_tokens floor regardless
+    # of whether the value came from the user or the heuristic, so requests with
+    # long ISL are not later rejected for exceeding max_num_tokens.
+    if not enable_chunked_prefill:
+        required_min_tokens = dataset_metadata.max_isl + max_batch_size
+        if max_num_tokens < required_min_tokens:
+            logger.warning(
+                f"Chunked prefill is disabled, but max_num_tokens ({max_num_tokens}) "
+                f"is less than required ({required_min_tokens}). "
+                f"Forcing max_num_tokens to {required_min_tokens}.")
+            max_num_tokens = required_min_tokens
 
     cuda_graph_config = {
         "enable_padding": True,

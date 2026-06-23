@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
 
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
@@ -15,7 +16,6 @@ from tensorrt_llm.mapping import Mapping
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
-from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 
@@ -98,7 +98,7 @@ def _parse_profile_range():
 
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
-    from .config import DiffusionModelConfig
+    from .config import DiffusionPipelineConfig
 
 
 class BasePipeline(nn.Module):
@@ -107,7 +107,7 @@ class BasePipeline(nn.Module):
     """
 
     @classmethod
-    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
+    def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
 
         Override in subclasses to select a variant pipeline at creation
@@ -117,11 +117,11 @@ class BasePipeline(nn.Module):
         """
         return cls
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
+    def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
-        self.model_config = model_config
-        self.config = model_config.pretrained_config
-        self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self.pipeline_config = pipeline_config
+        self.config = pipeline_config.primary_pretrained_config
+        self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
@@ -171,10 +171,10 @@ class BasePipeline(nn.Module):
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.model_config.cuda_graph.enable_cuda_graph:
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
-        if self.model_config.torch_compile.enable_torch_compile:
+        if self.pipeline_config.torch_compile.enable:
             logger.warning(
                 "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
@@ -193,7 +193,11 @@ class BasePipeline(nn.Module):
             if model is None:
                 continue
 
-            runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True), shared_pool)
+            runner = CUDAGraphRunner(
+                CUDAGraphRunnerConfig(use_cuda_graph=True),
+                shared_pool,
+            )
+            model.register_cuda_graph_extra_key_fns(runner)
             logger.info(f"CUDA graph runner: wrapping {name}.forward")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
@@ -294,7 +298,7 @@ class BasePipeline(nn.Module):
         Returns:
             (shapes, steps) tuple where shapes = list of (h, w, f)
         """
-        warmup_cfg = self.model_config.compilation
+        warmup_cfg = self.pipeline_config.compilation
 
         if warmup_cfg.resolutions is not None or warmup_cfg.num_frames is not None:
             resolutions = (
@@ -397,13 +401,12 @@ class BasePipeline(nn.Module):
             self.transformer.post_load_weights()
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
-        """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""
+        """Pick TeaCache coefficients from checkpoint path; updates pipeline config in place."""
         if not coefficients:
             return
-        teacache_cfg = self.model_config.teacache
-        checkpoint_path = (
-            getattr(getattr(self.model_config, "pretrained_config", None), "_name_or_path", "")
-            or ""
+        teacache_cfg = self.pipeline_config.teacache
+        checkpoint_path = getattr(
+            self.pipeline_config.primary_pretrained_config, "_name_or_path", ""
         )
         matched = False
         for model_size, coeff_data in coefficients.items():
@@ -445,7 +448,7 @@ class BasePipeline(nn.Module):
             self.cache_accelerator.unwrap()
             self.cache_accelerator = None
 
-        cfg = self.model_config
+        cfg = self.pipeline_config
 
         if cfg.cache_backend == "cache_dit":
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
@@ -468,35 +471,55 @@ class BasePipeline(nn.Module):
             self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
-        if not self.model_config.enable_parallel_vae:
-            return
-        if not dist.is_initialized() or dist.get_world_size() <= 1:
-            return
-        if self.vae is None:
+        """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
+
+        ``self._parallel_vae_enabled`` is a *global* mode flag: it is computed
+        from inputs that are identical on every rank (config + mapping +
+        deterministic capability check), so every rank agrees on whether
+        parallel-VAE decode ownership applies. The actual ``ParallelVAEFactory``
+        wrap is a local side effect that only runs on ranks in ``vae_ranks``.
+        """
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
+
+        # Global preconditions — evaluate identically on every rank.
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and self.vae is not None
+            and vgm is not None
+            and ParallelVAEFactory.supports(type(self.vae))
+        )
+        if not self._parallel_vae_enabled:
+            # Quick check to see if it wasn't enabled due to missing support.
+            if (
+                parallel_cfg.parallel_vae_size > 1
+                and self.vae is not None
+                and not ParallelVAEFactory.supports(type(self.vae))
+            ):
+                logger.warning(
+                    f"Parallel VAE not supported for {self.__class__.__name__} "
+                    f"(VAE type: {type(self.vae).__name__}). "
+                    "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
+                    "parallel VAE for this VAE type."
+                )
             return
 
-        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
-        pg = dist.new_group(list(range(dist.get_world_size())))
-        try:
-            self.vae = ParallelVAEFactory.from_vae(
-                self.vae,
-                split_dim=self.model_config.parallel_vae_split_dim,
-                pg=pg,
-            )
-        except ValueError:
-            logger.warning(
-                f"Parallel VAE not supported for {self.__class__.__name__} "
-                f"(VAE type: {type(self.vae).__name__}). "
-                "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
-                "parallel VAE for this VAE type."
-            )
+        # Local side effect: only ranks in the VAE group wrap the VAE module.
+        if self.rank not in vgm.vae_ranks or vgm.vae_group is None:
             return
 
-        self._parallel_vae_enabled = True
+        self.vae = ParallelVAEFactory.from_vae(
+            self.vae,
+            split_dim=parallel_cfg.parallel_vae_split_dim,
+            pg=vgm.vae_group,
+            adj_groups=vgm.vae_adj_groups,
+        )
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel_vae_split_dim}, "
-            f"world_size={dist.get_world_size(pg)}"
+            f"split_dim={parallel_cfg.parallel_vae_split_dim}, "
+            f"world_size={dist.get_world_size(vgm.vae_group)}"
         )
 
     def torch_compile(self) -> None:
@@ -508,7 +531,7 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
-        tc_config = self.model_config.torch_compile
+        tc_config = self.pipeline_config.torch_compile
 
         # Using default as max-autotune mode takes more initialization time and
         # does not improve performance a lot.
@@ -621,40 +644,40 @@ class BasePipeline(nn.Module):
         decode_fn: Callable[[torch.Tensor], Any],
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
-        """Execute VAE decoding. Only rank 0 performs decoding.
-        If parallel VAE is enabled, all processes perform decoding.
+        """Execute VAE decoding.
+
+        Decode ownership is decided from the global ``_parallel_vae_enabled``
+        flag set by ``setup_parallel_vae``:
+
+        - parallel-VAE mode on: ranks in ``vgm.vae_ranks`` decode collectively.
+        - parallel-VAE mode off: only rank 0 decodes.
+
+        Non-decoding ranks return ``None`` placeholders.
 
         Args:
-            latents: Primary latents to decode (e.g., video)
-            decode_fn: Decoder function for primary latents
+            latents: Primary latents to decode (e.g., video).
+            decode_fn: Decoder function for primary latents.
             extra_latents: Optional dict of additional latents to decode.
-                          Format: {name: (latents_tensor, decode_fn)}
-                          Example: {"audio": (audio_latents, audio_decode_fn)}
+                Format: ``{name: (latents_tensor, decode_fn)}``.
+                Example: ``{"audio": (audio_latents, audio_decode_fn)}``.
 
         Returns:
-            Single result if no extra_latents, tuple of results if extra_latents provided.
-            Non-rank-0 processes return None placeholders.
+            Single result if no ``extra_latents``, else a tuple of results.
+            Non-decoding ranks return ``None`` (or a tuple of ``None``).
         """
-
         if self._parallel_vae_enabled:
+            vgm = self.pipeline_config.visual_gen_mapping
+            decode_ranks = set(vgm.vae_ranks)
+        else:
+            decode_ranks = {0}
+
+        if self.rank in decode_ranks:
             primary_result = decode_fn(latents)
             if extra_latents:
                 extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
                 return (primary_result,) + tuple(extra_results)
             return primary_result
 
-        if self.rank == 0:
-            primary_result = decode_fn(latents)
-
-            if extra_latents:
-                extra_results = []
-                for name, (extra_latent, extra_decode_fn) in extra_latents.items():
-                    extra_results.append(extra_decode_fn(extra_latent))
-                return (primary_result,) + tuple(extra_results)
-
-            return primary_result
-
-        # Return None placeholders for non-rank-0 processes
         n_results = 1 + (len(extra_latents) if extra_latents else 0)
         return (None,) * n_results if n_results > 1 else None
 
@@ -683,13 +706,12 @@ class BasePipeline(nn.Module):
         Returns:
             Dict with CFG configuration including split tensors
         """
-        vgm = self.model_config.visual_gen_mapping
+        vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         attn2d_row_size = vgm.attn2d_row_size if vgm else 1
         attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_size = attn2d_row_size * attn2d_col_size
-        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
+        seq_parallel_size = vgm.seq_size if vgm is not None else 1
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
@@ -702,10 +724,9 @@ class BasePipeline(nn.Module):
                 if attn2d_row_size * attn2d_col_size > 1:
                     logger.info(
                         f"CFG Parallel: cfg_size={cfg_size}, "
-                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}, "
+                        f"ulysses_size={ulysses_size}"
                     )
-                else:
-                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:
@@ -747,6 +768,7 @@ class BasePipeline(nn.Module):
         self,
         latents,
         extra_stream_latents,
+        step_index,
         timestep,
         local_embeds,
         forward_fn,
@@ -756,12 +778,19 @@ class BasePipeline(nn.Module):
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
-        vgm = self.model_config.visual_gen_mapping
+        vgm = self.pipeline_config.visual_gen_mapping
         cfg_pg = vgm.cfg_group if vgm else None
         cfg_size = vgm.cfg_size if vgm else 1
 
         t_start = time.time()
-        result = forward_fn(latents, extra_stream_latents, timestep, local_embeds, local_extras)
+        result = forward_fn(
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            local_embeds,
+            local_extras,
+        )
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
@@ -811,6 +840,7 @@ class BasePipeline(nn.Module):
         self,
         latents,
         extra_stream_latents,
+        step_index,
         timestep,
         prompt_embeds,
         forward_fn,
@@ -834,7 +864,12 @@ class BasePipeline(nn.Module):
 
         t_start = time.time()
         result = forward_fn(
-            latent_input, extra_stream_input, timestep_expanded, prompt_embeds, local_extras
+            latent_input,
+            extra_stream_input,
+            step_index,
+            timestep_expanded,
+            prompt_embeds,
+            local_extras,
         )
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
@@ -922,8 +957,11 @@ class BasePipeline(nn.Module):
             prompt_embeds: Text embeddings (positive)
             guidance_scale: CFG strength (1.0 = no guidance)
             forward_fn: Transformer forward function
-                       Signature: forward_fn(latents, extra_stream_latents, timestep,
-                                            encoder_hidden_states, extra_tensors_dict)
+                       Signature: forward_fn(latents, extra_stream_latents, step_index,
+                                            timestep, encoder_hidden_states,
+                                            extra_tensors_dict)
+                       step_index is the ordinal denoising-loop index, distinct
+                       from the scheduler timestep value.
                        Returns: (primary_noise, extra_stream_noises_dict) or just primary_noise
             timesteps: Optional custom timesteps (defaults to scheduler.timesteps)
             neg_prompt_embeds: Optional negative text embeddings for CFG
@@ -1021,9 +1059,15 @@ class BasePipeline(nn.Module):
             with nvtx_range(f"denoise_step {i}"):
                 if do_cfg_parallel:
                     timestep = t.expand(latents.shape[0])
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
+                    (
+                        noise_pred,
+                        extra_noise_preds,
+                        t_trans,
+                        t_cfg,
+                    ) = self._denoise_step_cfg_parallel(
                         latents,
                         extra_stream_latents,
+                        i,
                         timestep,
                         cfg_config["local_embeds"],
                         forward_fn,
@@ -1033,9 +1077,15 @@ class BasePipeline(nn.Module):
                         local_extras,
                     )
                 else:
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
+                    (
+                        noise_pred,
+                        extra_noise_preds,
+                        t_trans,
+                        t_cfg,
+                    ) = self._denoise_step_standard(
                         latents,
                         extra_stream_latents,
+                        i,
                         t,
                         prompt_embeds,
                         forward_fn,
@@ -1088,7 +1138,7 @@ class BasePipeline(nn.Module):
             if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
                 stats = self.cache_accelerator.get_stats()
                 if stats:
-                    if self.model_config.cache_backend == "cache_dit":
+                    if self.pipeline_config.cache_backend == "cache_dit":
                         logger.info("Cache-DiT stats: %s", stats)
                     elif "hit_rate" in stats:
                         logger.info(

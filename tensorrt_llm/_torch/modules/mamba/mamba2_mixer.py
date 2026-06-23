@@ -157,13 +157,10 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        # TODO: Update head_dims and head_group_ratios once flashinfer is updated.
+        # TODO: Update head_dims once flashinfer is updated.
+        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
-        head_group_ratio = (self.tp_nheads //
-                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
-        self._use_flashinfer = (head_dim in supported_head_dims and
-                                head_group_ratio in supported_head_group_ratios)
+        self._use_flashinfer = head_dim in supported_head_dims
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
@@ -172,6 +169,8 @@ class Mamba2Mixer(nn.Module):
         # cache manager), so precompute both gate values here.
         sr_base = (self._stochastic_rounding_requested
                    and self._mamba_ssm_cache_dtype == torch.float16)
+        # Keep replay SSM-cache writes on the same stochastic-rounding policy
+        # as flashinfer; the replay kernel masks stale slots before using them.
         self._stochastic_rounding_for_replay = sr_base
         self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
 
@@ -375,6 +374,7 @@ class Mamba2Mixer(nn.Module):
 
             initial_states = None
             if mamba_metadata.use_initial_states:
+                # Rows without cached prefix state start SSM from zero.
                 initial_states = torch.where(
                     has_initial_states[:, None, None, None],
                     ssm_states[state_indices_p], 0)
@@ -413,11 +413,22 @@ class Mamba2Mixer(nn.Module):
                 # Speculative decoding only supported with Python path
                 assert layer_cache is not None, \
                     "Speculative decoding requires Python MambaCacheManager"
-                # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
-                draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
                 use_replay = getattr(attn_metadata.kv_cache_manager,
                                      'use_replay_state_update', False)
+                draft_token_num = spec_metadata.runtime_draft_len + 1
+                if use_replay:
+                    replay_metadata = (attn_metadata.kv_cache_manager.
+                                       get_replay_state_update_metadata())
+                    assert replay_metadata is not None, (
+                        "Mamba replay state update is enabled but replay "
+                        "metadata was not allocated.")
+                    replay_step_width = replay_metadata.replay_step_width
+                    assert draft_token_num == replay_step_width, (
+                        "Mamba replay state update does not support dynamic "
+                        "draft length yet. Runtime token width "
+                        f"{draft_token_num} must match fixed replay step "
+                        f"width {replay_step_width}.")
 
                 intermediate_state_indices = _cached_arange(
                     attn_metadata.kv_cache_manager.get_max_resource_count(),
@@ -512,11 +523,23 @@ class Mamba2Mixer(nn.Module):
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
-                    philox_kwargs['rand_seed'] = torch.randint(
-                        0, 2**62, (1, ), device=x_d.device, dtype=torch.int64)
+                    # Both replay and flashinfer use a single Philox seed. The
+                    # cache manager owns the persistent buffer; passing a (1,)
+                    # view avoids allocating CUDA tensors per forward.
+                    rand_seed = layer_cache.mamba_ssm_rand_seed
+                    assert rand_seed is not None, (
+                        "Mamba SSM stochastic rounding is enabled but the "
+                        "rand_seed buffer was not allocated; check that "
+                        "_util.py passes mamba_ssm_stochastic_rounding=True "
+                        "to the cache manager.")
+                    rand_seed.add_(1)
+                    philox_kwargs['rand_seed'] = rand_seed[:1]
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
+                    # replay_work_items is write-first for persistent_main and
+                    # carries decode-batch position, cache slot, PNAT, and
+                    # active cache buffer index for replay kernels.
                     replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x,
@@ -535,12 +558,19 @@ class Mamba2Mixer(nn.Module):
                         dt_softplus=self.delta_softplus,
                         state_batch_indices=state_batch_indices,
                         out=out_4d,
+                        n_writes=mamba_metadata.replay_n_writes,
+                        replay_work_items=(
+                            mamba_metadata.replay_work_items[:num_decodes]),
                         launch_with_pdl=True,
                         **philox_kwargs,
                     )
                 elif self._use_mtp_custom_op and not use_stochastic_rounding:
                     # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
                     # Does not support stochastic rounding.
+                    # CUDA kernel requires contiguous dense inputs.
+                    x_d_4d = x_d_4d.contiguous()
+                    B_d_4d = B_d_4d.contiguous()
+                    C_d_4d = C_d_4d.contiguous()
                     selective_state_update_mtp_ssm_cache_trtllm(
                         ssm_states,
                         x_d_4d,
@@ -560,7 +590,7 @@ class Mamba2Mixer(nn.Module):
                         intermediate_state_indices=intermediate_state_indices,
                     )
                 else:
-                    # Legacy flashinfer path: contiguous copies for alignment.
+                    # Triton kernel + flashinfer need contiguous for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
@@ -601,10 +631,19 @@ class Mamba2Mixer(nn.Module):
                 # Non-MTP decode only runs through flashinfer, no replay path.
                 use_stochastic_rounding = self._stochastic_rounding_for_flashinfer
                 if use_stochastic_rounding:
-                    ssu_kwargs['rand_seed'] = torch.randint(0,
-                                                            2**62, (1, ),
-                                                            device=x_d.device,
-                                                            dtype=torch.int64)
+                    # Fetch the persistent (cache_size,) Philox seed buffer
+                    # from the cache manager and pass slot 0 as a (1,) view to
+                    # flashinfer.  No per-call CUDA tensor allocation; the
+                    # in-place add_(1) is CUDA-graph-friendly.
+                    rand_seed = (attn_metadata.kv_cache_manager.
+                                 get_mamba_ssm_rand_seed())
+                    assert rand_seed is not None, (
+                        "Mamba SSM stochastic rounding is enabled but the "
+                        "rand_seed buffer was not allocated; check that "
+                        "_util.py passes mamba_ssm_stochastic_rounding=True "
+                        "to the cache manager.")
+                    rand_seed.add_(1)
+                    ssu_kwargs['rand_seed'] = rand_seed[:1]
                     ssu_kwargs['philox_rounds'] = self._philox_rounds
 
                 self.selective_state_update_func(

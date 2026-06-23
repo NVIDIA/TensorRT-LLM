@@ -6,16 +6,146 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import PIL
 import torch
 from blake3 import blake3
 
-import tensorrt_llm
 from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
+                                                 serialize_item)
 from tensorrt_llm.logger import logger
 
 # Default hasher
 default_hasher = blake3
+_INT32_MAX = 2**31 - 1
+
+# Versioned tag prefixed to every content hash so the canonical, self-describing
+# serialization scheme can evolve without silently reusing stale cache keys.
+_HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
+
+
+def _validate_int_list(values: Any, field_name: str) -> None:
+    """Boundary metadata must be owned Python list[int]. No tensor/tuple."""
+    if not isinstance(values, list):
+        raise TypeError(f"{field_name} must be a list")
+    if not all(isinstance(value, int) for value in values):
+        raise TypeError(f"{field_name} must contain only integers")
+
+
+def _validate_multimodal_positions_and_lengths(
+    multimodal_positions: List[int],
+    multimodal_lengths: List[int],
+    expected_num_items: int,
+    expected_num_items_name: str,
+) -> None:
+    """Validate one prompt span per MM item.
+
+    expected_num_items is owner count: hashes for MultimodalInput,
+    embedding lengths for E/P handoff. Positions are prompt offsets. Lengths
+    are prompt token counts.
+    """
+    _validate_int_list(multimodal_positions, "multimodal_positions")
+    _validate_int_list(multimodal_lengths, "multimodal_lengths")
+
+    if len(multimodal_positions) != len(multimodal_lengths):
+        raise ValueError(f"Position and length arrays must match in size: "
+                         f"positions={len(multimodal_positions)}, "
+                         f"lengths={len(multimodal_lengths)}")
+    if len(multimodal_positions) != expected_num_items:
+        raise ValueError(
+            f"{expected_num_items_name}, multimodal_positions, and "
+            "multimodal_lengths must all have the same length")
+
+    if any(position < 0 for position in multimodal_positions):
+        raise ValueError("multimodal_positions must be non-negative")
+    if any(length <= 0 for length in multimodal_lengths):
+        raise ValueError("multimodal_lengths must be positive")
+
+
+def _validate_multimodal_runs(
+    num_items: int,
+    multimodal_lengths: List[int],
+    multimodal_item_run_cu_offsets: Optional[List[int]],
+    multimodal_run_positions: Optional[List[int]],
+    multimodal_run_lengths: Optional[List[int]],
+    item_count_name: str,
+) -> None:
+    """Validate exact runs when they are present.
+
+    Either no run fields, or all three. Offsets length is num_items + 1.
+    Runs for each item must sum to multimodal_lengths[i]. Values must fit
+    int32 for executor/KV-cache code.
+    """
+    run_fields = (
+        multimodal_item_run_cu_offsets,
+        multimodal_run_positions,
+        multimodal_run_lengths,
+    )
+    if all(field is None for field in run_fields):
+        return
+    if any(field is None for field in run_fields):
+        raise ValueError(
+            "multimodal_item_run_cu_offsets, multimodal_run_positions, "
+            "and multimodal_run_lengths must be provided together")
+
+    assert multimodal_item_run_cu_offsets is not None
+    assert multimodal_run_positions is not None
+    assert multimodal_run_lengths is not None
+
+    for field_name, values in (
+        ("multimodal_item_run_cu_offsets", multimodal_item_run_cu_offsets),
+        ("multimodal_run_positions", multimodal_run_positions),
+        ("multimodal_run_lengths", multimodal_run_lengths),
+    ):
+        _validate_int_list(values, field_name)
+        if any(value > _INT32_MAX for value in values):
+            raise ValueError(f"{field_name} values must fit in int32")
+
+    if len(multimodal_item_run_cu_offsets) != num_items + 1:
+        raise ValueError("multimodal_item_run_cu_offsets length must be "
+                         f"len({item_count_name}) + 1")
+    if multimodal_item_run_cu_offsets[0] != 0:
+        raise ValueError("multimodal_item_run_cu_offsets must start at 0")
+    if len(multimodal_run_positions) != len(multimodal_run_lengths):
+        raise ValueError(
+            "multimodal_run_positions and multimodal_run_lengths must "
+            "have the same length")
+    if multimodal_item_run_cu_offsets[-1] != len(multimodal_run_positions):
+        raise ValueError(
+            "multimodal_item_run_cu_offsets[-1] must equal the number of "
+            "flat multimodal runs")
+    if not all(multimodal_item_run_cu_offsets[i] <=
+               multimodal_item_run_cu_offsets[i + 1]
+               for i in range(len(multimodal_item_run_cu_offsets) - 1)):
+        raise ValueError(
+            "multimodal_item_run_cu_offsets must be non-decreasing")
+    if any(pos < 0 for pos in multimodal_run_positions):
+        raise ValueError("multimodal_run_positions must be non-negative")
+    if any(length <= 0 for length in multimodal_run_lengths):
+        raise ValueError("multimodal_run_lengths must be positive")
+    for run_idx, (position, length) in enumerate(
+            zip(multimodal_run_positions, multimodal_run_lengths)):
+        if position + length > _INT32_MAX:
+            raise ValueError(
+                f"multimodal run {run_idx} end position exceeds int32 "
+                f"range: position={position}, length={length}, "
+                f"max={_INT32_MAX}")
+
+    for item_idx, expected_length in enumerate(multimodal_lengths):
+        run_begin = multimodal_item_run_cu_offsets[item_idx]
+        run_end = multimodal_item_run_cu_offsets[item_idx + 1]
+        actual_length = sum(multimodal_run_lengths[run_begin:run_end])
+        if actual_length != expected_length:
+            raise ValueError(
+                f"multimodal run lengths for item {item_idx} sum to "
+                f"{actual_length}, expected {expected_length}")
+        item_positions = multimodal_run_positions[run_begin:run_end]
+        item_lengths = multimodal_run_lengths[run_begin:run_end]
+        for prev_pos, prev_len, pos in zip(item_positions, item_lengths,
+                                           item_positions[1:]):
+            if pos < prev_pos + prev_len:
+                raise ValueError(
+                    "multimodal runs must be ordered and non-overlapping "
+                    "within each item")
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -86,6 +216,21 @@ class MultimodalInput:
     returned in KV cache events.
     """
 
+    multimodal_item_run_cu_offsets: Optional[List[int]] = None
+    """Optional offsets into the flat multimodal run arrays.
+
+    "Cu" means cumulative: length is `len(multimodal_hashes) + 1`.
+    Runs for item `i` live in
+    `multimodal_run_positions[offsets[i]:offsets[i + 1]]` and the matching
+    slice of `multimodal_run_lengths`.
+    """
+
+    multimodal_run_positions: Optional[List[int]] = None
+    """Optional prompt start position for each exact multimodal token run."""
+
+    multimodal_run_lengths: Optional[List[int]] = None
+    """Optional length for each exact multimodal token run."""
+
     def __post_init__(self):
         """Validate input data structure and consistency."""
         # Validate multimodal_hashes
@@ -103,19 +248,12 @@ class MultimodalInput:
                 f"All hash arrays must have the same length, got lengths: {hash_lengths}"
             )
 
-        # Check that positions and lengths are valid
-        if not all(isinstance(x, int) for x in self.multimodal_positions):
-            raise TypeError("multimodal_positions must contain only integers")
-
-        if not all(isinstance(x, int) for x in self.multimodal_lengths):
-            raise TypeError("multimodal_lengths must contain only integers")
-
-        # Check position and length arrays match in size
-        if len(self.multimodal_positions) != len(self.multimodal_lengths):
-            raise ValueError(
-                f"Position and length arrays must match in size: "
-                f"positions={len(self.multimodal_positions)}, lengths={len(self.multimodal_lengths)}"
-            )
+        _validate_multimodal_positions_and_lengths(
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            len(self.multimodal_hashes),
+            "multimodal_hashes",
+        )
 
         # Validate multimodal_uuids if provided
         if self.multimodal_uuids is not None:
@@ -131,6 +269,15 @@ class MultimodalInput:
                         f"multimodal_uuids[{i}] must be a string or None, got {type(uuid)}"
                     )
 
+        _validate_multimodal_runs(
+            len(self.multimodal_hashes),
+            self.multimodal_lengths,
+            self.multimodal_item_run_cu_offsets,
+            self.multimodal_run_positions,
+            self.multimodal_run_lengths,
+            "multimodal_hashes",
+        )
+
     @classmethod
     def from_components(
         cls,
@@ -138,11 +285,17 @@ class MultimodalInput:
         mm_positions: List[int],
         mm_lengths: List[int],
         mm_uuids: Optional[List[Optional[str]]] = None,
+        mm_item_run_cu_offsets: Optional[List[int]] = None,
+        mm_run_positions: Optional[List[int]] = None,
+        mm_run_lengths: Optional[List[int]] = None,
     ) -> 'MultimodalInput':
         return cls(multimodal_hashes=mm_hashes,
                    multimodal_positions=mm_positions,
                    multimodal_lengths=mm_lengths,
-                   multimodal_uuids=mm_uuids)
+                   multimodal_uuids=mm_uuids,
+                   multimodal_item_run_cu_offsets=mm_item_run_cu_offsets,
+                   multimodal_run_positions=mm_run_positions,
+                   multimodal_run_lengths=mm_run_lengths)
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""
@@ -151,6 +304,87 @@ class MultimodalInput:
             torch.tensor(self.multimodal_hashes, dtype=torch.int32),
             torch.tensor(self.multimodal_positions, dtype=torch.int32),
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
+
+    def run_metadata(self) -> Dict[str, List[int]]:
+        metadata = {}
+        if self.multimodal_item_run_cu_offsets is not None:
+            metadata[
+                "multimodal_item_run_cu_offsets"] = self.multimodal_item_run_cu_offsets
+        if self.multimodal_run_positions is not None:
+            metadata["multimodal_run_positions"] = self.multimodal_run_positions
+        if self.multimodal_run_lengths is not None:
+            metadata["multimodal_run_lengths"] = self.multimodal_run_lengths
+        return metadata
+
+    def to_binding(self, executor_module: Any) -> Any:
+        kwargs = dict(multimodal_hashes=self.multimodal_hashes,
+                      multimodal_positions=self.multimodal_positions,
+                      multimodal_lengths=self.multimodal_lengths,
+                      multimodal_uuids=self.multimodal_uuids)
+        kwargs.update(self.run_metadata())
+        return executor_module.MultimodalInput(**kwargs)
+
+
+@dataclass
+class DisaggPrefillMultimodalInputs:
+    """Typed multimodal metadata returned by E/P disagg prefill processors."""
+
+    prompt_token_ids: List[int]
+    multimodal_lengths: List[int]
+    multimodal_positions: List[int]
+    multimodal_embedding_lengths: List[int]
+    multimodal_item_run_cu_offsets: Optional[List[int]] = None
+    multimodal_run_positions: Optional[List[int]] = None
+    multimodal_run_lengths: Optional[List[int]] = None
+    special_token_offsets: Optional[List[int]] = None
+    item_types: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        _validate_int_list(self.prompt_token_ids, "prompt_token_ids")
+        _validate_int_list(self.multimodal_embedding_lengths,
+                           "multimodal_embedding_lengths")
+        _validate_multimodal_positions_and_lengths(
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            len(self.multimodal_embedding_lengths),
+            "multimodal_embedding_lengths",
+        )
+
+        if any(length <= 0 for length in self.multimodal_embedding_lengths):
+            raise ValueError("multimodal_embedding_lengths must be positive")
+
+        _validate_multimodal_runs(
+            len(self.multimodal_lengths),
+            self.multimodal_lengths,
+            self.multimodal_item_run_cu_offsets,
+            self.multimodal_run_positions,
+            self.multimodal_run_lengths,
+            "multimodal_lengths",
+        )
+        self._validate_optional_metadata()
+
+    def _validate_optional_metadata(self) -> None:
+        if self.special_token_offsets is not None:
+            _validate_int_list(self.special_token_offsets,
+                               "special_token_offsets")
+            if any(offset < 0 for offset in self.special_token_offsets):
+                raise ValueError("special_token_offsets must be non-negative")
+        if self.item_types is not None:
+            _validate_int_list(self.item_types, "item_types")
+            if len(self.item_types) != len(self.multimodal_lengths):
+                raise ValueError("item_types length must match "
+                                 "multimodal_lengths")
+
+    def to_multimodal_input(self,
+                            mm_hashes: List[List[int]]) -> MultimodalInput:
+        return MultimodalInput.from_components(
+            mm_hashes,
+            self.multimodal_positions,
+            self.multimodal_lengths,
+            mm_item_run_cu_offsets=self.multimodal_item_run_cu_offsets,
+            mm_run_positions=self.multimodal_run_positions,
+            mm_run_lengths=self.multimodal_run_lengths,
+        )
 
 
 @dataclass
@@ -214,6 +448,7 @@ class MultimodalRuntimeData:
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
 })
 
 
@@ -232,6 +467,12 @@ class MultimodalParams:
                            during KV cache scenarios. Contains information about cached
                            tokens, multimodal token positions, and lengths for efficient
                            processing during inference.
+        input_ids_start_offset: Start index of this request's (current-chunk) tokens
+                           within the flattened `input_ids` of the current forward pass
+                           (0 by default). Populated for context requests by the model
+                           engine and consumed by models that rewrite token IDs in place
+                           (e.g. Nemotron Nano EVS) so each request writes into its own
+                           span instead of assuming a contiguous multimodal prefix.
 
     Structure of multimodal_data:
         {
@@ -239,7 +480,10 @@ class MultimodalParams:
                 "mrope_rotary_cos_sin": torch.Tensor,    # Rotary embeddings (Qwen2/2.5-VL)
                 "mrope_position_deltas": torch.Tensor,   # Position deltas (Qwen2/2.5-VL)
             },
-            "multimodal_embedding": torch.Tensor,        # Pre-computed vision embeddings
+            "multimodal_embedding": torch.Tensor | List[SharedTensor handle dict],
+                # Pre-computed embeddings. In E/P handoff this may temporarily hold
+                # SharedTensorContainer dicts; BaseWorker restores them to tensors with
+                # to_tensor("multimodal_data") before PyTorch forward.
             "image": {
                 "pixel_values": torch.Tensor,
                 "image_height": torch.Tensor | List[int],
@@ -258,6 +502,14 @@ class MultimodalParams:
     multimodal_input: Optional[MultimodalInput] = None
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
+    input_ids_start_offset: int = 0
+    # CUDA event recorded on a side stream by the MM encoder prefetch path.
+    # When set, the consume site in `get_multimodal_embeddings` issues a
+    # `wait_event` on the current stream before reading cached embeddings.
+    # Always `None` unless `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is positive and a prefetch ran.
+    encoder_event: Optional[torch.cuda.Event] = field(default=None,
+                                                      repr=False,
+                                                      compare=False)
 
     def __post_init__(self):
         """Ensure default values are properly set."""
@@ -553,35 +805,13 @@ class MultimodalServerConfig():
     media_io_kwargs: Optional[dict] = None
 
 
-# adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
-def serialize_item(obj: object) -> bytes:
-    # Simple cases
-    if isinstance(obj, str):
-        return obj.encode("utf-8")
-    if isinstance(obj, bytes):
-        return obj
-    if isinstance(obj, (int, float)):
-        return np.array(obj).tobytes()
-
-    if isinstance(obj, PIL.Image.Image):
-        return np.array(obj.convert("RGBA")).tobytes()
-    if isinstance(obj, torch.Tensor):
-        return obj.numpy().tobytes()
-    if isinstance(obj, np.ndarray):
-        return obj.tobytes()
-    if isinstance(obj, (tuple, list)):
-        # Support compound types like audio (np.ndarray, sample_rate).
-        # Use length-delimited framing so sequences with different element
-        # boundaries (e.g. ["ab", "c"] vs ["a", "bc"]) cannot collide.
-        container_tag = b"T" if isinstance(obj, tuple) else b"L"
-        parts = [container_tag, len(obj).to_bytes(8, "big", signed=False)]
-        for x in obj:
-            payload = serialize_item(x)
-            parts.append(len(payload).to_bytes(8, "big", signed=False))
-            parts.append(payload)
-        return b"".join(parts)
-
-    raise ValueError(f"Unsupported object type: {type(obj)}")
+def _update_hash(hasher, item: object) -> None:
+    """Hash the content of a multimodal item into the provided hasher."""
+    hasher.update(_HASH_SCHEME_TAG)
+    if isinstance(item, BaseModalityData):
+        item.update_hash(hasher)
+        return
+    hasher.update(serialize_item(item))
 
 
 def apply_mm_hashes(
@@ -609,44 +839,10 @@ def apply_mm_hashes(
         - Flattened list of original UUID strings (or None for content-hashed items)
     """
 
-    def _hash_content(hasher, item):
-        """Hash the content of a multimodal item into the provided hasher."""
-        if isinstance(item, torch.Tensor):
-            # Ensure tensor is on CPU and contiguous for consistent hashing
-            item = item.detach().cpu().contiguous()
-            hasher.update(serialize_item(item))
-        elif isinstance(item, list):
-            # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
-            for frame in item:
-                hasher.update(b"<frame>")
-                if isinstance(frame, torch.Tensor):
-                    frame = frame.detach().cpu().contiguous()
-                hasher.update(serialize_item(frame))
-        elif isinstance(item, tensorrt_llm.inputs.utils.VideoData):
-            frames = item.frames
-            for frame in frames:
-                hasher.update(b"<frame>")
-                if isinstance(frame, torch.Tensor):
-                    frame = frame.detach().cpu().contiguous()
-                hasher.update(serialize_item(frame))
-            metadata = item.metadata
-            if (isinstance(metadata, dict) and "audio_samples" in metadata
-                    and "audio_sample_rate" in metadata):
-                audio_samples = metadata["audio_samples"]
-                if isinstance(audio_samples, torch.Tensor):
-                    audio_samples = audio_samples.detach().cpu().contiguous()
-                hasher.update(b"<audio>")
-                hasher.update(
-                    serialize_item(
-                        (audio_samples, metadata["audio_sample_rate"])))
-        else:
-            hasher.update(serialize_item(item))
-
     def _hash_item(item):
         """Hash only the content of a multimodal item (no UUID)."""
-        # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
         hasher = hash_lib()
-        _hash_content(hasher, item)
+        _update_hash(hasher, item)
         return hasher.hexdigest()
 
     def _hash_item_with_uuid(item, uuid: str):
@@ -663,7 +859,7 @@ def apply_mm_hashes(
         hasher.update(b"</uuid>")
         # Then hash the content
         hasher.update(b"<content>")
-        _hash_content(hasher, item)
+        _update_hash(hasher, item)
         hasher.update(b"</content>")
         return hasher.hexdigest()
 
@@ -768,6 +964,13 @@ def find_mm_token_lengths(
 
     mm_video_dict = (multimodal_data or {}).get("video") or {}
     video_grid_thw = mm_video_dict.get("video_grid_thw")
+    if video_grid_thw is not None:
+        video_grid_thw = torch.as_tensor(video_grid_thw)
+        assert video_grid_thw.device.type == "cpu", (
+            "video_grid_thw must be CPU-resident when computing "
+            f"multimodal metadata, got {video_grid_thw.device}.")
+        if video_grid_thw.ndim != 2 or video_grid_thw.shape[-1] != 3:
+            raise ValueError("video_grid_thw must have shape [num_segments, 3]")
 
     for modality, items in mm_items.items():
         if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
@@ -777,12 +980,14 @@ def find_mm_token_lengths(
 
         video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:
-            if len(video_grid_thw) == len(items):
+            if len(items) == 1:
+                video_grid_thw_for_items = video_grid_thw
+            elif video_grid_thw.shape[0] == len(items):
                 video_grid_thw_for_items = video_grid_thw
             else:
                 logger.warning(
                     "find_mm_token_lengths: video_grid_thw row count "
-                    f"({len(video_grid_thw)}) does not match number of "
+                    f"({video_grid_thw.shape[0]}) does not match number of "
                     f"videos in mm_data ({len(items)}); falling back to "
                     "per-item recompute without video_grid_thw.")
 
@@ -794,25 +999,28 @@ def find_mm_token_lengths(
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
                 video_metadata = None
-                if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                video_audio = None
+                if isinstance(item, VideoData):
                     video_metadata = item.metadata
+                    video_audio = item.audio
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 call_kwargs = {"video": item}
                 if video_metadata is not None:
                     # Used by per-model overrides that need to account for
-                    # video-derived auxiliary modalities (e.g. Nemotron Nano
-                    # adds <so_*> token slots when metadata carries
-                    # `audio_samples` from extract_audio=true).
+                    # per-video metadata such as sampled frame positions.
                     call_kwargs["video_metadata"] = video_metadata
+                if video_audio is not None:
+                    call_kwargs["video_audio"] = video_audio
                 if video_grid_thw_for_items is not None:
                     # TODO(TRTLLM-11951): Replace this Qwen-VL-specific
                     # metadata wiring with a generic per-item processed
                     # metadata route. Keep this for now: Qwen3-VL needs the
                     # processor-produced video_grid_thw for correct video token
                     # counts.
-                    call_kwargs["video_grid_thw"] = video_grid_thw_for_items[
-                        idx]
+                    call_kwargs["video_grid_thw"] = (
+                        video_grid_thw_for_items if len(items) == 1 else
+                        video_grid_thw_for_items[idx:idx + 1])
                 num_tokens = input_processor.get_num_tokens_per_video(
                     **call_kwargs)
                 modality_token_lengths.append(num_tokens)
@@ -835,6 +1043,7 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
     "special_token_offsets",
     "layout_metadata",
 })
@@ -1020,6 +1229,81 @@ def _find_mm_token_start_pos_from_masks(
     start_positions = mm_positions[offsets].tolist()
 
     return start_positions, start_special_token_positions
+
+
+def _find_mm_token_runs_from_mask(
+    mm_mask: torch.Tensor,
+    num_mm_tokens: List[int],
+) -> Tuple[List[int], List[int], List[int]]:
+    """Compute flat exact prompt token runs for each logical multimodal item."""
+    # CSR offsets: item i owns flat runs [offsets[i], offsets[i + 1]).
+    item_run_cu_offsets = [0]
+    if not torch.any(mm_mask):
+        return item_run_cu_offsets, [], []
+
+    mm_positions = torch.where(mm_mask)[0]
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item(), (
+        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+        f"num_mm_tokens={num_mm_tokens}")
+
+    # Full-prompt start index for each emitted flat multimodal run.
+    run_positions: List[int] = []
+    # Token count for each emitted flat multimodal run.
+    run_lengths: List[int] = []
+    offset = 0
+    for item_length in num_mm_tokens:
+        item_positions = mm_positions[offset:offset + item_length].tolist()
+        offset += item_length
+        if len(item_positions) == 0:
+            item_run_cu_offsets.append(len(run_positions))
+            continue
+
+        run_start = item_positions[0]
+        previous_position = item_positions[0]
+        run_length = 1
+        for position in item_positions[1:]:
+            if position == previous_position + 1:
+                run_length += 1
+            else:
+                run_positions.append(run_start)
+                run_lengths.append(run_length)
+                run_start = position
+                run_length = 1
+            previous_position = position
+
+        run_positions.append(run_start)
+        run_lengths.append(run_length)
+        item_run_cu_offsets.append(len(run_positions))
+
+    return item_run_cu_offsets, run_positions, run_lengths
+
+
+def _find_mm_embedding_lengths_from_masks(
+    mm_mask: torch.Tensor,
+    embed_mask: torch.Tensor,
+    num_mm_tokens: List[int],
+) -> List[int]:
+    """Compute embedding-slot counts per logical multimodal item."""
+    if not torch.any(mm_mask):
+        return []
+
+    mm_positions = torch.where(mm_mask)[0]
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item(), (
+        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+        f"num_mm_tokens={num_mm_tokens}")
+
+    embedding_lengths: List[int] = []
+    offset = 0
+    for item_length in num_mm_tokens:
+        item_positions = mm_positions[offset:offset + item_length]
+        offset += item_length
+        embedding_lengths.append(int(embed_mask[item_positions].sum().item()))
+
+    return embedding_lengths
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

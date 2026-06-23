@@ -15,11 +15,12 @@ import time
 import traceback
 import warnings
 import weakref
+from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
-                    get_type_hints)
+from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
+                    Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -171,19 +172,6 @@ def get_gpu_arch(device: int = 0) -> int:
     return torch.cuda.get_device_properties(device).major
 
 
-class ContextManager:
-    ''' A helper to create a context manager for a resource. '''
-
-    def __init__(self, resource):
-        self.resource = resource
-
-    def __enter__(self):
-        return self.resource.__enter__()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return self.resource.__exit__(exc_type, exc_value, traceback)
-
-
 def is_directory_empty(directory: Path) -> bool:
     return not any(directory.iterdir())
 
@@ -328,6 +316,7 @@ class ManagedThread(threading.Thread):
                  error_queue: Queue,
                  name: Optional[str] = None,
                  stop_event: Optional[threading.Event] = None,
+                 context: Optional[ContextManager[Any]] = None,
                  **kwargs):
         super().__init__(name=name)
         self.task = task
@@ -335,26 +324,27 @@ class ManagedThread(threading.Thread):
         self.kwargs = kwargs
         self.daemon = True
         self.stop_event = stop_event or threading.Event()
+        self.context = context or nullcontext()
 
     def run(self):
+        with self.context:
+            while not self.stop_event.is_set():
+                task = self.task
+                if isinstance(task, weakref.WeakMethod):
+                    task = task()
+                    if task is None:
+                        # Normally, this should not happen.
+                        logger.warning("WeakMethod is expired.")
+                        break
 
-        while not self.stop_event.is_set():
-            task = self.task
-            if isinstance(task, weakref.WeakMethod):
-                task = task()
-                if task is None:
-                    # Normally, this should not happen.
-                    logger.warning("WeakMethod is expired.")
-                    break
-
-            try:
-                if not task(**self.kwargs):
-                    break
-            except Exception as e:
-                logger.error(
-                    f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
-                )
-                self.error_queue.put(e)
+                try:
+                    if not task(**self.kwargs):
+                        break
+                except Exception as e:
+                    logger.error(
+                        f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
+                    )
+                    self.error_queue.put(e)
 
         logger.info(f"Thread {self.name} stopped.")
 
@@ -552,6 +542,9 @@ def get_numa_aware_cpu_affinity(device_id):
 
     Args:
         device_id: The CUDA device ID to query for optimal CPU affinity.
+                   This is the logical CUDA device index (after
+                   CUDA_VISIBLE_DEVICES remapping). The function will
+                   resolve it to the physical NVML device index.
 
     Returns:
         List of CPU IDs representing the optimal CPU affinity mask for the device.
@@ -573,6 +566,35 @@ def get_numa_aware_cpu_affinity(device_id):
         import pynvml
         pynvml.nvmlInit()
 
+        # Resolve the physical NVML device index from the logical CUDA
+        # device_id.  NVML always enumerates *all* GPUs on the system
+        # regardless of CUDA_VISIBLE_DEVICES, so when the user restricts
+        # visibility (e.g. CUDA_VISIBLE_DEVICES=3,4), logical device 0
+        # actually corresponds to physical GPU 3.
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible is not None and cuda_visible.strip():
+            visible_tokens = [
+                x.strip() for x in cuda_visible.split(",") if x.strip()
+            ]
+            if 0 <= device_id < len(visible_tokens):
+                token = visible_tokens[device_id]
+                if token.isdigit():
+                    nvml_device_id = int(token)
+                else:
+                    logger.warning(
+                        f"CUDA_VISIBLE_DEVICES token '{token}' is non-numeric; "
+                        f"falling back to device_id ({device_id}) as NVML index."
+                    )
+                    nvml_device_id = device_id
+            else:
+                logger.warning(
+                    f"device_id {device_id} exceeds CUDA_VISIBLE_DEVICES "
+                    f"list length ({len(visible_tokens)}), falling back to "
+                    f"device_id as NVML index.")
+                nvml_device_id = device_id
+        else:
+            nvml_device_id = device_id
+
         # Get the number of bits per ulong
         c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
 
@@ -581,7 +603,7 @@ def get_numa_aware_cpu_affinity(device_id):
 
         # Get the optimal CPU affinity for this device according to the NUMA
         # topology
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
         affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
         # Convert CPU masks to python list

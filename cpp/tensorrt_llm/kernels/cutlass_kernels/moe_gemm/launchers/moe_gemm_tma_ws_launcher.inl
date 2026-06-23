@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,6 +55,7 @@
 #include <cuda_fp8.h>
 #include <math.h>
 #include <sstream>
+#include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -586,7 +587,8 @@ using namespace cutlass::epilogue;
                 }                                                                                                                                                                                                                                                                                                           \
             }();                                                                                                                                                                                                                                                                                                            \
             using EpilogueArguments = typename CollectiveEpilogue::Arguments;                                                                                                                                                                                                                                               \
-            using EpilogueScalars = decltype(EpilogueArguments{}.thread);                                                                                                                                                                                                                                                   \
+            using EpilogueScalars = typename std::remove_cv<                                                                                                                                                                                                                                                                \
+                typename std::remove_reference<decltype(EpilogueArguments{}.thread)>::type>::type;                                                                                                                                                                                                                          \
             EpilogueScalars epilogue_scalars = [&]                                                                                                                                                                                                                                                                          \
             {                                                                                                                                                                                                                                                                                                               \
                 constexpr bool IsSimpleAlphaBeta                                                                                                                                                                                                                                                                            \

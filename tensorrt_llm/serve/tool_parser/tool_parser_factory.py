@@ -11,6 +11,8 @@ from .glm4_parser import Glm4ToolParser
 from .glm47_parser import Glm47ToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
+from .minimax_m3_parser import MiniMaxM3ToolParser
+from .poolside_v1_parser import PoolsideV1ToolParser
 from .qwen3_coder_parser import Qwen3CoderToolParser
 from .qwen3_tool_parser import Qwen3ToolParser
 
@@ -30,6 +32,9 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "glm4_moe_lite": "glm47",
     "glm_moe_dsa": "glm47",
     "gemma4": "gemma4",
+    "gemma4_text": "gemma4",
+    "laguna": "poolside_v1",
+    "minimax_m3_vl": "minimax_m3",
 }
 
 
@@ -54,10 +59,12 @@ class ToolParserFactory:
         "deepseek_v3": DeepSeekV3Parser,
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
+        "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
-        "gemma4": Gemma4ToolParser,
+        "minimax_m3": MiniMaxM3ToolParser,
+        "poolside_v1": PoolsideV1ToolParser,
     }
 
     @staticmethod

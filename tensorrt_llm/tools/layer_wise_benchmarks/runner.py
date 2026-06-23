@@ -606,9 +606,17 @@ class Runner:
         world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
         AttentionCls = get_attention_backend(
-            self.model_config.attn_backend, self.model_config.sparse_attention_config
+            self.model_config.attn_backend,
+            sparse_attention_config=self.model_config.sparse_attention_config,
         )
-        attn_metadata = AttentionCls.Metadata(
+        metadata_cls = AttentionCls.Metadata
+        sparse_attention_config = self.model_config.sparse_attention_config
+        sparse_metadata_params = (
+            sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
+            if sparse_attention_config is not None
+            else None
+        )
+        metadata_kwargs = dict(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
@@ -631,8 +639,9 @@ class Runner:
             ),
             workspace=attn_workspace,
             mapping=self.model_config.mapping,
-            sparse_attention_config=self.model_config.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
         )
+        attn_metadata = metadata_cls(**metadata_kwargs)
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
@@ -804,7 +813,8 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
                 layer_mask=layer_mask,
-                sparse_attn_config=model_config.sparse_attention_config,
+                sparse_attention_config=model_config.sparse_attention_config,
+                pretrained_config=model_config.pretrained_config,
             )
         elif is_nemotron_hybrid(config):
             mamba_layer_mask = [
@@ -828,7 +838,6 @@ class Runner:
                 mamba_layer_mask,
                 config.torch_dtype,
                 model_config.quant_config.mamba_ssm_cache_dtype,
-                False,  # is_disagg
                 # kv cache parameters
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -865,7 +874,6 @@ class Runner:
                 mamba_layer_mask,
                 config.torch_dtype,
                 model_config.quant_config.mamba_ssm_cache_dtype,
-                False,  # is_disagg
                 # kv cache parameters
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,

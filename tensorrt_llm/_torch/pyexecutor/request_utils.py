@@ -70,6 +70,33 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
                     setattr(item.request, attr_name, py_obj)
 
 
+def derive_attention_dp_per_rank_request_cap(
+    base_cap: int,
+    max_num_tokens: Optional[int],
+    max_total_draft_tokens: int,
+) -> int:
+    """Cap per-rank requests at ``max_num_tokens // (1 + max_total_draft_tokens)``
+    so gen-phase per-step token load cannot exceed ``max_num_tokens`` under
+    attention DP, where no component otherwise enforces a per-rank token cap
+    (nvbug-6133201). Each gen request occupies ``1 + max_total_draft_tokens``
+    token slots per step. Mirrors the CUDA graph batch-size cap at
+    ``model_engine._filter_cuda_graph_batch_sizes``.
+
+    Args:
+        base_cap: Per-rank request cap from ``get_max_num_sequences()``.
+        max_num_tokens: ``LlmArgs.max_num_tokens``; ``None`` disables tightening.
+        max_total_draft_tokens: Draft tokens per gen request (0 without spec
+            decoding); negative values are clamped to 0.
+
+    Returns:
+        The tighter of ``base_cap`` and ``max_num_tokens // step_tokens``.
+    """
+    if max_num_tokens is None:
+        return base_cap
+    step_tokens_per_req = 1 + max(max_total_draft_tokens, 0)
+    return min(base_cap, max_num_tokens // step_tokens_per_req)
+
+
 def can_process_attention_dp_request(
     req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
 ) -> bool:
@@ -500,6 +527,7 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
             filter(
@@ -510,6 +538,7 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_lora_path,
                 ],
             )
         )

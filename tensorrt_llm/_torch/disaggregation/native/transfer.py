@@ -70,7 +70,9 @@ class RecvReqInfo:
         np.ndarray
     ]  # Block IDs per layer group, each np.ndarray(dtype=np.int64)
     unique_rid: int
-    start_token_idx: Optional[int] = None
+    # Block-aligned token offset where the receiver's block list starts.
+    # None means "end-of-range suffix" — sender derives it from len(blocks).
+    dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
@@ -85,7 +87,7 @@ class RecvReqInfo:
                     arr.tobytes() for arr in self.block_ids_per_layer_groups
                 ],
                 "unique_rid": self.unique_rid,
-                "start_token_idx": self.start_token_idx,
+                "dst_start_token": self.dst_start_token,
                 "aux_slot": self.aux_slot,
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
@@ -157,6 +159,7 @@ class SendTaskBase:
         self.status = TaskStatus.INIT
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
+        self.lock = threading.Lock()
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
@@ -204,11 +207,15 @@ class KVSendTask(SendTaskBase):
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
+        prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
+        self._prompt_len = prompt_len
+        self._beam_width = beam_width
 
 
 class Sender(SenderBase):
@@ -230,7 +237,8 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}
+        self._dealers = {}  # used by listener thread only (single-threaded path)
+        self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         self._pre_cancelled_rids: set[int] = set()
@@ -346,10 +354,25 @@ class Sender(SenderBase):
         return session
 
     def _enqueue(self, write_meta: WriteMeta):
-        # Distribute tasks to threads by unique_rid to ensure same session's tasks
-        # are processed by the same thread in order
-        thread_idx = write_meta.unique_rid % self._num_threads
+        # Route by (unique_rid, peer_rank) so that:
+        # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
+        # - Different peers can run on different threads (better load balancing)
+        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
+
+    def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
+        """Get or create a per-thread DEALER socket via threading.local().
+        Each worker thread gets its own cache so there is no cross-thread
+        access to the same ZMQ socket."""
+        if endpoint is None:
+            raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
+        dealers = getattr(self._thread_local, "dealers", None)
+        if dealers is None:
+            dealers = {}
+            self._thread_local.dealers = dealers
+        if endpoint not in dealers:
+            dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+        return dealers[endpoint]
 
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
@@ -357,24 +380,40 @@ class Sender(SenderBase):
         CUASSERT(cudart.cudaSetDevice(device_id))
 
         task_queue = self._send_task_queues[thread_idx]
-        while True:
-            write_meta = task_queue.get()
-            if write_meta is None:
-                break
-            try:
-                if write_meta.meta_type == WriteMetaType.AUX:
-                    logger.debug(
-                        f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+        try:
+            while True:
+                write_meta = task_queue.get()
+                if write_meta is None:
+                    break
+                try:
+                    if write_meta.meta_type == WriteMetaType.AUX:
+                        logger.debug(
+                            f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+                        )
+                        self._deliver_aux_to_agent(write_meta)
+                    else:
+                        self._deliver_kv_to_agent(write_meta)
+                except Exception as e:
+                    logger.error(
+                        f"_process_task_queue[{thread_idx}]: unhandled exception for "
+                        f"unique_rid={write_meta.unique_rid}: {e}"
                     )
-                    self._deliver_aux_to_agent(write_meta)
-                else:
-                    self._deliver_kv_to_agent(write_meta)
-            except Exception as e:
-                logger.error(
-                    f"_process_task_queue[{thread_idx}]: unhandled exception for "
-                    f"unique_rid={write_meta.unique_rid}: {e}"
-                )
-                write_meta.task.fail(e)
+                    write_meta.task.fail(e)
+        finally:
+            # Clean up this thread's DEALER sockets. threading.local storage
+            # is only accessible from the owning thread, so shutdown must
+            # happen here rather than in Sender.shutdown().
+            dealers = getattr(self._thread_local, "dealers", None)
+            if dealers:
+                for endpoint, dealer in dealers.items():
+                    try:
+                        dealer.stop()
+                    except Exception as e:
+                        logger.warning(
+                            f"_process_task_queue[{thread_idx}]: failed to stop dealer "
+                            f"for endpoint {endpoint}: {e}"
+                        )
+                dealers.clear()
 
     @staticmethod
     @nvtx_range("_make_agent_request")
@@ -480,7 +519,7 @@ class Sender(SenderBase):
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
-        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.KV_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
@@ -491,16 +530,20 @@ class Sender(SenderBase):
             ]
         )
 
-        task.transferred_count += 1
         if timer:
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
         task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-        if task.transferred_count > write_meta.expected_transfers:
+
+        with task.lock:
+            task.transferred_count += 1
+            count = task.transferred_count
+
+        if count > write_meta.expected_transfers:
             session.set_exception(
                 f"KV slice {write_meta.slice_id} received more than {write_meta.expected_transfers} transfers"
             )
-        elif task.transferred_count == write_meta.expected_transfers:
+        elif count == write_meta.expected_transfers:
             if task.is_done:
                 task.status = TaskStatus.ERROR
                 session.set_exception(
@@ -539,7 +582,7 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
 
-        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.AUX_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
@@ -548,18 +591,22 @@ class Sender(SenderBase):
             ]
         )
 
-        aux_task._transfer_count += 1
         if timer:
             timer.record_task_end(write_meta.peer_rank)
         ri = self._registrar.self_rank_info
         aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
-        if aux_task._transfer_count == write_meta.expected_transfers:
+
+        with aux_task.lock:
+            aux_task._transfer_count += 1
+            count = aux_task._transfer_count
+
+        if count == write_meta.expected_transfers:
             if aux_task.is_done:
                 aux_task.status = TaskStatus.ERROR
                 session.set_exception("aux task already resolved on completion")
             else:
                 aux_task.complete()
-        elif aux_task._transfer_count > write_meta.expected_transfers:
+        elif count > write_meta.expected_transfers:
             session.set_exception(
                 f"aux task received more than {write_meta.expected_transfers} transfers"
             )
@@ -599,6 +646,13 @@ class Sender(SenderBase):
             src_block_ids[src_skip : src_skip + n_transfer],
             dst_block_ids[dst_skip : dst_skip + n_transfer],
         )
+
+    @staticmethod
+    def _beam0_block_count(block_ids: np.ndarray, total_blocks: int, beam_width: int) -> int:
+        """Return the number of beam-0 blocks in a packed 1-D beam layout."""
+        if beam_width <= 1 or block_ids.size <= total_blocks:
+            return block_ids.size
+        return max(0, block_ids.size - (beam_width - 1))
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -651,19 +705,41 @@ class Sender(SenderBase):
                 token_range = task._slice.token_range
                 lg_info = extractor.page_table.layer_groups[self_lg]
                 window_size = getattr(lg_info, "sliding_window_size", None)
-                if window_size is not None and token_range is not None:
-                    # For sliding-window layers the window-trimmed block list
-                    # starts at stale_end*tpb, not 0.  Compute correct per-group
-                    # src_start and dst_start so _align_kv_blocks can pair blocks
-                    # by their actual token coverage rather than the global offset.
-                    prompt_len = token_range.end
-                    stale_end = max(0, (prompt_len + 1 - window_size) // tpb)
-                    cached_tokens = token_range.start
-                    src_start = max(stale_end * tpb, cached_tokens)
-                    dst_start = max(stale_end * tpb, req_info.start_token_idx or 0)
-                else:
-                    src_start = token_range.start if token_range else 0
-                    dst_start = req_info.start_token_idx or 0
+
+                # Block lists are the suffix of [..., slice_end); cached prefix
+                # is implicit in their size. token_start = (total_blocks - n) * tpb.
+                slice_end = token_range.end if token_range is not None else 0
+                total_blocks = (slice_end + tpb - 1) // tpb
+                src_beam0_blocks = Sender._beam0_block_count(
+                    src_block_ids, total_blocks, task._beam_width
+                )
+                dst_beam0_blocks = Sender._beam0_block_count(
+                    dst_block_ids, total_blocks, task._beam_width
+                )
+                assert src_beam0_blocks <= total_blocks, (
+                    f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
+                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                )
+                assert dst_beam0_blocks <= total_blocks, (
+                    f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
+                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                )
+                src_start = (total_blocks - src_beam0_blocks) * tpb
+                dst_start = (total_blocks - dst_beam0_blocks) * tpb
+                if req_info.dst_start_token is not None:
+                    dst_start = max(dst_start, req_info.dst_start_token)
+                if window_size is not None:
+                    # SWA stale_end uses the request prompt_len (not slice_end —
+                    # they differ for non-final slices). prompt_len must be plumbed
+                    # via the session; falling back to slice_end is wrong on
+                    # non-final slices.
+                    assert task._prompt_len is not None, (
+                        "SWA layer requires session.prompt_len; "
+                        "set TxSession(prompt_len=request.prompt_len)."
+                    )
+                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
+                    src_start = max(stale_end * tpb, src_start)
+                    dst_start = max(stale_end * tpb, dst_start)
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                     src_block_ids,
                     dst_block_ids,
@@ -998,8 +1074,13 @@ class TxSession(TxSessionBase):
         sender: Sender,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
+        prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
-        super().__init__(sender, SessionArgsBase(params))
+        super().__init__(
+            sender,
+            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+        )
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
@@ -1049,7 +1130,13 @@ class TxSession(TxSessionBase):
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id)
+            task = KVSendTask(
+                slice,
+                params,
+                slice_id,
+                prompt_len=self._base_args.prompt_len,
+                beam_width=self._base_args.beam_width,
+            )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
@@ -1287,20 +1374,14 @@ class Receiver(ReceiverBase):
             f"ctx_request_id is None for task unique_rid={task._unique_rid}"
         )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
-        # Propagate the generation-side token offset so the context server can
-        # skip blocks that are already present in generation's prefix cache.
-        # Currently this is 0 for all requests (generation does not yet filter
-        # its block list); the hook is in place for future narrowing.
-        start_token_idx = (
-            task._kv_slice.token_range.start if task._kv_slice.token_range is not None else None
-        )
+        # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
-            start_token_idx=start_token_idx,
+            dst_start_token=None,
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
@@ -1515,8 +1596,13 @@ class RxSession(RxSessionBase):
         receiver: Receiver,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
+        prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
-        super().__init__(receiver, SessionArgsBase(params))
+        super().__init__(
+            receiver,
+            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+        )
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._receiver: Receiver  # narrow base class type for Pylance
@@ -1656,9 +1742,20 @@ class RxSession(RxSessionBase):
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
-        first_gen_tokens, draft_tokens = self._aux_buffer.get_slot_tokens(self.aux_slot)
+        first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens) = (
+            self._aux_buffer.get_slot_data(self.aux_slot)
+        )
         request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
         request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
+        if request.py_disaggregated_params is not None:
+            request.py_disaggregated_params.ctx_usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 0,
+                "total_tokens": prompt_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": cached_tokens,
+                },
+            }
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""
@@ -1894,6 +1991,8 @@ class TransferWorker:
             sender=self._sender,
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.tx_timeout_s,
+            prompt_len=request.prompt_len,
+            beam_width=request.py_beam_width,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -1905,6 +2004,8 @@ class TransferWorker:
             receiver=self._receiver,
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
+            prompt_len=request.prompt_len,
+            beam_width=request.py_beam_width,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:

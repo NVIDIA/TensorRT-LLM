@@ -18,7 +18,8 @@ import os
 
 import pytest
 
-from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
+from tensorrt_llm.llmapi.reasoning_parser import (NemotronV3ReasoningParser,
+                                                  ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 
 R1_START, R1_END = "<think>", "</think>"
@@ -242,6 +243,39 @@ def test_qwen3_reasoning_parser(text: str, content: str,
 def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
                                        reasoning_context: list):
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
+    for i, delta_text in enumerate(delta_texts):
+        result = reasoning_parser.parse_delta(delta_text)
+        assert result.content == content[i]
+        assert result.reasoning_content == reasoning_context[i]
+
+
+@pytest.mark.parametrize(("text", "content", "reasoning_context"), [
+    ("a<think>b</think>c", "c", "b"),
+    ("<think>a</think>b", "b", "a"),
+    ("<think>a", "", "a"),
+    ("a", "a", ""),
+    ("<think>", "", ""),
+])
+def test_laguna_reasoning_parser(text: str, content: str,
+                                 reasoning_context: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("laguna")
+    result = reasoning_parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_context
+
+
+@pytest.mark.parametrize(("delta_texts", "content", "reasoning_context"), [
+    (["<think>a", "l</think>r", "b"], ["", "r", "b"], ["a", "l", ""]),
+    (["<th", "ink>a</think>b"], ["", "b"], ["", "a"]),
+    (["<think>a</th", "ink>b"], ["", "b"], ["a", ""]),
+    (["<think>", "a</think>b"], ["", "b"], ["", "a"]),
+    (["<think>a</think>", "b"], ["", "b"], ["a", ""]),
+    (["<think>a</th", "ank></th", "ink>b"], ["", "", "b"
+                                             ], ["a", "</thank>", ""]),
+])
+def test_laguna_reasoning_parser_stream(delta_texts: list, content: list,
+                                        reasoning_context: list):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("laguna")
     for i, delta_text in enumerate(delta_texts):
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i]
@@ -610,6 +644,35 @@ def test_auto_detect_gemma4(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "gemma4"
+
+
+def test_auto_detect_laguna(tmp_path):
+    """Laguna model → 'laguna' parser."""
+    model_dir = str(tmp_path / "Laguna")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "laguna")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "laguna"
+
+
+@pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
+def test_auto_detect_nemotron_h(tmp_path, model_type):
+    """Nemotron-H models → 'nemotron-v3' parser (preferred over 'nano-v3')."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "nemotron-v3"
+
+
+def test_nemotron_v3_alias_same_parser():
+    """'nemotron-v3' and the legacy 'nano-v3' resolve to the same parser."""
+    nemotron = ReasoningParserFactory.create_reasoning_parser("nemotron-v3")
+    nano = ReasoningParserFactory.create_reasoning_parser("nano-v3")
+    assert isinstance(nemotron, NemotronV3ReasoningParser)
+    assert isinstance(nano, NemotronV3ReasoningParser)
 
 
 # ---------------------------------------------------------------------------

@@ -1090,7 +1090,7 @@ private:
             return info;
         }
 
-        // Check NVLink links are active (similar to Python support_nvlink(True))
+        // Check NVLink links are active (similar to Python support_nvlink(device_id, True))
         unsigned int activeLinks = 0;
         unsigned int availableLinks = 0;
 
@@ -1473,7 +1473,7 @@ private:
 #endif // ENABLE_MULTI_DEVICE
 
 void preallocateNCCLWindowBuffer(
-    torch::Tensor const& input, torch::List<int64_t> const& group, const int64_t buffersPerSize)
+    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t const buffersPerSize)
 {
 #if ENABLE_MULTI_DEVICE
     if (buffersPerSize <= 0 || group.size() == 0 || input.numel() == 0 || input.size(0) == 0)
@@ -1496,15 +1496,15 @@ void preallocateNCCLWindowBuffer(
 
     using tensorrt_llm::common::nccl_util::NCCLWindowAllocator;
     auto& allocator = NCCLWindowAllocator::getInstance();
-    const ncclComm_t comm = *commPtr;
+    ncclComm_t const comm = *commPtr;
 
-    const int64_t numTokens = input.size(0);
-    const int64_t elementsPerToken = input.numel() / numTokens;
+    int64_t const numTokens = input.size(0);
+    int64_t const elementsPerToken = input.numel() / numTokens;
     if (elementsPerToken <= 0)
     {
         return;
     }
-    const size_t bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
+    size_t const bufferSize = static_cast<size_t>(numTokens) * static_cast<size_t>(elementsPerToken)
         * static_cast<size_t>(input.element_size());
     if (bufferSize == 0)
     {
@@ -1757,25 +1757,137 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
     return {norm_out};
 }
 
+namespace
+{
+
+using MnnvlFusionPattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern;
+
+MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
+{
+    switch (fusionOp)
+    {
+    case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormOutFP8Quant;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormOutFP4Quant;
+    default:
+        TORCH_CHECK(
+            false, "[mnnvlFusionAllReduce] Unsupported fusion operation: " + tensorrt_llm::kernels::toString(fusionOp));
+    }
+    return MnnvlFusionPattern::kAllReduce;
+}
+
+bool isMnnvlQuantFusionOp(AllReduceFusionOp fusionOp)
+{
+    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
+}
+
+bool isMnnvlNvfp4FusionOp(AllReduceFusionOp fusionOp)
+{
+    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
+}
+
+bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
+{
+    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
+}
+
+} // namespace
+
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
-    torch::Tensor& buffer_flags, bool rmsnorm_fusion)
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
+    TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
 
+    // Treat input as a flat (numTokens, hiddenDim) buffer for the kernel while preserving the
+    // original N-D shape for the returned tensors (via empty_like / input.sizes() below).
     auto const eltsPerThread = sizeof(float4) / input.itemsize();
-    auto const hiddenDim = input.size(1);
-    auto const numTokens = input.size(0);
+    auto const hiddenDim = input.size(-1);
+    auto const numTokens = input.numel() / hiddenDim;
     TORCH_CHECK(hiddenDim % eltsPerThread == 0,
         "[mnnvlFusionAllReduce] Hidden dimension must be divisible by " + std::to_string(eltsPerThread) + ", got "
             + std::to_string(hiddenDim));
 
+    auto fusionOp = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));
+    if (fusionOp == AllReduceFusionOp::NONE && rmsnorm_fusion)
+    {
+        fusionOp = AllReduceFusionOp::RESIDUAL_RMS_NORM;
+    }
+    auto const pattern = getMnnvlFusionPattern(fusionOp);
+    bool const hasRmsNormFusion = fusionOp != AllReduceFusionOp::NONE;
+
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
-    torch::Tensor output = torch::empty_like(input);
+    torch::Tensor reduceOut;
+    torch::Tensor normOut;
     torch::Tensor residualOut;
+    torch::Tensor quantOut;
+    torch::Tensor scaleOut;
+
+    if (hasRmsNormFusion)
+    {
+        TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
+            "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for RMSNorm fusion");
+        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
+
+        residualOut = torch::empty_like(residual_in.value());
+        if (hasMnnvlNormOutput(fusionOp))
+        {
+            normOut = torch::empty_like(input);
+        }
+    }
+    else
+    {
+        reduceOut = torch::empty_like(input);
+    }
+
+    if (isMnnvlQuantFusionOp(fusionOp))
+    {
+        TORCH_CHECK(scale.has_value(), "[mnnvlFusionAllReduce] scale is required for quantized fusion");
+        TORCH_CHECK(scale.value().scalar_type() == torch::kFloat32,
+            "[mnnvlFusionAllReduce] scale must have dtype float32 for quantized fusion");
+        TORCH_CHECK(scale.value().is_contiguous(), "[mnnvlFusionAllReduce] scale must be contiguous");
+
+        if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+            || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8)
+        {
+            quantOut = at::detail::empty_cuda(input.sizes(), torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        }
+        else if (isMnnvlNvfp4FusionOp(fusionOp))
+        {
+            int64_t constexpr kSfVecSize = 16;
+            TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+                "[mnnvlFusionAllReduce] NVFP4 quantization requires FP16 or BF16 input");
+            TORCH_CHECK(hiddenDim % kSfVecSize == 0,
+                "[mnnvlFusionAllReduce] hidden dimension must be divisible by 16 for NVFP4 quantization");
+
+            std::vector<int64_t> quantShape(input.sizes().begin(), input.sizes().end());
+            quantShape.back() /= 2;
+            quantOut = at::detail::empty_cuda(quantShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
+            scaleOut
+                = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(numTokens, hiddenDim / kSfVecSize)},
+                    SF_DTYPE, input.device(), std::nullopt);
+        }
+        else
+        {
+            TORCH_CHECK(false,
+                "[mnnvlFusionAllReduce] Unsupported quantized fusion operation: "
+                    + tensorrt_llm::kernels::toString(fusionOp));
+        }
+    }
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
     allreduce_params.nRanks = mcast_mem->getWorldSize();
@@ -1788,33 +1900,38 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.multicastPtr = mcast_mem->getMulticastPtr();
     allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
-    allreduce_params.output = output.mutable_data_ptr();
+    allreduce_params.pattern = pattern;
+    allreduce_params.layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
 
-    if (rmsnorm_fusion)
+    if (fusionOp == AllReduceFusionOp::NONE)
     {
-        TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
-            "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for rmsnorm fusion");
-        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
-        TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
+        allreduce_params.output = reduceOut.mutable_data_ptr();
+    }
+    else
+    {
+        allreduce_params.output = normOut.defined() ? normOut.mutable_data_ptr() : nullptr;
 
         allreduce_params.residualIn = residual_in.value().const_data_ptr();
         allreduce_params.gamma = gamma.value().const_data_ptr();
         allreduce_params.epsilon = static_cast<float>(epsilon.value());
         allreduce_params.rmsNormFusion = true;
 
-        residualOut = torch::empty_like(residual_in.value());
         allreduce_params.residualOut = residualOut.mutable_data_ptr();
     }
-    else
+
+    if (isMnnvlQuantFusionOp(fusionOp))
     {
-        allreduce_params.rmsNormFusion = false;
+        allreduce_params.quantOut = quantOut.mutable_data_ptr();
+        allreduce_params.scaleOut = scaleOut.defined() ? scaleOut.mutable_data_ptr() : nullptr;
+        allreduce_params.scaleFactor = scale.value().data_ptr<float>();
     }
 
-    allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
+    allreduce_params.rmsNormFusion = hasRmsNormFusion;
+    allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    // Threshold to switch between one-shot and two-shot allreduce kernel
-    // Empirical value, MSG size * World size
-    constexpr size_t kOneShotSizeThreshold = 16 * 4 * 8192;
+    // Threshold to switch between one-shot and two-shot allreduce kernel.
+    // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
+    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
@@ -1825,7 +1942,19 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         tensorrt_llm::kernels::mnnvl::twoshotAllreduceFusionOp(allreduce_params);
     }
 
-    return {output, residualOut};
+    switch (fusionOp)
+    {
+    case AllReduceFusionOp::NONE: return {reduceOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return {quantOut, scaleOut, residualOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return {normOut, quantOut, scaleOut, residualOut};
+    default:
+        TORCH_CHECK(
+            false, "[mnnvlFusionAllReduce] Unsupported fusion operation: " + tensorrt_llm::kernels::toString(fusionOp));
+    }
+    return {};
 }
 
 torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor const& norm_weight,
@@ -1925,8 +2054,9 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "mnnvl_fusion_allreduce(Tensor input, Tensor? residual, Tensor? gamma, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion) -> "
+        "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
+        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
+        "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
         "allreduce("

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,9 +87,6 @@ struct CombineKernelPointers
 // Dispatch phase parameters
 struct MoeA2ADispatchParams
 {
-    // Threading policy
-    bool one_block_per_token; // True: one block per token, False: one warp per token
-
     // EP configuration
     int ep_size;     // Number of EP ranks
     int ep_rank;     // Current EP rank
@@ -140,8 +137,6 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 // Combine phase parameters
 struct MoeA2ACombineParams
 {
-    bool one_block_per_token; // True: one block per token, False: one warp per token
-
     // EP configuration
     int ep_size; // Number of EP ranks
     int ep_rank; // Current EP rank

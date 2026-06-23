@@ -923,7 +923,7 @@ void TrtGptModelInflightBatching::forwardSync()
                     TLLM_CHECK_WITH_INFO(mCacheTransceiver,
                         "Disaggregated serving is not enabled, please check the configuration of "
                         "cacheTransceiverConfig.");
-                    mCacheTransceiver->respondAndSendAsync(llmReq.get());
+                    mCacheTransceiver->respondAndSendAsync(llmReq);
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
             }
@@ -1216,7 +1216,20 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         {
             for (auto const& llmReq : activeRequests)
             {
+                // Remove from mInflightReqIds so changeBeamWidth can proceed on the next iteration.
+                // terminateRequest frees seqSlot/KV cache but does not clean up mInflightReqIds.
+                mInflightReqIds.erase(llmReq->mRequestId);
                 terminateRequest(llmReq);
+            }
+            // Force buffer/decoder reset to clean up any partial state from the aborted batch
+            // (e.g. partially-filled cross-KV block offsets from mid-context-chunk processing).
+            // Guard on mInflightReqIds.empty(): in pipeline-parallel multi-micro-batch mode,
+            // other micro-batches may still have requests tracked here; changeBeamWidth asserts
+            // emptiness so we skip the reset and let the next successful forwardAsync iteration
+            // perform it when the set is clear.
+            if (mWorldConfig.isLastPipelineParallelRank() && mInflightReqIds.empty())
+            {
+                changeBeamWidth(mOperatingBeamWidth);
             }
         }
         catch (std::exception const& e)
@@ -1604,11 +1617,11 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
             mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
         if (common::getEnvDisableKVCacheTransferOverlap())
         {
-            mCacheTransceiver->requestAndReceiveSync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveSync(newGenReq);
         }
         else
         {
-            mCacheTransceiver->requestAndReceiveAsync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveAsync(newGenReq);
         }
     }
     if (!common::getEnvDisableKVCacheTransferOverlap())

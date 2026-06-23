@@ -46,17 +46,44 @@ from blocks import (  # noqa: E402
     parse_stages_from_groovy,
     write_filtered_test_db,
 )
+from rules._helpers import strip_noop_diff_lines  # noqa: E402
+from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
+from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
+from rules.spec_dec_rule import SpecDecRule  # noqa: E402
+from rules.test_list_rule import TestListRule  # noqa: E402
+from rules.tests_def_rule import TestsDefRule  # noqa: E402
+from rules.visual_gen_rule import VisualGenRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
 # --- Rule registry -----------------------------------------------------------
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
-RULE_CLASSES: list[type[Rule]] = [WaivesRule]
+RULE_CLASSES: list[type[Rule]] = [
+    WaivesRule,
+    TestsDefRule,
+    TestListRule,
+    AutoDeployRule,
+    VisualGenRule,
+    SpecDecRule,
+    OutOfScopeRule,
+]
 
 
-def build_rules(yaml_index: YAMLIndex, stages: dict[str, Stage]) -> list[Rule]:
-    return [WaivesRule(yaml_index, stages)]
+def build_rules(
+    yaml_index: YAMLIndex,
+    stages: dict[str, Stage],
+    repo_root: Path,
+) -> list[Rule]:
+    return [
+        WaivesRule(yaml_index, stages),
+        TestsDefRule(yaml_index, stages, repo_root=repo_root),
+        TestListRule(yaml_index, stages, repo_root=repo_root),
+        AutoDeployRule(yaml_index, stages),
+        VisualGenRule(yaml_index, stages),
+        SpecDecRule(yaml_index, stages),
+        OutOfScopeRule(yaml_index, stages),
+    ]
 
 
 # --- Selector ---------------------------------------------------------------
@@ -67,6 +94,9 @@ class SelectionResult:
     """Aggregated CBTS decision serialized to JSON for Groovy."""
 
     scope: Optional[str]
+    # Per-rule scopes of every fired rule incl noop (the combined `scope`
+    # rolls these up; noop gives way to actionable scopes there).
+    scopes: list[str] = field(default_factory=list)
     affected_stages: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
@@ -83,6 +113,7 @@ class SelectionResult:
     def to_json(self) -> str:
         data = {
             "scope": self.scope,
+            "scopes": list(self.scopes),
             "affected_stages": sorted(self.affected_stages),
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
@@ -93,12 +124,38 @@ class SelectionResult:
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
+# Scopes that compose: a PR mixing waive + test-def + test-list edits
+# combines to a single "testsonly" scope rather than falling back.
+_TESTSONLY_FAMILY: frozenset[str] = frozenset(
+    {
+        "waiveonly",
+        "testdefonly",
+        "testlistonly",
+        "autodeployonly",
+        "visualgenonly",
+        "specdeconly",
+    }
+)
+
+
 def _combine_scopes(scopes: list[str]) -> Optional[str]:
-    """Return the common scope if all agree, else None."""
+    """Combine rule scopes.
+
+    Rules with scope="noop" (out-of-scope claims) give way to any
+    actionable rule that also fired. When only noop fired, returns
+    "noop". Otherwise: identical scopes pass through; testsonly-family
+    mixes combine to "testsonly"; anything else returns None.
+    """
     if not scopes:
         return None
-    if len(set(scopes)) == 1:
-        return scopes[0]
+    real = [s for s in scopes if s != "noop"]
+    if not real:
+        return "noop"
+    s = set(real)
+    if len(s) == 1:
+        return next(iter(s))
+    if s <= _TESTSONLY_FAMILY:
+        return "testsonly"
     return None
 
 
@@ -135,9 +192,12 @@ class Selector:
             affected_stages |= r.affected_stages
 
         # If rules fired but no stages resolved, return scope=None so
-        # downstream falls back to baseline. Maintains the invariant that any
-        # scope!=None result has a non-empty pre-filter affected_stages set.
-        if not affected_stages:
+        # downstream falls back to baseline. Exception: scope="noop" — the
+        # rule explicitly claimed files that need no test stages (e.g. QA
+        # test-list edits the pre-merge pipeline doesn't consume), so the
+        # empty stage set is intentional and gets preserved through to
+        # Groovy Layer 2.
+        if not affected_stages and scope != "noop":
             return SelectionResult(
                 scope=None,
                 reasons=reasons
@@ -160,6 +220,7 @@ class Selector:
 
         return SelectionResult(
             scope=scope,
+            scopes=sorted({r.scope for _, r in pairs if r.scope}),
             affected_stages=affected_stages,
             reasons=reasons,
             block_filters=block_filters,
@@ -173,9 +234,13 @@ class Selector:
 
 def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     data = json.loads(input_json_path.read_text())
+    # Pre-strip blank- and comment-only `+/-` lines once so every rule
+    # sees a "meaningful changes only" diff. Avoids spurious anchor
+    # walk-up and stage-select misfires from cosmetic edits.
+    diffs = {path: strip_noop_diff_lines(d) for path, d in data.get("diffs", {}).items()}
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
-        diffs=dict(data.get("diffs", {})),
+        diffs=diffs,
         post_merge=bool(data.get("post_merge", False)),
     )
 
@@ -256,7 +321,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # subset matching the user's flag.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path)
-    rules = build_rules(yaml_index, stages)
+    rules = build_rules(yaml_index, stages, repo_root)
     result = Selector(stages).run(pr, rules)
 
     # Layer 3: write narrowed test-db when any block was filtered.
@@ -275,11 +340,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
         )
 
-    # Filter affected_stages by trigger mode; recompute derived counts.
+    # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
+    # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
     pre_filter_stages = set(result.affected_stages)
-    if pr.post_merge:
-        result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" in s}
-    else:
+    if not pr.post_merge:
         result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
     result.affected_stage_test_counts = {
         k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
