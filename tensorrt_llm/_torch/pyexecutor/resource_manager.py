@@ -2012,16 +2012,40 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
-        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+        # Stage the block offsets through a freshly-allocated pinned host buffer
+        # every call instead of overwriting one persistent buffer in place.
+        #
+        # The H2D below is asynchronous, so its source is read at copy execution
+        # time, not enqueue time. With the overlap scheduler the CPU runs an
+        # iteration ahead, so reusing a single buffer let the next iteration's
+        # in-place overwrite clobber the source of this iteration's still-pending
+        # H2D -> the attention kernel indexed another batch's blocks (nvbug
+        # 6293536; the window is widened when host offloading stalls the
+        # execution stream in front of the H2D). A fresh allocation is held by
+        # PyTorch's caching host allocator until the consuming copy completes,
+        # matching the already-safe kv_lens / block_ids_per_seq staging.
+        host_block_offsets = torch.zeros(self.num_pools,
+                                         num_seqs,
+                                         2,
+                                         self.max_blocks_per_seq,
+                                         dtype=torch.int32,
+                                         pin_memory=prefer_pinned(),
+                                         device='cpu')
+        self.impl.copy_batch_block_offsets(host_block_offsets,
                                            request_ids[:num_context], 1, 0)
-        self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+        self.impl.copy_batch_block_offsets(host_block_offsets,
                                            request_ids[num_context:],
                                            beam_width, num_context)
 
-        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-            dst_tensor[pool_idx, :num_seqs].copy_(
-                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
-                non_blocking=True)
+        for pool_idx in range(self.num_pools):
+            dst_tensor[pool_idx, :num_seqs].copy_(host_block_offsets[pool_idx],
+                                                  non_blocking=True)
+
+        # Keep the attribute pointing at the current iteration's data for
+        # same-iteration CPU readers (e.g. DSA sparse attention) and the
+        # speculative-decoding draft/target swap, which read this buffer
+        # directly rather than the device tensor.
+        self.host_kv_cache_block_offsets = host_block_offsets
 
     def truncate_blocks(self, target_tokens: List[int],
                         num_tokens_to_keep: int):

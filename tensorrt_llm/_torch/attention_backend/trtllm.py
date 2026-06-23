@@ -564,6 +564,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets, self.request_ids, self.beam_width,
                 self.num_contexts, self.num_seqs)
+            # copy_batch_block_offsets stages through a fresh host buffer each
+            # iteration (nvbug 6293536 fix), so re-grab the current reference;
+            # the cached one from buffer allocation is now stale.
+            self.host_kv_cache_block_offsets = (
+                self.kv_cache_manager.host_kv_cache_block_offsets)
 
             error_message = (
                 f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
