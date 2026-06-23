@@ -3957,8 +3957,8 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
         {
             for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
-                auto const effectiveBlockCount = cacheBlockIds[beamIdx].size();
-                auto const copyChunkSize = effectiveBlockCount * sizeof(tk::KVCacheIndex);
+                auto const beamBlockCount = cacheBlockIds[beamIdx].size();
+                auto const copyChunkSize = beamBlockCount * sizeof(tk::KVCacheIndex);
                 for (auto xIdx : {kIdx, vIdx})
                 {
                     auto const srcIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, 0);
@@ -3966,7 +3966,7 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
                         = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
                 }
-                maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(effectiveBlockCount));
+                maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(beamBlockCount));
             }
         }
     }
