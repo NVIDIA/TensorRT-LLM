@@ -17,12 +17,13 @@ import torch
 # decorator on ``QwenImagePipeline`` being applied, which is what we are
 # testing here.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImagePipeline,
     QwenImageTransformer2DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
 def test_qwen_image_pipeline_is_registered():
