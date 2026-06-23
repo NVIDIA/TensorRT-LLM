@@ -59,6 +59,8 @@ _child_p_global: Optional[subprocess.Popen] = None
 _GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
 _SELF_BENCHMARK_PREFILL_GRANULARITY = SelfBenchmarkConfig.model_fields[
     "prefill_isl_granularity"].default
+_SELF_BENCHMARK_PREFILL_KV_READ_GRANULARITY = SelfBenchmarkConfig.model_fields[
+    "prefill_kv_read_granularity"].default
 _SELF_BENCHMARK_DECODE_LENGTH_GRANULARITY = SelfBenchmarkConfig.model_fields[
     "decode_context_granularity"].default
 _SELF_BENCHMARK_DECODE_BATCH_GRANULARITY = SelfBenchmarkConfig.model_fields[
@@ -225,6 +227,8 @@ def get_llm_args(
         self_benchmark_mode: Optional[str] = None,
         self_benchmark_prefill_granularity: int = (
             _SELF_BENCHMARK_PREFILL_GRANULARITY),
+        self_benchmark_prefill_kv_read_granularity: int = (
+            _SELF_BENCHMARK_PREFILL_KV_READ_GRANULARITY),
         self_benchmark_decode_length_granularity: int = (
             _SELF_BENCHMARK_DECODE_LENGTH_GRANULARITY),
         self_benchmark_decode_batch_granularity: int = (
@@ -329,6 +333,8 @@ def get_llm_args(
         SelfBenchmarkConfig(
             mode=self_benchmark_mode,
             prefill_isl_granularity=self_benchmark_prefill_granularity,
+            prefill_kv_read_granularity=(
+                self_benchmark_prefill_kv_read_granularity),
             decode_context_granularity=self_benchmark_decode_length_granularity,
             decode_batch_granularity=self_benchmark_decode_batch_granularity,
             warmup_iterations=self_benchmark_warmup_iterations,
@@ -906,6 +912,13 @@ class ChoiceWithAlias(click.Choice):
         "Number of input sequence length sample points for startup "
         "self-benchmark prefill sweep.", "prototype"))
 @click.option(
+    "--self_benchmark_prefill_kv_read_granularity",
+    type=int,
+    default=_SELF_BENCHMARK_PREFILL_KV_READ_GRANULARITY,
+    help=help_info_with_stability_tag(
+        "Number of block-aligned KV-read sample points per input sequence "
+        "length for startup self-benchmark prefill sweep.", "prototype"))
+@click.option(
     "--self_benchmark_decode_length_granularity",
     type=int,
     default=_SELF_BENCHMARK_DECODE_LENGTH_GRANULARITY,
@@ -1010,6 +1023,7 @@ def serve(
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         self_benchmark_mode: Optional[str],
         self_benchmark_prefill_granularity: int,
+        self_benchmark_prefill_kv_read_granularity: int,
         self_benchmark_decode_length_granularity: int,
         self_benchmark_decode_batch_granularity: int,
         self_benchmark_warmup_iterations: int,
@@ -1079,6 +1093,7 @@ def serve(
         exclude=("extra_llm_api_options", "config"))
     self_benchmark_cli_keys = {
         "self_benchmark_prefill_granularity",
+        "self_benchmark_prefill_kv_read_granularity",
         "self_benchmark_decode_length_granularity",
         "self_benchmark_decode_batch_granularity",
         "self_benchmark_warmup_iterations",
@@ -1126,6 +1141,8 @@ def serve(
             agent_types=agent_types,
             self_benchmark_mode=self_benchmark_mode,
             self_benchmark_prefill_granularity=self_benchmark_prefill_granularity,
+            self_benchmark_prefill_kv_read_granularity=(
+                self_benchmark_prefill_kv_read_granularity),
             self_benchmark_decode_length_granularity=self_benchmark_decode_length_granularity,
             self_benchmark_decode_batch_granularity=self_benchmark_decode_batch_granularity,
             self_benchmark_warmup_iterations=self_benchmark_warmup_iterations,
