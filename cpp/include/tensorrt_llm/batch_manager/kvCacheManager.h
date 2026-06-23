@@ -681,15 +681,6 @@ public:
         ++mNumFrontBlocksRemovedPerWindow.at(windowSize);
     }
 
-    //! \brief Advance the per-window front-block counter without touching cache blocks.
-    //! \details Used by ``BlockManager::releasePrefixBlocks`` to advance the
-    //! single-window front-block counter once after every ``WindowBlockManager`` has
-    //! processed the same prefix range.
-    void incrementNumFrontBlocksRemoved(SizeType32 windowSize)
-    {
-        ++mNumFrontBlocksRemovedPerWindow.at(windowSize);
-    }
-
     void removeLastBlock(SizeType32 windowSize)
     {
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
@@ -981,14 +972,6 @@ public:
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
-
-    //! \brief Release prefix blocks in range [startIdx, numBlocks) for a sequence.
-    //! \details Used by disaggregated serving to free sender-side KV memory
-    //! for blocks whose data has already been transferred.  Reuses the
-    //! detachFrontBlock mechanism (decRefCount + eviction policy release).
-    //! Called by BlockManager::releasePrefixBlocks which coordinates the
-    //! single-window front-block counter across all window managers.
-    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 startIdx, SizeType32 numBlocks);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -1530,13 +1513,6 @@ public:
 
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
-
-    //! \brief Release the first numBlocks prefix blocks of a sequence.
-    //! \details Mirrors detachFrontBlock logic: decRefCount + eviction policy
-    //! release for each prefix block.  The front-block counter on
-    //! GenerationRequest ensures releaseBlocks (called during removeSequence)
-    //! skips already-freed prefix blocks.
-    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks);
 
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
@@ -2454,11 +2430,6 @@ public:
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
         OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false) override;
-
-    //! \brief Release prefix blocks for a sequence without removing it.
-    //! \details Used by disaggregated serving for early block release during
-    //! chunked KV cache transfer.  No-op if the sequence does not exist.
-    void releasePrefixBlocks(LlmRequest::RequestIdType requestId, SizeType32 numBlocks);
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;
 

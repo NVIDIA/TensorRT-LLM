@@ -3439,8 +3439,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "slice is transferred independently. The total data per chunk is "
         "approximately chunk_size_blocks * num_layer_groups * slot_bytes. "
         "This reduces per-transfer NIXL descriptor pressure for long "
-        "sequences and enables early block release to free GPU memory "
-        "incrementally during transfer. When None (default), the entire "
+        "sequences. When None (default), the entire "
         "KV cache is transferred in a single slice. When set with NIXL "
         "backend (default), the Python transceiver is auto-selected. "
         "Not supported with UCX, MPI, or MOONCAKE backends.")
