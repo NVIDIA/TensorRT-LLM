@@ -2141,7 +2141,6 @@ class PyExecutor:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
-                    self._commit_kv_cache_stats(scheduled_batch)
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
@@ -2451,6 +2450,9 @@ class PyExecutor:
 
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate_pending_requests()
+
+        if executed_batch is not None:
+            self._commit_kv_cache_stats(executed_batch.scheduled_requests)
 
         if self.enable_iter_perf_stats and executed_batch is not None:
             self._process_iter_stats(
@@ -3408,7 +3410,6 @@ class PyExecutor:
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
-                    self._commit_kv_cache_stats(scheduled_batch)
 
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
