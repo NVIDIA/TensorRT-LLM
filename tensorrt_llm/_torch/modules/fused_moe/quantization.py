@@ -2540,8 +2540,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         delattr(module, 'tmp_pre_quant_scales')
 
-    def _prepare_shared_weight_scales_for_finalization(self,
-                                                       module: torch.nn.Module):
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
         """Hook for subclasses to transform the shared weight-scale tensors
         before they are registered with the load balancer and freed.
 
@@ -3070,7 +3070,8 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         dst_w3_w1_weight_scale.copy_(
             w3_w1_weight_scale_interleaved.view(dst_w3_w1_weight_scale.dtype))
 
-    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+    def _prepare_shared_weights_for_finalization(
+            self, module: torch.nn.Module) -> None:
         # The base hook registers the shared (host) w3_w1 weights with the load
         # balancer for online EPLB migration. Apply the same gate/up interleave
         # that process_weights_after_loading() applies to the on-device weights,
@@ -3085,8 +3086,8 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         for expert_idx in range(shared.shape[0]):
             self._interleave_w3_w1_weight(shared[expert_idx])
 
-    def _prepare_shared_weight_scales_for_finalization(self,
-                                                       module: torch.nn.Module):
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
         # Same as _prepare_shared_weights_for_finalization above, for the shared
         # (host) w3_w1 block scales.
         super()._prepare_shared_weight_scales_for_finalization(module)
