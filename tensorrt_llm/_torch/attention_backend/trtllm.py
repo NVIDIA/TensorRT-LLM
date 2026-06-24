@@ -186,16 +186,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return min(self.max_seq_len, self.max_num_tokens)
 
     @property
-    def effective_beam_width(self) -> int:
-        """Beam width visible to the kernel.
-
-        Cross-attention metadata is already expanded to one row per decoder
-        beam, and all beams read the same encoder K/V cache. Keep kernel beam
-        indirection disabled for that path.
-        """
-        return 1 if self.is_cross else self.beam_width
-
-    @property
     def max_seq_len(self) -> int:
         """
         Returns the max sequence length.
@@ -1438,10 +1428,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
-
-        if forward_args.multi_item_part_lens is not None:
-            raise ValueError(
-                "TRT-LLM Attention does not support multi-item scoring")
 
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
