@@ -405,6 +405,7 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_glm-5-fp4_8k1k_c
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_glm-5-fp4_8k1k_con1_ctx1_dep2_gen1_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6324131)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_kimi-k25-thinking-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6323074)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_kimi-k25-thinking-fp4_1k1k_con4_ctx1_dep4_gen1_tep4_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6323074)
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_kimi-k25-thinking-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb416_mtp3_ccb-NIXL] SKIP (https://nvbugs/6323074)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_2stage_bf16_i2v_cfg2_ulysses4_compile_on] SKIP (https://nvbugs/6294413)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_2stage_bf16_t2v_cfg2_ulysses4_compile_on] SKIP (https://nvbugs/6294413)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-ltx2_blackwell-ltx2_nvfp4_i2v_cfg2_ulysses4_compile_on] SKIP (https://nvbugs/6294413)
