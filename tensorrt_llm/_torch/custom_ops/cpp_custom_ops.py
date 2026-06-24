@@ -253,7 +253,10 @@ def _register_fake():
           next_n,
           index_topk,
           pre_idx=None,
-          heuristic_scratch=None):
+          heuristic_scratch=None,
+          compress_ratio=1,
+          radix_aux_indices=None,
+          radix_aux_logits=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -266,6 +269,21 @@ def _register_fake():
         m = a.shape[0]
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
+
+    @torch.library.register_fake("trtllm::gate_forward")
+    def _(
+        scores_in: torch.Tensor,
+        bias: torch.Tensor,
+        input_ids: torch.Tensor,
+        tid2eid: torch.Tensor,
+        out_weights: torch.Tensor,
+        out_indices: torch.Tensor,
+        topk: int,
+        route_scale: float,
+        is_hash: bool,
+    ) -> None:
+        # In-place operation, no return value.
+        pass
 
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):

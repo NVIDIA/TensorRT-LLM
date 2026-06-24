@@ -1440,10 +1440,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        if forward_args.multi_item_part_lens is not None:
-            raise ValueError(
-                "TRT-LLM Attention does not support multi-item scoring")
-
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
         if get_sm_version() == 90:

@@ -19,7 +19,7 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Iterator, Sequence, cast
+from typing import TYPE_CHECKING, Callable, Iterator, Sequence, cast
 
 from . import rawref
 from ._common import (
@@ -42,10 +42,11 @@ from ._config import (
     SwaScratchReuseConfig,
 )
 from ._copy_engine import CopyTask, batched_copy
+from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
-from ._page import Page
+from ._page import CommittedPage, Page
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
@@ -79,6 +80,9 @@ from ._utils import (
     typed_map,
     typed_range,
 )
+
+if TYPE_CHECKING:
+    from ._event_manager import KVCacheEventManager
 
 
 class CacheLevelManager:
@@ -165,6 +169,9 @@ class StorageStatistics:
         return self.total - self.available
 
 
+MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
+
+
 class StorageManager:
     __slots__ = (
         "_life_cycles",
@@ -177,6 +184,7 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_event_manager",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -189,6 +197,7 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -199,8 +208,10 @@ class StorageManager:
         swa_scratch_reuse: SwaScratchReuseConfig | None,
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
+        event_manager: "KVCacheEventManager | None" = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
+        self._event_manager = event_manager
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -277,12 +288,17 @@ class StorageManager:
         return self._life_cycle_grouping[life_cycle]
 
     def new_gpu_slots(
-        self, num_slots: TypedIndexList[LifeCycleId, int]
+        self,
+        num_slots: TypedIndexList[LifeCycleId, int],
+        migration_recorder: MigrationRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
-        return self.new_slots(GPU_LEVEL, num_slots)
+        return self.new_slots(GPU_LEVEL, num_slots, migration_recorder)
 
     def new_slots(
-        self, level: CacheLevel, num_slots: TypedIndexList[LifeCycleId, int]
+        self,
+        level: CacheLevel,
+        num_slots: TypedIndexList[LifeCycleId, int],
+        migration_recorder: MigrationRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
         lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
@@ -293,7 +309,7 @@ class StorageManager:
             pg_num_slots[pg] > storage.get_num_free_slots(pg)
             for pg in typed_range(self.num_pool_groups)
         ):
-            self.prepare_free_slots(level, pg_num_slots)
+            self.prepare_free_slots(level, pg_num_slots, migration_recorder)
         assert all(
             pg_num_slots[pg] <= storage.get_num_free_slots(pg)
             for pg in typed_range(self.num_pool_groups)
@@ -313,13 +329,17 @@ class StorageManager:
         return ret
 
     def new_slots_for_pool_group(
-        self, level: CacheLevel, pg_idx: PoolGroupIndex, num_slots: int
+        self,
+        level: CacheLevel,
+        pg_idx: PoolGroupIndex,
+        num_slots: int,
+        migration_recorder: MigrationRecorder | None = None,
     ) -> list[Slot]:
         storage = self._levels[level].storage
         if num_slots > storage.get_num_free_slots(pg_idx):
             num_slots_list = filled_list(0, self.num_pool_groups)
             num_slots_list[pg_idx] = num_slots
-            self.prepare_free_slots(level, num_slots_list)
+            self.prepare_free_slots(level, num_slots_list, migration_recorder)
         assert num_slots <= storage.get_num_free_slots(pg_idx)
         try:
             return storage.allocate_multiple(pg_idx, num_slots)
@@ -367,13 +387,16 @@ class StorageManager:
         )
 
     def prepare_free_slots(
-        self, level: CacheLevel, requirements: TypedIndexList[PoolGroupIndex, int]
+        self,
+        level: CacheLevel,
+        requirements: TypedIndexList[PoolGroupIndex, int],
+        migration_recorder: MigrationRecorder | None = None,
     ) -> None:
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         for pg in typed_range(self.num_pool_groups):
             goals[level, pg] = requirements[pg]
         fallen_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
-        self._prepare_free_slots(goals, level, fallen_pages)
+        self._prepare_free_slots(goals, level, fallen_pages, migration_recorder)
 
     def force_evict(
         self, level: CacheLevel, min_num_pages: TypedIndexList[PoolGroupIndex, int]
@@ -397,6 +420,7 @@ class StorageManager:
         goals: Array2D[CacheLevel, PoolGroupIndex, int],
         lvl_id: CacheLevel,
         fallen_pages: TypedIndexList[PoolGroupIndex, list[Page]],
+        migration_recorder: MigrationRecorder | None = None,
     ) -> None:
         assert NDEBUG or goals.rows == self.num_cache_levels and goals.cols == self.num_pool_groups
         assert NDEBUG or all(
@@ -468,7 +492,12 @@ class StorageManager:
                 if num_accepted > 0:
                     accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
                     del fallen_pages[pg_idx][-num_accepted:]
-            self._prepare_free_slots(goals, CacheLevel(lvl_id + 1), fallen_pages)
+            self._prepare_free_slots(
+                goals,
+                CacheLevel(lvl_id + 1),
+                fallen_pages,
+                migration_recorder,
+            )
         assert all(len(f) == 0 for f in fallen_pages)
         # migrate pages
         for pg_idx in typed_range(self.num_pool_groups):
@@ -479,7 +508,14 @@ class StorageManager:
             accepted_pages[pg_idx].clear()
             for (src_lvl, pg_idx), pages in partitioned.items():
                 dst_lvl = lvl_id
-                self._batched_migrate(pg_idx, dst_lvl, src_lvl, pages, update_src=True)
+                self._batched_migrate(
+                    pg_idx,
+                    dst_lvl,
+                    src_lvl,
+                    pages,
+                    update_src=True,
+                    migration_recorder=migration_recorder,
+                )
                 for p in pages:
                     if is_last_level and p.status == PageStatus.HELD:
                         continue
@@ -493,6 +529,7 @@ class StorageManager:
         src_level: CacheLevel,
         src_pages: Sequence[Page],
         update_src: bool,
+        migration_recorder: MigrationRecorder | None = None,
         defrag: bool = False,  # we are doing defragmentation
     ) -> Sequence[Slot] | None:
         "Free slots must be prepared before calling this function."
@@ -528,6 +565,15 @@ class StorageManager:
                 for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
+            emit_cache_level_updates = (
+                update_src
+                and not defrag
+                and src_level != dst_level
+                and self._event_manager is not None
+            )
+            emitted_update_keys: set[tuple[bytes, LifeCycleId]] = set()
+            if migration_recorder is not None and not defrag:
+                migration_recorder(src_pages, dst_slots, src_level, dst_level)
             for src, dst in zip(src_pages, dst_slots):
                 dst.ready_event = finish_event
                 src.ready_event = (
@@ -540,6 +586,10 @@ class StorageManager:
                     src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
+                    if emit_cache_level_updates:
+                        self._emit_cache_level_updated_event(
+                            src, src_level, dst_level, emitted_update_keys
+                        )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
             return None if update_src else dst_slots
@@ -547,6 +597,34 @@ class StorageManager:
             for s in dst_slots:
                 dst_pool_group.release(s)
             raise
+
+    def _emit_cache_level_updated_event(
+        self,
+        page: Page,
+        old_level: CacheLevel,
+        new_level: CacheLevel,
+        emitted_keys: set[tuple[bytes, LifeCycleId]],
+    ) -> None:
+        if self._event_manager is None or not isinstance(page, CommittedPage):
+            return
+
+        block = page.block()
+        if block is None or block.is_orphan:
+            return
+
+        event_key = (block.key, page.life_cycle)
+        if event_key in emitted_keys:
+            return
+
+        emitted_keys.add(event_key)
+        self._event_manager.add_updated_event(
+            block.key,
+            cache_level=KVCacheEventDiff(
+                old_value=int(old_level),
+                new_value=int(new_level),
+            ),
+            layer_group_id=int(page.life_cycle),
+        )
 
     def _pool_group(
         self, cache_level: CacheLevel, pool_group_index: PoolGroupIndex

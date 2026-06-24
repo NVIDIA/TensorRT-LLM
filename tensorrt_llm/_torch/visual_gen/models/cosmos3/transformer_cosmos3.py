@@ -866,6 +866,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self,
         hidden_states: torch.Tensor,
         timestep: Optional[torch.Tensor] = None,
+        attention_timestep: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         video_shape: Optional[Tuple[int, int, int]] = None,
@@ -878,7 +879,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
-            timestep: Normalized diffusion timestep in [0, 1], shape [B]
+            timestep: Raw scheduler diffusion timestep, shape [B]
+            attention_timestep: Normalized diffusion timestep in [0, 1], shape [B],
+                for attention backends that use timestep-dependent behavior.
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
@@ -931,7 +934,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 text_ids,
                 text_mask,
                 freqs_und,
-                timestep=timestep,
+                timestep=attention_timestep,
             )
             self.cached_freqs_gen = freqs_gen
 
@@ -971,7 +974,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 k_und,
                 v_und,
                 freqs_gen,
-                timestep=timestep,
+                timestep=attention_timestep,
             )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)

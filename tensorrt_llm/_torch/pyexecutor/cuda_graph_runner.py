@@ -837,6 +837,14 @@ class EncoderCUDAGraphRunner:
         if not self._capture_allowed:
             return None, None
 
+        if "multi_item_part_lens" in inputs:
+            # See model_engine.py for more details
+            logger.warning_once(
+                "Encoder CUDA graph does not support multi-item scoring; "
+                "falling back to eager.",
+                key="encoder_cuda_graph_multi_item_scoring_warning")
+            return None, None
+
         if attn_metadata.has_cross_sub_metadata:
             logger.warning_once(
                 "Encoder CUDA graph does not support cross-attention metadata; "
