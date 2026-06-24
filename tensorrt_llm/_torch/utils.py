@@ -580,32 +580,49 @@ def torch_multi_arange(
         repeats = (repeats + steps_abs - 1).div(steps_abs,
                                                 rounding_mode="floor")
     repeats = repeats.clip(min=0)  # ignore invalid ranges
+    ones = torch.ones((), dtype=ends.dtype, device=ends.device)
+    zeros = torch.zeros((), dtype=ends.dtype, device=ends.device)
+    if steps is None:
+        steps = ones.broadcast_to(ends.shape)
+
     range_ends = repeats - 1  # last element in each range
     if steps is not None:
         range_ends *= steps
     if starts is not None:
         range_ends += starts
-    prev_range_ends = range_ends.roll(
-        1)  # last element in preceding range (or 0)
-    prev_range_ends[0].fill_(0)
-    ones = torch.ones((), dtype=ends.dtype, device=ends.device)
-    zeros = torch.zeros((), dtype=ends.dtype, device=ends.device)
-    if steps is None:
-        steps = ones.broadcast_to(ends.shape)
-    jumps = -prev_range_ends  # delta from one range to the next
+    #
+    # Handling of zero-repeats requires extra care. Need to track index of last non-zero
+    # repeat for each non-zero repeat.
+    #   pad values: repeats.size(0) for scatter, 0 for gather
+    nz_repeats_idx = torch.nonzero_static(
+        repeats, size=repeats.size(0), fill_value=repeats.size(0)).squeeze(-1)
+    next_nz_repeats_idx = nz_repeats_idx.roll(-1)
+    next_nz_repeats_idx[-1].fill_(repeats.size(0))
+    nz_repeats_idx.masked_fill_(nz_repeats_idx == repeats.size(0), 0)
+    #
+    # contains end of last non-empty range for each index with non-zero repeat (other
+    # entries zero)
+    last_nonempty_range_ends = torch.zeros(
+        device=range_ends.device,
+        dtype=range_ends.dtype,
+        size=(repeats.size(0) + 1, ),
+    ).scatter(
+        dim=0,
+        index=next_nz_repeats_idx,
+        src=range_ends.gather(dim=0, index=nz_repeats_idx),
+    )[:-1]
+
+    jumps = -last_nonempty_range_ends  # delta from one non-empty range to the next
     if starts is not None:
         jumps += starts
-    #     NB: Apply correction for empty ranges
-    jumps_corrections = torch.where(repeats == 0, jumps,
-                                    zeros).cumsum(0, dtype=ends.dtype)
-    jumps += jumps_corrections
     seq = torch.cat((jumps.unsqueeze(-1), steps.unsqueeze(-1)), dim=1).view(-1)
     #
     # 2. Construct output via torch.repeat_interleave() and torch.cumsum()
     #     NB: For a resulting empty range, repeats - 1 == -1. In this case, we
     #         should set repeats for delta and increment both to 0 instead.
-    jump_repeats = torch.where(repeats == 0, zeros, ones)
-    step_repeats = torch.where(repeats == 0, zeros, repeats - 1)
+    zero_repeats_mask = (repeats == 0)
+    jump_repeats = torch.where(zero_repeats_mask, zeros, ones)
+    step_repeats = torch.where(zero_repeats_mask, zeros, repeats - 1)
     seq_repeats = torch.cat(
         (jump_repeats.unsqueeze(-1), step_repeats.unsqueeze(-1)),
         dim=1).view(-1)
