@@ -15,6 +15,7 @@
 
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .phased import FmhaParams, PhasedFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
@@ -24,6 +25,7 @@ __all__ = [
     "FMHA_LIBS",
     "FallbackFmha",
     "FlashInferTrtllmGenFmha",
+    "Fp4MlaFmha",
     "Fmha",
     "FmhaCls",
     "FmhaParams",

@@ -8,7 +8,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
+                    Union)
 
 import torch
 import torch._dynamo.config
@@ -80,6 +81,9 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 class ModelEngine(ABC):
@@ -2905,6 +2909,7 @@ class PyTorchModelEngine(ModelEngine):
         sequence_lengths = []  # per sequence
         prompt_lengths = []  # per sequence
         request_ids = []  # per request
+        seq_slots = []  # per request (stable seq_slot from SeqSlotManager)
         gather_ids = []
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
@@ -2975,6 +2980,8 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
             begin_compute = request.context_current_position
@@ -3146,6 +3153,8 @@ class PyTorchModelEngine(ModelEngine):
         previous_pos_indices = []
         for request in extend_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             request_accepted_path[
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
@@ -3224,6 +3233,8 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
             begin_compute = len(
@@ -3295,6 +3306,8 @@ class PyTorchModelEngine(ModelEngine):
                 # py_batch_idx is set after a request occupies a generation slot.
                 # None means this is its first generation step on this worker.
                 is_generation_admission = request.py_batch_idx is None
+                seq_slots.append(request.py_seq_slot if request.
+                                 py_seq_slot is not None else 0)
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -3751,6 +3764,14 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.beam_width = 1
 
         attn_metadata.request_ids = request_ids
+        attn_metadata.is_warmup = self.is_warmup
+        if hasattr(attn_metadata,
+                   'seq_slots') and attn_metadata.seq_slots is not None:
+            num_seqs = len(seq_slots)
+            attn_metadata.seq_slots_cpu[:num_seqs] = torch.tensor(
+                seq_slots, dtype=torch.int32)
+            attn_metadata.seq_slots[:num_seqs].copy_(
+                attn_metadata.seq_slots_cpu[:num_seqs], non_blocking=True)
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
         # Use num_chunked_ctx_requests to record the number of extend context requests,
@@ -3909,6 +3930,7 @@ class PyTorchModelEngine(ModelEngine):
         multi_modal_data = []
         draft_lens = []
         request_ids = []
+        seq_slots = []
         multimodal_params_list = []
 
         for request in scheduled_requests.context_requests:
@@ -3918,6 +3940,8 @@ class PyTorchModelEngine(ModelEngine):
             context_start_idx = len(input_ids)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             if request.position_ids is None:
                 position_ids.extend(range(len(prompt_tokens)))
             else:
@@ -4062,6 +4086,7 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = []
         prompt_lengths = []
         request_ids = []
+        seq_slots = []
         gather_ids = []
         position_ids = []
         # for star attention, we need customized block ids
@@ -4069,6 +4094,8 @@ class PyTorchModelEngine(ModelEngine):
         num_cached_tokens_per_seq = []
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             prompt_lengths.append(request.py_prompt_len)
 
             ctx_iter = request.ctx_iters
@@ -4180,6 +4207,8 @@ class PyTorchModelEngine(ModelEngine):
 
         for request in generation_requests:
             request_ids.append(request.py_request_id)
+            seq_slots.append(
+                request.py_seq_slot if request.py_seq_slot is not None else 0)
             prompt_lengths.append(request.py_prompt_len)
 
             input_token_id = request.get_token(0, request.get_num_tokens(0) - 1)
@@ -4216,7 +4245,6 @@ class PyTorchModelEngine(ModelEngine):
                     anchor_len)
                 all_cache_indices = all_cache_indices[
                     num_kvblocks_per_ctx_block:]
-            cache_indices = all_cache_indices[:num_kv_blocks]
             last_query_pos_id = request.ctx_position_blocks[-1][-1]
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])
@@ -4251,6 +4279,13 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         attn_metadata.request_ids = request_ids
+        if hasattr(attn_metadata,
+                   'seq_slots') and attn_metadata.seq_slots is not None:
+            num_seqs = len(seq_slots)
+            attn_metadata.seq_slots_cpu[:num_seqs] = torch.tensor(
+                seq_slots, dtype=torch.int32)
+            attn_metadata.seq_slots[:num_seqs].copy_(
+                attn_metadata.seq_slots_cpu[:num_seqs], non_blocking=True)
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = num_contexts
         attn_metadata.num_queries = num_queries

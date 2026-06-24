@@ -87,6 +87,19 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
     return sequenceBlocks;
 }
 
+SizeType32 getMlaVScaleElemsPerPage(SizeType32 sizePerHead, SizeType32 tokensPerBlock)
+{
+    // KVCacheManager only receives the full MLA latent head size. The Python V-scale view may consume fewer row
+    // groups when v_head_dim excludes RoPE channels, so this allocation intentionally keeps that headroom.
+    constexpr SizeType32 kFp4BlockSize = 16;
+    constexpr SizeType32 kScaleRowGroup = 128;
+    constexpr SizeType32 kScaleColGroup = 4;
+    auto const tokenScaleCols = tc::ceilDiv(tokensPerBlock, kFp4BlockSize);
+    auto const rowGroups = tc::ceilDiv(sizePerHead, kScaleRowGroup);
+    auto const colGroups = tc::ceilDiv(tokenScaleCols, kScaleColGroup);
+    return rowGroups * colGroups * 32 * 16;
+}
+
 // Compute maximum number of tokens that have been computed by prefill and generation.
 // Accounts for chunked prefill to avoid storing state that hasn't been written to KV cache yet.
 // We call LlmRequest::getContextRemainingLength to see how many tokens are still waiting to be computed in prefill.
@@ -3173,13 +3186,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     bool enableBlockReuse, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
     bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
-    std::vector<PoolConfiguration> const& poolConfigurations)
+    std::vector<PoolConfiguration> const& poolConfigurations, bool enableMlaVScalePool)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse, nullptr,
         enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
-        linearAttentionMetadata, poolConfigurations)
+        linearAttentionMetadata, poolConfigurations, enableMlaVScalePool)
 {
 }
 
@@ -3192,13 +3205,13 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
-    std::vector<PoolConfiguration> const& poolConfigurations)
+    std::vector<PoolConfiguration> const& poolConfigurations, bool enableMlaVScalePool)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
         maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
         kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations)
+        indexerKCacheUseFp4, linearAttentionMetadata, poolConfigurations, enableMlaVScalePool)
 {
 }
 
@@ -3211,11 +3224,12 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
-    std::vector<PoolConfiguration> const& poolConfigurations)
+    std::vector<PoolConfiguration> const& poolConfigurations, bool enableMlaVScalePool)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
     , mTokensPerBlock(tokensPerBlock)
+    , mSizePerHead(sizePerHead)
     , mSinkBubbleLength(BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock))
     , mSinkBlockTokenLength(mSinkBubbleLength + sinkTokenLength)
     , mChunkSize(chunkSize)
@@ -3227,6 +3241,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           poolConfigurations)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
+    , mEnableMlaVScalePool{enableMlaVScalePool}
 {
     // When num_layers < len(maxAttentionWindowVec), not all window sizes in the
     // repeating pattern are used. Update mMaxAttentionWindow to the actual
@@ -3253,13 +3268,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata,
-    std::vector<PoolConfiguration> const& poolConfigurations)
+    std::vector<PoolConfiguration> const& poolConfigurations, bool enableMlaVScalePool)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, std::move(stream),
         maxSequenceLength, chunkSize, enableBlockReuse, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
         enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager), enableIndexerKCache,
         indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata,
-        poolConfigurations)
+        poolConfigurations, enableMlaVScalePool)
 {
 }
 
@@ -3291,6 +3306,20 @@ void KVCacheManager::allocatePools(bool useUvm)
         {
             cacheSizeBytes += (cacheVolume * 4) / 8;
         }
+    }
+    if (mEnableMlaVScalePool)
+    {
+#ifdef ENABLE_FP4
+        TLLM_CHECK_WITH_INFO(
+            mDataType == nvinfer1::DataType::kFP4, "MLA V-scale pool is only supported for FP4 KV cache.");
+        auto const elemsPerPage = getMlaVScaleElemsPerPage(mSizePerHead, mTokensPerBlock);
+        auto const vScaleShape
+            = ITensor::makeShape({mBlockManager.getNumLayers(), mBlockManager.getNumPrimaryBlocks(), elemsPerPage});
+        mMlaVScalePool = BufferManager::gpuSync(vScaleShape, nvinfer1::DataType::kFP8);
+        cacheSizeBytes += ITensor::volume(vScaleShape) * BufferDataType(nvinfer1::DataType::kFP8).getSize();
+#else
+        TLLM_THROW("MLA V-scale pool requires FP4 support.");
+#endif
     }
     // Save the total number of bytes allocated for the KV-cache for KvCacheStats
     mAllocatedBytes = cacheSizeBytes;
@@ -3350,6 +3379,10 @@ void KVCacheManager::allocatePools(bool useUvm)
 void KVCacheManager::releasePools()
 {
     mBlockManager.releasePools();
+    if (mMlaVScalePool)
+    {
+        mMlaVScalePool->release();
+    }
 }
 
 void KVCacheManager::startScheduling()

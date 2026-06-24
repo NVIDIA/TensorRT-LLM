@@ -11,6 +11,7 @@ from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
 from tensorrt_llm._torch.pyexecutor.sampling_utils import torch_multi_arange
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -30,8 +31,6 @@ except RuntimeError:
     capability = torch.cuda.get_device_capability()
     arch_list = f"{capability[0]}.{capability[1]}"
     os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
-
-from tensorrt_llm._utils import prefer_pinned
 
 _FORCE_RAGGED_FA2 = False
 """Used for testing."""
@@ -125,6 +124,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # so set kv_layout as "HND" here
     kv_layout: Literal["NHD", "HND"] = "HND"
 
+    # Speculative-decoding placeholders used by shared one-model drafting
+    # code. FlashInfer does not consume TRTLLM XQA-style packed masks, so
+    # update_spec_dec_param intentionally leaves these tensors unset.
+    is_spec_decoding_enabled: bool = False
+    use_spec_decoding: bool = False
+    is_spec_dec_tree: bool = False
+    is_spec_dec_dynamic_tree: bool = False
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
+    spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
+    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
+
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
     _paged_kv_indices: torch.Tensor = field(init=False, repr=False)
@@ -156,6 +170,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _mla_qo_indptr_buf: Optional[torch.Tensor] = field(init=False, default=None)
     _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
                                                         default=None)
+    # True during warmup forward passes (dummy requests, no real data).
+    is_warmup: bool = field(init=False, default=False)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -364,9 +380,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         """
         num_gen = self.num_generations
         kv_indptr = self.paged_kv_indptr_decode[:num_gen + 1]
-        kv_indices = self._paged_kv_indices[self.num_context_blocks:self.
-                                            num_context_blocks +
-                                            self.num_generation_blocks]
+        kv_indices_start = self.num_context_blocks
+        kv_indices_end = kv_indices_start + self.num_generation_blocks
+        kv_indices = self._paged_kv_indices[
+            kv_indices_start:kv_indices_end].clone()
         kv_last_page = self._paged_kv_last_page_len[self.num_contexts:self.
                                                     num_contexts + num_gen]
 
@@ -1240,11 +1257,20 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.v_head_dim = mla_params.v_head_dim
 
+        if getattr(self, "has_fp4_kv_cache", False):
+            raise NotImplementedError(
+                "NVFP4 KV cache is not supported on the FlashInfer attention "
+                "backend. Set attn_backend='TRTLLM' for FP4 KV cache, or use "
+                "BF16/FP8 KV cache with FlashInfer.")
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
+        self.has_fp4_kv_cache = False
         if self.quant_config:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
+            )
+            self.has_fp4_kv_cache = self.quant_config.layer_quant_mode.has_fp4_kv_cache(
             )
 
     @staticmethod
@@ -1358,6 +1384,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # q_pe shape:    [num_tokens, num_heads, qk_rope_head_dim]
         fused_q[..., self.kv_lora_rank:] = q_pe
 
+    def _local_layer_idx(self, metadata: "FlashInferAttentionMetadata") -> int:
+        """Layer index within the local pipeline-parallel slice. Mirrors
+        ``TrtllmAttention.get_local_layer_idx``."""
+        if metadata.kv_cache_manager is None:
+            return self.layer_idx
+        return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+
     def _get_mla_caches(
         self,
         metadata: "FlashInferAttentionMetadata",
@@ -1469,32 +1502,32 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         kv_dtype = q.dtype
         if self.has_fp8_kv_cache:
             kv_dtype = torch.float8_e4m3fn
+
         ckv_cache, kpe_cache = self._get_mla_caches(metadata)
 
-        assert latent_cache is not None, (
-            "FlashInfer MLA generation requires latent_cache.")
-        # Append latent_cache to the paged MLA KV cache first.
+        # If latent_cache is provided, append it to the paged MLA KV cache first.
         # latent_cache shape: [num_tokens, kv_lora_rank + qk_rope_head_dim]
         # RoPE must already be applied to the k_pe portion before calling this.
-        append_ckv = latent_cache[:, :self.kv_lora_rank]
-        append_kpe = latent_cache[:, self.kv_lora_rank:]
-        if self.has_fp8_kv_cache:
-            append_ckv = append_ckv.to(kv_dtype)
-            append_kpe = append_kpe.to(kv_dtype)
-        num_ctx_tokens = metadata.num_ctx_tokens
-        gen_batch_indices = metadata.batch_indices[num_ctx_tokens:]
-        gen_positions = metadata.positions[num_ctx_tokens:]
-        flashinfer.page.append_paged_mla_kv_cache(
-            append_ckv,
-            append_kpe,
-            gen_batch_indices,
-            gen_positions,
-            ckv_cache,
-            kpe_cache,
-            metadata.paged_kv_indices,
-            metadata.paged_kv_indptr,
-            metadata.paged_kv_last_page_len,
-        )
+        if latent_cache is not None:
+            append_ckv = latent_cache[:, :self.kv_lora_rank]
+            append_kpe = latent_cache[:, self.kv_lora_rank:]
+            if self.has_fp8_kv_cache:
+                append_ckv = append_ckv.to(kv_dtype)
+                append_kpe = append_kpe.to(kv_dtype)
+            num_ctx_tokens = metadata.num_ctx_tokens
+            gen_batch_indices = metadata.batch_indices[num_ctx_tokens:]
+            gen_positions = metadata.positions[num_ctx_tokens:]
+            flashinfer.page.append_paged_mla_kv_cache(
+                append_ckv,
+                append_kpe,
+                gen_batch_indices,
+                gen_positions,
+                ckv_cache,
+                kpe_cache,
+                metadata.paged_kv_indices,
+                metadata.paged_kv_indptr,
+                metadata.paged_kv_last_page_len,
+            )
 
         # fused_q layout: [num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim)]
         # Split into q_nope (absorbed) and q_pe (rope)
