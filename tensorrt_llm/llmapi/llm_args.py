@@ -4368,8 +4368,7 @@ class BaseLlmArgs(StrictBaseModel):
         "(default), it is read from the HF config.json ('dtype', or the "
         "deprecated 'torch_dtype'); for composite/VLM configs it falls "
         "back to the nested text_config.dtype. Defaults to bfloat16 if "
-        "none is found, and is overridden to float16 on GPUs with compute "
-        "capability < 8.0 (pre-Ampere).",
+        "none is found.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32"))
 
