@@ -904,7 +904,13 @@ class CachedSequenceInterface:
                     self._caches[buf_name] = global_tensor
 
             if replay_work_items:
-                self._replay_work_items = torch.empty(
+                # Zero-init (not torch.empty): CUDA graph capture/warmup runs the
+                # replay SSM kernel before prepare_replay_metadata() populates this
+                # buffer, so uninitialized values would feed garbage cache slots to
+                # the kernel and trigger an out-of-bounds state-cache access (IMA).
+                # Zeros map every work item to slot 0 / pnat 0, which is in-bounds.
+                # Mirrors the PyTorch backend (mamba2_metadata.py).
+                self._replay_work_items = torch.zeros(
                     self.info.max_num_state_slots,
                     REPLAY_WORK_ITEM_WIDTH,
                     device=self.info.device,
