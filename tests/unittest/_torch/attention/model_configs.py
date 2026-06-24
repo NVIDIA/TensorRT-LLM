@@ -6,8 +6,9 @@ Instead of an arbitrary ``itertools.product`` of head counts and dims, the sweep
 is driven by the *distinct* attention configurations actually used by the
 supported models under ``tensorrt_llm/_torch/models/`` and
 ``tensorrt_llm/_torch/visual_gen/models/``. Each entry records the
-``(num_heads, num_kv_heads, head_dim, rope, mask, is_mla, is_cross)`` tuple and
-names the model family it comes from, so a failure points at real workloads.
+``(num_heads, num_kv_heads, head_dim, rope, mask, sliding_window, is_mla,
+is_cross)`` tuple and names the model family it comes from, so a failure points
+at real workloads.
 
 Many models collapse onto the same tuple (e.g. Llama/Mistral/Qwen-1.5 all use
 32 Q / 8 KV / 128); only the distinct tuples are listed. Numeric values are the
@@ -26,9 +27,10 @@ part of the attention architecture.
 
 Deliberate exclusions (not distinct at the dense-backend level, or covered
 elsewhere):
-- Per-layer-varying models (Gemma4 global vs sliding layers, Laguna per-layer
-  rope) decompose into the per-layer tuples already listed (sliding 128, MHA
-  128, head_dim 256).
+- Per-layer-varying models decompose into the per-layer tuples listed here. A
+  config value such as ``sliding_window`` is ignored when the PyTorch model path
+  does not pass it to the dense attention backend (for example Qwen2 /
+  Qwen2.5-VL with ``use_sliding_window=False``).
 - Vision/text encoders (SigLip/Radio/CLIP/Parakeet, MiniMax-VL tower) collapse
   onto the bidirectional MHA tuples already listed (e.g. 16x64 / 12x64 full).
 - Sparse/DSA indexer attention (GLM-DSA, NSA, RocketKV) is a separate paradigm
@@ -69,33 +71,366 @@ class ModelAttnConfig:
 # Standard self-attention (decoder LLMs). The dominant configurations.
 # ---------------------------------------------------------------------------
 _STANDARD = [
-    # GQA 4:1, neox, causal -- by far the most common LLM shape.
+    # Dense full-attention decoder LLMs.
     ModelAttnConfig(
         "llama3_gqa",
-        "Llama-2/3/4, Qwen-1.5, Phi-3, Nemotron, Mixtral",
+        "Llama-3 8B, Qwen3-8B, Mixtral-8x7B, Qwen3-VL-8B, Nemotron-H-8B",
         num_heads=32,
         num_kv_heads=8,
         head_dim=128,
     ),
-    # MHA, neox, causal.
     ModelAttnConfig(
-        "qwen3_mha",
-        "Qwen3, Qwen3-MoE, ExaOne-MoE, Hunyuan-MoE",
+        "llama70_qwen3_32b_gqa",
+        "Llama-3 70B, Qwen2/3-32B/72B, MiniMax-M1, Step-3.5/3.7 full layers",
+        num_heads=64,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "llama405_gqa",
+        "Llama-3.1 405B",
+        num_heads=128,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "llama4_gqa",
+        "Llama-4, Qwen3-14B, Qwen2.5-14B/32B, Nemotron Nano 4B/9B/12B",
+        num_heads=40,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "llama32_1b_gqa",
+        "Llama-3.2 1B, EXAONE-4.0-1.2B",
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=64,
+    ),
+    ModelAttnConfig(
+        "llama32_3b_gqa",
+        "Llama-3.2 3B, Phi-4-mini, HCXVision-3B, Minitron/Nemotron-4B",
+        num_heads=24,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "mixtral22_minimax_laguna_gqa",
+        "Mixtral-8x22B, MiniMax-M2, Laguna full layers",
+        num_heads=48,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "seedoss_gqa",
+        "Seed-OSS-36B",
+        num_heads=80,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen2_gqa",
+        "Qwen2-7B, Qwen2.5-VL-7B, Qwen2-MoE-57B, LLaVA-OneVision-Qwen2",
+        num_heads=28,
+        num_kv_heads=4,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen2_05b_gqa_hd64",
+        "Qwen2/Qwen2.5-0.5B",
+        num_heads=14,
+        num_kv_heads=2,
+        head_dim=64,
+    ),
+    ModelAttnConfig(
+        "qwen2_15b_gqa",
+        "Qwen2/Qwen2.5-1.5B",
+        num_heads=12,
+        num_kv_heads=2,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen2_3b_gqa",
+        "Qwen2.5-3B, Qwen2.5-VL-3B",
+        num_heads=16,
+        num_kv_heads=2,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen3_small_gqa",
+        "Qwen3-0.6B/1.7B, Qwen3-VL-2B, HyperCLOVAX-SEED-Text-0.5B",
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen3_moe_30b_gqa",
+        "Qwen3-MoE-30B-A3B, Qwen3-VL-MoE-30B-A3B",
+        num_heads=32,
+        num_kv_heads=4,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen3_moe_235b_gqa",
+        "Qwen3-MoE-235B-A22B, Qwen3-VL-MoE-235B-A22B",
+        num_heads=64,
+        num_kv_heads=4,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "tinyllama_gqa_hd64",
+        "TinyLlama / synthetic Llama GQA-4, head_dim=64",
+        num_heads=32,
+        num_kv_heads=4,
+        head_dim=64,
+    ),
+    ModelAttnConfig(
+        "nemotron_h_gqa2",
+        "Nemotron-H 30B/120B",
+        num_heads=32,
+        num_kv_heads=2,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "nemotron_h_64h_gqa2",
+        "Nemotron-H 47B/56B/Ultra sample",
+        num_heads=64,
+        num_kv_heads=2,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "glm4_moe_gqa",
+        "GLM-4.5/4.6/4.7 MoE",
+        num_heads=96,
+        num_kv_heads=8,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen3next_gqa_hd256",
+        "Qwen3-Next full-attention layers, Qwen3.5 35B-A3B full layers",
+        num_heads=16,
+        num_kv_heads=2,
+        head_dim=256,
+    ),
+    ModelAttnConfig(
+        "qwen35_27b_gqa_hd256",
+        "Qwen3.5-27B full-attention layers",
+        num_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+    ),
+    ModelAttnConfig(
+        "qwen35_397b_gqa_hd256",
+        "Qwen3.5-397B-A17B full-attention layers",
+        num_heads=32,
+        num_kv_heads=2,
+        head_dim=256,
+    ),
+    ModelAttnConfig(
+        "mha_32x32_hd128",
+        "Llama-2-7B, Qwen1.5-7B, DeciLM-7B",
         num_heads=32,
         num_kv_heads=32,
         head_dim=128,
     ),
-    # GQA + sliding window (4096), neox.
+    ModelAttnConfig(
+        "mha_20x20_hd128",
+        "VILA1.5-3B LLM",
+        num_heads=20,
+        num_kv_heads=20,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "mha_40x40_hd128",
+        "Llama-2-13B, Qwen1.5-14B",
+        num_heads=40,
+        num_kv_heads=40,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "mha_52x52_hd128",
+        "Llama-30B",
+        num_heads=52,
+        num_kv_heads=52,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "mha_64x64_hd128",
+        "Llama-65B, Qwen1.5-72B",
+        num_heads=64,
+        num_kv_heads=64,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "mha_128x128_hd128",
+        "Nemotron-NAS Ultra 253B",
+        num_heads=128,
+        num_kv_heads=128,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "qwen15_05b_mha_hd64",
+        "Qwen1.5-0.5B",
+        num_heads=16,
+        num_kv_heads=16,
+        head_dim=64,
+    ),
+    ModelAttnConfig(
+        "qwen15_moe_mha",
+        "Qwen1.5-MoE-A2.7B",
+        num_heads=16,
+        num_kv_heads=16,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "phi3_mha_hd96",
+        "Phi-3-mini / Phi-3.5-mini full-attention PyTorch path",
+        num_heads=32,
+        num_kv_heads=32,
+        head_dim=96,
+    ),
+    ModelAttnConfig(
+        "phi3_medium_gqa",
+        "Phi-3-medium full-attention PyTorch path",
+        num_heads=40,
+        num_kv_heads=10,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "nemotron_nas_mha_hd64",
+        "Nemotron-NAS / DeciLM mini",
+        num_heads=32,
+        num_kv_heads=32,
+        head_dim=64,
+    ),
+    ModelAttnConfig(
+        "gpt_oss_gqa",
+        "GPT-OSS full-attention layers (yarn, gptj-style rotation)",
+        num_heads=64,
+        num_kv_heads=8,
+        head_dim=64,
+        rope="gptj",
+    ),
+    # NoPE decoder self-attention (learned/relative positional embeddings are
+    # handled outside the dense backend).
+    ModelAttnConfig(
+        "t5_6_self_nope",
+        "FLAN-T5-small / ByT5-small decoder self-attention",
+        num_heads=6,
+        num_kv_heads=6,
+        head_dim=64,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "t5_8_self_nope",
+        "T5-small decoder self-attention",
+        num_heads=8,
+        num_kv_heads=8,
+        head_dim=64,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "t5_12_self_nope",
+        "T5-base decoder self-attention",
+        num_heads=12,
+        num_kv_heads=12,
+        head_dim=64,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "bart_self_nope",
+        "BART / mBART decoder self-attention",
+        num_heads=16,
+        num_kv_heads=16,
+        head_dim=64,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "t5_32_self_nope",
+        "FLAN-T5-XL decoder self-attention",
+        num_heads=32,
+        num_kv_heads=32,
+        head_dim=64,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "exaone4_nope_gqa",
+        "EXAONE-4.0/4.5 full-attention layers (NoPE)",
+        num_heads=40,
+        num_kv_heads=8,
+        head_dim=128,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "exaone_moe_nope_gqa",
+        "K-EXAONE full-attention layers (NoPE)",
+        num_heads=64,
+        num_kv_heads=8,
+        head_dim=128,
+        rope=None,
+    ),
+    ModelAttnConfig(
+        "gemma3_1b_mqa_hd256",
+        "Gemma3-1B full-attention layers",
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+    ),
+    ModelAttnConfig(
+        "gemma3_12b_gqa_hd256",
+        "Gemma3-12B full-attention layers",
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=256,
+    ),
+    ModelAttnConfig(
+        "gemma3_27b_gqa",
+        "Gemma3-27B full-attention layers",
+        num_heads=32,
+        num_kv_heads=16,
+        head_dim=128,
+    ),
+    ModelAttnConfig(
+        "gemma4_e2b_full_hd512",
+        "Gemma4-E2B full-attention layers",
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=512,
+    ),
+    ModelAttnConfig(
+        "gemma4_26b_full_hd512",
+        "Gemma4-26B-A4B full-attention layers",
+        num_heads=16,
+        num_kv_heads=2,
+        head_dim=512,
+    ),
+    ModelAttnConfig(
+        "gemma4_31b_full_hd512",
+        "Gemma4-31B full-attention layers",
+        num_heads=32,
+        num_kv_heads=4,
+        head_dim=512,
+    ),
+    # Dense sliding-window decoder LLMs. The window size is part of the tuple:
+    # two otherwise-identical head layouts with different windows stay separate.
     ModelAttnConfig(
         "mistral_swa",
-        "Mistral-7B, Mixtral, StarCoder2, ExaOne-4",
+        "Mistral-7B-v0.1",
         num_heads=32,
         num_kv_heads=8,
         head_dim=128,
         mask="sliding",
         sliding_window=4096,
     ),
-    # GQA + sliding window, gptj-style RoPE (Cohere2 per-layer PE).
+    ModelAttnConfig(
+        "ministral_swa32768",
+        "Ministral-style Mistral layer_types",
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        mask="sliding",
+        sliding_window=32768,
+    ),
     ModelAttnConfig(
         "cohere2_gptj_swa",
         "Cohere2 / Command-R (gptj RoPE, per-layer PE)",
@@ -106,43 +441,114 @@ _STANDARD = [
         mask="sliding",
         sliding_window=4096,
     ),
-    # GQA + sliding window, yarn-scaled RoPE (represented as neox).
     ModelAttnConfig(
-        "mistral_nemo_yarn_swa",
-        "Mistral-Nemo, GPT-OSS (yarn RoPE)",
-        num_heads=32,
+        "gpt_oss_swa128",
+        "GPT-OSS sliding layers (yarn, gptj-style rotation)",
+        num_heads=64,
+        num_kv_heads=8,
+        head_dim=64,
+        rope="gptj",
+        mask="sliding",
+        sliding_window=128,
+    ),
+    ModelAttnConfig(
+        "exaone4_swa4096",
+        "EXAONE-4.0/4.5 sliding layers",
+        num_heads=40,
         num_kv_heads=8,
         head_dim=128,
         mask="sliding",
         sliding_window=4096,
     ),
-    # MHA + sliding window, mrope (represented as neox); Qwen2-VL.
     ModelAttnConfig(
-        "qwen2vl_mrope_swa",
-        "Qwen2-VL, Step-3.7-VL (mrope)",
-        num_heads=32,
-        num_kv_heads=32,
+        "exaone_moe_swa128",
+        "K-EXAONE sliding layers",
+        num_heads=64,
+        num_kv_heads=8,
+        head_dim=128,
+        mask="sliding",
+        sliding_window=128,
+    ),
+    ModelAttnConfig(
+        "laguna_step_swa512",
+        "Laguna sliding layers, Step-3.5/3.7 sliding layers",
+        num_heads=64,
+        num_kv_heads=8,
+        head_dim=128,
+        mask="sliding",
+        sliding_window=512,
+    ),
+    ModelAttnConfig(
+        "starcoder2_3b_swa4096",
+        "StarCoder2-3B",
+        num_heads=24,
+        num_kv_heads=2,
         head_dim=128,
         mask="sliding",
         sliding_window=4096,
     ),
-    # MHA, mrope causal (represented as neox); Qwen3-VL / Kimi-K2.5 / SeedOSS.
     ModelAttnConfig(
-        "qwen3vl_mrope",
-        "Qwen3-VL, Kimi-K2.5, SeedOSS, ExaOne-4.5 (mrope)",
-        num_heads=32,
-        num_kv_heads=32,
+        "starcoder2_7b_swa4096",
+        "StarCoder2-7B",
+        num_heads=36,
+        num_kv_heads=4,
         head_dim=128,
+        mask="sliding",
+        sliding_window=4096,
     ),
-    # Large head_dim edge case (256), GQA, sliding window; Gemma3.
     ModelAttnConfig(
-        "gemma3_hd256_swa",
-        "Gemma3 (head_dim=256)",
+        "starcoder2_15b_swa4096",
+        "StarCoder2-15B",
+        num_heads=48,
+        num_kv_heads=4,
+        head_dim=128,
+        mask="sliding",
+        sliding_window=4096,
+    ),
+    ModelAttnConfig(
+        "gemma3_1b_swa512",
+        "Gemma3-1B local layers",
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+        mask="sliding",
+        sliding_window=512,
+    ),
+    ModelAttnConfig(
+        "gemma3_12b_swa1024",
+        "Gemma3-12B local layers, Gemma4-26B-A4B sliding layers",
         num_heads=16,
         num_kv_heads=8,
         head_dim=256,
         mask="sliding",
-        sliding_window=4096,
+        sliding_window=1024,
+    ),
+    ModelAttnConfig(
+        "gemma3_27b_swa1024",
+        "Gemma3-27B local layers",
+        num_heads=32,
+        num_kv_heads=16,
+        head_dim=128,
+        mask="sliding",
+        sliding_window=1024,
+    ),
+    ModelAttnConfig(
+        "gemma4_e2b_swa512",
+        "Gemma4-E2B sliding layers",
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=256,
+        mask="sliding",
+        sliding_window=512,
+    ),
+    ModelAttnConfig(
+        "gemma4_31b_swa1024",
+        "Gemma4-31B sliding layers",
+        num_heads=32,
+        num_kv_heads=16,
+        head_dim=256,
+        mask="sliding",
+        sliding_window=1024,
     ),
     # MQA (single KV head): SYNTHETIC -- no current supported model uses it, but
     # it is the GQA extreme (n_rep == num_heads) and worth guarding.
@@ -162,7 +568,7 @@ _MLA = [
     # DeepSeek-V3: 128 Q heads, qk_nope=128, qk_rope=64, kv_lora=512, v=128.
     ModelAttnConfig(
         "deepseekv3_mla",
-        "DeepSeek-V3 / R1",
+        "DeepSeek-V3 / R1 / V3.2, MistralLarge3",
         num_heads=128,
         num_kv_heads=1,
         head_dim=192,  # qk_nope+qk_rope
@@ -176,8 +582,22 @@ _MLA = [
     # Hunyuan-Dense MLA variant: 32 Q heads, qk_nope=128.
     ModelAttnConfig(
         "hunyuan_mla",
-        "Hunyuan-Dense (MLA mode)",
+        "Hunyuan-Dense (MLA mode), DeepSeek-V3-Lite",
         num_heads=32,
+        num_kv_heads=1,
+        head_dim=192,
+        is_mla=True,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+    ),
+    # Kimi K2.5 uses a DeepSeek-style MLA text backbone with 64 query heads.
+    ModelAttnConfig(
+        "kimi_k25_mla",
+        "Kimi-K2.5",
+        num_heads=64,
         num_kv_heads=1,
         head_dim=192,
         is_mla=True,
@@ -212,10 +632,50 @@ _MLA = [
 # ---------------------------------------------------------------------------
 _CROSS = [
     ModelAttnConfig(
+        "t5_6_cross",
+        "FLAN-T5-small / ByT5-small cross-attention",
+        num_heads=6,
+        num_kv_heads=6,
+        head_dim=64,
+        rope=None,
+        mask="full",
+        is_cross=True,
+    ),
+    ModelAttnConfig(
+        "t5_8_cross",
+        "T5-small cross-attention",
+        num_heads=8,
+        num_kv_heads=8,
+        head_dim=64,
+        rope=None,
+        mask="full",
+        is_cross=True,
+    ),
+    ModelAttnConfig(
         "t5_cross",
-        "T5 / BART (NoPE, bidirectional encoder)",
+        "T5-base cross-attention",
         num_heads=12,
         num_kv_heads=12,
+        head_dim=64,
+        rope=None,
+        mask="full",
+        is_cross=True,
+    ),
+    ModelAttnConfig(
+        "bart_cross",
+        "BART / mBART cross-attention",
+        num_heads=16,
+        num_kv_heads=16,
+        head_dim=64,
+        rope=None,
+        mask="full",
+        is_cross=True,
+    ),
+    ModelAttnConfig(
+        "t5_32_cross",
+        "FLAN-T5-XL cross-attention",
+        num_heads=32,
+        num_kv_heads=32,
         head_dim=64,
         rope=None,
         mask="full",
@@ -239,8 +699,18 @@ _CROSS = [
 # ---------------------------------------------------------------------------
 _NO_CACHE = [
     ModelAttnConfig(
+        "t5_6_encoder",
+        "FLAN-T5-small / ByT5-small encoder",
+        num_heads=6,
+        num_kv_heads=6,
+        head_dim=64,
+        rope=None,
+        mask="full",
+        no_cache=True,
+    ),
+    ModelAttnConfig(
         "bert_encoder",
-        "BERT / CLIP / SigLip (NoPE bidirectional encoder)",
+        "BERT / CLIP / T5-base / SigLip (NoPE bidirectional encoder)",
         num_heads=12,
         num_kv_heads=12,
         head_dim=64,
@@ -260,7 +730,7 @@ _NO_CACHE = [
     ),
     ModelAttnConfig(
         "ltx2_dit",
-        "LTX-2 (DiT, video)",
+        "T5-small encoder, LTX-2 (DiT, video)",
         num_heads=8,
         num_kv_heads=8,
         head_dim=64,
@@ -270,9 +740,19 @@ _NO_CACHE = [
     ),
     ModelAttnConfig(
         "cosmos3_dit",
-        "Cosmos3 (DiT, 3D mrope -> neox)",
+        "BART / mBART encoder, Cosmos3 (DiT, 3D mrope -> neox)",
         num_heads=16,
         num_kv_heads=16,
+        head_dim=64,
+        rope=None,
+        mask="full",
+        no_cache=True,
+    ),
+    ModelAttnConfig(
+        "t5_32_encoder",
+        "FLAN-T5-XL encoder",
+        num_heads=32,
+        num_kv_heads=32,
         head_dim=64,
         rope=None,
         mask="full",

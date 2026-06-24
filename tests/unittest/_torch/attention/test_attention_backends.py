@@ -32,11 +32,6 @@ from attention_test_harness import (
 )
 from model_configs import MODEL_CONFIGS, ModelAttnConfig
 
-# Sliding-window models ship a 4096 window; at the small sequence lengths used
-# here that would never mask, so the test shrinks it to exercise the windowing
-# logic (the real window is recorded in model_configs).
-_TEST_SLIDING_WINDOW = 48
-
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
 _BF16 = ("bfloat16", None)
@@ -48,7 +43,7 @@ _FP8 = ("bfloat16", "float8_e4m3fn")
 _CORE_PRECISIONS, _CORE_LAYOUTS, _CORE_PAGES = [_BF16, _FP8], ["HND"], [32]
 _EXTRA_PRECISIONS = [_FP16, _BF16, _FP8]
 _EXTRA_LAYOUTS, _EXTRA_PAGES = ["HND", "NHD"], [32, 64]
-_EXTRA_CONFIG_IDS = ("llama3_gqa", "qwen3_mha", "mqa_synthetic")
+_EXTRA_CONFIG_IDS = ("llama3_gqa", "mha_32x32_hd128", "mqa_synthetic")
 
 # Standard self-attention batch phases.
 _PHASES = {
@@ -71,7 +66,7 @@ def _common(cfg: ModelAttnConfig) -> dict:
         head_dim=cfg.head_dim,
         rope=_rope_dict(cfg),
         causal=cfg.mask in ("causal", "sliding"),
-        sliding_window=_TEST_SLIDING_WINDOW if cfg.mask == "sliding" else None,
+        sliding_window=cfg.sliding_window if cfg.mask == "sliding" else None,
     )
     if cfg.is_mla:
         common.update(
