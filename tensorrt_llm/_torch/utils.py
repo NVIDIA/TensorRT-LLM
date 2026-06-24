@@ -547,14 +547,13 @@ def torch_multi_arange(
     `ACCEPT_SYNC_COMPUTE` to explicitly accept the possibility of a device sync (for device tensors)
     or when tensors are known to reside on the host.
     """
-    if steps is not None:
-        assert ends.dtype == steps.dtype
-        assert ends.shape == steps.shape
-        assert ends.device == steps.device
-    if starts is not None:
-        assert ends.dtype == starts.dtype
-        assert ends.shape == starts.shape
-        assert ends.device == starts.device
+    if not ((steps is None or
+             (ends.dtype == steps.dtype and ends.shape == steps.shape
+              and ends.device == steps.device)) and
+            (starts is None or
+             (ends.dtype == starts.dtype and ends.shape == starts.shape
+              and ends.device == starts.device))):
+        raise ValueError("Incompatible input tensors")
     output_length_arg = None if isinstance(
         output_length, _AcceptSyncCompute) else output_length
 
@@ -571,12 +570,12 @@ def torch_multi_arange(
     #    preceding range into the start element for the current range and 'b' is
     #    simply the step size for the current range.
     #
-    repeats = ends  # number of elements in each range
-    if starts is not None:
-        repeats = repeats.clone()
-        repeats -= starts
+    repeats = ends - starts if starts is not None else ends
     if steps is not None:
-        repeats *= steps.sign()
+        if repeats is not ends:
+            repeats *= steps.sign()
+        else:
+            repeats = repeats * steps.sign()
         steps_abs = steps.abs()
         repeats = (repeats + steps_abs - 1).div(steps_abs,
                                                 rounding_mode="floor")
