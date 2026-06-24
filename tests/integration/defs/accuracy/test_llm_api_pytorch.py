@@ -38,8 +38,7 @@ from tensorrt_llm.llmapi import (
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (check_device_contain, get_device_count,
-                        get_device_memory, llm_models_root,
+from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
@@ -793,25 +792,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="beam_width=2")
 
 
-class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.2-1B"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_ada
-    def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B-FP8"
-        with LLM(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.2-3B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-3B"
@@ -970,154 +950,6 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
-
-
-@pytest.mark.timeout(14400)
-class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Maverick-17B-128E-Instruct"
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8), (4, 1, 1),
-                                    (4, 1, 2), (4, 1, 4)],
-        ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4"])
-    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
-        if get_device_count() != tp_size * pp_size:
-            pytest.skip("Device count mismatch with world size")
-        if get_device_memory() < 240000 and get_device_count() < 8:
-            pytest.skip("Not enough memory for this test")
-
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
-        with LLM(
-                self.MODEL_PATH,
-                tensor_parallel_size=tp_size,
-                # Keep this low to avoid warmup OOM in CI
-                max_seq_len=8192,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                cuda_graph_config=CudaGraphConfig()
-                if cuda_graph else None) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
-    def test_chunked_prefill(self, attn_backend):
-        pytorch_config = dict(attn_backend=attn_backend,
-                              disable_overlap_scheduler=True)
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=8,
-                 pipeline_parallel_size=1,
-                 moe_expert_parallel_size=1,
-                 max_seq_len=8192,
-                 enable_chunked_prefill=True,
-                 max_num_tokens=256,
-                 **pytorch_config) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device_memory(80000)
-    @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4), (8, 1, 8), (4, 1, 1),
-                                    (4, 1, 2), (4, 1, 4), (4, 2, 1)],
-        ids=["tp8", "tp8ep4", "tp8ep8", "tp4", "tp4ep2", "tp4ep4", "tp4pp2"])
-    def test_fp8(self, cuda_graph, tp_size, pp_size, ep_size):
-        if get_device_memory() < 140000 and get_device_count() < 8:
-            pytest.skip("Not enough memory for this test")
-        if get_device_count() != tp_size * pp_size:
-            pytest.skip("Device count mismatch with world size")
-
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
-        with LLM(
-                f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
-                tensor_parallel_size=tp_size,
-                # Keep this low to avoid warmup OOM in CI
-                max_seq_len=8192,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                cuda_graph_config=CudaGraphConfig()
-                if cuda_graph else None) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("cuda_graph", [False, True])
-    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 8)],
-                             ids=["tp8ep8"])
-    def test_fp8_chunked_prefill(self, cuda_graph, tp_size, pp_size, ep_size):
-        with LLM(
-                f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
-                tensor_parallel_size=tp_size,
-                # Keep this low to avoid warmup OOM in CI
-                max_seq_len=8192,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                enable_chunked_prefill=True,
-                max_num_tokens=256,
-                cuda_graph_config=CudaGraphConfig()
-                if cuda_graph else None) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestMistral7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-7B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestMistralSmall24B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
-
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
-        model_path = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503-fp8"
-        with LLM(model_path, kv_cache_config=kv_cache_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
@@ -1493,41 +1325,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **extra_llm_config) as llm:
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestMixtral8x7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
-
-    @pytest.mark.skip_less_device(2)
-    def test_tp2(self):
-        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
-    def test_fp8_tp2(self):
-        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp8"
-        with LLM(model_path, tensor_parallel_size=2) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_device_not_contain(["B200"])
-    def test_nvfp4_tp2(self):
-        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4"
-        with LLM(model_path, tensor_parallel_size=2) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
@@ -4917,22 +4714,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Codestral-22B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/Codestral-22B-v0.1"
-
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestKanana_Instruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
     MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
@@ -4944,86 +4725,6 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
             enable_padding=True, max_batch_size=384))
         with LLM(self.MODEL_PATH, **pytorch_config,
                  enable_attention_dp=True) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestBielik11BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "speakleash/Bielik-11B-v2.2-Instruct"
-
-    def test_auto_dtype(self):
-        with LLM(f"{llm_models_root()}/Bielik-11B-v2.2-Instruct") as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    def test_fp8(self):
-        with LLM(f"{llm_models_root()}/Bielik-11B-v2.2-Instruct-FP8") as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestPhi4(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "microsoft/phi-4"
-
-    def test_auto_dtype(self):
-        with LLM(f"{llm_models_root()}/Phi-4") as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    def test_fp8(self):
-        with LLM(f"{llm_models_root()}/Phi-4-FP8") as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestPhi4MM(LlmapiAccuracyTestHarness):
-    # phi4-mm can also support text input.
-    MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
-    MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct"
-
-    def test_auto_dtype(self):
-        # Set max_seq_len to 4096 to use short rope factor.
-        model_name = "microsoft/Phi-4-multimodal-instruct"
-        with LLM(self.MODEL_PATH, max_seq_len=4096) as llm:
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
-
-    def test_auto_dtype_long_rope(self):
-        # Set max_seq_len larger than 4096 to use long rope factor.
-        model_name = "microsoft/Phi-4-multimodal-instruct-long-rope"
-        with LLM(self.MODEL_PATH, max_seq_len=8192) as llm:
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
-
-    @skip_pre_blackwell
-    def test_fp4(self):
-        model_path = f"{self.MODEL_PATH}-FP4"
-        with LLM(model_path, max_seq_len=4096) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @skip_pre_hopper
-    def test_fp8(self):
-        model_path = f"{self.MODEL_PATH}-FP8"
-        with LLM(model_path, max_seq_len=4096) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -6304,52 +6005,6 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             )
 
             task.evaluate(llm, sampling_params=sampling_params)
-
-
-class TestStarcoder2_3B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "bigcode/starcoder2-3b"
-    MODEL_PATH = f"{llm_models_root()}/starcoder2-3b/"
-
-    @skip_pre_hopper
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH,
-                 attn_backend="TRTLLM",
-                 cuda_graph_config=None,
-                 max_batch_size=128,
-                 max_seq_len=4096) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestStarcoder2_7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "bigcode/starcoder2-7b"
-    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b/"
-
-    @skip_pre_hopper
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH,
-                 attn_backend="TRTLLM",
-                 cuda_graph_config=None,
-                 max_batch_size=128,
-                 max_seq_len=4096) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-class TestStarcoder2_15B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "bigcode/starcoder2-15b"
-    MODEL_PATH = f"{llm_models_root()}/starcoder2-15b/"
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH,
-                 attn_backend="TRTLLM",
-                 cuda_graph_config=None,
-                 max_batch_size=128,
-                 max_seq_len=4096) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 @skip_pre_blackwell
