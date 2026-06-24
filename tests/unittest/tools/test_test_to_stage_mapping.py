@@ -7,6 +7,8 @@ from collections import defaultdict
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 # Add scripts directory to path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
@@ -297,7 +299,7 @@ def test_cli_functionality(tmp_path, stage_query, sample_test_cases,
 
 
 def test_backend_filtering_consistency(stage_query):
-    """Test that tests only map to stages matching their backend."""
+    """Test that backend mappings resolve to matching stages."""
     # Discover all backends and collect sample tests for each
     backend_to_tests = defaultdict(list)
     all_backends = set()
@@ -324,15 +326,14 @@ def test_backend_filtering_consistency(stage_query):
             stages = stage_query.tests_to_stages([test_name])
 
             if not stages:
-                continue  # Skip tests that don't map to any stages
+                continue  # Skip tests that don't map to any parsed stages
 
-            # Check that test maps to at least one stage matching its backend
-            found_matching_stage = False
-            for stage in stages:
-                # Check if stage name contains the backend identifier
-                if backend.upper() in stage.upper():
-                    found_matching_stage = True
-                    break
+            backend_keywords = stage_query._backend_keywords[backend.lower()]
+            if isinstance(backend_keywords, str):
+                backend_keywords = [backend_keywords]
+            found_matching_stage = any(keyword in stage.upper()
+                                       for stage in stages
+                                       for keyword in backend_keywords)
 
             assert found_matching_stage, \
                 f"Test '{test_name}' with backend '{backend}' should map to " \
