@@ -170,6 +170,12 @@ def inplace_info():
             7: "acceptToken"
         }
     }
+    try:
+        inplace_map[torch.ops.trtllm.gdn_custom_op_inplace.default] = {
+            1: "output"
+        }
+    except AttributeError:
+        pass
     if IS_CUDA_TILE_AVAILABLE:
         # cuda.tile availability depends on GPU capability thus runtime check.
         inplace_map[
