@@ -41,6 +41,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import \
     NVFP4CutlassFusedMoEMethod
 # isort: on
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -2975,6 +2976,77 @@ class MockModule:
         self.scaling_vector_size = 16  # Standard for NVFP4
         self.weight_vec_size = 16  # 16 fp4 values packed into int64
         self.block_scales_vec_size = 4  # 4 fp8 values packed into int32
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 1,
+                    reason="needs 1 GPU to run this test")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_moe_int8_woq_per_channel_non_gated(dtype):
+    """Non-gated (squared-ReLU) INT8 weight-only per-channel MoE.
+
+    The gate projection (w3) is absent for non-gated experts, so the
+    intermediate buffer is single-width (expand ratio 1, not 2). This
+    exercises the non-gated path in the INT8 weight-only CUTLASS fused-MoE.
+    """
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f'cuda:{mapping.rank}'):
+        SEQ_LEN = 4
+        HIDDEN_SIZE = 768
+        INTERMEDIATE_SIZE = 640
+        NUM_EXPERTS = 3
+        TOP_K = 2
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
+        router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
+                                    dtype=dtype,
+                                    device="cuda")
+
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            # Non-gated: only w1 (up) and w2 (down); no w3 (gate).
+            w1_weight = torch.randint(-128,
+                                      127, (INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                      dtype=torch.int8).cuda()
+            w2_weight = torch.randint(-128,
+                                      127, (HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                      dtype=torch.int8).cuda()
+            w1_scale = torch.randn(
+                (INTERMEDIATE_SIZE), dtype=dtype, device="cuda") / HIDDEN_SIZE
+            w2_scale = torch.randn(
+                (HIDDEN_SIZE), dtype=dtype, device="cuda") / INTERMEDIATE_SIZE
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight
+            weights[f"{expert_id}.w2.weight"] = w2_weight
+            weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+
+        fused_moe = CutlassFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=False,
+            model_config=ModelConfig(quant_config=quant_config),
+            activation_type=ActivationType.Relu2)
+
+        # Non-gated buffer is single-width (expand ratio 1, not 2).
+        assert fused_moe.intermediate_size_expand_ratio == 1
+        assert not fused_moe.is_gated_activation
+
+        fused_moe.load_weights([weights])
+        fused_moe.cuda()
+
+        with torch.inference_mode(), autotune():
+            output = fused_moe.forward(x, router_logits)
+
+        assert output.shape == (SEQ_LEN, HIDDEN_SIZE)
+        assert torch.isfinite(output).all()
 
 
 def test_nvfp4_cutlass_get_weights_shapes_error_cases():
