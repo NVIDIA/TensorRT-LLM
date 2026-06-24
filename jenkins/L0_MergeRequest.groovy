@@ -1519,7 +1519,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             string(name: 'forkOwner', value: ''),
                             string(name: 'postMergePipelineName', value: ''),
                             string(name: 'postMergeBuildNumber', value: ''),
-                            string(name: 'scanMode', value: 'monitor'),
+                            string(name: 'scanMode', value: 'pre_merge'),
                             string(name: 'runSourceCodeScanning', value: 'true'),
                             string(name: 'runContainerScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
