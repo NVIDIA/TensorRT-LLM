@@ -1285,10 +1285,10 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
 # test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
 # the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
 # trtllm-serve resolves the HuggingFace id directly.
-@pytest.mark.parametrize("model_label", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
 def test_disaggregated_python_transceiver_host_offload(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
-        model_label):  # noqa: ARG001 — used only for the parametrize label
+        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
     See `_verify_python_transceiver_under_host_offload` for what this
@@ -1301,6 +1301,8 @@ def test_disaggregated_python_transceiver_host_offload(
     config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
     huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
     """
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
 
@@ -1311,6 +1313,7 @@ def test_disaggregated_python_transceiver_host_offload(
     run_disaggregated_test(disaggregated_example_root,
                            "python_transceiver_host_offload",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory(),
                            post_client_test=post_client_test)
 
