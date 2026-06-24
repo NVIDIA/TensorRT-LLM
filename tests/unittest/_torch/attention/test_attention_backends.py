@@ -55,6 +55,38 @@ _PHASES = {
     "gen": dict(seq_lens=[1, 1, 1], num_cached_tokens=[20, 130, 8], num_contexts=0),
     "mix": dict(seq_lens=[16, 1, 1], num_cached_tokens=[0, 30, 70], num_contexts=1),
 }
+_SLIDING_CTX_WINDOW_LIMIT = 1024
+
+
+def _phases_for(cfg: ModelAttnConfig) -> dict:
+    if cfg.mask != "sliding":
+        return _PHASES
+
+    assert cfg.sliding_window is not None
+    window = cfg.sliding_window
+    long_cache = window + 17
+    context_len = window + 17 if window <= _SLIDING_CTX_WINDOW_LIMIT else 257
+
+    # Every sliding config gets a decode request whose total KV length exceeds
+    # the real model window, while context prefill stays bounded for large
+    # windows because the Vanilla golden is quadratic in context length.
+    return {
+        "ctx": dict(
+            seq_lens=[context_len, 73, 41],
+            num_cached_tokens=[0, 0, 0],
+            num_contexts=3,
+        ),
+        "gen": dict(
+            seq_lens=[1, 1, 1],
+            num_cached_tokens=[long_cache, 73, 41],
+            num_contexts=0,
+        ),
+        "mix": dict(
+            seq_lens=[context_len, 1, 1],
+            num_cached_tokens=[0, long_cache, 73],
+            num_contexts=1,
+        ),
+    }
 
 
 def _rope_dict(cfg: ModelAttnConfig):
@@ -101,6 +133,7 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     NHD is physically equivalent and would skip TRTLLM coverage.
     """
     common = _common(cfg)
+    phases = _phases_for(cfg)
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.
     if cfg.no_cache:
@@ -145,7 +178,7 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
                         yield (
                             f"{cfg.id}-same_kv_{tag}",
                             BackendCase(
-                                seq_lens_kv=_PHASES["ctx"]["seq_lens"], **_PHASES["ctx"], **base
+                                seq_lens_kv=phases["ctx"]["seq_lens"], **phases["ctx"], **base
                             ),
                         )
                         yield (
@@ -154,19 +187,19 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
                                 seq_lens_kv=[
                                     x * y
                                     for x, y in zip(
-                                        _PHASES["ctx"]["seq_lens"], [2, 3, 6], strict=True
+                                        phases["ctx"]["seq_lens"], [2, 3, 6], strict=True
                                     )
                                 ],
-                                **_PHASES["ctx"],
+                                **phases["ctx"],
                                 **base,
                             ),
                         )
                     elif cfg.is_mla and cfg.mla_context:
-                        yield f"{cfg.id}-ctx-{tag}", BackendCase(**_PHASES["ctx"], **base)
+                        yield f"{cfg.id}-ctx-{tag}", BackendCase(**phases["ctx"], **base)
                     elif cfg.is_mla:
-                        yield f"{cfg.id}-gen-{tag}", BackendCase(**_PHASES["gen"], **base)
+                        yield f"{cfg.id}-gen-{tag}", BackendCase(**phases["gen"], **base)
                     else:
-                        for phase_name, phase in _PHASES.items():
+                        for phase_name, phase in phases.items():
                             yield f"{cfg.id}-{phase_name}-{tag}", BackendCase(**phase, **base)
 
 

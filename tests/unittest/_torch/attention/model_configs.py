@@ -94,7 +94,7 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "llama3_70b_qwen3_32b_gqa",
-        "Llama-3 70B, Qwen2/3-32B/72B, MiniMax-M1, Step-3.5/3.7 full layers",
+        "Llama-3 70B, Qwen3-32B, Qwen2/Qwen2.5-72B, MiniMax-M1, Step-3.5/3.7 full layers",
         num_heads=64,
         num_kv_heads=8,
         head_dim=128,
@@ -178,7 +178,7 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "qwen3_moe_30b_gqa",
-        "Qwen3-MoE-30B-A3B, Qwen3-VL-MoE-30B-A3B",
+        "Qwen3-MoE-30B-A3B, Qwen3-VL-MoE-30B-A3B, synthetic Llama GQA-4",
         num_heads=32,
         num_kv_heads=4,
         head_dim=128,
@@ -192,7 +192,7 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "tinyllama_gqa_hd64",
-        "TinyLlama / synthetic Llama GQA-4, head_dim=64",
+        "TinyLlama",
         num_heads=32,
         num_kv_heads=4,
         head_dim=64,
@@ -600,7 +600,7 @@ _MLA = [
     # Kimi K2.5 uses a DeepSeek-style MLA text backbone with 64 query heads.
     ModelAttnConfig(
         "kimi_k25_mla",
-        "Kimi-K2.5",
+        "Kimi-K2/K2.5",
         num_heads=64,
         num_kv_heads=1,
         head_dim=192,
@@ -741,7 +741,7 @@ _NO_CACHE = [
     ),
     ModelAttnConfig(
         "bert_mha_hd64_nope_encoder",
-        "BERT / CLIP / T5-base / SigLip (NoPE bidirectional encoder)",
+        "BERT / CLIP / T5-base (NoPE bidirectional encoder)",
         num_heads=12,
         num_kv_heads=12,
         head_dim=64,
@@ -771,7 +771,7 @@ _NO_CACHE = [
     ),
     ModelAttnConfig(
         "cosmos3_mha_hd64_dit",
-        "BART / mBART encoder, Cosmos3 (DiT, 3D mrope -> neox)",
+        "BART / mBART encoder, Cosmos3 (DiT)",
         num_heads=16,
         num_kv_heads=16,
         head_dim=64,
@@ -803,7 +803,7 @@ _NO_CACHE = [
     ),
     ModelAttnConfig(
         "gemma_qwen3vl_mha_hd72_nope_vision",
-        "Gemma3/Qwen3-VL vision tower (head_dim=72)",
+        "Gemma3/Qwen3-VL/SigLip vision tower (head_dim=72)",
         num_heads=16,
         num_kv_heads=16,
         head_dim=72,
