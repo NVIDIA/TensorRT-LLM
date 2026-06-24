@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cstdint>
 
@@ -168,7 +169,7 @@ inline __device__ int4 rms_norm(float denom, PackedStruct& vec, PackedStruct& we
 //   - Caller guarantees hidden_size % SF_VEC_SIZE == 0.
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false, bool UseSmem = false,
     bool OutNorm = false>
-__global__ void rms_norm_fp4_quant_kernel(RmsNormFp4QuantParams params, void* quant_out, void* scale_out,
+__global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params, void* quant_out, void* scale_out,
     void* norm_out_ptr, float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout,
     int input_row_stride)
 {
@@ -282,9 +283,9 @@ __global__ void rms_norm_fp4_quant_kernel(RmsNormFp4QuantParams params, void* qu
 }
 
 template <typename T, bool OutNorm = false>
-void launch_rms_norm_fp4_quant_kernel(RmsNormFp4QuantParams& params, void* quant_out, void* scale_out,
-    void* norm_out_ptr, float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout,
-    cudaStream_t stream, int input_row_stride = 0)
+void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams& params, void* quant_out, void* scale_out, void* norm_out_ptr,
+    float const* scale_factor_ptr, ::tensorrt_llm::QuantizationSFLayout sf_layout, cudaStream_t stream,
+    int input_row_stride = 0)
 {
     static constexpr int kPackedSize = kBytesPerAccess / sizeof(T);
     TLLM_CHECK(params.hidden_size % kPackedSize == 0);
@@ -301,11 +302,16 @@ void launch_rms_norm_fp4_quant_kernel(RmsNormFp4QuantParams& params, void* quant
     bool const has_weight = params.weight_buffer != nullptr;
 
     // Macro-dispatch over Bias/Residual/Affine/UseSmem and the OutNorm template arg.
+    // Launch through launchWithPdlWhenEnabled so the kernel's PDL primitives
+    // (cudaGridDependencySynchronize / cudaTriggerProgrammaticLaunchCompletion)
+    // are actually enabled when TLLM_ENABLE_PDL is set.
 #define DISPATCH_FP4_QUANT(BIAS, RESIDUAL, AFFINE, SMEM)                                                               \
     if (use_smem == SMEM)                                                                                              \
     {                                                                                                                  \
-        rms_norm_fp4_quant_kernel<T, BIAS, RESIDUAL, AFFINE, SMEM, OutNorm><<<cta_num, cta_size, smem_size, stream>>>( \
-            params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, input_row_stride);                \
+        tensorrt_llm::common::launchWithPdlWhenEnabled("rmsNormFp4Quant",                                              \
+            rmsNormFp4QuantKernel<T, BIAS, RESIDUAL, AFFINE, SMEM, OutNorm>, dim3(cta_num), dim3(cta_size),            \
+            static_cast<size_t>(smem_size), stream, params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr,      \
+            sf_layout, input_row_stride);                                                                              \
     }
 
     auto launch = [&]()
@@ -379,12 +385,12 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams& params, void* quant_out, voi
         {
 #ifdef ENABLE_BF16
         case nvinfer1::DataType::kBF16:
-            rms_norm_fp4_quant::launch_rms_norm_fp4_quant_kernel<__nv_bfloat16, /*OutNorm=*/true>(
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/true>(
                 params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
             break;
 #endif
         case nvinfer1::DataType::kHALF:
-            rms_norm_fp4_quant::launch_rms_norm_fp4_quant_kernel<half, /*OutNorm=*/true>(
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/true>(
                 params, quant_out, scale_out, norm_out_ptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
             break;
         default: TLLM_THROW("Unsupported dataType for residualRmsNormFp4Quant");
@@ -396,12 +402,12 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams& params, void* quant_out, voi
         {
 #ifdef ENABLE_BF16
         case nvinfer1::DataType::kBF16:
-            rms_norm_fp4_quant::launch_rms_norm_fp4_quant_kernel<__nv_bfloat16, /*OutNorm=*/false>(
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<__nv_bfloat16, /*OutNorm=*/false>(
                 params, quant_out, scale_out, nullptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
             break;
 #endif
         case nvinfer1::DataType::kHALF:
-            rms_norm_fp4_quant::launch_rms_norm_fp4_quant_kernel<half, /*OutNorm=*/false>(
+            rms_norm_fp4_quant::launchRmsNormFp4QuantKernel<half, /*OutNorm=*/false>(
                 params, quant_out, scale_out, nullptr, scale_factor_ptr, sf_layout, stream, input_row_stride);
             break;
         default: TLLM_THROW("Unsupported dataType for residualRmsNormFp4Quant");
