@@ -719,8 +719,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         stage('Check If Node Is Online') {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
                 // TODO: THIS IS FOR FUNCTIONAL TESTING, THIS SHOULD BE REMOVED BEFORE MERGE.
-                def slurmLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
-                echoRemoteLogTail(pipeline, remote, slurmLogPath)
+                def slurmLogPathTmp = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                echoRemoteLogTail(pipeline, remote, slurmLogPathTmp)
 
                 // Check the SLURM job once; if it is no longer active, raise a typed
                 // InfraFailure(SLURM) so the retry layer routes it via instanceof (scope=SLURM).
