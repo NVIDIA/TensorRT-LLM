@@ -12,6 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compatibility wrapper for visual-gen sparse attention helpers."""
 
-from tensorrt_llm.visual_gen.sparse_attention import *  # noqa: F403
+from .fallback import FallbackFmha
+from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .interface import Fmha
+from .phased import FmhaParams, PhasedFmha
+from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
+
+__all__ = [
+    "DEFAULT_FMHA_LIBS",
+    "FMHA_LIBS",
+    "FallbackFmha",
+    "FlashInferTrtllmGenFmha",
+    "Fmha",
+    "FmhaCls",
+    "FmhaParams",
+    "PhasedFmha",
+    "get_enabled_fmha_lib_classes",
+]

@@ -114,13 +114,14 @@ def create_rocket_kv_cache_manager(num_layers, num_kv_heads, head_dim,
         max_batch_size=max_batch_size,
         mapping=mapping,
         dtype=dtype,
-        sparse_attn_config=sparse_attn_config,
+        sparse_attention_config=sparse_attn_config,
     )
     return kv_cache_manager
 
 
 def create_test_metadata(seq_lens, num_contexts, past_seen_tokens, request_ids,
                          kv_cache_manager, sparse_attn_config, metadata_cls):
+    sparse_metadata_params = (sparse_attn_config.to_sparse_metadata_params())
     prompt_lens = []
     for i, (seq_len, past_token) in enumerate(zip(seq_lens, past_seen_tokens)):
         if i < num_contexts:
@@ -139,7 +140,7 @@ def create_test_metadata(seq_lens, num_contexts, past_seen_tokens, request_ids,
         kv_cache_manager=kv_cache_manager,
         request_ids=request_ids,
         prompt_lens=prompt_lens,
-        sparse_attention_config=sparse_attn_config,
+        sparse_metadata_params=sparse_metadata_params,
     )
     metadata.prepare()
     return metadata
@@ -227,13 +228,14 @@ def test_sparse_kv_predict(batch_size, num_contexts):
     ]
     trtllm_kv_cache_manager.add_dummy_requests(request_ids, token_nums)
     vanilla_kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    sparse_params = sparse_attn_config.to_sparse_params()
 
     trtllm_attn = RocketTrtllmAttention(
         layer_idx=0,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attn_config,
+        sparse_params=sparse_params,
     )
 
     vanilla_attn = RocketVanillaAttention(
@@ -241,7 +243,7 @@ def test_sparse_kv_predict(batch_size, num_contexts):
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attn_config,
+        sparse_params=sparse_params,
     )
 
     trtllm_metadata = create_test_metadata(seq_lens, num_contexts,
@@ -433,13 +435,15 @@ def test_sparse_attn_predict(batch_size, num_contexts):
     ]
     trtllm_kv_cache_manager.add_dummy_requests(request_ids, token_nums)
     vanilla_kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    trtllm_sparse_params = (sparse_attn_config_trtllm.to_sparse_params())
+    vanilla_sparse_params = (sparse_attn_config_vanilla.to_sparse_params())
 
     trtllm_attn = RocketTrtllmAttention(
         layer_idx=0,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attn_config_trtllm,
+        sparse_params=trtllm_sparse_params,
     )
 
     vanilla_attn = RocketVanillaAttention(
@@ -447,7 +451,7 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attn_config_vanilla,
+        sparse_params=vanilla_sparse_params,
     )
 
     trtllm_metadata = create_test_metadata(seq_lens, num_contexts,

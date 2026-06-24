@@ -444,6 +444,20 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def reject_piecewise_cuda_graph_for_speculative_decoding(self):
+        compile_model = self.transforms.get("compile_model", {})
+        if (
+            self.speculative_config is not None
+            and self.is_cuda_graph_enabled()
+            and compile_model.get("piecewise_enabled", False)
+        ):
+            raise ValueError(
+                "Speculative decoding with AutoDeploy does not currently support piecewise CUDA "
+                "graph capture."
+            )
+        return self
+
+    @model_validator(mode="after")
     def disable_piecewise_for_non_piecewise_backend(self):
         compile_model = self.transforms.get("compile_model")
         if compile_model is not None and not self.is_cuda_graph_enabled():
