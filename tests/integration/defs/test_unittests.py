@@ -66,7 +66,12 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
-    pynvml.nvmlInit()
+    try:
+        pynvml.nvmlInit()
+        gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        gpu_name = pynvml.nvmlDeviceGetName(gpu_handle)
+    except pynvml.NVMLError:
+        gpu_name = "CPU"
 
     test_root = tests_path()
     dry_run = False
@@ -79,6 +84,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     waives_file = request.config.getoption("--waives-file")
     run_ray = request.config.getoption("--run-ray")
+    unittest_markexpr = request.config.getoption("--unittest-markexpr")
 
     num_workers = 1
 
@@ -86,8 +92,6 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     # If you need to override this policy, please use postprocess code as below.
     agg_unit_mem_df = pd.read_csv(
         f'{test_root}/integration/defs/agg_unit_mem_df.csv')
-    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    gpu_name = pynvml.nvmlDeviceGetName(gpu_handle)
     if isinstance(gpu_name, bytes):
         gpu_name = gpu_name.decode()
     agg_unit_mem_df = agg_unit_mem_df[agg_unit_mem_df['gpu'] == gpu_name]
@@ -159,6 +163,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     if run_ray:
         command += ["--run-ray"]
+
+    if unittest_markexpr:
+        command += ["-m", unittest_markexpr]
 
     s3_secret_key = None
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)

@@ -29,14 +29,14 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
 
-try:
-    check_cuda_arch()
-except RuntimeError:
-    # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
-    # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
-    # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
-    # capability query would force a CUDA context at import time.
-    if torch.cuda.is_available():
+# Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
+# check would force a CUDA context at import time.
+if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+    try:
+        check_cuda_arch()
+    except RuntimeError:
+        # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
+        # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
         capability = torch.cuda.get_device_capability()
         arch_list = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
