@@ -484,6 +484,19 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def enabledStages = []
+    if (params.buildInternalRelease) {
+        enabledStages += ["Build Internal release (x86_64 trtllm)", "Build Internal release (SBSA trtllm)"]
+    }
+    if (params.buildCiImage) {
+        enabledStages += ["Build CI Image (x86_64 tritondevel)", "Build CI Image (SBSA tritondevel)", "Build CI Image (RockyLinux8 Python310)", "Build CI Image (RockyLinux8 Python312)", "Build CI Image (SBSA Ubuntu24.04 Python312)"]
+    }
+    if (params.buildNgcRelease) {
+        enabledStages += ["Build NGC devel And release (x86_64)", "Build NGC devel And release (SBSA)"]
+    }
+    buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
+    echo "Running stages: ${buildConfigs.keySet()}"
+
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
         defaultBuildConfig.each { defaultKey, defaultValue ->
@@ -551,6 +564,21 @@ pipeline {
             name: "action",
             choices: ["build", "push"],
             description: "Docker image generation action. build: only perform image build step; push: build docker image and push it to artifacts"
+        )
+        booleanParam(
+            name: "buildInternalRelease",
+            defaultValue: true,
+            description: "Build internal release images (x86_64 and SBSA trtllm)"
+        )
+        booleanParam(
+            name: "buildCiImage",
+            defaultValue: true,
+            description: "Build CI images (tritondevel and OS variant images)"
+        )
+        booleanParam(
+            name: "buildNgcRelease",
+            defaultValue: true,
+            description: "Build NGC devel and release images (x86_64 and SBSA)"
         )
     }
     options {
