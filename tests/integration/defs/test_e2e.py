@@ -2142,6 +2142,7 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
     pytest.param('MiniMax-M2', marks=skip_pre_hopper),
+    pytest.param('MiniMax-M3', marks=skip_pre_blackwell),
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                           mmlu_dataset_root):
@@ -2158,7 +2159,7 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         "--backend=pytorch",
     ]
 
-    if "Kimi" in model_path:
+    if "Kimi" in model_path or "MiniMax-M3" in model_path:
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")
