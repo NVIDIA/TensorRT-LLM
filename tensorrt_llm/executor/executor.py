@@ -134,8 +134,10 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
-        cache_salt_id: Optional[int] = None,
+        cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
+        encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                                list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
@@ -162,8 +164,9 @@ class GenerationExecutor(ABC):
             trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
+            encoder_input_token_ids=encoder_input_token_ids,
             priority=priority)
         result = self.submit(request)
         # release memory in time
@@ -180,6 +183,7 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -205,6 +209,7 @@ class GenerationExecutor(ABC):
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
+            cs = cache_salt[i] if isinstance(cache_salt, list) else cache_salt
             future = self.generate_async(
                 p,
                 sampling_params=sp,
@@ -212,7 +217,8 @@ class GenerationExecutor(ABC):
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 streaming=False,
-                disaggregated_params=disaggregated_params)
+                disaggregated_params=disaggregated_params,
+                cache_salt=cs)
             futures.append(future)
 
         for future in futures:
@@ -242,7 +248,11 @@ class GenerationExecutor(ABC):
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
                     not request.sampling_params._need_return_generation_logits)
-                or self.postproc_config.num_postprocess_workers > 0)
+                or self.postproc_config.num_postprocess_workers > 0,
+                logprobs_simple_format=request.sampling_params.
+                logprobs_simple_format,
+                prompt_logprobs_simple_format=request.sampling_params.
+                prompt_logprobs_simple_format)
 
         return logprob_params
 

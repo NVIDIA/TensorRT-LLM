@@ -30,32 +30,15 @@ transforms:
   fuse_nvfp4_moe:
     backend: trtllm_gen
   detect_sharding:
-    # for long input, tp8ep1 gives better performance
-    # dist_mapping: {moe_tp: 8, moe_ep: 1}
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
     allreduce_strategy: SYMM_MEM
-    shard_all_unprocessed: true
+    # Shared expert is excluded from sharding for performance purpose
+    shard_layers: ["moe", "delta", "mha"]
     simple_shard_filter: "lm_head"
-    sharding_dims: ['tp','ep', 'bmm']
-    # use only manual config for TP sharding
-    sharding_source: ['manual']
-    manual_config:
-      tp_plan:
-        # GDN layer
-        "in_proj_qkv": "delta"
-        # attention layer
-        "q_proj": "colwise"
-        "k_proj": "colwise"
-        "v_proj": "colwise"
-        "o_proj": "rowwise"
-        # lm_head: "gather" = column split + all_gather (not "colwise" which
-        # requires a LayerSubgraph and crashes for standalone unprocessed nodes)
-        "lm_head": "gather"
-        # replicating shared experts (keep them commented out)
-        # "shared_expert_gate_proj": "colwise"
-        # "shared_expert_up_proj": "colwise"
-        # "shared_expert_down_proj": "rowwise"
-        # gating layer should be replicated as well
-        # "gate": "gather"
   multi_stream_moe:
     stage: compile
     enabled: true
@@ -64,7 +47,3 @@ transforms:
     enabled: true
   gather_logits_before_lm_head:
     enabled: true
-  compile_model:
-    # Piecewise cudagraph may work if multi_stream_moe is disabled, but we want
-    # multi_stream_moe enabled on the default path for this model family.
-    piecewise_enabled: false

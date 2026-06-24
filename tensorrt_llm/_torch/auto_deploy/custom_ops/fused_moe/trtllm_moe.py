@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
@@ -26,6 +27,33 @@ from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 _f32_scale_cache: dict = {}
+
+
+def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
+    """Whether the router GEMM may use tinygemm2 (else fall back to F.linear).
+
+    Encodes tinygemm2's hard preconditions (thop CHECK_INPUT: CUDA + contiguous +
+    bf16; bias required; SM90/100/103) plus the small-M decode regime where it wins.
+    Any unmet condition (prefill, non-bf16, non-contiguous, no bias, other arch)
+    silently falls back to F.linear — no hard failure.
+    """
+    # Router GEMM uses TRT-LLM tinygemm2 (single-kernel tall-skinny GEMM, no cuBLAS split-K + splitKreduce) for small-M
+    # decode, matching PT's compute_gate_output. Above this token count cuBLAS GEMM is preferred (tinygemm2
+    # specialization no longer wins and its accumulation diverges); same threshold PT uses.
+    _MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+    # tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
+    _TINYGEMM_SM = (90, 100, 103)
+    return (
+        bias is not None
+        and get_sm_version() in _TINYGEMM_SM
+        and x2d.shape[0] <= _MIN_LATENCY_TINYGEMM_NUM_TOKENS
+        and x2d.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and bias.dtype == torch.bfloat16
+        and x2d.is_contiguous()
+        and weight.is_contiguous()
+        and bias.is_contiguous()
+    )
 
 
 def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -39,6 +67,116 @@ def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
     return f32
 
 
+# =============================================================================
+# Module-level cache for MoeAlltoAll state
+# =============================================================================
+#
+# Custom ops are stateless functions, but `MoeAlltoAll` is fundamentally
+# stateful: base TensorRT-LLM constructs it once per fused-MoE module and
+# reuses `self.moe_a2a` across forward steps. Auto-deploy previously
+# re-instantiated it on every layer call and re-parsed the serialized
+# `DistConfig` JSON, paying that overhead per-layer per-step.
+#
+# This module-level cache mirrors the `_GlobalTrtllmPlanner` pattern in
+# `trtllm_attention.py` (and `_GlobalFlashInferPlanner` in
+# `flashinfer_attention.py`): a Python-level singleton that lives across
+# custom-op invocations, lazily constructed on first use, keyed by
+# parameters that determine workspace identity. The class-level
+# `MoeAlltoAll._WORKSPACE` already deduplicates the GPU workspace and the
+# C++ `moe_a2a_initialize` call across instances; this cache additionally
+# eliminates the redundant Python ctor and JSON deserialization.
+
+
+class _MoeAll2AllCache:
+    """Per-process singleton cache for `MoeAlltoAll` instances and parsed `DistConfig` mappings.
+
+    A separate cache instance lives in each MPI worker process — there is no
+    cross-rank shared state here (that lives in `MoeAlltoAll._WORKSPACE`, which is
+    initialized via the C++ `moe_a2a_initialize` collective). Within a rank, all
+    fused-MoE layers share this cache so the Python `MoeAlltoAll` ctor and
+    `DistConfig` JSON deserialization run at most once per (workspace) configuration
+    per process, regardless of how many MoE-DP layers the model has.
+
+    Note: EPLB (Expert Parallelism Load Balancing — `MoeAlltoAll(num_experts=…)`
+    selects an EPLB-aware codepath) is not used by auto-deploy today;
+    `eplb_num_experts` is always `None` from the call sites. The cache still keys
+    on it explicitly so the helper composes correctly if EPLB is wired later.
+    """
+
+    def __init__(self) -> None:
+        self._all2all: dict[tuple, MoeAlltoAll] = {}
+        self._mapping: dict[str, Tuple[Optional[Mapping], bool]] = {}
+
+    def get_mapping(self, mapping_config: str) -> Tuple[Optional[Mapping], bool]:
+        """Return cached `(Mapping, enable_alltoall)` parsed from `mapping_config`.
+
+        All-to-all is used when attention-DP is enabled and experts are sharded
+        (EP > 1). The returned `mapping` is `None` when `mapping_config` is empty.
+
+        Note: `max_num_tokens` is a per-call argument and is therefore not part
+        of the cache key. Callers must validate it themselves (see `_check_moe_alltoall`).
+        """
+        cached = self._mapping.get(mapping_config)
+        if cached is not None:
+            return cached
+        if not mapping_config:
+            cached = (None, False)
+        else:
+            dc = DistConfig.deserialize(mapping_config)
+            mapping = dc.to_mapping()
+            enable = dc.enable_attention_dp and dc.moe_ep_size > 1
+            cached = (mapping, enable)
+        self._mapping[mapping_config] = cached
+        return cached
+
+    def get_alltoall(
+        self,
+        mapping: Mapping,
+        max_num_tokens: int,
+        top_k: int,
+        num_slots: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        eplb_num_experts: Optional[int] = None,
+    ) -> MoeAlltoAll:
+        """Return a `MoeAlltoAll` instance, constructing on first use.
+
+        Keyed on the tuple of ctor parameters that determine workspace identity.
+        In practice `MoeAlltoAll._WORKSPACE` is process-wide and only one
+        configuration is valid per process, but a tuple key keeps semantics
+        correct if the runner ever changes shapes between calls.
+        """
+        workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+            mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, dtype, eplb_num_experts
+        )
+        key = (
+            mapping.moe_ep_size,
+            mapping.moe_ep_rank,
+            top_k,
+            num_slots,
+            max_num_tokens,
+            workspace_size,
+            eplb_num_experts,
+        )
+        inst = self._all2all.get(key)
+        if inst is None:
+            inst = MoeAlltoAll(
+                mapping=mapping,
+                max_num_tokens=max_num_tokens,
+                top_k=top_k,
+                num_slots=num_slots,
+                workspace_size_per_rank=workspace_size,
+                num_experts=eplb_num_experts,
+            )
+            self._all2all[key] = inst
+        return inst
+
+
+# Per-process singleton: instantiated once at module import; each MPI rank
+# has its own instance because each rank is a separate Python process.
+_GlobalMoeAll2AllCache = _MoeAll2AllCache()
+
+
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
     """Check if MoE all-to-all mode should be used and validate parameters.
 
@@ -47,11 +185,7 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     Returns:
         (mapping, enable_alltoall) — mapping is None when mapping_config is empty.
     """
-    if not mapping_config:
-        return None, False
-    dc = DistConfig.deserialize(mapping_config)
-    mapping = dc.to_mapping()
-    enable_alltoall = dc.enable_attention_dp and dc.moe_ep_size > 1
+    mapping, enable_alltoall = _GlobalMoeAll2AllCache.get_mapping(mapping_config)
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall
@@ -74,6 +208,7 @@ def _run_moe_with_alltoall(
     use_deepseek_fp8_block_scale: bool = False,
     finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
     is_gated_mlp: bool = True,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Execute MoE with all-to-all dispatch/combine pattern.
@@ -117,6 +252,11 @@ def _run_moe_with_alltoall(
             ``use_deepseek_fp8_block_scale`` internally.
         is_gated_mlp: Whether gated MLP is used. Needed by the Blackwell finegrained
             FP8 path to compute ``intermediate_size``.
+        batch_info_host: Pinned-host int tensor managed by ``BatchInfo``. When
+            provided, slot 14 (``max_dp_num_tokens``) is read at capture time as
+            ``runtime_max_tokens_per_rank`` (the cross-rank max of
+            ``total_num_tokens``, computed pre-forward by the AD shim via
+            ``tp_allgather``). When ``None``, falls back to ``max_num_tokens``.
 
     Returns:
         2-D output tensor ``(num_tokens, hidden_size)`` — the caller reshapes to the
@@ -129,28 +269,32 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
+    # runtime_max_tokens_per_rank: max(total_num_tokens) across DP ranks.
+    # Mirrors base TRT-LLM's `runtime_max_tokens_per_rank = max(all_rank_num_tokens)`
+    # in fused_moe_cutlass.py / fused_moe_trtllm_gen.py. AD's shim writes slot 14
+    # pre-forward via `tp_allgather` of `total_num_tokens` (when attention-DP is on);
+    # nest_sequences seeds slot 14 with the local total as a safe default. See
+    # ``BatchInfo`` in attention_interface.py for the full slot layout.
+    if batch_info_host is not None:
+        runtime_max_tokens_per_rank = int(batch_info_host[14].item())
+        if runtime_max_tokens_per_rank <= 0:
+            runtime_max_tokens_per_rank = max_num_tokens
+    else:
+        runtime_max_tokens_per_rank = max_num_tokens
+
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
     # (bf16/fp16). We always pass the model dtype so the combine buffer is large enough.
-    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-        mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, output_dtype
-    )
-
-    # We need runtime_max_tokens_per_rank = max(tokens across all EP ranks).
-    # An NCCL all_reduce cannot run inside CUDA-graph capture, so we conservatively
-    # use max_num_tokens (the config-level upper bound) as an over-approximation.
-    # This causes the dispatch to allocate larger recv buffers (padded with invalid
-    # tokens that are skipped by the kernel), trading memory for correctness.
-    runtime_max_tokens_per_rank = max_num_tokens
-
-    # Build MoeAlltoAll (num_slots = num_experts without EPLB load balancing)
-    moe_a2a = MoeAlltoAll(
+    # The instance is cached across calls (see `_MoeAll2AllCache`), so the Python ctor and
+    # workspace-size computation happen once per (workspace) configuration per process.
+    moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
-        num_slots=global_num_experts,  # No EPLB: num_slots == num_experts
-        workspace_size_per_rank=workspace_size,
-        num_experts=None,  # None = EPLB disabled
+        num_slots=global_num_experts,
+        hidden_size=hidden_size,
+        dtype=output_dtype,
+        eplb_num_experts=None,
     )
 
     invalid_expert_id = global_num_experts
@@ -299,6 +443,7 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     mapping: Mapping,
     max_num_tokens: int,
     act_type: int,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run TRTLLM-Gen NVFP4 MoE through the all-to-all dispatch/combine path."""
 
@@ -306,18 +451,22 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
-        mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, x.dtype
-    )
-    runtime_max_tokens_per_rank = max_num_tokens
+    # See _run_moe_with_alltoall above for the slot-14 contract.
+    if batch_info_host is not None:
+        runtime_max_tokens_per_rank = int(batch_info_host[14].item())
+        if runtime_max_tokens_per_rank <= 0:
+            runtime_max_tokens_per_rank = max_num_tokens
+    else:
+        runtime_max_tokens_per_rank = max_num_tokens
 
-    moe_a2a = MoeAlltoAll(
+    moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         num_slots=global_num_experts,
-        workspace_size_per_rank=workspace_size,
-        num_experts=None,
+        hidden_size=hidden_size,
+        dtype=x.dtype,
+        eplb_num_experts=None,
     )
 
     invalid_expert_id = global_num_experts
@@ -400,6 +549,7 @@ def trtllm_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -445,6 +595,7 @@ def trtllm_moe_fused(
             activation_type=activation_type,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -475,6 +626,7 @@ def trtllm_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -514,6 +666,7 @@ def trtllm_quant_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
 
@@ -591,6 +744,7 @@ def trtllm_quant_fp8_moe_fused(
             activation_type=act_fn,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -628,6 +782,7 @@ def trtllm_quant_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -651,6 +806,7 @@ def trtllm_quant_nvfp4_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
 
@@ -720,6 +876,7 @@ def trtllm_quant_nvfp4_moe_fused(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             nvfp4_act_global_scale=fc1_act_global_scale,
+            batch_info_host=batch_info_host,
         ).view(x.shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -766,6 +923,7 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -784,6 +942,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 Block Scale MoE for FineGrainedFP8 format.
 
@@ -846,6 +1005,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             max_num_tokens=max_num_tokens,
             finegrained_fp8_block_scales=(fc1_weight_scale, fc2_weight_scale),
             is_gated_mlp=is_gated_mlp,
+            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -932,6 +1092,7 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -960,6 +1121,7 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
@@ -1036,6 +1198,7 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             act_type=act_type,
+            batch_info_host=batch_info_host,
         )
         if final_hidden_states.shape[1] > x_shape[-1]:
             final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
@@ -1108,6 +1271,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _trtllm_nvfp4_trtllm_gen_moe_impl(
         x,
@@ -1132,6 +1296,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         mapping_config=mapping_config,
         max_num_tokens=max_num_tokens,
         apply_routing_on_input=apply_routing_on_input,
+        batch_info_host=batch_info_host,
     )
 
 
@@ -1159,5 +1324,228 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
+    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+# =============================================================================
+# MXFP4 weights on TRT-LLM-Gen (W4A16 bf16-act or W4A8 mxfp8-act)
+# =============================================================================
+#
+# Same kernel path PT exercises for `gpt-oss-120b` on B200:
+#   * W4A16 (`act_dtype="bf16"`):  `bf16_mxe2m1_block_scale_moe_runner` —
+#     PT mirror in fused_moe_trtllm_gen.py:652-712 (W4A16MXFP4TRTLLMGenFusedMoEMethod).
+#   * W4A8  (`act_dtype="mxfp8"`): `mxfp8_quantize` + `mxe4m3_mxe2m1_block_scale_moe_runner` —
+#     PT mirror in fused_moe_trtllm_gen.py:511 (W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod).
+#     The MXFP8 cubin family (median 9.1 µs/call vs 27 µs for bf16) unlocks bigger
+#     TileN candidates (up to 256 vs 64).
+#
+# Both paths use the SAME prepared weight layout (pad/shard/shuffle done by
+# `prepare_trtllm_gen_moe_mxfp4_weights` in `prepare_trtllm_gen_moe_mxfp4_weights.py`);
+# only the activation handling differs. At forward time we only pad activations
+# to the kernel's expected hidden dim (and, for W4A8, also call `mxfp8_quantize`).
+#
+# Kernel-enforced weight layout:
+#   * Weights:  uint8 packed (2 elements / byte), pre-padded + pre-shuffled
+#   * Scales:   uint8 UE8M0 (block size 32)
+#   * Bias:     float32 (kernel API)
+#   * input_hidden_alignment = 512 (TMA constraint, runner.cu:472)
+#   * weight_alignment        = 128 (TMA 16U4 alignment)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_quant_mxfp4_trtllm_gen_moe_fused", mutates_args=())
+def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
+    x: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    fc1_weights_mxfp4: torch.Tensor,
+    fc2_weights_mxfp4: torch.Tensor,
+    fc1_weights_scale_ue8m0: torch.Tensor,
+    fc2_weights_scale_ue8m0: torch.Tensor,
+    fc1_bias_f32: torch.Tensor,
+    fc2_bias_f32: torch.Tensor,
+    swiglu_alpha: torch.Tensor,
+    swiglu_beta: torch.Tensor,
+    swiglu_limit: torch.Tensor,
+    valid_hidden_size: int,
+    valid_intermediate_size: int,
+    act_dtype: str,
+    local_expert_offset: int = 0,
+    local_num_experts: int = -1,
+    routing_method_type: int = int(RoutingMethodType.Renormalize),
+) -> torch.Tensor:
+    """TensorRT-LLM Gen MoE for MXFP4 weights with BF16 or MXFP8 activations.
+
+    ``act_dtype`` selects the activation precision (see module header above for the runner
+    selection + cubin family details):
+      * ``"bf16"`` (W4A16) — bf16 hidden states fed directly to the bf16 MoE runner.
+      * ``"mxfp8"`` (W4A8) — bf16 hidden states pre-quantized to MXFP8 (E4M3 + UE8M0
+        block scales via ``trtllm.mxfp8_quantize`` with alignment=512), then fed to
+        the MXFP8 MoE runner.
+
+    The op takes the **raw router weight + bias** and computes top-k routing inside the
+    C++ runner via ``softmax(topk(F.linear(x, w, b)))`` (fused topk+softmax+cast).
+
+    Args:
+        x: BF16 hidden states, shape ``(B, S, H)`` or ``(B*S, H)``. ``H`` may be smaller
+            than the kernel's expected (padded) hidden — the op zero-pads on entry and
+            slices the output back to ``valid_hidden_size``.
+        router_weight: ``[E_total, H]`` BF16 router projection.
+        router_bias: ``[E_total]`` BF16 router bias.
+        top_k: number of experts activated per token (4 for gpt-oss-120b).
+        fc1_weights_mxfp4: ``[E_local, 2*I_pad, H_pad/2]`` ``uint8`` (MXFP4 packed,
+            already pad+shard+shuffled; col-parallel along ``2*I``).
+        fc2_weights_mxfp4: ``[E_local, H_pad, I_pad/2]`` ``uint8`` (row-parallel along ``I``).
+        fc1_weights_scale_ue8m0: ``[E_local, 2*I_pad, H_pad/32]`` ``uint8`` UE8M0.
+        fc2_weights_scale_ue8m0: ``[E_local, H_pad, I_pad/32]`` ``uint8`` UE8M0.
+        fc1_bias_f32: ``[E_local, 2*I_pad]`` ``float32``.
+        fc2_bias_f32: ``[E_local, H_pad]`` ``float32`` (already divided by ``tp_size``).
+        swiglu_alpha / swiglu_beta / swiglu_limit: per-expert SwiGLU parameters,
+            ``[E_local]`` ``float32``. For gpt-oss: alpha=1.702, beta=1.0, limit=7.0.
+        valid_hidden_size: original (pre-pad) hidden size; output is sliced to this.
+        valid_intermediate_size: original per-rank intermediate size (kernel hint to skip
+            OOB MMA in padded regions).
+        act_dtype: ``"bf16"`` or ``"mxfp8"`` — selects W4A16 vs W4A8 cubin family.
+        local_expert_offset: ``slot_start`` for EP>1; ``0`` for EP=1.
+        local_num_experts: ``num_experts`` for EP=1, ``num_experts/ep_size`` for EP>1.
+            Pass ``-1`` to default to ``E_local`` inferred from ``fc1_weights_mxfp4``.
+        routing_method_type: integer from ``RoutingMethodType`` enum. Default
+            ``Renormalize`` (1) matches gpt-oss's ``RenormalizeMoeRoutingMethod``.
+
+    Returns:
+        BF16 hidden states of shape ``(*x.shape[:-1], valid_hidden_size)``.
+    """
+    x_shape = x.shape
+    x2d = x.view(-1, x_shape[-1])
+
+    # Routing: compute router logits and hand them to the C++ runner which performs
+    # fused topk + softmax + cast internally. routing_bias is None — the linear-layer
+    # bias is fused into router_logits here.
+    # For the small-M (decode) router GEMM, TRT-LLM tinygemm2 is a single-kernel tall-skinny GEMM that avoids cuBLAS's
+    # split-K + splitKreduce round-trip (matches PT's compute_gate_output). Router-only (small N=num_experts);
+    # attention/lm_head keep their cublas_mm path. See _router_use_tinygemm for the support guard.
+    if _router_use_tinygemm(x2d, router_weight, router_bias):
+        router_logits = torch.ops.trtllm.tinygemm2(x2d, router_weight, router_bias)
+    else:
+        router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
+
+    # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
+    # Hidden must be padded to the kernel's 512-aligned expected width. The mxfp8 path's
+    # mxfp8_quantize(alignment=512) already pads internally (2880->3072), so only the
+    # bf16 path needs an explicit F.pad (applied in that branch) — skipping the redundant
+    # per-token pad kernel on the mxfp8 decode path.
+    expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
+
+    num_experts_total = int(router_weight.shape[0])
+    if local_num_experts < 0:
+        local_num_experts = int(fc1_weights_mxfp4.shape[0])
+    intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
+
+    if act_dtype == "mxfp8":
+        # Pre-quantize bf16 activation to MXFP8 (E4M3 elem + UE8M0 per-32-elem scale).
+        # Match PT's ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.input_hidden_alignment = 512``.
+        # Keep ``x_scale`` 1D — the C++ runner asserts ``hidden_states_scale must be 1D``.
+        x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
+            x2d,
+            False,  # is_sf_swizzled_layout
+            alignment=512,
+        )
+        result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            router_logits,
+            None,  # routing_bias
+            x_mxfp8,  # hidden_states (E4M3-packed uint8)
+            x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
+            fc1_weights_mxfp4,
+            fc1_weights_scale_ue8m0,
+            fc1_bias_f32,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            fc2_weights_mxfp4,
+            fc2_weights_scale_ue8m0,
+            fc2_bias_f32,
+            num_experts_total,
+            int(top_k),
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size_padded,
+            valid_hidden_size,
+            valid_intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            None,  # routed_scaling_factor
+            routing_method_type,
+            0,  # act_type = SwiGlu
+            topk_weights=None,
+            topk_ids=None,
+        )
+    elif act_dtype == "bf16":
+        # bf16 runner takes the activation directly, so pad hidden to 512-aligned here.
+        pad_size = expected_hidden - int(x2d.shape[-1])
+        if pad_size > 0:
+            x2d = torch.nn.functional.pad(x2d, (0, pad_size))
+        result = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+            router_logits,
+            None,  # routing_bias
+            x2d,  # hidden_states (bf16)
+            fc1_weights_mxfp4,
+            fc1_weights_scale_ue8m0,
+            fc1_bias_f32,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            fc2_weights_mxfp4,
+            fc2_weights_scale_ue8m0,
+            fc2_bias_f32,
+            num_experts_total,
+            int(top_k),
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size_padded,
+            valid_hidden_size,
+            valid_intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            None,  # routed_scaling_factor
+            routing_method_type,
+            0,  # act_type = SwiGlu
+            # topk_weights/topk_ids omitted — kernel routes from router_logits.
+        )
+    else:
+        raise ValueError(
+            f"trtllm_quant_mxfp4_trtllm_gen_moe_fused: act_dtype must be 'bf16' or 'mxfp8', "
+            f"got {act_dtype!r}."
+        )
+
+    if result.shape[-1] > valid_hidden_size:
+        result = result[..., :valid_hidden_size].contiguous()
+    return result.view(*x_shape[:-1], valid_hidden_size)
+
+
+@trtllm_quant_mxfp4_trtllm_gen_moe_fused.register_fake
+def trtllm_quant_mxfp4_trtllm_gen_moe_fused_fake(
+    x: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    fc1_weights_mxfp4: torch.Tensor,
+    fc2_weights_mxfp4: torch.Tensor,
+    fc1_weights_scale_ue8m0: torch.Tensor,
+    fc2_weights_scale_ue8m0: torch.Tensor,
+    fc1_bias_f32: torch.Tensor,
+    fc2_bias_f32: torch.Tensor,
+    swiglu_alpha: torch.Tensor,
+    swiglu_beta: torch.Tensor,
+    swiglu_limit: torch.Tensor,
+    valid_hidden_size: int,
+    valid_intermediate_size: int,
+    act_dtype: str,
+    local_expert_offset: int = 0,
+    local_num_experts: int = -1,
+    routing_method_type: int = int(RoutingMethodType.Renormalize),
+) -> torch.Tensor:
+    out_shape = list(x.shape)
+    out_shape[-1] = valid_hidden_size
+    return x.new_empty(out_shape, dtype=x.dtype)

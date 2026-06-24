@@ -212,3 +212,28 @@ class TestStatsSerializer:
         result = BaseWorker._stats_serializer((iter_stats, None, None, None))
         d = json.loads(result)
         assert d["attentionDpRank"] == 0
+
+    def test_serializer_8_tuple_emits_new_timing_and_scheduler_mode(self):
+        """8-tuple shape with batch-matched gpuForwardTimeMS.
+
+        ``PyExecutor._append_iter_stats`` now emits an 8-tuple carrying the
+        per-loop CPU wall (slot 4), the ping-pong GPU forward time (slot 5),
+        the per-record schedulerMode tag (slot 6), and the batch-matched GPU
+        forward time (slot 7). The serializer must surface each under its
+        expected JSON key so /metrics consumers do not need iterLatencyMS for
+        FPM wall_time.
+
+        ``prevDeviceStepTimeMS`` is set to None to also guard the first-iter
+        case where the ping-pong event pair has no prior measurement: the
+        key must be omitted (not serialized as null or 0.0) so consumers can
+        distinguish "unavailable" from a real zero.
+        """
+        iter_stats = _make_mock_iteration_stats()
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, 12.5, None, "overlap", 4.25)
+        )
+        d = json.loads(result)
+        assert d["hostStepTimeMS"] == 12.5
+        assert "prevDeviceStepTimeMS" not in d
+        assert d["schedulerMode"] == "overlap"
+        assert d["gpuForwardTimeMS"] == 4.25

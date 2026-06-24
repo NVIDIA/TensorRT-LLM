@@ -104,21 +104,23 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         ht = ht + i_h * K * V
 
     # load initial state
+    # Pool layout [slots, HV, V, K], K innermost: logical block (K, V) but K has
+    # stride 1, V has stride K, order=(0, 1) so Triton treats K as innermost.
     if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV),
-                                   (1, 0))
+        p_h0_1 = tl.make_block_ptr(h0, (K, V), (1, K), (0, i_v * BV), (64, BV),
+                                   (0, 1))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
-            p_h0_2 = tl.make_block_ptr(h0, (K, V), (V, 1), (64, i_v * BV),
-                                       (64, BV), (1, 0))
+            p_h0_2 = tl.make_block_ptr(h0, (K, V), (1, K), (64, i_v * BV),
+                                       (64, BV), (0, 1))
             b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
         if K > 128:
-            p_h0_3 = tl.make_block_ptr(h0, (K, V), (V, 1), (128, i_v * BV),
-                                       (64, BV), (1, 0))
+            p_h0_3 = tl.make_block_ptr(h0, (K, V), (1, K), (128, i_v * BV),
+                                       (64, BV), (0, 1))
             b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
         if K > 192:
-            p_h0_4 = tl.make_block_ptr(h0, (K, V), (V, 1), (192, i_v * BV),
-                                       (64, BV), (1, 0))
+            p_h0_4 = tl.make_block_ptr(h0, (K, V), (1, K), (192, i_v * BV),
+                                       (64, BV), (0, 1))
             b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
     # main recurrence
@@ -215,26 +217,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(b_k, b_v_new)
 
-    # epilogue
+    # epilogue — write final state back to pool-layout [slots, HV, V, K].
     if STORE_FINAL_STATE or USE_INDEXED_STATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV),
-                                 (1, 0))
+        p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (0, i_v * BV), (64, BV),
+                                 (0, 1))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (64, i_v * BV),
-                                     (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (64, i_v * BV),
+                                     (64, BV), (0, 1))
             tl.store(p_ht,
                      b_h2.to(p_ht.dtype.element_ty),
                      boundary_check=(0, 1))
         if K > 128:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (128, i_v * BV),
-                                     (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (128, i_v * BV),
+                                     (64, BV), (0, 1))
             tl.store(p_ht,
                      b_h3.to(p_ht.dtype.element_ty),
                      boundary_check=(0, 1))
         if K > 192:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (192, i_v * BV),
-                                     (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (192, i_v * BV),
+                                     (64, BV), (0, 1))
             tl.store(p_ht,
                      b_h4.to(p_ht.dtype.element_ty),
                      boundary_check=(0, 1))
@@ -277,7 +279,9 @@ def chunk_gated_delta_rule_fwd_h(
             "Indexed chunk state updates require inplace_indexed_state_update=True."
         )
     store_final_state_in_kernel = output_final_state and not use_indexed_state
-    final_state = (k.new_empty(N, H, K, V, dtype=torch.float32)
+    # Kernel writes final state in [V, K] layout (K innermost) to match the
+    # pool layout. Allocate accordingly so the tensor's shape reflects memory.
+    final_state = (k.new_empty(N, H, V, K, dtype=torch.float32)
                    if store_final_state_in_kernel else None)
 
     v_new = torch.empty_like(u) if save_new_value else None

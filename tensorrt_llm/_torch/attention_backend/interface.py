@@ -10,23 +10,23 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
-
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
-from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RopeEmbeddingUtils, RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
+from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
+from .sparse.params import SparseMetadataParams
 
 try:
     # Transformers v5
@@ -71,6 +71,8 @@ class AttentionMetadata:
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
     draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     mapping: Optional[Mapping] = None
+    # Sparse settings for metadata allocation/update; dense metadata leaves it None.
+    sparse_metadata_params: Optional[SparseMetadataParams] = None
 
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False
@@ -135,6 +137,12 @@ class AttentionMetadata:
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
 
+    # Explicit query/KV sequence boundaries for attention kernels that operate
+    # on packed varlen context inputs. These are sequence/segment boundaries,
+    # not necessarily request boundaries.
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
+
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
     # are enabled.
@@ -163,9 +171,15 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    sparse_attention_config: Optional["SparseAttentionConfig"] = None
     # The number of heads per kv head.
     num_heads_per_kv: Optional[int] = 1
+
+    multi_item_part_lens: Optional[list[list[int]]] = None
+    """Additional token layout information for multi-item scoring.
+
+    Aggregates `TokensPrompt.multi_item_part_lens` for all requests in the batch,
+    see `TokensPrompt` for details.
+    """
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -256,7 +270,12 @@ class AttentionMetadata:
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
             self._seq_lens_kv = maybe_pin_memory(self._seq_lens_kv)
-            self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
+            if self.is_cuda_graph and self._seq_lens_kv_cuda is not None:
+                self._seq_lens_kv_cuda.copy_(self._seq_lens_kv,
+                                             non_blocking=True)
+            else:
+                self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(
+                    non_blocking=True)
 
     @property
     def seq_lens_kv_cuda(self):
@@ -321,12 +340,16 @@ class AttentionMetadata:
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
                                    max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   buffers=None,
+                                   encode_only: bool = False) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        When encode_only is True, initialize seq_lens as ones(max_batch_size)
+        and leave num_contexts at the caller's discretion.
         """
         if self.is_cuda_graph:
             return self
@@ -336,13 +359,20 @@ class AttentionMetadata:
         cuda_graph_metadata.cuda_graph_buffers = buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True)
+                max_batch_size, True, max_draft_tokens, buffers, encode_only)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
             cuda_graph_metadata._seq_lens_cuda = None
-            cuda_graph_metadata.seq_lens = torch.ones(
-                (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
+            if encode_only:
+                # Encoder: variable seq_lens per batch; the runner in-place
+                # updates them via the seq_lens setter each replay.
+                cuda_graph_metadata.seq_lens = torch.ones((max_batch_size, ),
+                                                          dtype=torch.int)
+            else:
+                cuda_graph_metadata.seq_lens = torch.ones(
+                    (max_batch_size, ),
+                    dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
@@ -357,7 +387,11 @@ class AttentionMetadata:
                     device='cuda',
                 )
 
-        cuda_graph_metadata.num_contexts = 0
+        if not encode_only:
+            # Decoder CUDA graphs are always generation-only (no context
+            # requests). Encoder CUDA graphs are the opposite (all context);
+            # the caller sets num_contexts = padded_batch_size.
+            cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -403,6 +437,78 @@ class AttentionMetadata:
         """
         Hook to be called when using helix parallelism.
         """
+
+    def create_cross_metadata(
+        self,
+        encoder_seq_lens: torch.Tensor,
+        cross_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2,
+                                      None] = None,
+        *,
+        encoder_num_cached_tokens_per_seq: Optional[List[int]] = None,
+    ) -> "AttentionMetadata":
+        """Build a sub-metadata instance for cross-attention.
+
+        The returned metadata shares Q-side fields (``seq_lens``,
+        ``request_ids``, ``num_contexts``) with ``self`` (the decoder
+        self-attention metadata) and overrides the K/V-side with the encoder
+        lengths so that ``returned.is_cross is True``.
+
+        This is intended to be called by the runtime / unit tests once the
+        encoder lengths and cross-pool KV cache manager are known. The
+        returned object is a *new* metadata instance (not stored on
+        ``self.cross``); callers can attach it to ``self.cross`` if desired.
+
+        Args:
+            encoder_seq_lens: Per-request encoder sequence length (CPU
+                int32 tensor). On the first decoder context step this is
+                the full encoder length; on generation steps it should be
+                ``0`` (no new K/V tokens to add to the cross pool — the
+                encoder K/V are already cached).
+            cross_kv_cache_manager: KV cache manager for the cross pool.
+                When ``None``, the returned metadata uses the stateless
+                (no-KV-cache) path (suitable for unit tests).
+            encoder_num_cached_tokens_per_seq: Per-request count of encoder
+                K/V tokens already present in the cross pool. ``None``
+                defaults to 0 (context phase, nothing cached yet).
+
+        Returns:
+            A new ``AttentionMetadata`` of the same subclass as ``self``,
+            with ``seq_lens_kv`` set to ``encoder_seq_lens`` so that
+            ``is_cross`` becomes ``True``.
+        """
+        cross_md = copy.copy(self)
+        cross_md._saved_tensors = {}
+        if self.is_cuda_graph:
+            # Cross-attention has K/V lengths from the encoder, while
+            # self-attention has K/V lengths from the decoder. Keep their
+            # CUDA graph metadata buffers separate so preparing cross metadata
+            # cannot overwrite self-attention sequence lengths.
+            cross_md.cuda_graph_buffers = Buffers()
+        cross_md.kv_cache_manager = cross_kv_cache_manager
+        cross_md._seq_lens_kv = None
+        cross_md._seq_lens_kv_cuda = None
+        cross_md.cross = None
+        cross_md.seq_lens_kv = encoder_seq_lens
+        if encoder_num_cached_tokens_per_seq is not None:
+            from ..metadata import KVCacheParams
+            base_params = self.kv_cache_params
+            cross_md.kv_cache_params = KVCacheParams(
+                use_cache=base_params.use_cache if base_params is not None else
+                (cross_kv_cache_manager is not None),
+                num_cached_tokens_per_seq=list(
+                    encoder_num_cached_tokens_per_seq),
+                block_ids_per_seq=base_params.block_ids_per_seq
+                if base_params is not None else None,
+                host_max_attention_window_sizes=base_params.
+                host_max_attention_window_sizes
+                if base_params is not None else None,
+                host_sink_token_length=base_params.host_sink_token_length
+                if base_params is not None else None,
+                num_extra_kv_tokens=base_params.num_extra_kv_tokens
+                if base_params is not None else 0,
+            )
+        cross_md.__post_init__()
+        return cross_md
 
     def update_for_spec_dec(self) -> None:
         """
@@ -695,6 +801,27 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
+class SparsePrediction:
+    """Sparse KV / attention indices predicted by the framework backends.
+
+    RocketKV and DSA produce these from ``sparse_kv_predict`` /
+    ``sparse_attn_predict``, telling the attention op which KV tokens to keep
+    and which blocks to attend to. Backends that don't predict leave
+    ``AttentionForwardArgs.sparse_prediction`` at its default-constructed value
+    (all-``None`` / ``0`` fields).
+    """
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+    # DeepSeek-V4 sparse-MLA only: per-token compressed top-k lengths and the
+    # base pointer of the compressed KV cache pool (compress_ratio > 1).
+    sparse_mla_topk_lens: Optional[torch.Tensor] = None
+    compressed_kv_cache_pool_ptr: Optional[int] = None
+
+
+@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -703,14 +830,17 @@ class AttentionForwardArgs:
 
     out_scale: Optional[torch.Tensor] = None
     out_scale_sf: Optional[torch.Tensor] = None
-    kv_scales_sf: Optional[torch.Tensor] = None
-    kv_scales_sf_inv: Optional[torch.Tensor] = None
+    kv_scale_orig_quant: Optional[torch.Tensor] = None
+    kv_scale_quant_orig: Optional[torch.Tensor] = None
 
     attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
     attention_input_type: AttentionInputType = AttentionInputType.mixed
     attention_window_size: Optional[int] = None
     attention_mask_data: Optional[torch.Tensor] = None
     attention_sinks: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    relative_attention_max_distance: int = 0
+    cross_kv: Optional[torch.Tensor] = None
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
@@ -734,6 +864,25 @@ class AttentionForwardArgs:
     sage_attn_qk_int8: bool = False
 
     topk_indices: Optional[torch.Tensor] = None
+
+    is_fused_qkv: bool = False
+    update_kv_cache: bool = True
+    # Optional normalized diffusion timestep for timestep-varying sparse attention.
+    timestep: Optional[torch.Tensor] = None
+
+    sparse_prediction: SparsePrediction = field(
+        default_factory=SparsePrediction)
+
+    @property
+    def mask_type(self) -> int:
+        """Integer mask type accepted by the C++ attention op
+        (``causal`` or ``padding``)."""
+        if self.attention_mask == PredefinedAttentionMask.CAUSAL:
+            return int(AttentionMaskType.causal)
+        if self.attention_mask == PredefinedAttentionMask.FULL:
+            return int(AttentionMaskType.padding)
+        raise ValueError(
+            f"Unexpected attention mask type: {self.attention_mask!r}")
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
@@ -774,7 +923,6 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
-        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
         """
@@ -785,14 +933,12 @@ class AttentionBackend(Generic[TMetadata]):
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
-            sparse_attention_config (SparseAttentionConfig): Optional sparse attention configuration. If None, no sparse attention is applied.
         """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
-        self.sparse_attention_config = sparse_attention_config
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         """
@@ -836,6 +982,10 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_multi_item_scoring(cls) -> bool:
         return False
 
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:

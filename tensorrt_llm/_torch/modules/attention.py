@@ -10,7 +10,6 @@ from torch import nn
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
                                  nvtx_range_debug)
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -102,6 +101,8 @@ def attn_custom_op_inplace(
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
+    relative_attention_bias: Optional[torch.Tensor],
+    relative_attention_max_distance: int,
     layer_idx: str,
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
@@ -112,18 +113,22 @@ def attn_custom_op_inplace(
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
         attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(q,
-                          k,
-                          v,
-                          metadata,
-                          mask,
-                          mrope_rotary_cos_sin,
-                          mrope_position_deltas,
-                          attention_window_size,
-                          attention_mask_data,
-                          output=output,
-                          output_sf=output_sf,
-                          attention_sinks=attention_sinks)
+    attn_layer._attn_impl(
+        q,
+        k,
+        v,
+        metadata,
+        mask,
+        mrope_rotary_cos_sin,
+        mrope_position_deltas,
+        attention_window_size,
+        attention_mask_data,
+        output=output,
+        output_sf=output_sf,
+        attention_sinks=attention_sinks,
+        relative_attention_bias=relative_attention_bias,
+        relative_attention_max_distance=relative_attention_max_distance,
+    )
 
 
 def _helix_post_process(
@@ -529,25 +534,13 @@ class Attention(nn.Module):
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
 
-        # Resolve target_sparsity → threshold_scale_factor if needed
         sparse_attn_cfg = config.sparse_attention_config
-        if (isinstance(sparse_attn_cfg, SkipSoftmaxAttentionConfig)
-                and sparse_attn_cfg.target_sparsity is not None):
-            hf_sparse = getattr(config.pretrained_config,
-                                'sparse_attention_config', None)
-            if not isinstance(hf_sparse, dict):
-                raise ValueError(
-                    "sparse_attention_config with target_sparsity requires formula "
-                    "coefficients in the model's config.json "
-                    "(sparse_attention_config.threshold_scale_factor.{prefill,decode}.{a,b}), "
-                    "but sparse_attention_config was not found or was not dict type in config.json."
-                )
-            formula = hf_sparse.get('threshold_scale_factor', {})
-            sparse_attn_cfg = sparse_attn_cfg.resolve_for_target_sparsity(
-                formula)
+        sparse_params = (sparse_attn_cfg.to_sparse_params(
+            pretrained_config=config.pretrained_config,
+            layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 
-        attn_cls = get_attention_backend(self.attn_backend,
-                                         sparse_attn_config=sparse_attn_cfg)
+        attn_cls = get_attention_backend(
+            self.attn_backend, sparse_attention_config=sparse_attn_cfg)
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -608,12 +601,16 @@ class Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params if self.rope_fusion else None,
+            pos_embd_params=(self.pos_embd_params if self.rope_fusion or
+                             (self.pos_embd_params is not None
+                              and not self.pos_embd_params.type.is_rope()) else
+                             None),
             quant_config=self.quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
-            sparse_attention_config=sparse_attn_cfg,
+            attn_cls=attn_cls,
+            sparse_params=sparse_params,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -698,6 +695,8 @@ class Attention(nn.Module):
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
     ):
         num_tokens = attn_metadata.num_tokens
@@ -712,7 +711,7 @@ class Attention(nn.Module):
         # then exchange and combine across CP ranks.
         # NOTE: The helix post-process combine step works on unquantized
         # (BF16/FP16) partial outputs and softmax stats from each rank.
-        # We intentionally skip passing out_scale/out_scale_sf to FMHA here
+        # We intentionally skip passing out_scale to FMHA here
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
@@ -735,27 +734,36 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
+                    relative_attention_bias=relative_attention_bias,
+                    relative_attention_max_distance=
+                    relative_attention_max_distance,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
             attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
+        # Don't set out_scale if o_proj has pre_quant_scale — this prevents
+        # FP8/FP4 output and keeps attention output in BF16 for better
+        # precision when applying pre_quant_scale. Also don't set out_scale
+        # if LoRA is active — LoRA grouped_gemm doesn't support FP8.
+        # Pass both scales; the backend selects ``out_scale_sf`` when the
+        # kernel writes NVFP4 output (``forward_args.output_sf`` is
+        # allocated downstream by ``create_output``) and ``out_scale``
+        # otherwise. Deciding here would be premature — ``output_sf`` is
+        # not populated yet at this call site.
         out_scale = None
         out_scale_sf = None
-        # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
-        # and keeps attention output in BF16 for better precision when applying pre_quant_scale
-        # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
         if self._use_quantize_output() and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
-        kv_scales_sf = None
-        kv_scales_sf_inv = None
+        kv_scale_orig_quant = None
+        kv_scale_quant_orig = None
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
         ):
-            kv_scales_sf = self.qkv_proj.kv_scales
-            kv_scales_sf_inv = self.qkv_proj.inv_kv_scales
+            kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
+            kv_scale_quant_orig = self.qkv_proj.kv_scales
 
         attn_output = self.attn.forward(
             q,
@@ -765,8 +773,8 @@ class Attention(nn.Module):
             forward_args=AttentionForwardArgs(
                 out_scale=out_scale,
                 out_scale_sf=out_scale_sf,
-                kv_scales_sf=kv_scales_sf,
-                kv_scales_sf_inv=kv_scales_sf_inv,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
                 attention_mask=attention_mask,
                 mrope_rotary_cos_sin=mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_position_deltas,
@@ -775,6 +783,8 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -794,6 +804,8 @@ class Attention(nn.Module):
         attention_mask_data: Optional[torch.Tensor],
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         has_lora: bool = False,
     ):
         mrope_rotary_cos_sin = None
@@ -826,22 +838,28 @@ class Attention(nn.Module):
                 attention_window_size,
                 attention_mask_data,
                 attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
                 self.layer_idx_str,
                 output,
                 output_sf,
             )
         else:
-            output, output_sf = self._attn_impl(q,
-                                                k,
-                                                v,
-                                                attn_metadata,
-                                                attention_mask,
-                                                mrope_rotary_cos_sin,
-                                                mrope_position_deltas,
-                                                attention_window_size,
-                                                attention_mask_data,
-                                                attention_sinks=attention_sinks,
-                                                has_lora=has_lora)
+            output, output_sf = self._attn_impl(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                attention_window_size,
+                attention_mask_data,
+                attention_sinks=attention_sinks,
+                relative_attention_bias=relative_attention_bias,
+                relative_attention_max_distance=relative_attention_max_distance,
+                has_lora=has_lora,
+            )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
 
@@ -859,6 +877,8 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        relative_attention_bias: Optional[torch.Tensor] = None,
+        relative_attention_max_distance: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -925,17 +945,23 @@ class Attention(nn.Module):
             assert self.attn_backend == "TRTLLM", (
                 f"Attention sinks are only supported with attn_backend='TRTLLM'. "
                 f"Current backend: {self.attn_backend}.")
+        if relative_attention_bias is not None:
+            assert self.attn_backend == "TRTLLM", "Relative attention bias is only supported for TRTLLM backend."
 
-        attn_output = self.forward_impl(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        attention_mask,
-                                        attention_window_size,
-                                        attention_mask_data,
-                                        mrope_config=mrope_config,
-                                        attention_sinks=attention_sinks,
-                                        has_lora=bool(lora_params))
+        attn_output = self.forward_impl(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_mask,
+            attention_window_size,
+            attention_mask_data,
+            mrope_config=mrope_config,
+            attention_sinks=attention_sinks,
+            relative_attention_bias=relative_attention_bias,
+            relative_attention_max_distance=relative_attention_max_distance,
+            has_lora=bool(lora_params),
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -1245,14 +1271,19 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
+        config = config or ModelConfig()
+        sparse_attn_cfg = config.sparse_attention_config
+        sparse_params = (sparse_attn_cfg.to_sparse_params(
+            pretrained_config=config.pretrained_config,
+            layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
+
         # Currently only DSA sparse attention is supported.
-        if config is not None and config.sparse_attention_config is not None and config.sparse_attention_config.algorithm == "dsa":
+        if getattr(sparse_params, "algorithm", None) == "dsa":
             self.is_dsa = True
         else:
             self.is_dsa = False
 
         # tensor parallel
-        config = config or ModelConfig()
         if mapping_with_cp is not None:
             logger.warning_once(
                 "[MLA::__init__] Overriding mapping with CP detected.",
@@ -1419,6 +1450,9 @@ class MLA(nn.Module):
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
 
+        mqa_cls = get_attention_backend(
+            config.attn_backend,
+            sparse_attention_config=config.sparse_attention_config)
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -1437,7 +1471,8 @@ class MLA(nn.Module):
             hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            sparse_attention_config=config.sparse_attention_config,
+            attn_cls=mqa_cls,
+            sparse_params=sparse_params,
             dtype=dtype,
             aux_stream=aux_stream,
         )
@@ -1476,6 +1511,10 @@ class MLA(nn.Module):
         _short_seq_mha = (self.is_dsa and self.short_seq_mha_threshold > 0
                           and not self.apply_rotary_emb)
         if not self.is_dsa or _short_seq_mha:
+            mha_sparse_config = (None if _short_seq_mha else
+                                 config.sparse_attention_config)
+            mha_cls = get_attention_backend(
+                config.attn_backend, sparse_attention_config=mha_sparse_config)
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1493,8 +1532,8 @@ class MLA(nn.Module):
                 v_head_dim=self.v_head_dim,
                 predicted_tokens_per_seq=self.predicted_tokens_per_seq,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                sparse_attention_config=(None if _short_seq_mha else
-                                         config.sparse_attention_config),
+                attn_cls=mha_cls,
+                sparse_params=(None if _short_seq_mha else sparse_params),
             )
         else:
             self.mha = None
@@ -1652,12 +1691,14 @@ class MLA(nn.Module):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def forward_impl(self,
-                     position_ids: Optional[torch.Tensor],
-                     hidden_states: torch.Tensor,
-                     attn_metadata: AttentionMetadata,
-                     output: torch.Tensor,
-                     latent_cache_gen: Optional[torch.Tensor] = None) -> None:
+    def forward_impl(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+    ) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
 
@@ -2353,9 +2394,11 @@ class MLA(nn.Module):
 
     @staticmethod
     @functools.cache
-    def cached_warmup_forward_context_with_chunked_prefill(
-            num_heads_tp, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank,
-            v_head_dim, dtype, device):
+    def cached_warmup_forward_context_with_cached_kv(num_heads_tp,
+                                                     qk_nope_head_dim,
+                                                     qk_rope_head_dim,
+                                                     kv_lora_rank, v_head_dim,
+                                                     dtype, device):
         """Warmup torch.compile for cat operations with different tensor layouts.
 
         Tensors are marked with torch._dynamo.maybe_mark_dynamic(..., 0) on the
@@ -2424,9 +2467,13 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.is_chunked_prefill_mla_context_for_warmup(
+            # Warm up maybe_compiled_cat for both the chunked-prefill path and
+            # the cached-kv path; without this, the cached-kv prefill
+            # (block-reuse without chunked_prefill) recompiles per shape and
+            # may stall inside inductor's compile worker.
+            if trtllm_attention.has_cached_kv_for_mla_context_warmup(
                     attn_metadata):
-                self.cached_warmup_forward_context_with_chunked_prefill(
+                self.cached_warmup_forward_context_with_cached_kv(
                     self.num_heads_tp, self.qk_nope_head_dim,
                     self.qk_rope_head_dim, self.kv_lora_rank, self.v_head_dim,
                     q.dtype, q.device)

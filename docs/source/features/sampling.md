@@ -36,10 +36,7 @@ llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
           sampler_type="TRTLLMSampler")
 ```
 
-By default, the sampling backend is chosen to be `auto`. This will use:
-
-* TRTLLM Sampler when using Beam Search.
-* Torch Sampler otherwise.
+By default, the sampling backend is chosen to be `auto`. This will use Torch Sampler for all requests.
 
 Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 

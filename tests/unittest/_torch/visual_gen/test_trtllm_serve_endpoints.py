@@ -27,12 +27,37 @@ from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
+from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_llm_envelope(
+    body: dict,
+    *,
+    code: int,
+    err_type: str = "BadRequestError",
+    message_contains: Optional[str] = None,
+) -> None:
+    """Assert *body* is the visual-gen LLM-style error envelope.
+
+    The envelope's wire shape is ``{"object": "error", "message": str,
+    "type": str, "code": int}`` with optional ``"param": str | None``.
+    ``object`` and ``param`` are returned by Pydantic's
+    ``ErrorResponse.model_dump`` and are stable across all visual-gen
+    error paths.
+    """
+    assert set(body.keys()) == {"object", "message", "type", "param", "code"}, body
+    assert body["object"] == "error"
+    assert body["type"] == err_type
+    assert body["code"] == code
+    assert isinstance(body["message"], str) and body["message"]
+    if message_contains is not None:
+        assert message_contains in body["message"], body["message"]
 
 
 def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
@@ -68,6 +93,21 @@ def _run_async(coro):
         loop.close()
 
 
+def _make_dummy_metrics() -> VisualGenMetrics:
+    return VisualGenMetrics(
+        generation=1.25,
+        pre_denoise=0.125,
+        denoise=0.75,
+        post_denoise=0.375,
+    )
+
+
+def _assert_visual_gen_server_timing(headers) -> None:
+    server_timing = headers[SERVER_TIMING_HEADER]
+    assert "generation;dur=1250.000000" in server_timing
+    assert "denoise;dur=750.000000" in server_timing
+
+
 # ---------------------------------------------------------------------------
 # Mock VisualGen
 # ---------------------------------------------------------------------------
@@ -89,18 +129,46 @@ class MockVisualGen:
         audio_output: Optional[torch.Tensor] = None,
         should_fail: bool = False,
         batch_aware: bool = True,
+        validation_error: Optional[ValueError] = None,
     ):
+        from types import SimpleNamespace
+
         self._image = image_output
         self._video = video_output
         self._audio = audio_output
         self._should_fail = should_fail
         self._batch_aware = batch_aware
+        self._validation_error = validation_error
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
+        # Stand-in for the coordinator-side executor proxy. The async video
+        # route reads ``default_generation_params`` / ``extra_param_specs``
+        # directly off this attribute when running synchronous pre-flight
+        # validation. ``default_generation_params`` declares the universal
+        # fields the mock pipeline accepts so the validator doesn't
+        # reject legitimate width/height/num_frames/... requests;
+        # ``extra_param_specs`` lists a single known key so tests can
+        # exercise both the accept-known and reject-unknown paths.
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        self.executor = SimpleNamespace(
+            default_generation_params={
+                "height": 64,
+                "width": 64,
+                "num_inference_steps": 20,
+                "guidance_scale": 5.0,
+                "max_sequence_length": 64,
+                "num_frames": 8,
+                "frame_rate": 8.0,
+            },
+            extra_param_specs={
+                "stg_scale": ExtraParamSchema(type="float", default=1.0),
+            },
+        )
 
     def _maybe_batch(self, tensor, n):
         """Replicate a single tensor along a new leading batch dimension."""
@@ -113,6 +181,8 @@ class MockVisualGen:
     def generate(self, inputs=None, params=None) -> VisualGenOutput:
         self.last_inputs = inputs
         self.last_params = params
+        if self._validation_error is not None:
+            raise self._validation_error
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
@@ -121,12 +191,14 @@ class MockVisualGen:
             image=self._maybe_batch(self._image, n),
             video=self._maybe_batch(self._video, n),
             audio=self._audio,
-            metrics=VisualGenMetrics(),
+            metrics=_make_dummy_metrics(),
         )
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
+        if self._validation_error is not None:
+            raise self._validation_error
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockVisualGenResult(
             request_id=self._next_request_id(),
@@ -148,6 +220,19 @@ class MockVisualGen:
         from tensorrt_llm.visual_gen import VisualGenParams
 
         return VisualGenParams()
+
+    @property
+    def extra_param_specs(self):
+        """Stand-in for VisualGen.extra_param_specs — empty by default so
+        every request ``extra_params`` key reaches the executor as
+        ``unknown_extra_param`` (matches a pipeline with no model-specific
+        knobs declared, like Flux or Wan 2.1)."""
+        return {}
+
+    @property
+    def model(self):
+        """Stand-in for VisualGen.model — used by warn-on-set logic."""
+        return "test-model"
 
     def _check_health(self) -> bool:
         return self._healthy
@@ -192,7 +277,7 @@ class MockVisualGenResult:
             image=self._image,
             video=self._video,
             audio=self._audio,
-            metrics=VisualGenMetrics(),
+            metrics=_make_dummy_metrics(),
         )
 
     def result(self, timeout=None):
@@ -203,7 +288,7 @@ class MockVisualGenResult:
             image=self._image,
             video=self._video,
             audio=self._audio,
-            metrics=VisualGenMetrics(),
+            metrics=_make_dummy_metrics(),
         )
 
 
@@ -318,6 +403,7 @@ def _mock_video_encoding():
 # =========================================================================
 
 
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
 class TestImageGeneration:
     def test_basic_image_generation_b64(self, image_client):
         resp = image_client.post(
@@ -329,6 +415,7 @@ class TestImageGeneration:
             },
         )
         assert resp.status_code == 200
+        _assert_visual_gen_server_timing(resp.headers)
         data = resp.json()
         assert "data" in data
         assert len(data["data"]) >= 1
@@ -365,7 +452,12 @@ class TestImageGeneration:
         assert params.guidance_scale == 7.5
         assert params.negative_prompt == "blurry"
 
-    def test_image_generation_url_format_not_supported(self, image_client):
+    def test_image_generation_url_returns_fetchable_urls(self, image_client):
+        """``response_format='url'`` writes each generated image to
+        media storage and surfaces a server-relative HTTP URL pointing
+        at ``GET /v1/images/{id}/content?i=N``. The URL fetches the
+        image bytes back through the API instead of leaking the
+        on-disk path."""
         resp = image_client.post(
             "/v1/images/generations",
             json={
@@ -373,7 +465,61 @@ class TestImageGeneration:
                 "response_format": "url",
             },
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["data"]) >= 1
+        url = body["data"][0]["url"]
+        # URL is an HTTP URL through the API content endpoint.
+        assert "/v1/images/" in url and "/content" in url
+        # Fetch via the same client to verify it works.
+        path = url.split("//", 1)[-1].split("/", 1)[1]
+        content = image_client.get("/" + path)
+        assert content.status_code == 200
+        # PNG bytes start with the standard magic header.
+        assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert content.headers["content-type"] == "image/png"
+
+    def test_image_generation_safetensors_b64(self, image_client):
+        """Tensor formats return base64-encoded raw bytes; loading the
+        payload yields the engine tensors back."""
+        from safetensors.torch import load as load_safetensors
+
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Tensor cat",
+                "response_format": "b64_json",
+                "format": "safetensors",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["data"]) == 1
+        b64 = body["data"][0]["b64_json"]
+        loaded = load_safetensors(base64.b64decode(b64))
+        assert "image" in loaded
+
+    def test_image_generation_pt_url(self, image_client):
+        """Tensor formats under ``response_format='url'`` write each
+        per-item payload to media storage and surface a fetchable
+        HTTP URL through the image content endpoint."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Tensor dog",
+                "response_format": "url",
+                "format": "pt",
+            },
+        )
+        assert resp.status_code == 200
+        url = resp.json()["data"][0]["url"]
+        assert "/v1/images/" in url and "/content" in url
+        path = url.split("//", 1)[-1].split("/", 1)[1]
+        content = image_client.get("/" + path)
+        assert content.status_code == 200
+        assert content.headers["content-type"] == "application/octet-stream"
+        loaded = torch.load(BytesIO(content.content), weights_only=True)
+        assert "image" in loaded
 
     def test_image_generation_auto_size(self, image_client):
         resp = image_client.post(
@@ -387,6 +533,8 @@ class TestImageGeneration:
         assert resp.status_code == 200
 
     def test_image_generation_failure(self, failing_client):
+        """Engine-side ``RuntimeError`` (non-validation) surfaces as HTTP 500;
+        the LLM envelope carries the error message."""
         resp = failing_client.post(
             "/v1/images/generations",
             json={
@@ -394,10 +542,12 @@ class TestImageGeneration:
                 "response_format": "b64_json",
             },
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 500
+        _assert_llm_envelope(resp.json(), code=500, err_type="InternalServerError")
 
     def test_image_generation_invalid_size(self, image_client):
-        """Invalid size triggers RequestValidationError → custom handler → 400."""
+        """Invalid size triggers a Pydantic ``RequestValidationError``;
+        the visual-gen-scoped handler emits the LLM-style 422 envelope."""
         resp = image_client.post(
             "/v1/images/generations",
             json={
@@ -406,7 +556,8 @@ class TestImageGeneration:
                 "size": "invalid",
             },
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="size")
 
     def test_image_generation_null_output(self, tmp_path):
         """Generator returns VisualGenOutput with image=None."""
@@ -448,12 +599,15 @@ class TestImageGeneration:
         assert resp.status_code == 200
 
     def test_missing_prompt_image_generation(self, image_client):
-        """Missing required field → RequestValidationError → custom handler → 400."""
+        """Missing required field surfaces as a Pydantic
+        ``RequestValidationError`` and the visual-gen-scoped handler
+        returns the LLM-style 422 envelope."""
         resp = image_client.post(
             "/v1/images/generations",
             json={},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="prompt")
 
     def test_image_generation_b64_no_save_image_no_disk_write(self, image_client, tmp_path):
         """Regression guard for NVBug 6064029.
@@ -537,7 +691,7 @@ class TestImageEdit:
     """
 
     def test_image_edit_returns_not_implemented(self, image_client):
-        """Valid request body still short-circuits to 501 NotImplemented."""
+        """Valid request body short-circuits to 501 NotImplemented."""
         b64_img = _b64_white_png_1x1()
         resp = image_client.post(
             "/v1/images/edits",
@@ -552,16 +706,14 @@ class TestImageEdit:
         assert body.get("type") == "NotImplementedError"
         assert "not supported" in body.get("message", "").lower()
 
-    def test_missing_image_for_edit(self, image_client):
-        """Missing required field is rejected by FastAPI request validation
-        (400) before the 501 short-circuit, so this contract is unchanged."""
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "prompt": "Edit without image",
-            },
-        )
-        assert resp.status_code == 400
+    def test_image_edit_no_body_returns_not_implemented(self, image_client):
+        """The route doesn't parse a typed body; any incoming request still
+        gets 501, including ones that would have failed schema validation
+        before. Restore typed-body coverage when an edit pipeline lands."""
+        resp = image_client.post("/v1/images/edits", json={"prompt": "Edit without image"})
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body.get("type") == "NotImplementedError"
 
 
 # =========================================================================
@@ -614,6 +766,7 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "video/mp4"
+        _assert_visual_gen_server_timing(resp.headers)
         assert len(resp.content) > 0
 
     def test_sync_video_generation_with_params(self, video_client):
@@ -645,20 +798,21 @@ class TestVideoGenerationSync:
         assert params.frame_rate == 8
         assert params.num_frames == int(2.0 * 8)
 
-    def test_sync_video_generation_multipart(self, video_client):
-        # Use files={} with a dummy file to ensure multipart/form-data
-        dummy_file = BytesIO(b"")
-        resp = video_client.post(
-            "/v1/videos/generations",
-            data={
-                "prompt": "Mountain sunrise",
-                "size": "64x64",
-                "seconds": "1.0",
-                "fps": "8",
-            },
-            files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
-        )
-        # The server will parse fields; _dummy is ignored since it's not "input_reference"
+    def test_sync_video_generation_multipart(self, video_client, tmp_path):
+        """Multipart sync request with a real ``input_reference`` file."""
+        ref_path = tmp_path / "ref.png"
+        Image.new("RGB", (4, 4), (64, 64, 64)).save(str(ref_path))
+        with open(ref_path, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos/generations",
+                data={
+                    "prompt": "Mountain sunrise",
+                    "size": "64x64",
+                    "seconds": "1.0",
+                    "fps": "8",
+                },
+                files={"input_reference": ("ref.png", f, "image/png")},
+            )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
@@ -723,26 +877,48 @@ class TestVideoGenerationSync:
         assert resp.status_code == 400
 
     def test_sync_video_missing_prompt_json(self, video_client):
-        """Missing required prompt → Pydantic ValidationError → 400."""
+        """Missing required ``prompt`` surfaces the visual-gen 422 envelope."""
         resp = video_client.post(
             "/v1/videos/generations",
             json={"size": "64x64"},
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="prompt")
 
     def test_sync_video_missing_prompt_multipart(self, video_client):
-        """Missing prompt in multipart form → ValueError → 400."""
+        """Multipart body with a missing required field surfaces the
+        same LLM envelope as JSON so the wire contract is identical."""
         dummy_file = BytesIO(b"")
         resp = video_client.post(
             "/v1/videos/generations",
             data={"size": "64x64"},
             files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422)
 
-    def test_sync_video_batch_n2(self, video_client):
-        """Sync video with n=2 should succeed and return the first video."""
+    def test_sync_video_multipart_rejects_unknown_field(self, video_client):
+        """Strict multipart parsing rejects any form field that is not
+        on :class:`VideoGenerationRequest` with the same 422 envelope as
+        the JSON path."""
+        dummy_file = BytesIO(b"")
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={
+                "prompt": "Strict multipart",
+                "size": "64x64",
+                "seconds": "1.0",
+                "fps": "8",
+                "output_format": "mp4",
+            },
+            files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="output_format")
+
+    def test_sync_video_rejects_top_level_n(self, video_client):
+        """Sync video has no top-level ``n``; it's rejected with 422."""
         resp = video_client.post(
             "/v1/videos/generations",
             json={
@@ -754,8 +930,8 @@ class TestVideoGenerationSync:
             },
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 200
-        assert len(resp.content) > 0
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422)
 
 
 # =========================================================================
@@ -799,51 +975,80 @@ class TestVideoGenerationAsync:
         assert data["fps"] == 12
         assert data["size"] == "64x64"
 
-    def test_async_video_multipart(self, video_client):
-        """Multipart encoding requires a file field to trigger the correct content-type."""
-        dummy_file = BytesIO(b"")
-        resp = video_client.post(
-            "/v1/videos",
-            data={
-                "prompt": "A sunset",
-                "size": "64x64",
-                "seconds": "1.0",
-                "fps": "8",
-            },
-            files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
-        )
+    def test_async_video_multipart(self, video_client, tmp_path):
+        """Multipart async request with a real ``input_reference`` file."""
+        ref_path = tmp_path / "ref.png"
+        Image.new("RGB", (4, 4), (16, 16, 16)).save(str(ref_path))
+        with open(ref_path, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos",
+                data={
+                    "prompt": "A sunset",
+                    "size": "64x64",
+                    "seconds": "1.0",
+                    "fps": "8",
+                },
+                files={"input_reference": ("ref.png", f, "image/png")},
+            )
         assert resp.status_code == 202
 
-    def test_async_video_invalid_seconds(self, video_client):
-        """Seconds must be between 1.0 and 16.0. Validation error → 400."""
+    def test_async_video_rejects_top_level_n(self, video_client):
+        """Video has no top-level ``n``; it's rejected with 422 by ``extra=forbid``."""
         resp = video_client.post(
             "/v1/videos",
             json={
-                "prompt": "Too short",
-                "seconds": 0.1,
+                "prompt": "Batch fireworks",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422)
+
+    def test_async_video_rejects_top_level_guidance_rescale(self, video_client):
+        """``guidance_rescale`` is per-model; must travel via ``extra_params``."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Bad knob",
+                "seconds": 1.0,
                 "size": "64x64",
                 "fps": 8,
+                "guidance_rescale": 0.7,
             },
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422)
 
-    def test_async_video_invalid_fps(self, video_client):
-        """Fps must be between 8 and 60. Validation error → 400."""
+    def test_async_video_rejects_output_format(self, video_client):
+        """``output_format`` has been renamed to ``format``."""
         resp = video_client.post(
             "/v1/videos",
             json={
-                "prompt": "Bad fps",
+                "prompt": "Bad name",
                 "seconds": 1.0,
-                "fps": 2,
                 "size": "64x64",
+                "fps": 8,
+                "output_format": "mp4",
             },
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422)
 
-    def test_async_video_forwards_params(self, video_client):
-        """Ensure async video endpoint forwards VisualGenParams to generate_async."""
+    def test_async_video_accepts_request_with_params(self, video_client):
+        """The async ``/v1/videos`` route accepts the full request shape and
+        returns 202 with a queued job. Per-field forwarding is asserted
+        only against the *sync* routes — the async path deep-copies the
+        request before enqueuing and the background task runs out-of-order
+        with the test, so ``mock_gen.last_params`` is not a reliable
+        capture point for merge-semantics here. Direct conversion-helper
+        tests cover the field-by-field overlay instead.
+        """
         resp = video_client.post(
             "/v1/videos",
             json={
@@ -859,40 +1064,22 @@ class TestVideoGenerationAsync:
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 202
-        video_id = resp.json()["id"]
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["object"] == "video"
+        assert data["prompt"] == "Rainy street"
+        assert data["id"].startswith("video_")
 
-        # The background task calls generate_async lazily — drive the event
-        # loop via status polling until the job completes.
-        import time as _time
-
-        deadline = _time.time() + 5
-        while _time.time() < deadline:
-            meta = video_client.get(f"/v1/videos/{video_id}").json()
-            if meta.get("status") in ("completed", "failed"):
-                break
-            _time.sleep(0.05)
-
-        params = video_client.mock_gen.last_params
-        assert video_client.mock_gen.last_inputs == "Rainy street"
-        assert params.width == 128
-        assert params.height == 64
-        assert params.num_inference_steps == 12
-        assert params.guidance_scale == 6.0
-        assert params.seed == 7
-        assert params.negative_prompt == "noise"
-        assert params.frame_rate == 10
-        assert params.num_frames == int(2.0 * 10)
-
-    def test_async_video_batch_n2(self, video_client):
-        """Async video with n=2 should accept the request and return 202."""
+    def test_async_video_accepts_extra_params(self, video_client):
+        """Per-model overflow travels through ``extra_params``."""
         resp = video_client.post(
             "/v1/videos",
             json={
-                "prompt": "Batch fireworks",
+                "prompt": "Stylized fireworks",
                 "size": "64x64",
                 "seconds": 1.0,
                 "fps": 8,
-                "n": 2,
+                "extra_params": {"stg_scale": 1.5},
             },
             headers={"content-type": "application/json"},
         )
@@ -1132,3 +1319,798 @@ class TestAsyncVideoFailureHandling:
         assert "output.video is None" in data["error"]
 
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+# =========================================================================
+# Route-level engine-validation-error handling
+# =========================================================================
+
+
+def _make_validation_error(param: str = "stg_sclae"):
+    """Build the kind of stock ``ValueError`` ``validate_visual_gen_params``
+    raises when extra_params contains an unknown key. Tests inject this
+    onto the mock so the routes' ``except ValueError`` arm fires the same
+    way it would in production."""
+    return ValueError(
+        f"Parameter validation failed:\n  - Unknown extra_params ['{param}']. Supported: []"
+    )
+
+
+class TestRouteEngineValidationError:
+    """When the engine raises ``ValueError`` (request-shape problem), the
+    image and sync-video routes return HTTP 400 with the LLM envelope
+    built from the exception message. The async-video route runs the
+    same check synchronously via ``validate_visual_gen_params`` so an
+    unknown ``extra_params`` key surfaces as 400 immediately instead of
+    becoming a queued 202 whose background task later fails."""
+
+    def test_image_route_renders_validation_error_at_400(self, tmp_path):
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            gen = MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                validation_error=_make_validation_error(),
+            )
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/images/generations",
+                json={
+                    "prompt": "trigger validation error",
+                    "response_format": "b64_json",
+                    "extra_params": {"stg_sclae": 1.0},
+                },
+            )
+            assert resp.status_code == 400
+            _assert_llm_envelope(
+                resp.json(),
+                code=400,
+                message_contains="stg_sclae",
+            )
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_sync_video_route_renders_validation_error_at_400(self, tmp_path):
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            gen = MockVisualGen(
+                video_output=_make_dummy_video_tensor(),
+                validation_error=_make_validation_error(),
+            )
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/videos/generations",
+                json={
+                    "prompt": "trigger validation error",
+                    "size": "64x64",
+                    "seconds": 1.0,
+                    "fps": 8,
+                    "extra_params": {"stg_sclae": 1.0},
+                },
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 400
+            _assert_llm_envelope(
+                resp.json(),
+                code=400,
+                message_contains="stg_sclae",
+            )
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_image_route_serialization_value_error_returns_500(self, tmp_path, monkeypatch):
+        """Server-side serialization failures map to 500, not 400.
+
+        ``infer_batch_size`` / ``serialize_visual_gen_output`` raise
+        ``ValueError`` for conditions on the server's own output
+        (no media tensor, inconsistent multi-modal batch). The image
+        route must render those as 500 — the client's request was
+        valid; the server failed to serialize its own output.
+        """
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            gen = MockVisualGen(image_output=_make_dummy_image_tensor())
+
+            def _raise_server_side(*args, **kwargs):
+                raise ValueError("Cannot infer batch size: carries no media tensor.")
+
+            # Force the tensor-format branch to hit a server-side ValueError
+            # in the serialization region (outside the pre-generation try).
+            monkeypatch.setattr(
+                "tensorrt_llm.media.tensor_payload.infer_batch_size",
+                _raise_server_side,
+            )
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/images/generations",
+                json={
+                    "prompt": "trigger serialization failure",
+                    "response_format": "b64_json",
+                    "format": "safetensors",
+                },
+            )
+            assert resp.status_code == 500
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_async_video_route_rejects_validation_error_synchronously(self, tmp_path):
+        """``/v1/videos`` calls ``validate_visual_gen_params`` against the
+        mock's executor metadata before queuing; the mock's
+        ``extra_param_specs={}`` causes any unknown extra to be rejected
+        with a stock ``ValueError`` which the route's ``except ValueError``
+        arm renders as HTTP 400."""
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/videos",
+                json={
+                    "prompt": "trigger validation error",
+                    "size": "64x64",
+                    "seconds": 1.0,
+                    "fps": 8,
+                    "extra_params": {"stg_sclae": 1.0},
+                },
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 400
+            _assert_llm_envelope(
+                resp.json(),
+                code=400,
+                message_contains="stg_sclae",
+            )
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+# =========================================================================
+# Non-visual-gen routes keep FastAPI's default validation response
+# =========================================================================
+
+
+class TestNonVisualGenValidationResponse:
+    """Validation failures on non-visual-gen roles use the shared
+    ``OpenAIServer`` response shape (HTTP 400 + ``{"error": ...}``)
+    that existing integration coverage and clients expect (e.g.
+    ``test_malformed_json_request``). Only the visual-gen role swaps
+    in the LLM envelope.
+
+    The assertion is checked at the handler-closure level: rebuild
+    the exact dispatch installed in :meth:`OpenAIServer.__init__`
+    against a minimal FastAPI app so the assertion stays narrow and
+    the test doesn't need to spin up a full LLM-role server."""
+
+    def _build_app_with_dispatch(self, role):
+        """Return a FastAPI app wired with the production handler
+        dispatch, where ``role`` controls the branch the handler takes
+        on a ``RequestValidationError``."""
+        from fastapi import FastAPI
+        from fastapi.exceptions import RequestValidationError
+        from fastapi.responses import JSONResponse
+        from pydantic import BaseModel
+
+        app = FastAPI()
+
+        class _Body(BaseModel):
+            messages: list
+
+        @app.post("/route")
+        async def _route(body: _Body):
+            return {"ok": True}
+
+        @app.exception_handler(RequestValidationError)
+        async def _handler(_, exc):
+            if role == "VISUAL_GEN":
+                return _llm_envelope_branch(exc)
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        # Mirror :meth:`OpenAIServer._create_visual_gen_validation_error_response`
+        # inline so the test does not depend on instance state.
+        def _llm_envelope_branch(exc):
+            from http import HTTPStatus
+
+            from tensorrt_llm.serve.openai_protocol import ErrorResponse
+
+            error = ErrorResponse(
+                message="Validation failed",
+                type="BadRequestError",
+                code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
+            )
+            return JSONResponse(
+                content=error.model_dump(),
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY.value,
+            )
+
+        return app
+
+    def test_non_visual_gen_role_returns_shared_400_error_body(self):
+        """Non-visual-gen roles return HTTP 400 with the shared
+        ``{"error": str(exc)}`` body that ``test_malformed_json_request``
+        and existing clients depend on."""
+        client = TestClient(self._build_app_with_dispatch(role="CONTEXT"))
+        resp = client.post("/route", json={"not_messages": []})
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "error" in body
+        assert isinstance(body["error"], str)
+        # The visual-gen LLM envelope must not leak into non-VG paths.
+        assert "object" not in body
+        assert "type" not in body
+        assert "code" not in body
+
+    def test_visual_gen_role_uses_llm_envelope(self):
+        client = TestClient(self._build_app_with_dispatch(role="VISUAL_GEN"))
+        resp = client.post("/route", json={"not_messages": []})
+        assert resp.status_code == 422
+        body = resp.json()
+        assert body["type"] == "BadRequestError"
+        assert body["code"] == 422
+        assert "message" in body
+
+
+# =========================================================================
+# Tensor-format response coverage on the video routes
+# =========================================================================
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVideoTensorResponse:
+    """The sync route emits tensor payloads as a single file under
+    ``response_format='url'`` and as base64-encoded bytes under
+    ``response_format='b64_json'``. The async route persists the
+    payload to media storage; ``GET /v1/videos/{id}/content`` serves
+    the file with ``application/octet-stream``."""
+
+    def _post_sync(self, video_client, fmt: str, response_format: str):
+        return video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": f"tensor video {fmt}",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": fmt,
+                "response_format": response_format,
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
+    def test_sync_tensor_url_returns_file_with_correct_suffix(self, video_audio_client, fmt):
+        resp = self._post_sync(video_audio_client, fmt, "url")
+        assert resp.status_code == 200
+        ext = f".{fmt}"
+        # The content-disposition header carries the on-disk filename.
+        disp = resp.headers.get("content-disposition", "")
+        assert ext in disp, disp
+        # And the payload itself round-trips.
+        if fmt == "safetensors":
+            from safetensors.torch import load as load_safetensors
+
+            loaded = load_safetensors(resp.content)
+        else:
+            loaded = torch.load(BytesIO(resp.content), weights_only=True)
+        assert "video" in loaded
+
+    @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
+    def test_sync_tensor_b64_returns_decodable_payload(self, video_audio_client, fmt):
+        resp = self._post_sync(video_audio_client, fmt, "b64_json")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["format"] == fmt
+        assert "b64_json" in data
+        raw = base64.b64decode(data["b64_json"])
+        if fmt == "safetensors":
+            from safetensors.torch import load as load_safetensors
+
+            loaded = load_safetensors(raw)
+        else:
+            loaded = torch.load(BytesIO(raw), weights_only=True)
+        assert "video" in loaded
+
+    @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
+    def test_async_tensor_persists_and_serves(self, video_audio_client, fmt, tmp_path):
+        import time as _time
+
+        client = video_audio_client
+        resp = client.post(
+            "/v1/videos",
+            json={
+                "prompt": f"async tensor {fmt}",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": fmt,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        # Drive the background task to completion via polling.
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            status = client.get(f"/v1/videos/{video_id}").json().get("status")
+            if status in ("completed", "failed"):
+                break
+            _time.sleep(0.05)
+
+        content = client.get(f"/v1/videos/{video_id}/content")
+        assert content.status_code == 200
+        # The server returns ``application/octet-stream`` for tensor payloads.
+        assert content.headers["content-type"] == "application/octet-stream"
+        if fmt == "safetensors":
+            from safetensors.torch import load as load_safetensors
+
+            loaded = load_safetensors(content.content)
+        else:
+            loaded = torch.load(BytesIO(content.content), weights_only=True)
+        assert "video" in loaded
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVideoEncoderB64Response:
+    """The sync video route's encoder branch (``mp4``/``avi``/``auto``)
+    honors ``response_format='b64_json'`` by base64-encoding the
+    encoded video bytes; ``response_format='url'`` keeps the
+    ``FileResponse`` download."""
+
+    def test_sync_encoder_b64_json_returns_base64_payload(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "encoded b64",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+                "response_format": "b64_json",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["format"] in {"mp4", "avi"}
+        assert "b64_json" in body
+        raw = base64.b64decode(body["b64_json"])
+        # Non-empty encoded bytes — exact format verification is the
+        # encoder layer's domain.
+        assert len(raw) > 0
+
+    def test_sync_encoder_url_keeps_file_response(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "encoded url",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+                "response_format": "url",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        # FileResponse for an AVI carries ``video/x-msvideo``.
+        assert resp.headers["content-type"] == "video/x-msvideo"
+
+
+class TestVideoTimingValidation:
+    """Numeric optionals on ``VideoGenerationRequest`` reject zero /
+    negative values so divisions and frame-count math downstream can
+    trust the value."""
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("fps", 0),
+            ("frame_rate", -1),
+            ("num_frames", 0),
+            ("num_frames", -3),
+            ("seconds", 0),
+            ("seconds", -2.5),
+        ],
+    )
+    def test_non_positive_timing_field_rejected(self, video_client, field, value):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "bad timing",
+                "size": "32x32",
+                field: value,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains=field)
+
+
+class TestImageResponseFormatMetadata:
+    """``ImageGenerationResponse.output_format`` reflects the
+    requested encoding so clients that introspect the response know
+    how to decode the bytes / read the URL."""
+
+    @pytest.mark.parametrize(
+        "fmt",
+        ["png", "webp", "jpeg", "safetensors", "pt"],
+    )
+    def test_response_carries_requested_format(self, image_client, fmt):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": f"metadata for {fmt}",
+                "response_format": "b64_json",
+                "format": fmt,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["output_format"] == fmt
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVideoZeroFrameDerivationRejected:
+    """``seconds * frame_rate`` that floors to zero frames must be
+    rejected with HTTP 400 + LLM envelope rather than reaching the
+    encoder with a 0-frame video."""
+
+    def test_subsecond_seconds_below_one_frame_returns_400(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "way too short",
+                "size": "32x32",
+                "seconds": 0.01,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        # int(0.01 * 8) == 0 — conversion raises ValueError → 400.
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="Derived frame count",
+        )
+
+    def test_seconds_without_frame_rate_returns_400(self, video_client):
+        """``seconds`` set but neither the request nor the pipeline default
+        declares a ``frame_rate``: the parser must reject the request with
+        HTTP 400 instead of silently dropping the duration and returning the
+        pipeline's default ``num_frames``."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "duration without fps",
+                "size": "32x32",
+                "seconds": 1.0,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="frame_rate",
+        )
+
+    def test_explicit_num_frames_one_is_accepted(self, video_client):
+        """The caller can bypass the derivation by passing ``num_frames``
+        directly; the request must succeed."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "explicit single frame",
+                "size": "32x32",
+                "num_frames": 1,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+
+
+class TestImageBatchCap:
+    """``ImageGenerationRequest.n`` is capped at 10 to bound resource
+    usage. ``n=10`` is accepted; ``n=11`` and ``n=100000`` are
+    rejected at the schema layer with HTTP 422 + LLM envelope."""
+
+    def test_n_equal_to_ten_accepted(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "ten images",
+                "response_format": "b64_json",
+                "size": "32x32",
+                "n": 10,
+            },
+        )
+        assert resp.status_code == 200
+        assert len(resp.json()["data"]) == 10
+
+    @pytest.mark.parametrize("n", [11, 100000])
+    def test_n_above_cap_rejected(self, image_client, n):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "too many",
+                "response_format": "b64_json",
+                "size": "32x32",
+                "n": n,
+            },
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="n")
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVideoFrameBudgetCap:
+    """Upper bounds keep unbounded work / memory requests from reaching
+    the engine. The defaults (a minute of video at 120 fps) are
+    generous enough for common workloads; clients hitting the cap can
+    raise it at deployment time."""
+
+    @pytest.mark.parametrize(
+        "field,value,boundary",
+        [
+            ("num_frames", 7200, "accepted"),
+            ("num_frames", 7201, "rejected"),
+            ("num_frames", 1_000_000, "rejected"),
+            ("seconds", 60.0, "accepted"),
+            ("seconds", 60.1, "rejected"),
+            ("seconds", 1.0e9, "rejected"),
+            ("fps", 120.0, "accepted"),
+            ("fps", 120.1, "rejected"),
+            ("fps", 1.0e6, "rejected"),
+        ],
+    )
+    def test_frame_budget_bounds(self, video_client, field, value, boundary):
+        payload = {
+            "prompt": "boundary",
+            "size": "32x32",
+        }
+        if field != "num_frames":
+            # Pair seconds/fps with a sane partner to avoid the
+            # derived-zero-frames check; pass num_frames otherwise.
+            payload.update({"seconds": 1.0, "fps": 8})
+        payload[field] = value
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json=payload,
+            headers={"content-type": "application/json"},
+        )
+        if boundary == "accepted":
+            # The schema accepts the value at the boundary. The
+            # downstream pipeline may still 200 or 500 depending on
+            # the mock's tensor shape; the relevant assertion is that
+            # the request did not fall into the schema-rejection path.
+            assert resp.status_code != 422, resp.text
+        else:
+            assert resp.status_code == 422
+            _assert_llm_envelope(resp.json(), code=422, message_contains=field)
+
+
+class TestVideoJobFractionalFps:
+    """``VideoJob.fps`` is a float so cinematic frame rates like
+    23.976 / 29.97 round-trip through the queued metadata instead of
+    being truncated to int."""
+
+    @pytest.mark.parametrize("rate", [23.976, 29.97, 59.94])
+    def test_async_job_metadata_preserves_fractional_fps(self, video_client, rate):
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "fractional fps",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": rate,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["fps"] == rate
+
+    def test_async_job_metadata_uses_resolved_default_fps(self, video_client):
+        """When the request omits ``fps``/``frame_rate``, the queued
+        ``VideoJob`` reports the pipeline-default rate that the
+        conversion layer resolved on ``params.frame_rate`` — not
+        ``None`` — so polling clients see accurate metadata for a
+        video encoded at the model default."""
+        # Force a known default on the mock pipeline so the assertion
+        # is deterministic. ``MockVisualGen.default_params`` builds a
+        # fresh ``VisualGenParams``; patching the property here lets
+        # the test pretend the pipeline default is 12 fps.
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        class _FixedDefaultGen(MockVisualGen):
+            @property
+            def default_params(self):
+                return VisualGenParams(frame_rate=12.0)
+
+        gen = _FixedDefaultGen(video_output=_make_dummy_video_tensor())
+        # The fixture installs media storage env vars; mirror that.
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = (
+            os.path.dirname(video_client.app.state.__dict__.get("media_storage_path", "/tmp/_vg"))
+            or "/tmp/_vg"
+        )
+        try:
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/videos",
+                json={
+                    "prompt": "no fps sent",
+                    "size": "32x32",
+                    "seconds": 1.0,
+                },
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 202
+            body = resp.json()
+            assert body["fps"] == 12.0
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+def _raise_value_error(_fmt):
+    raise ValueError("ffmpeg not available; encoder format unsupported")
+
+
+def _raise_runtime_error(_fmt):
+    raise RuntimeError("MP4 (H.264) format requires ffmpeg to be installed.")
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVideoEncoderFailsFast:
+    """When an encoder format can't be resolved, the sync and async
+    video routes must reject the request before any GPU generation
+    runs. ``resolve_video_format`` raises ``ValueError`` for genuinely
+    unsupported format strings and ``RuntimeError`` for the
+    missing-ffmpeg case on ``format='mp4'``; both must surface as a
+    400, not a 500."""
+
+    @pytest.mark.parametrize(
+        "raiser",
+        [_raise_value_error, _raise_runtime_error],
+        ids=["unsupported_format", "missing_ffmpeg"],
+    )
+    def test_sync_route_fails_before_generate(self, video_client, monkeypatch, raiser):
+        from tensorrt_llm.serve import openai_video_routes as routes
+
+        monkeypatch.setattr(routes, "resolve_video_format", raiser)
+        # Record whether the generator was called so the assertion
+        # locks in the fail-fast contract.
+        video_client.mock_gen.last_inputs = None
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "mp4 without ffmpeg",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "mp4",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        assert video_client.mock_gen.last_inputs is None, (
+            "generate() must not run when the encoder format is unsupported"
+        )
+
+    @pytest.mark.parametrize(
+        "raiser",
+        [_raise_value_error, _raise_runtime_error],
+        ids=["unsupported_format", "missing_ffmpeg"],
+    )
+    def test_async_route_fails_before_queue(self, video_client, monkeypatch, raiser):
+        from tensorrt_llm.serve import openai_video_routes as routes
+
+        monkeypatch.setattr(routes, "resolve_video_format", raiser)
+        video_client.mock_gen.last_inputs = None
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "mp4 without ffmpeg",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "mp4",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        assert video_client.mock_gen.last_inputs is None
+
+    def test_sync_route_tensor_format_unaffected(self, video_client, monkeypatch):
+        """Tensor formats have no encoder dependency; a broken
+        ``resolve_video_format`` must not affect them."""
+        from tensorrt_llm.serve import openai_video_routes as routes
+
+        monkeypatch.setattr(routes, "resolve_video_format", _raise_value_error)
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "tensor unaffected",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "safetensors",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestAsyncVideoB64JsonTransport:
+    """``POST /v1/videos`` persists the requested ``response_format`` on
+    the queued job. ``GET /v1/videos/{id}/content`` honors it:
+    ``url`` (or unset) returns a ``FileResponse`` download;
+    ``b64_json`` returns a JSON envelope with the encoded bytes
+    base64-inlined."""
+
+    def _drive_job_to_completion(self, client, video_id):
+        import time as _time
+
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            status = client.get(f"/v1/videos/{video_id}").json().get("status")
+            if status in ("completed", "failed"):
+                return status
+            _time.sleep(0.05)
+        return None
+
+    def test_async_b64_json_returned_at_get_content(self, video_client):
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "async base64",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+                "response_format": "b64_json",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        job = resp.json()
+        assert job["response_format"] == "b64_json"
+
+        status = self._drive_job_to_completion(video_client, job["id"])
+        assert status == "completed"
+
+        content = video_client.get(f"/v1/videos/{job['id']}/content")
+        assert content.status_code == 200
+        body = content.json()
+        assert set(body) >= {"id", "format", "b64_json"}
+        assert body["id"] == job["id"]
+        # The encoded payload decodes to non-empty bytes.
+        raw = base64.b64decode(body["b64_json"])
+        assert len(raw) > 0
+
+    def test_async_url_still_returns_file_response(self, video_client):
+        """Default and explicit ``response_format='url'`` keep the
+        existing ``FileResponse`` behavior."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "async url",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+                "response_format": "url",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        job = resp.json()
+        assert job["response_format"] == "url"
+
+        self._drive_job_to_completion(video_client, job["id"])
+        content = video_client.get(f"/v1/videos/{job['id']}/content")
+        assert content.status_code == 200
+        # AVI FileResponse carries ``video/x-msvideo``; the b64_json
+        # branch would have set ``application/json``.
+        assert content.headers["content-type"] == "video/x-msvideo"

@@ -180,7 +180,19 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self, spec_config: "EagleDecodingConfig", mapping, use_separate_draft_kv_cache: bool = False
     ):
         """Initialize dynamic-tree specific buffers and helper ops."""
-        super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
+        super().__init__(
+            spec_config,
+            mapping=mapping,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
+        if (
+            getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
+            or getattr(spec_config, "sa_config", None) is not None
+        ):
+            raise ValueError(
+                "Dynamic tree mode does not support relaxed acceptance or "
+                "suffix-automaton enhancement."
+            )
         assert self.use_dynamic_tree, (
             "Eagle3OneModelDynamicTreeWorker requires use_dynamic_tree=True"
         )
@@ -453,8 +465,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
     @nvtx_range("eagle3_dyn.sample_and_accept_draft_tokens")
-    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
-        """Override to handle dynamic tree verification."""
+    def sample_and_accept_draft_tokens(self, input_ids, logits, attn_metadata, spec_metadata):
+        """Override to handle dynamic tree verification.
+
+        ``input_ids`` is unused here (relaxed acceptance is not supported in
+        dynamic-tree mode); accepted to match the base class signature.
+        """
+        del input_ids
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -887,6 +904,15 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         offset=self.offset,
                         d2t=self._d2t,
                         skip_all_sampling_params=skip_all_sampling_params,
+                        # During CUDA graph capture bake top_k_max=0 so the
+                        # full-sort (always-correct) path is captured. Outside
+                        # capture, pass the pre-computed value for the fast
+                        # topk(kMax) path.
+                        top_k_max=(
+                            0
+                            if torch.cuda.is_current_stream_capturing()
+                            else getattr(spec_metadata, "top_k_max", None)
+                        ),
                     )
                 )
 
@@ -950,7 +976,17 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         Returns:
             True if rejection sampling is enabled and the draft logit buffer is allocated
         """
-        return spec_metadata.use_rejection_sampling and self._draft_depth_logits_cat is not None
+        # Skip rejection sampling when the whole batch is greedy: argmax is
+        # equivalent and avoids the rejection kernel cost.
+        # Also skip during CUDA graph capture/replay: the rejection ops use
+        # dynamic memory allocation (full-sort fallback) which is incompatible
+        # with stream capture.
+        return (
+            spec_metadata.use_rejection_sampling
+            and self._draft_depth_logits_cat is not None
+            and not spec_metadata.is_all_greedy_sample
+            and not spec_metadata.is_cuda_graph
+        )
 
     def _finalize_dynamic_tree_verify_outputs(
         self,

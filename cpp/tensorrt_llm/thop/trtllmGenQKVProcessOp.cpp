@@ -27,6 +27,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <optional>
 #include <torch/extension.h>
+#include <tuple>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -48,8 +49,6 @@ using tensorrt_llm::runtime::TorchUtils;
 
 namespace
 {
-
-constexpr size_t kFlashinferTrtllmGenCounterWorkspaceSize = 8 * 1024 * 1024;
 
 int64_t computeWindowLeft(
     int64_t const cyclicAttentionWindowSize, int64_t const maxKvLength, int64_t const attentionChunkSize)
@@ -78,22 +77,6 @@ T const* optPtr(OptTensorT&& t, std::enable_if_t<std::is_const_v<OptTensorT>>* =
 cudaStream_t currentStreamFor(at::Tensor const& tensor)
 {
     return at::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
-}
-
-void zeroFlashinferTrtllmGenCounterWorkspaceAsync(at::Tensor const& workspace, cudaStream_t stream)
-{
-    // FlashInfer reserves the first 8 MiB of the trtllm-gen workspace for
-    // multi-CTA KV semaphores. The remaining scratch space is overwritten by
-    // the FMHA kernels and does not need to be cleared.
-    auto const workspaceBytes = static_cast<size_t>(workspace.nbytes());
-    auto const counterBytes = workspaceBytes < kFlashinferTrtllmGenCounterWorkspaceSize
-        ? workspaceBytes
-        : kFlashinferTrtllmGenCounterWorkspaceSize;
-    if (counterBytes == 0)
-    {
-        return;
-    }
-    check_cuda_error(cudaMemsetAsync(workspace.data_ptr(), 0, counterBytes, stream));
 }
 
 struct WorkspaceAccessor
@@ -183,6 +166,8 @@ struct ContextWorkspaceRawViews
     at::Tensor cuQSeqlens;
     at::Tensor cuKvSeqlens;
     at::Tensor qBuf;
+    std::optional<at::Tensor> fmhaBmm1Scale;
+    std::optional<at::Tensor> fmhaBmm2Scale;
     ContextWorkspaceRawPointers ptrs;
 };
 
@@ -197,6 +182,16 @@ ContextWorkspaceRawViews makeContextWorkspaceRawViews(
     {
         qBuf = workspaceView.tensor(layout.qBufOffset, layout.qBufSize, layout.qBufScalarType);
     }
+    std::optional<at::Tensor> fmhaBmm1Scale;
+    std::optional<at::Tensor> fmhaBmm2Scale;
+    if (layout.fmhaBmm1ScaleSize > 0)
+    {
+        fmhaBmm1Scale = workspaceView.tensor(layout.fmhaBmm1ScaleOffset, layout.fmhaBmm1ScaleSize, at::kFloat);
+    }
+    if (layout.fmhaBmm2ScaleSize > 0)
+    {
+        fmhaBmm2Scale = workspaceView.tensor(layout.fmhaBmm2ScaleOffset, layout.fmhaBmm2ScaleSize, at::kFloat);
+    }
 
     return ContextWorkspaceRawViews{
         .trtllmGenWorkspace
@@ -205,6 +200,8 @@ ContextWorkspaceRawViews makeContextWorkspaceRawViews(
         .cuKvSeqlens
         = workspaceView.tensor(layout.cuKvSeqlensOffset, layout.cuSeqlensSize, sizeof(int32_t), intOptions),
         .qBuf = qBuf,
+        .fmhaBmm1Scale = fmhaBmm1Scale,
+        .fmhaBmm2Scale = fmhaBmm2Scale,
         .ptrs = makeContextWorkspaceRawPointers(workspaceView, layout),
     };
 }
@@ -213,6 +210,8 @@ struct GenerationWorkspaceRawViews
 {
     at::Tensor trtllmGenWorkspace;
     at::Tensor qBuf;
+    at::Tensor bmm1Scale;
+    at::Tensor bmm2Scale;
     int* cuSeqlensPtr{};
     int* cuKvSeqlensPtr{};
     float* rotaryInvFreqBufPtr{};
@@ -235,6 +234,8 @@ GenerationWorkspaceRawViews makeGenerationWorkspaceRawViews(
         .trtllmGenWorkspace
         = workspaceView.tensor(layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, 1, byteOptions),
         .qBuf = workspaceView.tensor(layout.qBufOffset, layout.qBufSize, qBufItemSize, qBufOptions),
+        .bmm1Scale = workspaceView.tensor(layout.bmm1ScaleOffset, layout.bmm1ScaleSize, at::kFloat),
+        .bmm2Scale = workspaceView.tensor(layout.bmm2ScaleOffset, layout.bmm2ScaleSize, at::kFloat),
         .cuSeqlensPtr = workspaceView.ptr<int>(layout.cuSeqlensOffset, layout.cuSeqlensSize),
         .cuKvSeqlensPtr = workspaceView.ptr<int>(layout.cuKvSeqlensOffset, layout.cuKvSeqlensSize),
         .rotaryInvFreqBufPtr = workspaceView.ptr<float>(layout.rotaryInvFreqOffset, layout.rotaryInvFreqSize),
@@ -248,8 +249,8 @@ GenerationWorkspaceRawViews makeGenerationWorkspaceRawViews(
 
 } // anonymous namespace
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor,
-    int64_t, int64_t, int64_t>
+std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,
+    std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t>
 trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     torch::Tensor context_lengths, std::optional<torch::Tensor> kv_cache_block_offsets,
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
@@ -272,7 +273,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     TORCH_CHECK(host_kv_cache_pool_mapping.has_value(), "host_kv_cache_pool_mapping is required.");
     TORCH_CHECK(kv_cache_block_offsets.has_value(), "kv_cache_block_offsets is required.");
 
-    bool const separateQKvOutput = paged_context_fmha;
+    bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha;
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
@@ -384,7 +385,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qkvParams.position_embedding_type = static_cast<PositionEmbeddingType>(position_embedding_type);
         qkvParams.position_shift_enabled = false;
         qkvParams.cache_type = cacheTypeFromQuantMode(quantMode);
-        qkvParams.separate_q_kv_output = paged_context_fmha;
+        qkvParams.separate_q_kv_output = separateQKvOutput;
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = false;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
@@ -413,10 +414,11 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     }
 
     std::optional<at::Tensor> kvPool;
+    std::optional<at::Tensor> kvScalePool;
     std::optional<at::Tensor> blockTables;
     if (need_build_kv_cache_metadata)
     {
-        kvPool = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
+        std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
             host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads, tokens_per_block, head_size, kv_factor,
             total_num_blocks, kv_cache_quant_mode, qkvScalarType);
 
@@ -434,11 +436,12 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qProcessed = qkv_input.slice(1, 0, num_heads * head_size).view({num_tokens, num_heads, head_size});
     }
 
-    zeroFlashinferTrtllmGenCounterWorkspaceAsync(views.trtllmGenWorkspace, stream);
-
+    // FlashInfer paged context launches trtllm-gen with multi-CTA-KV mode disabled, so it does not
+    // consume the counter slab reserved at the head of the workspace.
     auto const windowLeft = computeWindowLeft(cyclic_attention_window_size, max_past_kv_length, attention_chunk_size);
-    return {qProcessed, kvPool, blockTables, views.trtllmGenWorkspace, views.cuQSeqlens, views.cuKvSeqlens,
-        input_seq_length, max_past_kv_length, windowLeft};
+    return {qProcessed, kvPool, blockTables, kvScalePool, views.fmhaBmm1Scale, views.fmhaBmm2Scale,
+        views.trtllmGenWorkspace, views.cuQSeqlens, views.cuKvSeqlens, input_seq_length, max_past_kv_length,
+        windowLeft};
 }
 
 void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
@@ -460,6 +463,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+    bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha;
     auto const ptrs = [&]
     {
         auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(
@@ -527,7 +531,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
         qkvParams.position_embedding_type = static_cast<PositionEmbeddingType>(position_embedding_type);
         qkvParams.position_shift_enabled = false;
         qkvParams.cache_type = cacheTypeFromQuantMode(quantMode);
-        qkvParams.separate_q_kv_output = paged_context_fmha;
+        qkvParams.separate_q_kv_output = separateQKvOutput;
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = false;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
@@ -556,8 +560,8 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     }
 }
 
-std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor, std::optional<at::Tensor>,
-    int64_t, int64_t, int64_t, bool>
+std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor,
+    at::Tensor, at::Tensor, std::optional<at::Tensor>, int64_t, int64_t, int64_t, bool>
 trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, torch::Tensor sequence_lengths,
     std::optional<torch::Tensor> spec_decoding_generation_lengths,
     std::optional<torch::Tensor> spec_decoding_position_offsets, std::optional<torch::Tensor> kv_cache_block_offsets,
@@ -733,10 +737,11 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     }
 
     std::optional<at::Tensor> kvPool;
+    std::optional<at::Tensor> kvScalePool;
     std::optional<at::Tensor> blockTables;
     if (need_build_kv_cache_metadata)
     {
-        kvPool = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
+        std::tie(kvPool, kvScalePool) = buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers.value(),
             host_kv_cache_pool_mapping.value(), layer_idx, num_kv_heads, tokens_per_block, head_size, kv_factor,
             total_num_blocks, kv_cache_quant_mode, qkvScalarType);
 
@@ -745,11 +750,10 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     }
 
     auto qProcessed = views.qBuf.view({num_tokens, num_heads, head_size});
-    zeroFlashinferTrtllmGenCounterWorkspaceAsync(views.trtllmGenWorkspace, stream);
 
     auto const windowLeft = computeWindowLeft(cyclic_attention_window_size, max_past_kv_length, attention_chunk_size);
-    return {qProcessed, kvPool, blockTables, views.trtllmGenWorkspace, cuSeqlens, input_seq_length, max_past_kv_length,
-        windowLeft, isMultiTokenGen};
+    return {qProcessed, kvPool, blockTables, kvScalePool, views.bmm1Scale, views.bmm2Scale, views.trtllmGenWorkspace,
+        cuSeqlens, input_seq_length, max_past_kv_length, windowLeft, isMultiTokenGen};
 }
 
 } // namespace torch_ext

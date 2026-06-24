@@ -36,8 +36,9 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               get_ctx_gen_server_addrs,
                                               get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                create_cluster_storage)
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, create_cluster_storage,
+    validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
@@ -105,7 +106,13 @@ class OpenAIDisaggServer:
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
+        self._disagg_cluster_storage = None
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname)
+            self._disagg_cluster_storage = create_cluster_storage(
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name)
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._ctx_router, self._gen_router, self._create_client,

@@ -267,6 +267,23 @@ def extract_mamba_kv_cache_params(
     )
 
 
+class _Qwen35MoeVLMConfig(transformers.Qwen3NextConfig):
+    """Thin subclass that restores the top-level model_type for Qwen3.5 MoE.
+
+    ``_Qwen35ConfigCompat`` normalizes the HF config into Qwen3NextConfig
+    (needed by the PyTorch backend model), but that loses the original
+    ``model_type``.  The serving layer needs ``model_type = "qwen3_5_moe"``
+    for ``MULTIMODAL_PLACEHOLDER_REGISTRY`` lookup; without it,
+    ``resolve_top_level_model_type`` returns ``"qwen3_next"`` and multimodal
+    requests fail with "Unknown modality".
+
+    To remove: when ``_Qwen35ConfigCompat`` is removed and the PyTorch backend
+    consumes ``Qwen3_5MoeConfig`` directly.
+    """
+
+    model_type = "qwen3_5_moe"
+
+
 class _Qwen35ConfigCompat:
     """Temporary shim that normalizes Qwen3.5 HF configs into Qwen3NextConfig.
 
@@ -457,8 +474,11 @@ def load_pretrained_config(model_name_or_path: str,
                                 "Qwen3_5ForCausalLM",
                                 "Qwen3_5ForConditionalGeneration",
                             )):
-        model_config = transformers.Qwen3NextConfig.from_dict(
-            _Qwen35ConfigCompat.normalize(config_dict))
+        normalized = _Qwen35ConfigCompat.normalize(config_dict)
+        if model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_config = _Qwen35MoeVLMConfig.from_dict(normalized)
+        else:
+            model_config = transformers.Qwen3NextConfig.from_dict(normalized)
     elif (model_type == "exaone4" and config_dict.get("sliding_window") is None
           and config_dict.get("layer_types") is None):
         # transformers 5.5.x Exaone4Config.__post_init__ first forces
@@ -496,18 +516,26 @@ def load_pretrained_config(model_name_or_path: str,
             # needed — model_config.rope_theta (if any) is already canonical.
             rope_theta = rope_scaling.get("rope_theta")
             if rope_theta is not None:
-                existing = getattr(model_config, "rope_theta", None)
-                if existing is None:
-                    model_config.rope_theta = rope_theta
-                elif existing != rope_theta:
-                    # Both values are set but disagree. Keep the top-level value
-                    # (canonical in transformers 4.x and 5.x), but warn loudly
-                    # so that any future transformers upgrade that breaks this
-                    # invariant is easy to spot.
+                # `rope_scaling.rope_theta` mirrors `rope_parameters.rope_theta`
+                # and is the canonical value in transformers 5.x. Adopt it as
+                # `model_config.rope_theta` so downstream code can read it.
+                # Note: `model_config.rope_theta` may be absent entirely
+                # (transformers 5.x dropped it from some configs) or may be a
+                # config-class default that does NOT reflect the user's
+                # config.json (e.g. DeepseekV3Config default 10000 vs. user's
+                # 1000000 — the original bug).
+                user_top_level = config_dict.get("rope_theta")
+                if user_top_level is not None and user_top_level != rope_theta:
+                    # User explicitly set both top-level rope_theta and
+                    # rope_parameters.rope_theta to disagreeing values — keep
+                    # the top-level value but warn loudly.
                     logger.warning(
                         f"rope_scaling.rope_theta ({rope_theta}) differs from "
-                        f"model_config.rope_theta ({existing}); keeping the "
+                        f"config rope_theta ({user_top_level}); keeping the "
                         f"top-level value.")
+                    model_config.rope_theta = user_top_level
+                else:
+                    model_config.rope_theta = rope_theta
             model_config.rope_scaling = None
 
     return model_config

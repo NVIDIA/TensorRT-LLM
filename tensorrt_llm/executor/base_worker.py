@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import datetime
 import enum
 import gc
@@ -359,9 +358,11 @@ class BaseWorker(GenerationExecutor):
         it_result_queue.aqueue = None
 
     def return_queue(self, client_id: int):
-        """ If a centralized result queue is registered (used for communication with the proxy)
-            send the message there.
-            Otherwise, push the result directly in the GenerationResult queue.
+        """Return the queue used to deliver responses for ``client_id``.
+
+        If a centralized result queue is registered (used for communication
+        with the proxy) send the message there. Otherwise, push the result
+        directly in the GenerationResult queue.
         """
         if self.result_queue is not None:
             return self.result_queue
@@ -447,7 +448,7 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -466,21 +467,8 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids,
-                    multimodal_item_run_cu_offsets=request.multimodal_params.
-                    multimodal_input.multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=request.multimodal_params.
-                    multimodal_input.multimodal_run_positions,
-                    multimodal_run_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_run_lengths)
+                multimodal_input = request.multimodal_params.multimodal_input.to_binding(
+                    tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -604,21 +592,25 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
+                encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
+                cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
+            executor_request.py_logprobs_simple_format = (
+                request.sampling_params.logprobs_simple_format)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
+                    # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
@@ -824,6 +816,12 @@ class BaseWorker(GenerationExecutor):
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
         attention_dp_rank = stats[3] if len(stats) > 3 else None
+        # Newer slots — guarded with len() checks so historical 4-tuples and
+        # any external code still appending the legacy shape keep working.
+        host_step_time_ms = stats[4] if len(stats) > 4 else None
+        prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
+        scheduler_mode = stats[6] if len(stats) > 6 else None
+        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -866,6 +864,33 @@ class BaseWorker(GenerationExecutor):
                 }
                 for window_size, s in kv_iter_stats.items()
             }
+
+        # Per-loop CPU wall captured by profile_step() — always a clean
+        # single-loop measurement, matching the log line's `host_step_time`.
+        # Prefer this over iterLatencyMS when you need absolute per-loop
+        # CPU cost, especially under the overlap scheduler where
+        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
+        if host_step_time_ms is not None:
+            stats_dict["hostStepTimeMS"] = host_step_time_ms
+        # GPU forward time read via the ping-pong CUDA event pair in
+        # profile_step(). Note the "prev" in the name: under steady state
+        # the value lags its sibling host_step_time on the same record by
+        # one loop (the event-pair being read corresponds to the loop
+        # before the one host_step_time describes). See the ping-pong
+        # comment in PyExecutor._profiler for the design rationale.
+        if prev_device_step_time_ms is not None:
+            stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+        # Batch-matched GPU forward time measured from the CUDA events around
+        # this record's _forward_step. This is the preferred field for
+        # ForwardPassMetrics wall_time.
+        if gpu_forward_time_ms is not None:
+            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+        # Scheduler mode for this record. "overlap" means iterLatencyMS
+        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
+        # "non_overlap" means iterLatencyMS is itself the clean per-loop
+        # CPU wall. Set per-record so consumers do not need server config.
+        if scheduler_mode is not None:
+            stats_dict["schedulerMode"] = scheduler_mode
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
@@ -937,8 +962,19 @@ class AwaitResponseHelper:
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
-        responses = self.worker.engine.await_responses(
-            timeout=datetime.timedelta(seconds=timeout))
+        try:
+            responses = self.worker.engine.await_responses(
+                timeout=datetime.timedelta(seconds=timeout))
+        except Exception as e:
+            # Defensive: with id=None, PyExecutor.await_responses routes
+            # to _await_any_response, which does not raise on event-loop
+            # crash — it returns [] silently and we detect the crash
+            # via engine._event_loop_error after this block. But any
+            # unexpected exception out of await_responses (e.g. from a
+            # different engine implementation, or a future change to
+            # _await_any_response) is also a clear signal to broadcast
+            # and stop the thread.
+            return self._broadcast_event_loop_error(e)
         # filter since The _engine_response_callback may return None
         responses = list(
             filter(
@@ -953,7 +989,80 @@ class AwaitResponseHelper:
                               color="red",
                               category="Worker"):
             self.responses_handler(responses)
+
+        # Even when await_responses returned normally (e.g. via
+        # _await_any_response, whose predicate already includes
+        # is_shutdown but does not raise), an event-loop crash leaves
+        # _event_loop_error stashed on the engine. Broadcast and stop the
+        # thread in that case too — see nvbug 6038228.
+        error = getattr(self.worker.engine, "_event_loop_error", None)
+        if error is not None:
+            return self._broadcast_event_loop_error(error)
         return True
+
+    def _broadcast_event_loop_error(self, error: BaseException) -> bool:
+        """Wake every pending ``GenerationResult`` after an event-loop crash.
+
+        Inject an ``ErrorResponse`` into every pending ``GenerationResult``
+        queue so callers parked in ``queue.get()`` / ``aqueue.get()``
+        (``LLM.generate``, ``generate_async`` + ``aresult``,
+        ``trtllm-bench``) wake up with a meaningful error instead of
+        hanging when the PyExecutor event loop dies.
+
+        Returns ``False`` so the calling ``ManagedThread`` exits — there
+        is no point polling a dead engine.
+
+        Scope: single-process worker (the path that backs ``LLM.generate``
+        and the bench async client). The IPC / proxy path tracks pending
+        results on a different side of the boundary and would need a
+        separate poison-pill on ``self.worker.result_queue``; that is left
+        as a follow-up consistent with the PyExecutor-side fix.
+        """
+        error_msg = f"Event loop terminated with error: {error}"
+        pending_client_ids = list(self.worker._results.keys())
+        if not pending_client_ids:
+            logger.error(
+                f"Event-loop error with no pending results to wake: {error}")
+            return False
+
+        logger.error(
+            f"Broadcasting event-loop error to {len(pending_client_ids)} "
+            f"pending request(s): {error}")
+
+        event_loop = None
+        async_queues: List[_SyncQueue] = []
+        for client_id in pending_client_ids:
+            try:
+                queue = self.worker.return_queue(client_id)
+            except KeyError:
+                continue
+            err_resp = ErrorResponse(
+                client_id=client_id,
+                error_msg=error_msg,
+                request_id=client_id,
+            )
+            try:
+                if isinstance(queue, _SyncQueue):
+                    queue.put_nowait(err_resp)
+                    async_queues.append(queue)
+                    event_loop = event_loop or queue.loop
+                else:
+                    queue.put(err_resp)
+            except Exception as put_error:
+                logger.error(f"Failed to push ErrorResponse for client_id="
+                             f"{client_id}: {put_error}")
+                continue
+            self.worker._pop_result(client_id)
+
+        if async_queues:
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except Exception as notify_error:
+                logger.error(
+                    f"Failed to notify async queues on event-loop error: "
+                    f"{notify_error}")
+
+        return False
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
         ''' Return the responses to asyncio.event_loop. '''
@@ -1057,9 +1166,15 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
-    logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None,
-                                       prompt_token_ids)
+    logprobs_result = compute_logprobs(
+        logprob_params.prompt_logprobs,
+        None,
+        context_logits,
+        None,
+        None,
+        prompt_token_ids,
+        simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+    )
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -1098,11 +1213,15 @@ def _get_logprobs(worker,
                 return logprobs_result
 
         # TRT backend: compute both prompt and generation logprobs from logits
-        logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
-                                           logprob_params.logprobs,
-                                           response.result.context_logits,
-                                           response.result.generation_logits,
-                                           response.result.output_token_ids[0])
+        logprobs_result = compute_logprobs(
+            logprob_params.prompt_logprobs,
+            logprob_params.logprobs,
+            response.result.context_logits,
+            response.result.generation_logits,
+            response.result.output_token_ids[0],
+            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+            simple_logprobs=logprob_params.logprobs_simple_format,
+        )
 
         if logprob_params.drop_context_logits:
             response.clear_context_logits()

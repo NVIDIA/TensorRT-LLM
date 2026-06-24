@@ -27,12 +27,20 @@ from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     AttentionDescriptor,
+    AttentionType,
     CausalConvResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
+    ReplayCacheBufIdxHandler,
+    ReplayOldBHandler,
+    ReplayOldDAcumsumHandler,
+    ReplayOldDtHandler,
+    ReplayOldXHandler,
+    ReplayPrevNumAcceptedHandler,
     ResourceHandler,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
+    SpeculativeOnly,
     SSMResourceHandler,
     StateResourceHandler,
     UnpagedResourceHandler,
@@ -45,7 +53,9 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
 
 def test_paged_handler_with_nhd_layout():
     """Test KVPagedResourceHandler with NHD layout."""
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.bfloat16, kv_layout="NHD")
+    handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.bfloat16, kv_layout="NHD", attention_type=AttentionType.mha
+    )
     assert handler.num_kv_heads == 8
     assert handler.head_dim == 64
     assert handler.dtype == torch.bfloat16
@@ -54,7 +64,9 @@ def test_paged_handler_with_nhd_layout():
 
 def test_paged_handler_with_hnd_layout():
     """Test KVPagedResourceHandler with explicit HND layout."""
-    handler = KVPagedResourceHandler(4, 128, dtype=torch.float32, kv_layout="HND")
+    handler = KVPagedResourceHandler(
+        4, 128, dtype=torch.float32, kv_layout="HND", attention_type=AttentionType.mha
+    )
     assert handler.num_kv_heads == 4
     assert handler.head_dim == 128
     assert handler.dtype == torch.float32
@@ -64,7 +76,9 @@ def test_paged_handler_with_hnd_layout():
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 def test_paged_handler_allocate_with_blocks(kv_layout):
     """Verify KVPagedResourceHandler.allocate() returns correct shape."""
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout=kv_layout)
+    handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_layout=kv_layout, attention_type=AttentionType.mha
+    )
     tokens_per_block = 32
     seq_info = SequenceInfo(
         max_seq_len=128,
@@ -102,7 +116,7 @@ def test_paged_handler_allocate_with_blocks(kv_layout):
 
 def test_paged_handler_is_resource_handler():
     """Verify KVPagedResourceHandler is a ResourceHandler subclass."""
-    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16)
+    handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
     assert isinstance(handler, ResourceHandler)
 
 
@@ -285,9 +299,13 @@ def test_resolve_cache_dtype_explicit_fp8():
 
 def test_kv_paged_handler_eq_same_head_dim_dtype():
     """Verify KVPagedResourceHandler __eq__ checks head_dim and dtype."""
-    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
-    h2 = KVPagedResourceHandler(4, 64, dtype=torch.float16)  # Different num_kv_heads
-    h3 = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="NHD")  # Different layout
+    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    h2 = KVPagedResourceHandler(
+        4, 64, dtype=torch.float16, attention_type=AttentionType.mha
+    )  # Different num_kv_heads
+    h3 = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_layout="NHD", attention_type=AttentionType.mha
+    )  # Different layout
 
     # head_dim, kv_factor, dtype, kv_layout -> equal (num_kv_heads doesn't matter for compatibility)
     assert h1 == h2
@@ -296,12 +314,30 @@ def test_kv_paged_handler_eq_same_head_dim_dtype():
 
 def test_kv_paged_handler_eq_different_head_dim_or_dtype():
     """Verify KVPagedResourceHandler __eq__ returns False for different head_dim or dtype."""
-    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16)
-    h2 = KVPagedResourceHandler(8, 128, dtype=torch.float16)  # Different head_dim
-    h3 = KVPagedResourceHandler(8, 64, dtype=torch.bfloat16)  # Different dtype
+    h1 = KVPagedResourceHandler(8, 64, dtype=torch.float16, attention_type=AttentionType.mha)
+    h2 = KVPagedResourceHandler(
+        8, 128, dtype=torch.float16, attention_type=AttentionType.mha
+    )  # Different head_dim
+    h3 = KVPagedResourceHandler(
+        8, 64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+    )  # Different dtype
 
     assert h1 != h2
     assert h1 != h3
+
+
+def test_kv_paged_handler_eq_different_attention_type():
+    """Verify KVPagedResourceHandler __eq__ rejects different attention semantics."""
+    default_handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mha
+    )
+    mla_handler = KVPagedResourceHandler(
+        8, 64, dtype=torch.float16, kv_factor=1, attention_type=AttentionType.mla
+    )
+
+    assert default_handler.attention_type == AttentionType.mha
+    assert mla_handler.attention_type == AttentionType.mla
+    assert default_handler != mla_handler
 
 
 def test_ssm_handler_eq_same_params():
@@ -353,10 +389,10 @@ def test_conv_handler_eq_different_params():
 
 
 def test_spec_ssm_handler_from_base():
-    """Verify SpecSSMResourceHandler mirrors base SSM dims and remains a distinct type."""
+    """Verify IntermediateSSMStateHandler mirrors base SSM dims and remains a distinct type."""
     base = SSMResourceHandler(num_heads=8, head_dim=64, d_state=16, dtype=torch.bfloat16)
-    spec = SpecSSMResourceHandler.from_base(base)
-    matching_spec = SpecSSMResourceHandler(8, 64, 16, dtype=torch.bfloat16)
+    spec = IntermediateSSMStateHandler.from_base(base)
+    matching_spec = IntermediateSSMStateHandler(8, 64, 16, dtype=torch.bfloat16)
 
     assert base.state_shape == (8, 64, 16)
     assert spec.state_shape == (8, 64, 16)
@@ -365,22 +401,22 @@ def test_spec_ssm_handler_from_base():
     assert spec.d_state == base.d_state
     assert spec.dtype == base.dtype
 
-    assert isinstance(spec, SpecSSMResourceHandler)
+    assert isinstance(spec, IntermediateSSMStateHandler)
     assert not isinstance(spec, SSMResourceHandler)
     assert base != spec
     assert spec == matching_spec
 
 
 def test_spec_ssm_handler_from_base_none():
-    """Verify SpecSSMResourceHandler.from_base(None) returns None."""
-    assert SpecSSMResourceHandler.from_base(None) is None
+    """Verify IntermediateSSMStateHandler.from_base(None) returns None."""
+    assert IntermediateSSMStateHandler.from_base(None) is None
 
 
 def test_spec_conv_handler_from_base():
-    """Verify SpecCausalConvResourceHandler mirrors base conv dims and remains a distinct type."""
+    """Verify IntermediateConvStateHandler mirrors base conv dims and remains a distinct type."""
     base = CausalConvResourceHandler(conv_dim=256, d_conv=4, dtype=torch.float32)
-    spec = SpecCausalConvResourceHandler.from_base(base)
-    matching_spec = SpecCausalConvResourceHandler(256, 4, dtype=torch.float32)
+    spec = IntermediateConvStateHandler.from_base(base)
+    matching_spec = IntermediateConvStateHandler(256, 4, dtype=torch.float32)
 
     assert base.state_shape == (256, 3)
     assert spec.state_shape == (256, 3)
@@ -388,12 +424,48 @@ def test_spec_conv_handler_from_base():
     assert spec.d_conv == base.d_conv
     assert spec.dtype == base.dtype
 
-    assert isinstance(spec, SpecCausalConvResourceHandler)
+    assert isinstance(spec, IntermediateConvStateHandler)
     assert not isinstance(spec, CausalConvResourceHandler)
     assert base != spec
     assert spec == matching_spec
 
 
 def test_spec_conv_handler_from_base_none():
-    """Verify SpecCausalConvResourceHandler.from_base(None) returns None."""
-    assert SpecCausalConvResourceHandler.from_base(None) is None
+    """Verify IntermediateConvStateHandler.from_base(None) returns None."""
+    assert IntermediateConvStateHandler.from_base(None) is None
+
+
+# Handlers that only carry meaning on the speculative extend path. The kvcache insert
+# transform keys off the SpeculativeOnly trait to drop these when spec decoding is off, so
+# this list is the contract: every spec-only handler must carry the trait, and no base
+# (non-speculative) state handler may.
+_SPECULATIVE_ONLY_HANDLERS = [
+    IntermediateSSMStateHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+    IntermediateConvStateHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
+    ReplayOldXHandler(num_heads=4, head_dim=64, dtype=torch.bfloat16),
+    ReplayOldBHandler(n_groups=2, d_state=16, dtype=torch.bfloat16),
+    ReplayOldDtHandler(num_heads=4),
+    ReplayOldDAcumsumHandler(num_heads=4),
+    ReplayCacheBufIdxHandler(),
+    ReplayPrevNumAcceptedHandler(),
+]
+
+_NON_SPECULATIVE_HANDLERS = [
+    SSMResourceHandler(num_heads=4, head_dim=64, d_state=16, dtype=torch.bfloat16),
+    CausalConvResourceHandler(conv_dim=128, d_conv=4, dtype=torch.float32),
+    KVPagedResourceHandler(
+        num_kv_heads=4, head_dim=64, dtype=torch.bfloat16, attention_type=AttentionType.mha
+    ),
+]
+
+
+@pytest.mark.parametrize("handler", _SPECULATIVE_ONLY_HANDLERS, ids=lambda h: type(h).__name__)
+def test_speculative_only_handlers_carry_trait(handler):
+    """Every speculative-only handler must carry the SpeculativeOnly trait (gate contract)."""
+    assert isinstance(handler, SpeculativeOnly)
+
+
+@pytest.mark.parametrize("handler", _NON_SPECULATIVE_HANDLERS, ids=lambda h: type(h).__name__)
+def test_base_handlers_do_not_carry_speculative_trait(handler):
+    """Base (non-speculative) handlers must NOT carry the trait, or they'd be wrongly dropped."""
+    assert not isinstance(handler, SpeculativeOnly)
