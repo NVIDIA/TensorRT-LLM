@@ -90,7 +90,14 @@ def _phases_for(cfg: ModelAttnConfig) -> dict:
 def _rope_dict(cfg: ModelAttnConfig):
     if cfg.rope is None:
         return None
-    return dict(dim=cfg.head_dim, theta=10000.0, max_positions=8192, is_neox=(cfg.rope == "neox"))
+    max_positions = 8192
+    if cfg.sliding_window is not None:
+        # Sliding-window decode uses cached length window+17, so the generated
+        # token needs RoPE position window+17 to be present.
+        max_positions = max(max_positions, cfg.sliding_window + 18)
+    return dict(
+        dim=cfg.head_dim, theta=10000.0, max_positions=max_positions, is_neox=(cfg.rope == "neox")
+    )
 
 
 def _common(cfg: ModelAttnConfig) -> dict:
