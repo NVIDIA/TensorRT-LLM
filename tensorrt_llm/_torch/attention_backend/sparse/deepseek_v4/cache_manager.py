@@ -28,7 +28,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
-from .cache_utils import (
+from .compressor import KVCacheDtype
+from .deepseek_v4 import (
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -38,7 +39,6 @@ from .cache_utils import (
     is_overlap_compressor,
     is_sparse_layer,
 )
-from .compressor import KVCacheDtype
 
 
 def _estimate_bytes_per_token(
@@ -359,7 +359,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         tokens_per_block: int,
         vocab_size: int | None,
         cache_tiers: List[GpuCacheTierConfig | HostCacheTierConfig],
-        enable_stats: bool,
     ) -> KVCacheManagerConfigPy:
         """
         Create the cache manager config for DeepSeek-V4.
@@ -480,7 +479,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
-            enable_stats=enable_stats,
+            enable_stats=self.enable_stats,
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:

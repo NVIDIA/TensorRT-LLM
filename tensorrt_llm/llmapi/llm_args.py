@@ -802,7 +802,9 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
     compress_ratios: List[int] = Field(
         default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
-        description="The compress ratios of each layer.")
+        description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
+        "for uncompressed/SWA-only layers; internal allocation code normalizes "
+        "0 to 1, while checkpoint-facing semantics remain unchanged.")
     window_size: int = Field(
         default=128,
         description="The window size for slicing window attention part.")
