@@ -19,7 +19,7 @@ from cutlass.cutlass_dsl import Boolean, Int32, T, dsl_user_op
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 TensormapDescBytes = 128
-TensormapDescBytes = 64  # {$nv-internal-release}
+TensormapDescBytes = 64
 
 # =============================================================================
 # Pointer Utilities
@@ -488,8 +488,6 @@ class OnlineTensormapDescCreator(ABC):
         ...
 
 
-# {$nv-internal-release begin}
-
 # Internal example to show the general grouped gemm online desc construction.
 # =============================================================================
 # General Grouped GEMM TMA Descriptor Constructor
@@ -660,8 +658,6 @@ class GeneralGroupedGemmTensormapConstructor(OnlineTensormapDescCreator):
             cpasync.copy_tensormap(tma_atom_c,
                                    self.get_desc_ptr("c", group_idx))
 
-
-# {$nv-internal-release end}
 
 # =============================================================================
 # MoE Grouped GEMM Tensormap Constructor
