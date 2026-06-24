@@ -315,6 +315,13 @@ class CUDAGraphRunner:
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs
 
+    def is_cuda_graph_replay_compatible(self, key: KeyType,
+                                        attn_metadata: Any) -> bool:
+        stored_signature = self.graph_metadata[key].get(
+            "cuda_graph_replay_signature")
+        current_signature = attn_metadata.cuda_graph_replay_signature()
+        return stored_signature == current_signature
+
     @contextlib.contextmanager
     def allow_capture(self):
         """Context manager that enables CUDA graph capture.
@@ -375,8 +382,12 @@ class CUDAGraphRunner:
         capture_inputs.update(sliced_static_tensors)
 
         self.graph_metadata[key] = {
-            "attn_metadata": initial_inputs["attn_metadata"],
-            "spec_metadata": initial_inputs.get("spec_metadata", None),
+            "attn_metadata":
+            initial_inputs["attn_metadata"],
+            "spec_metadata":
+            initial_inputs.get("spec_metadata", None),
+            "cuda_graph_replay_signature":
+            initial_inputs["attn_metadata"].cuda_graph_replay_signature(),
         }
 
         def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,

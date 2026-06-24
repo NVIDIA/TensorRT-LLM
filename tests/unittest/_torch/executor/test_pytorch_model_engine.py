@@ -11,6 +11,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -83,6 +84,69 @@ class DummyModelEngine(PyTorchModelEngine):
                          mapping=mapping,
                          model=model,
                          llm_args=llm_args)
+
+
+class DummyReplaySignatureMetadata:
+
+    def __init__(self, signature):
+        self.signature = signature
+
+    def cuda_graph_replay_signature(self):
+        return self.signature
+
+
+def _create_cuda_graph_runner_with_signature(key, signature):
+    runner = object.__new__(CUDAGraphRunner)
+    runner.graphs = {}
+    runner.graph_outputs = {}
+    runner.memory_pool = None
+    runner.padding_dummy_requests = {}
+    runner.graph_metadata = {
+        key: {
+            "cuda_graph_replay_signature": signature,
+        },
+    }
+    return runner
+
+
+def test_cuda_graph_replay_signature_allows_unconstrained_backends():
+    key = (1, 0, False, False, True)
+    runner = _create_cuda_graph_runner_with_signature(key, None)
+
+    assert runner.is_cuda_graph_replay_compatible(
+        key, DummyReplaySignatureMetadata(None))
+
+
+def test_cuda_graph_replay_signature_accepts_matching_metadata():
+    key = (1, 0, False, False, True)
+    runner = _create_cuda_graph_runner_with_signature(key, (272, ))
+
+    assert runner.is_cuda_graph_replay_compatible(
+        key, DummyReplaySignatureMetadata((272, )))
+
+
+def test_cuda_graph_replay_signature_rejects_active_page_count_mismatch():
+    key = (1, 0, False, False, True)
+    runner = _create_cuda_graph_runner_with_signature(key, (272, ))
+
+    assert not runner.is_cuda_graph_replay_compatible(
+        key, DummyReplaySignatureMetadata((1, )))
+
+
+def test_cuda_graph_replay_signature_rejects_missing_current_signature():
+    key = (1, 0, False, False, True)
+    runner = _create_cuda_graph_runner_with_signature(key, (272, ))
+
+    assert not runner.is_cuda_graph_replay_compatible(
+        key, DummyReplaySignatureMetadata(None))
+
+
+def test_cuda_graph_replay_signature_rejects_batch_shape_mismatch():
+    key = (2, 0, False, False, True)
+    runner = _create_cuda_graph_runner_with_signature(key, (16, 16))
+
+    assert not runner.is_cuda_graph_replay_compatible(
+        key, DummyReplaySignatureMetadata((16, )))
 
 
 def _create_request(num_tokens, req_id: int):

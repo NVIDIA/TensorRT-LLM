@@ -5033,6 +5033,14 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager, can_run_graph)
+            graph_needs_capture = (self.cuda_graph_runner.needs_capture(key)
+                                   if can_run_graph else False)
+            graph_metadata_compatible = (
+                not can_run_graph or graph_needs_capture
+                or self.cuda_graph_runner.is_cuda_graph_replay_compatible(
+                    key, attn_metadata))
+            if not graph_metadata_compatible:
+                can_run_graph = False
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
