@@ -36,7 +36,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
+from tensorrt_llm.llmapi.llm_args import (MultimodalConfig, TorchLlmArgs,
+                                          TrtLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -155,6 +156,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
         "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
         "build_config":
         ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
+        "multimodal_config": ("video_pruning_rate", ),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
@@ -297,8 +299,9 @@ def get_llm_args(
         otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
-        "video_pruning_rate":
-        video_pruning_rate,
+        "multimodal_config":
+        MultimodalConfig(video_pruning_rate=video_pruning_rate)
+        if video_pruning_rate is not None else None,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
