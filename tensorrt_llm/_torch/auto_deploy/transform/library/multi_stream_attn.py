@@ -123,10 +123,6 @@ _LINEAR_OPS: List[Callable] = [
 # allgather on workspace_id=0 cannot clobber its buffer.
 _AUX_WORKSPACE_ID = 1
 
-# DSv3 MLA fused a-projection split sizes: q_a_lora (1536) and kv_a_with_mqa (576).
-_DSV3_Q_A_OUT = 1536
-_DSV3_KV_A_OUT = 576
-
 
 def _is_narrow_op(n: Node) -> bool:
     """True for either narrow representation: aten.narrow.default or the
@@ -618,6 +614,10 @@ def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, 
     graph = gm.graph
     node_order = {n: i for i, n in enumerate(graph.nodes)}
     num_wrapped = 0
+
+    # DSv3 MLA fused a-projection split sizes: q_a_lora (1536), kv_a_with_mqa (576).
+    _DSV3_Q_A_OUT = 1536
+    _DSV3_KV_A_OUT = 576
 
     # Anchor structurally: the fused DSv3 a-projection is any node feeding two
     # narrows of length 1536 (q_a) and 576 (kv_a).  This is producer-agnostic --
