@@ -30,6 +30,7 @@ from tensorrt_llm.mapping import Mapping
 
 _MIN_NCCL_RUNTIME_VERSION = "2.30.4"
 _MIN_NCCL_EP_INT32_TOPK_VERSION = "0.2"
+_NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
 
 _nccl_ep_installed: Optional[bool] = None
 
@@ -71,7 +72,7 @@ def _nccl_ep_supports_int32_topk_idx() -> bool:
 
         nccl_ep_info = nccl.get_version().nccl_ep
         nccl_ep_version = nccl_ep_info.version if nccl_ep_info is not None else None
-    except Exception as e:
+    except (ImportError, AttributeError, RuntimeError, OSError) as e:
         logger.info(
             f"NCCL EP int32 topk_idx disabled: could not determine libnccl_ep version ({e!r})"
         )
@@ -271,9 +272,8 @@ class NcclEpContext:
         # callers that want 2D should view-flatten the first dim.
         self.scales_buf: Optional[torch.Tensor] = None
         if use_fp8:
-            assert hidden_size % 512 == 0, (
-                f"FP8 dispatch requires hidden % 512 == 0, got {hidden_size}"
-            )
+            if hidden_size % 512 != 0:
+                raise ValueError(f"FP8 dispatch requires hidden % 512 == 0, got {hidden_size}")
             self.scales_buf = torch.empty(
                 self.num_local_experts,
                 self.max_recv_tokens,
@@ -316,7 +316,7 @@ class NcclEpContext:
         if self.ep_group is not None:
             try:
                 self.ep_group.destroy()
-            except Exception as e:
+            except _NCCL_RUNTIME_ERRORS as e:
                 logger.warning(f"NCCL EP group destroy error: {e}")
             self.ep_group = None
 
@@ -330,7 +330,7 @@ class NcclEpContext:
             if w is not None:
                 try:
                     w.close()
-                except Exception as e:
+                except _NCCL_RUNTIME_ERRORS as e:
                     logger.warning(f"NCCL EP window close error ({attr}): {e}")
                 setattr(self, attr, None)
 
@@ -343,7 +343,7 @@ class NcclEpContext:
         if getattr(self, "_output_tokens_alloc", None) is not None:
             try:
                 self._output_tokens_alloc.close()
-            except Exception as e:
+            except _NCCL_RUNTIME_ERRORS as e:
                 logger.warning(f"NCCL EP recv_x buffer free error: {e}")
             self._output_tokens_alloc = None
 
@@ -351,14 +351,16 @@ class NcclEpContext:
             try:
                 self.comm.finalize()
                 self.comm.destroy()
-            except Exception as e:
+            except _NCCL_RUNTIME_ERRORS as e:
                 logger.warning(f"NCCL EP comm destroy error: {e}")
             self.comm = None
 
         if self._ep_mpi_comm is not None:
+            from mpi4py import MPI
+
             try:
                 self._ep_mpi_comm.Free()
-            except Exception as e:
+            except MPI.Exception as e:
                 logger.warning(f"EP MPI sub-comm free error: {e}")
             self._ep_mpi_comm = None
 
@@ -405,6 +407,6 @@ def destroy_all_nccl_ep_contexts():
     for ctx in list(_ep_group_cache.values()):
         try:
             ctx.destroy()
-        except Exception as e:
+        except _NCCL_RUNTIME_ERRORS as e:
             logger.warning(f"Error destroying NCCL EP context: {e}")
     _ep_group_cache.clear()

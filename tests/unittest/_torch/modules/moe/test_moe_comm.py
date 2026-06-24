@@ -1303,8 +1303,7 @@ def _build_combine_reference(
             for i, (src_rank, token_idx) in enumerate(source_info):
                 if src_rank != target_rank or token_idx >= num_tokens:
                     continue
-                eid = recv_slots[i, 0].item()
-                if not (slot_start <= eid < slot_end):
+                if not any(slot_start <= eid < slot_end for eid in recv_slots[i].tolist()):
                     continue
                 if token_idx not in token_hs:
                     token_hs[token_idx] = recv_hs_bf16[i]

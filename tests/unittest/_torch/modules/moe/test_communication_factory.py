@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.modules.fused_moe.communication import communication_factory
+from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
+    AllGatherReduceScatter,
+)
+
+
+def _make_model_config(
+    act_dtype: torch.dtype = torch.bfloat16,
+    moe_max_num_tokens: int | None = 1024,
+):
+    mapping = SimpleNamespace(
+        enable_attention_dp=True,
+        dp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    return SimpleNamespace(
+        mapping=mapping,
+        pretrained_config=SimpleNamespace(hidden_size=4096),
+        torch_dtype=act_dtype,
+        quant_config=None,
+        max_num_tokens=1024,
+        moe_max_num_tokens=moe_max_num_tokens,
+        use_cuda_graph=False,
+        use_low_precision_moe_combine=False,
+        moe_load_balancer=None,
+    )
+
+
+def _strategy_unavailable(*args, **kwargs):
+    raise RuntimeError("strategy unavailable")
+
+
+@pytest.mark.parametrize(
+    ("act_dtype", "moe_max_num_tokens", "match"),
+    [
+        (torch.float16, 1024, "act_dtype=torch.bfloat16"),
+        (torch.bfloat16, None, "moe_max_num_tokens"),
+    ],
+)
+def test_forced_nccl_ep_validates_preconditions(
+    act_dtype: torch.dtype,
+    moe_max_num_tokens: int | None,
+    match: str,
+):
+    model_config = _make_model_config(act_dtype, moe_max_num_tokens)
+
+    with pytest.raises(ValueError, match=match):
+        communication_factory.CommunicationFactory._create_forced_method(
+            "NCCL_EP",
+            model_config,
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            use_flashinfer=False,
+            hidden_size=4096,
+        )
+
+
+@pytest.mark.parametrize(
+    ("act_dtype", "moe_max_num_tokens"),
+    [
+        (torch.float16, 1024),
+        (torch.bfloat16, None),
+    ],
+)
+def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    act_dtype: torch.dtype,
+    moe_max_num_tokens: int | None,
+):
+    model_config = _make_model_config(act_dtype, moe_max_num_tokens)
+
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("NcclEP should not be constructed")
+
+    monkeypatch.setattr(communication_factory, "NcclEP", fail_if_called)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, AllGatherReduceScatter)

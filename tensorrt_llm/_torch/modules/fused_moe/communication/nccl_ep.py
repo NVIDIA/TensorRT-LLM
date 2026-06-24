@@ -43,6 +43,8 @@ from tensorrt_llm.mapping import Mapping
 
 from .base import Communication
 
+_NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
+
 
 class NcclEP(Communication):
     """NCCL EP Low-Latency rank-major communication strategy for MoE expert parallelism."""
@@ -58,6 +60,9 @@ class NcclEP(Communication):
         use_fp8: bool = False,
     ):
         super().__init__(mapping)
+
+        if moe_max_num_tokens is None:
+            raise ValueError("NcclEP requires moe_max_num_tokens to be set.")
 
         from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import (
             get_nccl_ep_context,
@@ -76,7 +81,6 @@ class NcclEP(Communication):
         self.max_top_k = top_k
         self.use_fp8 = use_fp8
 
-        assert moe_max_num_tokens is not None
         self.max_tokens_per_rank = min(max_num_tokens, moe_max_num_tokens)
         self.max_recv_tokens = self.ep_size * self.max_tokens_per_rank
 
@@ -157,16 +161,16 @@ class NcclEP(Communication):
         ctx = self._ctx
 
         all_rank_max_num_tokens = max(all_rank_num_tokens)
-        assert all_rank_max_num_tokens <= self.max_tokens_per_rank, (
-            f"all_rank_max_num_tokens={all_rank_max_num_tokens} > "
-            f"max_tokens_per_rank={self.max_tokens_per_rank}"
-        )
+        if all_rank_max_num_tokens > self.max_tokens_per_rank:
+            raise ValueError(
+                f"all_rank_max_num_tokens={all_rank_max_num_tokens} > "
+                f"max_tokens_per_rank={self.max_tokens_per_rank}"
+            )
 
         num_tokens = hidden_states.shape[0]
         top_k = token_selected_slots.shape[1]
-        assert top_k <= self.max_top_k, (
-            f"top_k={top_k} exceeds configured max_top_k={self.max_top_k}"
-        )
+        if top_k > self.max_top_k:
+            raise ValueError(f"top_k={top_k} exceeds configured max_top_k={self.max_top_k}")
         if token_final_scales is None:
             raise RuntimeError(
                 "NcclEP rank-major dispatch requires token_final_scales "
@@ -293,9 +297,11 @@ class NcclEP(Communication):
         if final_hidden_states.dim() == 3 and final_hidden_states.shape[0] != self.ep_size:
             final_hidden_states = final_hidden_states.reshape(-1, self.hidden_size)
         if final_hidden_states.dim() == 2:
-            assert final_hidden_states.shape[0] == self.max_recv_tokens, (
-                f"combine input rows={final_hidden_states.shape[0]} expected={self.max_recv_tokens}"
-            )
+            if final_hidden_states.shape[0] != self.max_recv_tokens:
+                raise ValueError(
+                    f"combine input rows={final_hidden_states.shape[0]} "
+                    f"expected={self.max_recv_tokens}"
+                )
             final_hidden_states = final_hidden_states.view(
                 self.ep_size,
                 self.max_tokens_per_rank,
@@ -333,7 +339,7 @@ class NcclEP(Communication):
         if self._handle is not None:
             try:
                 self._handle.destroy()
-            except Exception as e:
+            except _NCCL_RUNTIME_ERRORS as e:
                 logger.warning(f"Handle.destroy error during destroy: {e}")
             self._handle = None
         self._ctx = None

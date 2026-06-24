@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -131,7 +131,7 @@ class CommunicationFactory:
             )
 
         # Auto-selection: Try strategies in priority order using try-catch
-        # Priority: NVLinkOneSided > NVLinkTwoSided > DeepEP > DeepEPLowLatency > AllGather
+        # Priority: NVLinkOneSided > NVLinkTwoSided > NcclEP > DeepEP > DeepEPLowLatency > AllGather
 
         try:
             enable_eplb = model_config.moe_load_balancer is not None
@@ -184,8 +184,11 @@ class CommunicationFactory:
             logger.info(f"NVLinkTwoSided not available: {e}")
 
         # Try NCCL EP (rank-major LL). Falls through to DeepEP/AllGather if
-        # libnccl_ep.so is not available. bfloat16-only on the wire.
-        if act_dtype == torch.bfloat16:
+        # prerequisites are not met or libnccl_ep.so is not available.
+        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
+            act_dtype, moe_max_num_tokens
+        )
+        if nccl_ep_unavailable_reason is None:
             try:
                 strategy = NcclEP(
                     mapping,
@@ -199,6 +202,8 @@ class CommunicationFactory:
                 return strategy
             except RuntimeError as e:
                 logger.debug(f"NcclEP not available: {e}")
+        else:
+            logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
@@ -338,6 +343,11 @@ class CommunicationFactory:
                 moe_max_num_tokens,
             )
         elif method == "NCCL_EP":
+            nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
+                act_dtype, moe_max_num_tokens
+            )
+            if nccl_ep_unavailable_reason is not None:
+                raise ValueError(nccl_ep_unavailable_reason)
             return NcclEP(
                 mapping,
                 num_slots,
@@ -350,3 +360,13 @@ class CommunicationFactory:
             return AllGatherReduceScatter(mapping)
         else:
             raise ValueError(f"Unknown communication method: {method}")
+
+    @staticmethod
+    def _get_nccl_ep_unavailable_reason(
+        act_dtype: torch.dtype, moe_max_num_tokens: Optional[int]
+    ) -> Optional[str]:
+        if act_dtype != torch.bfloat16:
+            return f"NcclEP requires act_dtype=torch.bfloat16, got {act_dtype}."
+        if moe_max_num_tokens is None:
+            return "NcclEP requires model_config.moe_max_num_tokens to be set."
+        return None

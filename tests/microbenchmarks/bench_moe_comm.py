@@ -783,10 +783,12 @@ def _time_dispatch_and_combine_cuda_graph(
             cupti_dispatch = detailed_stats.pop("dispatch_times_us")
             cupti_combine = detailed_stats.pop("combine_times_us")
             dispatch_times_us = [
-                ct if ct is not None else et for ct, et in zip(cupti_dispatch, dispatch_times_us)
+                ct if ct is not None else et
+                for ct, et in zip(cupti_dispatch, dispatch_times_us, strict=True)
             ]
             combine_times_us = [
-                ct if ct is not None else et for ct, et in zip(cupti_combine, combine_times_us)
+                ct if ct is not None else et
+                for ct, et in zip(cupti_combine, combine_times_us, strict=True)
             ]
         else:
             detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
@@ -825,6 +827,24 @@ def _gather_per_rank(times_us: List[float], iter_stats: bool = False) -> Dict[st
     return {f"rank{i}": (sum(t) / len(t) if t else 0.0) for i, t in enumerate(all_times)}
 
 
+def _min_local_tokens_for_receiver_coverage(ep_size: int, top_k: int) -> int:
+    if top_k <= 0:
+        raise ValueError(f"top_k must be > 0, got {top_k}")
+    return (ep_size + top_k - 1) // top_k
+
+
+def _scale_local_batch_sizes_for_receiver_coverage(
+    local_batch_sizes: List[int], ep_size: int, top_k: int
+) -> List[int]:
+    min_tokens = _min_local_tokens_for_receiver_coverage(ep_size, top_k)
+    scaled: List[int] = []
+    for local_num_tokens in local_batch_sizes:
+        value = max(int(local_num_tokens), min_tokens)
+        if not scaled or scaled[-1] != value:
+            scaled.append(value)
+    return scaled
+
+
 def _verify_dispatch_sentinel(
     backend: Communication,
     *,
@@ -834,7 +854,7 @@ def _verify_dispatch_sentinel(
     ep_size: int,
     act_dtype: torch.dtype,
     device: torch.device,
-    local_num_tokens: int = 16,
+    local_num_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One dispatch+combine with sender-rank-tagged hidden_states.
 
@@ -846,6 +866,8 @@ def _verify_dispatch_sentinel(
     histogram for the caller to allgather and inspect.
     """
     rank = mpi_rank()
+    min_tokens = _min_local_tokens_for_receiver_coverage(ep_size, top_k)
+    local_num_tokens = min_tokens if local_num_tokens is None else max(local_num_tokens, min_tokens)
     all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
     if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
         return {"rank": rank, "skipped": True}
@@ -893,7 +915,7 @@ def _verify_dispatch_sentinel(
     decoded = first_col.round().to(torch.int64)
     unique, counts = decoded.unique(return_counts=True)
     histogram: Dict[int, int] = {
-        int(u) - 1: int(c) for u, c in zip(unique.tolist(), counts.tolist())
+        int(u) - 1: int(c) for u, c in zip(unique.tolist(), counts.tolist(), strict=True)
     }
     return {"rank": rank, "histogram": histogram}
 
@@ -1134,6 +1156,10 @@ def _run_benchmark_worker_under_current_mpi(
 
     hidden_size, top_k, num_experts_total, quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
+    if args.verify:
+        local_batch_sizes = _scale_local_batch_sizes_for_receiver_coverage(
+            local_batch_sizes, ep_size, top_k
+        )
     act_dtype = torch.bfloat16
     quant_config = (
         QuantConfig(quant_algo=None)
@@ -1264,11 +1290,12 @@ def _run_benchmark_worker_under_current_mpi(
                 ep_size=ep_size,
                 act_dtype=act_dtype,
                 device=device,
+                local_num_tokens=local_batch_sizes[0],
             )
             all_verify = mpi_allgather(verify_local)
             # Pass criterion: every receiver must have at least one token from
-            # every sender [0, ep_size). With perfect_router top_k=ep_size=8
-            # and local_num_tokens=16, every (S,R) pair has matching routes;
+            # every sender [0, ep_size). The verify local_num_tokens is scaled
+            # so local_num_tokens * top_k covers every receiver;
             # any zero-column means the recv buffer was silently dropped from
             # that sender.
             verify_failed = False
@@ -1288,7 +1315,7 @@ def _run_benchmark_worker_under_current_mpi(
                     f"padding/unmapped) ===",
                     flush=True,
                 )
-                cols = [-1] + list(range(ep_size))
+                cols = [-1, *range(ep_size)]
                 header = "R\\S | " + "  ".join(f"{c:>5}" for c in cols) + "  | total"
                 print(header)
                 for entry in sorted(all_verify, key=lambda e: e.get("rank", -1)):
