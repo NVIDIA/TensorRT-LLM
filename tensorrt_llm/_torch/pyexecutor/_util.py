@@ -11,8 +11,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_device_integrated,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_device_integrated, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 
 # isort: off

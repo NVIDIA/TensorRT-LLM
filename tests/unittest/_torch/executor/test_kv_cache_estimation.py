@@ -185,10 +185,10 @@ def test_integrated_gpu_estimation_ignores_affine_intercept():
 
     with (
         patch("torch.cuda.mem_get_info", return_value=(100, 100)),
-        patch.object(KvCacheCreator, "_get_kv_size_per_token",
-                     return_value=CacheCost(slope=1, intercept=128)),
-        patch("tensorrt_llm._torch.pyexecutor._util.is_device_integrated",
-              return_value=True),
+        patch.object(
+            KvCacheCreator, "_get_kv_size_per_token", return_value=CacheCost(slope=1, intercept=128)
+        ),
+        patch("tensorrt_llm._torch.pyexecutor._util.is_device_integrated", return_value=True),
     ):
         assert c._get_token_num_for_estimation() == 64
 
