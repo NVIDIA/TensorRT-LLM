@@ -1342,9 +1342,11 @@ class TestResizeQuota(TestKVCacheManagerV2):
         # Shrink the gpu quota
         success = self.manager.resize(GPU_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(GPU_LEVEL) <= 32 << 20
-        # also shrink the host quota, this would evict some pages to disk
-        success = self.manager.resize(HOST_LEVEL, 4 << 20)
-        assert success and self.manager.get_quota(HOST_LEVEL) <= 4 << 20
+        # also shrink the host quota, this would evict some pages to disk.
+        # 16MB is the smallest shrink that still satisfies the SWA worst-case
+        # min_slots floor (sink + window blocks across all pool groups).
+        success = self.manager.resize(HOST_LEVEL, 16 << 20)
+        assert success and self.manager.get_quota(HOST_LEVEL) <= 16 << 20
         # also shrink the disk quota, this would drop some old pages
         success = self.manager.resize(DISK_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(DISK_LEVEL) <= 32 << 20
@@ -2018,16 +2020,25 @@ class TestInitRatioConfig(unittest.TestCase):
         """With scratch reuse, windowed PG needs fewer slots during prefill.
 
         16 SWA layers (frac_max=1/16) + 16 full layers.
-        Typical step: 4 prefill requests (history=0, capacity=4096).
+        Typical step: 8 prefill requests (history=0, capacity=16384).
 
         Without scratch: both PGs need the same block count; ratio reflects
         the buffer-size difference only.
         With scratch: PG0 needs far fewer slots -> ratio shifts toward PG1.
+
+        The quota is deliberately large and the sequences long so the SWA
+        worst-case min_slots floor (sink + window blocks) is a negligible
+        fraction and does not clamp the scratch-reduced windowed ratio.
         """
-        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=16384, history_length=0)] * 8)
         multi = dict(num_windowed_layers=16, num_full_layers=16)
-        cfg_no = self._make_config(typical_step=step, enable_swa_scratch_reuse=False, **multi)
-        cfg_yes = self._make_config(typical_step=step, enable_swa_scratch_reuse=True, **multi)
+        big_quota = 8 << 30
+        cfg_no = self._make_config(
+            gpu_quota=big_quota, typical_step=step, enable_swa_scratch_reuse=False, **multi
+        )
+        cfg_yes = self._make_config(
+            gpu_quota=big_quota, typical_step=step, enable_swa_scratch_reuse=True, **multi
+        )
         mgr_no = KVCacheManager(cfg_no)
         mgr_yes = KVCacheManager(cfg_yes)
         ratio_no = mgr_no._current_gpu_ratio
