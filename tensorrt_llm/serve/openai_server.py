@@ -403,6 +403,10 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
+        self._ensure_post_processor_hook_supported(
+            self.use_harmony,
+            getattr(self.generator.args, "post_processor_hook", None))
+
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
             # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
@@ -446,6 +450,22 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    @staticmethod
+    def _ensure_post_processor_hook_supported(
+            use_harmony: bool, post_processor_hook: Optional[str]) -> None:
+        """Reject ``--post_processor_hook`` combined with a harmony/gpt-oss model.
+
+        The harmony output path is rebuilt from raw token ids, not detokenized
+        text, so the text-based hook cannot act there.
+        """
+        if use_harmony and post_processor_hook:
+            raise ValueError(
+                "--post_processor_hook is not supported with harmony/gpt-oss models "
+                "in this version: the harmony output path is reconstructed from "
+                "raw token ids and would bypass the text-based hook. Disable the "
+                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
+                "not needed.")
 
     def _logit_bias_vocab_size(self) -> int:
         for config in (self.model_config,
@@ -1264,6 +1284,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
+
+            if request.mm_processor_kwargs:
+                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser

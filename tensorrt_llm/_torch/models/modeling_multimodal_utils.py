@@ -16,7 +16,7 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
-import contextlib
+import functools
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
@@ -63,31 +63,32 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
 })
 
 
-@contextlib.contextmanager
-def bypass_processor_output_validation():
-    """Filter processor-output keys out of ``validate_typed_dict`` for the
-    duration of an HF processor call.
+@functools.lru_cache(maxsize=None)
+def _install_processor_output_validation_filter():
+    """Install a process-wide filter over transformers' ``validate_typed_dict``.
 
     transformers 5.x added strict per-modality TypedDict validation in
-    ``ProcessorMixin._merge_kwargs``. The leak is an upstream bug: e.g.
-    ``Qwen2_5_VLProcessor._get_num_multimodal_tokens`` does
-    ``Qwen2_5_VLProcessorKwargs._defaults["videos_kwargs"].update(kwargs)``
-    on the class-level default dict (instead of a copy), so once any caller
-    passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets baked
-    into the per-modality default and leaks into every subsequent processor
-    call's ``output_kwargs[<modality>]`` — tripping the validator with
-    ``TypeError: merged_typed_dict.__init__() got an unexpected keyword
-    argument 'video_grid_thw'`` even when no caller passes such keys.
+    ``ProcessorMixin._merge_kwargs``. The keys in ``_PROCESSOR_OUTPUT_KEYS``
+    are processor *outputs* that leak into ``output_kwargs[<modality>]`` via
+    upstream bugs — e.g. ``Qwen2_5_VLProcessor._get_num_multimodal_tokens``
+    mutates the class-level default dict instead of a copy, so once any
+    caller passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets
+    baked into the per-modality default and trips ``validate_typed_dict`` on
+    every subsequent processor call. We filter those keys out before calling
+    the genuine huggingface_hub implementation.
 
-    Patches ``validate_typed_dict`` in *all* transformers modules that bind
-    it — each module has its own ``from huggingface_hub.dataclasses import
-    validate_typed_dict``, so patching only one is insufficient to cover
-    sub-processor validation paths. The set of binder modules differs
-    across transformers versions (5.3.x re-binds it on
-    ``image_processing_utils_fast``; 5.5.x dropped that module and re-binds
-    it on ``image_processing_utils`` instead), so we discover the binders
-    by ``hasattr`` rather than hard-coding the list. The originals are
-    restored on exit.
+    Called from each Qwen VL input processor's ``__init__``. ``@lru_cache``
+    guarantees the patch runs at most once per process: ``base_orig`` is
+    captured exactly once from the genuine HF function, so concurrent
+    ``trtllm-serve`` workers dispatched via ``asyncio.to_thread`` cannot
+    observe a partially-patched state or chain filters recursively.
+
+    Patches every transformers module that binds ``validate_typed_dict`` —
+    each does its own ``from huggingface_hub.dataclasses import …``, so
+    patching only one is insufficient. The set of binders differs across
+    transformers versions (5.3.x rebinds it on ``image_processing_utils_fast``;
+    5.5.x dropped that module and rebinds it on ``image_processing_utils``
+    instead), so we discover binders by ``hasattr`` rather than hard-coding.
     """
     import transformers.processing_utils as _pu
     import transformers.video_processing_utils as _vpu
@@ -105,8 +106,7 @@ def bypass_processor_output_validation():
         raise RuntimeError(
             "No transformers module exposes validate_typed_dict; "
             "cannot patch processor output validation.")
-    originals = {b: b.validate_typed_dict for b in binders}
-    base_orig = next(iter(originals.values()))
+    base_orig = binders[0].validate_typed_dict
 
     def _filtered_validate(schema, data):
         if isinstance(data, dict):
@@ -118,11 +118,6 @@ def bypass_processor_output_validation():
 
     for b in binders:
         b.validate_typed_dict = _filtered_validate
-    try:
-        yield
-    finally:
-        for b, orig in originals.items():
-            b.validate_typed_dict = orig
 
 
 def _get_uncached_multimodal_params(
@@ -196,10 +191,26 @@ def _cache_multimodal_embeddings(
     )
 
 
+def _normalize_encoder_embeddings(
+    encoder_embeddings: Union[torch.Tensor, List[torch.Tensor]],
+) -> List[torch.Tensor]:
+    if isinstance(encoder_embeddings, torch.Tensor):
+        return [encoder_embeddings]
+
+    if (not isinstance(encoder_embeddings, list) or not all(
+            isinstance(embedding, torch.Tensor)
+            for embedding in encoder_embeddings)):
+        raise TypeError(
+            "encoder_forward_fn must return a torch.Tensor or a list of torch.Tensor."
+        )
+
+    return encoder_embeddings
+
+
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
-        [List[MultimodalParams]],
-        List[torch.Tensor],
+        ...,
+        torch.Tensor | List[torch.Tensor],
     ],
     multimodal_params: List[MultimodalParams],
     encoder_kwargs: Optional[Dict[str, Any]] = None,
@@ -215,7 +226,8 @@ def get_multimodal_embeddings(
 
     Args:
         encoder_forward_fn: Callable that performs encoder forward pass.
-                           Should accept List[MultimodalParams] and return List[torch.Tensor].
+                           Should accept List[MultimodalParams] and return either
+                           a single torch.Tensor or List[torch.Tensor].
         multimodal_params: All multimodal parameters in the batch.
         encoder_kwargs: Optional kwargs to pass to encoder_forward_fn.
     Returns:
@@ -223,6 +235,13 @@ def get_multimodal_embeddings(
     """
     if not multimodal_params:
         return []
+
+    # Wait before touching tensors produced on the MM side stream. Do not
+    # clear the event here; repeated stream-side waits are cheap, and leaving
+    # the event field untouched avoids races if a caller accidentally reuses it.
+    for param in multimodal_params:
+        if param.encoder_event is not None:
+            torch.cuda.current_stream().wait_event(param.encoder_event)
 
     # Step 1: Find uncached multimodal params that need encoder processing
     uncached_multimodal_params = _get_uncached_multimodal_params(
@@ -233,6 +252,7 @@ def get_multimodal_embeddings(
         kwargs = encoder_kwargs or {}
         encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
                                                 **kwargs)
+        encoder_embeddings = _normalize_encoder_embeddings(encoder_embeddings)
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_embeddings) > 1:

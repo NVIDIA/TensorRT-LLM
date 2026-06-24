@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import enum
+import os
 import threading
+from ctypes.util import find_library
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -40,6 +43,7 @@ from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
+
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
@@ -53,6 +57,76 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+_NCCL_GB10_SYMMETRIC_FIXED_VERSION = 23004  # NCCL 2.30.4
+_NCCL_MNNVL_ENABLE = "NCCL_MNNVL_ENABLE"
+
+
+@lru_cache(maxsize=None)
+def _is_gb10() -> bool:
+    """Return True on GB10 (DGX Spark)."""
+    return "GB10" in torch.cuda.get_device_name()
+
+
+@lru_cache(maxsize=None)
+def _get_nccl_runtime_version_code() -> Optional[int]:
+    lib_names = ["libnccl.so.2", "libnccl.so"]
+    nccl_lib = find_library("nccl")
+    if nccl_lib is not None and nccl_lib not in lib_names:
+        lib_names.append(nccl_lib)
+
+    for lib_name in lib_names:
+        try:
+            nccl = ctypes.CDLL(lib_name)
+            nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            nccl.ncclGetVersion.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            continue
+
+        version = ctypes.c_int()
+        if nccl.ncclGetVersion(ctypes.byref(version)) == 0:
+            return version.value
+
+    return None
+
+
+@lru_cache(maxsize=None)
+def _needs_gb10_nccl_symmetric_workaround() -> bool:
+    if not _is_gb10():
+        return False
+
+    runtime_version = _get_nccl_runtime_version_code()
+    return (runtime_version is None
+            or runtime_version < _NCCL_GB10_SYMMETRIC_FIXED_VERSION)
+
+
+@lru_cache(maxsize=None)
+def _init_gb10_nccl_symmetric_workaround() -> bool:
+    if not _needs_gb10_nccl_symmetric_workaround():
+        return False
+
+    os.environ.setdefault(_NCCL_MNNVL_ENABLE, "0")
+    return True
+
+
+def _init_deep_gemm_pdl() -> None:
+    try:
+        cuda_available = torch.cuda.is_available()
+    except RuntimeError as err:
+        logger.warning(
+            f"Failed to query CUDA availability for DeepGEMM PDL: {err}")
+        return
+
+    if not cuda_available:
+        return
+
+    try:
+        deep_gemm.set_pdl(get_env_enable_pdl())
+    except RuntimeError as err:
+        logger.warning(f"Failed to initialize DeepGEMM PDL: {err}")
+
+
+_init_deep_gemm_pdl()
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -232,7 +306,7 @@ def fused_moe(
     use_dynamic_fc2_scale: bool = False,
     # Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
     # Each *_ranks   : CPU int32  [num_seqs]
-    # Each *_weights : CPU int64  [num_seqs, 3]  -- (A_ptr, B_ptr, DoRA_ptr unused)
+    # Each *_weights : CPU int64  [num_seqs, 3], holding (A_ptr, B_ptr, DoRA_ptr); DoRA unused.
     fc1_lora_ranks: Optional[torch.Tensor] = None,
     fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
     fc2_lora_ranks: Optional[torch.Tensor] = None,
@@ -242,6 +316,16 @@ def fused_moe(
     host_request_types: Optional[torch.Tensor] = None,
     host_context_lengths: Optional[torch.Tensor] = None,
     lora_max_low_rank: int = 0,
+    # Slot-indexed CUDA-graph LoRA inputs (mutually exclusive with the per-request
+    # tensors above). When fc1_slot_lora_ranks is provided, the per-token expansion
+    # is performed inside the op via token_to_slot indexed into the slot tables.
+    fc1_slot_lora_ranks: Optional[torch.Tensor] = None,
+    fc1_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    fc2_slot_lora_ranks: Optional[torch.Tensor] = None,
+    fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    gated_slot_lora_ranks: Optional[torch.Tensor] = None,
+    gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    token_to_slot: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -302,11 +386,17 @@ def fused_moe(
         gemm_idx=2,
     )
 
-    lora_active = fc1_lora_ranks is not None
+    lora_active = (fc1_lora_ranks is not None) or (fc1_slot_lora_ranks
+                                                   is not None)
     if min_latency_mode and lora_active:
         # Mirror the C++ rejection so the error surfaces before the kernel allocates anything.
         raise RuntimeError(
             "MoE LoRA is not supported in min-latency mode. Disable min_latency_mode or pass no LoRA tensors."
+        )
+    if (fc1_lora_ranks is not None) and (fc1_slot_lora_ranks is not None):
+        raise RuntimeError(
+            "MoE LoRA: per-request and slot-indexed input schemas are mutually exclusive. "
+            "Provide either (fc1_lora_ranks, ...) or (fc1_slot_lora_ranks, ..., token_to_slot), not both."
         )
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
     try:
@@ -332,7 +422,10 @@ def fused_moe(
                 out_tensor, use_dynamic_fc2_scale, fc1_lora_ranks,
                 fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs,
                 gated_lora_ranks, gated_lora_weight_ptrs, host_request_types,
-                host_context_lengths, lora_max_low_rank)
+                host_context_lengths, lora_max_low_rank, fc1_slot_lora_ranks,
+                fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks,
+                fc2_slot_lora_weight_ptrs, gated_slot_lora_ranks,
+                gated_slot_lora_weight_ptrs, token_to_slot)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
@@ -396,7 +489,14 @@ def _(input: torch.Tensor,
       gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
       host_request_types: Optional[torch.Tensor] = None,
       host_context_lengths: Optional[torch.Tensor] = None,
-      lora_max_low_rank: int = 0):
+      lora_max_low_rank: int = 0,
+      fc1_slot_lora_ranks: Optional[torch.Tensor] = None,
+      fc1_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      fc2_slot_lora_ranks: Optional[torch.Tensor] = None,
+      fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      gated_slot_lora_ranks: Optional[torch.Tensor] = None,
+      gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      token_to_slot: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
@@ -1607,14 +1707,30 @@ def _(
 
 # deep_gemm_gen_tuning_buckets is imported from ..utils
 
+_USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
+                                           "1") == "1"
+
 
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
-    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
+    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
+
+    When the CUDA path is selected on SM100 and ``TRTLLM_FUSED_FP8_QUANT_PACK=1``
+    is set, the fused ``fp8_quantize_1x128_packed_ue8m0`` op is used and the
+    follow-on ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped:
+    the new op writes packed-UE8M0 (int32) scales directly in the layout
+    deep_gemm expects, so deep_gemm's internal layout transform falls into the
+    pre-packed branch and skips its own pack kernel as well.
+    """
     TACTIC_TRITON = 1
     if tactic == TACTIC_TRITON:
         a, a_sf = fp8_quantize.triton_fp8_quantize_1x128(input, use_ue8m0=True)
-    else:
-        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
+        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            a_sf.transpose(0, 1))
+        return a, a_sf
+    if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() >= 100:
+        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+        return a, a_sf
+    a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
     a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
         a_sf.transpose(0, 1))
     return a, a_sf
@@ -1834,7 +1950,8 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
-                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+                 dtype: Optional[torch.dtype] = None,
+                 swiglu_limit: Optional[float] = None) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -1853,8 +1970,10 @@ def silu_and_mul(x: torch.Tensor,
         x_ptr=x,
         x_stride=x.stride(0),
         d=d,
+        swiglu_limit=swiglu_limit or 0.0,
         BLOCK_SIZE=1024,
         HAS_O_SCALE=scale is not None,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
     )
 
     return o
@@ -1865,6 +1984,7 @@ def _(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     b, n = x.shape
 
@@ -1969,10 +2089,14 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        # NCCL_SYMMETRIC is unsupported on GB10 (DGX Spark) before NCCL 2.30.4.
+        if _needs_gb10_nccl_symmetric_workaround():
+            valid_strategies = [AllReduceStrategy.NCCL.value]
+        else:
+            valid_strategies = [
+                AllReduceStrategy.NCCL_SYMMETRIC.value,
+                AllReduceStrategy.NCCL.value,
+            ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -1999,6 +2123,7 @@ class AllReduceRunner(TunableRunner):
         **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
+        gb10_nccl_workaround = _needs_gb10_nccl_symmetric_workaround()
         if do_preparation:
             valid_tactics = self.get_valid_tactics(inputs,
                                                    OptimizationProfile(),
@@ -2014,11 +2139,16 @@ class AllReduceRunner(TunableRunner):
                 )
             return input
         if tactic == -1:
-            # tactic == -1 means the autotuner cache missed for this shape;
-            # fall back to NCCL_SYMMETRIC. Asymmetric ncclMemAlloc failures are
-            # handled by a cross-rank barrier in NCCLWindowAllocator, which
-            # falls back to plain NCCL if allocation fails on any rank.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape.
+            # On GB10 (DGX Spark), NCCL_SYMMETRIC is unsupported before NCCL
+            # 2.30.4, so fall back to plain NCCL. On other platforms fall back
+            # to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
+            # by a cross-rank barrier in NCCLWindowAllocator which falls back
+            # to plain NCCL.
+            if gb10_nccl_workaround:
+                tactic = AllReduceStrategy.NCCL.value
+            else:
+                tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
         return torch.ops.trtllm.allreduce(
             input,
