@@ -118,11 +118,21 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
-    # FlashInfer's paged KV append kernel launches one thread block with
+    # FlashInfer's standard paged KV append kernel supports a fixed head_dim
+    # dispatch set and launches one thread block with
     # ``blockDim=(head_dim / vec_size, num_kv_heads)``. CUDA rejects launches
     # above 1024 threads/block, so large MHA shapes such as 128 KV heads x
     # bf16/fp16 head_dim 128 cannot be represented by this backend path.
-    if backend == "FLASHINFER" and getattr(case, "cache", "paged") != "none":
+    if (
+        backend == "FLASHINFER"
+        and getattr(case, "cache", "paged") != "none"
+        and not getattr(case, "is_mla", False)
+    ):
+        if case.head_dim not in (64, 128, 256, 512):
+            return (
+                "FLASHINFER paged KV append supports only head_dim "
+                f"64/128/256/512 (got {case.head_dim})"
+            )
         kv_dtype = getattr(case, "kv_dtype", None) or getattr(case, "dtype", None)
         dtype_size = 1 if kv_dtype == "float8_e4m3fn" else 2
         vec_size = max(16 // dtype_size, case.head_dim // 32)
@@ -133,6 +143,21 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
                 f"limit ({threads_per_head} threads/head x "
                 f"{case.num_kv_heads} KV heads)"
             )
+
+    # The TRTLLM MMHA generation kernel is fast-built in this environment, which
+    # omits non-core head sizes (for example Phi-3's head_dim 96). Context FMHA
+    # still covers those configs, so only skip cases that include generation.
+    if (
+        backend == "TRTLLM"
+        and getattr(case, "cache", "paged") != "none"
+        and not getattr(case, "is_mla", False)
+        and case.num_contexts < len(case.seq_lens)
+        and case.head_dim not in (32, 64, 128, 256)
+    ):
+        return (
+            "TRTLLM fast-build MMHA generation supports only head_dim "
+            f"32/64/128/256 (got {case.head_dim})"
+        )
 
     # TRTLLM's fp8 generation (XQA) path computes in fp8 and needs the model's
     # real KV-dequant + output scale state (fed by the Attention module's
