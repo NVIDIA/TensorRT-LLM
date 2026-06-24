@@ -89,11 +89,24 @@ class TestAttentionConfigQuantValidation:
                 ),
             )
 
-    def test_supported_quant_config_sage(self):
+    @pytest.mark.parametrize(
+        ("qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
+        [
+            ("int8", 1, 1, 1),
+            ("int8", 1, 4, 1),
+            ("int8", 1, 16, 1),
+            ("fp8", 1, 1, 1),
+            ("fp8", 1, 4, 1),
+        ],
+    )
+    def test_supported_quant_config_sage(self, qk_dtype, q_block_size, k_block_size, v_block_size):
         attention = AttentionConfig(
             backend="TRTLLM",
             quant_attention_config=QuantAttentionConfig(
-                qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1
+                qk_dtype=qk_dtype,
+                q_block_size=q_block_size,
+                k_block_size=k_block_size,
+                v_block_size=v_block_size,
             ),
         )
 
