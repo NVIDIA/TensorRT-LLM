@@ -1484,8 +1484,8 @@ class TokenInPullTokenBackPush:
                 token_comm_args.fc2_done_counter[i] = Int32(0)
                 i = i + stride
 
-        if cutlass.const_expr(
-                self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode ==
+                              "atomic_counter"):  # nosec B105
             if thread_linear == Int32(0):
                 token_comm_args.token_back_schedule_counter.store(Int32(0))
 

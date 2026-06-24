@@ -409,14 +409,14 @@ def validate_megamoe_tactic(tactic: Tuple) -> None:
         raise ValueError(f"use_bulk_fc2_store must be bool, got {use_bulk_fc2_store!r}.")
     # bulk fc2 store is only valid under epi_warps (the non-epi modes stage fc2
     # output locally -> forced non-bulk).
-    if use_bulk_fc2_store and token_back_mode != "epi_warps":
+    if use_bulk_fc2_store and token_back_mode != "epi_warps":  # nosec B105
         raise ValueError(
             f"use_bulk_fc2_store=True requires token_back_mode='epi_warps', got "
             f"{token_back_mode!r} (non-epi token-back forces non-bulk fc2 store)."
         )
     # N128 only pays off under epi_warps + bulk; other token-back modes
     # with N128 are not recommended.
-    if mma_tiler[1] == 128 and token_back_mode != "epi_warps":
+    if mma_tiler[1] == 128 and token_back_mode != "epi_warps":  # nosec B105
         raise ValueError(
             f"mma_tiler_mnk[1]=128 (N128) is only recommended with "
             f"token_back_mode='epi_warps'; got {token_back_mode!r}."
@@ -432,7 +432,7 @@ def validate_megamoe_tactic(tactic: Tuple) -> None:
             f"TokenInPullTokenBackPush hard limit), got {flag_batch!r}."
         )
     # standalone token-back warps publish one slot at a time.
-    if token_back_mode == "standalone_warps" and flag_batch != 1:
+    if token_back_mode == "standalone_warps" and flag_batch != 1:  # nosec B105
         raise ValueError(
             f"token_back_mode='standalone_warps' requires flag_batch == 1, got {flag_batch}."
         )

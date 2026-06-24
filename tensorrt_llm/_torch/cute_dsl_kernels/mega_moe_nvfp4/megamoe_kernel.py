@@ -208,7 +208,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             raise ValueError(
                 f"token_back_mode must be 'epi_warps', 'standalone_warps', "
                 f"or 'reuse_dispatch_warps'; got {token_back_mode!r}.")
-        token_back_by_dispatch = token_back_mode != "epi_warps"
+        token_back_by_dispatch = token_back_mode != "epi_warps"  # nosec B105
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
@@ -240,7 +240,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # token_back_by_push concurrently with dispatch_pull, selected by the
         # user-facing token_back_mode knob ("standalone_warps").
         self.token_back_mode = token_back_mode
-        self.token_back_standalone = token_back_mode == "standalone_warps"
+        self.token_back_standalone = token_back_mode == "standalone_warps"  # nosec B105
         self.token_back_warp_id = (12, 13, 14,
                                    15) if self.token_back_standalone else None
         num_token_back_warps = (len(self.token_back_warp_id)
@@ -548,7 +548,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                     (num_experts_per_rank, ),
                     16,
                 ))
-            if self.token_back_schedule_mode == "atomic_counter":
+            if self.token_back_schedule_mode == "atomic_counter":  # nosec B105
                 specs.append(
                     _RegionSpec(
                         "token_back_schedule_counter",
@@ -933,8 +933,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             fc2_done_counter = None
             combine_output_u8 = combine_output
 
-        if cutlass.const_expr(
-                self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode ==
+                              "atomic_counter"):  # nosec B105
             token_back_schedule_counter = self._view_local(
                 local_workspace,
                 "token_back_schedule_counter",
