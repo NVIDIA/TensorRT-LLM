@@ -18,9 +18,6 @@ from typing import List, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.normalization import (
-    triton_rms_norm,  # noqa: F401  (registers triton_fused_add_rms_norm)
-)
 from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
@@ -107,14 +104,9 @@ class FuseAddRMSNorm(BaseTransform):
             # Insert the fused call right before the norm node. Using
             # inserting_before(norm_node) ensures correct topological order:
             # fused_node → norm_out → add_out all appear before norm_node.
-            # Pick the matching fused op (both return (norm, add)). Triton path uses the
-            # OpOverload as target since the CustomOpDef object lacks __name__ for FX.
-            is_triton = is_op(norm_node, torch.ops.auto_deploy.triton_rms_norm)
-            fused_target = (
-                torch.ops.auto_deploy.triton_fused_add_rms_norm.default
-                if is_triton
-                else flashinfer_fused_add_rms_norm
-            )
+            # Both rmsnorm backends fuse into the TRT-LLM flashinfer fused op (returns
+            # (norm, add)); it matches triton/flashinfer rms_norm bit-for-bit at equal perf.
+            fused_target = flashinfer_fused_add_rms_norm
 
             with graph.inserting_before(norm_node):
                 # fused(x, residual, weight, eps) returns (norm_result, add_result).

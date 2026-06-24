@@ -84,7 +84,9 @@ class DeepSeekV3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.ops.auto_deploy.triton_rms_norm(
+        # Backend-agnostic: fuse_rmsnorm picks the rms_norm op per rmsnorm_backend
+        # (default flashinfer), then fuse_add_rms_norm folds the residual add into it.
+        return torch.ops.auto_deploy.torch_rmsnorm(
             hidden_states, self.weight, self.variance_epsilon
         ).to(hidden_states.dtype)
 
