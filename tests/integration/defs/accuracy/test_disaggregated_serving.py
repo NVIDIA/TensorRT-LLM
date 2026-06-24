@@ -2176,9 +2176,11 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
             use_py_transceiver=False)
+        # corner case: max_batch_size = 1 + dp for ctx to check if dp dummy requests are handled correctly
+        ctx_cfg["max_batch_size"] = 1
+        ctx_cfg["enable_attention_dp"] = True
         ctx_cfg["tensor_parallel_size"] = 2
         ctx_cfg["moe_expert_parallel_size"] = 2
-        ctx_cfg["enable_attention_dp"] = True
         gen_cfg["tensor_parallel_size"] = 4
         gen_cfg["moe_expert_parallel_size"] = 4
         gen_cfg["pipeline_parallel_size"] = 1

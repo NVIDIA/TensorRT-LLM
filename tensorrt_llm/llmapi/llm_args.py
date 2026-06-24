@@ -517,6 +517,84 @@ class SeqLenAwareSparseAttentionConfig(BaseSparseAttentionConfig):
         return False
 
 
+class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
+    """Configuration for MiniMax-M3 block-sparse attention.
+
+    Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
+
+      1. An index attention branch projects a per-head Q vector and a
+         **single replicated** K vector, scores main K/V cache blocks,
+         and selects the top-``topk`` blocks per ``(num_kv_heads, q_token)``
+         pair (with ``init_blocks`` forced at the head and ``local_blocks``
+         forced at the tail).
+      2. A sparse GQA attention runs only over the selected blocks.
+
+    The selected backend at runtime uses
+    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
+    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
+    paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
+    parallel to the main K/V cache. The M3 checkpoint sets
+    ``disable_index_value=True`` on every sparse layer so no index V
+    cache is allocated for the bring-up.
+    """
+
+    algorithm: Literal["minimax_m3"] = "minimax_m3"
+    sparse_num_index_heads: int = Field(
+        default=4,
+        description="Number of index-attention heads (per TP rank's view).",
+    )
+    sparse_index_dim: int = Field(
+        default=128,
+        description="Per-head index Q/K dimension.",
+    )
+    sparse_block_size: int = Field(
+        default=128,
+        description="Block size used by per-block scoring + top-k selection.",
+    )
+    sparse_topk_blocks: int = Field(
+        default=16,
+        description="Number of top-k blocks per (kv_head, q_token).")
+    sparse_init_blocks: int = Field(
+        default=0,
+        description=
+        "Number of leading blocks forced into the top-k regardless of score.",
+    )
+    sparse_local_blocks: int = Field(
+        default=1,
+        description=
+        "Number of trailing blocks forced into the top-k regardless of score.",
+    )
+    sparse_score_type: Literal["max"] = Field(
+        default="max",
+        description="Per-block score reduction; the M3 checkpoint sets 'max'.",
+    )
+    sparse_disable_index_value: bool = Field(
+        default=True,
+        description="If True, skip the index V branch (M3 checkpoint default).",
+    )
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return self.sparse_block_size
+
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
+            MiniMaxM3SparseParams
+
+        return MiniMaxM3SparseParams(
+            num_index_heads=self.sparse_num_index_heads,
+            sparse_index_dim=self.sparse_index_dim,
+            block_size=self.sparse_block_size,
+            topk=self.sparse_topk_blocks,
+            init_blocks=self.sparse_init_blocks,
+            local_blocks=self.sparse_local_blocks,
+            score_type=self.sparse_score_type,
+            disable_index_value=self.sparse_disable_index_value,
+        )
+
+
 class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     """Configuration for RocketKV sparse attention."""
     algorithm: Literal["rocket"] = Field(default="rocket")
@@ -1227,21 +1305,23 @@ class DecodingBaseConfig(StrictBaseModel):
         "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
         "PyTorch backend only.")
 
-    allow_advanced_sampling: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "If true, allows non-greedy sampling when speculation is used. Only applicable "
-        "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
-    )
-
     use_rejection_sampling: bool = Field(
         default=False,
         status="prototype",
         description=
-        "If true, enables rejection sampling for one-model speculative decoding paths. "
-        "This is intended for non-greedy sampling configurations on the PyTorch backend. "
+        "If true, enables rejection sampling for one-model speculative decoding "
+        "paths when the batch contains any non-greedy request. All-greedy batches "
+        "always take the argmax fast path regardless of this flag. Set to false "
+        "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
+
+    allow_advanced_sampling: bool = Field(
+        default=False,
+        status="deprecated",
+        description=
+        "DEPRECATED: no-op kept for backward compatibility. Will be removed "
+        "in a future release. Non-greedy sampling is now auto-detected per "
+        "request; this flag no longer has any effect.")
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
@@ -1297,14 +1377,32 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_config(self):
-        """Reject SA-enhanced configurations that invalidate rejection sampling."""
+        """Disable rejection sampling when SA-enhanced configurations are
+        active, since SA may override the proposed draft tokens. This is a
+        silent fallback so the new default (True) does not break sa_config
+        users.
+        """
         if self.use_rejection_sampling and getattr(self, 'sa_config',
                                                    None) is not None:
-            raise ValueError(
-                "use_rejection_sampling is incompatible with sa_config "
-                "because SA enhancement may override the proposed draft tokens."
-            )
+            self.use_rejection_sampling = False
         return self
+
+    @model_validator(mode='before')
+    @classmethod
+    def _warn_deprecated_allow_advanced_sampling(cls, data):
+        """Warn when users set the deprecated allow_advanced_sampling flag.
+
+        Non-greedy sampling is now auto-detected per request and always
+        available, so the flag is a no-op; warn loudly so callers update
+        their configs before the flag is removed.
+        """
+        if isinstance(data, dict) and 'allow_advanced_sampling' in data:
+            logger.warning(
+                "DecodingBaseConfig: 'allow_advanced_sampling' is deprecated "
+                "and will be removed in a future release. The flag has no "
+                "effect — non-greedy sampling is now auto-detected per "
+                "request.")
+        return data
 
     @model_validator(mode='after')
     # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
@@ -2810,6 +2908,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
+        MiniMaxM3SparseAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]
@@ -4661,12 +4760,17 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
-            if self.speculative_config.use_rejection_sampling:
-                if not isinstance(self.speculative_config,
-                                  Eagle3DecodingConfig):
-                    raise ValueError(
-                        "use_rejection_sampling is only supported for "
-                        "PyTorch Eagle3 one-model speculative decoding paths.")
+            if self.speculative_config.use_rejection_sampling and not isinstance(
+                    self.speculative_config, Eagle3DecodingConfig):
+                # Rejection sampling is only wired up for Eagle3 one-model paths.
+                # Silently fall back for other spec types so the new default
+                # (True) does not break them.
+                # TODO: extend rejection sampling to the remaining speculative
+                # decoding paths (MTP / DraftTarget / PARD / DFlash /
+                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
+                # so new spec algorithms get rejection sampling for free; once
+                # all paths are covered this whitelist guard can be removed.
+                self.speculative_config.use_rejection_sampling = False
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
