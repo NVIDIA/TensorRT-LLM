@@ -425,7 +425,23 @@ class ModelConfig(Generic[TConfig]):
                     config.has_zero_point = layer_cfg['has_zero_point']
                 if 'pre_quant_scale' in layer_cfg:
                     config.pre_quant_scale = layer_cfg['pre_quant_scale']
+                # W4A16_NVFP4 is a modelopt label for full NVFP4 (W4A4).
+                # Normalize to NVFP4 for kernel dispatch so the CUTLASS
+                # NVFP4 MoE path is selected (the label distinction is
+                # only meaningful at the checkpoint-loading boundary).
+                if config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                    config.quant_algo = QuantAlgo.NVFP4
                 mixed_quant_configs[layer] = config
+            # LMHead bypasses Linear.create_weights (manual Parameter),
+            # so NVFP4 weight scales are never allocated there.  Move
+            # lm_head to exclude_modules so it loads as BF16.
+            if mixed_quant_configs and "lm_head" in mixed_quant_configs:
+                if quant_config.exclude_modules is None:
+                    quant_config.exclude_modules = []
+                if "lm_head" not in quant_config.exclude_modules:
+                    quant_config.exclude_modules = list(
+                        quant_config.exclude_modules) + ["lm_head"]
+                del mixed_quant_configs["lm_head"]
             layer_quant_config = mixed_quant_configs
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:

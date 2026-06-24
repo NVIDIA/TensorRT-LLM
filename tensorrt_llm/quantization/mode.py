@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +40,10 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     INT8 = auto()
     MIXED_PRECISION = auto()
     NVFP4 = auto()
+    # W4A16_NVFP4 is a modelopt naming convention alias for NVFP4.
+    # Both weight and input activations are quantized to FP4 (W4A4).
+    # The kernel dispatch path normalizes this to NVFP4 semantics.
+    W4A16_NVFP4 = auto()
     W4A8_NVFP4_FP8 = auto()
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
@@ -417,6 +421,10 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_nvfp4=True)
         elif quant_algo == QuantAlgo.NVFP4_ARC:
             # NVFP4_ARC uses the same QuantMode as NVFP4, distinction is at QuantAlgo level
+            quant_mode = QuantMode.from_description(use_nvfp4=True)
+        elif quant_algo == QuantAlgo.W4A16_NVFP4:
+            # W4A16_NVFP4 is a modelopt label for NVFP4 (full W4A4 FP4 quant).
+            # Map to the same QuantMode bits as NVFP4 for kernel dispatch.
             quant_mode = QuantMode.from_description(use_nvfp4=True)
         elif quant_algo == QuantAlgo.W4A8_NVFP4_FP8:
             quant_mode = QuantMode.from_description(use_w4a8_nvfp4_fp8=True)
