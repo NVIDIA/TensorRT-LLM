@@ -1580,16 +1580,6 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping is not None and self.mapping.has_cp_helix():
             effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
 
-        # Blackwell trtllm-gen custom-mask spec-dec dynamic-tree generation
-        # FMHA reads out of bounds during CUDA-graph capture when the capture
-        # dummy uses the model's full context length.  The benchmark uses a
-        # max-token budget, so capture a graph within that budget.
-        if (self.spec_config is not None
-                and self.spec_config.spec_dec_mode.use_one_engine()
-                and getattr(self.spec_config, 'use_dynamic_tree', False)):
-            effective_max_seq_len = min(effective_max_seq_len,
-                                        self.max_num_tokens)
-
         sparse_config = self.sparse_attention_config
         if (isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
                 and sparse_config.needs_separate_short_long_cuda_graphs()):
