@@ -1777,9 +1777,9 @@ class _TorchLLM(BaseLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
         input_processor_kwargs = {}
-        if self.args.video_pruning_rate is not None:
-            input_processor_kwargs[
-                'video_pruning_rate'] = self.args.video_pruning_rate
+        video_pruning_rate = self.args.multimodal_config.video_pruning_rate
+        if video_pruning_rate is not None:
+            input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,

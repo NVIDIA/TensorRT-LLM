@@ -3,13 +3,12 @@
 
 The runner has two layers worth testing:
 
-* Pure-Python (bucket selection, side-stream guard, padding policy).
+* Pure-Python (bucket selection, padding policy).
 * CUDA graph capture/replay.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 from unittest import mock
@@ -18,7 +17,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
-    _MM_SIDE_STREAM_ENV,
     EncoderGraphKey,
     EncoderGraphTensorSpec,
     MultimodalEncoderGraphRunner,
@@ -140,13 +138,6 @@ class _FakeGraph:
         self.replay_calls += 1
 
 
-@pytest.fixture(autouse=True)
-def clean_side_stream_env(monkeypatch):
-    """Temporarily unset side-stream prefetch for tests unless a test sets it explicitly."""
-    monkeypatch.delenv(_MM_SIDE_STREAM_ENV, raising=False)
-    yield
-
-
 def _make_logic_runner(
     *,
     buckets: Optional[List[EncoderGraphKey]] = None,
@@ -173,31 +164,6 @@ def _make_logic_runner(
         output_specs={"y": 0},
         config=config,
     )
-
-
-@pytest.fixture
-def construct_with_env():
-    """Build a runner with the side-stream env var forced to a value.
-
-    The autouse env fixture restores the prior env state on teardown.
-    """
-
-    def _construct(env_value: Optional[str]):
-        os.environ.pop(_MM_SIDE_STREAM_ENV, None)
-        if env_value is not None:
-            os.environ[_MM_SIDE_STREAM_ENV] = env_value
-        config = MultimodalEncoderCudaGraphConfig(
-            buckets=[(128, 1)],
-        )
-        return MultimodalEncoderGraphRunner(
-            encoder_fn=_NeverInvokedEncoder(),
-            metadata_provider=_NoopMetadataProvider(),
-            input_specs={"x": EncoderGraphTensorSpec(shape=(4,), dtype=torch.float32)},
-            output_specs={"y": 0},
-            config=config,
-        )
-
-    return _construct
 
 
 @pytest.mark.parametrize(
@@ -329,21 +295,6 @@ def test_empty_buckets_rejected():
             output_specs={"y": 0},
             config=config,
         )
-
-
-def test_side_stream_env_var_blocks_runner(construct_with_env):
-    with pytest.raises(RuntimeError):
-        construct_with_env("2")
-
-
-def test_side_stream_env_var_zero_is_allowed(construct_with_env):
-    # Should construct without raising.
-    construct_with_env("0")
-
-
-def test_side_stream_invalid_env_value_raises(construct_with_env):
-    with pytest.raises(ValueError):
-        construct_with_env("not-an-int")
 
 
 def test_metadata_buffer_snapshot_records_declared_attrs():
