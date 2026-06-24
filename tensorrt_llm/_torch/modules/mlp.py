@@ -113,10 +113,8 @@ class MLP(nn.Module):
         self._use_fused_relu2_quant = (has_nvfp4 and has_kernel and has_scale
                                        and is_relu2 and is_sm100_or_later)
 
-        # Eligibility for the fused up-GEMM + bias + GELU(tanh) CuteDSL epilogue,
-        # computed once here (mirrors _use_fused_relu2_quant). bf16-out is the
-        # base path; fp4-out additionally needs an NVFP4 down_proj with a static
-        # input_scale (the SFC norm_const), mirroring GatedMLP.
+        # Static eligibility for the fused GELU(tanh) CuteDSL epilogue (mirrors
+        # GatedMLP); the runtime quant_method check is deferred to first forward.
         self._use_fused_gelu, self._use_fused_gelu_fp4out = (
             self._gelu_fusion_eligibility())
 
@@ -134,12 +132,18 @@ class MLP(nn.Module):
             return self.forward_lora(x, lora_params=lora_params)
 
         # Fuse up_proj GEMM + bias + GELU(tanh) (+ NVFP4-quant) into the GEMM
-        # epilogue (mirrors GatedMLP's SwiGLU paths) when eligible.
-        if self._use_fused_gelu_fp4out:
-            m = self._token_count(x)
-            return self.down_proj(
-                self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
-        elif self._use_fused_gelu:
+        # epilogue (mirrors GatedMLP). Static eligibility can go stale: quant_method
+        # may be downgraded to unquantized after create_weights (e.g. LTX-2
+        # quant-exclusion), so re-check the NVFP4 _input_prepare at runtime (a
+        # torch.compile trace-time guard, not a per-step cost); else fall back to eager.
+        if self._use_fused_gelu and hasattr(
+                getattr(self.up_proj, "quant_method", None), "_input_prepare"):
+            if self._use_fused_gelu_fp4out and hasattr(
+                    getattr(self.down_proj, "quant_method", None),
+                    "_input_prepare"):
+                m = self._token_count(x)
+                return self.down_proj(
+                    self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
             return self.down_proj(self._fused_gelu(x))
 
         x_up = self.up_proj(x)
@@ -154,13 +158,12 @@ class MLP(nn.Module):
         return x_down
 
     def _gelu_fusion_eligibility(self) -> Tuple[bool, bool]:
-        """Return (bf16_out_ok, fp4_out_ok) for the fused GELU(tanh) epilogue.
-
-        Mirrors GatedMLP._can_fuse_gate_up_swiglu / _can_fuse_gate_up_swiglu_fp4out
-        for the non-gated GELU(tanh) activation (bias supported). Requires the
-        Blackwell CuteDSL op(s), SM 100/103, and an NVFP4 up_proj. fp4-out builds
-        on bf16-out and additionally needs an NVFP4 down_proj with a static
-        input_scale and no forced dynamic quantization.
+        """Return (bf16_out_ok, fp4_out_ok) static eligibility for the fused
+        GELU(tanh) epilogue (mirrors GatedMLP's SwiGLU paths). Requires the
+        Blackwell CuteDSL op(s), SM 100/103, and an NVFP4 up_proj; fp4-out builds
+        on bf16-out and also needs an NVFP4 down_proj with a static input_scale
+        and no forced dynamic quantization. The runtime quant_method check is
+        applied in forward (quant_method can be downgraded after this).
         """
         if (self.activation is not gelu_tanh
                 or get_sm_version() not in (100, 103)
