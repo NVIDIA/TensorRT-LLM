@@ -11,7 +11,8 @@ import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from .._utils import (mpi_comm, mpi_rank, print_all_stacks,
+                      set_parent_death_signal)
 from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
@@ -178,6 +179,15 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
+
+    # Anti-zombie: if our parent (proxy / MPI launcher) dies abruptly, have the
+    # kernel SIGKILL this worker so it can't orphan and leak GPU memory.
+    try:
+        set_parent_death_signal()
+    except OSError as e:
+        logger.warning(
+            f"PR_SET_PDEATHSIG setup failed: {e}; orphaned workers may leak "
+            "GPU memory if the parent dies abruptly.")
 
     def _print_stacks():
         counter = 0
