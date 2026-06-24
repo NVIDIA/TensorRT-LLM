@@ -126,6 +126,14 @@ def validateRef() {
     }
 }
 
+def savePipelineScripts() {
+    // Capture the pipeline's own version of the scan scripts before the workspace
+    // is overwritten by checkoutSource() with params.ref. This ensures the script
+    // logic always matches the Groovy that is actually running.
+    checkout scm
+    sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
+}
+
 def checkoutSource ()
 {
     trtllm_utils.setupGitMirror()
@@ -343,7 +351,7 @@ def processScanResults(ref) {
                 def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
                 def output = withEnv(["LICENSE_CHECK_TOKEN=${token}"]) {
                     sh(script: """
-                        venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
+                        venv/bin/python /tmp/pulse_in_pipeline_scanning/main.py \
                             --build-url ${pipelineUrl} \
                             --build-number ${env.BUILD_NUMBER} \
                             --ref ${ref} \
@@ -404,6 +412,7 @@ pipeline {
             steps {
                 script {
                     container("cpu") {
+                        savePipelineScripts()
                         installTools()
                         checkoutSource()
                         validateRef()
