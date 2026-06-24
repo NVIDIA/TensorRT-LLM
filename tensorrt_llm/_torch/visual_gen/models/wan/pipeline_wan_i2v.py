@@ -112,7 +112,10 @@ class WanImageToVideoPipeline(BasePipeline):
         calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
-        t_freq = ce.timesteps_proj(timestep)
+        # The forward path receives normalized timesteps. TeaCache coefficients
+        # were calibrated against WAN's raw scheduler timestep scale.
+        timestep_for_embedding = timestep * self.scheduler.config.num_train_timesteps
+        t_freq = ce.timesteps_proj(timestep_for_embedding)
 
         # Cast to embedder's dtype (avoid int8 quantized layers)
         te_dtype = next(iter(ce.time_embedder.parameters())).dtype
@@ -370,7 +373,6 @@ class WanImageToVideoPipeline(BasePipeline):
             is_wan22_14b=self.is_wan22_14b,
             name_or_path=getattr(self.config, "_name_or_path", ""),
             num_heads=getattr(self.config, "num_attention_heads", 40),
-            include_i2v=True,
         )
 
     @property
@@ -417,6 +419,7 @@ class WanImageToVideoPipeline(BasePipeline):
         self,
         image: Union[PIL.Image.Image, torch.Tensor, str],
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         height: int = 480,
         width: int = 832,
@@ -425,7 +428,6 @@ class WanImageToVideoPipeline(BasePipeline):
         guidance_scale: Optional[float] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
-        seed: int = 42,
         max_sequence_length: int = 512,
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
@@ -551,7 +553,12 @@ class WanImageToVideoPipeline(BasePipeline):
         last_model_used = [None]
 
         def forward_fn(
-            latents_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for WAN I2V transformer with two-stage support.
 
@@ -603,7 +610,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latent_model_input,
-                timestep=timestep_input,
+                timestep=timestep_input / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds_to_use,
             )

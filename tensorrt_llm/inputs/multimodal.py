@@ -467,6 +467,12 @@ class MultimodalParams:
                            during KV cache scenarios. Contains information about cached
                            tokens, multimodal token positions, and lengths for efficient
                            processing during inference.
+        input_ids_start_offset: Start index of this request's (current-chunk) tokens
+                           within the flattened `input_ids` of the current forward pass
+                           (0 by default). Populated for context requests by the model
+                           engine and consumed by models that rewrite token IDs in place
+                           (e.g. Nemotron Nano EVS) so each request writes into its own
+                           span instead of assuming a contiguous multimodal prefix.
 
     Structure of multimodal_data:
         {
@@ -496,6 +502,14 @@ class MultimodalParams:
     multimodal_input: Optional[MultimodalInput] = None
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
+    input_ids_start_offset: int = 0
+    # CUDA event recorded on a side stream by the MM encoder prefetch path.
+    # When set, the consume site in `get_multimodal_embeddings` issues a
+    # `wait_event` on the current stream before reading cached embeddings.
+    # Always `None` unless `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is positive and a prefetch ran.
+    encoder_event: Optional[torch.cuda.Event] = field(default=None,
+                                                      repr=False,
+                                                      compare=False)
 
     def __post_init__(self):
         """Ensure default values are properly set."""

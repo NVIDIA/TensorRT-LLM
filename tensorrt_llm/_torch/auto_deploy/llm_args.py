@@ -443,6 +443,27 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def reject_piecewise_cuda_graph_for_speculative_decoding(self):
+        compile_model = self.transforms.get("compile_model", {})
+        if (
+            self.speculative_config is not None
+            and self.is_cuda_graph_enabled()
+            and compile_model.get("piecewise_enabled", False)
+        ):
+            raise ValueError(
+                "Speculative decoding with AutoDeploy does not currently support piecewise CUDA "
+                "graph capture."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def disable_piecewise_for_non_piecewise_backend(self):
+        compile_model = self.transforms.get("compile_model")
+        if compile_model is not None and not self.is_cuda_graph_enabled():
+            compile_model["piecewise_enabled"] = False
+        return self
+
     ### UTILITY METHODS ############################################################################
     @property
     def requires_uniform_kv_caches(self) -> bool:
@@ -497,7 +518,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return factory
 
     def is_cuda_graph_enabled(self) -> bool:
-        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+        cuda_graph_backends = {"torch-cudagraph", "torch-opt"}
+        return self.compile_backend in cuda_graph_backends
 
     def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
         """Build DistConfig from YAML transform config and runtime MPI info.

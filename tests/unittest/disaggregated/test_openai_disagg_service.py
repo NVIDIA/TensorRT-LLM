@@ -429,7 +429,7 @@ class TestVerifyCtxResponseDiagnostics:
     @pytest.mark.asyncio
     async def test_missing_disagg_request_id_includes_ctx_id(self):
         svc = _make_service("context_first")
-        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=555)
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=555)
         resp.choices[0].disaggregated_params.disagg_request_id = None
         resp.choices[0].disaggregated_params.ctx_request_id = 555
         with pytest.raises(ValueError, match=r"disagg_request_id is None.*555"):
@@ -439,6 +439,24 @@ class TestVerifyCtxResponseDiagnostics:
     async def test_valid_response_passes(self):
         svc = _make_service("context_first")
         resp = _make_completion_response("ok", finish_reason="stop", disagg_request_id=42)
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+    @pytest.mark.asyncio
+    async def test_completed_response_with_null_ctx_request_id_passes(self):
+        # CTX finished early (finish_reason='stop'): no GEN handoff was set up,
+        # so ctx_request_id is None. The verifier must accept it (NVBug 6245861).
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=42)
+        resp.choices[0].disaggregated_params.ctx_request_id = None
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+    @pytest.mark.asyncio
+    async def test_completed_response_with_null_disagg_request_id_passes(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=42)
+        resp.choices[0].disaggregated_params.disagg_request_id = None
         result = await svc._verify_ctx_response(resp)
         assert result is resp
 

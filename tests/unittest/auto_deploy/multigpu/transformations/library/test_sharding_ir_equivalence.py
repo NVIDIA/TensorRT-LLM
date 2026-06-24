@@ -86,9 +86,13 @@ def _has_ir_markers(gm) -> bool:
     This helper is the in-test equivalent of the follow-up PR's
     ``has_sharding_ir_markers`` dispatcher in ``sharding_ir.py``.
     """
-    target = torch.ops.auto_deploy.all_reduce
+    # Match both the OpOverloadPacket and its ``.default`` overload: torch.export
+    # emits the overload (``all_reduce.default``) as node.target, which is NOT ==
+    # the packet, so comparing against the packet alone silently misses every
+    # marker and skips sharding for all IR families.
+    targets = (torch.ops.auto_deploy.all_reduce, torch.ops.auto_deploy.all_reduce.default)
     for node in gm.graph.nodes:
-        if node.op == "call_function" and node.target == target:
+        if node.op == "call_function" and node.target in targets:
             return True
     return False
 
@@ -121,28 +125,37 @@ SEQ_LEN = 256
 WEIGHT_SEED = 0
 INPUT_SEED = 42
 
-# bf16 is the default forward dtype for unquantized AutoDeploy deployments.
-# fp32 would give tighter numerics but production runs in bf16, so that's
-# what the equivalence test should validate. With random init std=0.05 and a
-# deterministic-router fix applied to MoE blocks, clean sharding produces
-# rel_rmse < 0.012 on every IR family; sabotaged sharding produces > 0.05.
-FORWARD_DTYPE = torch.bfloat16
+# fp32 forward dtype. This test validates the *sharding transform* (weight / scale
+# / bias slicing + collective insertion), which is dtype-independent math, so fp32
+# isolates it cleanly: correct sharding reproduces the unsharded output to ~1e-6,
+# while a broken shard (missing collective, double-counted row-parallel bias, ...)
+# diverges by O(1). bf16 instead conflates real bugs with precision noise (up to
+# ~0.05 on attention-heavy models such as gpt_oss/step3p7, overlapping the sabotage
+# band). bf16 production numerics are covered by the accuracy tests, not here.
+FORWARD_DTYPE = torch.float32
 
-# Random init std. Small enough that 4 stacked layers don't blow up in bf16,
-# large enough that the per-rank contribution missing under sabotage is
-# detectable. Anything below ~0.03 makes sabotage indistinguishable from
-# noise on dense models; anything above ~0.1 starts triggering bf16 routing
-# noise in MoE blocks even with the deterministic-router fix.
+# Random init std. Large enough that the per-rank contribution missing under
+# sabotage is clearly detectable, small enough that 4 stacked layers stay
+# numerically sane.
 INIT_STD = 0.05
 
-# Relative-RMSE tolerance: ``||y_s - y_u||_F / ||y_u||_F``. Scale-invariant
-# across models with very different output magnitudes (dense models have
-# ``|y|`` ~0.08, MoE models ~3.6). Picked to be above the worst clean
-# rel_rmse observed on any IR family (~0.012 on qwen3_5_moe due to
-# softmax-amplified bf16 noise in router weights) and well below the
-# smallest sabotage rel_rmse (~0.05 on dense models). Override via
-# ``SHARDING_IR_REL_RMSE_TOL`` env var when triaging.
+# Relative-RMSE tolerance: ``||y_s - y_u||_F / ||y_u||_F``. In fp32, correct
+# sharding reproduces the unsharded output to ~1e-6 while a broken shard diverges
+# by O(1), so this loose bound trivially separates the two (no per-model tuning).
+# Override via ``SHARDING_IR_REL_RMSE_TOL`` env var when triaging.
 REL_RMSE_TOL = 0.02
+
+# Per-family ``shard_layers`` whitelist. ``None`` (the default) shards every linear,
+# which corrupts models that intend some weights replicated -- e.g. qwen3_5_moe's
+# shared expert (added after the routed all_reduce, with no all_reduce of its own) --
+# so those layer_types are excluded here. ``lm_head`` is excluded for both families:
+# its vocab-parallel gather (colwise + all_gather) is applied by a separate transform
+# this offline harness does not run, so lm_head is replicated here and validated
+# elsewhere. Keyed by modeling short name (``modeling_<name>.py`` -> ``<name>``).
+_SHARD_LAYERS_BY_FAMILY = {
+    "qwen3_5_moe": ["moe", "delta", "mha"],
+    "gpt_oss": ["mha", "moe"],
+}
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -340,8 +353,16 @@ def _run_equivalence_job_impl(
         moe_ep_size=dist_cfg_spec["moe_ep_size"],
         enable_attention_dp=enable_attention_dp,
     )
+    apply_hints_cfg = {"stage": "sharding", "enabled": True}
+    family = Path(modeling_file).stem.removeprefix("modeling_")
+    shard_layers = _SHARD_LAYERS_BY_FAMILY.get(family)
+    if shard_layers is not None:
+        # Mirror the model's production recipe: shard only these layer_types and
+        # leave the rest (e.g. qwen3_5_moe's untagged shared expert / lm_head)
+        # replicated, matching how the model is actually deployed.
+        apply_hints_cfg["shard_layers"] = shard_layers
     sharded_transforms = {
-        "apply_sharding_hints": {"stage": "sharding", "enabled": True},
+        "apply_sharding_hints": apply_hints_cfg,
         "strip_sharding_hints": {"stage": "weight_load"},
     }
     optimizer = InferenceOptimizer(factory=None, config=sharded_transforms, dist_config=dist_config)

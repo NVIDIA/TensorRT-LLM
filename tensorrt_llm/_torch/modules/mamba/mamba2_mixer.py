@@ -348,8 +348,6 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
-            has_initial_states_p = has_initial_states[:num_prefills]
-            conv_states[state_indices_p[~has_initial_states_p]].zero_()
             # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
             xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
                                                     self.tp_d_inner,
@@ -376,6 +374,7 @@ class Mamba2Mixer(nn.Module):
 
             initial_states = None
             if mamba_metadata.use_initial_states:
+                # Rows without cached prefix state start SSM from zero.
                 initial_states = torch.where(
                     has_initial_states[:, None, None, None],
                     ssm_states[state_indices_p], 0)
@@ -414,11 +413,22 @@ class Mamba2Mixer(nn.Module):
                 # Speculative decoding only supported with Python path
                 assert layer_cache is not None, \
                     "Speculative decoding requires Python MambaCacheManager"
-                # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
-                draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
                 use_replay = getattr(attn_metadata.kv_cache_manager,
                                      'use_replay_state_update', False)
+                draft_token_num = spec_metadata.runtime_draft_len + 1
+                if use_replay:
+                    replay_metadata = (attn_metadata.kv_cache_manager.
+                                       get_replay_state_update_metadata())
+                    assert replay_metadata is not None, (
+                        "Mamba replay state update is enabled but replay "
+                        "metadata was not allocated.")
+                    replay_step_width = replay_metadata.replay_step_width
+                    assert draft_token_num == replay_step_width, (
+                        "Mamba replay state update does not support dynamic "
+                        "draft length yet. Runtime token width "
+                        f"{draft_token_num} must match fixed replay step "
+                        f"width {replay_step_width}.")
 
                 intermediate_state_indices = _cached_arange(
                     attn_metadata.kv_cache_manager.get_max_resource_count(),
@@ -513,11 +523,9 @@ class Mamba2Mixer(nn.Module):
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
-                    # Both replay and flashinfer read from the cache manager's
-                    # persistent per-slot Philox seed buffer; replay indexes by
-                    # cache_batch_idx, flashinfer reads slot 0 from a (1,)
-                    # view.  In-place add_(1) keeps CUDA-graph replay fresh
-                    # without allocating any new CUDA tensors per forward.
+                    # Both replay and flashinfer use a single Philox seed. The
+                    # cache manager owns the persistent buffer; passing a (1,)
+                    # view avoids allocating CUDA tensors per forward.
                     rand_seed = layer_cache.mamba_ssm_rand_seed
                     assert rand_seed is not None, (
                         "Mamba SSM stochastic rounding is enabled but the "
@@ -525,13 +533,13 @@ class Mamba2Mixer(nn.Module):
                         "_util.py passes mamba_ssm_stochastic_rounding=True "
                         "to the cache manager.")
                     rand_seed.add_(1)
-                    if use_replay:
-                        philox_kwargs['rand_seed'] = rand_seed
-                    else:
-                        philox_kwargs['rand_seed'] = rand_seed[:1]
+                    philox_kwargs['rand_seed'] = rand_seed[:1]
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
+                    # replay_work_items is write-first for persistent_main and
+                    # carries decode-batch position, cache slot, PNAT, and
+                    # active cache buffer index for replay kernels.
                     replay_selective_state_update(
                         ssm_states,
                         layer_cache.old_x,
@@ -550,6 +558,9 @@ class Mamba2Mixer(nn.Module):
                         dt_softplus=self.delta_softplus,
                         state_batch_indices=state_batch_indices,
                         out=out_4d,
+                        n_writes=mamba_metadata.replay_n_writes,
+                        replay_work_items=(
+                            mamba_metadata.replay_work_items[:num_decodes]),
                         launch_with_pdl=True,
                         **philox_kwargs,
                     )

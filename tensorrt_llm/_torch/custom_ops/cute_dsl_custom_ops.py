@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import itertools
 import math
 from typing import List, Optional, Tuple
@@ -1612,20 +1613,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
         global_sf: torch.Tensor,
         use_tvm_ffi: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = mat_a.shape[0]
         n = mat_b.shape[-2]
         n_out = n // 2
         sf_vec_size = 16
-        # FP4 output packed: [m, n_out // 2]
-        fp4_output = torch.empty(m,
-                                 n_out // 2,
-                                 dtype=mat_a.dtype,
-                                 device=mat_a.device)
+        # FP4 output packed: [m, n_out // 2]. Use new_empty with the input
+        # shape list so the SymInt for the token dim is preserved through the
+        # FX graph (matches the BF16 / nvfp4_gemm fake patterns; a positional
+        # torch.empty(m, ...) loses the SymInt link required by the piecewise
+        # CUDA graph optimizer).
+        fp4_shape = list(mat_a.shape)
+        fp4_shape[-1] = n_out // 2
+        fp4_output = mat_a.new_empty(fp4_shape)
         # Scale factors: 1D
+        m = mat_a.shape[0]
         sf_size = pad_up(m, 128) * pad_up(n_out // sf_vec_size, 4)
-        output_sf = torch.empty(sf_size,
-                                dtype=input_scale.dtype,
-                                device=input_scale.device)
+        output_sf = input_scale.new_empty([sf_size])
         return fp4_output, output_sf
 
     class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
@@ -2145,7 +2147,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
-                    use_blkred=True,
                     raster_along_m=raster_along_m,
                 )
                 # Compute max active clusters on current device
@@ -5708,16 +5709,95 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLGvrTopKDecodeRunner:
         """Runner for the GVR Top-K cuTe DSL kernel (Blackwell SM100).
 
-        Owns the JIT compile cache keyed on
-        ``(dtype, top_k, next_n, tuning_knobs, compress_ratio)`` and an
-        auto-heuristic that resolves T (threads/block), V (vec-load width),
-        ``min_blocks_per_mp`` (ptxas ``__launch_bounds`` cap) and
-        ``enable_warp_parallel_reduce`` from input shape + dtype.
-
-        Production knobs (tuning parameters) are fixed: ``enable_unroll_4``
-        and ``enable_phase3_unroll`` always on, ``use_constant_hint`` off.
+        Owns the JIT cache and the (T, V, min_blocks_per_mp,
+        warp_parallel_reduce) heuristic. ``forward()`` dispatches three
+        paths from ``(counters, order_row)`` — see its docstring. All
+        share :meth:`_pick_tuning`; only the compiled kernel class and
+        launch signature differ.
         """
         kernel_cache: dict = {}
+
+        @staticmethod
+        def _pick_tuning(
+            torch_dtype: torch.dtype,
+            num_rows: int,
+            N_per_cta: int,
+            num_sms: int,
+            max_seq_len: Optional[int],
+            data_ptr: int,
+        ) -> dict:
+            """Pick T / V / min_blocks_per_mp tuning knobs shared by
+            single-CTA / sort and LB compile paths. Returned keys match
+            ``_compile`` / ``_compile_lb`` param names for ``**tuning``
+            spreading.
+            """
+            enable_unroll_4 = True
+            enable_phase3_unroll = True
+            use_constant_hint = False
+
+            # T=1024 needs 1 CTA/SM grid AND enough per-CTA vec work.
+            # Under graph capture, raise the half-prec bar so a small
+            # capture-N doesn't force T=1024 on small-N replays
+            # (~14-16% regression).
+            if max_seq_len is not None and torch_dtype != torch.float32:
+                n_thresh_t = 131072
+            else:
+                n_thresh_t = 65536
+            num_threads_per_block = (1024 if
+                                     (num_rows <= num_sms
+                                      and N_per_cta >= n_thresh_t) else 512)
+            # V=256-bit only helps fp32 at large N. Half-prec cvt
+            # doubles reg pressure (5-11% loss at K=512/1024). Caller
+            # must hand a contiguous (32B-aligned) tensor — torch.empty
+            # / row slices satisfy this; column / stride-padded layouts
+            # may not.
+            use_256bit_load = (torch_dtype == torch.float32
+                               and N_per_cta >= 16384)
+            if use_256bit_load:
+                assert data_ptr % 32 == 0, (
+                    f"use_256bit_load=True requires 32B-aligned "
+                    f"logits.data_ptr(), got {data_ptr} % 32 = "
+                    f"{data_ptr % 32}.")
+            # Warp-parallel reduce only pays at 32-warp (T=1024).
+            enable_warp_parallel_reduce = num_threads_per_block == 1024
+
+            # min_blocks_per_mp: reg-vs-occupancy 3-tier. Half-prec
+            # prefers extra CTA/SM (cvt-ILP fits in 40 regs); fp32
+            # wants mb=2 (4-LDG ILP needs ~70 regs).
+            vec_bits_host = 256 if use_256bit_load else 128
+            vec_w_host = vec_bits_host // (32 if torch_dtype == torch.float32
+                                           else 16)
+            n_vec_iters = max(1,
+                              N_per_cta // (num_threads_per_block * vec_w_host))
+            if torch_dtype == torch.float32:
+                if n_vec_iters < 4:
+                    min_blocks_per_mp = 0
+                elif num_rows <= num_sms:
+                    min_blocks_per_mp = 1
+                elif (num_sms * 2 < num_rows <= num_sms * 3
+                      and N_per_cta <= 32768):
+                    # mb=3 packs all CTAs in 1 wave; at N>=64K kernel
+                    # is bandwidth-bound and mb=2 wins instead.
+                    min_blocks_per_mp = 3
+                else:
+                    min_blocks_per_mp = 2
+            else:
+                if num_rows > num_sms:
+                    min_blocks_per_mp = 3
+                elif n_vec_iters < 4:
+                    min_blocks_per_mp = 0
+                else:
+                    min_blocks_per_mp = 1
+
+            return dict(
+                enable_unroll_4=enable_unroll_4,
+                enable_phase3_unroll=enable_phase3_unroll,
+                use_constant_hint=use_constant_hint,
+                num_threads_per_block=num_threads_per_block,
+                use_256bit_load=use_256bit_load,
+                enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+                min_blocks_per_mp=min_blocks_per_mp,
+            )
 
         @classmethod
         def _compile(
@@ -5734,19 +5814,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             enable_warp_parallel_reduce: bool,
             compress_ratio: int,
             return_output_values: bool,
-        ) -> None:
+            cluster_size: int,
+            seqlen_sorted: bool,
+        ) -> tuple:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
-                   compress_ratio, return_output_values)
+                   compress_ratio, return_output_values, cluster_size,
+                   seqlen_sorted)
             if key in cls.kernel_cache:
-                return
+                return key
             n_rows = cute.sym_int()
             n_cols = cute.sym_int()
             n_batch = cute.sym_int()
-            # 256-bit vec loads require 32-byte aligned input addresses
-            # (PyTorch CUDA allocations are 256-byte aligned; Phase 2/3
-            # offsets are multiples of vec_w * elem_bytes = 32 bytes).
+            # 32B alignment required by 256-bit vec loads.
             in_align = 32 if use_256bit_load else 16
             input_fake = cute.runtime.make_fake_compact_tensor(
                 dtype, (n_rows, n_cols),
@@ -5758,10 +5839,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assumed_align=16)
             seq_lens_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (n_batch, ), stride_order=(0, ))
-            # When return_output_values=False the kernel skips all STG.value
-            # writes; pass None so cute.compile doesn't materialize a fake
-            # value-output placeholder (matches the optional-tensor pattern
-            # used by CuteDSLTopKDecodeMultiCTARunner above).
+            # None → kernel skips STG.value path (cute.compile won't
+            # materialize the fake either).
             out_values_fake = (cute.runtime.make_fake_compact_tensor(
                 dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16)
                                if return_output_values else None)
@@ -5769,6 +5848,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Int32, (n_rows, top_k),
                 stride_order=(1, 0),
                 assumed_align=16)
+            # seqlen_sorted=False → const_expr's the indirection out, no
+            # order_row read at runtime. True → request-level fake
+            # (shape n_batch, not n_rows).
+            order_row_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch, ), stride_order=(0, )) if seqlen_sorted else None)
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -5785,6 +5870,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_warp_parallel_reduce=enable_warp_parallel_reduce,
                 compress_ratio=compress_ratio,
                 return_output_values=return_output_values,
+                cluster_size=cluster_size,
+                seqlen_sorted=seqlen_sorted,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -5793,10 +5880,101 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seq_lens_fake,
                 out_values_fake,
                 out_indices_fake,
+                order_row_fake,
                 stream=fake_stream,
                 options="--enable-tvm-ffi",
             )
             logger.debug(f"[compile cute_dsl gvr_topk_decode] {key}")
+            return key
+
+        @classmethod
+        def _compile_lb(
+            cls,
+            dtype,
+            top_k: int,
+            next_n: int,
+            compress_ratio: int,
+            max_batch_size: int,
+            num_threads_per_block: int,
+            cluster_size: int,
+            enable_unroll_4: bool,
+            enable_phase3_unroll: bool,
+            use_constant_hint: bool,
+            min_blocks_per_mp: int,
+            use_256bit_load: bool,
+            enable_warp_parallel_reduce: bool,
+            return_output_values: bool,
+        ) -> tuple:
+            """JIT-compile the LB (hybrid multi-CTA + single-CTA) kernel.
+
+            ``num_rows`` / ``N`` are ``cute.sym_int()`` — one compiled
+            kernel covers all shapes within a tuning bucket. Grid is
+            sized by ``max_batch_size`` (which IS in the cache key).
+            """
+            key = ("lb", dtype, top_k, next_n, compress_ratio, max_batch_size,
+                   num_threads_per_block, cluster_size, enable_unroll_4,
+                   enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
+                   use_256bit_load, enable_warp_parallel_reduce,
+                   return_output_values)
+            if key in cls.kernel_cache:
+                return key
+            n_rows = cute.sym_int()
+            n_cols = cute.sym_int()
+            n_batch = cute.sym_int()
+            in_align = 32 if use_256bit_load else 16
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                dtype, (n_rows, n_cols),
+                stride_order=(1, 0),
+                assumed_align=in_align)
+            pre_idx_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_batch, top_k),
+                stride_order=(1, 0),
+                assumed_align=16)
+            seq_lens_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_batch, ), stride_order=(0, ))
+            out_values_fake = (cute.runtime.make_fake_compact_tensor(
+                dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16)
+                               if return_output_values else None)
+            out_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, top_k),
+                stride_order=(1, 0),
+                assumed_align=16)
+            order_row_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (max_batch_size, ), stride_order=(0, ))
+            counters_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (2, ), stride_order=(0, ))
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+            kernel = _GvrTopKLBKernel(
+                dtype=dtype,
+                top_k=top_k,
+                next_n=next_n,
+                num_threads=num_threads_per_block,
+                compress_ratio=compress_ratio,
+                return_output_values=return_output_values,
+                cluster_size=cluster_size,
+                max_batch_size=max_batch_size,
+                enable_unroll_4=enable_unroll_4,
+                enable_phase3_unroll=enable_phase3_unroll,
+                use_constant_hint=use_constant_hint,
+                min_blocks_per_mp=min_blocks_per_mp,
+                use_256bit_load=use_256bit_load,
+                enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+            )
+            cls.kernel_cache[key] = cute.compile(
+                kernel,
+                input_fake,
+                pre_idx_fake,
+                seq_lens_fake,
+                out_values_fake,
+                out_indices_fake,
+                order_row_fake,
+                counters_fake,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            logger.debug(f"[compile cute_dsl gvr_topk_lb_decode] {key}")
+            return key
 
         @classmethod
         def forward(
@@ -5809,116 +5987,151 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: int = 1,
             compress_ratio: int = 1,
             max_seq_len: Optional[int] = None,
+            cluster_size: Optional[int] = None,
+            order_row: Optional[torch.Tensor] = None,
+            counters: Optional[torch.Tensor] = None,
+            max_batch_size: Optional[int] = None,
         ) -> None:
+            """Three paths, picked by ``(counters, order_row)``:
+
+            - (None, None)   single-CTA.
+            - (None, tensor) single-CTA + sort indirect; ``order_row`` is a
+              descending argsort of ``seq_lens`` (shape == seq_lens.shape).
+            - (tensor, tensor) LB; ``order_row`` is the long-first partition
+              from ``cute_dsl_gvr_topk_lb_prepare`` (shape == max_batch_size;
+              valid prefix in ``counters`` = [n_long, n_short]).
+
+            ``counters`` without ``order_row`` is rejected.
+            """
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
-            # Op-level hardcodes return_output_values=False — the DSA indexer
-            # pipeline only consumes indices, mirroring CUDA's
-            # ``indexer_topk_decode`` (which also doesn't expose value
-            # outputs). The compiled kernel skips all STG.value writes and
-            # accepts None for its value-output slot at launch time.
-            #
-            # The kernel keeps both ``return_output_values=True/False``
-            # branches to support enabling value writeback in the future
-            # if a downstream caller needs it.
+            # seq_lens is request-level, logits is row-level (next_n
+            # rows per request).
+            assert num_rows % next_n == 0 and seq_lens.shape[
+                0] == num_rows // next_n, (
+                    f"shape contract: seq_lens.shape[0] (={seq_lens.shape[0]}) "
+                    f"must equal logits.shape[0] / next_n "
+                    f"(={num_rows} / {next_n} = {num_rows // next_n})")
+            # DSA indexer only reads indices (mirrors CUDA
+            # indexer_topk_decode). Kernel keeps True/False branches.
             return_output_values = False
-            # max_seq_len: graph-safe hint. Eager mode: leave None and the
-            # heuristic adapts to actual N each call. Graph capture mode:
-            # caller passes peak runtime N so the captured kernel selects
-            # the large-N (T=1024, V=256) variant instead of the
-            # capture-time-small-N variant.
-            N_dec = max_seq_len if max_seq_len is not None else logits.shape[1]
+            # Under graph capture, max_seq_len = peak runtime N so the
+            # heuristic picks the large-N variant.
+            N_row = max_seq_len if max_seq_len is not None else logits.shape[1]
             num_sms = _get_num_sms()
 
-            # Production tuning knobs (fixed across shapes).
-            enable_unroll_4 = True
-            enable_phase3_unroll = True
-            use_constant_hint = False
-
-            # ---- T (num_threads_per_block) + V (use_256bit_load) ----
-            # T=1024 only when grid fits 1 CTA/SM and each thread has
-            # enough vec-loop work (N >= 65536). For half-prec under
-            # graph capture, raise the bar to 131072 so a small capture-N
-            # never forces T=1024 onto small-N replays (~14-16% regression).
-            if max_seq_len is not None and logits.dtype != torch.float32:
-                n_thresh_t = 131072
+            # cluster_size policy:
+            #   LB: caller-pinned in {2,4,8}; baked into cache key →
+            #       reject (not clamp) on hw mismatch.
+            #   single-CTA / sort: auto-pick from (N, BS) when unset;
+            #       safe to clamp to hw cap.
+            lb_mode = counters is not None
+            if lb_mode:
+                assert order_row is not None, (
+                    "counters requires order_row (both come from "
+                    "trtllm::cute_dsl_gvr_topk_lb_prepare).")
+                assert max_batch_size is not None, (
+                    "max_batch_size is required in LB mode and must "
+                    "match the value used at LB prepare time.")
+                assert (order_row.dtype == torch.int32 and order_row.is_cuda
+                        and order_row.shape == (max_batch_size, )), (
+                            f"LB order_row must be int32, CUDA, shape "
+                            f"({max_batch_size},); got dtype={order_row.dtype} "
+                            f"shape={tuple(order_row.shape)}")
+                assert (counters.dtype == torch.int32 and counters.is_cuda
+                        and counters.shape == (2, )), (
+                            f"LB counters must be int32, CUDA, shape (2,); "
+                            f"got dtype={counters.dtype} "
+                            f"shape={tuple(counters.shape)}")
+                if cluster_size is None:
+                    cluster_size = 4  # GvrTopKLBKernel ctor default
+                assert cluster_size in (2, 4, 8), (
+                    f"LB cluster_size must be 2, 4, or 8; got {cluster_size}")
+                hw_max_cluster = _query_max_cluster_size()
+                if cluster_size > hw_max_cluster:
+                    raise ValueError(
+                        f"LB cluster_size={cluster_size} exceeds device "
+                        f"max ({hw_max_cluster}); pin a smaller cs at LB "
+                        f"prepare, or use the single-CTA path.")
             else:
-                n_thresh_t = 65536
-            num_threads_per_block = (1024 if (num_rows <= num_sms
-                                              and N_dec >= n_thresh_t) else 512)
-            # V=256-bit only for fp32 above N=16K. Half-prec cvt-to-fp32
-            # doubles fragment reg footprint and regresses 5-11% on K=512/1024.
-            # Caller contract: when this fires, ``logits.data_ptr()`` must
-            # be 32-byte aligned (satisfied by torch.empty() and row slices;
-            # column slices / stride-padded layouts may violate it).
-            use_256bit_load = (logits.dtype == torch.float32 and N_dec >= 16384)
-            if use_256bit_load:
-                ptr = logits.data_ptr()
-                assert ptr % 32 == 0, (
-                    f"use_256bit_load=True requires 32B-aligned "
-                    f"logits.data_ptr(), got {ptr} % 32 = {ptr % 32}. "
-                    f"Pass a contiguous tensor (column slices / stride-"
-                    f"padded layouts violate alignment).")
-            # Warp-parallel reduce only pays off at 32-warp (T=1024); at
-            # 16-warp (T=512) it costs ~2pp on synth data.
-            enable_warp_parallel_reduce = num_threads_per_block == 1024
+                if cluster_size is None:
+                    # B200 SXM5 synth-data tuning, 2026-06-10:
+                    #   N < 64K              -> 1 (sync unrecouped)
+                    #   N >= 128K, BS <= 4   -> 8 (tiny grid)
+                    #   BS * cs <= num_sms   -> cs (single-wave)
+                    #   else                 -> 1 (multi-wave loses)
+                    if N_row < 65536:
+                        cluster_size = 1
+                    elif num_rows <= 4 and N_row >= 131072:
+                        cluster_size = 8
+                    elif num_rows * 4 <= num_sms:
+                        cluster_size = 4
+                    elif num_rows * 2 <= num_sms:
+                        cluster_size = 2
+                    else:
+                        cluster_size = 1
+                if cluster_size > 1:
+                    hw_max_cluster = _query_max_cluster_size()
+                    if cluster_size > hw_max_cluster:
+                        logger.warning_once(
+                            f"cute_dsl_gvr_topk_decode: cluster_size="
+                            f"{cluster_size} exceeds device max "
+                            f"({hw_max_cluster}); clamping.",
+                            key="cute_dsl_gvr_topk_decode_cluster_clamp",
+                        )
+                        cluster_size = hw_max_cluster
 
-            # ---- min_blocks_per_mp (ptxas __launch_bounds cap) ----
-            # Reg-vs-occupancy 3-tier heuristic. Tier-3 ordering differs
-            # by dtype: half-prec puts tier-3 first (cvt-ILP fits in 40
-            # regs, extra CTA/SM hides cvt latency); fp32 keeps tier-0
-            # first (4-LDG ILP wants ~70 regs, mb=2 cap=64 caps ILP).
-            vec_bits_host = 256 if use_256bit_load else 128
-            vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32
-                                           else 16)
-            n_vec_iters = max(1, N_dec // (num_threads_per_block * vec_w_host))
-            is_fp32 = logits.dtype == torch.float32
-            if is_fp32:
-                if n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                elif num_rows <= num_sms:
-                    min_blocks_per_mp = 1
-                elif (num_sms * 2 < num_rows <= num_sms * 3 and N_dec <= 32768):
-                    # Wave-fit + latency-bound: mb=3 caps each CTA to fit
-                    # all num_rows CTAs in a single wave. At N>=65K the
-                    # kernel becomes bandwidth-bound and mb=2 wins.
-                    min_blocks_per_mp = 3
-                else:
-                    min_blocks_per_mp = 2
-            else:
-                if num_rows > num_sms:
-                    min_blocks_per_mp = 3
-                elif n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                else:
-                    min_blocks_per_mp = 1
+            # Cluster CTAs split the row, so heuristics target per-CTA work.
+            N_per_cta = N_row // cluster_size
+            # tuning keys mirror _compile / _compile_lb param names; spread
+            # with **tuning at the call sites.
+            tuning = cls._pick_tuning(logits.dtype, num_rows, N_per_cta,
+                                      num_sms, max_seq_len, logits.data_ptr())
 
-            cls._compile(
+            if lb_mode:
+                key = cls._compile_lb(
+                    cute_dtype,
+                    top_k,
+                    next_n,
+                    compress_ratio,
+                    max_batch_size=max_batch_size,
+                    cluster_size=cluster_size,
+                    return_output_values=return_output_values,
+                    **tuning,
+                )
+                cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
+                                      output_indices, order_row, counters)
+                return
+
+            # seqlen_sorted=True compiles in order_row[req] * next_n + nn
+            # (longer rows first); False const_expr's it out.
+            seqlen_sorted = order_row is not None
+            if seqlen_sorted:
+                assert (
+                    order_row.dtype == torch.int32 and order_row.is_cuda
+                    and order_row.shape == seq_lens.shape
+                ), ("order_row must be int32, CUDA, shape == seq_lens.shape "
+                    f"(={tuple(seq_lens.shape)}); got dtype={order_row.dtype} "
+                    f"shape={tuple(order_row.shape)}")
+            key = cls._compile(
                 cute_dtype,
                 top_k,
                 next_n,
-                enable_unroll_4,
-                enable_phase3_unroll,
-                use_constant_hint,
-                min_blocks_per_mp,
-                use_256bit_load,
-                num_threads_per_block,
-                enable_warp_parallel_reduce,
-                compress_ratio,
-                return_output_values,
+                compress_ratio=compress_ratio,
+                return_output_values=return_output_values,
+                cluster_size=cluster_size,
+                seqlen_sorted=seqlen_sorted,
+                **tuning,
             )
-            key = (cute_dtype, top_k, next_n, enable_unroll_4,
-                   enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
-                   use_256bit_load, num_threads_per_block,
-                   enable_warp_parallel_reduce, compress_ratio,
-                   return_output_values)
-            # TVM FFI: pass raw torch tensors directly, env stream picked
-            # up automatically (no from_dlpack, no stream argument).
-            # ``output_values=None`` matches the kernel's compile-time
-            # ``return_output_values=False`` constexpr — no writes for top-k values.
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
-                                  output_indices)
+                                  output_indices, order_row)
 
+    # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
+    # (device-side, graph-safe) into the LJF row-reorder branch when
+    # ``num_rows >= 2 * num_sms``. Physical meaning: wave-2 must fit a
+    # full SM-row's worth of CTAs so the sort has long-vs-short rows to
+    # swap. Below that threshold the win is noise / can regress a few
+    # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
@@ -5931,45 +6144,54 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
+        cluster_size: Optional[int] = None,
+        order_row: Optional[torch.Tensor] = None,
+        counters: Optional[torch.Tensor] = None,
+        max_batch_size: Optional[int] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
-        Writes per-row top-K indices into the caller-allocated
-        ``output_indices`` buffer (no return). Values are NOT written —
-        the kernel is compiled with ``return_output_values=False`` so the
-        STG.value path is skipped. Mirrors CUDA ``indexer_topk_decode``
-        which also only exposes indices to callers.
+        Writes per-row top-K indices into ``output_indices`` (indices
+        only, mirroring CUDA ``indexer_topk_decode``).
 
         Args:
             logits: ``[num_rows, max_seq_len]`` fp32 / bf16 / fp16.
-            pre_idx: ``[num_rows // next_n, top_k]`` int32. ``pre_idx[..., 0]``
-                must be the argmax index (indexer invariant).
-            seq_lens: ``[num_rows // next_n]`` int32. Effective seq length per group.
+            pre_idx: ``[num_rows // next_n, top_k]`` int32.
+                ``pre_idx[..., 0]`` must be the argmax index.
+            seq_lens: ``[num_rows // next_n]`` int32, request-level.
             output_indices: ``[num_rows, top_k]`` int32.
             top_k: K ∈ {512, 1024, 2048} — compile-time specialized.
-            next_n: Temporal stride (V3.2 ``preIdxOffset = (row % next_n) + 1``).
-            compress_ratio: KV-indexer compression factor (1 = DSv3.2, 4 = DSv4).
-            max_seq_len: Graph-safe hint for peak ``logits.shape[1]`` at replay.
-                Pass under CUDA graph capture so the heuristic picks the
-                large-N kernel; leave ``None`` in eager mode.
+            next_n: Temporal stride (V3.2
+                ``preIdxOffset = (row % next_n) + 1``).
+            compress_ratio: 1 = DSv3.2, 4 = DSv4.
+            max_seq_len: Peak N at replay; pass under CUDA Graph capture
+                so the heuristic picks the large-N kernel.
+            cluster_size: 1 = single-CTA; 2/4/8 = N CTAs cooperate via
+                DSMEM. ``None`` → auto-pick from (N, BS) (single-CTA /
+                sort path) or 4 (LB path).
+            order_row: Request-level dispatch order (int32, CUDA).
+                Without ``counters``: descending argsort of ``seq_lens``
+                (shape == seq_lens.shape). With ``counters``: LB
+                long-first partition (shape == max_batch_size) from
+                :func:`cute_dsl_gvr_topk_lb_prepare`. ``None`` skips
+                the indirection.
+            counters: LB ``[n_long, n_short]`` from
+                :func:`cute_dsl_gvr_topk_lb_prepare`. Selects the LB
+                path and requires ``order_row`` + ``max_batch_size``.
+            max_batch_size: Required with ``counters``; ignored
+                otherwise. Power of 2 in ``[64, 1024]``, must match
+                the value passed to LB prepare.
         """
         if not is_sm_100f():
             raise ValueError(
                 f"CuteDSL: SM version {get_sm_version()} is not supported. "
                 f"CuteDSL GVR Top-K Decode only supports SM 100 family.")
-        # num_rows = batch_size * next_n contract; downstream sizing of
-        # pre_idx/seq_lens/output_indices derives batch_size from this.
-        # Caught here so the user sees a clear message instead of an OOB
-        # write or ZeroDivisionError deep inside the kernel.
         if logits.shape[0] % next_n != 0:
             raise ValueError(
                 f"logits.shape[0] (={logits.shape[0]}) must be divisible by "
-                f"next_n (={next_n}); the kernel derives batch_size as "
+                f"next_n (={next_n}); kernel derives batch_size as "
                 f"logits.shape[0] / next_n.")
-        # Key includes the shape + dtype signature so a NEW input shape
-        # gets its own one-shot log line; without the signature only the
-        # first shape would ever be logged, hiding follow-up shapes from
-        # production diagnostics.
+        # Log once per (dtype, shape) so each new shape gets a line.
         _log_sig = (
             f"{logits.dtype}|{tuple(logits.shape)}|"
             f"k={top_k}|nn={next_n}|cr={compress_ratio}|msl={max_seq_len}")
@@ -5992,6 +6214,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n=next_n,
             compress_ratio=compress_ratio,
             max_seq_len=max_seq_len,
+            cluster_size=cluster_size,
+            order_row=order_row,
+            counters=counters,
+            max_batch_size=max_batch_size,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -6004,8 +6230,143 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
+        cluster_size: Optional[int] = None,
+        order_row: Optional[torch.Tensor] = None,
+        counters: Optional[torch.Tensor] = None,
+        max_batch_size: Optional[int] = None,
     ) -> None:
         return None
+
+    # ---- GVR Top-K Load-Balance (hybrid multi-CTA + single-CTA) ----
+    # Two ops:
+    #   1. cute_dsl_gvr_topk_lb_prepare (once per decode step) — writes
+    #      (order_row, counters) by classifying seq_lens into long/short.
+    #   2. cute_dsl_gvr_topk_decode with counters set (once per layer) —
+    #      long rows ride a cluster (cs=2/4) via DSMEM; short rows go
+    #      single-CTA. Both branches share the grid for graph capture.
+    # (order_row, counters) are layer-invariant within a decode step.
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
+        GvrTopKLBKernel as _GvrTopKLBKernel
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
+        GvrTopKLBPrepareKernel as _GvrTopKLBPrepareKernel
+
+    # No Runner class for prepare: no tuning knobs, no cluster dispatch.
+    @functools.cache
+    def _compile_lb_prepare(
+        num_threads: int,
+        batch_size: int,
+        long_threshold: int,
+        compress_ratio: int,
+    ):
+        """JIT-compile the LB prepare kernel.
+
+        ``num_threads`` = block size = max_batch_size. ``batch_size``
+        must equal runtime ``seq_lens.shape[0]`` (TVM-FFI marshalling).
+        ``compress_ratio`` puts the classifier in scan-length space.
+        """
+        prep = _GvrTopKLBPrepareKernel(
+            long_threshold=long_threshold,
+            compress_ratio=compress_ratio,
+            num_threads=num_threads,
+        )
+        fake_seq = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                         (batch_size, ),
+                                                         stride_order=(0, ))
+        fake_order = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                           (num_threads, ),
+                                                           stride_order=(0, ))
+        fake_ctr = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2, ),
+                                                         stride_order=(0, ))
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            prep,
+            fake_seq,
+            fake_order,
+            fake_ctr,
+            cutlass.Int32(0),
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_gvr_topk_lb_prepare",
+        mutates_args=("order_row", "counters"),
+        device_types="cuda",
+    )
+    def cute_dsl_gvr_topk_lb_prepare(
+        seq_lens: torch.Tensor,
+        order_row: torch.Tensor,
+        counters: torch.Tensor,
+        max_batch_size: int,
+        long_threshold: int = 64 * 1024,
+        compress_ratio: int = 1,
+    ) -> None:
+        """LB partition prepare — run once per decode step; outputs
+        are layer-invariant and feed every per-layer decode call.
+
+        Writes:
+          ``order_row[max_batch_size]`` int32 — long group at
+              ``[0, n_long)``, short group at ``[n_long, n_long+n_short)``,
+              tail untouched (caller should pre-fill with -1).
+          ``counters[2]`` int32 — ``[n_long_req, n_short_req]``.
+
+        Args:
+            seq_lens: ``[batch_size]`` int32, UNCOMPRESSED tokens
+                (classifier divides by ``compress_ratio`` internally).
+            order_row: caller-allocated ``[max_batch_size]`` int32.
+                Fixed shape so CUDA Graph capture sees a single grid.
+            counters: caller-allocated ``[2]`` int32.
+            long_threshold: scan-length-space threshold (default 64K =
+                B200 cs=4 break-even ≈ 3.2us / row).
+            max_batch_size: power of 2 in [64, 1024]
+                (block_prefix_sum_kernel constraint).
+            compress_ratio: 1 = DSv3.2, 4 = DSv4.
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL GVR Top-K LB prepare only supports SM 100 family.")
+        # block_prefix_sum needs num_warps > 1 and pow2 →
+        # max_batch_size ∈ {64, 128, 256, 512, 1024}.
+        if not (64 <= max_batch_size <= 1024) or (max_batch_size &
+                                                  (max_batch_size - 1)) != 0:
+            raise ValueError(
+                f"max_batch_size must be a power of 2 in [64, 1024] "
+                f"(block_prefix_sum_kernel constraint); got {max_batch_size}")
+        batch_size = seq_lens.shape[0]
+        if batch_size > max_batch_size:
+            # Block is sized to max_batch_size (1 thread / request);
+            # requests with idx >= max_batch_size have no thread.
+            raise ValueError(
+                f"batch_size ({batch_size}) must be <= max_batch_size "
+                f"({max_batch_size}).")
+        assert (order_row.dtype == torch.int32 and order_row.is_cuda
+                and order_row.shape == (max_batch_size, )), (
+                    f"order_row must be int32, CUDA, shape "
+                    f"({max_batch_size},); got dtype={order_row.dtype} "
+                    f"shape={tuple(order_row.shape)}")
+        assert (counters.dtype == torch.int32 and counters.is_cuda
+                and counters.shape == (2, )), (
+                    f"counters must be int32, CUDA, shape (2,); got "
+                    f"dtype={counters.dtype} shape={tuple(counters.shape)}")
+        compiled = _compile_lb_prepare(max_batch_size, batch_size,
+                                       long_threshold, compress_ratio)
+        compiled(seq_lens, order_row, counters, cutlass.Int32(batch_size))
+
+    @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_lb_prepare")
+    def _(
+        seq_lens: torch.Tensor,
+        order_row: torch.Tensor,
+        counters: torch.Tensor,
+        max_batch_size: int,
+        long_threshold: int = 64 * 1024,
+        compress_ratio: int = 1,
+    ) -> None:
+        return None
+
+    # LB decode lives inside CuteDSLGvrTopKDecodeRunner — see
+    # ``_compile_lb`` and the ``counters is not None`` branch of
+    # ``forward`` (shares ``_pick_tuning`` with the single-CTA path).
 
     def warmup_cute_dsl_indexer_topk(
         dtype: torch.dtype,

@@ -82,9 +82,9 @@ class RequestData:
     # Per-request cache salt that the KV cache manager uses to isolate reuse
     # between requests carrying different salts. Connectors that key cached
     # content on token sequences (e.g. by hashing tokens to a file path or
-    # remote object id) MUST mix cache_salt_id into their identifiers,
+    # remote object id) MUST mix cache_salt into their identifiers,
     # otherwise blocks from a different salt could be incorrectly reused.
-    cache_salt_id: Optional[int] = None
+    cache_salt: Optional[str] = None
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -361,7 +361,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             num_scheduled_tokens,
             block_hashes=block_hashes,
             priorities=priorities,
-            cache_salt_id=req.cache_salt_id,
+            cache_salt=req.cache_salt,
         )
 
 

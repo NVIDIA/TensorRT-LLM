@@ -301,12 +301,29 @@ public:
     }
 
 private:
+    // Warmup up grid selection should be able to cover most possible kernel cases.
+    // Given a model, autotuner decision is relative to number of numCtas/numCtasPerSeqKv,
+    // which translate to batch size, seqLenQ and seqLenKv. Autotuner is sensitive to
+    // numCtas/numCtasPerSeqKv in the range of 1-24, but became much insensitive later.
+
+    // Selection of batch size: numCtas = numCtasPerSeqKv * batchsize
+    // So we need batch size = 1-24 to cover sensitive area when numCtasPerSeqKv = 1
+    // And then gradually increase gap between batch sizes.
     inline static std::vector<int> const kDefaultWarmupBatchSizeCandidates
-        = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 128, 256, 512, 1024};
-    inline static std::vector<int> const kDefaultWarmupPrefillBatchSizeCandidates
-        = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256};
-    inline static std::vector<int> const kDefaultWarmupSeqLenQkvCandidates
-        = {1, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+        = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 28, 30, 32, 36,
+            40, 48, 56, 64, 80, 96, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048};
+    // Selection of seqLenKv: numCtasPerSeqKv = seqLenKv / (tileSizePerKv)
+    // TileSizePerKv is typically 128, 256 and 512 and numCtasPerSeqKv is capped at SM number.
+    // For numCtasPerSeqKv we like to cover full range of 1-23, and sparsely cover 25-256
+    // Final formula: set({1, ..., 24, 26, 28, 32, 40, 48, 64, 80, 96, 128, 192, 256} * {128, 256, 512})
+    inline static std::vector<int> const kDefaultWarmupSeqLenKvCandidates = {1, 128, 256, 384, 512, 640, 768, 896, 1024,
+        1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048, 2176, 2304, 2432, 2560, 2688, 2816, 2944, 3072, 3328, 3584,
+        3840, 4096, 4352, 4608, 4864, 5120, 5376, 5632, 5888, 6144, 6656, 7168, 7680, 8192, 8704, 9216, 9728, 10240,
+        10752, 11264, 11776, 12288, 13312, 14336, 16384, 20480, 24576, 32768, 40960, 49152, 65536, 98304, 131072};
+    // Selection of seqLenQ: typically our prefill kernels would not use JIT and seqLenQ is fixed during decode.
+    // However seqLenQ can change when we use generation kernel to do prefill. SeqLenQ is sensitive in the range 1-16.
+    // But for prefill we typically face much longer sequence. So we only use a very single datapoint.
+    inline static std::vector<int> const kDefaultWarmupSeqLenQCandidates = {128};
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
@@ -392,14 +409,13 @@ private:
         TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
             "TRTLLM-Gen Fmha Warmup Param is invalid.");
 
-        auto const& batchSizeDefaults
-            = useGenKernelForPrefill ? kDefaultWarmupPrefillBatchSizeCandidates : kDefaultWarmupBatchSizeCandidates;
-        std::vector<int> batchSizeCandidates = makeWarmupCandidateSizes(batchSizeDefaults, maxBatchSize);
+        std::vector<int> batchSizeCandidates
+            = makeWarmupCandidateSizes(kDefaultWarmupBatchSizeCandidates, maxBatchSize);
         // Use specified Q for generation, and use our Q grid for prefill
         std::vector<int> seqLenQCandidates = useGenKernelForPrefill
-            ? makeWarmupCandidateSizes(kDefaultWarmupSeqLenQkvCandidates, maxSeqLenQ)
+            ? makeWarmupCandidateSizes(kDefaultWarmupSeqLenQCandidates, maxSeqLenQ)
             : std::vector<int>{runnerParams.mMaxSeqLenQ};
-        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenQkvCandidates, maxSeqLenKv);
+        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenKvCandidates, maxSeqLenKv);
 
         auto warmupParams = runnerParams;
 
@@ -997,6 +1013,8 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
+        // Carry static tree length into FMHA kernel selection.
+        options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;
     }
@@ -1020,9 +1038,24 @@ private:
         // loop. And the number of loops are not the same in different tasks.
         sstream << "\"checksTaskSchedules\": false,\n";
 
+        bool hasCompileDefs = false;
+        auto writeCompileDef = [&](char const* compileDef)
+        {
+            if (!hasCompileDefs)
+            {
+                sstream << "\"compileDefs\": [";
+                hasCompileDefs = true;
+            }
+            else
+            {
+                sstream << ", ";
+            }
+            sstream << "\"" << compileDef << "\"";
+        };
+
         if (options.mIsExportingCubin)
         {
-            sstream << "\"compileDefs\": [\"-DTLLM_EXPORT_CUBIN\"],\n";
+            writeCompileDef("-DTLLM_EXPORT_CUBIN");
         }
 
         // Set compile flags for E2M1 KV kernel benchmark.
@@ -1030,7 +1063,18 @@ private:
         if (options.mChecksResults == 0 && options.mDtypeKv == tg::Dtype::E2m1)
         {
             TLLM_LOG_INFO("Forcing -DTLLM_BENCHMARK_E2M1_KV_CACHE for E2m1 Kv. The results are not correct.");
-            sstream << "\"compileDefs\": [\"-DTLLM_BENCHMARK_E2M1_KV_CACHE\"],\n";
+            writeCompileDef("-DTLLM_BENCHMARK_E2M1_KV_CACHE");
+        }
+
+        // SwapsMmaAb NVRTC kernels already emit __launch_bounds__; avoid a CUDA 13 .reqntid/.maxntid conflict.
+        if (shouldUseNvrtc(options) && options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration)
+        {
+            writeCompileDef("-DTLLM_DISABLE_BLOCK_SIZE");
+        }
+
+        if (hasCompileDefs)
+        {
+            sstream << "],\n";
         }
 
         // Enable programmatic dependent launch.

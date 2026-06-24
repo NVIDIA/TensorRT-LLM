@@ -315,6 +315,11 @@ def latency_command(
     if bench_env.telemetry_config is not None:
         kwargs["telemetry_config"] = bench_env.telemetry_config
 
+    runtime_config.settings_config.max_batch_size = kwargs.get(
+        "max_batch_size", runtime_config.settings_config.max_batch_size)
+    runtime_config.settings_config.max_num_tokens = kwargs.get(
+        "max_num_tokens", runtime_config.settings_config.max_num_tokens)
+
     # Set environment variables for setting runtime options.
     default_env_overrides = {
         "TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG": "1",

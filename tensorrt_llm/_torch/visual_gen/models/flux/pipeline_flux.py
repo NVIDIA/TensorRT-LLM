@@ -264,11 +264,11 @@ class FluxPipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 3.5,
-        seed: int = 42,
         max_sequence_length: int = 512,
         num_images_per_prompt: int = 1,
     ):
@@ -349,7 +349,12 @@ class FluxPipeline(BasePipeline):
 
         # Denoising loop
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for FLUX transformer."""
             return self.transformer(

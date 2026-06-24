@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import datetime
 import enum
 import gc
@@ -449,7 +448,7 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -593,9 +592,10 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
+                encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
+                cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs

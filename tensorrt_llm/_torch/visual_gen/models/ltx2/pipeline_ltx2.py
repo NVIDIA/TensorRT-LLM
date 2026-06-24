@@ -366,10 +366,10 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         elif v is None:
             yield (prefix, None)
 
-    def get_graph_key(self, *args, **kwargs):
+    def _get_tensor_shape_key(self, *args, **kwargs):
         parts = []
         for i, arg in enumerate(args):
-            parts.extend(self._key_parts_for(f"a{i}", arg))
+            parts.extend(self._key_parts_for(f"arg{i}", arg))
         for k in sorted(kwargs.keys()):
             parts.extend(self._key_parts_for(k, kwargs[k]))
         return tuple(parts)
@@ -810,7 +810,10 @@ class LTX2Pipeline(BasePipeline):
         if not self.pipeline_config.cuda_graph.enable:
             return
 
-        runner = _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        runner = _LTX2CUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True),
+        )
+        self.transformer.register_cuda_graph_extra_key_fns(runner)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             f"CUDA graph runner: wrapping transformer.forward (Modality-aware){compile_note}"
@@ -1275,7 +1278,6 @@ class LTX2Pipeline(BasePipeline):
             "max_sequence_length": 1024,
             "num_frames": 121,
             "frame_rate": 24.0,
-            "image_cond_strength": 1.0,
         }
 
     @property
@@ -1290,6 +1292,11 @@ class LTX2Pipeline(BasePipeline):
                 type="float",
                 default=0.0,
                 description="Guidance rescale factor to prevent overexposure.",
+            ),
+            "image_cond_strength": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Image conditioning strength for I2V (1.0 = fully conditioned first frame).",
             ),
             "stg_scale": ExtraParamSchema(
                 type="float",
@@ -1340,7 +1347,7 @@ class LTX2Pipeline(BasePipeline):
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
             image=req.params.image,
-            image_cond_strength=req.params.image_cond_strength,
+            image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -1353,7 +1360,7 @@ class LTX2Pipeline(BasePipeline):
     # Prompt enhancement
     # ------------------------------------------------------------------
 
-    def _enhance_prompt(self, prompt: str, seed: int = 42) -> str:
+    def _enhance_prompt(self, prompt: str, seed: int) -> str:
         """Use Gemma3 as an LLM to enhance the prompt for video generation."""
         system_prompt = (
             "You are a helpful assistant that enhances text prompts for video generation. "
@@ -1392,6 +1399,7 @@ class LTX2Pipeline(BasePipeline):
     def forward(
         self,
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 512,
         width: int = 768,
@@ -1400,7 +1408,6 @@ class LTX2Pipeline(BasePipeline):
         num_inference_steps: int = 40,
         guidance_scale: float = 4.0,
         guidance_rescale: float = 0.0,
-        seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
         image: Optional[Union[str, torch.Tensor]] = None,
@@ -1643,6 +1650,7 @@ class LTX2Pipeline(BasePipeline):
         audio_scheduler = copy.deepcopy(self.scheduler)
         audio_scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         timesteps = self.scheduler.timesteps
+        num_steps = len(timesteps)
 
         # ---- 7. Build perturbation config for STG -----------------------
         stg_perturbation: PerturbationConfig | None = None
@@ -1712,6 +1720,7 @@ class LTX2Pipeline(BasePipeline):
         def _run_transformer(
             v_latents,
             a_latents,
+            step_index,
             timestep_val,
             v_context,
             a_context,
@@ -1769,6 +1778,8 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=text_cache,
+                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
+                step_index=step_index,
             )
 
             dn_v = None
@@ -1791,23 +1802,21 @@ class LTX2Pipeline(BasePipeline):
 
             return dn_v, dn_a
 
-        step_counter = [0]
-
         def forward_fn(
             video_latents,
             extra_stream_latents,
+            step_index,
             timestep,
             encoder_hidden_states,
             extra_tensors,
         ):
             audio_latents_in = extra_stream_latents.get("audio")
-            cur_step = step_counter[0]
-            step_counter[0] += 1
 
-            if not use_multi_modal_guidance or video_guider.should_skip_step(cur_step):
+            if not use_multi_modal_guidance or video_guider.should_skip_step(step_index):
                 dn_v, dn_a = _run_transformer(
                     video_latents,
                     audio_latents_in,
+                    step_index,
                     timestep,
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
@@ -1824,6 +1833,7 @@ class LTX2Pipeline(BasePipeline):
                     local_v, local_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
+                        step_index,
                         timestep,
                         video_embeds,
                         audio_embeds,
@@ -1834,6 +1844,7 @@ class LTX2Pipeline(BasePipeline):
                     local_v, local_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
+                        step_index,
                         timestep,
                         neg_video_embeds,
                         neg_audio_embeds,
@@ -1860,6 +1871,7 @@ class LTX2Pipeline(BasePipeline):
                 cond_v, cond_a = _run_transformer(
                     video_latents,
                     audio_latents_in,
+                    step_index,
                     timestep,
                     video_embeds,
                     audio_embeds,
@@ -1872,6 +1884,7 @@ class LTX2Pipeline(BasePipeline):
                     uncond_v, uncond_a = _run_transformer(
                         video_latents,
                         audio_latents_in,
+                        step_index,
                         timestep,
                         neg_video_embeds,
                         neg_audio_embeds,
@@ -1889,6 +1902,7 @@ class LTX2Pipeline(BasePipeline):
                 perturbed_v, perturbed_a = _run_transformer(
                     video_latents,
                     audio_latents_in,
+                    step_index,
                     timestep,
                     video_embeds,
                     audio_embeds,
@@ -1904,6 +1918,7 @@ class LTX2Pipeline(BasePipeline):
                 iso_v, _ = _run_transformer(
                     video_latents,
                     None,
+                    step_index,
                     timestep,
                     video_embeds,
                     None,
@@ -1914,6 +1929,7 @@ class LTX2Pipeline(BasePipeline):
                     _, iso_a = _run_transformer(
                         None,
                         audio_latents_in,
+                        step_index,
                         timestep,
                         None,
                         audio_embeds,
