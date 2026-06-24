@@ -5142,6 +5142,7 @@ class PyTorchModelEngine(ModelEngine):
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
         attrs.update(self.model.model_config.extra_attrs)
+        attrs["spec_metadata"] = kwargs.get('spec_metadata', None)
 
         if self._torch_compile_backend is not None:
             # Register aux streams and events to model extra attrs.
