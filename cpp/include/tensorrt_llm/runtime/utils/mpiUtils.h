@@ -467,6 +467,39 @@ int getNumNodes();
 
 void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
 
+//! \brief Returns true iff the WideEP fault-tolerance MPI mode is enabled.
+//!
+//! Reads the `TLLM_FAULT_TOLERANCE_MODE` environment variable and returns
+//! `true` exactly when its value is the string `"1"`. Any other value
+//! (including unset, empty, `"0"`, `"true"`, `"yes"`, etc.) returns `false`.
+//!
+//! This is an internal/dev knob for the WideEP fault-tolerance MVP (PR 1d.0).
+//! It is intentionally not surfaced as a user-facing CLI/config option;
+//! a proper `LLMArgs` field will replace it in PR 1d.1.
+bool isFaultToleranceModeEnabled();
+
+//! \brief Install WideEP fault-tolerance signal handlers on `SIGABRT` and `SIGSEGV`.
+//!
+//! Replaces the default handlers (which call `MPI_Abort(MPI_COMM_WORLD)`
+//! and optionally `kill(parent, SIGKILL)`) with handlers that call
+//! `_exit(137)` instead. This lets surviving ranks outlive a peer's
+//! crash so the higher-level FT layers (kernel rank-mask, EPLB remap,
+//! AlltoAll watchdog, FT subcomm) get a chance to run.
+//!
+//! `_exit` (not `exit`) is used because it is async-signal-safe and
+//! skips `atexit` / Python finalizers / `MPI_Finalize`, all of which
+//! can deadlock on a poisoned state.
+//!
+//! \note This source-level change is necessary but not sufficient on
+//! its own: OpenMPI's `mpirun` terminates the world on any abnormal
+//! child exit (any code, any signal) unless launched with
+//! `--mca orte_enable_recovery 1`. See the WideEP FT design §5.4
+//! and audit-1a-findings.md Day 2 for the empirical results that motivate
+//! this combination.
+//!
+//! Idempotent: safe to call multiple times.
+void installFaultToleranceSignalHandlers();
+
 class MpiWaitThread
 {
 public:

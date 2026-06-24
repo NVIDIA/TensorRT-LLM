@@ -190,9 +190,6 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
-    parser.add_argument('--allow_advanced_sampling',
-                        default=False,
-                        action='store_true')
     parser.add_argument('--eagle3_model_arch',
                         type=str,
                         default="llama3",
@@ -294,7 +291,6 @@ def setup_llm(args, **kwargs):
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
-            allow_advanced_sampling=args.allow_advanced_sampling,
             eagle3_model_arch=args.eagle3_model_arch,
             max_total_draft_tokens=args.max_total_draft_tokens)
     elif spec_decode_algo == "DFLASH":

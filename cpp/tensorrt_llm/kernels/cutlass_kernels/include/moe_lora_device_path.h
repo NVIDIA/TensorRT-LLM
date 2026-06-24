@@ -33,13 +33,27 @@ struct MoeLoraDevicePathModule;
 
 // Function-pointer dispatch for the libtorch-dependent GEMM stage of the MoE
 // LoRA device path. The implementation lives in th_common (moeOp.cpp) because
-// the cudaGraph(SplitK)GroupedGemm wrappers allocate workspace via at::Tensor,
-// which cannot be linked from libmoe_gemm_src.a (that archive is also linked
-// into the TensorRT plugin, which must not depend on libtorch).
+// the underlying cudaGraph(SplitK)GroupedGemm wrappers allocate workspace via
+// at::Tensor, which is not linkable from libmoe_gemm_src.a (that archive ends
+// up inside the TensorRT plugin shared object, which deliberately does not
+// depend on libtorch).
 //
-// It repacks mod into a MoeLoraGemmGroupArrays, runs the problem builder, and
-// dispatches the in/out GEMMs, accumulating into output_base (which the caller
-// must initialize). data_type is the scalar dtype (fp16/bf16/fp32).
+// Contract:
+//   mod:                 per-module device-resident scratch produced by
+//                        launchMoeLoraPointerExpand. The implementation repacks
+//                        it into a MoeLoraGemmGroupArrays, calls the problem
+//                        builder, and dispatches the in/out GEMMs.
+//   num_permuted_tokens: length of the permuted-row tables in mod.
+//   in_hidden_size:      K of the in-GEMM (the input row stride).
+//   max_lora_rank:       workspace ldd and worst-case rank cap.
+//   dtype_bytes:         sizeof(scalar) for the LoRA tensors.
+//   splitk_slices:       split-K factor for the in-GEMM.
+//   input_base:          base of the input matrix (M rows of in_hidden_size).
+//   output_base:         base of the module's output buffer; the implementation
+//                        accumulates into it, so callers must initialize it.
+//   data_type:           scalar dtype expected by the GEMM wrappers
+//                        (fp16/bf16/fp32).
+//   stream:              CUDA stream to launch onto.
 using MoeLoraDeviceRunFn = void (*)(MoeLoraDevicePathModule const& mod, int64_t num_permuted_tokens,
     int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices, void const* input_base,
     void* output_base, nvinfer1::DataType data_type, cudaStream_t stream);

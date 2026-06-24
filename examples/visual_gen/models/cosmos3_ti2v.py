@@ -85,7 +85,6 @@ def main():
     )
     parser.add_argument(
         "--visual_gen_args",
-        "--extra_visual_gen_options",
         dest="visual_gen_args",
         type=str,
         default=None,

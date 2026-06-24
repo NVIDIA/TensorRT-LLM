@@ -141,11 +141,8 @@ if [ $pytest_exit_code -eq 4 ]; then
 fi
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    if [[ "$stageName" == *PyTorch* ]]; then
-        basePerfFilename="base_perf_pytorch.csv"
-    else
-        basePerfFilename="base_perf.csv"
-    fi
+    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
+    basePerfFilename="base_perf_pytorch.csv"
     basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
     echo "Check Perf Result"
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \

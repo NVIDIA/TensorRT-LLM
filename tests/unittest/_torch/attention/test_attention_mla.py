@@ -11,11 +11,11 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             KVCacheManagerV2)
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
