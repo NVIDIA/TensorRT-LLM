@@ -314,11 +314,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
-        sync_size = (
-            self._mapping.pp_size if self._mapping.enable_attention_dp else self._mapping.world_size
-        )
+        # adp-off: use the TP-then-PP two-stage consensus (same ordered TP/PP
+        # communicators as ctx; tp x pp == world) instead of a lone WORLD
+        # allgather that deadlocks against the PP subgroup collectives.
+        if not self._mapping.enable_attention_dp:
+            return self._ctx_consensus(local_ids)
         all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        return _find_consensus_request_ids(all_ranks, self._mapping.pp_size)
 
     @staticmethod
     def _allgather_or_passthrough(
@@ -366,6 +368,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return new_cancelled, new_failed, new_completed
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+        # adp-off: TP-then-PP two-stage on the ordered subgroup communicators
+        # (not a WORLD allgather) to avoid the cross-communicator PP deadlock;
+        # tp x pp == world, so the outcome is identical.
+        if not self._mapping.enable_attention_dp:
+            c, f, d = self._consensus_outcome(
+                to_process,
+                cancelled,
+                failed,
+                completed,
+                self._dist.tp_allgather,
+                self._ctx_need_tp_sync,
+            )
+            if self._ctx_need_pp_sync:
+                c, f, d = self._consensus_outcome(
+                    to_process, c, f, d, self._dist.pp_allgather, True
+                )
+            return c, f, d
         return self._consensus_outcome(
             to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
         )

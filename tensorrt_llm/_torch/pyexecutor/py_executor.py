@@ -1937,9 +1937,14 @@ class PyExecutor:
                                    and is_dp_broadcast):
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
+            disagg_gen_transfer_in_progress = (
+                self.kv_cache_transceiver is not None
+                and (any(req.is_disagg_generation_transmission_in_progress
+                         for req in self.active_requests)
+                     or bool(fitting_disagg_gen_init_requests)))
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
-                num_fitting_reqs)
+                num_fitting_reqs, disagg_gen_transfer_in_progress)
 
         # Broadcast within first tp+cp group before send/recv chain to other tp+cp groups
         if self.dist.is_first_pp_rank:
@@ -1971,6 +1976,11 @@ class PyExecutor:
         if scheduled_batch is None:
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
                 self.active_requests)
+        # Adopt the scheduling rank's disagg-gen-transfer flag on every PP rank
+        # (rode this broadcast, no extra collective) so the next iteration's
+        # gen transfer-status allgather is entered/skipped by all ranks together.
+        self._pp_disagg_gen_transfer_in_progress = (
+            serializable_schedule.disagg_gen_transfer_in_progress)
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
@@ -4294,6 +4304,13 @@ class PyExecutor:
         need_check_one = bool(non_gen_first_reqs) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_reqs)
+
+        # PP: gate the transceiver's group allgather on the scheduling rank's
+        # propagated flag (set only on the PP loop) so all ranks enter/skip
+        # together; a divergent per-rank need_check deadlocks that allgather.
+        pp_flag = getattr(self, "_pp_disagg_gen_transfer_in_progress", None)
+        if pp_flag is not None:
+            need_check = pp_flag
 
         if need_check:
             at_least_num = 1 if need_check_one else 0

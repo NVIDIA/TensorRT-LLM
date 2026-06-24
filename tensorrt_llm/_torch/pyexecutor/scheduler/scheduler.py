@@ -236,6 +236,10 @@ class SerializableSchedulerOutput:
         int
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
+    # Scheduling rank's "any disagg-gen KV transfer in progress" flag; rides
+    # this existing schedule broadcast (no extra collective) so all PP ranks
+    # enter/skip the gen transfer-status allgather together (else it deadlocks).
+    disagg_gen_transfer_in_progress: bool = False
 
     @classmethod
     def from_scheduler_result(
@@ -243,6 +247,7 @@ class SerializableSchedulerOutput:
         scheduled_requests: ScheduledRequests,
         fitting_disagg_gen_init_requests: RequestList,
         num_fitting_requests: int,
+        disagg_gen_transfer_in_progress: bool = False,
     ) -> "SerializableSchedulerOutput":
         return cls(
             encoder_requests=[req.request_id for req in scheduled_requests.encoder_requests],
@@ -258,6 +263,7 @@ class SerializableSchedulerOutput:
                 req.request_id for req in fitting_disagg_gen_init_requests
             ],
             num_fitting_requests=num_fitting_requests,
+            disagg_gen_transfer_in_progress=disagg_gen_transfer_in_progress,
         )
 
     def to_scheduler_result(
