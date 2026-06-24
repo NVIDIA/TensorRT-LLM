@@ -49,6 +49,9 @@ COSMOS3_720P_PARAMS = {
     "frame_rate": 24.0,
 }
 
+COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
+COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
+
 # Fields merged by the executor for every request. Modality-specific values
 # (height/width/num_frames/steps/guidance) are declared with ``None`` so the
 # executor accepts explicit overrides; ``forward()`` resolves unset fields from
@@ -314,7 +317,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     ),
     "use_system_prompt": ExtraParamSchema(
         type="bool",
-        default=False,
+        default=None,
         description="Whether to use the system prompt.",
     ),
     "use_guardrails": ExtraParamSchema(
@@ -388,12 +391,28 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate when omitted."
         ),
     ),
+    "condition_frame_indexes_vision": ExtraParamSchema(
+        type="list",
+        default=list(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION),
+        description="Latent frame indexes to keep fixed for video conditioning.",
+    ),
+    "condition_video_keep": ExtraParamSchema(
+        type="str",
+        default=COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+        description="Which side of the input video to use for conditioning: first or last.",
+    ),
+    "flow_shift": ExtraParamSchema(
+        type="float",
+        default=None,
+        description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
+    ),
     "video": ExtraParamSchema(
         type="path_or_list",
         default=None,
         description=(
-            "Video for inverse_dynamics: .mp4/.avi file, frame directory, "
-            "image path, or list of PIL images / frame paths."
+            "Video input for video-to-video generation or inverse_dynamics: "
+            ".mp4/.avi file, frame directory, image path, or list of PIL "
+            "images / frame paths."
         ),
     ),
 }
