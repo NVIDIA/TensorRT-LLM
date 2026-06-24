@@ -137,6 +137,7 @@ l0_a10:
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_proxy_postproc_terminate.py
+  - unittest/executor/test_proxy_fast_death.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py
