@@ -333,6 +333,8 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
@@ -343,6 +345,7 @@ def test_KvCacheConfig_declaration():
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
+                           kv_cache_event_hash_algo="v2_sha256_64",
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
                            attention_dp_events_gather_period_ms=10)
@@ -358,6 +361,11 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
+    assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert KvCacheConfig(
+        kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
+                         ).kv_cache_event_hash_algo == "v1_block_key"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
