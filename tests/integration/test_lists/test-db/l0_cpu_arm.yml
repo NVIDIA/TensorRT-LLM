@@ -12,4 +12,5 @@ l0_cpu_arm:
       stage: pre_merge
       backend: generic
       orchestrator: mpi
-  tests: []
+  tests:
+  - unittest/executor/test_rpc.py
