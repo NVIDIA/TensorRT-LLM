@@ -155,6 +155,7 @@ class TrtllmAttentionMetadata:
         cached = self._metadata_cache.get(cache_key)
         if cached is None:
             self._create_metadata(batch_size, max_seq_len)
+            self._cached_seq_lens = None
             cached = {
                 "metadata": self._metadata,
                 "prepared": False,
@@ -167,17 +168,15 @@ class TrtllmAttentionMetadata:
             self._cached_seq_lens = cached["seq_lens"]
 
         if self._needs_prepare(batch_size, seq_lens_tensor):
-            self._metadata.seq_lens = seq_lens_tensor
+            cached_seq_lens = seq_lens_tensor.clone()
+            self._metadata.seq_lens = cached_seq_lens
             self._metadata.num_contexts = batch_size
             self._metadata.max_seq_len = max_seq_len
             self._metadata.request_ids = list(range(batch_size))
             self._metadata.prepare()
 
-            # Cache for next comparison
-            if self._cached_seq_lens is None or self._cached_seq_lens.shape[0] < batch_size:
-                self._cached_seq_lens = seq_lens_tensor.clone()
-            else:
-                self._cached_seq_lens[:batch_size].copy_(seq_lens_tensor)
+            # Cache per-shape state without sharing the tensor across entries.
+            self._cached_seq_lens = cached_seq_lens
             self._prepared = True
             cached["prepared"] = True
             cached["seq_lens"] = self._cached_seq_lens

@@ -137,11 +137,8 @@ class CUDAGraphRunner:
 
         graph = torch.cuda.CUDAGraph()
         for _ in range(self.WARMUP_STEPS):
-            # Keep outputs alive until kernels have completed. Some visual-gen
-            # custom ops write asynchronously into returned tensors.
-            warmup_output = fn(*static_args, **static_kwargs)
+            fn(*static_args, **static_kwargs)
             torch.cuda.synchronize()
-            del warmup_output
             gc.collect()
             torch.cuda.empty_cache()
 
