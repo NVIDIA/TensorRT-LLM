@@ -538,7 +538,10 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
         def cleanupCommands = [
-            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            // .sqsh is shared across jobs (named by image digest), so age-prune
+            // instead of deleting per job; reused images keep a refreshed mtime.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
             "rm -rf ${jobWorkspace} || true",
         ].join(" ; ")
         Utils.exec(
@@ -577,7 +580,10 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
-            "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/containers/container-${slurmJobID}.sqsh || true",
+            // .sqsh is shared across jobs (named by image digest), so age-prune
+            // instead of deleting per job; reused images keep a refreshed mtime.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -852,6 +858,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         "--cap-add=SYSLOG"
 
                     echo "Final dockerArgs: ${dockerArgs}"
+
+                    if (cluster.containerRuntime.toString() == "ENROOT" && slurmJobID) {
+                        def setupLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                        def enrootLog = Utils.exec(
+                            pipeline,
+                            script: Utils.sshUserCmd(remote, "\"grep '\\[ENROOT\\]' ${setupLogPath} 2>/dev/null || true\""),
+                            returnStdout: true,
+                            numRetries: 3
+                        ).trim()
+                        if (enrootLog) {
+                            echo "[Enroot setup log]\n${enrootLog}"
+                        }
+                    }
                 } else {
                     error "The Slurm node does not come online in the waiting period. Terminating the job."
                 }
@@ -1257,11 +1276,28 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    def enrootImagePath = "${cluster.scratchPath}/users/svc_tensorrt/containers/container-\${SLURM_JOB_ID}.sqsh"
-                    containerImageArg = enrootImagePath
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    // Name the .sqsh by image digest (not job ID) so jobs sharing
+                    // an image reuse one .sqsh instead of re-running `enroot import`
+                    // per job. Path is resolved at runtime into ${enrootImagePath}.
+                    containerImageArg = "\${enrootImagePath}"
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+
+                    containerDir="$containerDir"
+                    mkdir -p "\$containerDir"
+                    # If the image URI already contains a manifest digest (@sha256:…) use
+                    # it directly for content-addressed caching; otherwise hash the tag
+                    # string, which is stable for per-build images but will not detect a
+                    # re-pushed mutable tag within the 3-day TTL window.
+                    if printf '%s' "$container" | grep -q '@sha256:'
+                    then
+                        imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+                    else
+                        imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
+                    fi
+                    export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
                     importContainerWithRetries() {
                         local docker_uri=\$1
@@ -1269,25 +1305,49 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         local max_attempts=\${3:-3}
                         local delay=\${4:-60}
                         local attempt=1
+                        local tmp_path
 
-                        rm -f "\$output_path"
+                        # Best-effort lock so racing jobs don't all import the same
+                        # image. flock may be a no-op on some shared filesystems;
+                        # correctness still holds since the import publishes atomically.
+                        exec 9>"\${output_path}.lock" || true
+                        flock 9 || true
 
-                        until enroot import -o "\$output_path" -- "docker://\$docker_uri"
+                        if [ -f "\$output_path" ]
+                        then
+                            echo "Reusing cached container image: \$output_path"
+                            # Refresh mtime so reused images survive age-based pruning.
+                            touch "\$output_path" || true
+                            flock -u 9 || true
+                            return 0
+                        fi
+
+                        # Import to a temp path, then mv to publish atomically so
+                        # other jobs never see a partial .sqsh.
+                        tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
+                        rm -f "\$tmp_path"
+
+                        until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
                         do
                             if ((attempt >= max_attempts))
                             then
                                 echo "enroot import failed after \$max_attempts attempts"
+                                rm -f "\$tmp_path"
+                                flock -u 9 || true
                                 return 1
                             fi
 
                             echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
-                            rm -f "\$output_path"
+                            rm -f "\$tmp_path"
                             sleep \$delay
-                            ((attempt++))
+                            attempt=\$((attempt + 1))
                         done
+
+                        mv -f "\$tmp_path" "\$output_path"
+                        flock -u 9 || true
                     }
 
-                    importContainerWithRetries "$container" "$enrootImagePath"
+                    importContainerWithRetries "$container" "\$enrootImagePath"
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -4521,18 +4581,18 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4],
         // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 7, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-8": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 8, 9, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-9": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 9, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 1, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 2, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 3, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 4, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 5, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 6, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 7, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-8": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 8, 9, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-9": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 9, 9, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
