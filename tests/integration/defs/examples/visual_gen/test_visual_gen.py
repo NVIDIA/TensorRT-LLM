@@ -550,10 +550,7 @@ def _run_wan_lpips_pipeline(
     parallel=None,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import (
-        AttentionConfig,
-        VisualGenArgs,
-    )
+    from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
