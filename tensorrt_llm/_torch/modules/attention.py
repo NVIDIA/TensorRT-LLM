@@ -700,7 +700,6 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -740,7 +739,6 @@ class Attention(nn.Module):
                     relative_attention_bias=relative_attention_bias,
                     relative_attention_max_distance=
                     relative_attention_max_distance,
-                    multi_item_part_lens=multi_item_part_lens,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -789,7 +787,6 @@ class Attention(nn.Module):
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
-                multi_item_part_lens=multi_item_part_lens,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -812,7 +809,6 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -866,7 +862,6 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
-                multi_item_part_lens=multi_item_part_lens,
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
@@ -887,7 +882,6 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -947,23 +941,6 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
-        if multi_item_part_lens is not None:
-            # adjust RoPE positions for multi-item scoring
-            current_idx = 0
-            for req_multi_item_part_lens in multi_item_part_lens:
-                req_prefix_len, *req_multi_item_part_lens = req_multi_item_part_lens
-                # RoPE for prefix does not need updating and RoPE for delimiter does not matter
-                current_idx += req_prefix_len + 1
-                for item_len in req_multi_item_part_lens:
-                    next_idx = current_idx + item_len
-                    position_ids[0, current_idx:next_idx].copy_(
-                        torch.arange(req_prefix_len,
-                                     req_prefix_len + item_len,
-                                     dtype=position_ids.dtype,
-                                     device=position_ids.device),
-                        non_blocking=True)
-                    current_idx = next_idx + 1  # RoPE for delimiter does not matter
-
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -987,7 +964,6 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
-            multi_item_part_lens=multi_item_part_lens,
         )
 
         if self.attn_output_gate:
