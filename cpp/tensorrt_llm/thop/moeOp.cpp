@@ -792,6 +792,13 @@ public:
         int64_t unpadded_hidden_size_val
             = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        if (mUseINT8WoqPerChannel)
+        {
+            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // [num_experts, inter_size, hidden_size]
+            hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+            inter_size = fc2_expert_weights.sizes()[1];
+        }
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
