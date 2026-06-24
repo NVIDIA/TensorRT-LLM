@@ -160,24 +160,31 @@ def pre_comm_embedding_ops(
     gather_output: bool,
     padding_size: int,
 ):
-    # Generate the mask for the input if needed.
     if tp_mode == TensorParallelMode.COLUMN:
         input_, input_mask = get_masked_input_and_mask(
             input_,
             vocab_start_index,
             vocab_end_index,
         )
+    else:
+        # flashinfer's rejection kernel (chain_speculative_sampling) pads non-accepted
+        # tokens with -1. When the full vocab is local (non-TP or ROW TP), mask
+        # out-of-range ids (e.g. -1) over [0, weight.shape[0]) to avoid an OOB
+        # embedding lookup.
+        input_, input_mask = get_masked_input_and_mask(
+            input_,
+            0,
+            weight.shape[0],
+        )
 
     # Get the embeddings.
     output = F.embedding(input_, weight)
 
-    # Mask or pad the output if needed.
-    if tp_mode == TensorParallelMode.COLUMN:
-        output.masked_fill_(input_mask, 0)
-    elif tp_mode == TensorParallelMode.ROW:
-        if gather_output:
-            if tp_rank == tp_size - 1 and padding_size > 0:
-                output = F.pad(output, (0, padding_size))
+    output.masked_fill_(input_mask, 0)
+
+    if tp_mode == TensorParallelMode.ROW and gather_output:
+        if tp_rank == tp_size - 1 and padding_size > 0:
+            output = F.pad(output, (0, padding_size))
 
     return output
 

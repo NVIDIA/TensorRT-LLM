@@ -219,6 +219,13 @@ def get_multimodal_embeddings(
     if not multimodal_params:
         return []
 
+    # Wait before touching tensors produced on the MM side stream. Do not
+    # clear the event here; repeated stream-side waits are cheap, and leaving
+    # the event field untouched avoids races if a caller accidentally reuses it.
+    for param in multimodal_params:
+        if param.encoder_event is not None:
+            torch.cuda.current_stream().wait_event(param.encoder_event)
+
     # Step 1: Find uncached multimodal params that need encoder processing
     uncached_multimodal_params = _get_uncached_multimodal_params(
         multimodal_params)
