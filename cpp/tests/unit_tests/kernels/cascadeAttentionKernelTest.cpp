@@ -166,7 +166,7 @@ TEST(CascadeAttentionEligibilityTest, AcceptsRopeWithCosSinCache)
     p.rotary_embedding_base = 1000000.0f;
     p.rotary_embedding_scale = 1.0f;
     p.rotary_embedding_scale_type = tk::RotaryScalingType::kNONE;
-    static float fake_cos_sin[256];
+    static float2 fake_cos_sin[256];
     static float fake_inv_freq[64];
     p.rotary_embedding_cos_sin_cache = fake_cos_sin;
     p.rotary_embedding_inv_freq_cache = fake_inv_freq;
