@@ -27,7 +27,13 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages as ltx2_two_stages
 from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
-from tensorrt_llm.visual_gen.args import AttentionConfig, CacheDiTConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    CacheDiTConfig,
+    CudaGraphConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
@@ -1173,6 +1179,30 @@ class TestLTX2TwoStageLoRAHelpers:
         assert original_key != merged_key
         assert original_key[-1] == ("ltx2_two_stage_lora_state", "original")
         assert merged_key[-1] == ("ltx2_two_stage_lora_state", "merged")
+
+    def test_two_stage_cuda_graph_setup_uses_pipeline_config(self):
+        """CUDA graph setup runs before the two-stage model_config is assigned."""
+
+        class TinyTransformer:
+            def forward(self, *args, **kwargs):
+                return args, kwargs
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+
+        assert not hasattr(pipeline, "model_config")
+
+        pipeline._setup_cuda_graphs()
+
+        runner = pipeline._cuda_graph_runners["transformer"]
+        assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
+        assert runner._lora_state_getter() == "original"
+        assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
 
     def test_persistent_bf16_cache_reuses_weight_storage(self):
         """Persistent BF16 cache swaps between the same original and merged tensors."""
