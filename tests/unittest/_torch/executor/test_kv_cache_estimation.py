@@ -21,6 +21,9 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
