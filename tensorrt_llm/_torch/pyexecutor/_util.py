@@ -483,6 +483,7 @@ class KvCacheCreator:
                             torch.zeros(1, 1, dtype=torch.int32)
                         }
                     }
+            request.py_conversation_params = None
             remaining_tokens -= len(prompt_token_ids)
             requests.append(request)
 
@@ -532,6 +533,7 @@ class KvCacheCreator:
                         torch.zeros(1, 1, dtype=torch.int32)
                     }
                 }
+            request.py_conversation_params = None
             requests.append(request)
             remaining_tokens -= input_seq_len
         if self._mapping.enable_attention_dp:

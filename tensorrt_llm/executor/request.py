@@ -8,6 +8,7 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
@@ -108,6 +109,7 @@ class GenerationRequest:
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        conversation_params: Optional[ConversationParams] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
@@ -153,6 +155,7 @@ class GenerationRequest:
                     f"exceeds the maximum supported length "
                     f"({self.MAX_CACHE_SALT_LEN}).")
         self.cache_salt = cache_salt
+        self.conversation_params = conversation_params
         self.arrival_time = arrival_time
         self.encoder_input_token_ids = self._normalize_optional_token_ids(
             encoder_input_token_ids, "encoder_input_token_ids")

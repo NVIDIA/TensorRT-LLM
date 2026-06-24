@@ -9,6 +9,7 @@ import pytest
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
+                                                ConversationParams,
                                                 DisaggregatedParams)
 from tensorrt_llm.serve.router import (BlockHashMixin, ConversationRouter,
                                        KvCacheAwareRouter, LoadBalancingRouter,
@@ -665,11 +666,15 @@ async def test_get_next_server_exclude_server_insufficient(router_class):
 
 
 def _make_request(conversation_id=None, prompt="the " * 100):
-    params = DisaggregatedParams(request_type="context_only",
-                                 conversation_id=conversation_id)
+    params = DisaggregatedParams(request_type="context_only")
+    conversation_params = None
+    if conversation_id is not None:
+        conversation_params = ConversationParams(
+            conversation_id=conversation_id)
     return CompletionRequest(model="TinyLlama",
                              prompt=[prompt],
-                             disaggregated_params=params)
+                             disaggregated_params=params,
+                             conversation_params=conversation_params)
 
 
 @pytest.mark.asyncio

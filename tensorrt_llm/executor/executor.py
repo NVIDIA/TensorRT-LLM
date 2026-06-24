@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger, set_level
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
@@ -135,6 +136,7 @@ class GenerationExecutor(ABC):
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        conversation_params: Optional[ConversationParams] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
@@ -165,6 +167,7 @@ class GenerationExecutor(ABC):
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt=cache_salt,
+            conversation_params=conversation_params,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority)
@@ -184,6 +187,7 @@ class GenerationExecutor(ABC):
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
+        conversation_params: Optional[ConversationParams] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -218,7 +222,8 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=pa_req,
                 streaming=False,
                 disaggregated_params=disaggregated_params,
-                cache_salt=cs)
+                cache_salt=cs,
+                conversation_params=conversation_params)
             futures.append(future)
 
         for future in futures:
