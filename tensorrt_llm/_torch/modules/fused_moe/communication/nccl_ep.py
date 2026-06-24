@@ -61,15 +61,10 @@ class NcclEP(Communication):
     ):
         super().__init__(mapping)
 
-        from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import (
-            get_nccl_ep_context,
-            is_nccl_ep_installed,
-        )
+        from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import is_nccl_ep_installed
 
         if not is_nccl_ep_installed():
             raise RuntimeError("nccl-ep is not installed.")
-
-        from nccl.ep import Layout
 
         self.num_slots = num_slots
         self.num_experts = num_slots
@@ -86,17 +81,11 @@ class NcclEP(Communication):
         self.max_recv_tokens = self.ep_size * self.max_tokens_per_rank
 
         # Singleton NCCL EP context: owns the EP group, RDMA buffers, and
-        # persistent OUTPUT Tensor descriptors. Heavyweight; matches the
-        # eager-allocation pattern used by NVLinkOneSided / DeepEPLowLatency.
-        self._ctx = get_nccl_ep_context(
-            mapping,
-            self.num_experts,
-            self.max_tokens_per_rank,
-            self.hidden_size,
-            self.max_top_k,
-            self.use_fp8,
-            Layout.RANK_MAJOR,
-        )
+        # persistent OUTPUT Tensor descriptors. Allocate it lazily on first
+        # dispatch because full-model construction runs under MetaInitMode,
+        # which redirects torch.empty to the meta device even when a CUDA
+        # device is passed explicitly.
+        self._ctx = None
 
         # Persistent dispatch handle. Created on first dispatch via
         # group.create_handle; reused thereafter via handle.update so
@@ -120,6 +109,23 @@ class NcclEP(Communication):
     def supports_post_quant_dispatch(self) -> bool:
         # FP8 path: NCCL EP internally quantizes bf16 -> fp8 during dispatch.
         return self.use_fp8
+
+    def _get_context(self):
+        if self._ctx is None:
+            from nccl.ep import Layout
+
+            from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import get_nccl_ep_context
+
+            self._ctx = get_nccl_ep_context(
+                self.mapping,
+                self.num_experts,
+                self.max_tokens_per_rank,
+                self.hidden_size,
+                self.max_top_k,
+                self.use_fp8,
+                Layout.RANK_MAJOR,
+            )
+        return self._ctx
 
     def _setup_handle(self, ctx, topk_nd, stream):
         """Ensure self._handle exists; rebind topk via handle.update on subsequent calls."""
@@ -159,7 +165,7 @@ class NcclEP(Communication):
         """
         from nccl.ep import DispatchConfig, DispatchInputs, DispatchOutputs, LayoutInfo, Tensor
 
-        ctx = self._ctx
+        ctx = self._get_context()
 
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         if all_rank_max_num_tokens > self.max_tokens_per_rank:
@@ -287,6 +293,8 @@ class NcclEP(Communication):
         from nccl.ep import CombineInputs, CombineOutputs, Tensor
 
         ctx = self._ctx
+        if ctx is None:
+            raise RuntimeError("NcclEP.combine called before dispatch.")
         state = self._dispatch_state
         stream = ctx.get_stream()
 
@@ -346,6 +354,7 @@ class NcclEP(Communication):
 
         from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import release_nccl_ep_context
 
-        release_nccl_ep_context(self._ctx)
+        if self._ctx is not None:
+            release_nccl_ep_context(self._ctx)
         self._ctx = None
         self._dispatch_state = {}
