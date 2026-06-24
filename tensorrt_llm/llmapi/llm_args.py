@@ -796,6 +796,9 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     """Configuration for DeepSeek-V4 Sparse Attention."""
 
     algorithm: Literal["deepseek_v4"] = "deepseek_v4"
+    index_head_dim: Optional[int] = Field(
+        default=128,
+        description="The dimension of the DeepSeek-V4 indexer heads.")
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=
@@ -803,13 +806,30 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     compress_ratios: List[int] = Field(
         default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
         description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
-        "for uncompressed/SWA-only layers; internal allocation code normalizes "
+        "for uncompressed/SWA-only layers; the LLM API config normalizes "
         "0 to 1, while checkpoint-facing semantics remain unchanged.")
     window_size: int = Field(
         default=128,
-        description="The window size for slicing window attention part.")
+        description="The sliding window size in tokens for SWA layers.")
     index_topk: Optional[int] = Field(default=512,
-                                      description="The topk for the indexer.")
+                                      description="The top-k for the indexer.")
+
+    @field_validator("index_head_dim")
+    @classmethod
+    def validate_index_head_dim(cls, index_head_dim):
+        if index_head_dim is None:
+            raise ValueError(
+                "index_head_dim is required for DeepSeek-V4 sparse attention.")
+        return index_head_dim
+
+    @field_validator("compress_ratios")
+    @classmethod
+    def normalize_compress_ratios(cls, compress_ratios):
+        if not compress_ratios:
+            raise ValueError("compress_ratios must not be empty.")
+        if any(ratio < 0 for ratio in compress_ratios):
+            raise ValueError("compress_ratios must be non-negative.")
+        return [1 if ratio == 0 else ratio for ratio in compress_ratios]
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
