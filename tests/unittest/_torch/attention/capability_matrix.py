@@ -158,10 +158,25 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return f"TRTLLM paged attention supports head_dim <= 256 (got {case.head_dim})"
 
+    # TRTLLM's Blackwell paged fallback path aborts for non-core head sizes such
+    # as Phi-3's head_dim 96. Hopper covers those context configs, but Blackwell
+    # must skip them before entering the fused op.
+    if (
+        backend == "TRTLLM"
+        and sm >= 100
+        and getattr(case, "cache", "paged") != "none"
+        and not getattr(case, "is_mla", False)
+        and case.head_dim not in (32, 64, 128, 256)
+    ):
+        return (
+            "TRTLLM Blackwell paged attention supports only head_dim "
+            f"32/64/128/256 (got {case.head_dim})"
+        )
+
     # The TRTLLM MMHA generation kernel is fast-built in this environment, which
     # omits non-core head sizes (for example Phi-3's head_dim 96). Context FMHA
-    # still covers those configs, so only skip remaining cases that include
-    # generation.
+    # covers those configs only on some architectures, so skip remaining cases
+    # that include generation.
     if (
         backend == "TRTLLM"
         and getattr(case, "cache", "paged") != "none"
