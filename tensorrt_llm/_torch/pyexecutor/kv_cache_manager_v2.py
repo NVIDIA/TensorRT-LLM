@@ -1052,6 +1052,7 @@ class KVCacheManagerV2(BaseResourceManager):
             constraints=[
                 self._build_concurrent_decode_constraint(
                     max_batch_size=self.max_batch_size,
+                    max_tokens=kv_cache_config.max_tokens,
                     tokens_per_block=tokens_per_block,
                 )
             ],
@@ -1080,10 +1081,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @staticmethod
     def _build_concurrent_decode_constraint(
-        *, max_batch_size: int, tokens_per_block: int
+        *, max_batch_size: int, max_tokens: Optional[int], tokens_per_block: int
     ) -> BatchDesc:
         assert max_batch_size > 0
         assert tokens_per_block > 0
+        if max_tokens is not None:
+            max_batch_size = max(1, min(max_batch_size, max_tokens // tokens_per_block))
         return BatchDesc(
             [
                 KVCacheDesc(capacity=tokens_per_block, history_length=tokens_per_block - 1)
