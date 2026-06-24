@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@create_PR']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1166,33 +1166,6 @@ def collectTestResults(pipeline, testFilter, globalVars)
                 } catch (Exception e) {
                     // No need to fail the stage if the duration file generation fails.
                     echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
-                }
-                // if (currentBuild.currentResult == 'SUCCESS') {
-                if (true) {
-                    // Mark the stage UNSTABLE (yellow) on any failure inside this block.
-                    catchError(
-                        buildResult: 'SUCCESS',
-                        stageResult: 'UNSTABLE',
-                        message: 'Auto-update test duration PR creation failed') {
-                        sh """
-                            apk add --no-cache git
-                            git config --global --add safe.directory "*"
-                            echo "--- .git diagnostic ---"
-                            ls -la ${LLM_ROOT}/.git 2>&1 | head -n 5 || echo "${LLM_ROOT}/.git missing"
-                        """
-                        trtllm_utils.createAutoUpdatePR(pipeline, [
-                            repoDir:       LLM_ROOT,
-                            srcFile:       "new_test_duration.json",
-                            dstFile:       "tests/integration/defs/.test_durations",
-                            branchName:    "auto/update_test_durations",
-                            forcePush:     true,
-                            commitMessage: "[None][infra] Auto-update test durations from post-merge #${BUILD_NUMBER}",
-                            prTitle:       "[None][infra] Auto-update test durations from post-merge",
-                            prBody:        "Continuously refreshed by the post-merge pipeline: each run force-pushes the latest pytest-split test duration file onto this branch. See the branch's commit list for the originating build number.",
-                        ])
-                    }
-                } else {
-                    echo "Skipping test duration PR creation because post-merge build result is ${currentBuild.currentResult}."
                 }
             }
 
