@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -258,11 +258,22 @@ public:
     NCCLWindowAllocator& operator=(NCCLWindowAllocator&&) = delete;
 
 private:
+    friend class NCCLWindowAllocatorTestAccess;
+
     NCCLWindowAllocator() = default;
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
     NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle);
+
+    // Record a failed new symmetric allocation (assumes mMutex is already locked).
+    void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);
+
+    using CudaGetLastErrorFunc = cudaError_t (*)();
+
+    // Drain the sticky CUDA error left by a failed symmetric allocation.
+    static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
+        int localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
 
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
@@ -282,12 +293,10 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
-    // Comms whose symmetric memory path is known to fail collectively (e.g. H100 PCIe without
-    // NVLink fabric where ncclMemAlloc returns ncclUnhandledCudaError on at least one rank).
-    // Once recorded, subsequent requestBuffer() calls short-circuit to NCCLWindowBuffer{} so we
-    // don't repeatedly trigger the warning, the rank-sync allreduce, and the sticky-error drain
-    // for every autotuner trial.
-    std::unordered_set<ncclComm_t> mSymmetricUnavailable;
+    // Smallest request size that is known to fail collectively for each communicator.
+    // Requests below the recorded size may still succeed and already-pooled buffers are always
+    // reused before consulting this cache.
+    std::unordered_map<ncclComm_t, size_t> mMinSymmetricFailureSize;
 };
 
 // RAII wrapper for NCCL window buffers

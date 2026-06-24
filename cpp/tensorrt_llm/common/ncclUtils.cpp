@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
 namespace
 {
 
-// RAII guard for cudaMalloc — frees the pointer on destruction, logging a warning on failure.
+// RAII guard for cudaMalloc. Frees the pointer on destruction, logging a warning on failure.
 struct CudaMallocGuard
 {
     void* ptr{nullptr};
@@ -56,7 +56,7 @@ struct CudaMallocGuard
     CudaMallocGuard& operator=(CudaMallocGuard const&) = delete;
 };
 
-// RAII guard for ncclMemAlloc — frees the pointer on destruction, logging a warning on failure.
+// RAII guard for ncclMemAlloc. Frees the pointer on destruction, logging a warning on failure.
 struct NcclMemGuard
 {
     void* ptr{nullptr};
@@ -416,17 +416,6 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     // This is cheap even if no buffers exist yet - cleanup will just return early
     registerBufferCleanup(comm);
 
-    // If a previous allocateAndRegisterBuffer call collectively concluded that this comm
-    // cannot use NCCL symmetric memory, short-circuit so callers transparently fall back to
-    // regular allreduce. This avoids re-running ncclMemAlloc + the rank-sync allreduce on
-    // every autotuner trial, which would otherwise spam warnings and stress the failing path.
-    // The decision is collective (driven by an ncclAllReduce(min) inside allocateAndRegisterBuffer),
-    // so all ranks reach the same conclusion and stay in sync without further communication.
-    if (mSymmetricUnavailable.find(comm) != mSymmetricUnavailable.end())
-    {
-        return NCCLWindowBuffer();
-    }
-
     // Check if we have an available buffer of at least the requested size for this communicator
     // Use best-fit: find the smallest buffer that's >= requested size
     auto& commBuffers = mBufferPool[comm];
@@ -449,6 +438,17 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
             "[NCCLUtil] Reusing NCCL window buffer for comm %p: handle=%d, ptr=%p, size=%zu (requested: %zu)",
             static_cast<void*>(comm), bestFit->buffer.handle, bestFit->buffer.ptr, bestFit->buffer.size, size);
         return bestFit->buffer;
+    }
+
+    // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
+    // no larger than this request, do not retry the known-failing new allocation path. Smaller
+    // requests and already-pooled buffers can still use NCCL windows.
+    auto const failureIt = mMinSymmetricFailureSize.find(comm);
+    if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
+    {
+        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm %p, size=%zu; known failure threshold=%zu",
+            static_cast<void*>(comm), size, failureIt->second);
+        return NCCLWindowBuffer();
     }
 
     // No available buffer found, avoid registration during CUDA graph capture
@@ -480,13 +480,36 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     }
     else
     {
-        // The collective allreduce inside allocateAndRegisterBuffer agreed that at least one
-        // rank could not allocate symmetric memory. Mark this comm so future requests don't
-        // retry the failing path on every autotuner trial.
-        mSymmetricUnavailable.insert(comm);
+        // The collective allreduce inside allocateAndRegisterBuffer agreed that this request
+        // cannot use symmetric memory on at least one rank. Remember the smallest failing
+        // request size so repeated too-large autotuner probes do not keep stressing this path.
+        recordSymmetricFailureLocked(comm, size);
     }
 
     return buffer;
+}
+
+void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, size_t size)
+{
+    auto failureIt = mMinSymmetricFailureSize.find(comm);
+    if (failureIt == mMinSymmetricFailureSize.end())
+    {
+        mMinSymmetricFailureSize.emplace(comm, size);
+    }
+    else if (size < failureIt->second)
+    {
+        failureIt->second = size;
+    }
+}
+
+cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
+    int localAllocOk, CudaGetLastErrorFunc getLastError) noexcept
+{
+    if (localAllocOk == 0)
+    {
+        return getLastError();
+    }
+    return cudaSuccess;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr) const
@@ -586,35 +609,37 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
-    // Step 1: Pre-allocate the rank-sync flag *before* ncclMemAlloc.  ncclMemAlloc can fail
+    // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
     // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
-    // is unavailable; that failure may leave a sticky CUDA last-error on the device.  If we
+    // is unavailable; that failure may leave a sticky CUDA last-error on the device. If we
     // deferred this cudaMalloc until after the failure, the sticky error would propagate into
     // cudaMalloc, TLLM_CUDA_CHECK would throw, and the failing rank would never reach the
-    // collective ncclAllReduce(min) below — hanging every other rank that *did* succeed.
+    // collective ncclAllReduce(min) below, hanging every other rank that did succeed.
     int* rankSyncFlag = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
     CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    TLLM_CUDA_CHECK(cudaMemsetAsync(rankSyncFlag, 0, sizeof(int), stream));
 
-    // Step 2: Allocate symmetric memory (per-rank, non-collective — can fail asymmetrically).
-    // If ncclMemAlloc fails, drain any sticky CUDA last-error so the subsequent cudaMemcpy and
-    // ncclAllReduce(min) observe a clean device state and the failing rank reaches the collective
-    // below on the same control path as healthy ranks.
+    // Step 2: Allocate symmetric memory. This per-rank, non-collective call can fail
+    // asymmetrically. When it fails, NCCL may leave a sticky CUDA error behind; clear it before
+    // the stream-ordered flag copy and collective fallback so the failing rank still reaches
+    // ncclAllReduce with the other ranks.
     void* ncclPtr = nullptr;
     TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
     int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
     NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
-    if (!localAllocOk)
-    {
-        (void) cudaGetLastError();
-    }
+    clearCudaErrorIfSymmetricAllocationFailed(localAllocOk);
 
-    // Step 3: ncclCommWindowRegister is collective — if any rank skips it, all other ranks hang.
+    // Step 3: ncclCommWindowRegister is collective. If any rank skips it, all other ranks hang.
     // Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
-    // H2D failure is non-fatal: warn and continue — device flag may be stale but the allreduce
-    // must still be reached by all ranks. allreduce and D2H failures are catastrophic (throw).
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    TLLM_CUDA_CHECK_WARN(cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice));
+    // The flag is initialized to 0, so H2D failure is non-fatal and conservatively falls back
+    // to regular NCCL while still reaching the collective. allreduce and D2H failures throw.
+    if (localAllocOk != 0)
+    {
+        TLLM_CUDA_CHECK_WARN(
+            cudaMemcpyAsync(rankSyncFlag, &localAllocOk, sizeof(localAllocOk), cudaMemcpyHostToDevice, stream));
+    }
     TLLM_NCCL_CHECK(ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream));
     TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(stream));
 
@@ -634,7 +659,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
         return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
     }
 
-    // Step 4: Register with NCCL as a window (collective — all ranks must reach this call).
+    // Step 4: Register with NCCL as a window. This is collective, so all ranks must reach it.
     // Failure here is non-fatal: warn and fall back to regular allreduce.
     // ncclGuard frees ncclPtr on return.
     ncclWindow_t window = nullptr;
@@ -645,7 +670,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
         return NCCLWindowBuffer{};
     }
 
-    // Step 5: Success — transfer ownership to the returned buffer.
+    // Step 5: Success. Transfer ownership to the returned buffer.
     ncclGuard.release();
     NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
@@ -718,7 +743,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     {
         // No buffers to clean up, but mark as cleaned
         mRegisteredComms.erase(comm);
-        mSymmetricUnavailable.erase(comm);
+        mMinSymmetricFailureSize.erase(comm);
         return;
     }
 
@@ -794,7 +819,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
-    mSymmetricUnavailable.erase(comm);
+    mMinSymmetricFailureSize.erase(comm);
 }
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
