@@ -131,6 +131,14 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     import shlex
     arg_list = shlex.split(case)
+    if unittest_markexpr:
+        if "-m" in arg_list:
+            markexpr_index = arg_list.index("-m") + 1
+            case_markexpr = arg_list[markexpr_index]
+            arg_list[markexpr_index] = (
+                f"({case_markexpr}) and ({unittest_markexpr})")
+        else:
+            arg_list += ["-m", unittest_markexpr]
     case_fn = re.sub(r'[/\s"\']+', '-', case)
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
@@ -170,9 +178,6 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     if run_ray:
         command += ["--run-ray"]
-
-    if unittest_markexpr:
-        command += ["-m", unittest_markexpr]
 
     s3_secret_key = None
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)

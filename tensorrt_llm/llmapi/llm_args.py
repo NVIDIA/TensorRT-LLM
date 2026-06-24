@@ -4456,16 +4456,6 @@ class BaseLlmArgs(StrictBaseModel):
             config_dict = yaml.safe_load(f)
         return cls(**config_dict)
 
-    @field_validator("dtype")
-    @classmethod
-    def validate_dtype(cls, v, info):
-        if torch.cuda.get_device_properties(0).major < 8:
-            if v == 'auto':
-                v = 'float16'
-            if v == 'bfloat16':
-                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-        return v
-
     @field_validator("gpus_per_node", mode='before')
     @classmethod
     def validate_gpus_per_node(cls, v, info):
