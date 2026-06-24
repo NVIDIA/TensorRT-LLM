@@ -15,10 +15,10 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     VIDEO_RES_SIZE_INFO,
     action_reference_image,
     find_closest_target_size,
-    normalize_action_video_input,
     resolve_action_size,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input
 
 pytestmark = pytest.mark.cosmos3
 
@@ -183,17 +183,17 @@ class TestActionReferenceImage:
         assert ref.getpixel((0, 0)) == (0, 0, 255)
 
 
-class TestNormalizeActionVideoInput:
+class TestNormalizeVideoInput:
     def test_image_path_returns_singleton_list(self, tmp_path):
         image_path = tmp_path / "frame.png"
         PIL.Image.new("RGB", (8, 4), "red").save(image_path)
-        assert normalize_action_video_input(str(image_path)) == [str(image_path)]
+        assert normalize_video_input(str(image_path)) == [str(image_path)]
 
     def test_frame_directory_returns_sorted_paths(self, tmp_path):
         (tmp_path / "b.png").write_bytes(b"")
         (tmp_path / "a.png").write_bytes(b"")
         (tmp_path / "skip.txt").write_text("x")
-        assert normalize_action_video_input(str(tmp_path)) == [
+        assert normalize_video_input(str(tmp_path)) == [
             str(tmp_path / "a.png"),
             str(tmp_path / "b.png"),
         ]
@@ -202,7 +202,7 @@ class TestNormalizeActionVideoInput:
         bad_path = tmp_path / "clip.mov"
         bad_path.write_bytes(b"fake")
         with pytest.raises(ValueError, match="must be a frame directory"):
-            normalize_action_video_input(str(bad_path))
+            normalize_video_input(str(bad_path))
 
     def test_decode_mp4_returns_pil_frames(self, tmp_path, monkeypatch):
         video_path = tmp_path / "clip.mp4"
@@ -227,7 +227,7 @@ class TestNormalizeActionVideoInput:
             "torchvision.io.read_video",
             _fake_read_video,
         )
-        frames = normalize_action_video_input(str(video_path))
+        frames = normalize_video_input(str(video_path))
         assert len(frames) == 2
         assert all(isinstance(frame, PIL.Image.Image) for frame in frames)
         assert frames[0].getpixel((0, 0)) == (255, 0, 0)
@@ -247,7 +247,7 @@ class TestNormalizeActionVideoInput:
             return tensor, None, {}
 
         monkeypatch.setattr("torchvision.io.read_video", _fake_read_video)
-        frames = normalize_action_video_input(
+        frames = normalize_video_input(
             str(video_path),
             max_frames=2,
         )

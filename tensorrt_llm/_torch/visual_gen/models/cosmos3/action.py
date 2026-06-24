@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+
+from .utils import IMAGE_EXTENSIONS, normalize_video_input, pil_to_rgb
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -244,74 +246,6 @@ def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int
     return best_size
 
 
-ACTION_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
-ACTION_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi"})
-
-
-def pil_to_rgb(value: Any) -> PIL.Image.Image:
-    if isinstance(value, str):
-        return PIL.Image.open(value).convert("RGB")
-    if isinstance(value, PIL.Image.Image):
-        return value.convert("RGB")
-    raise TypeError(
-        f"Cosmos3 action preprocessing expected PIL image or image path, got {type(value)!r}."
-    )
-
-
-def decode_action_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:
-    import torchvision.io as io
-
-    frames, _, _ = io.read_video(str(path), pts_unit="sec")
-    if frames.numel() == 0:
-        raise ValueError(f"Cosmos3 action video file contains no frames: {path}")
-    if max_frames is not None:
-        frames = frames[:max_frames]
-    return [PIL.Image.fromarray(frames[i].numpy()) for i in range(frames.shape[0])]
-
-
-def normalize_action_video_path(path: Path, max_frames: Optional[int] = None) -> List[Any]:
-    if not path.exists():
-        raise ValueError(f"Cosmos3 action video path does not exist: {path}")
-    if path.is_dir():
-        frames = sorted(p for p in path.iterdir() if p.suffix.lower() in ACTION_IMAGE_EXTENSIONS)
-        if not frames:
-            raise ValueError(f"No image frames found in Cosmos3 action video directory: {path}")
-        frame_paths = [str(p) for p in frames]
-        if max_frames is not None:
-            frame_paths = frame_paths[:max_frames]
-        return frame_paths
-
-    suffix = path.suffix.lower()
-    if suffix in ACTION_IMAGE_EXTENSIONS:
-        return [str(path)]
-    if suffix in ACTION_VIDEO_EXTENSIONS:
-        return decode_action_video_file(path, max_frames=max_frames)
-    raise ValueError(
-        "Cosmos3 action video path must be a frame directory, an image file "
-        f"{sorted(ACTION_IMAGE_EXTENSIONS)}, or a video file "
-        f"{sorted(ACTION_VIDEO_EXTENSIONS)}; got {path}"
-    )
-
-
-def normalize_action_video_input(video: Any, max_frames: Optional[int] = None) -> List[Any]:
-    """Normalize action video input to a frame list.
-
-    Accepts a list of PIL images / paths, a single image or video file path,
-    or a directory of frame images (sorted lexicographically).
-    """
-    if video is None:
-        return []
-    if isinstance(video, list):
-        if not video:
-            raise ValueError("Cosmos3 action video input must contain at least one frame.")
-        if max_frames is not None:
-            return video[:max_frames]
-        return video
-    if isinstance(video, (str, Path)):
-        return normalize_action_video_path(Path(video), max_frames=max_frames)
-    return [video]
-
-
 def resolve_action_size(
     height: Optional[int],
     width: Optional[int],
@@ -339,7 +273,7 @@ def action_reference_image(
     """Resolve the reference frame used for action sizing and conditioning."""
     if action_mode == ACTION_MODE_INVERSE_DYNAMICS:
         source = video if video is not None else image
-        frames = normalize_action_video_input(source, max_frames=1)
+        frames = normalize_video_input(source, max_frames=1)
         if not frames:
             raise ValueError("Cosmos3 action_mode='inverse_dynamics' requires a video input.")
         return pil_to_rgb(frames[0])
@@ -351,9 +285,9 @@ def action_reference_image(
         return source.convert("RGB")
     if isinstance(source, str):
         path = Path(source)
-        if path.is_file() and path.suffix.lower() in ACTION_IMAGE_EXTENSIONS:
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
             return PIL.Image.open(source).convert("RGB")
-        frames = normalize_action_video_input(source, max_frames=1)
+        frames = normalize_video_input(source, max_frames=1)
         if not frames:
             raise ValueError(
                 f"Cosmos3 action_mode={action_mode!r} requires an image or video input."
