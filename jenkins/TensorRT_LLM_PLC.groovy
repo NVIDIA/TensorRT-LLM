@@ -366,7 +366,12 @@ def processScanResults(ref) {
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    currentBuild.result = 'UNSTABLE'
+                    // In pre_merge mode, we intentionally skip marking the build as UNSTABLE.
+                    // PLC scanning accuracy needs further improvement before we can reliably
+                    // gate pre-merge builds on scan results without causing false failures.
+                    if (params.scanMode != "pre_merge") {
+                        currentBuild.result = 'UNSTABLE'
+                    }
                 } else {
                     echo "No new risks detected."
                 }
@@ -385,7 +390,7 @@ pipeline {
         string(name: 'forkOwner', defaultValue: '', description: 'Name of the fork owner, need to select \"github_fork\" for repoUrlKey, otherwise it will be ignored')
         string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
-        choice(name: 'scanMode', choices: ['monitor','release'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
+        choice(name: 'scanMode', choices: ['monitor','release','pre_merge'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
         booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
         booleanParam(name: 'runContainerScanning', defaultValue: true, description: 'Run Container Scanning (Pulse container scan)')
         booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
