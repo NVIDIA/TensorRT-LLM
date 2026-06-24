@@ -36,6 +36,7 @@ match on the packed FP4 bytes, mirroring ``test_fused_activation_quant.py``.
 import pytest
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.utils import ceil_div, pad_up, unswizzle_sf
 from tests.unittest.utils.util import getSMVersion
 
@@ -71,9 +72,22 @@ skip_unless_rmsnorm = pytest.mark.skipif(
 
 
 def rms_norm_ref(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Reference RMSNorm matching tensorrt_llm/_torch/modules/rms_norm.py:
-    fp32 accumulate, rsqrt(var + eps), then weight * normed cast back to the
-    input dtype."""
+    """Reference RMSNorm. Uses the *production* flashinfer RMSNorm kernel (the
+    exact kernel RMSNorm.forward runs on the unfused path the fusion replaces)
+    when available, so the comparison is apples-to-apples; otherwise falls back
+    to the fp32 PyTorch formula matching tensorrt_llm/_torch/modules/rms_norm.py.
+
+    Note the fused kernel still differs from this reference by ULPs: it does the
+    fp32 reduction + RMSNorm in registers in a single pass, whereas the unfused
+    path materializes the normed bf16 in a separate kernel before fp4_quantize.
+    Those ULP differences can flip a value across an E2M1/E4M3 step, so the
+    cross-path comparison is a high match rate (see _FP4_MATCH_THRESHOLD), while
+    the exact fused-epilogue equivalence is checked separately in
+    assert_fp4_bitexact_from_norm."""
+    if IS_FLASHINFER_AVAILABLE:
+        from tensorrt_llm._torch.custom_ops import flashinfer_rmsnorm
+
+        return flashinfer_rmsnorm(hidden_states.contiguous(), weight, eps)
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -157,6 +171,38 @@ def assert_sf_match(sf_fused: torch.Tensor, sf_ref: torch.Tensor, m: int, n: int
     )
 
 
+def assert_fp4_bitexact_from_norm(
+    fp4_fused: torch.Tensor,
+    sf_fused: torch.Tensor,
+    norm_out: torch.Tensor,
+    sf_scale: torch.Tensor,
+    m: int,
+    n: int,
+    ctx: str,
+):
+    """Bit-exact check of the fused NVFP4 epilogue. The fused kernel returns the
+    same post-RMSNorm BF16 value (norm_out) that it quantized, so quantizing that
+    exact tensor with the standalone fp4_quantize must reproduce the fused
+    quant_out/scale_out bit-for-bit -- there is no rounding-order freedom left
+    once the normed input is fixed. (This isolates the epilogue from the RMSNorm
+    ULP differences that the cross-path match-rate check tolerates.)
+
+    quant_out is dense row-major [m, n/2] so it's compared directly. scale_out is
+    swizzled+padded (rows -> 128, sf_cols -> 4) with uninitialized padding, so the
+    two separate allocations differ in the pad region only; compare the
+    unswizzled valid [m, n/SF_VEC] grid where bit-exactness must hold."""
+    fp4_req, sf_req = fp4_quantize_ref(norm_out, sf_scale)
+    assert torch.equal(fp4_fused, fp4_req), (
+        f"fused FP4 not bit-exact vs fp4_quantize(norm_out) ({ctx})"
+    )
+    padded_rows = pad_up(m, 128)
+    num_sf_cols = ceil_div(n, SF_VEC)
+    padded_cols = pad_up(num_sf_cols, 4) * SF_VEC
+    u_fused = unswizzle_sf(sf_fused, padded_rows, padded_cols, SF_VEC)[:m, :num_sf_cols]
+    u_req = unswizzle_sf(sf_req, padded_rows, padded_cols, SF_VEC)[:m, :num_sf_cols]
+    assert torch.equal(u_fused, u_req), f"fused SF not bit-exact vs fp4_quantize(norm_out) ({ctx})"
+
+
 # --------------------------------------------------------------------------- #
 # fused_add_rmsnorm_fp4_quantize: residual_add -> rms_norm -> nvfp4_quantize    #
 # --------------------------------------------------------------------------- #
@@ -222,6 +268,11 @@ def test_fused_add_rmsnorm_fp4_quantize_return_norm_out(dtype):
 
     assert_fp4_match(quant_out, fp4_ref, f"add-rmsnorm return_norm_out {dtype}")
     assert_sf_match(scale_out, sf_ref, m, n, f"add-rmsnorm return_norm_out {dtype}")
+    # Bit-exact: re-quantizing the fused op's own norm_out must reproduce its
+    # quant_out/scale_out exactly (isolates the epilogue from RMSNorm ULP noise).
+    assert_fp4_bitexact_from_norm(
+        quant_out, scale_out, norm_out, sf_scale, m, n, f"add-rmsnorm return_norm_out {dtype}"
+    )
     torch.testing.assert_close(norm_out, normed_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(residual_out.float(), added, rtol=2e-2, atol=2e-2)
 
@@ -273,6 +324,11 @@ def test_fused_rmsnorm_fp4_quantize_return_norm_out(dtype):
 
     assert_fp4_match(quant_out, fp4_ref, f"rmsnorm return_norm_out {dtype}")
     assert_sf_match(scale_out, sf_ref, m, n, f"rmsnorm return_norm_out {dtype}")
+    # Bit-exact: re-quantizing the fused op's own norm_out must reproduce its
+    # quant_out/scale_out exactly (isolates the epilogue from RMSNorm ULP noise).
+    assert_fp4_bitexact_from_norm(
+        quant_out, scale_out, norm_out, sf_scale, m, n, f"rmsnorm return_norm_out {dtype}"
+    )
     torch.testing.assert_close(norm_out, normed_ref, rtol=2e-2, atol=2e-2)
 
 
