@@ -749,97 +749,99 @@ class TestDeepseekV4CacheManager:
 
         # Create requests and their cache values
         requests = list[LlmRequest]()
-        cache_values = dict[int, _RequestCache]()
-        for req_id, prompt_len in enumerate(prompt_lens):
-            req = self._create_request(req_id, prompt_len)
-            requests.append(req)
+        try:
+            cache_values = dict[int, _RequestCache]()
+            for req_id, prompt_len in enumerate(prompt_lens):
+                req = self._create_request(req_id, prompt_len)
+                requests.append(req)
 
-            # Generate random cache values for this request
-            cache_values[req_id] = self._create_random_cache(
-                seq_len=prompt_len + num_generation_steps + 1,
-                head_dim=self.head_dim,
-                sparse_attn_config=sparse_attn_config,
-                dtype=binding_to_torch_dtype(dtype),
-                compressor_dtype=binding_to_torch_dtype(compressor_dtype),
-            )
+                # Generate random cache values for this request
+                cache_values[req_id] = self._create_random_cache(
+                    seq_len=prompt_len + num_generation_steps + 1,
+                    head_dim=self.head_dim,
+                    sparse_attn_config=sparse_attn_config,
+                    dtype=binding_to_torch_dtype(dtype),
+                    compressor_dtype=binding_to_torch_dtype(compressor_dtype),
+                )
 
-        # Simulate the prefill phrase
-        scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests_last_chunk = requests
-        for req in requests:
-            cache_manager.prepare_context(req)
-            cache_manager.resize_context(req, req.context_chunk_size)
-
-        # Write context to cache
-        for req in requests:
-            self._write_request_prefill(
-                req=req,
-                prompt_len=prompt_lens[req.py_request_id],
-                cache_manager=cache_manager,
-                cache_values=cache_values[req.py_request_id],
-            )
-
-        # Update requests state and call update_resources
-        for req in requests:
-            req.context_current_position = prompt_lens[req.py_request_id]
-            req.add_new_token(prompt_lens[req.py_request_id], 0)
-        cache_manager.update_resources(scheduled_batch)
-
-        # Read context from cache and verify
-        for req in requests:
-            actual_cache_values = self._read_request(
-                req=req,
-                seq_len=prompt_lens[req.py_request_id],
-                cache_manager=cache_manager,
-                compress_ratios=compress_ratios,
-            )
-            self._assert_cache_equal(
-                seq_len=prompt_lens[req.py_request_id],
-                compress_ratios=compress_ratios,
-                expect=cache_values[req.py_request_id],
-                actual=actual_cache_values,
-            )
-
-        # Simulate the decode phrase
-        for i in range(num_generation_steps):
-            seq_lens = [prompt_len + i + 1 for prompt_len in prompt_lens]
+            # Simulate the prefill phrase
             scheduled_batch = ScheduledRequests()
-            scheduled_batch.generation_requests = requests
+            scheduled_batch.context_requests_last_chunk = requests
             for req in requests:
-                cache_manager.try_allocate_generation(req)
+                cache_manager.prepare_context(req)
+                cache_manager.resize_context(req, req.context_chunk_size)
 
-            # Write new token to cache
+            # Write context to cache
             for req in requests:
-                self._write_request_decode(
+                self._write_request_prefill(
                     req=req,
-                    token_idx=seq_lens[req.py_request_id] - 1,
+                    prompt_len=prompt_lens[req.py_request_id],
                     cache_manager=cache_manager,
                     cache_values=cache_values[req.py_request_id],
                 )
+
+            # Update requests state and call update_resources
+            for req in requests:
+                req.context_current_position = prompt_lens[req.py_request_id]
+                req.add_new_token(prompt_lens[req.py_request_id], 0)
+            cache_manager.update_resources(scheduled_batch)
 
             # Read context from cache and verify
             for req in requests:
                 actual_cache_values = self._read_request(
                     req=req,
-                    seq_len=seq_lens[req.py_request_id],
+                    seq_len=prompt_lens[req.py_request_id],
                     cache_manager=cache_manager,
                     compress_ratios=compress_ratios,
                 )
                 self._assert_cache_equal(
-                    seq_len=seq_lens[req.py_request_id],
+                    seq_len=prompt_lens[req.py_request_id],
                     compress_ratios=compress_ratios,
                     expect=cache_values[req.py_request_id],
                     actual=actual_cache_values,
                 )
 
-            for req in requests:
-                req.add_new_token(seq_lens[req.py_request_id], 0)
-            cache_manager.update_resources(scheduled_batch)
+            # Simulate the decode phrase
+            for i in range(num_generation_steps):
+                seq_lens = [prompt_len + i + 1 for prompt_len in prompt_lens]
+                scheduled_batch = ScheduledRequests()
+                scheduled_batch.generation_requests = requests
+                for req in requests:
+                    cache_manager.try_allocate_generation(req)
 
-        # Clean up
-        for req in requests:
-            cache_manager.free_resources(req)
-        cache_manager.shutdown()
+                # Write new token to cache
+                for req in requests:
+                    self._write_request_decode(
+                        req=req,
+                        token_idx=seq_lens[req.py_request_id] - 1,
+                        cache_manager=cache_manager,
+                        cache_values=cache_values[req.py_request_id],
+                    )
+
+                # Read context from cache and verify
+                for req in requests:
+                    actual_cache_values = self._read_request(
+                        req=req,
+                        seq_len=seq_lens[req.py_request_id],
+                        cache_manager=cache_manager,
+                        compress_ratios=compress_ratios,
+                    )
+                    self._assert_cache_equal(
+                        seq_len=seq_lens[req.py_request_id],
+                        compress_ratios=compress_ratios,
+                        expect=cache_values[req.py_request_id],
+                        actual=actual_cache_values,
+                    )
+
+                for req in requests:
+                    req.add_new_token(seq_lens[req.py_request_id], 0)
+                cache_manager.update_resources(scheduled_batch)
+        finally:
+            try:
+                for req in requests:
+                    cache_manager.free_resources(req)
+            finally:
+                cache_manager.shutdown()
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize(
@@ -859,18 +861,21 @@ class TestDeepseekV4CacheManager:
             compressor_dtype=compressor_dtype,
         )
 
-        kv_cache_pool_mapping = cache_manager.kv_cache_pool_mapping
-        assert kv_cache_pool_mapping.shape == (num_layers, 2)
+        try:
+            kv_cache_pool_mapping = cache_manager.kv_cache_pool_mapping
+            assert kv_cache_pool_mapping.shape == (num_layers, 2)
 
-        assert torch.all(kv_cache_pool_mapping[:, 0] != -1), (
-            "all layers should have swa attention pool"
-        )
-        assert torch.all(kv_cache_pool_mapping[:, 1] >= 0), (
-            "buffer pointer offset should be non-negative"
-        )
-        assert torch.all(kv_cache_pool_mapping[:, 0] == kv_cache_pool_mapping[0, 0]), (
-            "all layers should have the same pool_id"
-        )
+            assert torch.all(kv_cache_pool_mapping[:, 0] != -1), (
+                "all layers should have swa attention pool"
+            )
+            assert torch.all(kv_cache_pool_mapping[:, 1] >= 0), (
+                "buffer pointer offset should be non-negative"
+            )
+            assert torch.all(kv_cache_pool_mapping[:, 0] == kv_cache_pool_mapping[0, 0]), (
+                "all layers should have the same pool_id"
+            )
+        finally:
+            cache_manager.shutdown()
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize(
@@ -896,33 +901,45 @@ class TestDeepseekV4CacheManager:
             compressor_dtype=compressor_dtype,
         )
 
-        # Fresh cache (zero-initialized) should have no invalid values
-        result = cache_manager.check_invalid_values_in_kv_cache()
-        assert not result, "Fresh cache should have no invalid values"
+        needs_invalid_cleanup = False
+        try:
+            # Fresh cache (zero-initialized) should have no invalid values
+            result = cache_manager.check_invalid_values_in_kv_cache()
+            assert not result, "Fresh cache should have no invalid values"
 
-        if invalid:
-            # Inject invalid into a float buffer so NaN/Inf checks are supported.
-            layer_idx = next(i for i, ratio in enumerate(compress_ratios) if ratio > 1)
-            buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESSOR_STATE)
-            buffer[0, 0, 0] = torch.nan
+            if invalid:
+                # Inject invalid into a float buffer so NaN/Inf checks are supported.
+                layer_idx = next(i for i, ratio in enumerate(compress_ratios) if ratio > 1)
+                buffer = cache_manager.get_buffers(
+                    layer_idx, DeepseekV4AttentionType.COMPRESSOR_STATE
+                )
+                buffer[0, 0, 0] = torch.nan
+                needs_invalid_cleanup = True
 
-        result = cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=fill_with_zero)
-        assert result == invalid, (
-            f"Expected invalid={invalid} from check_invalid_values_in_kv_cache, got {result}"
-        )
+            result = cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=fill_with_zero)
+            if invalid and fill_with_zero:
+                needs_invalid_cleanup = False
+            assert result == invalid, (
+                f"Expected invalid={invalid} from check_invalid_values_in_kv_cache, got {result}"
+            )
 
-        # Verify whether invalid values remain after the check.
-        post_check = cache_manager.check_invalid_values_in_kv_cache()
-        expected_post_check = invalid and not fill_with_zero
-        assert post_check == expected_post_check, (
-            f"Expected post-check invalid={expected_post_check}, got {post_check}"
-        )
+            # Verify whether invalid values remain after the check.
+            post_check = cache_manager.check_invalid_values_in_kv_cache()
+            expected_post_check = invalid and not fill_with_zero
+            assert post_check == expected_post_check, (
+                f"Expected post-check invalid={expected_post_check}, got {post_check}"
+            )
 
-        if expected_post_check:
-            # Cleanup for shutdown path when zero-fill wasn't requested above.
-            cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
-
-        cache_manager.shutdown()
+            if expected_post_check:
+                # Cleanup for shutdown path when zero-fill wasn't requested above.
+                cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+                needs_invalid_cleanup = False
+        finally:
+            try:
+                if needs_invalid_cleanup:
+                    cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+            finally:
+                cache_manager.shutdown()
 
 
 if __name__ == "__main__":
