@@ -21,8 +21,7 @@ import pytest
 import torch
 from utils.util import assert_no_cuda_sync, force_ampere
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (ACCEPT_SYNC_COMPUTE,
-                                                           torch_multi_arange)
+from tensorrt_llm._torch.utils import ACCEPT_SYNC_COMPUTE, torch_multi_arange
 
 BASE_CASES = [
     (None, [], None, []),
