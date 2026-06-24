@@ -65,20 +65,20 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def _llm_models_root() -> str:
+def _llm_models_root() -> str | None:
     root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ["LLM_MODELS_ROOT"])
     if not root.exists():
         root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
+    return str(root) if root.exists() else None
 
 
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
+def _checkpoint(env_var: str, default_name: str) -> str | None:
+    if env_var in os.environ:
+        return os.environ[env_var]
+    models_root = _llm_models_root()
+    return os.path.join(models_root, default_name) if models_root is not None else None
 
 
 WAN21_VSA_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_VSA", "Wan2.1-VSA-T2V-14B-720P-Diffusers")
@@ -237,6 +237,9 @@ def _logic_vsa_cfg2_ulysses4(rank: int, world_size: int, *, checkpoint_path: str
     if rank != 0:
         return
 
+    # Destroy the world_size=8 group before loading the single-GPU reference.
+    dist.destroy_process_group()
+
     ref_pipe = PipelineLoader(_build_vsa_single_args(checkpoint_path)).load(skip_warmup=True)
     ref_video = _capture_trtllm_video(ref_pipe)
     _free(ref_pipe)
@@ -274,7 +277,7 @@ class TestWanVsaUlysses:
             pytest.skip("Required modules not available")
         if not _cute_dsl_available:
             pytest.skip(f"CUTEDSL not available (requires Blackwell GPU): {_cute_dsl_import_error}")
-        if not os.path.exists(WAN21_VSA_PATH):
+        if WAN21_VSA_PATH is None or not os.path.exists(WAN21_VSA_PATH):
             pytest.skip(
                 f"Checkpoint not found: {WAN21_VSA_PATH}. Set DIFFUSION_MODEL_PATH_WAN21_VSA."
             )
