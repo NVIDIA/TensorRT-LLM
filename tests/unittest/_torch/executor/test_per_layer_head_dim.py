@@ -66,6 +66,22 @@ def _create_kv_cache_manager_v2(
     )
 
 
+def _create_cache_config_only_manager() -> KVCacheManagerV2:
+    mgr = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    mgr.kv_cache_type = CacheType.SELF
+    mgr.dtype = DataType.HALF
+    mgr.kv_factor = 2
+    mgr.max_batch_size = 4
+    mgr.max_attention_window_vec = [4, None]
+    mgr.num_local_layers = 2
+    mgr.pp_layers = [0, 1]
+    mgr.num_kv_heads_per_layer = [1, 1]
+    mgr.head_dim_per_layer = [8, 8]
+    mgr.enable_swa_scratch_reuse = False
+    mgr.enable_stats = False
+    return mgr
+
+
 class TestPerLayerHeadDimBasic(unittest.TestCase):
     """Tests that don't allocate GPU memory or use uniform buffer sizes."""
 
@@ -113,19 +129,8 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
         finally:
             mgr.shutdown()
 
-    def test_build_cache_config_reserves_concurrent_decode_slots(self):
-        mgr = KVCacheManagerV2.__new__(KVCacheManagerV2)
-        mgr.kv_cache_type = CacheType.SELF
-        mgr.dtype = DataType.HALF
-        mgr.kv_factor = 2
-        mgr.max_batch_size = 4
-        mgr.max_attention_window_vec = [4, None]
-        mgr.num_local_layers = 2
-        mgr.pp_layers = [0, 1]
-        mgr.num_kv_heads_per_layer = [1, 1]
-        mgr.head_dim_per_layer = [8, 8]
-        mgr.enable_swa_scratch_reuse = False
-        mgr.enable_stats = False
+    def test_build_base_config_reserves_concurrent_decode_slots(self):
+        mgr = _create_cache_config_only_manager()
 
         config = mgr._build_base_config(
             KvCacheConfigV2(max_tokens=128, enable_block_reuse=False),
@@ -146,6 +151,17 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
         self.assertEqual(len(config.typical_step.kv_caches), 1)
         self.assertEqual(config.typical_step.kv_caches[0].capacity, 2049)
         self.assertEqual(config.typical_step.kv_caches[0].history_length, 2048)
+
+    def test_build_base_config_bounds_concurrent_decode_slots_by_max_tokens(self):
+        mgr = _create_cache_config_only_manager()
+
+        config = mgr._build_base_config(
+            KvCacheConfigV2(max_tokens=16, enable_block_reuse=False),
+            tokens_per_block=8,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        )
+
+        self.assertEqual(len(config.constraints[0].kv_caches), 2)
 
     def test_per_layer_head_dim_wrong_length(self):
         """Test that mismatched list length raises assertion."""
