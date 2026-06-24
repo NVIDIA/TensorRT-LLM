@@ -13,7 +13,8 @@ each case maps to a real workload. The orthogonal dimensions are bounded:
   precision {bf16, fp8-KV} x KV-manager {v1, v2}, at page_size=32, layout=HND.
 * the non-default dimension values (page_size=64, layout=NHD, dtype=fp16) are
   exercised on a small representative set (GQA / MHA / MQA) to avoid a full
-  cross blow-up -- page/manager/layout are head-config-independent.
+  cross blow-up -- page/manager/layout are mostly head-config-independent. For
+  single-KV-head configs, NHD duplicates HND and is canonicalized to HND.
 
 Gen-only batches are also replayed through a captured CUDA graph; backends that
 cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
@@ -96,8 +97,9 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     cases. Used to generate both the core slice (default dims on every config)
     and the feature slice (non-default dims on representative configs); callers
     dedup by id. Dimensions that don't apply to a case type are filtered:
-    no-cache encoders take only the compute-dtype precisions; MLA uses its
-    NHD-internal latent cache in bf16; cross skips fp8.
+    no-cache encoders take only the compute-dtype precisions; MLA uses bf16
+    latent cache; cross skips fp8. Single-KV-head configs use only HND because
+    NHD is physically equivalent and would skip TRTLLM coverage.
     """
     common = _common(cfg)
 
@@ -124,6 +126,8 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
         precisions = [(d, k) for d, k in precisions if k is None]  # bf16 latent
     elif cfg.is_cross:
         precisions = [(d, k) for d, k in precisions if k is None]  # no fp8 cross
+    if cfg.num_kv_heads == 1:
+        kv_layouts = ["HND"]
 
     for dtype, kvd in precisions:
         for layout in kv_layouts:

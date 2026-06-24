@@ -322,12 +322,12 @@ def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
     )
 
 
-def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent):
+def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent, *, kv_layout: str):
     """Write the per-request cached latent prefix into the MLA cache pool."""
     if all(c.shape[0] == 0 for c in cached_latent):
         return
-    buf = mgr.get_buffers(layer_idx)  # [pages, 1, page_size, 1, d_latent]
-    tokens_per_block = buf.shape[2]
+    buf = mgr.get_buffers(layer_idx, kv_layout=kv_layout)
+    tokens_per_block = buf.shape[2] if kv_layout == "NHD" else buf.shape[3]
     blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), layer_idx)
     for i, blocks in enumerate(blocks_per_req):
         blocks = [b for b in blocks if b != -1]
@@ -337,12 +337,16 @@ def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent):
             if written >= lat.shape[0]:
                 break
             n = min(tokens_per_block, lat.shape[0] - written)
-            buf[blk, 0, :n, 0, :].copy_(lat[written : written + n].to(buf.dtype))
+            new_latent = lat[written : written + n].to(buf.dtype)
+            if kv_layout == "NHD":
+                buf[blk, 0, :n, 0, :].copy_(new_latent)
+            else:
+                buf[blk, 0, 0, :n, :].copy_(new_latent)
             written += n
 
 
-def _mla_metadata(AttentionCls, case, mgr):
-    return AttentionCls.Metadata(
+def _mla_metadata(AttentionCls, case, mgr, *, kv_layout: str):
+    metadata = AttentionCls.Metadata(
         num_contexts=0,
         kv_cache_params=KVCacheParams(
             use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
@@ -354,9 +358,13 @@ def _mla_metadata(AttentionCls, case, mgr):
         request_ids=list(range(case.num_seqs)),
         prompt_lens=case.token_nums,
     )
+    metadata.kv_layout = kv_layout
+    return metadata
 
 
-def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Tensor:
+def _run_mla_gen_backend(
+    case, backend, inputs, *, cuda_graph=False, kv_layout: str = "NHD"
+) -> torch.Tensor:
     """Run one backend's absorbed-MLA generation; return [nnz_q, heads*kv_lora].
 
     No ``mla_rope_generation`` call (see ``generate_mla_gen_inputs``): ``fused_q``
@@ -382,7 +390,7 @@ def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Te
     )
     mgr = _build_mla_kv_cache_manager(case, backend)
     mgr.add_dummy_requests(request_ids, case.token_nums)
-    _fill_mla_cache(mgr, 0, request_ids, inputs["cached_latent"])
+    _fill_mla_cache(mgr, 0, request_ids, inputs["cached_latent"], kv_layout=kv_layout)
     fused_q = inputs["fused_q"]
     latent_cache = inputs["latent_cache"]
     fwd_kwargs = dict(
@@ -399,11 +407,14 @@ def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Te
                 AttentionCls,
                 case,
                 mgr,
-                _mla_metadata,
+                lambda AttentionCls, case, mgr: _mla_metadata(
+                    AttentionCls, case, mgr, kv_layout=kv_layout
+                ),
                 {"q": fused_q},
                 lambda md, bufs: _forward(md, bufs["q"]),
+                kv_layout=kv_layout,
             )
-        metadata = _mla_metadata(AttentionCls, case, mgr)
+        metadata = _mla_metadata(AttentionCls, case, mgr, kv_layout=kv_layout)
         metadata.prepare()
         return _forward(metadata, fused_q)[: case.nnz_q].contiguous()
     finally:
@@ -425,7 +436,7 @@ def generate_mla_context_inputs(case: BackendCase, seed: int = 0) -> Dict:
     )
 
 
-def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
+def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str = "NHD") -> torch.Tensor:
     """Run one backend's up-projected MLA context; return [nnz_q, heads*v_head]."""
     AttentionCls = get_attention_backend(backend)
     qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
@@ -458,6 +469,7 @@ def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
         request_ids=request_ids,
         prompt_lens=case.token_nums,
     )
+    metadata.kv_layout = kv_layout
     metadata.prepare()
     try:
         out = attn.forward(
@@ -603,8 +615,10 @@ def run_backend(
     """
     if case.is_mla:
         if case.is_context_only:
-            return _run_mla_context_backend(case, backend, inputs)
-        return _run_mla_gen_backend(case, backend, inputs, cuda_graph=cuda_graph)
+            return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
+        return _run_mla_gen_backend(
+            case, backend, inputs, cuda_graph=cuda_graph, kv_layout=kv_layout
+        )
 
     AttentionCls = get_attention_backend(backend)
     H, Hkv, D = case.num_heads, case.num_kv_heads, case.head_dim
