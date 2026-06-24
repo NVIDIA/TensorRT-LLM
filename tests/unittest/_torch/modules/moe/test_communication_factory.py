@@ -54,11 +54,28 @@ def _strategy_unavailable(*args, **kwargs):
     raise RuntimeError("strategy unavailable")
 
 
+class _FakeNcclEP:
+    def __init__(
+        self,
+        mapping,
+        num_slots,
+        hidden_size,
+        max_num_tokens,
+        moe_max_num_tokens,
+        top_k=8,
+    ):
+        self.mapping = mapping
+        self.num_slots = num_slots
+        self.hidden_size = hidden_size
+        self.max_num_tokens = max_num_tokens
+        self.moe_max_num_tokens = moe_max_num_tokens
+        self.top_k = top_k
+
+
 @pytest.mark.parametrize(
     ("act_dtype", "moe_max_num_tokens", "match"),
     [
         (torch.float16, 1024, "act_dtype=torch.bfloat16"),
-        (torch.bfloat16, None, "moe_max_num_tokens"),
     ],
 )
 def test_forced_nccl_ep_validates_preconditions(
@@ -83,11 +100,58 @@ def test_forced_nccl_ep_validates_preconditions(
         )
 
 
+def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_config = _make_model_config(torch.bfloat16, None)
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory._create_forced_method(
+        "NCCL_EP",
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        payload_in_workspace=False,
+        alltoall_result_do_sum=True,
+        use_flashinfer=False,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, _FakeNcclEP)
+    assert strategy.max_num_tokens == model_config.max_num_tokens
+    assert strategy.moe_max_num_tokens is None
+
+
+def test_auto_selection_uses_nccl_ep_with_missing_moe_max_num_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_config = _make_model_config(torch.bfloat16, None)
+
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, _FakeNcclEP)
+    assert strategy.max_num_tokens == model_config.max_num_tokens
+    assert strategy.moe_max_num_tokens is None
+
+
 @pytest.mark.parametrize(
     ("act_dtype", "moe_max_num_tokens"),
     [
         (torch.float16, 1024),
-        (torch.bfloat16, None),
     ],
 )
 def test_auto_selection_skips_nccl_ep_when_preconditions_fail(

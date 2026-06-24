@@ -61,9 +61,6 @@ class NcclEP(Communication):
     ):
         super().__init__(mapping)
 
-        if moe_max_num_tokens is None:
-            raise ValueError("NcclEP requires moe_max_num_tokens to be set.")
-
         from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import (
             get_nccl_ep_context,
             is_nccl_ep_installed,
@@ -81,7 +78,11 @@ class NcclEP(Communication):
         self.max_top_k = top_k
         self.use_fp8 = use_fp8
 
-        self.max_tokens_per_rank = min(max_num_tokens, moe_max_num_tokens)
+        self.max_tokens_per_rank = (
+            max_num_tokens
+            if moe_max_num_tokens is None
+            else min(max_num_tokens, moe_max_num_tokens)
+        )
         self.max_recv_tokens = self.ep_size * self.max_tokens_per_rank
 
         # Singleton NCCL EP context: owns the EP group, RDMA buffers, and

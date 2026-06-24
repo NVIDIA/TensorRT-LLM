@@ -185,9 +185,7 @@ class CommunicationFactory:
 
         # Try NCCL EP (rank-major LL). Falls through to DeepEP/AllGather if
         # prerequisites are not met or libnccl_ep.so is not available.
-        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
-            act_dtype, moe_max_num_tokens
-        )
+        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(act_dtype)
         if nccl_ep_unavailable_reason is None:
             try:
                 strategy = NcclEP(
@@ -344,7 +342,7 @@ class CommunicationFactory:
             )
         elif method == "NCCL_EP":
             nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
-                act_dtype, moe_max_num_tokens
+                act_dtype
             )
             if nccl_ep_unavailable_reason is not None:
                 raise ValueError(nccl_ep_unavailable_reason)
@@ -363,10 +361,8 @@ class CommunicationFactory:
 
     @staticmethod
     def _get_nccl_ep_unavailable_reason(
-        act_dtype: torch.dtype, moe_max_num_tokens: Optional[int]
+        act_dtype: torch.dtype,
     ) -> Optional[str]:
         if act_dtype != torch.bfloat16:
             return f"NcclEP requires act_dtype=torch.bfloat16, got {act_dtype}."
-        if moe_max_num_tokens is None:
-            return "NcclEP requires model_config.moe_max_num_tokens to be set."
         return None
