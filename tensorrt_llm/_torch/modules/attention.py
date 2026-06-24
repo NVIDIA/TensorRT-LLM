@@ -529,7 +529,8 @@ class Attention(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -1462,7 +1463,8 @@ class MLA(nn.Module):
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
