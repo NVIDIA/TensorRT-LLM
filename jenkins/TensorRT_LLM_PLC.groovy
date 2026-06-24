@@ -333,6 +333,13 @@ def processScanResults(ref) {
                     python3 -m venv venv
                     venv/bin/pip install requests elasticsearch==7.13.4
                 """
+                def skipArgs = ""
+                if (!params.runSourceCodeScanning) {
+                    skipArgs += " --skip-source-code"
+                }
+                if (!params.runContainerScanning) {
+                    skipArgs += " --skip-container"
+                }
                 def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
                 def output = withEnv(["LICENSE_CHECK_TOKEN=${token}"]) {
                     sh(script: """
@@ -341,7 +348,7 @@ def processScanResults(ref) {
                             --build-number ${env.BUILD_NUMBER} \
                             --ref ${ref} \
                             --report-directory ${pwd()}/scan_report \
-                            --scan-mode ${params.scanMode}
+                            --scan-mode ${params.scanMode}${skipArgs}
                     """, returnStdout: true).trim()
                 }
                 echo "Scan result: ${output}"
