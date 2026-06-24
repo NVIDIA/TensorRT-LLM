@@ -22,12 +22,44 @@ import abc
 import sys
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
+from typing import Any, Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._torch.pyexecutor.sampling_backends import backend_custom, backend_torch
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    BeamSearchMetadata as BeamSearchMetadata,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    StrategyMetadata as StrategyMetadata,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import _Fusions as _Fusions
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    beam_search_sampling_batch,
+    greedy_search_sampling_batch,
+    temperature_sampling_batch,
+    top_k_sampling_batch,
+    top_k_top_p_sampling_batch,
+    top_p_sampling_batch,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    compute_probs as _torch_compute_probs,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    get_rejected_indices as get_rejected_indices,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import greedy as _torch_greedy
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    sample_from_logits as _torch_sample_from_logits,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    sample_from_probs as _torch_sample_from_probs,
+)
+from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_torch import (
+    sample_rejected as sample_rejected,
+)
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
 if sys.version_info[:2] >= (3, 12):
@@ -47,28 +79,6 @@ GREEDY: Greedy = ("greedy", None)
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
 
 BEAM_SEARCH_PAD_TOKEN = -1
-
-
-@dataclass(kw_only=True)
-class StrategyMetadata:
-    pass
-
-
-@dataclass(kw_only=True)
-class BeamSearchMetadata(StrategyMetadata):
-    cache_indirection: torch.Tensor
-    cache_indirection_buffer: torch.Tensor
-    cum_log_probs: torch.Tensor
-    new_log_probs: torch.Tensor
-    seq_slots: torch.Tensor
-    seq_lens: torch.Tensor
-    finished_beams: torch.Tensor
-    predecessor_beams: torch.Tensor
-    # Pre-computed indexer constants sliced (not allocated) per call.
-    # seq_offsets[i] = i * max_beam_width, shape (max_num_sequences,), int64.
-    # beam_idx_arange[j] = j, shape (max_beam_width,), int32.
-    seq_offsets: torch.Tensor
-    beam_idx_arange: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -137,335 +147,6 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     if need_top_k:
         return ("top_k", top_k, temperature)
     return ("temperature", temperature)
-
-
-def top_k_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_k: int,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # NB: To be replaced by a more efficient implementation.
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_k=top_k,
-        temperature=temperature,
-        generator=generator,
-        top_p=1,
-    )
-
-
-def top_p_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_p: float,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # NB: To be replaced by a more efficient implementation.
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_p=top_p,
-        top_k=logits.size(1),
-        temperature=temperature,
-        generator=generator,
-    )
-
-
-def temperature_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # NB: To be replaced by a more efficient implementation.
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_p=1,
-        top_k=logits.size(1),
-        temperature=temperature,
-        generator=generator,
-    )
-
-
-def top_k_top_p_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_k: int,
-    top_p: float,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    logits_dim = logits.dim()
-    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
-    assert temperature > 0, "non-greedy sampling requires valid temperature"
-    logits = logits / max(temperature, 1e-5)
-    batch_size, vocab_size = logits.size()
-
-    assert top_k > 1, "non-greedy sampling requires valid top_k"
-    need_top_k = top_k < vocab_size
-    assert top_p > 0, "non-greedy sampling requires valid top_p"
-    need_top_p = top_p < 1
-
-    # top-K: mask out logits not belonging to the top-K for each sample
-    if need_top_k:
-        values, _ = torch.topk(logits, top_k, dim=-1)
-        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
-
-        # set the logits who is less than first top_k logits to -inf
-        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
-
-    # top-p: mask out logits outside the nucleus
-    if need_top_p:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-
-        # compute cumulative probability distribution of each sample
-        probs_sorted = torch.softmax(sorted_logits, dim=-1)
-        cumulative_probs = torch.cumsum(probs_sorted, dim=-1)
-
-        # get the location of top_p
-        # NB: Currently selecting the smallest index with cumulative_probs >= top_p.
-        #     Thus, top_p -> 0 resembles greedy; agreement requires torch.sort(..., stable=True).
-        mask_to_remove = cumulative_probs >= top_p  # at least one 'True' per row
-        last_index_to_keep = torch.searchsorted(
-            mask_to_remove.to(torch.int8, non_blocking=True),
-            torch.ones((1,), dtype=torch.int8, device=mask_to_remove.device).expand(
-                (mask_to_remove.size(0), 1)
-            ),
-            right=False,
-            out_int32=True,
-        )
-        mask_to_remove.scatter_(
-            1,
-            last_index_to_keep,
-            torch.zeros((1,), dtype=torch.bool, device=mask_to_remove.device).expand_as(
-                last_index_to_keep
-            ),
-        )
-
-        # mask not selected probs
-        probs_sorted.masked_fill_(mask_to_remove, 0.0)
-        probs = torch.empty_like(probs_sorted)
-        probs.scatter_(1, sorted_indices, probs_sorted)
-        probs /= cumulative_probs[  # renormalize probs
-            torch.arange(
-                cumulative_probs.size(0), dtype=torch.int32, device=cumulative_probs.device
-            ),  # needed for advanced indexing
-            last_index_to_keep.squeeze(-1),
-        ].unsqueeze(-1)
-        del logits  # do not use, inconsistent with probs
-    else:
-        # compute probability distribution
-        probs = torch.softmax(logits, dim=-1)
-
-    # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
-    return next_tokens, probs
-
-
-def greedy_search_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    next_tokens = torch.argmax(logits, dim=-1)
-    softmax: Optional[torch.Tensor] = None
-    if return_probs:
-        softmax = torch.zeros_like(logits)
-        softmax.scatter_(1, next_tokens.unsqueeze(-1), 1.0)
-    return next_tokens, softmax
-
-
-def update_cache_indirection_buffer(
-    cache_indirection_input: torch.Tensor,
-    cache_indirection_output: torch.Tensor,
-    seq_slots: torch.Tensor,
-) -> None:
-    assert cache_indirection_input.device == cache_indirection_output.device, (
-        "cache_indirection_input and cache_indirection_output must be on the same device"
-    )
-    cache_indirection_input.index_copy_(0, seq_slots, cache_indirection_output[seq_slots])
-
-
-def beam_search_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    beam_width_in: int,
-    beam_width_out: int,
-    beam_search_args: BeamSearchMetadata,
-    temperature: float | None,
-    return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Sample <beam_width> tokens for each request in parallel.
-    """
-    logits_dim = logits.dim()
-    assert logits_dim == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
-    batch_size, vocab_size = logits.size()
-    batch_size = batch_size // beam_width_in
-
-    # compute probability distribution
-    logits = logits.view(batch_size, beam_width_in, vocab_size)
-    if temperature is not None and temperature != 0:
-        logits = logits / max(temperature, 1e-5)
-    softmax: Optional[torch.Tensor] = None
-    if return_probs:
-        softmax = torch.softmax(logits, dim=-1)
-    # update the "input" cache indirection
-    update_cache_indirection_buffer(
-        beam_search_args.cache_indirection_buffer,
-        beam_search_args.cache_indirection,
-        beam_search_args.seq_slots,
-    )
-    assert batch_size == beam_search_args.seq_slots.size(0), (
-        f"batch_size {batch_size} must be equal to seq_slots.size(0) {beam_search_args.seq_slots.size(0)}"
-    )
-
-    # get logprobs of each beam
-    logprobs = torch.log_softmax(logits, dim=-1)
-
-    # handle finished beams
-    # Guarantee that finished beams will only sample their end_id token, with logprob 0.
-    # This implies that a finished beam will not alter its score
-
-    # mask showing which beams in the batch are finished: Shape: (batch_size, beam_width)
-    finished_beams_mask = (
-        beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
-        != FinishReason.NOT_FINISHED.value
-    )
-    # expand the mask in the vocabulary dimension
-    finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
-        -1, -1, logprobs.size(-1)
-    )
-
-    # we can now use torch.where to fill the logprobs of the finished beams with -inf asynchronously
-    logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
-    # set the first token to 0 for finished beams. We will overwrite sampling with a padding token later.
-    logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
-
-    # Add the current cum_log_probs to the logprobs of each beam
-    logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-
-    # get the top <beam_width> logprobs across all beams
-    logprobs = logprobs.view(batch_size, beam_width_in * vocab_size)
-    sorted_logprobs, sorted_indices = torch.topk(logprobs, k=beam_width_out, sorted=True, dim=-1)
-
-    next_tokens = sorted_indices.to(torch.int32)
-
-    # Rework the past cache indirection
-    # get the beam idx from which the tokens were sampled (optimal predecessor)
-    predecessor_beam = next_tokens // vocab_size
-    beam_search_args.predecessor_beams[beam_search_args.seq_slots, :beam_width_out] = (
-        predecessor_beam
-    )
-
-    # update finished states of each beam
-    max_beam_width = beam_search_args.finished_beams.size(1)
-    finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
-
-    offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
-        : predecessor_beam.size(0)
-    ].unsqueeze(1)
-    finished_beams = finished_beams[offset_predecessor_beam]
-    beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
-        batch_size, max_beam_width
-    )
-
-    # Update the cache indirection
-    cache_indirection = beam_search_args.cache_indirection[
-        beam_search_args.seq_slots, :beam_width_out
-    ]
-    cache_indirection_buffer = beam_search_args.cache_indirection_buffer[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-    # Perform the swap of the cache indirections between beams
-    torch.gather(
-        cache_indirection_buffer,
-        dim=1,
-        index=predecessor_beam.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
-        out=cache_indirection,
-    )
-
-    # seq lens is of shape (batch_size), we assume all beams have the same seq len
-    # therefore we can use expand
-    index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
-    # index is of shape (batch_size, beam_width, 1)
-    src = (
-        beam_search_args.beam_idx_arange[:beam_width_out]
-        .view(1, beam_width_out, 1)
-        .expand(batch_size, beam_width_out, 1)
-    )
-    # src is of shape (batch_size, beam_width, 1)
-    # cache_indirection is of shape (batch_size, beam_width, max_seq_len)
-    cache_indirection.scatter_(2, index, src)
-
-    # copy the batched buffer back to the original buffer
-    beam_search_args.cache_indirection[beam_search_args.seq_slots, :beam_width_out] = (
-        cache_indirection
-    )
-
-    # project the next_tokens values to the vocab_size
-    next_tokens = next_tokens % vocab_size
-    ended_predecessor_mask = torch.gather(dim=1, index=predecessor_beam, input=finished_beams_mask)
-    # set the finished beams to the pad token
-    next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
-
-    # update the logprobs of the newly generated tokens
-    # NB this is not needed if logprobs are not returned
-    old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
-    beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
-        sorted_logprobs[:, :beam_width_out] - old_cum_log_probs[offset_predecessor_beam]
-    )
-    # update the beam scores
-    beam_search_args.cum_log_probs[beam_search_args.seq_slots, :beam_width_out] = sorted_logprobs[
-        :, :beam_width_out
-    ]
-    return next_tokens, softmax
-
-
-def get_rejected_indices(
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    generator: torch.Generator,
-    draft_tokens: list[int],
-) -> torch.Tensor:
-    # NB: ModelDrafter._pad_to_max_draft_tokens pads draft_tokens, but
-    #     not draft_probs. Relying on shape of draft_probs here.
-    num_draft_tokens = draft_probs.size(0)
-    draft_tokens = draft_tokens[:num_draft_tokens]
-    # NB: torch.arange is needed to enable "advanced indexing",
-    #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
-    token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(
-        draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
-    ).to(device=generator.device, non_blocking=True)
-    p = draft_probs[token_idx, draft_tokens_cuda]
-    q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
-    accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
-    # Use deterministic random generation for multi-GPU consistency
-    rejected_indices = (
-        torch.rand(accept_probs.shape, generator=generator, device=accept_probs.device)
-        > accept_probs
-    ).nonzero()
-    return rejected_indices
-
-
-def sample_rejected(
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    generator: torch.Generator,
-    num_accepted: int,
-) -> int:
-    last_draft = draft_probs[num_accepted]
-    last_target = target_probs[num_accepted]
-    new = last_target - last_draft
-    new = torch.where(new > 0, new, 0.0)
-
-    new_token = torch.multinomial(new, num_samples=1, generator=generator).squeeze(-1)
-    return cast(int, new_token.item())
 
 
 def sample(
@@ -614,72 +295,775 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
         )
 
 
-class _Fusions:
-    @staticmethod
-    @torch.compile(dynamic=None, fullgraph=True)
-    def _gather_scatter_impl(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        # NB: helper function for TorchSampler._sample_batched_by_strategy, torch.compile is expected to avoid a copy
-        dst_cuda[dst_index_cuda] = src_cuda[src_index_cuda]
+class _StrategyImpls:
+    class StrategyImpl(abc.ABC):
+        @classmethod
+        @abc.abstractmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.StrategyImpl":
+            pass
 
-    @staticmethod
-    def gather_scatter(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        torch._dynamo.mark_dynamic(dst_cuda, 0)
-        torch._dynamo.mark_dynamic(dst_index_cuda, 0)
-        torch._dynamo.mark_dynamic(src_cuda, 0)
-        torch._dynamo.mark_dynamic(src_index_cuda, 0)
-        _Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
+        @classmethod
+        @abc.abstractmethod
+        def computes_probs(cls) -> bool:
+            pass
 
+        def get_temperature(self) -> torch.Tensor | None:
+            return getattr(self, "_temperature", None)
+
+        @abc.abstractmethod
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            pass
+
+        @staticmethod
+        def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
+            torch._assert_async(~torch.any(torch.isnan(inputs)))
+            return False
+
+        @staticmethod
+        def _make_tensor(data: list[Any], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+            return torch.tensor(data, dtype=dtype, pin_memory=prefer_pinned()).to(
+                device=device, non_blocking=True
+            )
+
+        @staticmethod
+        def _prepare_logits_with_temperature(
+            logits: torch.Tensor,
+            group_logit_indices: Optional[torch.Tensor],
+            temperature: torch.Tensor,
+        ) -> torch.Tensor:
+            temperature = temperature.unsqueeze(-1)
+            if group_logit_indices is not None:
+                logits = torch.index_select(logits, 0, group_logit_indices)
+                logits /= temperature
+            else:
+                logits = logits / temperature
+            return logits
+
+        @staticmethod
+        def _prepare_probs_with_temperature(
+            logits: torch.Tensor,
+            group_logit_indices: Optional[torch.Tensor],
+            temperature: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            if group_logit_indices is not None:
+                logits = logits[group_logit_indices]
+            return softmax_op(logits, temperature)
+
+        @classmethod
+        def _sample_from_probs(
+            cls,
+            probs: torch.Tensor,
+            generator: Optional[torch.Generator],
+        ) -> torch.Tensor:
+            return sampling_from_probs_generator_op(
+                probs, generator, check_nan=cls._flashinfer_check_nans(probs)
+            )
+
+        def _sample_greedy_with_probs(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor],
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            if group_logit_indices is not None:
+                logits = torch.index_select(logits, 0, group_logit_indices)
+            tokens = torch.argmax(logits, dim=-1)
+            probs = torch.zeros_like(logits)
+            probs.scatter_(1, tokens.unsqueeze(-1), 1.0)
+            return tokens, probs
+
+        @classmethod
+        def _sample_with_probs(
+            cls,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor],
+            top_k: Optional[torch.Tensor],
+            top_p: Optional[torch.Tensor],
+            temperature: torch.Tensor,
+            generator: Optional[torch.Generator],
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            if top_k is not None:
+                logits = cls._prepare_logits_with_temperature(
+                    logits, group_logit_indices, temperature
+                )
+                logits = top_k_mask_logits_op(logits, top_k)
+                probs = cls._prepare_probs_with_temperature(logits, None, None)
+            else:
+                probs = cls._prepare_probs_with_temperature(
+                    logits, group_logit_indices, temperature
+                )
+            if top_p is not None:
+                probs = top_p_renorm_probs_op(probs, top_p)
+            new_tokens = cls._sample_from_probs(probs, generator=generator)
+            return new_tokens, probs
+
+    class StrategyImplWithProbs(StrategyImpl):
+        @override
+        @classmethod
+        def computes_probs(cls) -> bool:
+            return True
+
+    class GreedyWithProbs(StrategyImplWithProbs):
+        def __init__(self) -> None:
+            self._temperature = None
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.GreedyWithProbs":
+            return cls()
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            return self._sample_greedy_with_probs(logits, group_logit_indices=group_logit_indices)
+
+    class TopKTopPWithProbs(StrategyImplWithProbs):
+        def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):
+            self._top_k = top_k
+            self._top_p = top_p
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopKTopPWithProbs":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.int32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[3] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            return self._sample_with_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=self._top_k,
+                top_p=self._top_p,
+                temperature=self._temperature,
+                generator=generator,
+            )
+
+    class TopKWithProbs(StrategyImplWithProbs):
+        def __init__(self, top_k: torch.Tensor, temperature: torch.Tensor):
+            self._top_k = top_k
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopKWithProbs":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.int32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            return self._sample_with_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=self._top_k,
+                top_p=None,
+                temperature=self._temperature,
+                generator=generator,
+            )
+
+    class TopPWithProbs(StrategyImplWithProbs):
+        def __init__(self, top_p: torch.Tensor, temperature: torch.Tensor):
+            self._top_p = top_p
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopPWithProbs":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            return self._sample_with_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=None,
+                top_p=self._top_p,
+                temperature=self._temperature,
+                generator=generator,
+            )
+
+    class TemperatureOnlyWithProbs(StrategyImplWithProbs):
+        def __init__(self, temperature: torch.Tensor):
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TemperatureOnlyWithProbs":
+            return cls(cls._make_tensor([s[1] for s in strategies], torch.float32, cuda_device))
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            return self._sample_with_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=None,
+                top_p=None,
+                temperature=self._temperature,
+                generator=generator,
+            )
+
+    class StrategyImplSampleOnly(StrategyImpl):
+        @override
+        @classmethod
+        def computes_probs(cls) -> bool:
+            return False
+
+    class GreedySampleOnly(StrategyImplSampleOnly):
+        def __init__(self) -> None:
+            self._temperature = None
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.GreedySampleOnly":
+            return cls()
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            if group_logit_indices is not None:
+                logits = logits[group_logit_indices]
+            return torch.argmax(logits, dim=-1), None
+
+    class TopKTopPSampleOnly(StrategyImplSampleOnly):
+        def __init__(self, top_k: torch.Tensor, top_p: torch.Tensor, temperature: torch.Tensor):
+            self._top_k = top_k
+            self._top_p = top_p
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopKTopPSampleOnly":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.int32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[3] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            logits = self._prepare_logits_with_temperature(
+                logits, group_logit_indices, self._temperature
+            )
+            return top_k_top_p_sampling_from_logits_with_generator_op(
+                logits,
+                self._top_k,
+                self._top_p,
+                generator,
+                check_nan=self._flashinfer_check_nans(logits),
+            ), None
+
+    class TopKSampleOnly(StrategyImplSampleOnly):
+        def __init__(self, top_k: torch.Tensor, temperature: torch.Tensor):
+            self._top_k = top_k
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopKSampleOnly":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.int32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            probs = self._prepare_probs_with_temperature(
+                logits, group_logit_indices, self._temperature
+            )
+            return top_k_sampling_from_probs_op(
+                probs, self._top_k, generator, check_nan=self._flashinfer_check_nans(probs)
+            ), None
+
+    class TopPSampleOnly(StrategyImplSampleOnly):
+        def __init__(self, top_p: torch.Tensor, temperature: torch.Tensor):
+            self._top_p = top_p
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TopPSampleOnly":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            probs = self._prepare_probs_with_temperature(
+                logits, group_logit_indices, self._temperature
+            )
+            return top_p_sampling_from_probs_op(
+                probs, self._top_p, generator, check_nan=self._flashinfer_check_nans(probs)
+            ), None
+
+    class TemperatureOnlySampleOnly(StrategyImplSampleOnly):
+        def __init__(self, temperature: torch.Tensor):
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.TemperatureOnlySampleOnly":
+            return cls(cls._make_tensor([s[1] for s in strategies], torch.float32, cuda_device))
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            new_tokens, _ = self._sample_with_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=None,
+                top_p=None,
+                temperature=self._temperature,
+                generator=generator,
+            )
+            return new_tokens, None
+
+    class BeamSearchMixin(StrategyImpl):
+        def __init__(self, beam_width_in: int, beam_width_out: int, temperature: torch.Tensor):
+            self._beam_width_in = beam_width_in
+            self._beam_width_out = beam_width_out
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.BeamSearchMixin":
+            assert all(strat[0] == "beam_search" for strat in strategies)
+            narrowed_strats = cast(list[BeamSearch], strategies)
+            (beam_width_in,) = set(strat[1] for strat in narrowed_strats)
+            (beam_width_out,) = set(strat[2] for strat in narrowed_strats)
+            temperature = cls._make_tensor(
+                [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
+            )
+            return cls(beam_width_in, beam_width_out, temperature)
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata)
+            temperature = self._temperature.repeat_interleave(self._beam_width_in)
+            logits = self._prepare_logits_with_temperature(logits, group_logit_indices, temperature)
+            return beam_search_sampling_batch(
+                logits,
+                beam_width_in=self._beam_width_in,
+                beam_width_out=self._beam_width_out,
+                beam_search_args=group_metadata,
+                temperature=None,
+                return_probs=self.computes_probs(),
+            )
+
+    class BeamSearchWithProbs(BeamSearchMixin, StrategyImplWithProbs):
+        pass
+
+    class BeamSearchSampleOnly(BeamSearchMixin, StrategyImplSampleOnly):
+        pass
+
+
+_STRATEGY_KEY_TYPE: TypeAlias = (
+    Literal["temperature"]
+    | Literal["top_k"]
+    | Literal["top_p"]
+    | Literal["top_k_top_p"]
+    | Literal["greedy"]
+    | tuple[Literal["beam_search"], int, int]
+)
+
+
+class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE]):
+    """Implements batched sampling with FlashInfer.sampling kernels."""
+
+    STRATEGY_KEY_TYPE: TypeAlias = _STRATEGY_KEY_TYPE
+
+    @override
     @staticmethod
-    @torch.compile(dynamic=None, fullgraph=True)
-    def _determine_sampled_rank_impl(
-        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        sampled_rank_cuda = (
-            group_logprobs_cuda.greater(sampled_logprobs_cuda).count_nonzero(dim=-1).to(torch.int32)
+    def strategy_grouping_key(strategy: Strategy) -> _STRATEGY_KEY_TYPE:
+        match strategy:
+            case (
+                ("top_k", _, _)
+                | ("top_p", _, _)
+                | ("top_k_top_p", _, _, _)
+                | ("temperature", _)
+                | ("greedy", None)
+            ):
+                return cast(_STRATEGY_KEY_TYPE, strategy[0])
+            case ("beam_search", beam_width_in, beam_width_out, _):
+                return cast(_STRATEGY_KEY_TYPE, (strategy[0], beam_width_in, beam_width_out))
+            case _:
+                raise NotImplementedError("Unsupported strategy encountered")
+
+    @override
+    @staticmethod
+    def get_metadata_type_for_group(
+        strategy_key: _STRATEGY_KEY_TYPE,
+    ) -> Type[StrategyMetadata] | None:
+        match strategy_key:
+            case ("beam_search", _, _):
+                return BeamSearchMetadata
+            case _:
+                return None
+
+    @override
+    @staticmethod
+    def sample_grouped_strategies(
+        group_key: _STRATEGY_KEY_TYPE,
+        strategies: list[Strategy],
+        logits: torch.Tensor,
+        *,
+        group_logit_indices: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        return_probs: bool,
+        group_metadata: StrategyMetadata | None = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        beam_width_in = 1
+        strategy_impl_cls: Type[_StrategyImpls.StrategyImpl]
+        if return_probs:
+            match group_key:
+                case "top_k":
+                    strategy_impl_cls = _StrategyImpls.TopKWithProbs
+                case "top_p":
+                    strategy_impl_cls = _StrategyImpls.TopPWithProbs
+                case "top_k_top_p":
+                    strategy_impl_cls = _StrategyImpls.TopKTopPWithProbs
+                case "temperature":
+                    strategy_impl_cls = _StrategyImpls.TemperatureOnlyWithProbs
+                case "greedy":
+                    strategy_impl_cls = _StrategyImpls.GreedyWithProbs
+                case ("beam_search", beam_width_in_key, _):
+                    beam_width_in = beam_width_in_key
+                    strategy_impl_cls = _StrategyImpls.BeamSearchWithProbs
+                case _:
+                    raise NotImplementedError("Unsupported strategy key encountered")
+        else:
+            match group_key:
+                case "top_p":
+                    strategy_impl_cls = _StrategyImpls.TopPSampleOnly
+                case "top_k":
+                    strategy_impl_cls = _StrategyImpls.TopKSampleOnly
+                case "top_k_top_p":
+                    strategy_impl_cls = _StrategyImpls.TopKTopPSampleOnly
+                case "temperature":
+                    strategy_impl_cls = _StrategyImpls.TemperatureOnlySampleOnly
+                case "greedy":
+                    strategy_impl_cls = _StrategyImpls.GreedySampleOnly
+                case ("beam_search", beam_width_in_key, _):
+                    beam_width_in = beam_width_in_key
+                    strategy_impl_cls = _StrategyImpls.BeamSearchSampleOnly
+                case _:
+                    raise NotImplementedError("Unsupported strategy key encountered")
+        if group_logit_indices is None:
+            assert logits.size(0) == beam_width_in * len(strategies)
+        else:
+            assert group_logit_indices.size(0) == beam_width_in * len(strategies)
+        strategy_impl = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
+        next_tokens, softmax = strategy_impl.sample(
+            logits,
+            group_logit_indices=group_logit_indices,
+            generator=generator,
+            group_metadata=group_metadata,
         )
-        return sampled_rank_cuda
+        return next_tokens, softmax, strategy_impl.get_temperature()
 
-    @staticmethod
-    def determine_sampled_rank(
-        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
-        #     memory passes
-        torch._dynamo.mark_dynamic(group_logprobs_cuda, 0)
-        torch._dynamo.mark_dynamic(sampled_logprobs_cuda, 0)
-        return _Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
 
-    @staticmethod
-    @torch.compile(
-        dynamic=None,
-        fullgraph=True,
-        options=dict(
-            online_softmax=True,
-            split_reductions=False,  # https://github.com/pytorch/pytorch/issues/153241
-        ),
+# ---------------------------------------------------------------------------
+# Static routing: SamplerConfig, BoundSamplingBackend, resolve_sampling_backend
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, kw_only=True)
+class SamplerConfig:
+    """Configuration used to resolve and bind a sampling backend at init time."""
+
+    use_flashinfer: bool = False
+
+
+class BoundSamplingBackend:
+    """Holds kernel function pointers bound at initialisation; CUDA-graph safe.
+
+    All callables are resolved once (in resolve_sampling_backend) so that no
+    per-call dispatch occurs inside CUDA graph capture.  Includes the
+    strategy-grouping helpers so TorchSampler needs no separate
+    _grouped_sampler_cls attribute.
+    """
+
+    def __init__(
+        self,
+        compute_probs: Any,
+        sample_from_probs: Any,
+        sample_from_logits: Any,
+        greedy: Any,
+        strategy_grouping_key: Any,
+        get_metadata_type_for_group: Any,
+        sample_grouped_strategies: Any,
+    ) -> None:
+        self.compute_probs = compute_probs
+        self.sample_from_probs = sample_from_probs
+        self.sample_from_logits = sample_from_logits
+        self.greedy = greedy
+        self.strategy_grouping_key = strategy_grouping_key
+        self.get_metadata_type_for_group = get_metadata_type_for_group
+        self.sample_grouped_strategies = sample_grouped_strategies
+
+
+def resolve_sampling_backend(
+    device: torch.device,
+    config: SamplerConfig,
+) -> BoundSamplingBackend:
+    """Bind kernel functions at init time; returns a CUDA-graph-safe backend.
+
+    Selection order:
+      1. FlashInfer  — CUDA device AND IS_FLASHINFER_AVAILABLE AND config.use_flashinfer
+      2. Torch       — everything else (including CPU)
+    """
+    if device.type == "cuda" and IS_FLASHINFER_AVAILABLE and config.use_flashinfer:
+        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
+            compute_probs as _fi_compute_probs,
+        )
+        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
+            greedy as _fi_greedy,
+        )
+        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
+            sample_from_logits as _fi_sample_from_logits,
+        )
+        from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
+            sample_from_probs as _fi_sample_from_probs,
+        )
+
+        return BoundSamplingBackend(
+            compute_probs=_fi_compute_probs,
+            sample_from_probs=_fi_sample_from_probs,
+            sample_from_logits=_fi_sample_from_logits,
+            greedy=_fi_greedy,
+            strategy_grouping_key=FlashInferGroupedStrategySampler.strategy_grouping_key,
+            get_metadata_type_for_group=FlashInferGroupedStrategySampler.get_metadata_type_for_group,
+            sample_grouped_strategies=FlashInferGroupedStrategySampler.sample_grouped_strategies,
+        )
+    return BoundSamplingBackend(
+        compute_probs=_torch_compute_probs,
+        sample_from_probs=_torch_sample_from_probs,
+        sample_from_logits=_torch_sample_from_logits,
+        greedy=_torch_greedy,
+        strategy_grouping_key=SimpleGroupedStrategySampler.strategy_grouping_key,
+        get_metadata_type_for_group=SimpleGroupedStrategySampler.get_metadata_type_for_group,
+        sample_grouped_strategies=SimpleGroupedStrategySampler.sample_grouped_strategies,
     )
-    def _gather_log_softmax_impl(
-        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
-        #     materializing the index select
-        return torch.nn.functional.log_softmax(
-            inputs_cuda[indices_cuda],
-            dim=-1,
-        )
 
-    @staticmethod
-    def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
-        torch._dynamo.mark_dynamic(inputs_cuda, 0)
-        torch._dynamo.mark_dynamic(indices_cuda, 0)
-        return _Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+
+# Public re-exports of the new kernel contract (torch backend as default).
+# Callers that need a specific backend should use resolve_sampling_backend.
+compute_probs = _torch_compute_probs
+sample_from_probs = _torch_sample_from_probs
+sample_from_logits = _torch_sample_from_logits
+greedy = _torch_greedy
+
+# ---------------------------------------------------------------------------
+# Spec-decoding interface: compute_probs_from_logits (per-request tensor params)
+# ---------------------------------------------------------------------------
+
+
+def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Map ``top_k`` into a backend-safe range before top-k filtering.
+
+    Per ``SamplingParams``, ``top_k == 0`` means "all logits" (top-k disabled),
+    but the flashinfer (``top_k_mask_logits``) and PyTorch-native top-k paths
+    break on a literal 0 — they mask the entire row (all-zero probs) or gather
+    out of bounds. Mirror the C++ op (``dynamicTreeKernels.cu``): map any
+    non-positive value (and any oversized disable sentinel such as
+    ``INT32_MAX``) to ``vocab_size`` (== keep all tokens), leaving genuine
+    top_k values untouched.
+    """
+    return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
+
+
+if IS_FLASHINFER_AVAILABLE:
+    from tensorrt_llm._torch.pyexecutor.sampling_backends import backend_flashinfer
+    from tensorrt_llm._torch.pyexecutor.sampling_backends.backend_flashinfer import (
+        sampling_from_probs_generator_op,
+        softmax_op,
+        top_k_mask_logits_op,
+        top_k_sampling_from_probs_op,
+        top_k_top_p_sampling_from_logits_with_generator_op,
+        top_p_renorm_probs_op,
+        top_p_sampling_from_probs_op,
+    )
+
+
+@torch.compile(options={"max-autotune": True})
+def compute_probs_from_logits(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Compute filtered+normalized probs. Dispatches: flashinfer → C++ op → CPU.
+
+    ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching
+    the spec-decoding call site in interface.py.
+    """
+    if top_k is not None:
+        top_k = sanitize_top_k(top_k, logits.shape[-1])
+
+    if logits.is_cuda and IS_FLASHINFER_AVAILABLE:
+        return backend_flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    if logits.is_cuda:
+        return backend_custom.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    return backend_torch.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+
+
+@torch.compile(options={"max-autotune": True})
+def sampling_batch_spec_dec_one_model(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CUDA-graph compatible sampling; supports mixed sampling params."""
+    top_k = sanitize_top_k(top_k, logits.shape[-1])
+    # Greedy rows (temperature <= threshold) must return the argmax token, not a
+    # sample from the temperature-scaled distribution. Capture the argmax from the
+    # *original* logits up front; _safely_apply_temperature then guards the division
+    # against the greedy sentinel, and torch.where restores the greedy rows below.
+    # All ops are branch-free (no data-dependent control flow), so this stays
+    # CUDA-graph safe.
+    is_greedy = temperatures <= backend_torch._GREEDY_TEMPERATURE_THRESHOLD
+    greedy_tokens = logits.argmax(dim=-1)
+    logits = backend_torch._safely_apply_temperature(logits, temperatures)
+    if IS_FLASHINFER_AVAILABLE:
+        sampled = backend_flashinfer.top_k_top_p_sampling_from_logits_op(
+            logits, top_k, top_p, seed=seed, offset=offset
+        )
+    else:
+        sampled = backend_torch.forward_native_sampling(logits, top_k, top_p)
+    return torch.where(is_greedy, greedy_tokens, sampled)
+
+
+@torch.compile(options={"max-autotune": True})
+def sampling_batch_spec_dec_one_model_for_rejection(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: Optional[torch.Tensor] = None,
+    offset: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
+    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
+    if IS_FLASHINFER_AVAILABLE:
+        tokens = backend_flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
+    else:
+        tokens = backend_torch._random_sample(probs)
+    return tokens, probs

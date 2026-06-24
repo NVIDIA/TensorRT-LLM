@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
     GREEDY,
     BeamSearch,
+    FlashInferGroupedStrategySampler,
     Greedy,
     SimpleGroupedStrategySampler,
     Strategy,
@@ -59,9 +60,6 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
     TopKTopP,
     TopP,
     UtilsSamplingParams,
-)
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
-    FlashInferGroupedStrategySampler,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -1516,7 +1514,17 @@ class TestBatchedSampling:
         expected_cls = (
             FlashInferGroupedStrategySampler if use_flashinfer else SimpleGroupedStrategySampler
         )
-        assert sampler._grouped_sampler_cls == expected_cls
+        # Verify the full strategy-grouping contract bound into _bound_backend, not
+        # just one callable: a partial/mismatched bind must fail this test.
+        assert (
+            sampler._bound_backend.sample_grouped_strategies
+            == expected_cls.sample_grouped_strategies
+        )
+        assert sampler._bound_backend.strategy_grouping_key == expected_cls.strategy_grouping_key
+        assert (
+            sampler._bound_backend.get_metadata_type_for_group
+            == expected_cls.get_metadata_type_for_group
+        )
 
     @pytest.mark.parametrize(
         (
@@ -1817,10 +1825,11 @@ class TestBatchedSampling:
         flashinfer_keys_seen: set[Any] = set()
 
         if use_flashinfer:
-            assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
-            sample_grouped_strategies_orig = (
-                FlashInferGroupedStrategySampler.sample_grouped_strategies
+            assert (
+                sampler._bound_backend.sample_grouped_strategies
+                == FlashInferGroupedStrategySampler.sample_grouped_strategies
             )
+            sample_grouped_strategies_orig = sampler._bound_backend.sample_grouped_strategies
 
             def _sample_grouped_strategies(
                 group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
@@ -1850,7 +1859,7 @@ class TestBatchedSampling:
                 )
 
             patch_ctx.setattr(
-                sampler._grouped_sampler_cls,
+                sampler._bound_backend,
                 "sample_grouped_strategies",
                 _sample_grouped_strategies,
             )
