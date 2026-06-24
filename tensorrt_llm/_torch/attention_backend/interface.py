@@ -75,7 +75,9 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
     # Sparse settings for metadata allocation/update; dense metadata leaves it None.
     sparse_metadata_params: Optional[SparseMetadataParams] = None
-    # Paged KV-cache block layout exposed by KVCacheManager.get_buffers().
+    # Paged KV-cache block layout:
+    # NHD: [max_num_pages, 2, page_size, num_kv_heads, head_dim]
+    # HND: [max_num_pages, 2, num_kv_heads, page_size, head_dim]
     kv_layout: Literal["NHD", "HND"] = "HND"
 
     enable_flash_mla: bool = False

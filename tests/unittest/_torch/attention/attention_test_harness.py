@@ -651,7 +651,6 @@ def run_backend(
             kv_cache_manager=None,
             mapping=None,
             runtime_features=None,
-            kv_layout=kv_layout,
         )
         metadata.seq_lens = torch.tensor(case.seq_lens, dtype=torch.int)
         metadata.num_contexts = case.num_seqs
@@ -666,7 +665,7 @@ def run_backend(
         # says. The caller passes a supported ``kv_layout`` (capability-gated).
         fill_kv_cache_logical(mgr, 0, request_ids, cached_k, cached_v, kv_layout=kv_layout)
 
-        def create_metadata(AttentionCls, case, mgr, *, num_contexts: int):
+        def create_metadata(AttentionCls, case, mgr, *, num_contexts: int = 0):
             seq_lens_kv = torch.tensor(case.seq_lens_kv, dtype=torch.int) if case.is_cross else None
             return AttentionCls.Metadata(
                 num_contexts=num_contexts,
@@ -699,9 +698,7 @@ def run_backend(
                     AttentionCls,
                     case,
                     mgr,
-                    lambda AttentionCls, case, mgr: create_metadata(
-                        AttentionCls, case, mgr, num_contexts=0
-                    ),
+                    create_metadata,
                     static,
                     _cg_fwd,
                 )
