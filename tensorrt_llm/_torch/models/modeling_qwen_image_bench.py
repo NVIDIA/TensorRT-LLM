@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from typing import Dict, List
 
 import torch
@@ -23,6 +26,7 @@ from .modeling_qwen3vl import (
 from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
 
 _QWEN_IMAGE_BENCH_PLACEHOLDERS = MultimodalPlaceholderMetadata(
+    # Match Qwen3-VL/Qwen-Image-Bench chat-template vision placeholders.
     placeholder_map={
         "image": "<|vision_start|><|image_pad|><|vision_end|>",
         "video": "<|vision_start|><|video_pad|><|vision_end|>",
@@ -42,14 +46,37 @@ class _QwenImageBenchModelMixin:
             "multimodal_embedding",
         ]
 
-    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def model(self):
+        return self.llm.model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    def load_draft_weights(self, *args, **kwargs):
+        return self.llm.load_draft_weights(*args, **kwargs)
+
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        _weight_mapper: BaseWeightMapper,
+    ):
         if not _is_disagg():
             self.mm_encoder.load_weights(weights)
 
-        weight_mapper = Qwen3_5MoeHfWeightMapper()
-        weight_mapper.init_model_and_config(self.llm, self.model_config)
+        qwen3_5_weight_mapper = Qwen3_5MoeHfWeightMapper()
+        qwen3_5_weight_mapper.init_model_and_config(self.llm, self.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
-        self.llm.load_weights(filtered_weights, weight_mapper)
+        self.llm.load_weights(filtered_weights, qwen3_5_weight_mapper)
 
 
 @support_multimodal_disaggregated

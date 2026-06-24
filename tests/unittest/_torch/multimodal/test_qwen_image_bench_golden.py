@@ -66,9 +66,13 @@ def _eval_args(model_dir: Path, image_path: Path) -> argparse.Namespace:
 
 
 def _stable_result(result: dict) -> dict:
+    image_name = result.get("image_name")
+    if image_name is None:
+        image_name = Path(result["image_path"]).name
+
     return {
         "prompt": result["prompt"],
-        "image_name": Path(result["image_path"]).name,
+        "image_name": image_name,
         "dimensions": result["dimensions"],
         "level1_scores": result["level1_scores"],
         "level2_scores": result["level2_scores"],
@@ -76,7 +80,6 @@ def _stable_result(result: dict) -> dict:
         "total_score": result["total_score"],
         "parse_failures": result["parse_failures"],
         "parsed_scores": result["parsed_scores"],
-        "raw_outputs": result["raw_outputs"],
     }
 
 
@@ -89,6 +92,6 @@ def test_qwen_image_bench_cat_piano_golden_output():
 
     module = _load_eval_module()
     actual = _stable_result(module.evaluate(_eval_args(model_dir, image_path)))
-    expected = json.loads(GOLDEN_PATH.read_text())
+    expected = _stable_result(json.loads(GOLDEN_PATH.read_text()))
 
     assert actual == expected

@@ -299,9 +299,16 @@ class _Qwen35ConfigCompat:
     """
 
     @staticmethod
-    def normalize(config_dict: dict) -> dict:
-        """Entry point: raw config.json dict -> flat Qwen3NextConfig-compatible dict."""
-        text_config = _Qwen35ConfigCompat._extract_text_config(config_dict)
+    def normalize(config_dict: dict, require_text_config: bool = False) -> dict:
+        """Return a Qwen3NextConfig-compatible text config.
+
+        Qwen-Image-Bench publishes a composite VLM config with a nested
+        ``text_config``.  TRT-LLM keeps the top-level config for multimodal
+        metadata, but normalizes that nested text config for the Qwen3.5
+        decoder.  Text-only checkpoints can still pass a flat config directly.
+        """
+        text_config = _Qwen35ConfigCompat._extract_text_config(
+            config_dict, require_text_config=require_text_config)
         text_config = _Qwen35ConfigCompat._inherit_quantization_config(
             config_dict, text_config)
         text_config = _Qwen35ConfigCompat._flatten_rope(text_config)
@@ -327,24 +334,53 @@ class _Qwen35ConfigCompat:
     _QWEN_IMAGE_BENCH_ARCHITECTURE = "QwenImageBenchForConditionalGeneration"
 
     @staticmethod
-    def is_qwen_image_bench_config(config_dict: dict,
-                                   model_name_or_path: str) -> bool:
+    def is_qwen_image_bench_config(config_dict: dict) -> bool:
+        """Detect Qwen-Image-Bench's composite VLM checkpoint config.
+
+        The checkpoint advertises the generic Qwen3.5 VLM architecture, but
+        TRT-LLM needs a dedicated architecture key to route it to
+        QwenImageBenchModel. Require both text and vision sub-configs plus
+        multimodal token IDs so plain or malformed Qwen3.5 configs are not
+        rewritten as Qwen-Image-Bench.
+        """
         architectures = config_dict.get("architectures") or []
-        model_id = str(model_name_or_path).rstrip("/\\")
-        model_name = re.split(r"[/\\]", model_id)[-1].casefold()
+        text_config = config_dict.get("text_config")
+        vision_config = config_dict.get("vision_config")
+        required_multimodal_token_ids = {
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+        }
         return (architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
-                and bool(config_dict.get("text_config"))
-                and bool(config_dict.get("vision_config"))
-                and model_name == "qwen-image-bench")
+                and isinstance(text_config, dict) and bool(text_config)
+                and isinstance(vision_config, dict) and bool(vision_config)
+                and required_multimodal_token_ids.issubset(config_dict))
 
     @staticmethod
-    def _extract_text_config(config_dict: dict) -> dict:
+    def _extract_text_config(config_dict: dict,
+                             require_text_config: bool = False) -> dict:
         """Pull nested text_config from VLM checkpoints, or use dict as-is."""
+        if require_text_config:
+            text_config = config_dict.get("text_config")
+            if not isinstance(text_config, dict) or not text_config:
+                raise ValueError(
+                    "Qwen3.5 composite config is missing a usable text_config")
+            return dict(text_config)
+
         architectures = config_dict.get("architectures") or []
         if (architectures
                 and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES
-                and config_dict.get("text_config")):
-            text_config = dict(config_dict.get("text_config") or {})
+                and isinstance(config_dict.get("vision_config"), dict)):
+            text_config = config_dict.get("text_config")
+            if not isinstance(text_config, dict) or not text_config:
+                raise ValueError(
+                    "Qwen3.5 composite config is missing a usable text_config")
+            text_config = dict(text_config)
+        elif (architectures
+              and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES
+              and isinstance(config_dict.get("text_config"), dict)):
+            text_config = dict(config_dict["text_config"])
         else:
             text_config = dict(config_dict)
         if not text_config:
@@ -482,8 +518,7 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
-    elif _Qwen35ConfigCompat.is_qwen_image_bench_config(config_dict,
-                                                        model_name_or_path):
+    elif _Qwen35ConfigCompat.is_qwen_image_bench_config(config_dict):
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
         # Keep the composite VLM config so the vision encoder and multimodal
@@ -493,7 +528,8 @@ def load_pretrained_config(model_name_or_path: str,
             _Qwen35ConfigCompat._QWEN_IMAGE_BENCH_ARCHITECTURE
         ]
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
-            _Qwen35ConfigCompat.normalize(config_dict))
+            _Qwen35ConfigCompat.normalize(config_dict,
+                                          require_text_config=True))
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

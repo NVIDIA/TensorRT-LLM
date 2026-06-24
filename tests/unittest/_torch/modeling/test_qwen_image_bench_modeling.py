@@ -1,7 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
+import transformers
+
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm._torch.models.modeling_qwen_image_bench import QwenImageBenchModel
+from tensorrt_llm._torch.models.modeling_utils import (
+    MODEL_CLASS_MAPPER_MAPPING,
+    MODEL_CLASS_MAPPING,
+    MODEL_CLASS_VISION_ENCODER_MAPPING,
+)
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    extract_mamba_kv_cache_params,
+    get_qwen3_hybrid_layer_types,
+    load_pretrained_config,
+)
 
 
 def _write_qwen_image_bench_config(model_dir):
@@ -79,14 +97,6 @@ def _qwen3_5_text_config():
 
 
 def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path):
-    import transformers
-
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        extract_mamba_kv_cache_params,
-        get_qwen3_hybrid_layer_types,
-        load_pretrained_config,
-    )
-
     model_dir = tmp_path / "Qwen-Image-Bench"
     model_dir.mkdir()
     _write_qwen_image_bench_config(model_dir)
@@ -110,10 +120,6 @@ def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path
 
 
 def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path):
-    import transformers
-
-    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
-
     (tmp_path / "config.json").write_text(json.dumps(_qwen3_5_text_config()))
 
     config = load_pretrained_config(str(tmp_path))
@@ -122,32 +128,32 @@ def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path)
     assert config.architectures == ["Qwen3_5ForCausalLM"]
 
 
-def test_qwen3_5_composite_config_requires_image_bench_model_name(tmp_path):
-    import transformers
-
-    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
-
-    model_dir = tmp_path / "Qwen3.6-27B-FP8"
+def test_qwen_image_bench_config_detection_does_not_depend_on_model_name(tmp_path):
+    model_dir = tmp_path / "local-checkpoint"
     model_dir.mkdir()
     _write_qwen_image_bench_config(model_dir)
 
     config = load_pretrained_config(str(model_dir))
 
-    assert isinstance(config, transformers.Qwen3NextConfig)
-    assert config.architectures == ["Qwen3_5ForCausalLM"]
+    assert config.architectures == ["QwenImageBenchForConditionalGeneration"]
+    assert isinstance(config.text_config, transformers.Qwen3NextConfig)
+
+
+def test_qwen3_5_composite_config_requires_text_config(tmp_path):
+    model_dir = tmp_path / "malformed-composite"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
+
+    config_path = model_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    del config["text_config"]
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="missing a usable text_config"):
+        load_pretrained_config(str(model_dir))
 
 
 def test_qwen_image_bench_model_and_mapper_registration():
-    from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import (
-        Qwen3_5MoeHfWeightMapper,
-    )
-    from tensorrt_llm._torch.models.modeling_qwen_image_bench import QwenImageBenchModel
-    from tensorrt_llm._torch.models.modeling_utils import (
-        MODEL_CLASS_MAPPER_MAPPING,
-        MODEL_CLASS_MAPPING,
-        MODEL_CLASS_VISION_ENCODER_MAPPING,
-    )
-
     assert MODEL_CLASS_MAPPING["QwenImageBenchForConditionalGeneration"] is QwenImageBenchModel
     assert "Qwen3_5ForConditionalGeneration" not in MODEL_CLASS_MAPPING
     assert "QwenImageBenchForConditionalGeneration" in MODEL_CLASS_VISION_ENCODER_MAPPING
@@ -158,8 +164,6 @@ def test_qwen_image_bench_model_and_mapper_registration():
 
 
 def test_qwen_image_bench_forwards_speculative_interface():
-    from tensorrt_llm._torch.models.modeling_qwen_image_bench import QwenImageBenchModel
-
     draft_config = object()
     draft_model = object()
     text_model = object()

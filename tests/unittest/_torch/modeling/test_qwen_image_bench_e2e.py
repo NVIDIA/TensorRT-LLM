@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 
 import pytest
-import torch
 from PIL import Image, ImageDraw
 
 from tensorrt_llm.inputs import default_multimodal_input_loader
@@ -68,4 +67,3 @@ def test_qwen_image_bench_single_image_generation(tmp_path):
     assert len(outputs) == 1
     assert len(outputs[0].outputs) > 0
     assert isinstance(outputs[0].outputs[0].text, str)
-    assert torch.cuda.is_available()

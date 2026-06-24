@@ -106,10 +106,7 @@ def _load_model_config(checkpoint_dir: str) -> DiffusionModelConfig:
         model=checkpoint_dir,
         torch_compile_config=TorchCompileConfig(enable=False),
     )
-    return DiffusionPipelineConfig.from_pretrained(
-        checkpoint_dir,
-        args=args,
-    ).model_configs["transformer"]
+    return DiffusionPipelineConfig.from_pretrained(checkpoint_dir, args=args).primary_model_config
 
 
 def _init_all_weights(model: torch.nn.Module, std: float = 0.02) -> None:
