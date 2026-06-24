@@ -297,6 +297,13 @@ def test_split_consistency(backend):
     )
     out_sub = run_backend(sub, backend, sub_inputs, kv_dtype=sub.compute_dtype)
 
-    # ctx0 occupies rows [0:16] in both runs; gen2 is row 40 (full) / 16 (sub).
-    torch.testing.assert_close(out_sub[0:16], out_full[0:16], atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(out_sub[16:17], out_full[40:41], atol=1e-2, rtol=1e-3)
+    ctx0_end = ctx_lens[0]
+    gen_full_start = q_offsets[2]
+    gen_sub_start = ctx0_end
+    torch.testing.assert_close(out_sub[:ctx0_end], out_full[:ctx0_end], atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(
+        out_sub[gen_sub_start : gen_sub_start + 1],
+        out_full[gen_full_start : gen_full_start + 1],
+        atol=1e-2,
+        rtol=1e-3,
+    )
