@@ -197,11 +197,23 @@ def test_dense_gemm_swiglu_fp4out(m: int, k: int, inter: int):
 # ---------------------------------------------------------------------------
 def test_mlp_fp4out_min_m_switch():
     """MLP.forward picks fp4-out only at m >= _FP4OUT_MIN_M, else bf16-out fallback."""
+    import types
+
     from tensorrt_llm._torch.modules.mlp import MLP
     from tensorrt_llm._torch.utils import gelu_tanh
 
     mlp = MLP(hidden_size=64, intermediate_size=128, bias=True, activation=gelu_tanh)
-    mlp._use_fused_gelu_fp4out = True  # force the fp4-out-eligible branch
+    # forward() reaches the fp4-out vs bf16-out switch only when the static
+    # eligibility flags AND a runtime NVFP4 quant_method (exposing _input_prepare)
+    # are present on up/down. Force all of that here; _fused_gelu is stubbed, so no
+    # kernel runs and the test stays HW-independent (hence no skip_pre_blackwell).
+    fake_qm = types.SimpleNamespace(_input_prepare=lambda *a, **k: None)
+    mlp._use_fused_gelu = True
+    mlp._use_fused_gelu_fp4out = True
+    mlp.up_proj.quant_method = fake_qm
+    down = torch.nn.Identity()  # skip the real down GEMM
+    down.quant_method = fake_qm
+    mlp.down_proj = down
     seen = {}
 
     def _spy(x, fp4_out=False):
@@ -209,7 +221,6 @@ def test_mlp_fp4out_min_m_switch():
         return torch.zeros(MLP._token_count(x), mlp.intermediate_size)
 
     mlp._fused_gelu = _spy
-    mlp.down_proj = torch.nn.Identity()  # skip the real down GEMM
 
     assert MLP._FP4OUT_MIN_M == 128
     for m, expected in [(64, False), (127, False), (128, True), (256, True)]:
