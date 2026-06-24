@@ -1501,6 +1501,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        encoder_output_lens: Optional[List[int]] = None,
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
     ):
@@ -1534,8 +1535,10 @@ class KVCacheManagerV2(BaseResourceManager):
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen else None
-            # TODO: support cross attention
-            encoder_input_tokens = None
+            encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
+            encoder_input_tokens = (
+                [1] * encoder_output_len if encoder_output_len is not None else None
+            )
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             input_tokens = [1 for _ in range(token_num)]
             req = LlmRequest(
@@ -1545,6 +1548,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
+                encoder_output_len=encoder_output_len,
             )
             req.is_dummy_request = True
             req.paged_kv_block_ids = []

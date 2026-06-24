@@ -25,7 +25,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             strip_mm_data_for_generation)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig,
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
@@ -71,7 +71,7 @@ from .cuda_graph_runner import (CUDAGraphRunner, CUDAGraphRunnerConfig,
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, get_draft_token_length,
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -230,7 +230,7 @@ class PyTorchModelEngine(ModelEngine):
         mapping: Optional[Mapping] = None,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[Distributed] = None,
-        spec_config: Optional["DecodingBaseConfig"] = None,
+        spec_config: Optional[DecodingBaseConfig] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
@@ -553,6 +553,16 @@ class PyTorchModelEngine(ModelEngine):
         self.encoder_attn_metadata = None
         self.spec_metadata = None
         self.iter_states = {}
+        self.cuda_graph_phase_stats = {
+            "encoder_eager": 0,
+            "encoder_graph": 0,
+            "decoder_context_eager": 0,
+            "decoder_context_graph": 0,
+            "decoder_generation_eager": 0,
+            "decoder_generation_graph": 0,
+            "decoder_mixed_eager": 0,
+            "decoder_mixed_graph": 0,
+        }
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
@@ -659,6 +669,7 @@ class PyTorchModelEngine(ModelEngine):
             original_max_total_draft_tokens,
             is_draft_model=self.is_draft_model,
             enable_attention_dp=self.enable_attention_dp,
+            is_encoder_decoder=self._is_encoder_decoder_model(),
             batch_size=self.batch_size,
             mapping=self.mapping,
             dist=self.dist,
@@ -798,6 +809,30 @@ class PyTorchModelEngine(ModelEngine):
         if moe_load_balancer is not None:
             moe_load_balancer.set_iter_info(enable_statistic=value[0],
                                             enable_update_weights=value[1])
+
+    def get_cuda_graph_phase_stats(self) -> Dict[str, int]:
+        return dict(self.cuda_graph_phase_stats)
+
+    def _record_encoder_cuda_graph_phase(self, used_cuda_graph: bool) -> None:
+        if self.is_warmup:
+            return
+        key = "encoder_graph" if used_cuda_graph else "encoder_eager"
+        self.cuda_graph_phase_stats[key] += 1
+
+    def _record_decoder_cuda_graph_phase(self,
+                                         scheduled_requests: ScheduledRequests,
+                                         used_cuda_graph: bool) -> None:
+        if self.is_warmup:
+            return
+
+        suffix = "graph" if used_cuda_graph else "eager"
+        if scheduled_requests.num_context_requests > 0:
+            self.cuda_graph_phase_stats[f"decoder_context_{suffix}"] += 1
+        if scheduled_requests.num_generation_requests > 0:
+            self.cuda_graph_phase_stats[f"decoder_generation_{suffix}"] += 1
+        if (scheduled_requests.num_context_requests > 0
+                and scheduled_requests.num_generation_requests > 0):
+            self.cuda_graph_phase_stats[f"decoder_mixed_{suffix}"] += 1
 
     @property
     def use_beam_search(self):
@@ -995,9 +1030,9 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner.padding_dummy_requests = {}
 
         if self._is_encoder_decoder_model():
-            logger.info(
-                "Skipping warmup for encoder-decoder models; warmup dummy "
-                "requests do not carry encoder output state.")
+            AutoTuner.get()
+            with self.cuda_graph_runner.allow_capture():
+                self._run_cuda_graph_warmup(resource_manager)
             return
 
         if self.mapping.cp_size > 1:
@@ -1383,6 +1418,9 @@ class PyTorchModelEngine(ModelEngine):
                             self._update_draft_inference_state_for_warmup(
                                 batch, draft_len > 0, resource_manager)
                             self.runtime_draft_len = draft_len
+                            if self._is_encoder_decoder_model():
+                                self._prepare_encoder_decoder_cuda_graph_warmup_batch(
+                                    batch, resource_manager)
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
@@ -1481,6 +1519,8 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         try:
@@ -1491,6 +1531,8 @@ class PyTorchModelEngine(ModelEngine):
                     kv_cache_manager.free_resources(req)
                     if draft_kv_cache_manager is not None:
                         draft_kv_cache_manager.free_resources(req)
+                    if cross_kv_cache_manager is not None:
+                        cross_kv_cache_manager.free_resources(req)
                     if spec_resource_manager is not None:
                         spec_resource_manager.free_resources(req)
 
@@ -1652,15 +1694,26 @@ class PyTorchModelEngine(ModelEngine):
 
         result = ScheduledRequests()
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        is_encoder_decoder = self._is_encoder_decoder_model()
+        dummy_encoder_output_len = (
+            self._get_encoder_decoder_dummy_encoder_output_len(resource_manager)
+            if is_encoder_decoder else None)
 
         # Add (batch_size - 1) dummy requests with seq_len=1.
+        short_token_nums = ([2] *
+                            (batch_size - 1)) if is_encoder_decoder else None
+        short_encoder_output_lens = (
+            [dummy_encoder_output_len] *
+            (batch_size - 1)) if is_encoder_decoder else None
         requests = kv_cache_manager.add_dummy_requests(
             list(range(batch_size - 1)),
+            token_nums=short_token_nums,
             is_gen=True,
             max_num_draft_tokens=draft_len,
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
+            encoder_output_lens=short_encoder_output_lens,
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager)
 
@@ -1689,7 +1742,7 @@ class PyTorchModelEngine(ModelEngine):
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
-            1,
+            2 if is_encoder_decoder else 1,
             min(
                 available_tokens, max_seq_len - 1 -
                 get_num_extra_kv_tokens(self.spec_config) - _kv_draft))
@@ -1714,6 +1767,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
+            encoder_output_lens=[dummy_encoder_output_len]
+            if is_encoder_decoder else None,
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager)
 
@@ -1732,7 +1787,154 @@ class PyTorchModelEngine(ModelEngine):
         if spec_resource_manager is not None:
             spec_resource_manager.add_dummy_requests(
                 request_ids=list(range(batch_size)))
+        if self._is_encoder_decoder_model():
+            if not self._allocate_encoder_decoder_dummy_cross_kv(
+                    result.generation_requests, resource_manager):
+                for request in result.generation_requests:
+                    kv_cache_manager.free_resources(request)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(request)
+                    if spec_resource_manager is not None:
+                        spec_resource_manager.free_resources(request)
+                return None
         return result
+
+    def _get_encoder_decoder_dummy_encoder_output_len(
+            self, resource_manager: ResourceManager) -> int:
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        max_encoder_output_len = int(self.max_seq_len)
+        if cross_kv_cache_manager is not None:
+            max_encoder_output_len = min(
+                max_encoder_output_len,
+                int(
+                    getattr(cross_kv_cache_manager, "max_seq_len",
+                            max_encoder_output_len)))
+        return max(1, max_encoder_output_len)
+
+    def _allocate_encoder_decoder_dummy_cross_kv(
+            self, requests: List[LlmRequest],
+            resource_manager: ResourceManager) -> bool:
+        if not requests:
+            return True
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is None:
+            raise RuntimeError("Encoder-decoder CUDA graph warmup requires "
+                               "ResourceManagerType.CROSS_KV_CACHE_MANAGER.")
+
+        encoder_output_len = self._get_encoder_decoder_dummy_encoder_output_len(
+            resource_manager)
+        for request in requests:
+            request.py_encoder_output = None
+            request.py_skip_cross_kv_projection = True
+
+        encoder_output_lens = [encoder_output_len] * len(requests)
+        cross_dummy_requests = cross_kv_cache_manager.add_dummy_requests(
+            request_ids=[request.py_request_id for request in requests],
+            token_nums=encoder_output_lens,
+            is_gen=True,
+            max_beam_width=1,
+            encoder_output_lens=encoder_output_lens)
+        return cross_dummy_requests is not None
+
+    def _prepare_encoder_decoder_cuda_graph_warmup_batch(
+            self, batch: ScheduledRequests,
+            resource_manager: ResourceManager) -> None:
+        if not batch.generation_requests:
+            return
+
+        encoder_output_len = self._get_encoder_decoder_dummy_encoder_output_len(
+            resource_manager)
+        hidden_size = self._get_encoder_decoder_hidden_size()
+        saved_request_state = []
+        for request in batch.generation_requests:
+            saved_request_state.append(
+                (request, request.py_encoder_output,
+                 request.py_skip_cross_kv_projection, request.state,
+                 request.py_batch_idx, request._cached_tokens,
+                 request._cached_tokens_set))
+            request.py_encoder_output = torch.ones(
+                (encoder_output_len, hidden_size),
+                device="cuda",
+                dtype=self.dtype)
+            request.py_skip_cross_kv_projection = False
+            request.state = LlmRequestState.CONTEXT_INIT
+            request.context_current_position = 0
+            request.context_chunk_size = 1
+
+        projection_batch = ScheduledRequests()
+        projection_batch.reset_context_requests(batch.generation_requests)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        draft_kv_cache_manager = self._get_draft_kv_cache_manager(
+            resource_manager)
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
+                                                   draft_kv_cache_manager)
+        with self.no_cuda_graph():
+            projection_inputs, _ = self._prepare_inputs(
+                projection_batch,
+                kv_cache_manager,
+                attn_metadata,
+                spec_metadata=None,
+                new_tensors_device=None,
+                resource_manager=resource_manager,
+                maybe_graph=False)
+            self._project_encoder_decoder_warmup_cross_kv(projection_inputs)
+        torch.cuda.synchronize()
+
+        for (request, encoder_output, skip_cross_kv_projection, state,
+             batch_idx, cached_tokens,
+             cached_tokens_set) in saved_request_state:
+            request.py_encoder_output = encoder_output
+            request.py_skip_cross_kv_projection = skip_cross_kv_projection
+            request.state = state
+            if state == LlmRequestState.GENERATION_IN_PROGRESS:
+                request.context_current_position = request.prompt_len
+            request.py_batch_idx = batch_idx
+            request._cached_tokens = cached_tokens
+            request._cached_tokens_set = cached_tokens_set
+
+    def _project_encoder_decoder_warmup_cross_kv(
+            self, inputs: Dict[str, Any]) -> None:
+        encoder_hidden_states = inputs.get("encoder_hidden_states")
+        cross_attn_metadata = inputs.get("cross_attn_metadata")
+        if encoder_hidden_states is None or cross_attn_metadata is None:
+            return
+
+        decoder = getattr(self._get_top_level_model(), "decoder", None)
+        layers = getattr(decoder, "layers", None)
+        if layers is None:
+            raise RuntimeError("Encoder-decoder CUDA graph warmup requires a "
+                               "decoder with cross-attention layers.")
+
+        attn_metadata = inputs["attn_metadata"]
+        hidden_states = torch.ones(
+            (attn_metadata.num_tokens, self._get_encoder_decoder_hidden_size()),
+            device=encoder_hidden_states.device,
+            dtype=encoder_hidden_states.dtype)
+        for layer in layers:
+            cross_attn = getattr(layer, "cross_attn", None)
+            if cross_attn is None:
+                raise RuntimeError(
+                    "Encoder-decoder CUDA graph warmup requires every decoder "
+                    "layer to expose a cross_attn module.")
+            cross_attn(hidden_states=hidden_states,
+                       encoder_hidden_states=encoder_hidden_states,
+                       attn_metadata=attn_metadata,
+                       cross_attn_metadata=cross_attn_metadata,
+                       skip_cross_kv_projection=False)
+
+    def _get_encoder_decoder_hidden_size(self) -> int:
+        config = self.model.model_config.pretrained_config
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(config, "d_model", None)
+        if hidden_size is None:
+            raise RuntimeError(
+                "Encoder-decoder CUDA graph warmup could not infer encoder "
+                "hidden size from the model config.")
+        return int(hidden_size)
 
     def _update_draft_inference_state_for_warmup(
             self, batch: ScheduledRequests, is_first_draft: bool,
@@ -2323,51 +2525,17 @@ class PyTorchModelEngine(ModelEngine):
             packed_encoder_hidden_states = None
             skip_cross_kv_projection = True
 
-        encoder_seq_lens_tensor = torch.tensor(encoder_seq_lens,
-                                               dtype=torch.int,
-                                               pin_memory=prefer_pinned())
-
-        def update_cross_metadata(
-                cross_attn_metadata: AttentionMetadata) -> AttentionMetadata:
-            base_params = attn_metadata.kv_cache_params
-            cross_attn_metadata.kv_cache_manager = cross_kv_cache_manager
-            cross_attn_metadata._seq_lens = attn_metadata.seq_lens
-            cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
-            cross_attn_metadata.cross = cross_attn_metadata
-            cross_attn_metadata.seq_lens_kv = encoder_seq_lens_tensor
-            if encoder_num_cached_tokens_per_seq is not None:
-                use_cache = (base_params.use_cache if base_params is not None
-                             else (cross_kv_cache_manager is not None))
-                block_ids_per_seq = (base_params.block_ids_per_seq
-                                     if base_params is not None else None)
-                host_max_attention_window_sizes = (
-                    base_params.host_max_attention_window_sizes
-                    if base_params is not None else None)
-                host_sink_token_length = (base_params.host_sink_token_length
-                                          if base_params is not None else None)
-                num_extra_kv_tokens = (base_params.num_extra_kv_tokens
-                                       if base_params is not None else 0)
-                cross_attn_metadata.kv_cache_params = KVCacheParams(
-                    use_cache=use_cache,
-                    num_cached_tokens_per_seq=list(
-                        encoder_num_cached_tokens_per_seq),
-                    block_ids_per_seq=block_ids_per_seq,
-                    host_max_attention_window_sizes=
-                    host_max_attention_window_sizes,
-                    host_sink_token_length=host_sink_token_length,
-                    num_extra_kv_tokens=num_extra_kv_tokens,
-                )
-            cross_attn_metadata.request_ids = attn_metadata.request_ids
-            cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
-            cross_attn_metadata.num_contexts = attn_metadata.num_contexts
-            return cross_attn_metadata
-
         if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
-            cross_attn_metadata = update_cross_metadata(attn_metadata.cross)
+            cross_attn_metadata = attn_metadata.update_cross_metadata(
+                encoder_seq_lens=encoder_seq_lens,
+                cross_kv_cache_manager=cross_kv_cache_manager,
+                encoder_num_cached_tokens_per_seq=
+                encoder_num_cached_tokens_per_seq,
+            )
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
-                encoder_seq_lens=encoder_seq_lens_tensor,
                 cross_kv_cache_manager=cross_kv_cache_manager,
+                encoder_seq_lens=encoder_seq_lens,
                 encoder_num_cached_tokens_per_seq=
                 encoder_num_cached_tokens_per_seq,
             )
@@ -3013,7 +3181,9 @@ class PyTorchModelEngine(ModelEngine):
             append_cross_attention_state(
                 request,
                 project_encoder_output=not request.py_skip_cross_kv_projection
-                and not getattr(request, "is_dummy", False))
+                and
+                (not getattr(request, "is_dummy", False)
+                 or getattr(request, "py_encoder_output", None) is not None))
 
             # Embed mask is required only for partial iterations (chunked
             # prefill or KV-cache reuse); full-prefill degrades gracefully.
@@ -4785,6 +4955,7 @@ class PyTorchModelEngine(ModelEngine):
             ) if self.encoder_attn_metadata is None else self.encoder_attn_metadata
             graph_attn_metadata, key = self.encoder_cuda_graph_runner.maybe_get_cuda_graph(
                 padded_inputs, attn_metadata)
+            self._record_encoder_cuda_graph_phase(key is not None)
             # Unpad seq_lens when fallback to eager path.
             if key is None:
                 padded_inputs['seq_lens'] = padded_inputs[
@@ -4958,6 +5129,8 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
+            self._record_decoder_cuda_graph_phase(scheduled_requests,
+                                                  can_run_graph)
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
@@ -5377,6 +5550,7 @@ class PyTorchModelEngine(ModelEngine):
         with torch.inference_mode():
             inputs = self._prepare_tp_inputs_encoder(
                 encoder_requests, resource_manager=resource_manager)
+            self._record_encoder_cuda_graph_phase(False)
             encoder_hidden_states = self._forward_step_encoder(inputs)
 
         return encoder_hidden_states, inputs['encoder_seq_lens']

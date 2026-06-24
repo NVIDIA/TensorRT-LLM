@@ -544,6 +544,38 @@ class PyExecutor:
         # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
 
+        # Encoder-decoder models execute the encoder and decoder in separate
+        # iterations. The encoder branch lives in ``_executor_loop`` only;
+        # ``_executor_loop_overlap`` has not been threaded yet. Reject
+        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
+        # is intentionally out of scope for this port).
+        is_encoder_decoder = bool(
+            getattr(getattr(self.model_engine.model, "model_config", None),
+                    "is_encoder_decoder", False))
+        if is_encoder_decoder:
+            if self.dist.pp_size > 1:
+                raise NotImplementedError(
+                    "pp_size > 1 is not supported for encoder-decoder models "
+                    "in the PyTorch flow; encoder send/recv hooks are out of "
+                    "scope. Set pp_size=1 to run T5/BART/mBART.")
+            if not self.disable_overlap_scheduler:
+                raise NotImplementedError(
+                    "Overlap scheduler is not yet wired for encoder-decoder "
+                    "models. Set disable_overlap_scheduler=True for "
+                    "encoder-decoder runs.")
+            if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
+                       False):
+                raise NotImplementedError(
+                    "Piecewise CUDA graph is not supported for "
+                    "encoder-decoder models. Disable "
+                    "torch_compile_config.enable_piecewise_cuda_graph.")
+            if (getattr(self.model_engine, "cuda_graph_config", None)
+                    is not None and getattr(self.model_engine, "spec_config",
+                                            None) is not None):
+                raise NotImplementedError(
+                    "Speculative decoding with CUDA graph is not supported "
+                    "for encoder-decoder models.")
+
         # Synchronize all ranks before warmup. This prevents a PP
         # communication deadlock when ranks on the last PP stage are delayed
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
@@ -677,31 +709,6 @@ class PyExecutor:
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
                 self.dist, self._do_terminate_request)
-
-        # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations. The encoder branch lives in ``_executor_loop`` only;
-        # ``_executor_loop_overlap`` has not been threaded yet. Reject
-        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
-        # is intentionally out of scope for this port).
-        is_encoder_decoder = bool(
-            getattr(getattr(self.model_engine.model, "model_config", None),
-                    "is_encoder_decoder", False))
-        if is_encoder_decoder:
-            if self.dist.pp_size > 1:
-                raise NotImplementedError(
-                    "pp_size > 1 is not supported for encoder-decoder models "
-                    "in the PyTorch flow; encoder send/recv hooks are out of "
-                    "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models. Set disable_overlap_scheduler=True for "
-                    "encoder-decoder runs.")
-            if getattr(self.model_engine, "cuda_graph_config",
-                       None) is not None:
-                raise NotImplementedError(
-                    "CUDA graph is not supported for encoder-decoder models. "
-                    "Disable cuda_graph_config for encoder-decoder runs.")
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp

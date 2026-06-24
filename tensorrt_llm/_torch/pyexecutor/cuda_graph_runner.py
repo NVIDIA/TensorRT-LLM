@@ -78,6 +78,7 @@ class CUDAGraphRunnerConfig:
     original_max_total_draft_tokens: int
     is_draft_model: bool
     enable_attention_dp: bool
+    is_encoder_decoder: bool
     batch_size: int
     mapping: Optional[Mapping]
     dist: Optional[Distributed]
@@ -107,13 +108,14 @@ class CUDAGraphRunner:
         self.max_beam_width = config.max_beam_width
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
+        self.is_encoder_decoder = config.is_encoder_decoder
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self.padding_dummy_requests: Dict[int, "Request"] = {}
+        self.padding_dummy_requests: Dict[int, Any] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
@@ -491,6 +493,14 @@ class CUDAGraphRunner:
         # respect the requirement just in case that changes in the future.
         # Use per-draft-len dummy requests for dynamic draft length support.
         if runtime_draft_len not in self.padding_dummy_requests:
+            dummy_encoder_output_len = None
+            if self.is_encoder_decoder:
+                cross_kv_cache_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+                if cross_kv_cache_manager is None:
+                    return 0
+                dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
+                    batch, cross_kv_cache_manager)
 
             # Get draft KV cache manager only for one-model speculative decoding.
             # In two-model mode, each model has its own KV cache manager, so
@@ -502,10 +512,13 @@ class CUDAGraphRunner:
             dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
             dummy_request = kv_cache_manager.add_dummy_requests(
                 [dummy_request_id],
+                token_nums=[2] if self.is_encoder_decoder else None,
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width,
+                encoder_output_lens=[dummy_encoder_output_len]
+                if dummy_encoder_output_len is not None else None,
                 draft_kv_cache_manager=draft_kv_cache_manager)
 
             if dummy_request is None:
@@ -513,6 +526,14 @@ class CUDAGraphRunner:
             else:
                 dummy_request = dummy_request[0]
             dummy_request.is_cuda_graph_dummy = True
+            if self.is_encoder_decoder:
+                if not self._prepare_encoder_decoder_padding_dummy(
+                        dummy_request, resource_manager,
+                        dummy_encoder_output_len):
+                    kv_cache_manager.free_resources(dummy_request)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(dummy_request)
+                    return 0
 
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -523,6 +544,42 @@ class CUDAGraphRunner:
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
+
+    def _prepare_encoder_decoder_padding_dummy(
+            self, dummy_request: Any, resource_manager: ResourceManager,
+            encoder_output_len: int) -> bool:
+        cross_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is None:
+            return False
+
+        dummy_request.py_encoder_output = None
+        dummy_request.py_skip_cross_kv_projection = True
+
+        encoder_output_lens = [encoder_output_len]
+        cross_dummy_requests = cross_kv_cache_manager.add_dummy_requests(
+            request_ids=[dummy_request.py_request_id],
+            token_nums=encoder_output_lens,
+            is_gen=True,
+            max_beam_width=self.config.max_beam_width,
+            encoder_output_lens=encoder_output_lens)
+        return cross_dummy_requests is not None
+
+    @staticmethod
+    def _get_padding_dummy_encoder_output_len(
+            batch: ScheduledRequests, cross_kv_cache_manager: Any) -> int:
+        encoder_output_len = 1
+        for request in batch.generation_requests:
+            request_encoder_output_len = getattr(request, "encoder_output_len",
+                                                 None)
+            if request_encoder_output_len is not None:
+                encoder_output_len = max(1, int(request_encoder_output_len))
+                break
+
+        max_seq_len = getattr(cross_kv_cache_manager, "max_seq_len", None)
+        if max_seq_len is not None:
+            encoder_output_len = min(encoder_output_len, int(max_seq_len))
+        return encoder_output_len
 
     def _round_up_batch_size(self, batch_size: int) -> int:
         """Finds the smallest supported graph batch size >= the given size."""

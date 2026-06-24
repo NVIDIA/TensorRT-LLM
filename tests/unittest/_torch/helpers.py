@@ -252,6 +252,7 @@ def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
         original_max_draft_len=0,
         original_max_total_draft_tokens=0,
         is_draft_model=False,
+        is_encoder_decoder=False,
         mapping=Mapping(),
         dist=None,
         kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)

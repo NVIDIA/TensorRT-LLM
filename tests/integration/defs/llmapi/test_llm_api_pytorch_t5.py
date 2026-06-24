@@ -106,7 +106,8 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
+    cuda_graph_batch_sizes: list[int] | None = None,
+    marks=None,
 ):
     if num_beams == 1:
         expected_output_token_ids = (
@@ -127,6 +128,10 @@ def _test_case(
 
     assert not exact_match or expected_output_token_ids is not None
 
+    param_kwargs = {"id": f"{feature_id}-{model_name}"}
+    if marks is not None:
+        param_kwargs["marks"] = marks
+
     return pytest.param(
         model_name,
         expected_output_token_ids,
@@ -136,8 +141,8 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
-        id=f"{feature_id}-{model_name}",
-        marks=marks,
+        cuda_graph_batch_sizes,
+        **param_kwargs,
     )
 
 
@@ -246,6 +251,28 @@ _TEST_CASES = [
         exact_match=True,
         feature_id="bf16-kv-v1-cuda-graph-off-greedy",
     ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v1-cuda-graph-on-greedy",
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+    ),
     # Precision coverage for beam search. KVCacheManagerV2 currently requires
     # max_beam_width == 1, so beam-search precision coverage uses v1.
     _test_case(
@@ -298,6 +325,17 @@ _TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v2-cuda-graph-on-greedy",
     ),
     _test_case(
         model_name="t5-small",
@@ -524,12 +562,7 @@ def _assert_expected_generation(
     assert token_ids_by_output == expected_token_ids_by_output
 
 
-@pytest.mark.parametrize(
-    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
-    _TEST_CASES,
-)
-def test_t5_pytorch_generate_encoder_decoder_end_to_end(
+def _run_t5_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
     expected_output_token_ids_by_output: list[list[int]] | None,
@@ -539,6 +572,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    cuda_graph_batch_sizes: list[int] | None,
 ) -> None:
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
@@ -555,7 +589,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(enable_cuda_graph),
+        cuda_graph_config=_cuda_graph_config(enable_cuda_graph, cuda_graph_batch_sizes),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -566,7 +600,7 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         ),
-        max_batch_size=1,
+        max_batch_size=max(cuda_graph_batch_sizes or [1]),
         max_beam_width=num_beams,
         max_input_len=_MAX_SEQUENCE_LENGTH,
         max_num_tokens=_MAX_SEQUENCE_LENGTH,
@@ -590,6 +624,37 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
             exact_match,
             expected_output_token_ids_by_output,
         )
+
+
+@pytest.mark.parametrize(
+    "model_name,expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,cuda_graph_batch_sizes",
+    _TEST_CASES,
+)
+def test_t5_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+    cuda_graph_batch_sizes: list[int] | None,
+) -> None:
+    _run_t5_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        model_name,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+        cuda_graph_batch_sizes,
+    )
 
 
 @pytest.mark.parametrize(

@@ -63,6 +63,8 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
+    cuda_graph_batch_sizes: list[int] | None = None,
+    kv_cache_dtype: str = "auto",
 ):
     expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
     assert not exact_match or expected_output_token_ids is not None
@@ -75,6 +77,8 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
+        cuda_graph_batch_sizes,
+        kv_cache_dtype,
         id=f"{feature_id}-{_MODEL_NAME}",
     )
 
@@ -88,6 +92,16 @@ _TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v1-cuda-graph-off-greedy",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v1-cuda-graph-on-greedy",
     ),
     _test_case(
         torch_dtype="float16",
@@ -109,12 +123,30 @@ _TEST_CASES = [
     ),
     _test_case(
         torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
         enable_cuda_graph=False,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="bf16-kv-v2-cuda-graph-on-greedy",
     ),
 ]
 
@@ -192,7 +224,31 @@ def _cuda_graph_config(
     enabled: bool,
     batch_sizes: list[int] | None = None,
 ) -> CudaGraphConfig | None:
-    return CudaGraphConfig(batch_sizes=batch_sizes or [1]) if enabled else None
+    if not enabled:
+        return None
+    return CudaGraphConfig(batch_sizes=batch_sizes or [1], enable_padding=True)
+
+
+def _assert_cuda_graphs_captured(llm: LLM, enabled: bool) -> None:
+    if not enabled:
+        return
+    model_engine = llm._executor.engine.model_engine
+    assert model_engine.cuda_graph_runner.graphs
+
+
+def _assert_cuda_graph_padding_used(llm: LLM, batch_sizes: list[int] | None) -> None:
+    if batch_sizes is None:
+        return
+    model_engine = llm._executor.engine.model_engine
+    assert model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1")
+
+    from tensorrt_llm._torch.attention_backend import trtllm
+
+    monkeypatch.setattr(trtllm, "_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", True)
 
 
 def _assert_bart_response(
@@ -250,7 +306,7 @@ def _assert_expected_generation(
     "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
     _TEST_CASES,
 )
-def test_bart_pytorch_generate_encoder_decoder_end_to_end(
+def _run_bart_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     expected_output_token_ids_by_output: list[list[int]] | None,
     torch_dtype: str,
@@ -259,6 +315,8 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    cuda_graph_batch_sizes: list[int] | None,
+    kv_cache_dtype: str = "auto",
 ) -> None:
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
@@ -275,7 +333,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(enable_cuda_graph),
+        cuda_graph_config=_cuda_graph_config(enable_cuda_graph, cuda_graph_batch_sizes),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -286,7 +344,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         ),
-        max_batch_size=1,
+        max_batch_size=max(cuda_graph_batch_sizes or [1]),
         max_beam_width=num_beams,
         max_input_len=_MAX_SEQUENCE_LENGTH,
         max_num_tokens=_MAX_SEQUENCE_LENGTH,
@@ -310,6 +368,40 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
             exact_match,
             expected_output_token_ids_by_output,
         )
+        _assert_cuda_graphs_captured(llm, enable_cuda_graph)
+        _assert_cuda_graph_padding_used(llm, cuda_graph_batch_sizes)
+
+
+@pytest.mark.parametrize(
+    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,cuda_graph_batch_sizes,"
+    "kv_cache_dtype",
+    _TEST_CASES,
+)
+def test_bart_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+    cuda_graph_batch_sizes: list[int] | None,
+    kv_cache_dtype: str,
+) -> None:
+    _run_bart_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+        cuda_graph_batch_sizes,
+        kv_cache_dtype,
+    )
 
 
 @pytest.mark.parametrize(
