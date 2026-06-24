@@ -71,6 +71,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_cutedsl
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16 SKIP (https://nvbugs/6283537)
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False] SKIP (https://nvbugs/6368874)
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/6248827)
+accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6367805)
+accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6367805)
 accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4] SKIP (https://nvbugs/6336747)
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales[mtp_nextn=3] SKIP (https://nvbugs/6274932)
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=3] SKIP (https://nvbugs/6367805)
