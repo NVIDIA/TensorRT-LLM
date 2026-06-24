@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import functools
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import time
 import traceback
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -91,6 +93,17 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+# Dedicated executor for HF input-processor / preprocess work on the chat
+# and completion endpoints. Same rationale as the media-load executor in
+# inputs/media_io.py: isolate this CPU-bound work from unrelated
+# to_thread() callers on the default asyncio pool and allow independent
+# tuning.
+_INPUT_PROC_WORKERS = int(os.environ.get("TRTLLM_INPUT_PROC_WORKERS", "8"))
+_INPUT_PROC_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_INPUT_PROC_WORKERS,
+    thread_name_prefix="trtllm_inputproc",
+)
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1318,9 +1331,11 @@ class OpenAIServer(_VideoRoutesMixin):
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
-                generate_inputs = await asyncio.to_thread(
-                    preprocess_fn, prompt, sampling_params,
-                    disaggregated_params)
+                loop = asyncio.get_event_loop()
+                generate_inputs = await loop.run_in_executor(
+                    _INPUT_PROC_EXECUTOR,
+                    functools.partial(preprocess_fn, prompt, sampling_params,
+                                      disaggregated_params))
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -1619,8 +1634,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
-                    prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
-                        self.generator.input_processor, prompt, sampling_params)
+                    loop = asyncio.get_event_loop()
+                    prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
+                        _INPUT_PROC_EXECUTOR,
+                        functools.partial(self.generator.input_processor,
+                                          prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         query_token_ids=extra_processed_inputs.get(
