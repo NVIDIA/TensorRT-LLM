@@ -127,11 +127,6 @@ class FlashInferWrappers:
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
 
-    # cache concat/split kernels when using PD disaggregation
-    # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
-    # so set kv_layout as "HND" here
-    kv_layout: Literal["NHD", "HND"] = "HND"
-
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
     _paged_kv_indices: torch.Tensor = field(init=False, repr=False)
@@ -1929,8 +1924,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             else:
                 output = torch.empty_like(q)
 
-        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
-        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined
+        # in TRTLLM is exclusive. Subtract 1 from the attention window size for consistent behavior.
         attention_window_size = forward_args.attention_window_size
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1

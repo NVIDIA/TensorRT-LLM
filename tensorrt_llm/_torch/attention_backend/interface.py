@@ -3,8 +3,8 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -42,8 +42,10 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
-    chunk_size: int = 0  # this is the chunk size for MLA chunked prefill, it will split kv cache into chunks to save global memory.
-    chunked_prefill_buffer_batch_size: int = 4  # real chunk size for MLA chunked prefill is chunked_prefill_buffer_batch_size * chunk_size.
+    # This is the chunk size for MLA chunked prefill, which splits KV cache into chunks.
+    chunk_size: int = 0
+    # The real chunk size for MLA chunked prefill is this value * chunk_size.
+    chunked_prefill_buffer_batch_size: int = 4
 
 
 # The type of requests in qkv passed to attention
@@ -73,6 +75,8 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
     # Sparse settings for metadata allocation/update; dense metadata leaves it None.
     sparse_metadata_params: Optional[SparseMetadataParams] = None
+    # Paged KV-cache block layout exposed by KVCacheManager.get_buffers().
+    kv_layout: Literal["NHD", "HND"] = "HND"
 
     enable_flash_mla: bool = False
     enable_context_mla_with_cached_kv: bool = False

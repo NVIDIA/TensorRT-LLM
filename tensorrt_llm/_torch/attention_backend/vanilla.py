@@ -60,6 +60,10 @@ def generate_sliding_window_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.kv_layout = "NHD"
+
     def prepare(self) -> None:
         super().prepare()
         # indices of used cache blocks for each sequence
