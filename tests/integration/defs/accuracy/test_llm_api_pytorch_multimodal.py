@@ -23,6 +23,7 @@ from tensorrt_llm.llmapi import (
     MTPDecodingConfig,
     SamplingParams,
 )
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
@@ -666,7 +667,10 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize(
-        "model_name,model_path,kv_cache_config,max_batch_size,expected_quant_algo,task_specs",
+        (
+            "model_name,model_path,kv_cache_config,max_batch_size,"
+            "expected_quant_algo,task_specs,multimodal_config"
+        ),
         [
             pytest.param(
                 "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
@@ -679,6 +683,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 32,
                 None,
                 (MMMU_TASK_SPEC,),
+                None,
                 id="bf16",
             ),
             pytest.param(
@@ -693,8 +698,38 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 64,
                 QuantAlgo.FP8,
                 (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                None,
                 marks=skip_pre_hopper,
                 id="fp8",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                64,
+                QuantAlgo.FP8,
+                (MMMU_TASK_SPEC,),
+                MultimodalConfig(
+                    encoder_cuda_graph={
+                        "vision": MultimodalEncoderCudaGraphConfig(
+                            # Uncomment to debug (logs will show hits / misses), which is how the
+                            # below buckets were determined.
+                            # enable_replay_stats=True,
+                            buckets=[
+                                (1280, 1),
+                                (4096, 1),
+                                (5500, 2),
+                            ],
+                        )
+                    },
+                ),
+                marks=skip_pre_hopper,
+                id="fp8_mmmu_encoder_cuda_graph",
             ),
             pytest.param(
                 "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
@@ -708,6 +743,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 128,
                 QuantAlgo.MIXED_PRECISION,
                 (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                None,
                 marks=(skip_pre_blackwell,),
                 id="nvfp4",
             ),
@@ -726,7 +762,12 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
             tuple[type[MMMU] | type[VoxPopuli], SamplingParams, dict[str, object]],
             ...,
         ],
+        multimodal_config: MultimodalConfig | None,
     ) -> None:
+        multimodal_config_kwargs = {}
+        if multimodal_config is not None:
+            multimodal_config_kwargs["multimodal_config"] = multimodal_config
+
         with LLM(
             model_path,
             trust_remote_code=True,
@@ -739,6 +780,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
             # so lower it from its default of 2048.
             # Quantized variants fit larger batches within the CI GPU memory budget.
             max_batch_size=max_batch_size,
+            **multimodal_config_kwargs,
         ) as llm:
             if expected_quant_algo is not None:
                 assert llm.args.quant_config.quant_algo == expected_quant_algo
