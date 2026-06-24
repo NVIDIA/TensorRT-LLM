@@ -237,6 +237,99 @@ struct Sort<4, RedType>
     }
 };
 
+template <typename RedType>
+struct Sort<5, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(2, 3);
+        TOPK_SWAP(1, 4);
+        TOPK_SWAP(0, 3);
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(1, 2);
+    }
+};
+
+template <typename RedType>
+struct Sort<6, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(4, 5);
+        TOPK_SWAP(3, 5);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(0, 3);
+        TOPK_SWAP(1, 4);
+        TOPK_SWAP(2, 5);
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(2, 3);
+    }
+};
+
+template <typename RedType>
+struct Sort<7, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(5, 6);
+        TOPK_SWAP(3, 5);
+        TOPK_SWAP(4, 6);
+        TOPK_SWAP(4, 5);
+        TOPK_SWAP(0, 4);
+        TOPK_SWAP(0, 3);
+        TOPK_SWAP(1, 5);
+        TOPK_SWAP(2, 6);
+        TOPK_SWAP(2, 5);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(2, 3);
+    }
+};
+
+template <typename RedType>
+struct Sort<8, RedType>
+{
+    static __device__ void run(RedType* topK)
+    {
+        TOPK_SWAP(0, 1);
+        TOPK_SWAP(2, 3);
+        TOPK_SWAP(4, 5);
+        TOPK_SWAP(6, 7);
+
+        TOPK_SWAP(0, 2);
+        TOPK_SWAP(1, 3);
+        TOPK_SWAP(4, 6);
+        TOPK_SWAP(5, 7);
+
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(5, 6);
+
+        TOPK_SWAP(0, 4);
+        TOPK_SWAP(1, 5);
+        TOPK_SWAP(2, 6);
+        TOPK_SWAP(3, 7);
+
+        TOPK_SWAP(2, 4);
+        TOPK_SWAP(3, 5);
+
+        TOPK_SWAP(1, 2);
+        TOPK_SWAP(3, 4);
+        TOPK_SWAP(5, 6);
+    }
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int K, typename Type>
