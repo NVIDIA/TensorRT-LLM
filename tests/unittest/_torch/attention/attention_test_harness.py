@@ -160,7 +160,7 @@ class BackendCase:
     @property
     def token_nums(self) -> List[int]:
         # Total KV tokens per request after the backend appends the new KV.
-        return [c + s for c, s in zip(self.num_cached_tokens, self.kv_new_lens)]
+        return [c + s for c, s in zip(self.num_cached_tokens, self.kv_new_lens, strict=True)]
 
     @property
     def compute_dtype(self) -> torch.dtype:

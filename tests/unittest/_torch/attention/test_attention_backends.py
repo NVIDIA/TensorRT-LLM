@@ -122,7 +122,6 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     # Filter dims to those meaningful for this case type.
     if cfg.is_mla:
         precisions = [(d, k) for d, k in precisions if k is None]  # bf16 latent
-        kv_layouts = ["NHD"]  # MLA reads its latent cache NHD-internally
     elif cfg.is_cross:
         precisions = [(d, k) for d, k in precisions if k is None]  # no fp8 cross
 
@@ -150,7 +149,10 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
                             f"{cfg.id}-diff_kv_{tag}",
                             BackendCase(
                                 seq_lens_kv=[
-                                    x * y for x, y in zip(_PHASES["ctx"]["seq_lens"], [2, 3, 6])
+                                    x * y
+                                    for x, y in zip(
+                                        _PHASES["ctx"]["seq_lens"], [2, 3, 6], strict=True
+                                    )
                                 ],
                                 **_PHASES["ctx"],
                                 **base,

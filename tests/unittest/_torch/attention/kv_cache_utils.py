@@ -38,7 +38,7 @@ def fill_kv_cache_logical(
         layer_idx: the layer whose pool to write.
         request_ids: request ids previously passed to ``add_dummy_requests``.
         k_per_seq, v_per_seq: per-sequence logical cached K and V.
-        kv_layout: ``"NHD"`` (TRTLLM/Vanilla) or ``"HND"`` (FlashInfer). Must
+        kv_layout: ``"NHD"`` (Vanilla) or ``"HND"`` (TRTLLM/FlashInfer). Must
             match the layout the backend reads with, since the two interpret the
             physical block memory differently.
     """
@@ -49,22 +49,12 @@ def fill_kv_cache_logical(
         # uninitialized e4m3 byte decodes to NaN, poisoning the softmax (a real
         # run never hits this; its kernel appends incrementally). NVFP4 pools are
         # left as-is: get_buffers cannot reshape the half-size packed pool.
-        try:
-            buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=kv_layout)
-        except TypeError:
-            buf = kv_cache_manager.get_buffers(layer_idx)
-        except Exception:
-            return
+        buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=kv_layout)
         if buf.dtype == torch.float8_e4m3fn:
             buf.zero_()
         return
 
-    try:
-        buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=kv_layout)
-    except TypeError:
-        # Older signature without kv_layout (defaults to NHD).
-        assert kv_layout == "NHD", "manager.get_buffers does not accept kv_layout"
-        buf = kv_cache_manager.get_buffers(layer_idx)
+    buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=kv_layout)
 
     # Zero the pool first: the freshly-allocated KV pool is uninitialized, and
     # the decode kernel reads whole blocks (masking positions beyond kv_len).
@@ -112,7 +102,7 @@ def make_position_ids(
     ``[sum(seq_lens)]`` matching the packed q layout used by the backends.
     """
     pieces = []
-    for s_len, cached in zip(seq_lens, num_cached_tokens):
+    for s_len, cached in zip(seq_lens, num_cached_tokens, strict=True):
         pieces.append(torch.arange(cached, cached + s_len, dtype=torch.int32))
     return torch.cat(pieces).to(device)
 
