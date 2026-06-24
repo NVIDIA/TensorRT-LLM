@@ -35,6 +35,7 @@ def _make_model_config(
         dp_size=2,
         moe_tp_size=1,
         moe_ep_size=2,
+        moe_ep_rank=0,
     )
     return SimpleNamespace(
         mapping=mapping,

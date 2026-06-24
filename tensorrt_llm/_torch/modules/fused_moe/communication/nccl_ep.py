@@ -333,8 +333,8 @@ class NcclEP(Communication):
     def destroy(self):
         """Release per-instance NCCL EP resources (handle).
 
-        NcclEpContext is a singleton -- its lifetime is managed elsewhere
-        (``destroy_all_nccl_ep_contexts``).
+        NcclEpContext is shared across instances and released through a
+        refcounted cache.
         """
         if self._handle is not None:
             try:
@@ -342,4 +342,9 @@ class NcclEP(Communication):
             except _NCCL_RUNTIME_ERRORS as e:
                 logger.warning(f"Handle.destroy error during destroy: {e}")
             self._handle = None
+
+        from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import release_nccl_ep_context
+
+        release_nccl_ep_context(self._ctx)
         self._ctx = None
+        self._dispatch_state = {}

@@ -95,6 +95,7 @@ def _nccl_ep_supports_int32_topk_idx() -> bool:
 # Singleton EP context keyed by (ep_size, ep_rank, max_tokens, num_experts,
 # hidden, max_top_k, use_fp8, layout).
 _ep_group_cache: dict = {}
+_ep_group_refcounts: dict = {}
 
 
 class NcclEpContext:
@@ -399,7 +400,30 @@ def get_nccl_ep_context(
             use_fp8,
             layout,
         )
+    _ep_group_refcounts[key] = _ep_group_refcounts.get(key, 0) + 1
     return _ep_group_cache[key]
+
+
+def release_nccl_ep_context(ctx: Optional[NcclEpContext]) -> None:
+    """Release one reference to a cached :class:`NcclEpContext`."""
+    if ctx is None:
+        return
+
+    key = next((key for key, cached_ctx in _ep_group_cache.items() if cached_ctx is ctx), None)
+    if key is None:
+        return
+
+    refcount = _ep_group_refcounts.get(key, 0) - 1
+    if refcount > 0:
+        _ep_group_refcounts[key] = refcount
+        return
+
+    _ep_group_refcounts.pop(key, None)
+    cached_ctx = _ep_group_cache.pop(key)
+    try:
+        cached_ctx.destroy()
+    except _NCCL_RUNTIME_ERRORS as e:
+        logger.warning(f"Error destroying NCCL EP context: {e}")
 
 
 def destroy_all_nccl_ep_contexts():
@@ -410,3 +434,4 @@ def destroy_all_nccl_ep_contexts():
         except _NCCL_RUNTIME_ERRORS as e:
             logger.warning(f"Error destroying NCCL EP context: {e}")
     _ep_group_cache.clear()
+    _ep_group_refcounts.clear()
