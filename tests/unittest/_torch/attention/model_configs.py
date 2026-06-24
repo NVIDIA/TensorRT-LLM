@@ -21,6 +21,19 @@ identical given pre-rotated Q/K, so it is represented by the base RoPE style
 ``"causal"`` / ``"full"`` / ``"sliding"``. ``no_cache=True`` marks the
 bidirectional, KV-cache-free DiT / encoder workloads.
 
+ID naming rule:
+- Use lowercase snake_case:
+  ``<family>[_<variant_or_size>]_<attn_kind>[_hdN][_rope][_swaN|_self|_cross|_encoder|_vision|_mla|_mla_ctx]``.
+- ``attn_kind`` is ``mha`` / ``gqa`` / ``mqa`` for dense attention. MLA uses
+  ``_mla`` or ``_mla_ctx`` instead of a separate dense-attention kind.
+- Omit ``hd128`` for the common head dimension; include ``hdN`` for other
+  dimensions. Omit default GPT-NeoX RoPE; include ``gptj`` or ``nope`` when
+  they distinguish the tuple.
+- Sliding-window IDs must include the real window size as ``swaN`` because the
+  window is part of the backend config tuple.
+- When multiple model families share one tuple, the ID names a representative
+  family or compact group; the ``models`` field lists the known families.
+
 Compute/KV dtype is intentionally NOT a field here: a model can be served in
 many precisions (fp16/bf16/fp8), so dtype is an orthogonal test dimension, not
 part of the attention architecture.
@@ -73,21 +86,21 @@ class ModelAttnConfig:
 _STANDARD = [
     # Dense full-attention decoder LLMs.
     ModelAttnConfig(
-        "llama3_gqa",
+        "llama3_8b_gqa",
         "Llama-3 8B, Qwen3-8B, Mixtral-8x7B, Qwen3-VL-8B, Nemotron-H-8B",
         num_heads=32,
         num_kv_heads=8,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "llama70_qwen3_32b_gqa",
+        "llama3_70b_qwen3_32b_gqa",
         "Llama-3 70B, Qwen2/3-32B/72B, MiniMax-M1, Step-3.5/3.7 full layers",
         num_heads=64,
         num_kv_heads=8,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "llama405_gqa",
+        "llama3_405b_gqa",
         "Llama-3.1 405B",
         num_heads=128,
         num_kv_heads=8,
@@ -101,49 +114,49 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "llama32_1b_gqa",
+        "llama3_2_1b_gqa_hd64",
         "Llama-3.2 1B, EXAONE-4.0-1.2B",
         num_heads=32,
         num_kv_heads=8,
         head_dim=64,
     ),
     ModelAttnConfig(
-        "llama32_3b_gqa",
+        "llama3_2_3b_gqa",
         "Llama-3.2 3B, Phi-4-mini, HCXVision-3B, Minitron/Nemotron-4B",
         num_heads=24,
         num_kv_heads=8,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "mixtral22_minimax_laguna_gqa",
+        "mixtral_8x22b_minimax_laguna_gqa",
         "Mixtral-8x22B, MiniMax-M2, Laguna full layers",
         num_heads=48,
         num_kv_heads=8,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "seedoss_gqa",
+        "seed_oss_gqa",
         "Seed-OSS-36B",
         num_heads=80,
         num_kv_heads=8,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "qwen2_gqa",
+        "qwen2_7b_gqa",
         "Qwen2-7B, Qwen2.5-VL-7B, Qwen2-MoE-57B, LLaVA-OneVision-Qwen2",
         num_heads=28,
         num_kv_heads=4,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "qwen2_05b_gqa_hd64",
+        "qwen2_0_5b_gqa_hd64",
         "Qwen2/Qwen2.5-0.5B",
         num_heads=14,
         num_kv_heads=2,
         head_dim=64,
     ),
     ModelAttnConfig(
-        "qwen2_15b_gqa",
+        "qwen2_1_5b_gqa",
         "Qwen2/Qwen2.5-1.5B",
         num_heads=12,
         num_kv_heads=2,
@@ -185,14 +198,14 @@ _STANDARD = [
         head_dim=64,
     ),
     ModelAttnConfig(
-        "nemotron_h_gqa2",
+        "nemotron_h_32h_gqa",
         "Nemotron-H 30B/120B",
         num_heads=32,
         num_kv_heads=2,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "nemotron_h_64h_gqa2",
+        "nemotron_h_64h_gqa",
         "Nemotron-H 47B/56B/Ultra sample",
         num_heads=64,
         num_kv_heads=2,
@@ -206,77 +219,77 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "qwen3next_gqa_hd256",
+        "qwen3_next_gqa_hd256",
         "Qwen3-Next full-attention layers, Qwen3.5 35B-A3B full layers",
         num_heads=16,
         num_kv_heads=2,
         head_dim=256,
     ),
     ModelAttnConfig(
-        "qwen35_27b_gqa_hd256",
+        "qwen3_5_27b_gqa_hd256",
         "Qwen3.5-27B full-attention layers",
         num_heads=24,
         num_kv_heads=4,
         head_dim=256,
     ),
     ModelAttnConfig(
-        "qwen35_397b_gqa_hd256",
+        "qwen3_5_397b_gqa_hd256",
         "Qwen3.5-397B-A17B full-attention layers",
         num_heads=32,
         num_kv_heads=2,
         head_dim=256,
     ),
     ModelAttnConfig(
-        "mha_32x32_hd128",
+        "llama2_7b_qwen1_5_7b_mha",
         "Llama-2-7B, Qwen1.5-7B, DeciLM-7B",
         num_heads=32,
         num_kv_heads=32,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "mha_20x20_hd128",
+        "vila1_5_3b_mha",
         "VILA1.5-3B LLM",
         num_heads=20,
         num_kv_heads=20,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "mha_40x40_hd128",
+        "llama2_13b_qwen1_5_14b_mha",
         "Llama-2-13B, Qwen1.5-14B",
         num_heads=40,
         num_kv_heads=40,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "mha_52x52_hd128",
+        "llama_30b_mha",
         "Llama-30B",
         num_heads=52,
         num_kv_heads=52,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "mha_64x64_hd128",
+        "llama_65b_qwen1_5_72b_mha",
         "Llama-65B, Qwen1.5-72B",
         num_heads=64,
         num_kv_heads=64,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "mha_128x128_hd128",
+        "nemotron_nas_ultra_mha",
         "Nemotron-NAS Ultra 253B",
         num_heads=128,
         num_kv_heads=128,
         head_dim=128,
     ),
     ModelAttnConfig(
-        "qwen15_05b_mha_hd64",
+        "qwen1_5_0_5b_mha_hd64",
         "Qwen1.5-0.5B",
         num_heads=16,
         num_kv_heads=16,
         head_dim=64,
     ),
     ModelAttnConfig(
-        "qwen15_moe_mha",
+        "qwen1_5_moe_mha",
         "Qwen1.5-MoE-A2.7B",
         num_heads=16,
         num_kv_heads=16,
@@ -304,7 +317,7 @@ _STANDARD = [
         head_dim=64,
     ),
     ModelAttnConfig(
-        "gpt_oss_gqa",
+        "gpt_oss_gqa_hd64_gptj",
         "GPT-OSS full-attention layers (yarn, gptj-style rotation)",
         num_heads=64,
         num_kv_heads=8,
@@ -314,7 +327,7 @@ _STANDARD = [
     # NoPE decoder self-attention (learned/relative positional embeddings are
     # handled outside the dense backend).
     ModelAttnConfig(
-        "flan_t5_small_self_nope",
+        "flan_t5_small_mha_hd64_nope_self",
         "FLAN-T5-small / ByT5-small decoder self-attention",
         num_heads=6,
         num_kv_heads=6,
@@ -322,7 +335,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "t5_small_self_nope",
+        "t5_small_mha_hd64_nope_self",
         "T5-small decoder self-attention",
         num_heads=8,
         num_kv_heads=8,
@@ -330,7 +343,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "t5_base_self_nope",
+        "t5_base_mha_hd64_nope_self",
         "T5-base decoder self-attention",
         num_heads=12,
         num_kv_heads=12,
@@ -338,7 +351,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "bart_self_nope",
+        "bart_mha_hd64_nope_self",
         "BART / mBART decoder self-attention",
         num_heads=16,
         num_kv_heads=16,
@@ -346,7 +359,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "flan_t5_xl_self_nope",
+        "flan_t5_xl_mha_hd64_nope_self",
         "FLAN-T5-XL decoder self-attention",
         num_heads=32,
         num_kv_heads=32,
@@ -354,7 +367,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "exaone4_nope_gqa",
+        "exaone4_gqa_nope",
         "EXAONE-4.0/4.5 full-attention layers (NoPE)",
         num_heads=40,
         num_kv_heads=8,
@@ -362,7 +375,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "exaone_moe_nope_gqa",
+        "exaone_moe_gqa_nope",
         "K-EXAONE full-attention layers (NoPE)",
         num_heads=64,
         num_kv_heads=8,
@@ -391,21 +404,21 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "gemma4_e2b_full_hd512",
+        "gemma4_e2b_mqa_hd512",
         "Gemma4-E2B full-attention layers",
         num_heads=8,
         num_kv_heads=1,
         head_dim=512,
     ),
     ModelAttnConfig(
-        "gemma4_26b_full_hd512",
+        "gemma4_26b_gqa_hd512",
         "Gemma4-26B-A4B full-attention layers",
         num_heads=16,
         num_kv_heads=2,
         head_dim=512,
     ),
     ModelAttnConfig(
-        "gemma4_31b_full_hd512",
+        "gemma4_31b_gqa_hd512",
         "Gemma4-31B full-attention layers",
         num_heads=32,
         num_kv_heads=4,
@@ -414,7 +427,7 @@ _STANDARD = [
     # Dense sliding-window decoder LLMs. The window size is part of the tuple:
     # two otherwise-identical head layouts with different windows stay separate.
     ModelAttnConfig(
-        "mistral_swa",
+        "mistral_gqa_swa4096",
         "Mistral-7B-v0.1",
         num_heads=32,
         num_kv_heads=8,
@@ -423,7 +436,7 @@ _STANDARD = [
         sliding_window=4096,
     ),
     ModelAttnConfig(
-        "ministral_swa32768",
+        "ministral_gqa_swa32768",
         "Ministral-style Mistral layer_types",
         num_heads=32,
         num_kv_heads=8,
@@ -432,7 +445,7 @@ _STANDARD = [
         sliding_window=32768,
     ),
     ModelAttnConfig(
-        "cohere2_gptj_swa",
+        "cohere2_gqa_gptj_swa4096",
         "Cohere2 / Command-R (gptj RoPE, per-layer PE)",
         num_heads=32,
         num_kv_heads=8,
@@ -442,7 +455,7 @@ _STANDARD = [
         sliding_window=4096,
     ),
     ModelAttnConfig(
-        "gpt_oss_swa128",
+        "gpt_oss_gqa_hd64_gptj_swa128",
         "GPT-OSS sliding layers (yarn, gptj-style rotation)",
         num_heads=64,
         num_kv_heads=8,
@@ -452,7 +465,7 @@ _STANDARD = [
         sliding_window=128,
     ),
     ModelAttnConfig(
-        "exaone4_swa4096",
+        "exaone4_gqa_swa4096",
         "EXAONE-4.0/4.5 sliding layers",
         num_heads=40,
         num_kv_heads=8,
@@ -461,7 +474,7 @@ _STANDARD = [
         sliding_window=4096,
     ),
     ModelAttnConfig(
-        "exaone_moe_swa128",
+        "exaone_moe_gqa_swa128",
         "K-EXAONE sliding layers",
         num_heads=64,
         num_kv_heads=8,
@@ -470,7 +483,7 @@ _STANDARD = [
         sliding_window=128,
     ),
     ModelAttnConfig(
-        "laguna_step_swa512",
+        "laguna_step_gqa_swa512",
         "Laguna sliding layers, Step-3.5/3.7 sliding layers",
         num_heads=64,
         num_kv_heads=8,
@@ -479,7 +492,7 @@ _STANDARD = [
         sliding_window=512,
     ),
     ModelAttnConfig(
-        "starcoder2_3b_swa4096",
+        "starcoder2_3b_gqa_swa4096",
         "StarCoder2-3B",
         num_heads=24,
         num_kv_heads=2,
@@ -488,7 +501,7 @@ _STANDARD = [
         sliding_window=4096,
     ),
     ModelAttnConfig(
-        "starcoder2_7b_swa4096",
+        "starcoder2_7b_gqa_swa4096",
         "StarCoder2-7B",
         num_heads=36,
         num_kv_heads=4,
@@ -497,7 +510,7 @@ _STANDARD = [
         sliding_window=4096,
     ),
     ModelAttnConfig(
-        "starcoder2_15b_swa4096",
+        "starcoder2_15b_gqa_swa4096",
         "StarCoder2-15B",
         num_heads=48,
         num_kv_heads=4,
@@ -506,7 +519,7 @@ _STANDARD = [
         sliding_window=4096,
     ),
     ModelAttnConfig(
-        "gemma3_1b_swa512",
+        "gemma3_1b_mqa_hd256_swa512",
         "Gemma3-1B local layers",
         num_heads=4,
         num_kv_heads=1,
@@ -515,7 +528,7 @@ _STANDARD = [
         sliding_window=512,
     ),
     ModelAttnConfig(
-        "gemma3_12b_swa1024",
+        "gemma3_12b_gqa_hd256_swa1024",
         "Gemma3-12B local layers, Gemma4-26B-A4B sliding layers",
         num_heads=16,
         num_kv_heads=8,
@@ -524,7 +537,7 @@ _STANDARD = [
         sliding_window=1024,
     ),
     ModelAttnConfig(
-        "gemma3_27b_swa1024",
+        "gemma3_27b_gqa_swa1024",
         "Gemma3-27B local layers",
         num_heads=32,
         num_kv_heads=16,
@@ -533,7 +546,7 @@ _STANDARD = [
         sliding_window=1024,
     ),
     ModelAttnConfig(
-        "gemma4_e2b_swa512",
+        "gemma4_e2b_mqa_hd256_swa512",
         "Gemma4-E2B sliding layers",
         num_heads=8,
         num_kv_heads=1,
@@ -542,7 +555,7 @@ _STANDARD = [
         sliding_window=512,
     ),
     ModelAttnConfig(
-        "gemma4_31b_swa1024",
+        "gemma4_31b_gqa_hd256_swa1024",
         "Gemma4-31B sliding layers",
         num_heads=32,
         num_kv_heads=16,
@@ -650,7 +663,7 @@ _MLA = [
 # ---------------------------------------------------------------------------
 _CROSS = [
     ModelAttnConfig(
-        "flan_t5_small_cross",
+        "flan_t5_small_mha_hd64_nope_cross",
         "FLAN-T5-small / ByT5-small cross-attention",
         num_heads=6,
         num_kv_heads=6,
@@ -660,7 +673,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "t5_small_cross",
+        "t5_small_mha_hd64_nope_cross",
         "T5-small cross-attention",
         num_heads=8,
         num_kv_heads=8,
@@ -670,7 +683,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "t5_base_cross",
+        "t5_base_mha_hd64_nope_cross",
         "T5-base cross-attention",
         num_heads=12,
         num_kv_heads=12,
@@ -680,7 +693,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "bart_cross",
+        "bart_mha_hd64_nope_cross",
         "BART / mBART cross-attention",
         num_heads=16,
         num_kv_heads=16,
@@ -690,7 +703,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "flan_t5_xl_cross",
+        "flan_t5_xl_mha_hd64_nope_cross",
         "FLAN-T5-XL cross-attention",
         num_heads=32,
         num_kv_heads=32,
@@ -700,7 +713,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "mllama_cross",
+        "mllama_gqa_cross",
         "MLLama (GQA decoder, llama3 RoPE)",
         num_heads=32,
         num_kv_heads=8,
@@ -717,7 +730,7 @@ _CROSS = [
 # ---------------------------------------------------------------------------
 _NO_CACHE = [
     ModelAttnConfig(
-        "t5_small_encoder",
+        "t5_small_mha_hd64_nope_encoder",
         "FLAN-T5-small / ByT5-small encoder",
         num_heads=6,
         num_kv_heads=6,
@@ -727,7 +740,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "bert_encoder",
+        "bert_mha_hd64_nope_encoder",
         "BERT / CLIP / T5-base / SigLip (NoPE bidirectional encoder)",
         num_heads=12,
         num_kv_heads=12,
@@ -737,7 +750,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "flux_dit",
+        "flux_mha_dit",
         "FLUX-1 (DiT, dual-stream joint attention)",
         num_heads=24,
         num_kv_heads=24,
@@ -747,7 +760,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "ltx2_dit",
+        "ltx2_mha_hd64_dit",
         "T5-small encoder, LTX-2 (DiT, video)",
         num_heads=8,
         num_kv_heads=8,
@@ -757,7 +770,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "cosmos3_dit",
+        "cosmos3_mha_hd64_dit",
         "BART / mBART encoder, Cosmos3 (DiT, 3D mrope -> neox)",
         num_heads=16,
         num_kv_heads=16,
@@ -767,7 +780,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "flan_t5_xl_encoder",
+        "flan_t5_xl_mha_hd64_nope_encoder",
         "FLAN-T5-XL encoder",
         num_heads=32,
         num_kv_heads=32,
@@ -779,7 +792,7 @@ _NO_CACHE = [
     # Vision towers with non-standard head_dims (the production kernels pad
     # these to a supported cubin size; here they exercise the head_dim directly).
     ModelAttnConfig(
-        "qwen2vl_vision",
+        "qwen2vl_mha_hd80_nope_vision",
         "Qwen2-VL vision tower (head_dim=80)",
         num_heads=16,
         num_kv_heads=16,
@@ -789,7 +802,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "gemma_vision",
+        "gemma_qwen3vl_mha_hd72_nope_vision",
         "Gemma3/Qwen3-VL vision tower (head_dim=72)",
         num_heads=16,
         num_kv_heads=16,
