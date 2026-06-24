@@ -76,14 +76,13 @@ void initConfigBindings(nb::module_& m)
 
     auto schedulerConfigSetstate = [](tle::SchedulerConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3 && state.size() != 4)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
-        bool const enablePrefixAwareScheduling = state.size() == 4 ? nb::cast<bool>(state[3]) : true;
         new (&self) tle::SchedulerConfig(nb::cast<tle::CapacitySchedulerPolicy>(state[0]),
             nb::cast<std::optional<tle::ContextChunkingPolicy>>(state[1]),
-            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]), enablePrefixAwareScheduling);
+            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]), nb::cast<bool>(state[3]));
     };
     auto schedulerConfigGetstate = [](tle::SchedulerConfig const& self)
     {

@@ -20,29 +20,6 @@
 namespace tensorrt_llm::executor
 {
 
-namespace
-{
-
-bool dynamicBatchConfigsEqual(
-    std::optional<DynamicBatchConfig> const& lhs, std::optional<DynamicBatchConfig> const& rhs)
-{
-    if (lhs.has_value() != rhs.has_value())
-    {
-        return false;
-    }
-    if (!lhs.has_value())
-    {
-        return true;
-    }
-
-    return lhs->getEnableBatchSizeTuning() == rhs->getEnableBatchSizeTuning()
-        && lhs->getEnableMaxNumTokensTuning() == rhs->getEnableMaxNumTokensTuning()
-        && lhs->getDynamicBatchMovingAverageWindow() == rhs->getDynamicBatchMovingAverageWindow()
-        && lhs->getBatchSizeTable() == rhs->getBatchSizeTable();
-}
-
-} // namespace
-
 SchedulerConfig::SchedulerConfig(CapacitySchedulerPolicy capacitySchedulerPolicy,
     std::optional<ContextChunkingPolicy> contextChunkingPolicy, std::optional<DynamicBatchConfig> dynamicBatchConfig,
     bool enablePrefixAwareScheduling)
@@ -56,8 +33,7 @@ SchedulerConfig::SchedulerConfig(CapacitySchedulerPolicy capacitySchedulerPolicy
 bool SchedulerConfig::operator==(SchedulerConfig const& other) const
 {
     return mCapacitySchedulerPolicy == other.mCapacitySchedulerPolicy
-        && mContextChunkingPolicy == other.mContextChunkingPolicy
-        && dynamicBatchConfigsEqual(mDynamicBatchConfig, other.mDynamicBatchConfig)
+        && mContextChunkingPolicy == other.mContextChunkingPolicy && mDynamicBatchConfig == other.mDynamicBatchConfig
         && mEnablePrefixAwareScheduling == other.mEnablePrefixAwareScheduling;
 }
 

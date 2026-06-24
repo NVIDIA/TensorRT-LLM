@@ -1372,7 +1372,7 @@ def test_dynamic_batch_config_pickle():
     assert config_copy.dynamic_batch_moving_average_window == 128
 
 
-def test_scheduler_config() -> None:
+def test_scheduler_config():
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig()
     assert config.capacity_scheduler_policy == capacity_scheduler_policy

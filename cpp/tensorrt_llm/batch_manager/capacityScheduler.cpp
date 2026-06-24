@@ -326,38 +326,39 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 bool const isEncoderInit = req->isEncoderInitState();
                 std::optional<kv_cache_manager::PrefixReuseSummary> summary;
                 std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;
-                if (isFirstChunkContext)
+                if (mEnablePrefixAwareScheduling)
                 {
-                    // analyzePrefixReuse asserts on variable-window managers; skip the walk there
-                    // and let downstream callers fall back to their fresh tree-walk path.
-                    if (!mEnablePrefixAwareScheduling)
+                    if (isFirstChunkContext)
                     {
-                        summary = kv_cache_manager::PrefixReuseSummary{};
-                        if (crossKvCacheManager)
+                        // analyzePrefixReuse asserts on variable-window managers; skip the walk there
+                        // and let downstream callers fall back to their fresh tree-walk path.
+                        if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
                         {
-                            crossSummary = kv_cache_manager::PrefixReuseSummary{};
+                            auto uniqueTokens = req->getUniqueTokens(0);
+                            summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
+                        }
+                        if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                            && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                        {
+                            auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
+                            crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                         }
                     }
-                    else if (kvCacheManager.isEnableBlockReuse()
-                        && !kvCacheManager.getBlockManager().isVariableWindow())
-                    {
-                        auto uniqueTokens = req->getUniqueTokens(0);
-                        summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
-                    }
-                    if (mEnablePrefixAwareScheduling && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                    else if (isEncoderInit && crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
                         && !crossKvCacheManager->getBlockManager().isVariableWindow())
                     {
+                        // Encoder admission only needs the cross summary for reuse ordering.
                         auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                         crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
                     }
                 }
-                else if (mEnablePrefixAwareScheduling && isEncoderInit && crossKvCacheManager
-                    && crossKvCacheManager->isEnableBlockReuse()
-                    && !crossKvCacheManager->getBlockManager().isVariableWindow())
+                else if (isFirstChunkContext)
                 {
-                    // Encoder admission only needs the cross summary for reuse ordering.
-                    auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
-                    crossSummary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);
+                    summary = kv_cache_manager::PrefixReuseSummary{};
+                    if (crossKvCacheManager)
+                    {
+                        crossSummary = kv_cache_manager::PrefixReuseSummary{};
+                    }
                 }
                 // Beneficial-to-skip check using the cached summary
                 if (!StaticBatchScheduling && skippingIsRelevant && (isFirstChunkContext || isEncoderInit)

@@ -989,6 +989,8 @@ public:
 
     [[nodiscard]] std::vector<std::pair<SizeType32, SizeType32>> getBatchSizeTable() const;
 
+    bool operator==(DynamicBatchConfig const& other) const;
+
     /// @brief The default value of batch size table
     static std::vector<std::pair<SizeType32, SizeType32>> const kDefaultBatchSizeTable;
 
