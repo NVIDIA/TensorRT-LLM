@@ -904,8 +904,8 @@ class DeepseekV3Gate(nn.Module):
         if w is not None:
             self.weight.copy_(w[:])
         if bias is not None:
-            self.e_score_correction_bias.copy_(
-                bias[:].to(self.e_score_correction_bias.dtype))
+            self.e_score_correction_bias.copy_(bias[:].to(
+                self.e_score_correction_bias.dtype))
 
     @property
     def routing_method(self) -> DeepSeekV3MoeRoutingMethod:

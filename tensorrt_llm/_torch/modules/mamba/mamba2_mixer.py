@@ -149,8 +149,7 @@ class Mamba2Mixer(nn.Module):
             allreduce_strategy=config.allreduce_strategy)
 
         # A
-        self.A = nn.Parameter(torch.empty(self.tp_nheads,
-                                          dtype=torch.float32),
+        self.A = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
                               requires_grad=False)
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
@@ -201,8 +200,7 @@ class Mamba2Mixer(nn.Module):
                     key="stochastic_rounding_disabled")
 
         # D
-        self.D = nn.Parameter(torch.empty(self.tp_nheads,
-                                          dtype=torch.float32),
+        self.D = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
                               requires_grad=False)
 
         # dt_bias

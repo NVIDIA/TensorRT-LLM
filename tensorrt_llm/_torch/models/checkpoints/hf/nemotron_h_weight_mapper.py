@@ -137,7 +137,8 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                     val = weights[name]
                     m = re.match(r"(.*\.mixer\.experts)\.(up_proj|down_proj)$",
                                  key)
-                    is_hf_fused = (m is not None and isinstance(val, torch.Tensor)
+                    is_hf_fused = (m is not None
+                                   and isinstance(val, torch.Tensor)
                                    and val.dim() == 3)
                     if is_hf_fused:
                         prefix, sub = m.group(1), m.group(2)
