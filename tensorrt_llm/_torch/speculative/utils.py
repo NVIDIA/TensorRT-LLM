@@ -211,8 +211,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         if sa_cfg is not None:
             sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
-        # Dynamic tree needs a SpecTreeManager (for the target's tree-mask verify
-        # forward) composed with the MTP hidden-state slot pools.
+        # Dynamic tree combines SpecTreeManager with MTP hidden-state slots.
         if getattr(spec_config, 'use_dynamic_tree', False):
             return MTPEagleDynamicTreeResourceManager(
                 spec_config,

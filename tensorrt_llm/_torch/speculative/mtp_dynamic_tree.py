@@ -12,22 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MTP-Eagle one-model dynamic tree speculative decoding (greedy only).
-
-This worker subclasses :class:`MTPEagleWorker` and reuses the drafter-agnostic
-dynamic-tree bookkeeping/verification helpers (``DynamicTreeOpsConverter`` and
-``SpecTreeManager``) that were originally written for
-``Eagle3OneModelDynamicTreeWorker``. The only piece that is drafter-specific is
-the draft loop: instead of running the eagle drafter
-(``draft_model.model(...)`` with ``apply_eagle3_fc`` + hidden-state capture),
-this worker runs ``draft_model.mtp_layers[0]`` repeatedly (the linear MTP-Eagle
-drafter) but grows a topK tree at each layer instead of a linear chain.
-
-Scope (intentional simplifications):
-- GREEDY only (temperature 0). The rejection-sampling path is not implemented.
-- The new code path is only reached when ``spec_config.use_dynamic_tree`` is
-  True; the linear ``MTPEagleWorker`` path is unchanged.
-"""
+"""MTP-Eagle one-model dynamic tree speculative decoding (greedy only)."""
 
 import math
 from typing import TYPE_CHECKING, List, Optional
@@ -45,9 +30,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .eagle3 import MTPEagleWorker
 
-# Reuse the drafter-agnostic fused helpers from the eagle3 dynamic-tree worker.
-# These operate purely on token/score/mask tensors and do not touch the eagle
-# drafter, so they are safe to share with the MTP drafter.
+# Reuse drafter-agnostic dynamic-tree helpers.
 from .eagle3_dynamic_tree import (
     _build_mask_and_position,
     _gather_repack_step0_kernel,
@@ -61,13 +44,7 @@ if TYPE_CHECKING:
 
 
 class MTPEagleDynamicTreeWorker(MTPEagleWorker):
-    """MTP-Eagle one-model worker with dynamic tree drafting + verification.
-
-    Inherits the linear MTP-Eagle drafting/sampling primitives from
-    :class:`MTPEagleWorker` (``draft_sampler``, ``prepare_drafter_inputs``,
-    ``update_mtp_hidden_states``, ``_prepare_next_new_tokens``, ...) and adds the
-    dynamic-tree draft loop, greedy verification, and tree construction.
-    """
+    """MTP-Eagle worker with dynamic-tree draft and greedy verify."""
 
     def __init__(
         self,
@@ -85,9 +62,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self.K = spec_config.dynamic_tree_max_topK
         self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         self.tokens_per_gen_step = spec_config.tokens_per_gen_step
-        # _max_batch_size is auto-populated by py_executor_creator from the
-        # global max_batch_size (mirrors EagleDecodingConfig). It must be set by
-        # the time we get here.
+        # Set by py_executor_creator from the global max_batch_size.
         assert spec_config._max_batch_size is not None, (
             "MTPDecodingConfig._max_batch_size was not populated; "
             "py_executor_creator should have set it from the global max_batch_size."
@@ -103,8 +78,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self.spec_tree_manager = None
         self._d2t = None
 
-        # === Pre-allocated draft-loop buffers (CUDA-graph safe) ===
-        # Mirror Eagle3OneModelDynamicTreeWorker.__init__ buffer strategy.
+        # Pre-allocated draft-loop buffers (CUDA-graph safe).
         self.draft_tokens_buffer = torch.zeros(
             max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
@@ -137,13 +111,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         )
 
         self._max_path_len = max_draft_len + 1
-        # Step-0 spec-dec reset buffers (mirror Eagle3OneModelDynamicTreeWorker):
-        # the target verify forward leaves a tokens_per_gen_step-wide tree mask,
-        # tree position offsets, and a kv_lens inflated by tokens_per_gen_step.
-        # The step-0 draft attends only to the max_path_len accepted-path tokens,
-        # so it resets to an 8-wide causal mask + causal offsets and rewinds
-        # kv_lens by (tokens_per_gen_step - max_path_len). Linear MTP needs none
-        # of this because there tokens_per_gen_step == max_path_len.
+        # Step-0 draft resets verify-time tree metadata to accepted-path width.
         self._kv_correction = self.tokens_per_gen_step - self._max_path_len
         self._step0_causal_mask = torch.tensor(
             [(1 << (t + 1)) - 1 for t in range(self._max_path_len)],
@@ -170,9 +138,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._candidates_buf = torch.zeros(max_batch_size, N, dtype=torch.int32, device="cuda")
         self._target_predict_buf = torch.zeros(max_batch_size, N, dtype=torch.int32, device="cuda")
 
-        # === Hidden-state management for the growing-context draft loop ===
-        # These mirror the eagle reference's _hs_write_buffer / _accumulated_hs
-        # but store the MTP layer's output hidden states (no eagle capture).
+        # Hidden states for the growing-context draft loop.
         self._hs_write_buffer = None
         self._accumulated_hs = None
         self._hs_read_map = torch.zeros(
@@ -181,13 +147,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         self._step0_hs = None
         self._hs_dim = None
 
-        # === Step-0 repack scratch (graph-safe; mirrors eagle3 reference) ===
-        # The target verify forward lays gen tokens out as
-        # tokens_per_gen_step rows per request, but the MTP draft step-0 only
-        # attends to the accepted-path (max_path_len) tokens. These buffers hold
-        # the repacked gen-only [num_gens * max_path_len] inputs; rows are sized
-        # by the static max (max_batch_size * tokens_per_gen_step) and the hidden
-        # buffer is lazily sized once the hidden dim is known.
+        # Step-0 repack scratch for accepted-path inputs.
         max_total_tokens = max_batch_size * self.tokens_per_gen_step
         self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int32, device="cuda")
         self._step0_position_ids_buf = torch.zeros(
@@ -217,9 +177,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         else:
             self._saved_kv_lens_cuda = None
 
-        # The draft loop overwrites the target verify tree mask/positions with
-        # draft-layer causal/growing-tree masks. Restore them before the next
-        # target forward.
+        # Restore verify metadata after the draft loop mutates it.
         if attn_metadata.spec_decoding_packed_mask is not None:
             self._saved_packed_mask = attn_metadata.spec_decoding_packed_mask[:batch_size].clone()
         else:
@@ -262,7 +220,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             self._saved_generation_lengths = None
 
     # ------------------------------------------------------------------ #
-    # Helpers (mirroring eagle3 dynamic-tree worker, drafter-agnostic)    #
+    # Helpers                                                            #
     # ------------------------------------------------------------------ #
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
         """Set spec-dec gen lengths and refresh the C++ position-offset view."""
@@ -286,9 +244,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             attn_metadata.update_blackwell_first_sparse_mask_offset()
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
-        """Compact the padded [n_req, buf_dim, ceil(buf_dim/32)] mask into the
-        flat prefix XQA expects when n_tok < buf_dim. See the eagle reference
-        for the detailed rationale."""
+        """Compact padded masks into the flat prefix XQA expects."""
         buf_dim = mask_buf.shape[1]
         if n_tok >= buf_dim or n_req <= 1:
             return
@@ -333,25 +289,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     def sample(
         self, logits: torch.Tensor, max_top_k: int, draft_model=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """TopK sampling with softmax for the dynamic tree (greedy=topK).
-
-        Returns (topk_indices [.., K], topk_values [.., K]). MTP shares the
-        target vocabulary through ``shared_head``/``lm_head``, so unlike EAGLE3
-        there is no draft->target (d2t) token remap.
-
-        TP correctness: ``DeepseekV3MTPHead`` forces ``gather_output=False`` on
-        the column-parallel lm_head in pure TP, so ``logits`` here is a per-rank
-        vocab shard ``[.., vocab/tp]``. Sampling top-K on a shard yields
-        DIFFERENT draft tokens/scores per rank, so the per-rank trees (and hence
-        ``num_accepted_tokens`` in the next verify) diverge across TP ranks and
-        the downstream attention/MoE collectives desync (hang at TP>1). The
-        linear ``MTPWorker.draft_sampler`` avoids this by all-gathering the
-        local argmax; the dynamic tree needs full top-K + probabilities, so we
-        all-gather the full sharded logits (stripping lm_head column padding)
-        and run softmax+top-K on the replicated full vocab, exactly matching the
-        TP=1 path. Gated on pure TP (tp_size>1, attention DP off) where the
-        lm_head output is actually sharded.
-        """
+        """TopK sampling for dynamic tree; all-gather sharded TP logits."""
         mapping = (
             getattr(self.model_config, "mapping", None) if self.model_config is not None else None
         )
@@ -373,9 +311,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         batch_size,
         attn_metadata=None,
     ):
-        """Grow the tree: write tokens/scores to history buffers + masks.
-
-        Identical bookkeeping to the eagle reference (drafter-agnostic)."""
+        """Grow the tree and update history buffers."""
         if cur_draft_idx == 0:
             new_draft_scores = new_draft_scores.reshape(batch_size, self.K)
             new_draft_tokens_2d = new_draft_tokens.reshape(batch_size, self.K)
@@ -434,9 +370,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     def prepare_tree_mask_and_position_offset(
         self, cur_draft_idx, attn_metadata, selected_parents=None
     ):
-        """Prepare mask + position offsets for the next draft layer.
-
-        Drafter-agnostic; identical to the eagle reference."""
+        """Prepare mask and position offsets for the next draft layer."""
         if attn_metadata.spec_decoding_packed_mask is None:
             return
         spec_tree_manager = self.spec_tree_manager
@@ -495,11 +429,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         hidden_states_to_save=None,
         selected_parents=None,
     ):
-        """Manage the growing-context hidden states for the MTP draft loop.
-
-        Unlike the eagle reference (which saves eagle prenorm hidden states),
-        we save the MTP layer's OUTPUT hidden states. The gather/parent logic is
-        otherwise identical."""
+        """Manage growing-context hidden states for the MTP draft loop."""
         if cur_draft_idx == 0:
             hs_dim = step0_hs.shape[-1]
             self._hs_dim = hs_dim
@@ -544,10 +474,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     # ------------------------------------------------------------------ #
     @nvtx_range("mtp_dyn.sample_and_accept_draft_tokens")
     def sample_and_accept_draft_tokens(self, input_ids, logits, spec_metadata, attn_metadata):
-        """Greedy dynamic-tree verification of the PREVIOUS step's tree.
-
-        Overrides MTPWorker.sample_and_accept_draft_tokens. Returns
-        (accepted_tokens [bs, max_path_len], num_accepted_tokens [bs])."""
+        """Greedy verification of the previous dynamic tree."""
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -576,8 +503,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             target_predict = self._target_predict_buf[:num_gens]
             target_predict.copy_(target_tokens[num_contexts:].reshape(num_gens, N))
 
-            # First-step bootstrap / CUDA-graph warmup: no tree exists yet, so
-            # accept only the golden token (the first of the gen tokens).
+            # No prior tree exists on bootstrap/warmup; accept the golden token.
             if spec_tree_manager is None:
                 num_accepted_tokens[num_contexts:batch_size] = 1
                 accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0]
@@ -620,8 +546,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             accepted_tokens[num_contexts:batch_size] = torch.where(
                 tree_valid_i.unsqueeze(1), gen_accepted_tokens, bootstrap_accepted_tokens
             )
-            # accept_index stores root at slot 0; subtract 1 so root/padding 0
-            # becomes the sentinel -1 (tree node index into the draft tokens).
+            # Convert root/padding index 0 to draft-node sentinel -1.
             gen_accepted_indices = (accept_index[:num_gens, 1:max_path_len] - 1).to(torch.int32)
             self._accepted_draft_indices_tensor[num_contexts:batch_size] = torch.where(
                 tree_valid_i.unsqueeze(1),
@@ -635,17 +560,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         return accepted_tokens, num_accepted_tokens
 
     def _accepted_leaf_intermediate_positions(self, num_accepted_tokens, num_contexts, num_gens):
-        """Tree-node position of each gen request's accepted leaf in the mamba
-        intermediate-state buffer.
-
-        The mixer records states in verify-token order: position 0 is the
-        golden/root token, positions 1.. are the draft nodes in tree order.
-        ``_accepted_draft_indices_tensor[r, c]`` holds the (c+1)-th accepted
-        draft node's tree index (= candidate position - 1), so the deepest
-        accepted node lives at column ``num_accepted - 2`` and its buffer
-        position is that index + 1.  When only the golden token is accepted
-        (num_accepted == 1) the leaf is the root at position 0.
-        """
+        """Return each accepted leaf's position in the Mamba state buffer."""
         accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens].to(torch.int64)
         # Column of the deepest accepted draft node, clamped to >=0 for the
         # golden-only case (its value is ignored via the mask below).
@@ -659,30 +574,14 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
     @nvtx_range("mtp_dyn._relocate_kv_eagerly")
     def _relocate_kv_eagerly(self, attn_metadata, batch_size):
-        """Move accepted draft tokens' KV from tree positions to the linear
-        prefix the next step expects. Mirrors the eagle reference.
-
-        Mamba-2 hybrid handling: the parent KVCacheManager spans every global
-        layer, but Mamba layers carry recurrent state (``num_kv_heads == 0``)
-        and live in a *separate* C++ pool from the attention layers. The
-        ``update_kv_cache_draft_token_location_2d`` op addresses a single pool
-        with a uniform per-layer stride (``layerIdx * 2 * bytesPerBlock`` off
-        one base pointer, see ``updateKVBlockArrayDraftTokenLocation2D``), and
-        the stored block offsets are scaled by *that pool's* layer count
-        (``flat_index3(blockIdx, 0, fieldIdx, pool.numLayers, kvFactor)``). So
-        we must drive the op with the attention pool only: its compact layer
-        count, its uniform head count, and its slice of the pool-pointer and
-        block-offset tensors. For a pure-attention model there is exactly one
-        pool and this reduces to the original call."""
+        """Move accepted draft KV from tree positions to the linear prefix."""
         cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
         if cache_mgr is None or self._kv_head_dim_bytes is None:
             return
         if not hasattr(cache_mgr, "num_kv_heads_per_layer"):
             return
 
-        # Attention layers are those with KV heads (Mamba layers are zeroed).
-        # The set is static for a given model, so the layerCount / head count /
-        # pool index below are CUDA-graph-safe (no data-dependent control flow).
+        # Mamba layers have zero KV heads; relocate attention-layer KV only.
         kv_heads = cache_mgr.num_kv_heads_per_layer
         attn_heads = set(h for h in kv_heads if h > 0)
         assert len(attn_heads) == 1, (
@@ -693,10 +592,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         attn_layer_offsets = [i for i, h in enumerate(kv_heads) if h > 0]
         attn_num_layers = len(attn_layer_offsets)
 
-        # All attention layers share one pool (same head count => same pool in
-        # the C++ WindowBlockManager). Resolve its index from the layer->pool
-        # mapping so we slice the correct pool's pointers/offsets; the op reads
-        # pool_pointers[0]/[1] as that pool's primary/secondary base.
+        # Resolve the attention KV pool used by the relocation op.
         pool_mapping = getattr(cache_mgr, "kv_cache_pool_mapping", None)
         if pool_mapping is not None:
             attn_pool_indices = set(int(pool_mapping[off][0]) for off in attn_layer_offsets)
@@ -743,16 +639,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         draft_model,
         resource_manager=None,
     ):
-        """Dynamic-tree MTP-Eagle forward.
-
-        Step-by-step (see module/report for divergence notes):
-          (a) verify the previous tree against target logits (greedy);
-          (b) update the Mamba hybrid cache with num_accepted_tokens, and
-              relocate accepted draft-token KV;
-          (c) run the MTP draft TREE loop and build the new tree into
-              spec_tree_manager.slot_storage;
-          (d) return the MTPEagleWorker output contract.
-        """
+        """Run verify, cache promotion, and next-tree drafting."""
         if resource_manager is not None:
             self._ensure_spec_tree_manager(resource_manager)
 
@@ -770,12 +657,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         if num_gens > 0:
             self._relocate_kv_eagerly(attn_metadata, batch_size)
 
-        # (b) Update Mamba hybrid cache for accepted variable-length paths.
-        #     The mixer records one intermediate state per verified token in
-        #     tree order (root/golden at buffer position 0), so the accepted
-        #     leaf's state lives at its tree-node position, not at linear depth
-        #     num_accepted-1. Compute that per-gen-request leaf position from the
-        #     accepted draft-node tree indices and pass it to the cache rollback.
+        # Dynamic-tree Mamba states are stored by tree-node position.
         if self._is_mamba_hybrid_cache is None:
             self._is_mamba_hybrid_cache = isinstance(
                 attn_metadata.kv_cache_manager, MambaHybridCacheManager
@@ -851,36 +733,13 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         accepted_tokens,
         attn_metadata,
     ):
-        """Repack step-0 drafter inputs to the accepted-path layout.
-
-        ``MTPEagleWorker.prepare_drafter_inputs`` only repacks the gen
-        ``input_ids`` to ``num_gens * max_path_len`` rows while leaving
-        ``hidden_states`` / ``position_ids`` in the target verify layout
-        (``num_gens * tokens_per_gen_step`` rows). For the linear MTP path the
-        two layouts coincide (``tokens_per_gen_step == max_path_len``); for the
-        dynamic tree they differ, and the NemotronHMTP ``eh_proj`` fusion
-        ``cat([enorm(embed(input_ids)), hnorm(hidden_states)], dim=-1)`` then
-        sees mismatched row counts and crashes.
-
-        This mirrors ``Eagle3OneModelDynamicTreeWorker.prepare_1st_drafter_inputs``:
-        a single fused Triton kernel gathers the TARGET ``hidden_states`` at the
-        accepted tree positions and repacks ``input_ids`` / ``position_ids``
-        into the ``[ctx | gen (num_gens * max_path_len)]`` layout, and writes the
-        per-gen-request "last accepted token" gather id into ``_gather_ids_buf``.
-
-        Unlike eagle3 there is no ``spec_metadata.hidden_states`` /
-        ``apply_eagle3_fc`` / ``layers_to_capture`` indirection: MTP shares the
-        target vocab and consumes the target hidden states directly.
-
-        Returns the drafter ``inputs`` dict.
-        """
+        """Repack step-0 drafter inputs to accepted-path layout."""
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
         num_gens = batch_size - num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
 
-        # Context input_ids: shift-left + place golden token at last positions
-        # (identical to MTPEagleWorker.prepare_drafter_inputs context path).
+        # Match MTPEagleWorker context input repack.
         input_ids_ctx = self._prepare_context_input_ids(
             input_ids, num_ctx_tokens, last_tokens_idx, accepted_tokens, num_contexts
         )
@@ -901,8 +760,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     device="cuda",
                 )
 
-            # accepted_tokens[num_contexts:] is the accepted path (incl golden
-            # at col 0); it is exactly the eagle reference's ``_accept_token``.
+            # Accepted path includes the golden token at column 0.
             accept_token = accepted_tokens[num_contexts:batch_size]
 
             BLOCK_H = triton.next_power_of_2(hidden_dim)
@@ -970,26 +828,14 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         num_gens,
         batch_size,
     ):
-        """MTP dynamic-tree draft loop with growing context.
-
-        Step 0 runs mtp_layers[0] over the accepted-path tokens (max_path_len
-        per request, repacked by _prepare_step0_drafter_inputs), then expands
-        topK. Each subsequent layer re-runs mtp_layers[0] over ALL accumulated
-        tree tokens and expands topK per surviving parent. Finally the tree is
-        resampled and built into slot_storage so the NEXT target forward uses
-        the tree mask.
-        """
+        """Draft the next dynamic tree with growing context."""
         spec_tree_manager = self.spec_tree_manager
 
         assert batch_size <= self._max_batch_size, (
             f"batch_size {batch_size} exceeds pre-allocated max_batch_size {self._max_batch_size}"
         )
 
-        # --- Step 0: one MTP forward over accepted golden tokens ---
-        # Repack input_ids/position_ids AND hidden_states to the accepted-path
-        # layout (num_gens * max_path_len gen rows) so the NemotronHMTP eh_proj
-        # fusion sees matching row counts. The fused kernel also writes the
-        # per-request last-accepted-token gather id into _gather_ids_buf.
+        # Step 0: run MTP over accepted-path rows.
         position_ids, last_tokens_idx = self.prepare_position_ids_and_last_tokens(
             position_ids, attn_metadata.seq_lens_cuda
         )
@@ -1002,11 +848,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             attn_metadata=attn_metadata,
         )
 
-        # Step-0 causal spec-dec reset (mirrors Eagle3OneModelDynamicTreeWorker).
-        # The target verify forward left a tokens_per_gen_step-wide tree mask +
-        # position offsets and an inflated kv_lens; the step-0 draft attends only
-        # to the max_path_len accepted-path tokens, so reset to an 8-wide causal
-        # mask + causal offsets and rewind kv_lens. None in prefill-only warmup.
+        # Reset verify-time tree metadata to accepted-path width.
         num_step0_tokens = self._max_path_len
         if attn_metadata.spec_decoding_generation_lengths is not None:
             total = num_gens * num_step0_tokens
@@ -1027,9 +869,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= self._kv_correction
         self._refresh_blackwell_tree_mask_metadata(attn_metadata)
         if spec_metadata.all_rank_num_tokens is not None:
-            # Step-0 draft repacks gen requests to max_path_len tokens. Attention
-            # reads rank token counts from attn_metadata, while MoE also gets
-            # the same counts via the explicit all_rank_num_tokens argument.
+            # Keep attention/MoE token counts aligned with step-0 repack.
             attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_tokens
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
@@ -1039,12 +879,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 **inputs,
             )
 
-            # Gather the per-request "last accepted token" hidden state (the
-            # tree root for depth-0 expansion). The Triton kernel already wrote
-            # gen gather ids (num_ctx_tokens + gen_idx * max_path_len +
-            # num_accepted - 1) into _gather_ids_buf; prepend the context last-
-            # token ids. This indexes the post-repack [ctx | gen max_path_len]
-            # hidden_states layout.
+            # Gather each request's root hidden state for depth-0 expansion.
             self._gather_ids_buf[:num_contexts].copy_(last_tokens_idx[:num_contexts])
             gather_ids = self._gather_ids_buf[:batch_size]
 
@@ -1076,16 +911,13 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 inputs,
             )
 
-            # --- Subsequent layers: grow the tree ---
+            # Subsequent layers grow the tree.
             for layer_idx in range(1, self.max_draft_len):
                 num_tokens_per_req = layer_idx * self.K
                 num_infer_tokens = batch_size * num_tokens_per_req
                 subseq_all_rank_num_tokens = None
                 if spec_metadata.all_rank_num_seqs is not None:
-                    # Subsequent dynamic-tree draft forwards process the full
-                    # growing tree context, not one token per request. Attention
-                    # DP/MoE communication sizes must therefore scale with the
-                    # current per-request tree width.
+                    # Token counts scale with the current tree width.
                     subseq_all_rank_num_tokens = [
                         n * num_tokens_per_req for n in spec_metadata.all_rank_num_seqs
                     ]
@@ -1171,11 +1003,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         num_accepted_tokens=None,
         inputs=None,
     ):
-        """Set up attn_metadata seq_lens/kv_lens for the next drafter layer.
-
-        Drafter-agnostic; mirrors the eagle reference's prepare_for_generation
-        (which is itself derived from MTPEagleWorker's i==0 / i>0 metadata
-        updates)."""
+        """Set attn_metadata seq_lens/kv_lens for the next draft layer."""
         if cur_draft_idx == 0:
             base_pos = inputs["position_ids"][gather_ids] + 1
             self.position_ids_buffer[:batch_size, : self.K] = base_pos.unsqueeze(1).expand(
@@ -1191,10 +1019,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                 attn_metadata.num_contexts = 0
 
             if hasattr(attn_metadata, "kv_lens_cuda"):
-                # Match linear MTPEagleWorker's first-step cache-len semantics:
-                # generation rows only rewind unaccepted verify tokens here. The
-                # K depth-0 draft tokens are added after their forward writes KV;
-                # otherwise attention can read unwritten draft KV slots.
+                # Rewind only unaccepted verify tokens; draft KV is added later.
                 if num_gens > 0:
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                         self._max_path_len
@@ -1221,17 +1046,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
 
 
 class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
-    """Resource manager for one-model MTP-Eagle dynamic tree mode.
-
-    Composes:
-      - a ``SpecTreeManager`` (exposed as ``.spec_tree_manager``) so the model
-        engine / attention backend can wire the per-slot tree mask for the
-        target's multi-token verify forward, and the worker can build/store the
-        tree, and
-      - an ``MTPHiddenStatesManager`` so MTPEagleWorker's drafter-input
-        preparation (mtp_past_tokens / mtp_past_hidden_states slot pools and
-        slot_ids) keeps working.
-    """
+    """Resource manager for MTP dynamic-tree mode."""
 
     hidden_states: Optional[torch.Tensor] = None
 
@@ -1289,8 +1104,7 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
         self._mtp_hidden_states_manager.free_resources(request)
 
     def add_dummy_requests(self, request_ids: List[int]):
-        # Dynamic-tree dummies use slot_storage.dummy_slot_id (no per-request
-        # slot), but the MTP hidden-state pool still needs a slot per dummy.
+        # Dummies still need MTP hidden-state slots.
         self._mtp_hidden_states_manager.add_dummy_requests(request_ids)
 
     def shutdown(self):

@@ -2237,9 +2237,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Top-K candidates expanded per node per draft layer when use_dynamic_tree "
         "is enabled. Required when use_dynamic_tree is True.")
 
-    # Backs the dynamic-tree worker's pre-allocated, batch-indexed CUDA buffers;
-    # MUST equal the global max_batch_size. Auto-populated by py_executor_creator
-    # (mirrors Eagle3DecodingConfig). PrivateAttr -- not a user-tunable knob.
+    # Internal max batch size for dynamic-tree worker buffers.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
 
     sa_config: Optional[SAEnhancerConfig] = Field(
@@ -2286,16 +2284,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Leave max_draft_len as None ("use the model's num_nextn_predict_layers")
-        # when the user doesn't set it; update_spec_config_from_model_config
-        # resolves it from the checkpoint before the model runs.
+        # None means update_spec_config_from_model_config resolves it from checkpoint.
         if self.max_draft_len is not None:
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
 
-        # Dynamic-tree MTP: mirror EagleDecodingConfig. Honor an explicit
-        # max_total_draft_tokens within [max_draft_len, dynamic_tree_max_topK * max_draft_len];
-        # otherwise default to dynamic_tree_max_topK * max_draft_len.
+        # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
         if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
             self.use_dynamic_tree = True
             if self.max_draft_len is None:

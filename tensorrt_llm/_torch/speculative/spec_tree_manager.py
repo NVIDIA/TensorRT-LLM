@@ -24,16 +24,8 @@ class DynamicTreeSlotStorage:
         S = num_slots + 1
         self.dummy_slot_id = num_slots
 
-        # Slot buffers — C++ kernel writes directly via slotIds.
-        # position_offsets / packed_mask init to a valid degenerate LINEAR chain
-        # (token i at depth i, attending to tokens 0..i incl. self), NOT zeros.
-        # The reserved CUDA-graph dummy slot (warmup/capture) is never written by
-        # the C++ tree scatter, so the spec-dec FMHA reads these rows as-is; a
-        # zeros packed_mask has no self-attention bit and OOBs the trtllm-gen
-        # kernel.  Mirrors the retrieve_next_token chain below; real trees
-        # overwrite the row via the C++ scatter.  bit (32*w + j) of packed_mask
-        # [i, w] set <=> token i attends to tree token (32*w + j); the causal
-        # value matches the static-tree mask formula 2^(i+1)-1.
+        # Default no-tree rows to a valid linear chain; real trees overwrite
+        # these rows via scatter.
         _tok = torch.arange(n_dt, device='cuda')
         self.position_offsets = _tok.to(torch.int32).unsqueeze(0).repeat(
             S, 1).contiguous()
@@ -46,17 +38,8 @@ class DynamicTreeSlotStorage:
         self._no_tree_position_offsets = self.position_offsets[0].clone()
         self._no_tree_packed_mask = self.packed_mask[0].clone()
 
-        # Override ONLY the reserved CUDA-graph/warmup dummy slot with a
-        # bounded-depth K-ary tree (parent[i] = (i-1)//topK).  Unlike a real
-        # slot's no-tree fallback — read only 1 token wide on its first decode —
-        # the dummy slot is read at the FULL n_dt-wide generation shape by the
-        # spec-dec verify forward during the CUDA-graph generation warmup.  A
-        # depth-(n_dt-1) linear chain there presents a tree real requests never
-        # produce (real max depth = max_draft_len, sparse ancestor mask).  The
-        # K-ary template mirrors the drafter's topK expansion so the warmup's
-        # dummy metadata matches what real dynamic-tree requests feed the
-        # trtllm-gen FMHA.  Scoped to the dummy row so real slots (and the
-        # accepted eager path) keep the linear fallback above unchanged.
+        # CUDA-graph dummy rows use a bounded K-ary tree to match real warmup
+        # verify shapes.
         _k = max(int(topK), 1)
         _depth = torch.zeros(n_dt, dtype=torch.int32)
         _adj = torch.zeros(n_dt, n_dt, dtype=torch.bool)
@@ -76,17 +59,8 @@ class DynamicTreeSlotStorage:
                                           dtype=torch.int32,
                                           device='cuda')
 
-        # Degenerate linear-chain next-token links for no-tree slots (dummy
-        # CUDA-graph/warmup requests and a real slot's first decode before any
-        # tree is built).  Token i's child is i+1 (parent i-1); the leaf has no
-        # child (-1).  The Mamba tree-aware conv1d/SSU verify path indexes
-        # retrieve_next_token unconditionally (it does not gate on has_tree), so
-        # every no-tree row must describe a valid chain rather than sentinels.
-        # retrieve_next_token is initialized to the chain (not -1) so a
-        # never-built slot — notably the reserved dummy slot used by CUDA-graph
-        # capture/warmup, which never passes through the C++ scatter or
-        # prepare()'s has_tree substitution — still gathers valid, in-bounds
-        # parent links.  Real trees overwrite the row via the C++ scatter.
+        # Mamba verify reads next links unconditionally, so no-tree rows must be
+        # valid linear chains instead of sentinels.
         chain = torch.arange(1, n_dt + 1, dtype=torch.int32, device='cuda')
         chain[n_dt - 1] = -1
         self._no_tree_next_token = chain
@@ -170,17 +144,7 @@ class DynamicTreeSlotStorage:
 
     def apply_no_tree_linear_chain(self, next_token, next_sibling, slot_ids,
                                    count):
-        """Overwrite no-tree rows' links with a valid degenerate linear chain.
-
-        For gen slots whose tree was not built this step (has_tree False:
-        CUDA-graph/warmup dummies, and a real slot's first decode), the gathered
-        links are sentinels/uninitialized.  The Mamba tree-aware verify path
-        reads them unconditionally, so replace those rows in-place with the
-        linear-chain template (next_token[i]=i+1, leaf -1; next_sibling -1) so
-        the conv1d/SSU parent traversal stays in-bounds and matches the
-        captured-graph op sequence a real-tree forward replays.  Rows with a
-        real tree (has_tree True) are left untouched.
-        """
+        """Replace no-tree rows with linear-chain links in-place."""
         if count == 0:
             return next_token, next_sibling
         ids = slot_ids[:count]

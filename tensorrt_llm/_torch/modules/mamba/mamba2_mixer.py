@@ -432,8 +432,7 @@ class Mamba2Mixer(nn.Module):
                         f"{draft_token_num} must match fixed replay step "
                         f"width {replay_step_width}.")
 
-                # Dynamic-tree verify: per-request tree links drive tree-aware
-                # conv/SSM recurrence.  Off for linear MTP (path unchanged).
+                # Dynamic-tree verify uses per-request links; linear MTP skips it.
                 is_dyn_tree = getattr(spec_metadata, 'is_spec_dec_dynamic_tree',
                                       False)
                 retrieve_next_token = retrieve_next_sibling = None
@@ -452,25 +451,14 @@ class Mamba2Mixer(nn.Module):
                                 "tensors on spec_metadata.")
                     retrieve_next_token = retrieve_next_token[:num_decodes]
                     retrieve_next_sibling = retrieve_next_sibling[:num_decodes]
-                    # conv1d fuses parent derivation: it reads next/sibling and
-                    # writes the parent map into this buffer, which the SSM
-                    # update then consumes to restore each token's parent state.
+                    # conv1d fills parent links used by tree-aware SSM restore.
                     retrieve_parent_token = torch.empty(
                         (num_decodes, draft_token_num),
                         dtype=torch.int32,
                         device=state_indices_d.device)
 
-                # Prefer the cache_manager's persistent arange tensor when
-                # available (allocated once at __init__, lives as long as the
-                # cache manager).  The functools-cached fallback's storage can
-                # be co-allocated into the CUDA-graph private memory pool
-                # during the first warmup pass; the second warmup pass / capture
-                # then reads garbage from that recycled memory because no live
-                # tensor pins those exact bytes during the inter-pass
-                # allocator reset.  The kv_cache_manager-owned tensor is
-                # outside the graph pool so its bytes stay valid.  Linear
-                # MTP/non-dynamic-tree paths take the dense conv1d branch
-                # below and never reach here, so the linear path is unchanged.
+                # Prefer the cache_manager-owned arange; cached fallback storage
+                # can be recycled by CUDA graph warmup.
                 _km_isi = getattr(attn_metadata.kv_cache_manager,
                                   'intermediate_state_indices', None)
                 if _km_isi is not None:
@@ -480,9 +468,7 @@ class Mamba2Mixer(nn.Module):
                         attn_metadata.kv_cache_manager.get_max_resource_count(),
                         state_indices_d.device)[:num_decodes]
 
-                # Reshape for batch processing.  reshape (not view) because tree
-                # tokens may be non-contiguous; for linear (contiguous) tokens
-                # reshape is exactly view, so the linear path is unaffected.
+                # Use reshape because dynamic-tree tokens may be non-contiguous.
                 xbc_d_reshaped = xbc_d.reshape(num_decodes, draft_token_num,
                                                -1).transpose(1, 2)
 
@@ -496,7 +482,7 @@ class Mamba2Mixer(nn.Module):
                         conv_state_indices=state_indices_d[:num_decodes],
                         intermediate_conv_window=intermediate_conv_states,
                         intermediate_state_indices=intermediate_state_indices,
-                        # Tree links (None for linear MTP -> dense conv path).
+                        # None on linear MTP.
                         retrieve_next_token=retrieve_next_token,
                         retrieve_next_sibling=retrieve_next_sibling,
                         retrieve_parent_token=retrieve_parent_token,
@@ -648,9 +634,7 @@ class Mamba2Mixer(nn.Module):
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
                     if is_dyn_tree:
-                        # flashinfer's selective_state_update has no tree-parent
-                        # restore; use the native Triton kernel (which does) for
-                        # dynamic tree.  Linear MTP keeps the configured func.
+                        # flashinfer SSU cannot restore tree-parent states.
                         ssu_func = selective_state_update_native
                         ssu_extra = dict(
                             retrieve_parent_token=retrieve_parent_token)

@@ -928,10 +928,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
-        # Linear MTP: accepted path is a contiguous chain (leaf at depth
-        # num_accepted-1).  Dynamic tree: states are recorded in tree order, so
-        # the leaf's buffer position is its tree-node index (supplied by the
-        # worker).  None -> linear (unchanged).
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
         accepted_positions = (accepted_leaf_positions if accepted_leaf_positions
                               is not None else num_accepted_draft_tokens)
         state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
@@ -1940,11 +1937,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_accepted_draft_tokens = (
             num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
                 torch.int32)
-        # Intermediate-buffer position of each request's accepted leaf state.
-        # Linear MTP: the accepted path is a contiguous chain, so the leaf sits
-        # at depth (num_accepted - 1).  Dynamic tree: the 31 verified tokens are
-        # laid out in tree order, so the leaf's buffer position is its tree-node
-        # index (root/golden at 0), supplied by the worker.
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
         accepted_positions = (accepted_leaf_positions.to(torch.int32)
                               if accepted_leaf_positions is not None else
                               num_accepted_draft_tokens)
