@@ -334,24 +334,69 @@ def extract_audio_from_video(
 
 
 def _load_video_by_cv2(
-    video: str,
+    video,
     num_frames: int = 10,
     fps: int = 30,
     format: str = "pt",
     device: str = "cpu",
     extract_audio: bool = False,
 ) -> VideoData:
+    """Decode a video and return sampled frames as a list.
+
+    ``video`` is a file path / URL (``str``) or raw mp4 bytes. When bytes
+    are passed, cv2.VideoCapture is opened over a ``BytesIO`` via the
+    stream-buffered backend, avoiding a tempfile write. A tempfile fallback
+    is used when no stream-buffered backend is available.
+    """
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
 
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
-    vidcap = cv2.VideoCapture(video)
+    # In-memory fast path. The BytesIO must be kept alive for the duration
+    # of decoding — cv2 holds a non-owning view into the buffer.
+    _video_buf = None
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        from cv2 import videoio_registry as _vr
+
+        _api_pref = None
+        try:
+            for _backend in _vr.getStreamBufferedBackends():
+                if not _vr.hasBackend(_backend):
+                    continue
+                if not _vr.isBackendBuiltIn(_backend):
+                    _, _abi, _api = _vr.getStreamBufferedBackendPluginVersion(_backend)
+                    if _abi < 1 or (_abi == 1 and _api < 2):
+                        continue
+                _api_pref = _backend
+                break
+        except Exception:
+            _api_pref = None
+        if _api_pref is not None:
+            _video_buf = BytesIO(bytes(video))
+            vidcap = cv2.VideoCapture(_video_buf, _api_pref, [])
+        else:
+            # No stream-buffered backend; fall back to a tempfile.
+            _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            try:
+                _tmp.write(bytes(video))
+                _tmp.flush()
+            finally:
+                _tmp.close()
+            video = _tmp.name
+            vidcap = cv2.VideoCapture(video)
+    else:
+        vidcap = cv2.VideoCapture(video)
 
     try:
         if not vidcap.isOpened():
+            _src_repr = (
+                f"<{len(video)} bytes>"
+                if isinstance(video, (bytes, bytearray, memoryview))
+                else f"'{video}'"
+            )
             raise ValueError(
-                f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
+                f"Video {_src_repr} could not be opened. Make sure opencv is installed with video support."
             )
 
         frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -392,15 +437,11 @@ def _load_video_by_cv2(
 
         valid_indices = [i for i in indices if i in raw_frames]
         if format == "pt":
-            # Bypass PIL: direct numpy HWC uint8 -> torch CHW float32
-            loaded_frames = [
-                torch.from_numpy(raw_frames[i])
-                .permute(2, 0, 1)
-                .float()
-                .div_(255.0)
-                .to(device=device)
-                for i in valid_indices
-            ]
+            # Return uint8 HWC numpy frames. The downstream HF processor's
+            # do_rescale=True path rescales and permutes the stacked
+            # (N, H, W, 3) array as one vectorized op, so per-frame Python
+            # torch conversion here is redundant work.
+            loaded_frames = [raw_frames[i] for i in valid_indices]
         else:
             loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
 
@@ -417,8 +458,15 @@ def _load_video_by_cv2(
 
     audio = None
     if extract_audio:
+        # extract_audio_from_video accepts Union[str, BytesIO]. If the
+        # in-memory cv2 path was taken, ``video`` is still the original
+        # bytes parameter — wrap in a fresh BytesIO (the one consumed by
+        # cv2 is at end-of-stream).
+        _audio_source = (
+            BytesIO(bytes(video)) if isinstance(video, (bytes, bytearray, memoryview)) else video
+        )
         try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(video)
+            audio_samples, audio_sample_rate = extract_audio_from_video(_audio_source)
             audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
         except ValueError as e:
             if "No audio stream found" in str(e):
@@ -611,17 +659,17 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return merged
 
     def load_bytes(self, data: bytes) -> VideoData:
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as f:
-            f.write(data)
-            f.flush()
-            return _load_video_by_cv2(
-                f.name,
-                self._num_frames,
-                self._fps,
-                self._format,
-                self._device,
-                extract_audio=self._extract_audio,
-            )
+        # Pass mp4 bytes directly; the in-memory fast path in
+        # _load_video_by_cv2 opens cv2.VideoCapture via BytesIO and avoids
+        # a tempfile write.
+        return _load_video_by_cv2(
+            data,
+            self._num_frames,
+            self._fps,
+            self._format,
+            self._device,
+            extract_audio=self._extract_audio,
+        )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
         return self.load_bytes(base64.b64decode(data))
