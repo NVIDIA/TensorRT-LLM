@@ -45,8 +45,6 @@ transforms:
     enabled: true
   fuse_add_rms_norm:
     enabled: true
-  fuse_moe_allreduce_residual_rmsnorm:
-    enabled: true
   detect_sharding:
     enabled: false
   sharding_transform_executor:
