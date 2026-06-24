@@ -1,3 +1,4 @@
+from .configurable_moe import ConfigurableMoE
 from .create_moe import create_moe, get_moe_cls
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
@@ -15,7 +16,7 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod,
                       Llama4RenormalizeMoeRoutingMethod,
                       LoadBalancedMoeRoutingMethod, MiniMaxM2MoeRoutingMethod,
-                      RenormalizeMoeRoutingMethod,
+                      MiniMaxM3MoeRoutingMethod, RenormalizeMoeRoutingMethod,
                       RenormalizeNaiveMoeRoutingMethod, RoutingMethodType,
                       SigmoidRenormMoeRoutingMethod,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
@@ -25,6 +26,7 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
 
 __all__ = [
     "BaseMoeRoutingMethod",
+    "ConfigurableMoE",
     "create_load_balanced_logits",
     "create_moe",
     "CuteDslB12xFusedMoE",
@@ -41,6 +43,7 @@ __all__ = [
     "MoeLoadBalancer",
     "MoEWeightLoadingMode",
     "MiniMaxM2MoeRoutingMethod",
+    "MiniMaxM3MoeRoutingMethod",
     "RenormalizeMoeRoutingMethod",
     "SigmoidRenormMoeRoutingMethod",
     "RenormalizeNaiveMoeRoutingMethod",

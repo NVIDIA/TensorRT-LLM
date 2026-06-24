@@ -224,13 +224,13 @@ Visual Generation Serving
 
    # Video generation (Wan)
    trtllm-serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-       --extra_visual_gen_options config.yml
+       --visual_gen_args config.yml
 
    # Image generation (FLUX)
    trtllm-serve black-forest-labs/FLUX.2-dev \
-       --extra_visual_gen_options config.yml
+       --visual_gen_args config.yml
 
-The ``--extra_visual_gen_options`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/generations``, and video management APIs.
+The ``--visual_gen_args`` flag accepts a YAML file that configures quantization, parallelism, and TeaCache. Available visual generation endpoints include ``/v1/images/generations``, ``/v1/videos``, ``/v1/videos/generations``, and video management APIs.
 
 For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
 
@@ -317,7 +317,7 @@ Example output:
 Configuring with YAML Files
 ----------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. The arguments in the file override the corresponding command line arguments.
+You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias

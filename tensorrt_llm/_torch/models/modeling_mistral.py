@@ -25,7 +25,7 @@ from tensorrt_llm._torch.models.modeling_mistral_large3 import (
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderOutput, MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    _MULTIMODAL_ENV_NAME, _is_disagg)
+    _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
                                                        _load_weights_impl,
@@ -310,13 +310,19 @@ class MistralCommonImageProcessor:
             Image.new("RGB", (w, h)))
         return ncols * nrows + nrows
 
-    def __call__(self, text, images, **kwargs):
-        mm_items = []
-        if images:
-            mm_items = [{
-                "type": "image",
-                "base64": encode_base64_image(image)
-            } for image in images]
+    def __call__(self, text, images=None, **kwargs):
+        if not images:
+            # Plain-text inputs (e.g. text-only evaluation like MMLU/GSM8K): tokenize
+            # directly without wrapping in a multi-modal chat conversation, which would
+            # otherwise inject chat-template tokens and corrupt continuation prompts.
+            encoded = self.tokenizer.transformers_tokenizer(text,
+                                                            return_tensors='pt')
+            return {"input_ids": encoded["input_ids"]}
+
+        mm_items = [{
+            "type": "image",
+            "base64": encode_base64_image(image)
+        } for image in images]
 
         conversation = [{
             "role": "user",
@@ -371,19 +377,20 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
         self._model_path = model_path
+        auto_processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
         if model_type == "mistral_large_3":
             # For mistral large 3, we add chat template in the model forward, and the
             # MistralCommonImageProcessor is used to process the input when both text and images are provided.
             # When the input only contains text, we use the text processor to process the input.
             self._processor = MistralCommonImageProcessor(
                 tokenizer=self._tokenizer, dtype=self.dtype)
-            self.text_processor = self._processor
+            self.text_processor = auto_processor
         else:
             # For other mistral models, we use the AutoProcessor to process the input.
-            self._processor = AutoProcessor.from_pretrained(
-                model_path,
-                use_fast=self.use_fast,
-                trust_remote_code=trust_remote_code)
+            self._processor = auto_processor
             self.text_processor = self._processor
 
     @property
@@ -407,7 +414,7 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         return self._dtype
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")
@@ -560,7 +567,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         model_config: ModelConfig[Mistral3Config],
     ):
-        if _is_disagg():
+        # No MM E/P handoff here yet. Fail before partial model setup.
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Mistral3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
@@ -604,7 +612,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         # NOTE: attn_backend: Pixtral head size not always divisible by 128
         vision_model_config = self._get_sub_model_config(model_config_cp,
                                                          "vision_config",
-                                                         attn_backend="VANILLA",
+                                                         attn_backend="TRTLLM",
                                                          quant_config=None)
 
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
@@ -697,7 +705,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
-        **encoder_kwargs: Any,
     ) -> MultimodalEncoderOutput:
         mm_embeds = self._vision_forward(list(multimodal_params))
         return MultimodalEncoderOutput(embeddings=mm_embeds[0])

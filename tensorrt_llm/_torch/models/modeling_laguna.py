@@ -259,7 +259,6 @@ class LagunaAttention(QKNormRoPEAttention):
             bias=getattr(config, "qkv_bias", False) or getattr(config, "attention_bias", False),
             pos_embd_params=pos_embd_params,
             fuse_qk_norm_rope=False,
-            rope_fusion=False,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             dense_bias=False,

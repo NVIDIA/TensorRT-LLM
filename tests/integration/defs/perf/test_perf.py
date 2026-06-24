@@ -49,6 +49,7 @@ TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 NEMOTRON_SUPER_MODELS = {
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_ultra_550b_nvfp4",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
 }
@@ -61,9 +62,14 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "kimi_k2_nvfp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_ultra_550b_nvfp4",
     "glm_5_fp8",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_nano_12b_v2",
+    "phi_4_multimodal_instruct",
+    "phi_4_multimodal_instruct_fp4",
+    "phi_4_multimodal_instruct_fp8",
 }
 
 # Models that use random_image dataset in serve mode benchmarks.
@@ -84,6 +90,17 @@ SPEC_DEC_REAL_DATASET_MODELS = {
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
 }
 
+# All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
+# benchmark client commands: forcing generation past EOS produces unstable
+# acceptance rates for spec-dec.
+SPEC_DEC_MODELS = {
+    "qwen3_4b_eagle3",
+    "qwen3_235b_a22b_fp4_eagle3",
+    "gpt_oss_120b_eagle3",
+    "gpt_oss_120b_eagle3_throughput",
+    *SPEC_DEC_REAL_DATASET_MODELS,
+}
+
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
 AUTODEPLOY_MODEL_CONFIGS = {
     "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
@@ -91,13 +108,12 @@ AUTODEPLOY_MODEL_CONFIGS = {
 
 
 def get_model_dir(model_name: str):
-    model_dir = ""
+    # HF models use the repo id verbatim (downloaded at runtime, no LLM_MODELS_ROOT prefix).
+    if model_name in HF_MODEL_PATH.keys():
+        return HF_MODEL_PATH[model_name]
     if model_name in MODEL_PATH_DICT.keys():
-        model_dir = os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
-    elif model_name in HF_MODEL_PATH.keys():
-        model_dir = os.path.join(llm_models_root(),
-                                 MODEL_PATH_DICT[model_name.split('_hf')[0]])
-    return model_dir
+        return os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
+    return ""
 
 
 def get_dataset_path():
@@ -1023,14 +1039,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_dir = self.get_trtllm_bench_model()
         if model_dir == "":
             pytest.skip("Model Name is not supported by trtllm-bench")
+        # Legacy "<name>_hf" label; weights load from --model_path.
         model_name = self._config.model_name
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
-        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         build_cmd = [
-            self._build_script, f"--log_level=info",
-            f"--workspace={engine_dir}", f"--model={hf_model_name}",
-            f"--model_path={model_dir}", "build",
+            self._build_script, "--log_level=info", f"--workspace={engine_dir}",
+            f"--model={model_name}", f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
         ]
@@ -1062,8 +1077,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         elif self._config.model_name in HF_MODEL_PATH.keys():
             tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
         else:
-            tokenizer_dir = os.path.join(llm_models_root(), "llama-models",
-                                         "llama-7b-hf")
+            tokenizer_dir = os.path.join(llm_models_root(), "llama-models-v2",
+                                         "TinyLlama-1.1B-Chat-v1.0")
         if not os.path.exists(engine_dir):
             os.makedirs(engine_dir, exist_ok=True)
 
@@ -1155,11 +1170,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_name = self._config.model_name
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
         report_path = os.path.join(engine_dir, "report.json")
+        # Legacy "<name>_hf" label; weights load from --model_path.
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
-        hf_model_name = HF_MODEL_PATH.get(model_name, "")
         tp_pp_str = f"tp_{self._config.tp_size}_pp_{self._config.pp_size}"
-        engine_dir = os.path.join(engine_dir, hf_model_name, tp_pp_str)
+        engine_dir = os.path.join(engine_dir, tp_pp_str)
         benchmark_cmd = [
             self._benchmark_script,
             f"--model={model_name}",
@@ -1314,7 +1329,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             trust_remote_code=self._config.model_name
             in TRUST_REMOTE_CODE_MODELS)
-        dataset = load_dataset("cnn_dailymail",
+        dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
+                                            "cnn_dailymail"),
                                "3.0.0",
                                split="validation",
                                streaming=True,
@@ -1389,12 +1405,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_dir,
             "--num-prompts",
             str(self._config.num_reqs),
-            "--ignore-eos",
             "--tokenize-on-client",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        # --ignore-eos must be off for spec-decoding models: forcing generation
+        # past EOS produces unstable acceptance rates.
+        if self._config.model_name not in SPEC_DEC_MODELS:
+            client_cmd.append("--ignore-eos")
         if self._config.model_name in OPENAI_CHAT_BACKEND_MODELS:
             client_cmd += ["--backend", "openai-chat"]
         if real_dataset_path:

@@ -3,6 +3,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -14,15 +15,19 @@ from test_modeling_multimodal import llm_models_root
 from test_modeling_nemotron_h import extract_decode_logprobs
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.models import modeling_nemotron_nano as nemotron_nano
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLInputProcessor,
+    NanoV2VLMultimodalEncoder,
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
 )
 from tensorrt_llm._torch.models.modeling_parakeet import ProjectedParakeet
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm.inputs import (
     AudioData,
+    VideoData,
     create_input_processor,
     create_input_processor_with_hash,
     default_multimodal_input_loader,
@@ -34,6 +39,169 @@ from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
+
+
+def _make_minimal_nano_model_config():
+    llm_config = SimpleNamespace(vocab_size=128)
+    pretrained_config = SimpleNamespace(
+        llm_config=llm_config,
+        torch_dtype=torch.bfloat16,
+        img_context_token_id=20,
+        video_context_token_id=21,
+        sound_context_token_id=None,
+        sound_config=None,
+    )
+    return SimpleNamespace(
+        pretrained_config=pretrained_config,
+        quant_config=SimpleNamespace(exclude_modules=None),
+        quant_config_dict=None,
+        video_pruning_rate=None,
+    )
+
+
+def test_nemotron_nano_registers_native_multimodal_epd_components():
+    """Native Nano VL/Omni classes advertise MM EPD support."""
+    for arch in ("NemotronH_Nano_VL_V2", "NemotronH_Nano_Omni_Reasoning_V3"):
+        vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
+        assert vision_encoder_cls is NanoV2VLMultimodalEncoder
+        assert vlm_base_model is None
+    assert NanoV2VLInputProcessor.support_mm_disagg is True
+    assert NemotronH_Nano_VL_V2.support_mm_disagg is True
+
+
+def _assert_nano_video_handoff(handoff):
+    """Shared assertions for the EPD video handoff: split runs stay grouped under one MM item."""
+    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert handoff.multimodal_lengths == [8]
+    assert handoff.multimodal_positions == [1]
+    assert handoff.multimodal_embedding_lengths == [4]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
+    assert handoff.multimodal_run_positions == [1, 6]
+    assert handoff.multimodal_run_lengths == [4, 4]
+    assert handoff.special_token_offsets == [0, 3, 4, 7]
+
+
+@pytest.mark.parametrize(
+    "input_field, input_value, asserts_encode_not_called",
+    [
+        # Detokenized prompt text path: the tokenizer may encode the prompt.
+        ("prompt", "Question <video> answer", False),
+        # Tokenized handoff path: prompt text is absent, so encode must not be called.
+        ("prompt_token_ids", [101, 98, 102], True),
+    ],
+    ids=["prompt", "prompt_token_ids"],
+)
+def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
+    input_field, input_value, asserts_encode_not_called
+):
+    """Split video prompt runs stay grouped under one MM item, with or without prompt text."""
+    processor = object.__new__(NanoV2VLInputProcessor)
+    processor._config = SimpleNamespace(
+        llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
+    )
+    if asserts_encode_not_called:
+        # In the tokenized path the tokenizer must never be invoked; a side effect
+        # turns any accidental call into a hard failure.
+        encode_mock = MagicMock(side_effect=AssertionError("tokenizer should not be called"))
+    else:
+        encode_mock = MagicMock(return_value=[101, 98, 102])
+    processor._tokenizer = SimpleNamespace(encode=encode_mock)
+    processor.img_context_token_id = 20
+    processor._img_start_token_ids = [30]
+    processor._img_end_token_ids = [31]
+    processor._sound_context_token_id = None
+    processor._sound_start_token_id = None
+    processor._sound_end_token_id = None
+
+    processor.get_num_tokens_per_video = MagicMock(return_value=8)
+    processor.expand_prompt_token_ids_for_mm = MagicMock(
+        return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None)
+    )
+
+    video = VideoData(frames=[object()], metadata={}, audio=None)
+    handoff = processor.build_disagg_prefill_multimodal_inputs(
+        {
+            input_field: input_value,
+            "multi_modal_data": {"video": [video]},
+        },
+        [{"tensor_size": (4, 16)}],
+    )
+
+    if asserts_encode_not_called:
+        processor._tokenizer.encode.assert_not_called()
+        processor.expand_prompt_token_ids_for_mm.assert_called_once()
+        assert processor.expand_prompt_token_ids_for_mm.call_args.args[0] == [101, 98, 102]
+    _assert_nano_video_handoff(handoff)
+
+
+@pytest.mark.parametrize(
+    "env_value, expects_encoder",
+    [
+        # Normal worker: the vision encoder must be built and loaded for raw MM prefill.
+        ("0", True),
+        # MM E/P/D full-model worker: consumes attached embeddings, so the encoder is deferred.
+        ("1", False),
+    ],
+    ids=["normal_worker", "mm_epd_worker"],
+)
+def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects_encoder):
+    """Encoder load depends on whether the worker runs raw MM prefill or consumes embeddings."""
+    fake_encoder = MagicMock()
+    fake_encoder.eval.return_value = fake_encoder
+    fake_encoder.to.return_value = fake_encoder
+    vision_encoder_cls = MagicMock(return_value=fake_encoder)
+
+    fake_mapper = MagicMock()
+    mapper_cls = MagicMock(return_value=fake_mapper)
+
+    model = SimpleNamespace(
+        _mm_model_config=_make_minimal_nano_model_config(),
+        vision_encoder=None,
+        sound_encoder=None,
+        llm=MagicMock(),
+        model_config=SimpleNamespace(),
+    )
+    weights = {
+        "vision_model.weight": torch.empty(0),
+        "mlp1.weight": torch.empty(0),
+        "language_model.weight": torch.empty(0),
+    }
+
+    with (
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": env_value}),
+        mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
+        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
+    ):
+        NemotronH_Nano_VL_V2.load_weights(model, weights)
+
+    if expects_encoder:
+        vision_encoder_cls.assert_called_once_with(model._mm_model_config)
+        fake_encoder.load_weights.assert_called_once_with(weights)
+    else:
+        vision_encoder_cls.assert_not_called()
+
+
+def test_nemotron_nano_rejects_evs_attached_video_embeddings():
+    """EVS needs retained-token metadata that E/P attached embeddings do not carry."""
+    model = SimpleNamespace(
+        video_pruning_rate=0.5,
+        _validate_evs_context_batch=MagicMock(),
+    )
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    param = MultimodalParams(
+        multimodal_data={
+            "modality_type": "video",
+            "multimodal_embedding": torch.zeros(1, 4),
+        }
+    )
+
+    with pytest.raises(ValueError, match="EVS video pruning is not supported"):
+        NemotronH_Nano_VL_V2.forward(
+            model,
+            attn_metadata,
+            input_ids=torch.tensor([[20]], dtype=torch.long),
+            multimodal_params=[param],
+        )
 
 
 @pytest.fixture(scope="function")
@@ -74,6 +242,7 @@ def nano_llm_model():
     # we use the top-level LLM to create the engine to make things simpler.
     nano_llm = LLM(
         model=MODEL_PATH,
+        trust_remote_code=True,
         tensor_parallel_size=1,
         max_batch_size=24,
         cuda_graph_config=CudaGraphConfig(),

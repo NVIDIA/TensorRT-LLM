@@ -69,13 +69,14 @@ from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
 
-from ..._compat import KvCacheConfig, get_sm_version, prefer_pinned
+from ..._compat import KvCacheConfig, prefer_pinned
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -84,15 +85,12 @@ from ..attention_interface import (
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
+from .rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
-# Metadata key used by fuse_rope_into_trtllm_mla (at post_load_fusion) to stash
-# rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
-# (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
-_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
 # ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
 # auto-resizes the workspace tensor when its sizing formula exceeds the
 # tensor's capacity.  ``resize_()`` reallocates storage and rebinds the
@@ -856,6 +854,7 @@ def _handle_prefill_thop(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     quant_mode: int,
     sequence_length: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -913,6 +912,7 @@ def _handle_prefill_thop(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             quant_mode,
             sequence_length,
             context_lengths,
@@ -990,15 +990,6 @@ def _handle_prefill_thop(
     # replays: this Python body would otherwise only execute at capture
     # time.
 
-    sm_version = get_sm_version()
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
-    spec_decoding_bool_params = [False, False, False]
-    spec_decoding_tensor_params = [None, None, None]
-    if sm_version >= 89:
-        spec_decoding_tensor_params.extend([None, None, None])
-    mla_tensor_params = [None, None]
-
     # NOTE: Do NOT clone V here. The V tensor must be a non-contiguous view
     # from kv.split() with token stride = numHeads * (qk_nope + v_head_dim).
     # The C++ FP8 quantize kernel and FMHA kernel read V using this stride.
@@ -1027,6 +1018,7 @@ def _handle_prefill_thop(
         context_lengths[:pf],  # context_lengths
         host_context_lengths[:pf],  # host_context_lengths
         host_request_types[:pf],  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets (device-filled)
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         planner.host_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1050,17 +1042,21 @@ def _handle_prefill_thop(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
         q_scaling,  # q_scaling
         int(PositionEmbeddingType.yarn),  # position_embedding_type
-        qk_rope_head_dim,  # rotary_embedding_dim
-        10000.0,  # rotary_embedding_base
-        5,  # rotary_embedding_scale_type (YaRN)
-        rotary_embedding_scales,  # rotary_embedding_scales
-        rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
+        qk_rope_head_dim,  # rope_dim
+        10000.0,  # rope_base
+        5,  # rope_scale_type (YaRN)
+        1.0,  # rope_scale
+        1.0,  # rope_short_m_scale
+        1.0,  # rope_long_m_scale
+        max_context_length,  # rope_max_positions
+        max_context_length,  # rope_original_max_positions
         True,  # use_paged_context_fmha
         int(AttentionInputType.context_only),  # attention_input_type
         True,  # is_mla_enable
@@ -1073,11 +1069,19 @@ def _handle_prefill_thop(
         True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
-        mla_tensor_params,  # helix_tensor_params
+        None,  # helix_position_offsets
+        None,  # helix_is_inactive_rank
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
-        spec_decoding_bool_params,  # spec_decoding_bool_params
-        spec_decoding_tensor_params,  # spec_decoding_tensor_params
+        False,  # is_spec_decoding_enabled
+        False,  # use_spec_decoding
+        False,  # is_spec_dec_tree
+        None,  # spec_decoding_generation_lengths
+        None,  # spec_decoding_position_offsets_for_cpp
+        None,  # spec_decoding_packed_mask
+        None,  # spec_decoding_bl_tree_mask_offset
+        None,  # spec_decoding_bl_tree_mask
+        None,  # spec_bl_tree_first_sparse_mask_offset_kv
         None,  # sparse_kv_indices
         None,  # sparse_kv_offsets
         None,  # sparse_attn_indices
@@ -1122,6 +1126,7 @@ def _handle_prefill_thop_cached_kv(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     quant_mode: int,
     sequence_length: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -1208,7 +1213,6 @@ def _handle_prefill_thop_cached_kv(
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
         planner.kv_scale_orig_quant,
-        planner.kv_scale_quant_orig,
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,
@@ -1245,14 +1249,6 @@ def _handle_prefill_thop_cached_kv(
         planner._kv_b_proj_grouped_cache[perm_cache_key] = w_grouped
 
     # Constants reused across all thop.attention calls below.
-    sm_version = get_sm_version()
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
-    spec_decoding_bool_params = [False, False, False]
-    spec_decoding_tensor_params = [None, None, None]
-    if sm_version >= 89:
-        spec_decoding_tensor_params.extend([None, None, None])
-    mla_tensor_params = [None, None]
     workspace = planner._select_workspace()
 
     chunked_loop_num = planner.chunked_loop_num
@@ -1277,7 +1273,6 @@ def _handle_prefill_thop_cached_kv(
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             planner.host_pool_mapping,
-            planner.kv_scale_orig_quant,
             planner.kv_scale_quant_orig,
             _CONTEXT_LAYER_OFFSET,
             kv_lora_rank,
@@ -1316,6 +1311,7 @@ def _handle_prefill_thop_cached_kv(
             context_lengths[:pf],
             host_context_lengths[:pf],
             host_request_types[:pf],
+            None,  # max_context_q_len_override
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             planner.host_pool_mapping,
@@ -1339,17 +1335,21 @@ def _handle_prefill_thop_cached_kv(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,  # max_seq_len
             max_context_length,
             1,  # beam_width
             int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
             quant_mode,
             q_scaling,
             int(PositionEmbeddingType.yarn),
-            qk_rope_head_dim,
-            10000.0,
-            5,
-            rotary_embedding_scales,
-            rotary_embedding_max_position_info,
+            qk_rope_head_dim,  # rope_dim
+            10000.0,  # rope_base
+            5,  # rope_scale_type (YaRN)
+            1.0,  # rope_scale
+            1.0,  # rope_short_m_scale
+            1.0,  # rope_long_m_scale
+            max_context_length,  # rope_max_positions
+            max_context_length,  # rope_original_max_positions
             True,  # use_paged_context_fmha
             int(AttentionInputType.context_only),
             True,  # is_mla_enable
@@ -1362,11 +1362,19 @@ def _handle_prefill_thop_cached_kv(
             True,  # rope_append
             None,  # mrope_rotary_cos_sin
             None,  # mrope_position_deltas
-            mla_tensor_params,
+            None,  # helix_position_offsets
+            None,  # helix_is_inactive_rank
             None,  # attention_chunk_size
             temp_softmax_stats,  # softmax_stats_tensor (per-iteration output)
-            spec_decoding_bool_params,
-            spec_decoding_tensor_params,
+            False,  # is_spec_decoding_enabled
+            False,  # use_spec_decoding
+            False,  # is_spec_dec_tree
+            None,  # spec_decoding_generation_lengths
+            None,  # spec_decoding_position_offsets_for_cpp
+            None,  # spec_decoding_packed_mask
+            None,  # spec_decoding_bl_tree_mask_offset
+            None,  # spec_decoding_bl_tree_mask
+            None,  # spec_bl_tree_first_sparse_mask_offset_kv
             None,  # sparse_kv_indices
             None,  # sparse_kv_offsets
             None,  # sparse_attn_indices
@@ -1433,6 +1441,7 @@ def _handle_prefill_thop_cached_kv(
         context_lengths[:pf],
         host_context_lengths[:pf],
         host_request_types[:pf],
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
@@ -1456,20 +1465,24 @@ def _handle_prefill_thop_cached_kv(
         tokens_per_block,
         max_num_requests,
         max_context_length,
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
         quant_mode,
         q_scaling,
         int(PositionEmbeddingType.yarn),
-        qk_rope_head_dim,
-        10000.0,
-        5,
-        rotary_embedding_scales,
-        rotary_embedding_max_position_info,
-        True,
+        qk_rope_head_dim,  # rope_dim
+        10000.0,  # rope_base
+        5,  # rope_scale_type (YaRN)
+        1.0,  # rope_scale
+        1.0,  # rope_short_m_scale
+        1.0,  # rope_long_m_scale
+        max_context_length,  # rope_max_positions
+        max_context_length,  # rope_original_max_positions
+        True,  # use_paged_context_fmha
         int(AttentionInputType.context_only),
-        True,
+        True,  # is_mla_enable
         _TRTLLM_MLA_CHUNK_BATCH_SIZE,
         0,
         kv_lora_rank,
@@ -1479,11 +1492,19 @@ def _handle_prefill_thop_cached_kv(
         True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
-        mla_tensor_params,
+        None,  # helix_position_offsets
+        None,  # helix_is_inactive_rank
         None,  # attention_chunk_size
         temp_softmax_stats,  # softmax_stats_tensor
-        spec_decoding_bool_params,
-        spec_decoding_tensor_params,
+        False,  # is_spec_decoding_enabled
+        False,  # use_spec_decoding
+        False,  # is_spec_dec_tree
+        None,  # spec_decoding_generation_lengths
+        None,  # spec_decoding_position_offsets_for_cpp
+        None,  # spec_decoding_packed_mask
+        None,  # spec_decoding_bl_tree_mask_offset
+        None,  # spec_decoding_bl_tree_mask
+        None,  # spec_bl_tree_first_sparse_mask_offset_kv
         None,  # sparse_kv_indices
         None,  # sparse_kv_offsets
         None,  # sparse_attn_indices
@@ -1538,6 +1559,7 @@ def _handle_decode_impl(
     tokens_per_block: int,
     max_num_requests: int,
     max_context_length: int,
+    max_seq_len: int,
     q_scaling: float,
     quant_mode: int,
     sequence_length: torch.Tensor,
@@ -1667,15 +1689,6 @@ def _handle_decode_impl(
 
     output_latent = planner.output_latent[:num_tokens]
 
-    sm_version = get_sm_version()
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
-    spec_decoding_bool_params = [False, False, False]
-    spec_decoding_tensor_params = [None, None, None]
-    if sm_version >= 89:
-        spec_decoding_tensor_params.extend([None, None, None])
-    mla_tensor_params = [None, None]
-
     thop.attention(
         fused_q_flat,  # q (fused Q for decode)
         None,  # k
@@ -1689,6 +1702,7 @@ def _handle_decode_impl(
         context_lengths,  # context_lengths
         host_context_lengths,  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -1712,17 +1726,21 @@ def _handle_decode_impl(
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         max_context_length,  # attention_window_size
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
         q_scaling,  # q_scaling
         int(PositionEmbeddingType.yarn),  # position_embedding_type
-        qk_rope_head_dim,  # rotary_embedding_dim
-        10000.0,  # rotary_embedding_base
-        5,  # rotary_embedding_scale_type (YaRN)
-        rotary_embedding_scales,  # rotary_embedding_scales
-        rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
+        qk_rope_head_dim,  # rope_dim
+        10000.0,  # rope_base
+        5,  # rope_scale_type (YaRN)
+        1.0,  # rope_scale
+        1.0,  # rope_short_m_scale
+        1.0,  # rope_long_m_scale
+        max_context_length,  # rope_max_positions
+        max_context_length,  # rope_original_max_positions
         False,  # use_paged_context_fmha
         int(AttentionInputType.generation_only),  # attention_input_type
         True,  # is_mla_enable
@@ -1735,11 +1753,19 @@ def _handle_decode_impl(
         True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
-        mla_tensor_params,  # helix_tensor_params
+        None,  # helix_position_offsets
+        None,  # helix_is_inactive_rank
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
-        spec_decoding_bool_params,  # spec_decoding_bool_params
-        spec_decoding_tensor_params,  # spec_decoding_tensor_params
+        False,  # is_spec_decoding_enabled
+        False,  # use_spec_decoding
+        False,  # is_spec_dec_tree
+        None,  # spec_decoding_generation_lengths
+        None,  # spec_decoding_position_offsets_for_cpp
+        None,  # spec_decoding_packed_mask
+        None,  # spec_decoding_bl_tree_mask_offset
+        None,  # spec_decoding_bl_tree_mask
+        None,  # spec_bl_tree_first_sparse_mask_offset_kv
         None,  # sparse_kv_indices
         None,  # sparse_kv_offsets
         None,  # sparse_attn_indices
@@ -1816,6 +1842,7 @@ def _mla_with_cache_impl(
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_tokens = num_prefill_tokens + num_decode
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
 
@@ -1949,6 +1976,7 @@ def _mla_with_cache_impl(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             quant_mode,
             sequence_length,
             context_lengths,
@@ -1984,6 +2012,7 @@ def _mla_with_cache_impl(
             tokens_per_block,
             max_num_requests,
             max_context_length,
+            max_seq_len,
             q_scaling,
             quant_mode,
             sequence_length,
@@ -2178,15 +2207,15 @@ class TrtllmMLAAttention(AttentionDescriptor):
 
         cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
 
-        return {
-            "kv_cache": KVPagedResourceHandler(
-                num_kv_heads=1,
-                head_dim=kv_lora_rank + qk_rope_head_dim,
-                dtype=cache_dtype,
-                kv_factor=1,
-                kv_layout="HND",
-            )
-        }
+        kv_handler = KVPagedResourceHandler(
+            num_kv_heads=1,
+            head_dim=kv_lora_rank + qk_rope_head_dim,
+            dtype=cache_dtype,
+            kv_factor=1,
+            kv_layout="HND",
+            attention_type=AttentionType.mla,
+        )
+        return {"kv_cache": kv_handler}
 
     @classmethod
     def get_host_prepare_metadata_function(

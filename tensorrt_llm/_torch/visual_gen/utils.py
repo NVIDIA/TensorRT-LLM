@@ -52,7 +52,7 @@ class SequenceSharder:
 
     Built from a :class:`VisualGenMapping` via :meth:`from_vgm`, the sharder
     uses ``vgm.seq_size / seq_rank / seq_group`` so the same call sites work
-    uniformly for ring, attn2d, ulysses, and ring + ulysses.
+    uniformly for sequence parallelism (CP × Ulysses).
 
     Models call ``shard(...)`` / ``gather(...)`` / ``shard_rope(...)`` directly;
     when the sharder is inactive (``size == 1`` or runtime-disabled) every
@@ -85,7 +85,7 @@ class SequenceSharder:
         """Build a sharder from a :class:`VisualGenMapping`.
 
         Uses ``(cp_size * ulysses_size, seq_rank, seq_group)`` so the same
-        sharder works for ring, attn2d, ulysses, and ring + ulysses.
+        sharder works for ring, attn2d, ulysses, ring + ulysses, and attn2d + ulysses.
 
         Validates head divisibility only when Ulysses is part of the seq
         group — ring and attn2d shard the sequence axis and have no

@@ -885,8 +885,8 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto allottedTimeMs = allottedTimeInt
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
-    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
     auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
+    auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
@@ -896,7 +896,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID, disaggRequestId);
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
@@ -933,6 +933,11 @@ Tensor Serialization::deserializeTensor(std::istream& is)
     // Size in bytes
     size_t sizeInBytes{0};
     is.read(reinterpret_cast<char*>(&sizeInBytes), sizeof(size_t));
+    auto checkTensorSize = [sizeInBytes](Tensor const& tensor)
+    {
+        TLLM_CHECK_WITH_INFO(sizeInBytes == tensor.getSizeInBytes(),
+            "Serialized tensor byte size does not match size implied by tensor data type and shape.");
+    };
 
     Tensor tensor;
     switch (memoryType)
@@ -940,18 +945,21 @@ Tensor Serialization::deserializeTensor(std::istream& is)
     case MemoryType::kCPU:
     {
         tensor = Tensor::cpu(dataType, shape);
+        checkTensorSize(tensor);
         is.read(reinterpret_cast<char*>(tensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         break;
     }
     case MemoryType::kCPU_PINNED:
     {
         tensor = Tensor::pinned(dataType, shape);
+        checkTensorSize(tensor);
         is.read(reinterpret_cast<char*>(tensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         break;
     }
     case MemoryType::kUVM:
     {
         tensor = Tensor::managed(dataType, shape);
+        checkTensorSize(tensor);
         is.read(reinterpret_cast<char*>(tensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         break;
     }
@@ -960,6 +968,7 @@ Tensor Serialization::deserializeTensor(std::istream& is)
         // TODO: Eventually we might want to support serialization/deserialization in GPU memory
         //       Until then created Pinned tensor and move to GPU
         auto pinnedTensor = Tensor::pinned(dataType, shape);
+        checkTensorSize(pinnedTensor);
         is.read(reinterpret_cast<char*>(pinnedTensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         auto stream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
         tensor = pinnedTensor.copyToGpu(stream);
@@ -2508,6 +2517,7 @@ size_t Serialization::serializedSize(KVCacheStoredBlockData const& data)
     totalSize += su::serializedSize(data.cacheLevel);
     totalSize += su::serializedSize(data.priority);
     totalSize += su::serializedSize(data.mmKeys);
+    totalSize += su::serializedSize(data.cacheSalt);
     return totalSize;
 }
 
@@ -2519,6 +2529,7 @@ void Serialization::serialize(KVCacheStoredBlockData const& data, std::ostream& 
     su::serialize(data.cacheLevel, os);
     su::serialize(data.priority, os);
     su::serialize(data.mmKeys, os);
+    su::serialize(data.cacheSalt, os);
 }
 
 KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::istream& is)
@@ -2529,8 +2540,9 @@ KVCacheStoredBlockData Serialization::deserializeKVCacheStoredBlockData(std::ist
     auto cacheLevel = su::deserialize<SizeType32>(is);
     auto priority = su::deserialize<SizeType32>(is);
     auto mmKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
+    auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
 
-    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority, mmKeys};
+    return KVCacheStoredBlockData{blockHash, tokens, loraId, cacheLevel, priority, mmKeys, cacheSalt};
 }
 
 // KVcacheRemovedData
@@ -2677,7 +2689,7 @@ size_t Serialization::serializedSize(tensorrt_llm::batch_manager::kv_cache_manag
     totalSize += su::serializedSize(key.uniqueTokens);
     // std::vector<MmKey> where MmKey is pair<std::array<uint8_t,32>, SizeType32>
     totalSize += su::serializedSize(key.extraKeys);
-    totalSize += su::serializedSize(key.cacheSaltID);
+    totalSize += su::serializedSize(key.cacheSalt);
     return totalSize;
 }
 
@@ -2687,7 +2699,7 @@ void Serialization::serialize(tensorrt_llm::batch_manager::kv_cache_manager::Blo
     su::serialize(key.loraTaskId, os);
     su::serialize(key.uniqueTokens, os);
     su::serialize(key.extraKeys, os);
-    su::serialize(key.cacheSaltID, os);
+    su::serialize(key.cacheSalt, os);
 }
 
 tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deserializeBlockKey(std::istream& is)
@@ -2696,13 +2708,13 @@ tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deseriali
     auto loraTaskId = su::deserialize<std::optional<tensorrt_llm::batch_manager::kv_cache_manager::LoraTaskIdType>>(is);
     auto uniqueTokens = su::deserialize<std::vector<tensorrt_llm::runtime::UniqueToken>>(is);
     auto extraKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
-    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
+    auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
     tensorrt_llm::batch_manager::kv_cache_manager::BlockKey key;
     key.usesExtraIds = usesExtraIds;
     key.loraTaskId = std::move(loraTaskId);
     key.uniqueTokens = std::move(uniqueTokens);
     key.extraKeys = std::move(extraKeys);
-    key.cacheSaltID = std::move(cacheSaltID);
+    key.cacheSalt = std::move(cacheSalt);
     return key;
 }
 

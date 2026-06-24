@@ -69,7 +69,7 @@ from tensorrt_llm.bindings.internal.runtime import (
     DecoderState,
     GptDecoderBatched,
 )
-from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.executor.result import Logprob, SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -291,8 +291,64 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
 @dataclass(kw_only=True)
 class MultimodalResult:
     mm_embeddings: List[torch.Tensor]
+    # needed to torch.split the mm_embeddings into item-wise chunks
+    mm_embedding_lengths: List[List[int]]
+    # needed when requests mix text-only and multimodal ones
+    mm_embedding_request_indices: List[int]
+    # number of context requests in the batch
+    num_context_requests: int
     # Can be used to include e.g. `mrope_position_ids`, etc.
     extra_data: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        num_embeddings = len(self.mm_embeddings)
+        num_lengths = len(self.mm_embedding_lengths)
+        if num_lengths != num_embeddings:
+            raise ValueError(
+                "mm_embedding_lengths batch size does not match mm_embeddings: "
+                f"{num_lengths} != {num_embeddings}"
+            )
+        num_request_indices = len(self.mm_embedding_request_indices)
+        if num_request_indices != num_embeddings:
+            raise ValueError(
+                "mm_embedding_request_indices batch size does not match "
+                f"mm_embeddings: {num_request_indices} != {num_embeddings}"
+            )
+        for result_index, (mm_embedding, mm_embedding_lengths) in enumerate(
+            zip(self.mm_embeddings, self.mm_embedding_lengths, strict=True)
+        ):
+            actual_rows = len(mm_embedding)
+            expected_rows = sum(mm_embedding_lengths)
+            if actual_rows != expected_rows:
+                raise ValueError(
+                    f"mm_embedding shape mismatch for result {result_index}: "
+                    f"{actual_rows} != {expected_rows}"
+                )
+        for request_index in self.mm_embedding_request_indices:
+            if request_index < 0 or request_index >= self.num_context_requests:
+                raise ValueError(
+                    "mm_embedding_request_indices contains an invalid request "
+                    f"index: {request_index} not in [0, {self.num_context_requests})"
+                )
+
+    @classmethod
+    def from_model_outputs(
+        cls, model_outputs: Dict[str, Any], num_context_requests: int
+    ) -> "MultimodalResult":
+        result_keys = {
+            "mm_embeddings",
+            "mm_embedding_lengths",
+            "mm_embedding_request_indices",
+        }
+        return cls(
+            mm_embeddings=model_outputs["mm_embeddings"],
+            mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
+            mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
+            num_context_requests=num_context_requests,
+            extra_data={
+                key: value for key, value in model_outputs.items() if key not in result_keys
+            },
+        )
 
 
 @dataclass(kw_only=True)
@@ -301,7 +357,7 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)
-class RequestGroupKey(Generic[GenericStrategyKeyType]):  # type: ignore[misc]
+class RequestGroupKey(Generic[GenericStrategyKeyType]):
     strategy_key: GenericStrategyKeyType
     needs_probs: bool
 
@@ -336,11 +392,10 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleState:
         # from model_outputs to MultimodalResult
-        data = MultimodalResult(
-            mm_embeddings=model_outputs.pop("mm_embeddings"),
-            extra_data={**model_outputs},
-        )
         assert not scheduled_requests.generation_requests
+        data = MultimodalResult.from_model_outputs(
+            model_outputs, scheduled_requests.num_context_requests
+        )
         return self.SampleState(requests=scheduled_requests.context_requests, data=data)
 
     @override
@@ -356,26 +411,28 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         extra_data = state.data.extra_data or {}
         mrope_position_ids = extra_data.get("mrope_position_ids", None)
         mrope_position_deltas = extra_data.get("mrope_position_deltas", None)
-        for i, (request, mm_embedding) in enumerate(zip(requests, mm_embeddings)):
+        for request in requests:
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            assert request.multimodal_lengths is not None
-            # TODO(TRTLLM-12175): request.multimodal_lengths is a
-            # prompt-side MM-token count and may include non-embedding
-            # special/framing tokens. This validation needs per-item
-            # encoder-output embedding lengths instead.
-            if len(mm_embedding) != sum(request.multimodal_lengths):
-                raise ValueError(
-                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
-                )
 
-            request.py_result.append_mm_embeddings(mm_embedding, request.multimodal_lengths)
+        request_indices = state.data.mm_embedding_request_indices
+        for result_index, (request_index, mm_embedding) in enumerate(
+            zip(request_indices, mm_embeddings, strict=True)
+        ):
+            request = requests[request_index]
+            mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
+
+            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
+                mrope_index = (
+                    request_index if len(mrope_position_ids) == len(requests) else result_index
+                )
                 request.py_result.set_mrope_position(
-                    mrope_position_ids[i], mrope_position_deltas[i]
+                    mrope_position_ids[mrope_index],
+                    mrope_position_deltas[mrope_index],
                 )
 
     @override
@@ -2600,10 +2657,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_width: int,
         count: int,
         num_topk_logprobs: int,
-    ) -> list[list[dict[int, Logprob]]]:
-        """Convert the LogProbsStateList object to a list of lists of dictionaries of Logprob objects
+        simple_format: bool = False,
+    ) -> list[list[dict[int, Logprob]]] | list[list[float]]:
+        """Convert the LogProbsStateList object to per-token logprobs.
 
-        Logprobs storage expects logprobs as a list[list[dict[int, Logprob]]] object
+        By default returns ``list[list[dict[int, Logprob]]]``. When
+        ``simple_format`` is True and ``num_topk_logprobs == 0`` the result is a
+        flat ``list[list[float]]`` (one logprob per generated token, per beam).
 
         args:
             logprobs_state_list: LogProbsStateList. Contains the topk indices, topk values,
@@ -2612,17 +2672,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             beam_width: int. The beam width of the request.
             count: int. The number of tokens to store.
             num_topk_logprobs: int. The number of topk logprobs of each token.
+            simple_format: bool. If True (and num_topk_logprobs == 0), return
+                ``list[list[float]]`` instead of the dict format. Avoids per-token
+                dict allocation when only the sampled-token logprob is needed.
         output:
-            list[list[dict[int, Logprob]]]. Shape: (beam_width, count)
+            list[list[dict[int, Logprob]]] (default) or list[list[float]] (simple format).
+            Shape: (beam_width, count)
         """
 
         sampled_log_probs_indices_list = logprobs_state_list.sampled_indices[req_seq_slot]
         sampled_log_probs_vals_list = logprobs_state_list.sampled_vals[req_seq_slot]
         sampled_log_probs_rank_list = logprobs_state_list.sampled_rank[req_seq_slot]
 
-        token_log_probs: list[list[dict[int, Logprob]]]
         if num_topk_logprobs == 0:
-            token_log_probs = [
+            if simple_format:
+                token_log_probs_simple: list[list[float]] = [
+                    [sampled_log_probs_vals_list[beam_idx][step_idx] for step_idx in range(count)]
+                    for beam_idx in range(beam_width)
+                ]
+                return token_log_probs_simple
+
+            token_log_probs: list[list[dict[int, Logprob]]] = [
                 [
                     {
                         sampled_log_probs_indices_list[beam_idx][step_idx]: Logprob(
@@ -2677,7 +2747,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             assert logprobs_state_list is not None, "logprobs_state_list must be provided"
             assert request.py_seq_slot is not None
             token_log_probs = self._store_logprobs_list_to_request(
-                logprobs_state_list, request.py_seq_slot, beam_width, count, request.py_num_logprobs
+                logprobs_state_list,
+                request.py_seq_slot,
+                beam_width,
+                count,
+                request.py_num_logprobs,
+                simple_format=request.py_logprobs_simple_format,
             )
             request.py_result.append_log_probs(token_log_probs)
 
@@ -3132,12 +3207,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if logprobs_tensor.numel() > 0:
             logprobs_list = request.py_result.log_probs
             assert logprobs_list is not None
-            for beam_idx, beam_logprobs in enumerate(logprobs_list):
-                for token_idx, token_logprobs in enumerate(beam_logprobs):
-                    for key, value in token_logprobs.items():
-                        assert value.rank is not None
-                        logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
-                        logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
+
+            if request.py_logprobs_simple_format:
+                tokens = request.get_tokens()
+                for beam_idx, beam_logprobs in enumerate(logprobs_list):
+                    beam_logprobs = cast(SimpleTokenLogprobs, beam_logprobs)
+                    for token_idx, token_logprobs_simple in enumerate(beam_logprobs):
+                        logprobs_tensor[beam_idx, token_idx, 0] = token_logprobs_simple
+                        logprobs_indices_tensor[beam_idx, token_idx, 0] = tokens[beam_idx][
+                            token_idx
+                        ]
+            else:
+                for beam_idx, beam_logprobs in enumerate(logprobs_list):
+                    beam_logprobs = cast(TokenLogprobs, beam_logprobs)
+                    for token_idx, token_logprobs in enumerate(beam_logprobs):
+                        for key, value in token_logprobs.items():
+                            assert value.rank is not None
+                            logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
+                            logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
         return logprobs_tensor_full, logprobs_indices_tensor_full
 
     def _prepare_beam_history(
@@ -3613,6 +3700,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._prev_first_finish_reasons_host[req.py_seq_slot] = (
                         first_finish_reasons_host[req.py_seq_slot]
                     )
+                if req.is_context_only_request:
+                    beam_search_store = self.store.beam_search_store
+                    assert beam_search_store is not None
+                    assert req.py_seq_slot is not None
+                    beam_width = req.py_beam_width
+                    first_gen_scores = (
+                        beam_search_store.cum_log_probs[req.py_seq_slot, :beam_width]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    first_gen_tokens = [
+                        new_tokens_list[0][req.py_seq_slot][beam_idx]
+                        for beam_idx in range(beam_width)
+                    ]
+                    first_gen_log_probs = [
+                        {token_id: Logprob(logprob=log_prob, rank=None)}
+                        for token_id, log_prob in zip(first_gen_tokens, first_gen_scores)
+                    ]
+                    req.py_result.set_first_gen_log_probs(first_gen_log_probs)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
             else:
@@ -4192,9 +4299,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
-        new_tokens_host = self._copy_to_host(new_tokens_cuda)
-
-        return new_tokens_host
+        return self._copy_to_host(new_tokens_cuda)
 
     @staticmethod
     @torch.inference_mode()

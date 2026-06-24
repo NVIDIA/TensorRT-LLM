@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxConfig
+from .sparse_attention import SkipSoftmaxAttentionConfig
 
 # =============================================================================
 # Type aliases
@@ -44,57 +44,49 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM backend only).
+    """Attention quantization recipe (TRTLLM / CUTEDSL backends).
 
-    Describes user intent for quantized attention: per-axis dtype and
-    per-block layout for Q, K, V. Providing this config to
-    ``AttentionConfig`` enables quantized attention; setting
-    ``AttentionConfig.quant_attention_config = None`` disables it.
+    Describes user intent for quantized attention: per-bmm dtype and per-block layout for Q, K, V.
+    Providing this config to AttentionConfig enables quantized attention; setting
+    AttentionConfig.quant_attention_config = None disables it.
 
-    Bare ``QuantAttentionConfig()`` is a valid finest-granularity recipe
-    (``qk_dtype="int8"``, ``v_dtype="fp8"``, ``q=k=v=1``); tune
-    ``k_block_size`` up (4 or 16) for speed.
-
-    The ``"fp8"`` dtype maps to ``e4m3`` (``torch.float8_e4m3fn``) in
-    the current kernel; ``e5m2`` is not supported on this path.
-
-    Unsupported recipes are rejected by ``AttentionConfig``'s validator
-    with a ``ValueError``.
+    Bare QuantAttentionConfig() is a valid Qk16Pv8 recipe.
+    Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
     """
 
-    qk_dtype: Literal["int8", "fp8"] = Field(
-        "int8",
+    qk_dtype: Literal["bf16", "int8", "fp8"] = Field(
+        "bf16",
         status="prototype",
-        description="Q/K quantization dtype: 'int8' or 'fp8' (e4m3 in practice).",
+        description="Q/K quantization dtype; bf16 leaves Q/K unquantized.",
     )
     v_dtype: Literal["fp8"] = Field(
         "fp8",
         status="prototype",
-        description="V quantization dtype. The current kernel always stores V in FP8 (e4m3).",
+        description="V quantization dtype. The current kernels always load V in FP8 (e4m3).",
     )
     q_block_size: int = Field(
-        1,
-        ge=1,
+        0,
+        ge=0,
         status="prototype",
-        description="Elements per quantization block for Q.",
+        description="Elements per quantization block for Q; 0 for per-tensor quantization.",
     )
     k_block_size: int = Field(
-        1,
-        ge=1,
+        0,
+        ge=0,
         status="prototype",
-        description="Elements per quantization block for K.",
+        description="Elements per quantization block for K; 0 for per-tensor quantization.",
     )
     v_block_size: int = Field(
-        1,
-        ge=1,
+        0,
+        ge=0,
         status="prototype",
-        description="Elements per quantization block for V.",
+        description="Elements per quantization block for V; 0 for per-tensor quantization.",
     )
 
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxConfig],
+    Union[SkipSoftmaxAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -102,16 +94,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = Field(
         "VANILLA",
         status="prototype",
-        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM backend only). "
+            "Quantized-attention recipe (TRTLLM / CUTEDSL backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -121,46 +113,51 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description="Sparse attention configuration. Currently supports: skip_softmax.",
     )
-    sparse_config_path: Optional[str] = Field(
-        None,
-        status="prototype",
-        description=(
-            "Path to a ModelOpt sparse attention YAML config file. "
-            "Overrides auto-detection from the checkpoint directory."
-        ),
-    )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        SUPPORTED_QUANT_RECIPES = {
+        # SAGE recipes target the TRTLLM backend (per-block Q/K/V scales).
+        SAGE_RECIPES = {
             ("int8", "fp8", (1, 1, 1)),
             ("int8", "fp8", (1, 4, 1)),
             ("int8", "fp8", (1, 16, 1)),
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
         }
+        # QK16PV8 (CUTEDSL backend): Q/K kept in bf16, V quantized to FP8.
+        QK16PV8_DTYPES = {
+            ("bf16", "fp8", (0, 0, 0)),
+        }
 
         if self.quant_attention_config is None:
             return self
 
-        if self.backend != "TRTLLM":
-            raise ValueError(
-                f"quant_attention_config requires backend='TRTLLM', "
-                f"got backend='{self.backend}'. Either set backend='TRTLLM' "
-                f"or remove quant_attention_config."
-            )
-
-        q = self.quant_attention_config
+        q_config = self.quant_attention_config
         recipe = (
-            q.qk_dtype,
-            q.v_dtype,
-            (q.q_block_size, q.k_block_size, q.v_block_size),
+            q_config.qk_dtype,
+            q_config.v_dtype,
+            (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
-        if recipe not in SUPPORTED_QUANT_RECIPES:
+        if self.backend == "TRTLLM":
+            if recipe not in SAGE_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='TRTLLM'. Supported SAGE recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(SAGE_RECIPES)}."
+                )
+        elif self.backend == "CUTEDSL":
+            if recipe not in QK16PV8_DTYPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='CUTEDSL'. Supported (qk_dtype, v_dtype): "
+                    f"{sorted(QK16PV8_DTYPES)}."
+                )
+        else:
             raise ValueError(
-                f"Unsupported quant_attention_config={self.quant_attention_config!r}. "
-                f"Supported recipes (qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                f"{sorted(SUPPORTED_QUANT_RECIPES)}."
+                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
+                f"got backend='{self.backend}'. Either change backend or "
+                f"remove quant_attention_config."
             )
         return self
 
@@ -200,6 +197,15 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Ulysses head-sharding degree. Heads are sharded across ulysses_size GPUs."),
     )
+    async_ulysses: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Enable the async Ulysses A2A pipeline: overlap per-rank V/Q/K projection compute "
+            "with cross-rank symm-mem all-to-all on a dedicated side stream. "
+            "Requires ulysses_size > 1. Defaults to False."
+        ),
+    )
     ring_size: int = Field(
         1,
         ge=1,
@@ -221,6 +227,12 @@ class ParallelConfig(StrictBaseModel):
             "column group. Mutually exclusive with ring_size > 1."
         ),
     )
+    tp_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
+    )
 
     @property
     def seq_parallel_size(self) -> int:
@@ -241,11 +253,28 @@ class ParallelConfig(StrictBaseModel):
 
     @property
     def n_workers(self) -> int:
-        return self.cfg_size * self.seq_parallel_size
+        return self.cfg_size * self.seq_parallel_size * self.tp_size
 
     @property
     def total_parallel_size(self) -> int:
         return self.cfg_size * self.seq_parallel_size
+
+    @model_validator(mode="after")
+    def _validate_async_ulysses(self) -> "ParallelConfig":
+        if self.async_ulysses:
+            if self.ulysses_size == 1:
+                raise ValueError(
+                    "async_ulysses=True requires ulysses_size > 1; got "
+                    f"ulysses_size={self.ulysses_size}."
+                )
+            if self.ring_size > 1:
+                raise ValueError(
+                    "async_ulysses=True is incompatible with ring_size > 1: "
+                    "async_ulysses forces SEPARATE_QKV which bypasses the "
+                    "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
+                    f"(got ring_size={self.ring_size})."
+                )
+        return self
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:
@@ -470,7 +499,7 @@ class VisualGenArgs(StrictBaseModel):
             "Quantization config — accepts either a QuantConfig instance "
             "or a ModelOpt-format dict (e.g. ``{'quant_algo': 'FP8', "
             "'dynamic': True}``). Dict-form parsing happens lazily in "
-            "DiffusionModelConfig.from_pretrained."
+            "DiffusionPipelineConfig.from_pretrained."
         ),
     )
     compilation_config: CompilationConfig = Field(
@@ -575,7 +604,7 @@ class VisualGenArgs(StrictBaseModel):
 __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
-    "SkipSoftmaxConfig",
+    "SkipSoftmaxAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",
