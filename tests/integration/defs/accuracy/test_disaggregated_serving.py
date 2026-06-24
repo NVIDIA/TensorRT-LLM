@@ -1952,11 +1952,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "backend": "UCX",
             "max_tokens_in_buffer": 8192,
         }
-        if (comms_medium == "fifo_v2" and cuda_graph_config is not None
-                and cuda_graph_config.get("enable_padding", False)
-                and not enable_attention_dp and gen_pp == 1
-                and (gen_tp, gen_cp) in ((1, 4), (2, 2))):
-            cache_transceiver_config["kv_transfer_timeout_ms"] = 300000
         ctx_server_config = {
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 4,

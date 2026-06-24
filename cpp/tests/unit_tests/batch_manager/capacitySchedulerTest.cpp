@@ -805,6 +805,50 @@ TEST_F(CapacitySchedulerTest, DisaggGenInitMaxUtilization)
     EXPECT_EQ(numIterations, expectedNumIters);
 }
 
+TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 90;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager
+            = getKvCacheManager(2, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq);
+        auto peftCacheManager = getPeftCacheManager();
+
+        int32_t maxNewTokens = 40;
+        int32_t promptLen = 10;
+        auto transferReq = createRequest(promptLen, maxNewTokens, 0, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+        auto pendingReq = createRequest(promptLen, maxNewTokens, 1, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+        kvCacheManager->addSequenceBatch(
+            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+            {std::ref(*transferReq)});
+
+        RequestList saturatedActiveRequests{transferReq, pendingReq};
+        auto saturatedScheduler = CapacityScheduler(1, capacitySchedulerPolicy, kvCacheManager != nullptr);
+        auto [saturatedRequests, saturatedDisaggGenInitRequests, saturatedPausedRequests]
+            = saturatedScheduler(saturatedActiveRequests, kvCacheManager, peftCacheManager);
+        EXPECT_TRUE(saturatedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(saturatedDisaggGenInitRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(saturatedPausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+
+        RequestList activeRequestsWithCapacity{transferReq, pendingReq};
+        auto schedulerWithCapacity = CapacityScheduler(2, capacitySchedulerPolicy, kvCacheManager != nullptr);
+        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+            = schedulerWithCapacity(activeRequestsWithCapacity, kvCacheManager, peftCacheManager);
+        EXPECT_TRUE(fittingRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1u) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId)
+            << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+    }
+}
+
 TEST_F(CapacitySchedulerTest, RequestsSortedByPriorities)
 {
     RequestList activeRequests;
