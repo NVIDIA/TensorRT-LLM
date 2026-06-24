@@ -13,6 +13,8 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.attention_backend import VanillaAttention
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_padded_kv_with_mask_matches_unpadded():
     torch.manual_seed(42)

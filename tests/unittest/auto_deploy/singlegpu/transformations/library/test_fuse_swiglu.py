@@ -220,6 +220,7 @@ def test_swiglu_pattern_match_only():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_collect_classification_hints_consensus_over_mixed_mechanics():
     """Consensus recovers the shared layer_type even when constituents disagree on tp_mode."""
     g = torch.fx.Graph()
@@ -240,6 +241,7 @@ def test_collect_classification_hints_consensus_over_mixed_mechanics():
     assert collect_classification_hints(nodes) == {"layer_type": "shared_expert"}
 
 
+@pytest.mark.cpu_only
 def test_collect_classification_hints_conflict_is_dropped():
     """Conflicting layer_type values (a rewrite spanning layers) are dropped, not guessed."""
     g = torch.fx.Graph()
@@ -257,6 +259,7 @@ def test_collect_classification_hints_conflict_is_dropped():
     assert collect_classification_hints([a, b]) == {}
 
 
+@pytest.mark.cpu_only
 def test_stamp_hints_only_on_declaring_ops():
     """stamp_hints sets a hint only on ops whose schema declares it (aten.silu is skipped)."""
     g = torch.fx.Graph()

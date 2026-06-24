@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from torch import nn
 
@@ -15,6 +16,9 @@ from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+pytestmark = pytest.mark.cpu_only
+
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=1,

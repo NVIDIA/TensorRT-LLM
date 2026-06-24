@@ -19,9 +19,12 @@ turns every passthrough / aux-stream impl into a pure pass-through that
 never touches the CUDA stream manager.
 """
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.utils import multi_stream_utils as msu
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _CountingManager:

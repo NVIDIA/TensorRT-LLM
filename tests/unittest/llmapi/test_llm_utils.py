@@ -4,6 +4,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 import torch
 
 from tensorrt_llm.llmapi.llm_utils import *
@@ -54,6 +55,7 @@ def test_CachedModelLoader():
     assert model_format is _ModelFormatKind.TLLM_ENGINE
 
 
+@pytest.mark.cpu_only
 def test_LlmArgs_default_gpus_per_node():
     # default
     llm_args = TrtLlmArgs(model=llama_model_path)
@@ -64,6 +66,7 @@ def test_LlmArgs_default_gpus_per_node():
     assert llm_args.gpus_per_node == 6
 
 
+@pytest.mark.cpu_only
 def test_AsyncQueue():
     queue = AsyncQueue()
 

@@ -3,6 +3,7 @@ import math
 from typing import List
 
 import numpy as np
+import pytest
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
@@ -15,6 +16,8 @@ from tensorrt_llm.scaffolding import (GenerationTask,
 from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy, ConstantRateStrategy, LoadGenerationStrategy,
     PoissonRateStrategy, SynchronousStrategy, ThroughputStrategy)
+
+pytestmark = pytest.mark.cpu_only
 
 OUTPUT_STR = "Yes."
 

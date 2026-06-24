@@ -70,6 +70,7 @@ def make_raw_multimodal_param() -> MultimodalParams:
     return MultimodalParams(multimodal_data={"image": {"pixel_values": torch.empty(1)}})
 
 
+@pytest.mark.cpu_only
 def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
     module = torch.nn.Linear(4, 4, device="meta")
 
@@ -115,8 +116,7 @@ def test_prepare_multimodal_inputs_forwards_precomputed_indices(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
-@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
-def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
+def _test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     hidden = 8
     mm_token_id = 7
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
@@ -147,3 +147,12 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
         mm_emb.to(dtype=out.inputs_embeds.dtype, device=out.inputs_embeds.device),
     )
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
+
+
+@pytest.mark.cpu_only
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cpu")
+
+
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")

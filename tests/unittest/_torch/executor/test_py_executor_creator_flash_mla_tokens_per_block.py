@@ -34,7 +34,11 @@ under cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp.
 import inspect
 import re
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _get_create_py_executor_source() -> str:

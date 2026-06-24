@@ -379,6 +379,7 @@ class TestFeatureTrackingIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 class TestTelemetryEvalContext:
     """Verify UsageContext.CLI_EVAL flows through TelemetryConfig."""
 
@@ -390,6 +391,7 @@ class TestTelemetryEvalContext:
         assert config.usage_context == _llm_args_mod.UsageContext.CLI_EVAL
 
 
+@pytest.mark.cpu_only
 class TestTelemetryBenchContext:
     """Verify UsageContext.CLI_BENCH flows through TelemetryConfig."""
 

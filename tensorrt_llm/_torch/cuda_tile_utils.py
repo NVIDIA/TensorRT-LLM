@@ -44,7 +44,7 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-if platform.system() != "Windows":
+if platform.system() != "Windows" and torch.cuda.device_count() > 0:
     try:
         import cuda.tile  # noqa: F401
     except ImportError:

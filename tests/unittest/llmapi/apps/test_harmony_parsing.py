@@ -47,7 +47,10 @@ try:
 except (ImportError, ModuleNotFoundError):
     _harmony_available = False
 
-pytestmark = pytest.mark.skipif(not _harmony_available, reason="harmony_adapter not importable")
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(not _harmony_available, reason="harmony_adapter not importable"),
+]
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,9 @@ moe_h_to_4h to fc1, moe_gate to gated, moe_4h_to_h to fc2.
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
+
 # These imports are pure-Python; skip cleanly if the package layout changes.
 fused_moe_cutlass = pytest.importorskip("tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass")
 lora_layer = pytest.importorskip("tensorrt_llm._torch.peft.lora.layer")

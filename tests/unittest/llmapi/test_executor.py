@@ -21,6 +21,9 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from utils.llm_data import llm_models_root
+
+pytestmark = pytest.mark.cpu_only
+
 # isort: on
 
 WORLD_SIZE = mpi_world_size()

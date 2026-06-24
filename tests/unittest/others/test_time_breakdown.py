@@ -16,10 +16,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from tensorrt_llm.serve.scripts.time_breakdown import (RequestDataParser,
                                                        RequestTimeBreakdown,
                                                        TimingMetric,
                                                        TimingMetricsConfig)
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestTimingMetric(unittest.TestCase):

@@ -269,6 +269,7 @@ def generate_rope_embeddings(
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestSeparateQkvSequenceParallelGuard:
     def test_ring_with_separate_qkv_raises(self):
         vgm = VisualGenMapping(world_size=2, rank=0, ring_size=2)

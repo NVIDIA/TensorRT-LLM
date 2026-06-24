@@ -182,6 +182,7 @@ class _MiniWan22Pipeline:
         self.transformer = torch.nn.Linear(1, 1)
 
 
+@pytest.mark.cpu_only
 class TestSplitWan22InferenceSteps:
     def test_counts_high_noise_at_default_boundary(self):
         pipeline = _MiniWan22Pipeline(

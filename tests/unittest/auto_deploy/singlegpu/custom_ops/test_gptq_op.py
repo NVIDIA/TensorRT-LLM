@@ -17,6 +17,8 @@ import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 
+pytestmark = pytest.mark.cpu_only
+
 
 def pack_gptq_qweight_from_u4(U4_nk: torch.Tensor) -> torch.Tensor:
     """GPTQ: pack along K, 8 nibbles per int32.

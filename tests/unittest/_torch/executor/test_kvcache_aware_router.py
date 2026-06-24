@@ -19,11 +19,16 @@ These tests use mock objects and do NOT require GPU.
 
 from unittest.mock import MagicMock, Mock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     KVCacheAwareADPRouter,
     RankState,
 )
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---- Helpers ----
 

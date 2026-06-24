@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _MockRequest(MagicMock):
     """Mock executor Request whose ``num_input_tokens`` mirrors the real binding

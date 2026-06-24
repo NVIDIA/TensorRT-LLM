@@ -321,6 +321,7 @@ class _HFDeciLMForCausalLM(nn.Module):
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 def test_decilm_layer_structure():
     """Test that layers have correct structure based on block_configs."""
     config = _create_small_config()
@@ -339,6 +340,7 @@ def test_decilm_layer_structure():
     assert layer2.has_attention is True
 
 
+@pytest.mark.cpu_only
 def test_decilm_ffn_mult_to_intermediate_size():
     assert _ffn_mult_to_intermediate_size(5.25, 8192) == 28672
     assert _ffn_mult_to_intermediate_size(2.625, 8192) == 14336
@@ -346,6 +348,7 @@ def test_decilm_ffn_mult_to_intermediate_size():
     assert _ffn_mult_to_intermediate_size(0.5, 8192) == 2816
 
 
+@pytest.mark.cpu_only
 def test_decilm_weight_keys_match_checkpoint():
     config = _create_small_config()
     model = DeciLMForCausalLM(config)

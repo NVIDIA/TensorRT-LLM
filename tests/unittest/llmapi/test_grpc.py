@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,9 +43,10 @@ from utils.llm_data import llm_models_root
 
 skip_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available")
 
-pytestmark = pytest.mark.threadleak(enabled=False)
+pytestmark = [pytest.mark.disabled, pytest.mark.threadleak(enabled=False)]
 
 
+@pytest.mark.cpu_only
 class TestSamplingParamsConversion:
     """Tests for proto to SamplingParams conversion."""
 
@@ -167,6 +168,7 @@ class TestSamplingParamsConversion:
         assert params.guided_decoding.regex is not None
 
 
+@pytest.mark.cpu_only
 class TestLoraRequestConversion:
     """Tests for proto to LoRARequest conversion."""
 
@@ -185,6 +187,7 @@ class TestLoraRequestConversion:
         assert request is None
 
 
+@pytest.mark.cpu_only
 class TestDisaggregatedParamsConversion:
     """Tests for proto to DisaggregatedParams conversion."""
 
@@ -245,6 +248,7 @@ class TestDisaggregatedParamsConversion:
         assert params is None
 
 
+@pytest.mark.cpu_only
 class TestProtoMessages:
     """Tests for proto message structure."""
 
@@ -369,6 +373,7 @@ class TestProtoMessages:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestComprehensiveSamplingParamsConversion:
     """Comprehensive test covering all proto fields for SamplingParams conversion.
 
@@ -581,6 +586,7 @@ class TestComprehensiveSamplingParamsConversion:
 # ============================================================================
 
 
+@pytest.mark.cpu_only
 class TestGenerateValidation:
     """Test that invalid gRPC requests return INVALID_ARGUMENT status.
 

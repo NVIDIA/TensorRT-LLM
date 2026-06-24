@@ -819,6 +819,7 @@ def test_conditional_generation_wrapper():
     assert torch.isfinite(out.logits).all()
 
 
+@pytest.mark.cpu_only
 def test_shared_kv_layer_metadata_matches_config():
     model = Gemma4ForCausalLM(_shared_kv_text_config())
     layer_expectations = [
@@ -835,6 +836,7 @@ def test_shared_kv_layer_metadata_matches_config():
         assert layer.self_attn.kv_shared_layer_index == source_idx
 
 
+@pytest.mark.cpu_only
 def test_export_uses_shared_kv_attention_for_shared_layers():
     config = _shared_kv_text_config()
     model = Gemma4ForCausalLM(config).eval()
@@ -905,6 +907,7 @@ def test_shared_kv_eager_layers_ignore_local_kv_weights():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_export():
     """Model can be exported with torch.export and produces correct output."""
     device = "cpu"
@@ -1037,6 +1040,7 @@ def test_dense_conditional_generation_wrapper():
     assert torch.isfinite(out.logits).all()
 
 
+@pytest.mark.cpu_only
 def test_conditional_generation_wrapper_handles_exported_text_graph_without_per_layer_inputs():
     config = Gemma4Config(
         text_config=_small_text_config(),
@@ -1064,6 +1068,7 @@ def test_conditional_generation_wrapper_handles_exported_text_graph_without_per_
     assert out.logits.shape == (B, S, config.text_config.vocab_size)
 
 
+@pytest.mark.cpu_only
 def test_dense_export():
     """Dense model (no MoE) can be exported with torch.export."""
     device = "cpu"
@@ -1591,6 +1596,7 @@ def test_vision_patch_embedder_equivalence():
     torch.testing.assert_close(ad_out, ref_out, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.cpu_only
 def test_image_processor_pads_to_fixed_patch_budget():
     """Image processor should pad every request to the configured patch budget."""
     config = _small_vision_config()
@@ -1617,6 +1623,7 @@ def test_image_processor_pads_to_fixed_patch_budget():
     assert torch.all(outputs["image_position_ids"][1, :18] >= 0)
 
 
+@pytest.mark.cpu_only
 def test_ad_input_processor_emits_layout_metadata_for_boi_eoi_spans():
     class _DummyBaseProcessor:
         def __init__(self):
@@ -2012,6 +2019,7 @@ def test_e2b_like_conditional_wrapper_forwards_explicit_per_layer_inputs():
     torch.testing.assert_close(explicit_logits, implicit_logits, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.cpu_only
 def test_e2b_like_hf_per_layer_state_dict_keys_are_present_and_loadable():
     config = Gemma4Config(
         text_config=_small_e2b_text_config(),

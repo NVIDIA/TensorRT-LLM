@@ -4,6 +4,8 @@ import pytest
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_disaggregated_params_ctx_dp_rank():
     params = DisaggregatedParams()

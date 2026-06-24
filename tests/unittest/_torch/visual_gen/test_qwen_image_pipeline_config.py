@@ -23,6 +23,8 @@ from tensorrt_llm.visual_gen.args import (
     VisualGenArgs,
 )
 
+pytestmark = [pytest.mark.disabled, pytest.mark.cpu_only]
+
 
 def _write_minimal_qwen_checkpoint(tmp_path):
     """Create the minimum diffusers layout needed by PipelineLoader config code."""

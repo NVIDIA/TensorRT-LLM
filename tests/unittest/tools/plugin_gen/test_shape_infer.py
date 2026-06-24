@@ -3,6 +3,8 @@ import pytest
 from tensorrt_llm.tools.plugin_gen.core import InputArg, Type
 from tensorrt_llm.tools.plugin_gen.shape_infer import *
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize('expr', [
     "a[m,n,k]:m*2+k+(n+1) -> b",

@@ -2,8 +2,12 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.build_cache import BuildCache, BuildCacheConfig
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_BuildStep():

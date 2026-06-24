@@ -21,6 +21,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
+pytestmark = pytest.mark.cpu_only
+
+
 GB = 1 << 30
 
 

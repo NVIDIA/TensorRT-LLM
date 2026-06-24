@@ -1,6 +1,10 @@
 import time
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # PerfTimer tests

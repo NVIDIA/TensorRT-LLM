@@ -57,6 +57,8 @@ def test_native_block_key_hasher_matches_python_v1():
             toks[t:t_end], parent_hash=0 if parent is None else parent)
         parent = h
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_mock_aiohttp_session(return_value=None):
     """Create a mock aiohttp.ClientSession whose .post() returns canned JSON."""

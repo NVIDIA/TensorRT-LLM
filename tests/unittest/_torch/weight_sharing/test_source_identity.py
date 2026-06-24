@@ -38,6 +38,8 @@ from tensorrt_llm._torch.weight_sharing import (
     check_weight_sharing_compatibility,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_identical_configs_match():
     a = identity_from(FakeModelConfig())

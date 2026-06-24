@@ -22,10 +22,13 @@ seam is patched, so the gate logic runs against real `SourceIdentity` objects
 without any model, GPU, or RDMA.
 """
 
+import pytest
 from _source_identity_fakes import FakeMapping
 from _source_identity_fakes import make_identity as _identity
 
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _new_loader(local_identity, source_identity, fetched=True):

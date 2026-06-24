@@ -17,6 +17,8 @@ import pytest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     "values, weights, expected_average",

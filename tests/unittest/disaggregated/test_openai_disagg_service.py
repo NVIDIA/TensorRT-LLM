@@ -56,6 +56,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
 )
 from tensorrt_llm.serve.router import Router
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _client_factory(*_args, **_kwargs):
     return AsyncMock()

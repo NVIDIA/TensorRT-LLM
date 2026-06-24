@@ -26,6 +26,8 @@ from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.mapping import CpType
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def attention_dp_config():

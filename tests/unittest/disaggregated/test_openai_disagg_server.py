@@ -24,6 +24,8 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _raw_request(headers: dict[str, str]):
     return SimpleNamespace(headers=Headers(headers=headers))

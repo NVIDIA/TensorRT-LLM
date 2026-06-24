@@ -43,6 +43,7 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderInactive:
     def test_shard_gather_identity_when_size_one(self):
         s = SequenceSharder(size=1, rank=0, group=None)
@@ -73,6 +74,7 @@ class TestSequenceSharderInactive:
         assert s.is_active
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderShardSlices:
     """Active sharder: block slice math without ``gather``."""
 
@@ -96,6 +98,7 @@ class TestSequenceSharderShardSlices:
             s.shard(x, dim=1)
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderShardRope:
     def test_shard_rope_bsd_layout(self):
         s = SequenceSharder(size=2, rank=1, group=None)
@@ -122,6 +125,7 @@ class TestSequenceSharderShardRope:
         assert oc.shape == (2, 4, S)
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderFromVgm:
     def test_from_vgm_none(self):
         s = SequenceSharder.from_vgm(None)
@@ -187,6 +191,7 @@ def _run_dist(world_size: int, entry: Callable[[int, int, int], None]):
     mp.spawn(entry, args=(world_size, port), nprocs=world_size, join=True)
 
 
+@pytest.mark.cpu_only
 class TestSequenceSharderDistributed:
     def test_shard_gather_pad_unpad_four_ranks(self):
         _run_dist(4, _spawn_entry_combined)

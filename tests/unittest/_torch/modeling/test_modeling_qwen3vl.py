@@ -649,6 +649,7 @@ def test_rot_pos_ids_matches_gpu_reference(grid_thw_list):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.cpu_only
 def test_rot_pos_ids_lru_cache_hit():
     """Repeated (h, w, spatial_merge_size) keys must hit the lru_cache and
     return the same underlying tensor object (no recompute)."""

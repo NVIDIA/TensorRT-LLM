@@ -536,6 +536,7 @@ def test_full_model_equivalence():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_export():
     """Model can be exported with torch.export and produces correct output."""
     device = "cpu"

@@ -1,10 +1,12 @@
 import unittest
 
+import pytest
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 
 
+@pytest.mark.cpu_only
 class TestMultimodalParamsHandleConversion(unittest.TestCase):
     """Test cases for to_handle and to_tensor methods in MultimodalParams."""
 

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -25,6 +26,33 @@ from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import AttentionTypeCpp
 from tensorrt_llm.llmapi import CacheTransceiverConfig
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _mock_autodeploy_runtime_dependencies():
+    mock_dist = Mock()
+    mock_dist.broadcast.side_effect = lambda value: value
+    mock_autotuner = Mock()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.Distributed.get",
+            return_value=mock_dist,
+        ),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.torch.cuda.set_device"),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.initialize_or_skip"),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.AutoTuner.get",
+            return_value=mock_autotuner,
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.instantiate_sampler",
+            return_value=Mock(),
+        ),
+    ):
+        yield
 
 
 class MockTokenizer:
@@ -103,6 +131,31 @@ def make_mock_engine(
     return mock_engine, kv_cache_manager
 
 
+@contextmanager
+def _mock_ad_engine_build(mock_engine, *, vocab_size_padded: int = 1000):
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config",
+            return_value=mock_engine,
+        ) as mock_ad_engine,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=vocab_size_padded),
+        ),
+    ):
+        yield mock_ad_engine
+
+
+@contextmanager
+def _mock_py_executor_creation(mock_engine, *, vocab_size_padded: int = 1000):
+    with (
+        _mock_ad_engine_build(mock_engine, vocab_size_padded=vocab_size_padded),
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
+    ):
+        py_executor_cls.side_effect = MockPyExecutor
+        yield py_executor_cls
+
+
 @pytest.mark.parametrize("guided_decoding_backend", ["xgrammar", "llguidance"])
 @pytest.mark.parametrize("max_batch_size", [4, 8])
 @pytest.mark.parametrize("vocab_size_padded", [42, 1000])
@@ -131,7 +184,6 @@ def test_create_autodeploy_executor_with_guided_decoding(
         max_batch_size=max_batch_size, vocab_size_padded=vocab_size_padded
     )
 
-    # Mock the specific dependencies requested, plus minimal additional mocks to prevent errors
     with (
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.get_guided_decoding_config",
@@ -140,20 +192,11 @@ def test_create_autodeploy_executor_with_guided_decoding(
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.GuidedDecoder"
         ) as guided_decoder_cls,
-        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
-        ) as mock_ad_engine,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=vocab_size_padded),
-        ),
+        _mock_py_executor_creation(
+            mock_engine, vocab_size_padded=vocab_size_padded
+        ) as py_executor_cls,
     ):
-        mock_ad_engine.return_value = mock_engine
-
-        # substitute the GuidedDecoder and PyExecutor classes
         guided_decoder_cls.side_effect = MockGuidedDecoder
-        py_executor_cls.side_effect = MockPyExecutor
 
         # Call the function under test
         result = create_autodeploy_executor(ad_config, mock_tokenizer)
@@ -201,24 +244,15 @@ def test_create_executor_uses_cache_transceiver(cache_attention_type, expected_a
     mock_engine, kv_cache_manager = make_mock_engine(attention_type=cache_attention_type)
 
     with (
-        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
-        ) as mock_ad_engine,
+        _mock_py_executor_creation(mock_engine) as py_executor_cls,
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.create_kv_cache_transceiver",
             return_value=mock_transceiver,
         ) as create_transceiver,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=1000),
-        ),
     ):
-        mock_ad_engine.return_value = mock_engine
-        py_executor_cls.side_effect = MockPyExecutor
-
         result = create_autodeploy_executor(ad_config, mock_tokenizer)
 
+    py_executor_cls.assert_called_once()
     create_transceiver.assert_called_once()
     _, _, passed_kv_cache_manager, attention_type, passed_config = create_transceiver.call_args.args
     assert passed_kv_cache_manager is kv_cache_manager
@@ -258,22 +292,12 @@ def test_create_executor_preserves_explicit_transceiver_buffer_size(
     mock_engine, _ = make_mock_engine(attention_type=cache_attention_type)
 
     with (
-        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
-        ) as mock_ad_engine,
+        _mock_py_executor_creation(mock_engine),
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.create_kv_cache_transceiver",
             return_value=mock_transceiver,
         ) as create_transceiver,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=1000),
-        ),
     ):
-        mock_ad_engine.return_value = mock_engine
-        py_executor_cls.side_effect = MockPyExecutor
-
         create_autodeploy_executor(ad_config, mock_tokenizer)
 
     _, _, _, attention_type, passed_config = create_transceiver.call_args.args
@@ -300,17 +324,7 @@ def test_create_executor_rejects_non_enum_attention_type(cache_attention_type):
     mock_engine, _ = make_mock_engine()
     mock_engine.cache_seq_interface.attention_type = cache_attention_type
 
-    with (
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
-        ) as mock_ad_engine,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=1000),
-        ),
-    ):
-        mock_ad_engine.return_value = mock_engine
-
+    with _mock_ad_engine_build(mock_engine):
         with pytest.raises(TypeError):
             create_autodeploy_executor(ad_config, mock_tokenizer)
 
@@ -331,17 +345,7 @@ def test_create_executor_requires_attention_type():
 
     mock_engine, _ = make_mock_engine(attention_type=None)
 
-    with (
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
-        ) as mock_ad_engine,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=1000),
-        ),
-    ):
-        mock_ad_engine.return_value = mock_engine
-
+    with _mock_ad_engine_build(mock_engine):
         with pytest.raises(RuntimeError):
             create_autodeploy_executor(ad_config, mock_tokenizer)
 
@@ -368,19 +372,11 @@ def test_create_executor_rejects_mamba_cache_manager_for_transceiver():
     mock_engine.cache_seq_interface.kv_cache_manager = mamba_cache_manager
 
     with (
-        patch(
-            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
-        ) as mock_ad_engine,
+        _mock_ad_engine_build(mock_engine),
         patch(
             "tensorrt_llm._torch.auto_deploy.shim.ad_executor.create_kv_cache_transceiver"
         ) as create_transceiver,
-        patch(
-            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
-            return_value=MockFactory(vocab_size_padded=1000),
-        ),
     ):
-        mock_ad_engine.return_value = mock_engine
-
         with pytest.raises(RuntimeError):
             create_autodeploy_executor(ad_config, mock_tokenizer)
 

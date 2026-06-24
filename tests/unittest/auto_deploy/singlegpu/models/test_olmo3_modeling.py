@@ -502,6 +502,7 @@ def test_olmo3_model_can_be_exported(rope_type):
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_olmo3_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -512,6 +513,7 @@ def test_olmo3_config_registration():
     assert hasattr(config, "layer_types")
 
 
+@pytest.mark.cpu_only
 def test_olmo3_post_norm_structure():
     """Test that OLMo-3 uses post-norm (not pre-norm)."""
     config = _create_small_config()
@@ -527,6 +529,7 @@ def test_olmo3_post_norm_structure():
     )
 
 
+@pytest.mark.cpu_only
 def test_olmo3_qk_norm_structure():
     """Test that attention uses QK normalization on full projection."""
     config = _create_small_config()
@@ -542,6 +545,7 @@ def test_olmo3_qk_norm_structure():
     assert attn.k_norm.weight.shape[0] == config.num_key_value_heads * head_dim
 
 
+@pytest.mark.cpu_only
 def test_olmo3_mixed_attention_types():
     """Test that model correctly assigns sliding/full attention types."""
     config = _create_small_config()
@@ -559,6 +563,7 @@ def test_olmo3_mixed_attention_types():
             assert layer.self_attn.sliding_window is None
 
 
+@pytest.mark.cpu_only
 def test_olmo3_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()

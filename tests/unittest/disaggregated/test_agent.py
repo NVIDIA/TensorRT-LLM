@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover - binding unavailable in some envs
 _AGENT_CPP_MODULE = "tensorrt_llm._torch.disaggregation.nixl._agent_cpp"
 
 
+@pytest.mark.cpu_only
 class TestTransferStatus(TestCase):
     def test_mock_transfer_status(self):
         mock_transfer_status = Mock(spec=TransferStatus)

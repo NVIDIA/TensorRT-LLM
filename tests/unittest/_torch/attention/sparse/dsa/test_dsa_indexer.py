@@ -2073,6 +2073,7 @@ def test_compute_cu_seqlen_bounds_with_cache_compressed_kv():
     ],
     ids=["small_single", "small_multi", "large_chunked", "mixed", "exact_size", "non_zero_start"],
 )
+@pytest.mark.cpu_only
 def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_specs):
     """
     Test split_prefill_chunks covering:
@@ -3047,6 +3048,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
 
 
+@pytest.mark.cpu_only
 class TestPrepareRestoreAttnMetadataForDraftReplay:
     """Tests for prepare_attn_metadata_for_draft_replay and
     restore_attn_metadata_after_draft_replay."""

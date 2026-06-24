@@ -19,6 +19,11 @@ from collections.abc import Iterator
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
+
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import ReuseScope, TokenId
     from kv_cache_manager_v2._block_radix_tree import (

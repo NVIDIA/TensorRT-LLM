@@ -174,6 +174,7 @@ def _build_small_draft_factory(
     )
 
 
+@pytest.mark.cpu_only
 def test_eagle_rmsnorm_keeps_fp32_weights():
     norm = EagleRMSNorm(hidden_size=16)
 

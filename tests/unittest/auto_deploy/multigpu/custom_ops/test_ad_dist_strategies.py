@@ -320,6 +320,7 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
         "SYMM_MEM",
     ],
 )
+@pytest.mark.cpu_only
 def test_allreduce_strategy_propagation(strategy):
     """Test that allreduce_strategy is correctly propagated to graph nodes.
 
@@ -427,6 +428,7 @@ def test_allreduce_strategy_propagation(strategy):
         "SYMM_MEM",
     ],
 )
+@pytest.mark.cpu_only
 def test_allgather_strategy_propagation(strategy):
     """Test that allgather_strategy is correctly propagated to graph nodes.
 

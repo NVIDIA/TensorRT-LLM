@@ -488,6 +488,7 @@ def test_gemma2_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_gemma2_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -502,6 +503,7 @@ def test_gemma2_config_registration():
     assert hasattr(config, "sliding_window")
 
 
+@pytest.mark.cpu_only
 def test_gemma2_layer_types():
     """Test that layer types alternate correctly."""
     config = _create_small_config()
@@ -512,6 +514,7 @@ def test_gemma2_layer_types():
     assert config.layer_types[3] == "full_attention"
 
 
+@pytest.mark.cpu_only
 def test_gemma2_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -529,6 +532,7 @@ def test_gemma2_gqa_structure():
     assert attn1.sliding_window is None
 
 
+@pytest.mark.cpu_only
 def test_gemma2_four_layernorms():
     """Test that each decoder layer has 4 layer norms."""
     config = _create_small_config()
@@ -541,6 +545,7 @@ def test_gemma2_four_layernorms():
     assert hasattr(layer, "post_feedforward_layernorm")
 
 
+@pytest.mark.cpu_only
 def test_gemma2_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()

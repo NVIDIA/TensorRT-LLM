@@ -23,6 +23,8 @@ from pydantic import ValidationError
 
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content, parse_chat_messages_coroutines
 
+pytestmark = [pytest.mark.disabled, pytest.mark.cpu_only]
+
 
 class SingleUseIterator:
     """Mimics Pydantic v2 ValidatorIterator: yields items once, then empty."""

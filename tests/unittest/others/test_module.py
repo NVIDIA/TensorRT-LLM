@@ -14,10 +14,13 @@
 # limitations under the License.
 import unittest
 
+import pytest
 import torch
 
 from tensorrt_llm.layers import GroupNorm
 from tensorrt_llm.module import Module, ModuleList
+
+pytestmark = pytest.mark.cpu_only
 
 
 class Module1(Module):

@@ -19,6 +19,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.models.quant_config_utils import update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _compressed_tensors_config(weights=None, input_activations=None, **overrides):
     config = {

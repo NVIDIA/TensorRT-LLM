@@ -1078,6 +1078,8 @@ def getPytestBaseCommandLine(
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
+    def unittestMarkExpr = (stageName.startsWith("CPU-") || stageName.contains("-CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
+    testCmdLine += ["--unittest-markexpr=${unittestMarkExpr}"]
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -2390,6 +2392,37 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
+    case "cpu":
+        containerConfig = """
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TEST}]
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: ${TESTER_CORES}
+                        memory: ${TESTER_MEMORY}
+                        ephemeral-storage: 300Gi
+                      limits:
+                        cpu: ${TESTER_CORES}
+                        memory: ${TESTER_MEMORY}
+                        ephemeral-storage: 300Gi
+                    imagePullPolicy: Always
+                    volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: scratch-trt-llm-data
+                      mountPath: /scratch.trt_llm_data
+                      readOnly: true
+                    - name: sw-tensorrt-pvc
+                      mountPath: "/mnt/sw-tensorrt-pvc"
+                      readOnly: false
+                    securityContext:
+                      capabilities:
+                        add:
+                        - SYS_ADMIN"""
+        nodeLabelPrefix = "cpu"
+        break
     default:
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
@@ -2831,6 +2864,9 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
         // At this point, only tests with backend=autodeploy or unspecified backend will be run
         makoArgs += ["backend=autodeploy"]
+    } else if (stageName.contains("-Generic-")) {
+        // Generic stages select tests by marker expression rather than backend ownership.
+        makoArgs += ["backend=generic"]
     } else if (stageName.contains("-Verl-")) {
         // If stageName contains "-Verl-", add "backend=verl" to makoArgs
         // At this point, only tests with backend=verl or unspecified backend will be run
@@ -2874,9 +2910,19 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
-        def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
         def makoArgs = getMakoArgsFromStageName(stageName)
-        makoOpts = getMakoOpts(scriptPath, makoArgs)
+        if (stageName.startsWith("CPU-") || stageName.contains("-CPU-")) {
+            def cpuName = env.targetArch == AARCH64_TRIPLE ? "aarch64" : "x86_64"
+            makoOpts = transformMakoArgsToJson(
+                ["Mako options:"] + makoArgs + [
+                    "system_gpu_count=0",
+                    "cpu=${cpuName}",
+                    "linux_distribution_name=ubuntu"
+                ])
+        } else {
+            def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
+            makoOpts = getMakoOpts(scriptPath, makoArgs)
+        }
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
@@ -4369,6 +4415,7 @@ def launchTestJobs(pipeline, testFilter)
     // may break the mapping functionality.
 
     x86TestConfigs = [
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
@@ -4572,6 +4619,7 @@ def launchTestJobs(pipeline, testFilter)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],

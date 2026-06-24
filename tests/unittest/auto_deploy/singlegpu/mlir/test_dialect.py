@@ -17,6 +17,9 @@
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 xdsl = pytest.importorskip("xdsl")
 
 from xdsl.dialects.builtin import (  # noqa: E402

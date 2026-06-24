@@ -21,6 +21,9 @@ import pytest
 
 from tensorrt_llm.usage import usage_lib
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Opt-out tests
 # ---------------------------------------------------------------------------

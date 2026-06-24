@@ -28,6 +28,8 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.router import Router
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def mock_router():

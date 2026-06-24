@@ -104,6 +104,7 @@ class TestLlavaNext(TestModelingMultimodal):
         return scenarios
 
 
+@pytest.mark.cpu_only
 def test_llava_next_expand_prompt_token_ids_for_mm():
     """Test LlavaNextInputProcessor.expand_prompt_token_ids_for_mm replaces image placeholders correctly."""
     model_path = LLAVA_NEXT_7B_CONFIG["_name_or_path"]

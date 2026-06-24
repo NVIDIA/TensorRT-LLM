@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _compressed_tensors_nvfp4_config(**overrides):

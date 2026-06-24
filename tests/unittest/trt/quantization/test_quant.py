@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from unittest.mock import patch
 
+import pytest
 from parameterized import parameterized
 
 from tensorrt_llm.layers import (Attention, ColumnLinear, GatedMLP, RmsNorm,
@@ -33,6 +35,14 @@ from tensorrt_llm.quantization.layers import (
 from utils.util import unittest_name_func
 
 from tensorrt_llm.quantization.quantize import quantize
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _force_mpi_topology_mapping():
+    with patch("tensorrt_llm.mapping.mpi_disabled", return_value=False):
+        yield
 
 
 class TestQuant(unittest.TestCase):

@@ -15,6 +15,8 @@ from tensorrt_llm.serve.cluster_storage import (WatchEventType,
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
                                                     DisaggClusterWorker)
 
+pytestmark = pytest.mark.cpu_only
+
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
@@ -80,6 +82,7 @@ async def cluster_manager(config, storage_server):
 @pytest.mark.threadleak(
     enabled=False
 )  # ignore thread leak for python-etcd3 watch thread, there is no way to stop it
+@pytest.mark.timeout(20)
 @pytest.mark.asyncio(scope="module")
 async def test_init_workers_first(config, storage_server):
     try:

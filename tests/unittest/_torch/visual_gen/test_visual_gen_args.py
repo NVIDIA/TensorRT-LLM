@@ -22,6 +22,8 @@ from tensorrt_llm.visual_gen.args import (
     VisualGenArgs,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TestVisualGenArgsStrictValidation:
     """extra='forbid' rejects unknown fields at every nesting level."""

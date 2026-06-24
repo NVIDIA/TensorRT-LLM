@@ -23,6 +23,8 @@ from tensorrt_llm.bench.utils.data import (
     initialize_tokenizer,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeTokenizer:
     """Minimal tokenizer stub for testing create_dataset_from_stream."""

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
@@ -12,6 +13,8 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+pytestmark = pytest.mark.cpu_only
 
 
 def make_rankinfo(

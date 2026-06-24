@@ -30,6 +30,9 @@ from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # _align_kv_blocks: contract unchanged.
 # ---------------------------------------------------------------------------

@@ -27,6 +27,8 @@ from tensorrt_llm._torch.auto_deploy.models.hf import (
     hf_load_state_dict_with_device,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class SimpleModel(nn.Module):
     def __init__(self):

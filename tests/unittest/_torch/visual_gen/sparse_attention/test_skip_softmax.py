@@ -18,6 +18,8 @@ from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
 from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _ckpt_sparse_attention_config(
     *,

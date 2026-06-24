@@ -26,6 +26,8 @@ from tensorrt_llm.serve.visual_gen_utils import (
 )
 from tensorrt_llm.visual_gen import VisualGenParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _StubExtraParamSpec:
     def __init__(self, default: Any = None) -> None:

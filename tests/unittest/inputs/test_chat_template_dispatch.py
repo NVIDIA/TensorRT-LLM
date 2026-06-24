@@ -18,6 +18,8 @@ from tensorrt_llm.inputs.utils import (
     interleave_mm_placeholders,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _register_test_models():

@@ -22,6 +22,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
     """Create a KVCachePageTable for testing."""

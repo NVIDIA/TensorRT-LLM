@@ -7,6 +7,7 @@ from typing import NamedTuple, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm
@@ -913,6 +914,7 @@ class TestResourceManager(unittest.TestCase):
         self.assertTrue(peft_cache_manager.impl.enabled)
 
 
+@pytest.mark.cpu_only
 class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):

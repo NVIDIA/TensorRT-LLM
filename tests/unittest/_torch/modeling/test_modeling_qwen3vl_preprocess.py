@@ -31,7 +31,11 @@ control-flow.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _fake_video(metadata):
