@@ -260,12 +260,16 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             [vd.metadata for vd in video_datas] if video_datas and mm_processor_kwargs else None
         )
 
-        # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
-        # If the caller set num_frames without fps, null fps explicitly so the class-level
-        # default fps=2 does not interfere.
-        proc_kwargs = dict(mm_processor_kwargs)
-        if "num_frames" in proc_kwargs and "fps" not in proc_kwargs:
-            proc_kwargs["fps"] = None
+        # Frames are already sampled by the IO loader (_load_video_by_cv2).
+        # Pass do_sample_frames=False so the HF processor skips its own
+        # frame-sampling branch (which would otherwise re-sample identical
+        # frames or take a slower path due to the metadata/frame-count
+        # mismatch). Caller-supplied kwargs other than fps/num_frames are
+        # preserved.
+        proc_kwargs = {"do_sample_frames": False}
+        for _k, _v in dict(mm_processor_kwargs).items():
+            if _k not in ("num_frames", "fps"):
+                proc_kwargs[_k] = _v
 
         return self.processor(
             text=[text],
