@@ -953,7 +953,8 @@ def test_pd_disagg_with_image_input(
         pytest.param(_LLAVA_DIR, True, False, id="llava_7b-encoder_embeddings"),
         # Encoder embeddings routed back through default_multimodal_input_loader.
         pytest.param(_LLAVA_DIR, True, True, id="llava_7b-loader_embeddings"),
-        # Qwen models don't implement attach_multimodal_embeddings, so only the raw path is exercised.
+        # Keep Qwen rows on the raw path here; Qwen image-embedding attach is
+        # covered by dedicated input-processor and OpenAI image_embeds tests.
         pytest.param(_QWEN_2_5_VL_DIR, False, False,
                      id="qwen2.5_3b-raw_inputs"),
         pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_2b-raw_inputs"),

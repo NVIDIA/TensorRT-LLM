@@ -95,25 +95,6 @@ def test_yaml_compile_backend_disables_default_piecewise(tmp_path):
     assert args.transforms["compile_model"]["piecewise_enabled"] is False
 
 
-def test_speculative_flashinfer_fallback_disables_piecewise():
-    from tensorrt_llm.llmapi import EagleDecodingConfig
-
-    spec_config = EagleDecodingConfig(
-        max_draft_len=3,
-        speculative_model="some/model",
-        eagle3_one_model=True,
-    )
-
-    args = LlmArgs(
-        model="test-model",
-        attn_backend="flashinfer",
-        speculative_config=spec_config,
-    )
-
-    assert args.compile_backend == "torch-simple"
-    assert args.transforms["compile_model"]["piecewise_enabled"] is False
-
-
 def test_cache_transceiver_rejects_unmanaged_persistent_caches():
     """Cache transceiver rejects unmanaged persistent cache resources."""
     args = LlmArgs(
@@ -294,6 +275,10 @@ class TestSpeculativeConfigValidation:
     Verify that supported speculative modes are accepted and configured before executor setup.
     """
 
+    @staticmethod
+    def piecewise_disabled_transforms():
+        return {"compile_model": {"piecewise_enabled": False}}
+
     def test_accepts_eagle_one_model(self):
         from tensorrt_llm.llmapi import EagleDecodingConfig
 
@@ -303,7 +288,11 @@ class TestSpeculativeConfigValidation:
             eagle3_one_model=True,
         )
         # Should not raise.
-        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms=self.piecewise_disabled_transforms(),
+        )
         assert args.model_factory == "eagle_one_model"
 
     def test_accepts_mtp_eagle_one_model(self):
@@ -314,7 +303,11 @@ class TestSpeculativeConfigValidation:
             mtp_eagle_one_model=True,
         )
         # Should not raise.
-        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        args = LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            transforms=self.piecewise_disabled_transforms(),
+        )
         assert args.model_factory == "eagle_one_model"
 
     @pytest.mark.parametrize("compile_backend", ["torch-cudagraph", "torch-opt"])
@@ -375,7 +368,10 @@ class TestSSMReplayValidation:
         args = LlmArgs(
             model="test-model",
             speculative_config=spec_config,
-            transforms={"insert_cached_ssm_attention": {"ssm_replay": True}},
+            transforms={
+                "compile_model": {"piecewise_enabled": False},
+                "insert_cached_ssm_attention": {"ssm_replay": True},
+            },
         )
         assert args.transforms["insert_cached_ssm_attention"]["ssm_replay"] is True
 

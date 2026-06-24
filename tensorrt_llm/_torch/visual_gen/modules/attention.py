@@ -4,14 +4,15 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig, SkipSoftmaxConfig
+from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
 
 
@@ -53,6 +54,7 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
     ):
@@ -105,6 +107,7 @@ class Attention(nn.Module):
         self.qk_norm = qk_norm
         self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
+        self.module_name = self._qualified_module_name(config.component_name, module_name)
         self.eps = eps
 
         self.q_dim = self.num_attention_heads * self.head_dim
@@ -180,11 +183,22 @@ class Attention(nn.Module):
         # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
         # V/Q/K projections AND still needs the head-sharding wrap — opt in
         # via async_ulysses=True.
+        cp_size = vgm.cp_size if vgm else 1
         use_ulysses = (
             ulysses_size > 1
             and enable_sequence_parallel
-            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses)
+            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses or cp_size == 1)
         )
+        if ulysses_size > 1 and enable_sequence_parallel and not use_ulysses:
+            # Ulysses was requested (ulysses_size > 1, SP on) but disabled: this is a
+            # SEPARATE_QKV cross-attention that is neither async nor pure-Ulysses
+            # (cp_size > 1), so it falls back to the all-gather K/V path.
+            logger.debug(
+                f"Attention(layer={layer_idx}): Ulysses disabled despite ulysses_size="
+                f"{ulysses_size} — qkv_mode={self.qkv_mode.value}, "
+                f"async_ulysses={async_ulysses}, cp_size={cp_size} "
+                f"(SEPARATE_QKV cross-attn needs async_ulysses or cp_size==1)."
+            )
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -196,21 +210,15 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Resolve sparse attention config for TRTLLM backend
-        sparse_attention_config = None
+        # Resolve sparse attention params for TRTLLM backend
+        sparse_params = None
         ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
-            # Cache the resolved scalar on a private attr (idempotent across
-            # all Attention modules); does NOT mutate the source-of-truth
-            # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
-            # callers — including `apply_skip_softmax_overrides` — read the
-            # cached value via `resolve_threshold(module_name)`.
-            threshold = ss_cfg.get_or_resolve_threshold()
-
-            if threshold is not None and threshold > 0:
-                sparse_attention_config = SkipSoftmaxAttentionConfig(
-                    threshold_scale_factor={"prefill": threshold, "decode": 0}
-                )
+        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
+            sparse_params = ss_cfg.to_sparse_params(
+                module_name=self.module_name,
+                pretrained_config=config.pretrained_config,
+            )
+        self.sparse_params = sparse_params
 
         # Create compute backend
         self.attn = create_attention(
@@ -223,7 +231,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
-            sparse_attention_config=sparse_attention_config,
+            sparse_params=sparse_params,
         )
 
         if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
@@ -238,8 +246,21 @@ class Attention(nn.Module):
             self.attn,
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
+            use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+    @staticmethod
+    def _qualified_module_name(
+        component_name: Optional[str],
+        module_name: Optional[str],
+    ) -> Optional[str]:
+        if module_name is None:
+            return None
+        if component_name is None:
+            return module_name
+        prefix = f"{component_name}."
+        return module_name if module_name.startswith(prefix) else f"{prefix}{module_name}"
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
@@ -505,6 +526,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
@@ -523,7 +545,7 @@ class Attention(nn.Module):
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v)
+            out = self._attn_impl(q, k, v, timestep=timestep)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
@@ -542,7 +564,7 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v)
+        out = self._attn_impl(q, k, v, timestep=timestep)
         out = self.to_out[0](out)
         return out
 
@@ -550,6 +572,7 @@ class Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
         each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
@@ -643,6 +666,6 @@ class Attention(nn.Module):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
         b, t = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(b, t, H * D))

@@ -30,6 +30,7 @@ from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
+from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
 if TYPE_CHECKING:
@@ -498,6 +499,17 @@ class GenerationResultBase:
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
                                             None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
+            # Expose gen-first ctx usage so the postprocessor
+            # (_ctx_usage_from_outputs) can adopt the context-side accounting.
+            # ctx_usage only exists on the Python LlmResult wrapper; the raw C++
+            # bindings.executor.Result (non-disagg / benchmark path) does not
+            # have it, so fall back to None as with cached_tokens above.
+            ctx_usage = getattr(response_result, 'ctx_usage', None)
+            if ctx_usage is not None:
+                self._disaggregated_params = dataclasses.replace(
+                    self._disaggregated_params or DisaggregatedParams(),
+                    ctx_usage=ctx_usage,
+                )
             if context_phase_params is not None:
                 existing_disagg_params = self.disaggregated_params
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
@@ -532,9 +544,12 @@ class GenerationResultBase:
             # can prepend them.
             if (context_phase_params is not None
                     and self._disaggregated_params is not None):
-                first_gen_lp = [
-                    out.logprobs[0] for out in self._outputs if out.logprobs
-                ]
+                first_gen_lp = getattr(response_result, "first_gen_log_probs",
+                                       None)
+                if first_gen_lp is None:
+                    first_gen_lp = [
+                        out.logprobs[0] for out in self._outputs if out.logprobs
+                    ]
                 if first_gen_lp:
                     self._disaggregated_params.first_gen_log_probs = \
                         first_gen_lp
@@ -814,7 +829,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                  tokenizer: Optional[Callable] = None,
                  streaming: bool = False,
                  background_error_handler: Optional[Callable] = None,
-                 postproc_params: Optional["PostprocParams"] = None):
+                 postproc_params: Optional["PostprocParams"] = None,
+                 post_processor_hook: Optional[PostProcessorHook] = None):
         super().__init__(
             id,
             sampling_params,
@@ -823,6 +839,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         )
         self.tokenizer = tokenizer
         self._streaming = streaming
+        # User post-processing hook, threaded in alongside the
+        # tokenizer by this result's creator; None when unconfigured.
+        self._post_processor_hook = post_processor_hook
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
@@ -837,7 +856,12 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             'spaces_between_special_tokens':
             self.sampling_params.spaces_between_special_tokens
         }
-        if self.sampling_params.detokenize and self.tokenizer is not None:
+        # Detokenize when the client asked for text, OR whenever a post-processing
+        # hook is configured: the hook runs on every response regardless of the
+        # client's ``detokenize`` flag, else it could be bypassed with
+        # ``detokenize=False``.
+        if (self.sampling_params.detokenize or self._post_processor_hook
+                is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
                 if hasattr(
@@ -876,6 +900,21 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                             beam_output.stop_reason = stop_reason
                             self._done = True
                             break
+
+            self._apply_post_processor_hook()
+
+    def _apply_post_processor_hook(self):
+        """Run the user post-processing hook at the detok chokepoint.
+
+        Runs after detok populated ``text``/``text_diff`` and before any
+        per-endpoint formatter reads them. The hook instance is threaded in via
+        ``post_processor_hook`` (``None`` when unconfigured) so independent
+        ``LLM`` instances stay isolated.
+        """
+        hook = self._post_processor_hook
+        if hook is None:
+            return
+        apply_post_processor_hook(hook, self, streaming=self._streaming)
 
 
 # alias

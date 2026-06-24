@@ -75,6 +75,7 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/post-processor-hook.md
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
@@ -98,6 +99,8 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
+   developer-guide/telemetry.md
+   developer-guide/sparse-attention-development-guide.md
 
 
 .. toctree::

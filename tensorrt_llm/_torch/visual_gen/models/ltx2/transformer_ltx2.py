@@ -72,7 +72,7 @@ class LTX2Attention(Attention):
     - Output projection (to_out)
 
     Adds LTX-2 specifics:
-    - LTX 3D RoPE (INTERLEAVED / SPLIT) with separate k_pe support
+    - LTX 3D RoPE (INTERLEAVED / SPLIT)
     - Gated attention (to_gate_logits)
     - Cross-attention with different context_dim for K/V input
     """
@@ -88,6 +88,7 @@ class LTX2Attention(Attention):
         apply_gated_attention: bool = False,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
         enable_sequence_parallel: bool = False,
         use_ulysses: bool = False,
         async_ulysses: bool = False,
@@ -149,6 +150,7 @@ class LTX2Attention(Attention):
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
+            module_name=module_name,
             enable_sequence_parallel=enable_sp,
             async_ulysses=self._use_async_ulysses,
         )
@@ -168,11 +170,14 @@ class LTX2Attention(Attention):
             # (sharded inner backend + UlyssesAttention) for both self-attn and
             # cross-attn paths.
 
-        # For audio self-attention that may need a runtime Ulysses toggle
-        # (sequence length not always divisible by ulysses_size), create a
-        # plain backend as fallback.  The base class already set self.attn
-        # to UlyssesAttention(inner_backend=sharded_backend).
-        if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
+        # Build a Ulysses/plain dual-attn pair so set_ulysses_active() can toggle
+        # at runtime. Needed for self-attn (audio seq not always divisible by
+        # ulysses_size) and for v2a cross-attn under pure Ulysses (cp_size == 1),
+        # where it lets the block forward use Ulysses a2a instead of all-gathering
+        # the full video K/V. Combined ring/attn2d + Ulysses (cp_size > 1) keeps
+        # cross-attn on the all-gather fallback. The base class already set
+        # self.attn to UlyssesAttention(inner_backend=sharded_backend).
+        if use_ulysses and (cp_size == 1 or not self._is_cross_attn) and ulysses_size > 1:
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
@@ -184,6 +189,7 @@ class LTX2Attention(Attention):
                 dtype=self.dtype,
                 attention_config=config.attention,
                 attention_metadata_state=config.attention_metadata_state,
+                sparse_params=self.sparse_params,
             )
             self._has_dual_attn = True
 
@@ -274,8 +280,8 @@ class LTX2Attention(Attention):
         before all-gather. RoPE is per-token element-wise so it commutes with
         seq-dim concat — bit-identical to the post-gather rope while saving
         the cos/sin all-gather collective and reducing K-rope compute by U×.
-        The forward() consumer should pass ``k_pe=None`` to signal that K is
-        already rotated.
+        After this, K is already rotated, and the forward() consumer passes
+        ``pre_projected_kv=(k, v)`` to skip re-rotation.
         """
         k = self.to_k(context)
         v = self.to_v(context)
@@ -298,19 +304,24 @@ class LTX2Attention(Attention):
         x: torch.Tensor,
         context: torch.Tensor | None = None,
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
-        k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_padding_mask: torch.Tensor | None = None,
+        timestep=None,
     ) -> torch.Tensor:
         """Forward pass.
 
         Caller contract:
-          - FUSE_QKV (self-attn): pe must be set; k_pe and pre_projected_kv unused.
-          - SEPARATE_QKV (cross-attn): cached path requires pre_projected_kv;
-            uncached path uses ``context`` (may be None when the async-Ulysses
-            inner backend was swapped to a non-async one — falls back to
-            self-attn via kv_source=x). pe optional (None = norm-only).
-            k_pe overrides pe for K (e.g. AV cross-attn) when provided.
+          - FUSE_QKV (self-attn): pe must be set; pre_projected_kv unused.
+          - SEPARATE_QKV self-attn (async-Ulysses): pre_projected_kv=None,
+            context=None — routed to ``forward_async`` (V/Q/K rolling A2A).
+            Falls through to the sync SEPARATE_QKV self-attn path when the
+            inner backend lacks ``forward_async`` (Ulysses-inactive swap).
+          - SEPARATE_QKV cross-attn: pre_projected_kv must be set (K already
+            norm+rope'd by ``project_kv`` upstream — text cache or AV
+            project-before-gather). pe optional (None = norm-only on Q).
+            Uncached cross-attn (context != None without pre_projected_kv) is
+            rejected: Q/K may have different lengths so sharing pe would
+            mis-rotate K. Caller must use project_kv + pre_projected_kv.
 
         Args:
             key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
@@ -324,13 +335,13 @@ class LTX2Attention(Attention):
         Routing:
           1. Async-Ulysses self-attn → ``forward_async`` (V/Q/K rolling A2A).
           2. FUSE_QKV self-attn → packed fused kernel (or naive mini-config).
-          3. SEPARATE_QKV cross-attn → split fused kernel (or naive mini-config).
+          3. SEPARATE_QKV cross-attn (cached) → split fused kernel.
+          4. SEPARATE_QKV self-attn (sync fallback) → split fused kernel on x.
         """
         # Async-Ulysses self-attn dispatch. ``hasattr`` guard: audio_attn1 may
         # have ``set_ulysses_active(False)`` swap ``self.attn`` to a plain
         # backend that lacks ``forward_async`` — fall through to the sync
-        # uncached SEPARATE_QKV branch, which handles context=None via
-        # kv_source=x.
+        # uncached SEPARATE_QKV branch (self-attn on x).
         if (
             self.qkv_mode == QKVMode.SEPARATE_QKV
             and self._use_async_ulysses
@@ -338,7 +349,7 @@ class LTX2Attention(Attention):
             and pre_projected_kv is None
             and hasattr(self.attn, "forward_async")
         ):
-            return self.forward_async(x, freqs=pe)
+            return self.forward_async(x, freqs=pe, timestep=timestep)
 
         # Fused gate: prod uses fused kernels (head_dim ∈ {64, 128}); mini-config
         # tests (head_dim=32) fall to naive ops.
@@ -378,24 +389,28 @@ class LTX2Attention(Attention):
                     if pe is not None:
                         q = apply_rotary_emb(q, pe, self.rope_type)
             else:
-                # ─── uncached cross-attn / async self-attn fallback ───
-                # LTX-2 prod doesn't use uncached cross-attn (always pre-projects
-                # K/V). This branch also catches async self-attn when the inner
-                # backend lacks forward_async (audio Ulysses-inactive swap):
-                # context=None then, fall back to self-attn via kv_source=x.
-                kv_source = context if context is not None else x
+                # ─── uncached SEPARATE_QKV ───
+                # Two valid cases:
+                #   (a) async-Ulysses self-attn fallback (context=None) when
+                #       the inner backend lacks forward_async (e.g. audio
+                #       Ulysses-inactive swap). Use x for K/V (self-attn).
+                #   (b) (forbidden) uncached cross-attn (context != None) —
+                #       Q/K may have different lengths so sharing pe would
+                #       mis-rotate K. Caller must use project_kv + pre_projected_kv.
+                if context is not None:
+                    raise ValueError(
+                        "uncached SEPARATE_QKV cross-attn is forbidden; "
+                        "pass pre_projected_kv from project_kv(context, pe=...)."
+                    )
                 q = self.to_q(x)
-                k = self.to_k(kv_source)
-                v = self.to_v(kv_source)
+                k = self.to_k(x)
+                v = self.to_v(x)
                 if use_fused:
                     self.apply_split_norm_or_norm_rope(
                         q, self.norm_q.weight, self.num_attention_heads, pe
                     )
                     self.apply_split_norm_or_norm_rope(
-                        k,
-                        self.norm_k.weight,
-                        self.num_key_value_heads,
-                        k_pe if k_pe is not None else pe,
+                        k, self.norm_k.weight, self.num_key_value_heads, pe
                     )
                 else:
                     if self.qk_norm:
@@ -403,14 +418,12 @@ class LTX2Attention(Attention):
                         k = self.norm_k(k)
                     if pe is not None:
                         q = apply_rotary_emb(q, pe, self.rope_type)
-                    k_pe_use = k_pe if k_pe is not None else pe
-                    if k_pe_use is not None:
-                        k = apply_rotary_emb(k, k_pe_use, self.rope_type)
+                        k = apply_rotary_emb(k, pe, self.rope_type)
 
         attn_kwargs = {}
         if key_padding_mask is not None:
             attn_kwargs["key_padding_mask"] = key_padding_mask
-        out = self._attn_impl(q, k, v, **attn_kwargs)
+        out = self._attn_impl(q, k, v, timestep=timestep, **attn_kwargs)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
@@ -426,6 +439,7 @@ class LTX2Attention(Attention):
         self,
         x: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor] | None = None,
+        timestep=None,
     ) -> torch.Tensor:
         """LTX-2 async-Ulysses self-attn driver. Structurally mirrors base
         ``Attention.forward_async`` (single function, fused/unfused branches)
@@ -494,7 +508,7 @@ class LTX2Attention(Attention):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
 
         # LTX-2 gated-attention scaling in 4D before to_out.
         if self.to_gate_logits is not None:
@@ -580,6 +594,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.attn1",
             enable_sequence_parallel=True,
             use_ulysses=True,
             async_ulysses=_async_ulysses,
@@ -594,6 +609,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.attn2",
             enable_sequence_parallel=False,
         )
         self.ff = self._make_mlp(cfg, model_config, idx)
@@ -626,6 +642,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=audio_self_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.audio_attn1",
             enable_sequence_parallel=True,
         )
         self.audio_attn2 = LTX2Attention(
@@ -638,6 +655,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.audio_attn2",
             enable_sequence_parallel=False,
         )
         self.audio_ff = self._make_mlp(cfg, model_config, idx)
@@ -654,6 +672,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=v_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.audio_to_video_attn",
             enable_sequence_parallel=False,
         )
         self.video_to_audio_attn = LTX2Attention(
@@ -666,7 +685,9 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=a_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
+            module_name=f"transformer_blocks.{idx}.video_to_audio_attn",
             enable_sequence_parallel=True,
+            use_ulysses=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
         self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
@@ -739,6 +760,7 @@ class BasicAVTransformerBlock(nn.Module):
         perturbations=None,
         text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
         text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
+        step_index=None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
@@ -746,7 +768,8 @@ class BasicAVTransformerBlock(nn.Module):
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
             text_kv_video: Pre-projected (K, V) for video text cross-attention.
-                Falls back to inline computation if ``None``.
+                Required when the video stream runs cross-attn — built by
+                ``LTXModel.prepare_text_cache``.
             text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
         """
         if video is None and audio is None:
@@ -775,7 +798,14 @@ class BasicAVTransformerBlock(nn.Module):
             )
             if not skip_v_self:
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
-                v_self_out = self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa
+                v_self_out = (
+                    self.attn1(
+                        norm_vx,
+                        pe=video.positional_embeddings,
+                        timestep=video.timesteps,
+                    )
+                    * vgate_msa
+                )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
                 ):
@@ -787,6 +817,7 @@ class BasicAVTransformerBlock(nn.Module):
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 pre_projected_kv=text_kv_video,
+                timestep=video.timesteps,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -805,6 +836,7 @@ class BasicAVTransformerBlock(nn.Module):
                         norm_ax,
                         pe=audio.positional_embeddings,
                         key_padding_mask=audio.audio_padding_mask,
+                        timestep=audio.timesteps,
                     )
                     * agate_msa
                 )
@@ -819,6 +851,7 @@ class BasicAVTransformerBlock(nn.Module):
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
                 pre_projected_kv=text_kv_audio,
+                timestep=audio.timesteps,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -885,8 +918,8 @@ class BasicAVTransformerBlock(nn.Module):
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
-                        k_pe=None,  # K already rotated in project_kv
                         key_padding_mask=audio.audio_padding_mask,
+                        timestep=video.timesteps,
                     )
                     * gate_out_a2v
                 )
@@ -927,7 +960,7 @@ class BasicAVTransformerBlock(nn.Module):
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
-                        k_pe=None,  # K already rotated in project_kv
+                        timestep=audio.timesteps,
                     )
                     * gate_out_v2a
                 )
@@ -1722,6 +1755,8 @@ class LTXModel(BaseDiffusionModel):
         perturbations=None,
         *,
         text_cache: TextCache,
+        timestep: torch.Tensor | None = None,
+        step_index=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1731,6 +1766,14 @@ class LTXModel(BaseDiffusionModel):
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
             text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
                 Always required — callers must invoke ``prepare_text_cache()`` first.
+            timestep: Normalized denoising-time coordinate in ``[0, 1]``.
+                May be ``None`` for LTX-2 paths that rely only on per-modality
+                timestep values and do not need timestep-based CUDA graph
+                partitioning.
+                LTX-2 also carries per-modality timestep values in
+                ``video.timesteps`` / ``audio.timesteps`` for the reference
+                time-embedding path.
+            step_index: Ordinal denoising-loop index.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1814,7 +1857,12 @@ class LTXModel(BaseDiffusionModel):
             vx = video_args.x if video_args is not None else None
             ax = audio_args.x if audio_args is not None else None
             for block in self.transformer_blocks:
-                vx, ax = block(vx, ax, perturbations=perturbations)
+                vx, ax = block(
+                    vx,
+                    ax,
+                    perturbations=perturbations,
+                    step_index=step_index,
+                )
                 if video_args is not None and vx is not None:
                     video_args = replace(video_args, x=vx)
                 if audio_args is not None and ax is not None:
@@ -1827,6 +1875,7 @@ class LTXModel(BaseDiffusionModel):
                     perturbations=perturbations,
                     text_kv_video=v_kv[i] if v_kv else None,
                     text_kv_audio=a_kv[i] if a_kv else None,
+                    step_index=step_index,
                 )
 
         # Gather sequences back to full length for output processing.
