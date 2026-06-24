@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import time
 from abc import ABC, abstractmethod
@@ -677,16 +678,20 @@ class BlockHashMixin:
 
     def _init_block_hashing(self,
                             tokens_per_block: int = 32,
-                            custom_tokenizer: Optional[str] = None):
+                            custom_tokenizer: Optional[str] = None,
+                            use_harmony: Optional[bool] = None) -> None:
         env_tokens_per_block = os.environ.get(
             "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
         self._tokenizers: dict = {}
+        self._model_types: dict[str, Optional[str]] = {}
         self._custom_tokenizer = custom_tokenizer
+        self._use_harmony = use_harmony
         logger.info(f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
-                    f", custom_tokenizer={self._custom_tokenizer}")
+                    f", custom_tokenizer={self._custom_tokenizer}"
+                    f", use_harmony={self._use_harmony}")
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
@@ -706,12 +711,69 @@ class BlockHashMixin:
                     model, trust_remote_code=True).tokenizer
         return self._tokenizers[model]
 
+    def _get_model_type(self, model: str) -> Optional[str]:
+        if model not in self._model_types:
+            model_type = None
+            normalized_model = model.lower().replace("_", "-")
+            if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
+                model_type = "gpt_oss"
+            else:
+                config_path = os.path.join(model, "config.json")
+                if os.path.isfile(config_path):
+                    try:
+                        with open(config_path, encoding="utf-8") as config_file:
+                            config = json.load(config_file)
+                        if isinstance(config, dict):
+                            raw_model_type = config.get("model_type")
+                            if isinstance(raw_model_type, str):
+                                model_type = raw_model_type
+                    except (OSError, json.JSONDecodeError) as e:
+                        logger.debug(
+                            "BlockHashMixin: failed to read model config for "
+                            f"{model}: {e}")
+            self._model_types[model] = model_type
+        return self._model_types[model]
+
+    def _uses_harmony_tokenization(self,
+                                   request: ChatCompletionRequest) -> bool:
+        if self._use_harmony is not None:
+            return self._use_harmony
+        return self._get_model_type(request.model) == "gpt_oss"
+
+    @staticmethod
+    def _tool_dicts(
+            request: ChatCompletionRequest
+    ) -> Optional[list[dict[str, object]]]:
+        if request.tools is None:
+            return None
+        return [tool.model_dump() for tool in request.tools]
+
+    def _tokenize_harmony_chat(
+            self, request: ChatCompletionRequest) -> list[list[int]]:
+        from tensorrt_llm.serve import harmony_adapter
+
+        tools = self._tool_dicts(request) if request.tools else None
+        result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
+            request.messages,
+            tools,
+            reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
+                request.reasoning_effort),
+            tool_choice=request.tool_choice,
+        )
+        return [result]
+
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
+            if self._uses_harmony_tokenization(request):
+                return self._tokenize_harmony_chat(request)
             tokenizer = self._get_tokenizer(request.model)
+            # Forward tool schemas and chat-template flags so router hashes use
+            # the same rendered prompt as the worker-side tokenizer.
+            chat_template_kwargs = dict(request.chat_template_kwargs or {})
+            chat_template_kwargs["tools"] = self._tool_dicts(request)
             result = tokenizer.apply_chat_template(
                 [
                     msg if isinstance(msg, dict) else dict(msg)
@@ -720,14 +782,13 @@ class BlockHashMixin:
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
                 return_dict=False,
+                **chat_template_kwargs,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
             # string from apply_chat_template even with tokenize=True.
             # Encode to token IDs if needed.
             if isinstance(result, str):
                 result = tokenizer.encode(result, add_special_tokens=False)
-            # Set prompt_token_ids so the worker server skips re-tokenization
-            request.prompt_token_ids = result
             return [result]
 
         # Handle CompletionRequest (has prompt)
@@ -743,10 +804,6 @@ class BlockHashMixin:
 
         tokenizer = self._get_tokenizer(request.model)
         token_lists = [tokenizer(prompt)["input_ids"] for prompt in prompts]
-        # Replace string prompts with token IDs so the worker server
-        # skips re-tokenization
-        request.prompt = (token_lists
-                          if len(token_lists) > 1 else token_lists[0])
         return token_lists
 
     def _compute_block_hashes(self,
@@ -800,10 +857,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
+                 use_harmony: Optional[bool] = None,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer)
+        self._init_block_hashing(tokens_per_block, custom_tokenizer,
+                                 use_harmony)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size

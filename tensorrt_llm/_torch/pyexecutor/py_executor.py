@@ -2708,6 +2708,31 @@ class PyExecutor:
         if self._is_kv_manager_v2:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
+    
+    @staticmethod
+    def _sync_disagg_generation_trans_complete_draft_tokens(
+            requests: Iterable[LlmRequest]) -> None:
+        for request in requests:
+            if not getattr(request,
+                           "is_disagg_generation_transmission_complete", False):
+                continue
+
+            context_phase_params = request.context_phase_params
+            if context_phase_params is None:
+                continue
+
+            draft_tokens = context_phase_params.draft_tokens
+            request.py_draft_tokens = [] if draft_tokens is None else list(
+                draft_tokens)
+            request.draft_tokens = request.py_draft_tokens
+            request.py_draft_pages_allocated = len(request.py_draft_tokens)
+
+    @staticmethod
+    def _get_generation_num_draft_tokens(request: LlmRequest) -> int:
+        py_draft_tokens = getattr(request, "py_draft_tokens", None)
+        if py_draft_tokens is None:
+            return request.num_draft_tokens
+        return max(len(py_draft_tokens), request.num_draft_tokens)
 
     def _get_disagg_transfer_admission_controller(
             self) -> DisaggTransferAdmissionController:
@@ -2843,6 +2868,8 @@ class PyExecutor:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
+            self._sync_disagg_generation_trans_complete_draft_tokens(
+                self.active_requests)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -4283,8 +4310,9 @@ class PyExecutor:
             else:
                 compute = max(1, remaining - reusable_in_chunk)
             num_scheduled_ctx_tokens += compute
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
+        num_scheduled_gen_tokens = sum(
+            1 + PyExecutor._get_generation_num_draft_tokens(gen_req)
+            for gen_req in generation_requests)
         return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
@@ -4718,7 +4746,10 @@ class PyExecutor:
                     ctx_draft_tokens = [
                         0
                     ] * self.model_engine.max_total_draft_tokens
-                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+                req.py_draft_tokens = [] if ctx_draft_tokens is None else list(
+                    ctx_draft_tokens)
+                req.draft_tokens = req.py_draft_tokens
+                req.py_draft_pages_allocated = len(req.py_draft_tokens)
                 beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(
                         req, beam_width, first_gen_tokens):

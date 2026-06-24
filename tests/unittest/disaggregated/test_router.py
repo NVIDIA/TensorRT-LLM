@@ -1,6 +1,8 @@
 import asyncio
 import copy
 import threading
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import aiohttp
@@ -8,8 +10,10 @@ import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ChatCompletionToolsParam,
                                                 CompletionRequest,
-                                                DisaggregatedParams)
+                                                DisaggregatedParams,
+                                                FunctionDefinition)
 from tensorrt_llm.serve.router import (BlockHashMixin, ConversationRouter,
                                        KvCacheAwareRouter, LoadBalancingRouter,
                                        RoundRobinRouter, create_router)
@@ -81,6 +85,33 @@ def servers():
 
 def get_prompt_lengths():
     return [100, 500, 10, 400, 2000, 100]
+
+
+def _get_weather_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(function=FunctionDefinition(
+        name="get_current_weather",
+        description="Get the current weather in a given location",
+        parameters={
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "City and country",
+                },
+            },
+            "required": ["location"],
+        },
+    ))
+
+
+def _mock_tokenizer(token_ids: list[int] | None = None) -> mock.MagicMock:
+    if token_ids is None:
+        token_ids = [10, 20, 30]
+    tokenizer = mock.MagicMock()
+    tokenizer.apply_chat_template.return_value = token_ids
+    tokenizer.encode.return_value = token_ids
+    tokenizer.return_value = {"input_ids": token_ids}
+    return tokenizer
 
 
 @pytest.fixture
@@ -858,6 +889,334 @@ def test_create_router_conversation():
     router = create_router(RouterConfig(type="conversation"),
                            ["server1", "server2"])
     assert isinstance(router, ConversationRouter)
+
+
+def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[11, 22, 33])
+    req = ChatCompletionRequest(
+        model="custom-chat-model",
+        messages=[{
+            "role": "user",
+            "content": "what's the weather in Paris?"
+        }],
+        tools=[_get_weather_tool()],
+        chat_template_kwargs={"thinking": True},
+    )
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=tokenizer):
+        token_lists = router._tokenize(req)
+
+    assert token_lists == [[11, 22, 33]]
+    tokenizer.apply_chat_template.assert_called_once()
+    assert req.prompt_token_ids is None
+
+    kwargs = tokenizer.apply_chat_template.call_args.kwargs
+    tool_dicts = kwargs["tools"]
+    assert isinstance(tool_dicts, list)
+    assert tool_dicts[0]["function"]["name"] == "get_current_weather"
+    assert kwargs["thinking"] is True
+
+
+@pytest.mark.parametrize(("tools", "expected_tools"), [(None, None), ([], [])])
+def test_tokenize_handles_absent_and_empty_tools(
+        tools: list[ChatCompletionToolsParam] | None,
+        expected_tools: list[ChatCompletionToolsParam] | None) -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[11, 22, 33])
+    req = ChatCompletionRequest(model="custom-chat-model",
+                                messages=[{
+                                    "role": "user",
+                                    "content": "hello"
+                                }],
+                                tools=tools)
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=tokenizer):
+        router._tokenize(req)
+
+    tokenizer.apply_chat_template.assert_called_once()
+    assert req.prompt_token_ids is None
+    kwargs = tokenizer.apply_chat_template.call_args.kwargs
+    assert kwargs["tools"] == expected_tools
+
+
+def test_gpt_oss_tokenize_uses_harmony_tokens_for_router_hashes() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[900, 901, 902, 903])
+    harmony_tokens = [100, 101, 102, 103, 104]
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.return_value = harmony_tokens
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"), mock.patch.object(
+                            router, "_get_tokenizer", return_value=tokenizer):
+        req = ChatCompletionRequest(
+            model="openai/gpt-oss-20b",
+            messages=[{
+                "role": "developer",
+                "content": "Use tools when useful."
+            }, {
+                "role": "user",
+                "content": "what's the weather in Paris?"
+            }],
+            tools=[_get_weather_tool()],
+            tool_choice="none",
+            reasoning_effort="medium",
+        )
+        token_lists, block_hashes = router._tokenize_and_compute_block_hashes(
+            req)
+
+    tokenizer.apply_chat_template.assert_not_called()
+    harmony.openai_to_harmony_tokens.assert_called_once()
+    assert token_lists == [harmony_tokens]
+    assert req.prompt_token_ids is None
+
+    call_args = harmony.openai_to_harmony_tokens.call_args
+    assert call_args.args[0] == req.messages
+    tool_dicts = call_args.args[1]
+    assert isinstance(tool_dicts, list)
+    assert tool_dicts[0]["function"]["name"] == "get_current_weather"
+    assert call_args.kwargs["reasoning_effort"] == "medium"
+    assert call_args.kwargs["tool_choice"] == "none"
+
+    expected_hashes = router._compute_block_hashes([harmony_tokens])
+    assert block_hashes == expected_hashes
+
+
+def test_gpt_oss_harmony_empty_tools_matches_chat_harmony_path() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    harmony_tokens = [100, 101, 102, 103, 104]
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.return_value = harmony_tokens
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"):
+        req = ChatCompletionRequest(model="openai/gpt-oss-20b",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }],
+                                    tools=[],
+                                    tool_choice="auto",
+                                    reasoning_effort="medium")
+        token_lists = router._tokenize(req)
+
+    harmony.openai_to_harmony_tokens.assert_called_once()
+    assert token_lists == [harmony_tokens]
+    assert req.prompt_token_ids is None
+
+    call_args = harmony.openai_to_harmony_tokens.call_args
+    assert call_args.args[0] == req.messages
+    assert call_args.args[1] is None
+    assert call_args.kwargs["reasoning_effort"] == "medium"
+    assert call_args.kwargs["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_case", ["nonempty", "empty"])
+async def test_gpt_oss_router_and_server_create_same_tokenized_input(
+        tool_case: str) -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    request_tools = [_get_weather_tool()] if tool_case == "nonempty" else []
+
+    def fake_harmony_tokens(messages: list[object],
+                            tools: list[dict[str, object]] | None,
+                            reasoning_effort: object | None = None,
+                            tool_choice: object | None = None) -> list[int]:
+        tool_marker = 0 if tools is None else len(tools) + 10
+        return [
+            len(messages),
+            tool_marker,
+            len(str(reasoning_effort)),
+            len(str(tool_choice)),
+        ]
+
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.side_effect = fake_harmony_tokens
+    harmony.get_stop_tokens.return_value = [42]
+
+    request = ChatCompletionRequest(
+        model="openai/gpt-oss-20b",
+        messages=[{
+            "role": "developer",
+            "content": "Use tools when useful."
+        }, {
+            "role": "user",
+            "content": "what's the weather in Paris?"
+        }],
+        tools=request_tools,
+        tool_choice="auto",
+        reasoning_effort="medium",
+        stream=True,
+        max_completion_tokens=1,
+    )
+    router_request = copy.deepcopy(request)
+    server_request = copy.deepcopy(request)
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.harmony_adapter = harmony
+    server.await_disconnected = mock.AsyncMock()
+    server.model_config = SimpleNamespace(vocab_size=1000)
+    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
+        vocab_size=1000))
+    promise = mock.MagicMock()
+    promise.prompt_token_ids = []
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(num_postprocess_workers=0),
+        generate_async=mock.MagicMock(return_value=promise),
+    )
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"), mock.patch(
+                            "tensorrt_llm.serve.openai_server."
+                            "maybe_transform_reasoning_effort",
+                            return_value="medium"):
+        router_token_ids = router._tokenize(router_request)[0]
+        await server.chat_harmony(server_request, raw_request=None)
+
+    server_token_ids = server.generator.generate_async.call_args.kwargs[
+        "inputs"]
+    assert router_token_ids == server_token_ids
+    assert router_request.prompt_token_ids is None
+
+    router_call, server_call = harmony.openai_to_harmony_tokens.call_args_list
+    assert router_call.args == server_call.args
+    assert router_call.kwargs == server_call.kwargs
+
+
+def test_use_harmony_flag_for_alias_model() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32,
+                                use_harmony=True)
+    tokenizer = _mock_tokenizer(token_ids=[900, 901, 902, 903])
+    harmony_tokens = [100, 101, 102, 103, 104]
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.return_value = harmony_tokens
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"), mock.patch.object(
+                            router, "_get_tokenizer", return_value=tokenizer):
+        req = ChatCompletionRequest(model="served-model",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+        token_lists = router._tokenize(req)
+
+    tokenizer.apply_chat_template.assert_not_called()
+    harmony.openai_to_harmony_tokens.assert_called_once()
+    assert token_lists == [harmony_tokens]
+    assert req.prompt_token_ids is None
+
+
+def test_gpt_oss_config_model_type_uses_harmony(tmp_path: Path) -> None:
+    model_dir = tmp_path / "served-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type": "gpt_oss"}',
+                                           encoding="utf-8")
+
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[900, 901, 902, 903])
+    harmony_tokens = [100, 101, 102, 103, 104]
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.return_value = harmony_tokens
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"), mock.patch.object(
+                            router, "_get_tokenizer", return_value=tokenizer):
+        req = ChatCompletionRequest(model=str(model_dir),
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+        token_lists = router._tokenize(req)
+
+    tokenizer.apply_chat_template.assert_not_called()
+    harmony.openai_to_harmony_tokens.assert_called_once()
+    assert token_lists == [harmony_tokens]
+    assert req.prompt_token_ids is None
+
+
+def test_tokenize_does_not_rewrite_completion_prompt() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[10, 20, 30])
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=tokenizer):
+        req = CompletionRequest(model="TinyLlama", prompt="hello")
+        token_lists = router._tokenize(req)
+
+    assert token_lists == [[10, 20, 30]]
+    assert req.prompt == "hello"
+
+
+def test_tokenize_skipped_when_prompt_token_ids_already_set() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    req = ChatCompletionRequest(model="openai/gpt-oss-20b",
+                                messages=[{
+                                    "role": "user",
+                                    "content": "hello"
+                                }],
+                                prompt_token_ids=[1, 2, 3])
+
+    with mock.patch.object(router, "_tokenize_harmony_chat") as harmony_path, \
+            mock.patch.object(router, "_get_tokenizer") as get_tokenizer:
+        token_lists = router._tokenize(req)
+
+    assert token_lists == [[1, 2, 3]]
+    harmony_path.assert_not_called()
+    get_tokenizer.assert_not_called()
 
 
 def test_block_hash_mixin_routes_through_transformers_tokenizer():
