@@ -49,13 +49,34 @@ _EXTRA_CONFIG_IDS = (
     "gemma3_1b_mqa_hd256",
 )
 
-# Standard self-attention batch phases.
-_PHASES = {
-    "ctx": dict(seq_lens=[16, 24, 5], num_cached_tokens=[0, 0, 0], num_contexts=3),
-    "gen": dict(seq_lens=[1, 1, 1], num_cached_tokens=[20, 130, 8], num_contexts=0),
-    "mix": dict(seq_lens=[16, 1, 1], num_cached_tokens=[0, 30, 70], num_contexts=1),
-}
-_SLIDING_CTX_WINDOW_LIMIT = 1024
+_NON_SLIDING_PHASE_WINDOW = 1024
+
+
+def _phases_from_window(window: int) -> dict:
+    long_len = window + 17
+    return {
+        "ctx": dict(
+            seq_lens=[long_len, 73, 41],
+            num_cached_tokens=[0, 0, 0],
+            num_contexts=3,
+        ),
+        "gen": dict(
+            seq_lens=[1, 1, 1],
+            num_cached_tokens=[long_len, 73, 41],
+            num_contexts=0,
+        ),
+        "mix": dict(
+            seq_lens=[long_len, 1, 1],
+            num_cached_tokens=[0, long_len, 73],
+            num_contexts=1,
+        ),
+    }
+
+
+# Standard self-attention batch phases. Non-sliding cases use a nominal window
+# only to choose non-tiny, non-power-of-two lengths; the backend still receives
+# sliding_window=None.
+_PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
@@ -63,30 +84,7 @@ def _phases_for(cfg: ModelAttnConfig) -> dict:
         return _PHASES
 
     assert cfg.sliding_window is not None
-    window = cfg.sliding_window
-    long_cache = window + 17
-    context_len = window + 17 if window <= _SLIDING_CTX_WINDOW_LIMIT else 257
-
-    # Every sliding config gets a decode request whose total KV length exceeds
-    # the real model window, while context prefill stays bounded for large
-    # windows because the Vanilla golden is quadratic in context length.
-    return {
-        "ctx": dict(
-            seq_lens=[context_len, 73, 41],
-            num_cached_tokens=[0, 0, 0],
-            num_contexts=3,
-        ),
-        "gen": dict(
-            seq_lens=[1, 1, 1],
-            num_cached_tokens=[long_cache, 73, 41],
-            num_contexts=0,
-        ),
-        "mix": dict(
-            seq_lens=[context_len, 1, 1],
-            num_cached_tokens=[0, long_cache, 73],
-            num_contexts=1,
-        ),
-    }
+    return _phases_from_window(cfg.sliding_window)
 
 
 def _rope_dict(cfg: ModelAttnConfig):
@@ -144,9 +142,7 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
                 f"{cfg.id}-{_prec_tag(dtype, kvd)}",
                 BackendCase(
                     cache="none",
-                    seq_lens=[16, 24, 5],
-                    num_cached_tokens=[0, 0, 0],
-                    num_contexts=3,
+                    **phases["ctx"],
                     dtype=dtype,
                     **common,
                 ),
@@ -238,12 +234,14 @@ def test_split_consistency(backend):
     from capability_matrix import unsupported_reason
 
     # Two context + two generation requests.
+    ctx_lens = _PHASES["ctx"]["seq_lens"][:2]
+    gen_cached_lens = _PHASES["gen"]["num_cached_tokens"][:2]
     full = BackendCase(
         num_heads=8,
         num_kv_heads=2,
         head_dim=128,
-        seq_lens=[16, 24, 1, 1],
-        num_cached_tokens=[0, 0, 30, 50],
+        seq_lens=[*ctx_lens, 1, 1],
+        num_cached_tokens=[0, 0, *gen_cached_lens],
         num_contexts=2,
     )
     if unsupported_reason(backend, full) is not None:
@@ -254,18 +252,35 @@ def test_split_consistency(backend):
 
     # Run request 0 (ctx) + request 2 (gen) as a sub-batch with the SAME inputs.
     # The per-request slices of the packed tensors must reproduce the full run.
+    q_offsets = [0, *torch.tensor(full.seq_lens).cumsum(0).tolist()]
     sub = BackendCase(
         num_heads=8,
         num_kv_heads=2,
         head_dim=128,
-        seq_lens=[16, 1],
-        num_cached_tokens=[0, 30],
+        seq_lens=[ctx_lens[0], 1],
+        num_cached_tokens=[0, gen_cached_lens[0]],
         num_contexts=1,
     )
-    # Slice inputs for requests {0, 2}: q tokens [0:16] (ctx0) + [40:41] (gen2).
-    q = torch.cat([inputs["q"][0:16], inputs["q"][40:41]], dim=0)
-    nk = torch.cat([inputs["new_k"][0:16], inputs["new_k"][40:41]], dim=0)
-    nv = torch.cat([inputs["new_v"][0:16], inputs["new_v"][40:41]], dim=0)
+    # Slice inputs for requests {0, 2}: context request 0 plus generation
+    # request 0 after the two contexts.
+    q = torch.cat(
+        [inputs["q"][q_offsets[0] : q_offsets[1]], inputs["q"][q_offsets[2] : q_offsets[3]]],
+        dim=0,
+    )
+    nk = torch.cat(
+        [
+            inputs["new_k"][q_offsets[0] : q_offsets[1]],
+            inputs["new_k"][q_offsets[2] : q_offsets[3]],
+        ],
+        dim=0,
+    )
+    nv = torch.cat(
+        [
+            inputs["new_v"][q_offsets[0] : q_offsets[1]],
+            inputs["new_v"][q_offsets[2] : q_offsets[3]],
+        ],
+        dim=0,
+    )
     sub_inputs = dict(
         q=q,
         new_k=nk,

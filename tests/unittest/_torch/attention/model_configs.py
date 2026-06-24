@@ -178,7 +178,7 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "qwen3_moe_30b_gqa",
-        "Qwen3-MoE-30B-A3B, Qwen3-VL-MoE-30B-A3B, synthetic Llama GQA-4",
+        "Qwen3-MoE-30B-A3B, Qwen3-VL-MoE-30B-A3B",
         num_heads=32,
         num_kv_heads=4,
         head_dim=128,
