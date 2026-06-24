@@ -19,6 +19,7 @@ This module defines atomic TRT-LLM-specific ops that use optimized kernels.
 The torch fallback variants are defined separately to enable multi-pattern matching.
 """
 
+import os
 from typing import List, Optional
 
 import torch
@@ -295,5 +296,18 @@ def trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4_fake(
 
 
 def is_trtllm_op_available():
-    """Check if TRT-LLM ops are available and running with MPI."""
-    return is_ompi()
+    """Check if TRT-LLM ops are available for AutoDeploy collectives."""
+    if is_ompi():
+        return True
+
+    # trtllm-llmapi-launch intentionally removes OMPI/SLURM variables from
+    # the trtllm-serve child to avoid duplicate MPI initialization. It leaves
+    # these launcher-specific variables so the child can bind to pre-spawned
+    # LLMAPI worker ranks.
+    if os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1":
+        try:
+            return int(os.getenv("tllm_mpi_size") or "1") > 1
+        except ValueError:
+            return False
+
+    return False
