@@ -7372,3 +7372,35 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestGLM52FP8(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-5.2-FP8"
+    MODEL_PATH = f"{llm_models_root()}/GLM-5.2-FP8"
+
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    @pytest.mark.skip_less_device(8)
+    def test_8gpus(self, tp_size, ep_size):
+        # GLM-5.2 reuses the DeepSeek-V3.2 path (MLA + DSA) with cross-layer
+        # indexer sharing: only "full" layers run the indexer, "shared" layers
+        # reuse the previous full layer's top-k.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="DEEPGEMM"),
+            speculative_config=MTPDecodingConfig(max_draft_len=1),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
