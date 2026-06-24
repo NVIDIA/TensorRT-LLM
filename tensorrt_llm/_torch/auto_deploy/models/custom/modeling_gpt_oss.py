@@ -50,9 +50,10 @@ deterministic, node-local sharding.
     head-count dimension scales with TP.
   * MoE router + experts stay replicated under sharding-IR; EP/TP-MoE for the
     trtllm-gen path is applied later by a separate ``ShardableNode``.
-  * ``lm_head`` stays as a plain ``nn.Linear`` — no canonical sharding-IR pattern
-    for col-parallel-linear-then-all-gather, and the gain is marginal
-    (~80 us/token at TP=4 for gpt-oss-120b).
+  * ``lm_head`` is emitted as ``torch_linear_simple`` (NOT a plain ``nn.Linear``): the hint-driven
+    sharder only recognizes canonical ops, so a plain ``aten.linear`` would be invisible to it.
+    ``simple_shard_filter: "lm_head"`` then column-splits the vocab dim + all_gathers
+    (vocab-parallel), matching PT's COLUMN ``ParallelLMHead``.
 """
 
 import math
@@ -553,7 +554,8 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = GptOssModel(config)
-        # lm_head stays as plain nn.Linear; see module docstring for rationale.
+        # lm_head module is a plain nn.Linear; the forward emits it as torch_linear_simple
+        # for vocab-parallel sharding (see forward + module docstring).
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
@@ -583,7 +585,18 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        # Vocab-parallel lm_head: emit a plain linear; the sharder column-splits
+        # the vocab dim + all_gathers via `simple_shard_filter: "lm_head"` (matches
+        # PT's COLUMN ParallelLMHead and the upstream deepseek-r1/qwen pattern).
+        # NOTE: do NOT add tp_mode="colwise"/an explicit all_gather here — the
+        # hint-driven sharder replicates lm_head, and a manual all_gather would
+        # double-gather on top of simple_shard_filter.
+        logits = torch.ops.auto_deploy.torch_linear_simple(
+            outputs.last_hidden_state,
+            self.lm_head.weight,
+            self.lm_head.bias,
+            layer_type="lm_head",
+        )
         return GptOssCausalLMOutput(logits=logits)
 
 

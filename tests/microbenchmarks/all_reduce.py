@@ -14,6 +14,11 @@
 # limitations under the License.
 
 import os
+
+# For benchmarks, we disable the CUDA graph support overhead.
+# TRT-LLM production and profiling runs should do the same.
+os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
+
 from argparse import ArgumentParser
 from itertools import product
 
@@ -45,6 +50,37 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 
+def _allocate_nccl_window_tensor(input_tensor: torch.Tensor,
+                                 mapping: Mapping) -> torch.Tensor | None:
+    """Allocate a tensor from the NCCL symmetric-memory window pool."""
+    try:
+        from tensorrt_llm.bindings.internal.thop import BufferKind
+        window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
+            input_tensor, int(BufferKind.NCCL_WINDOW), mapping.tp_group)
+    except RuntimeError:
+        return None
+    if actual_kind != int(BufferKind.NCCL_WINDOW):
+        return None
+    return window_tensor
+
+
+def _register_nccl_window_input(input_tensor: torch.Tensor,
+                                mapping: Mapping,
+                                *,
+                                required: bool = False) -> torch.Tensor:
+    """Run NCCL_SYMMETRIC on the already-registered input path."""
+    window_tensor = _allocate_nccl_window_tensor(input_tensor, mapping)
+    if window_tensor is None:
+        if required:
+            raise RuntimeError(
+                "NCCL_SYMMETRIC benchmark requires a registered NCCL_WINDOW "
+                "input tensor, but allocation did not return NCCL_WINDOW.")
+        return input_tensor
+    window_tensor.copy_(input_tensor)
+    torch.cuda.synchronize(input_tensor.device)
+    return window_tensor
+
+
 def profile_allreduce(
     mapping: Mapping,
     dist: Distributed,
@@ -61,7 +97,18 @@ def profile_allreduce(
     allreduce_instance=None,
     profile_gemm_allreduce: bool = False,
     gemm_in_features: int | None = None,
+    register_symmetric_input: bool = True,
+    require_registered_symmetric_input: bool = True,
 ):
+
+    allreduce = allreduce_instance or AllReduce(mapping=mapping,
+                                                strategy=strategy)
+    effective_strategy = getattr(allreduce, "strategy", strategy)
+    strategy = effective_strategy
+    if (register_symmetric_input and not profile_gemm_allreduce
+            and effective_strategy == AllReduceStrategy.NCCL_SYMMETRIC):
+        input = _register_nccl_window_input(
+            input, mapping, required=require_registered_symmetric_input)
 
     allreduce_params = AllReduceParams(
         fusion_op=fusion,
@@ -72,8 +119,6 @@ def profile_allreduce(
         bias=bias,
     )
 
-    allreduce = allreduce_instance or AllReduce(mapping=mapping,
-                                                strategy=strategy)
     linear = None
     if profile_gemm_allreduce:
         if gemm_in_features is None:
@@ -114,11 +159,11 @@ def profile_allreduce(
             func(input, loop_num=1)
 
         if enable_cudagraph:
-            # Untimed warmup run outside of graph capture
-            func(input, loop_num=1)
-            # CUDA graph warmup then capture
-            for _ in range(2):
-                func(input, loop_num=1)
+            # Run one multi-iteration warmup, not repeated single-iteration
+            # warmups: `output = allreduce(x)` keeps the previous output alive
+            # while the next RHS allocates its output, seeding the same two
+            # reusable output windows that graph capture will need.
+            func(input, loop_num=3)
             with torch.cuda.graph(graph, stream=stream):
                 output = func(input)
 
@@ -266,17 +311,6 @@ def allreduce_benchmark(
                 start_col = mapping.tp_rank * local_in_features
                 input_for_profile = input[:, start_col:start_col +
                                           local_in_features].contiguous()
-            elif strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
-                              AllReduceStrategy.NCCL, AllReduceStrategy.AUTO):
-                try:
-                    from tensorrt_llm.bindings.internal.thop import BufferKind
-                    window_out, actual_kind = torch.ops.trtllm.allocate_output(
-                        input, int(BufferKind.NCCL_WINDOW), mapping.tp_group)
-                    if actual_kind == int(BufferKind.NCCL_WINDOW):
-                        window_out.copy_(input)
-                        input_for_profile = window_out
-                except RuntimeError:
-                    pass
 
             median_ms = profile_allreduce(
                 mapping=mapping,

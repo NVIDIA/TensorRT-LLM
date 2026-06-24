@@ -539,7 +539,13 @@ models:
 - name: google/gemma-4-26B-A4B-it
   config_id: gemma4_moe
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
+- name: nvidia/Gemma-4-26B-A4B-NVFP4
+  config_id: gemma4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
 # --- Gemma 4 (2026) - Dense 31B ---
+- name: nvidia/Gemma-4-31B-IT-NVFP4
+  config_id: gemma4_dense
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'gemma4_dense.yaml']
 # AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
 # - name: google/gemma-4-31B-it
 #   config_id: gemma4_dense
