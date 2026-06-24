@@ -118,11 +118,12 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
-    # FlashInfer's standard paged KV append kernel supports a fixed head_dim
-    # dispatch set and launches one thread block with
-    # ``blockDim=(head_dim / vec_size, num_kv_heads)``. CUDA rejects launches
-    # above 1024 threads/block, so large MHA shapes such as 128 KV heads x
-    # bf16/fp16 head_dim 128 cannot be represented by this backend path.
+    # FlashInfer's standard paged path has shape-specific kernel limits. The KV
+    # append kernel supports a fixed head_dim dispatch set and launches one
+    # thread block with ``blockDim=(head_dim / vec_size, num_kv_heads)``. CUDA
+    # rejects launches above 1024 threads/block, so large MHA shapes such as
+    # 128 KV heads x bf16/fp16 head_dim 128 cannot be represented by this
+    # backend path. The paged FA2 attention path also rejects head_dim 512.
     if (
         backend == "FLASHINFER"
         and getattr(case, "cache", "paged") != "none"
@@ -133,6 +134,8 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
                 "FLASHINFER paged KV append supports only head_dim "
                 f"64/128/256/512 (got {case.head_dim})"
             )
+        if case.head_dim == 512:
+            return "FLASHINFER paged attention does not support head_dim 512"
         kv_dtype = getattr(case, "kv_dtype", None) or getattr(case, "dtype", None)
         dtype_size = 1 if kv_dtype == "float8_e4m3fn" else 2
         vec_size = max(16 // dtype_size, case.head_dim // 32)
@@ -144,9 +147,21 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
                 f"{case.num_kv_heads} KV heads)"
             )
 
+    # TRTLLM's standard paged FMHA/MMHA kernels in this build do not cover the
+    # Gemma4 head_dim 512 path. Smaller non-core context sizes such as Phi-3's
+    # head_dim 96 still run through the fallback FMHA path.
+    if (
+        backend == "TRTLLM"
+        and getattr(case, "cache", "paged") != "none"
+        and not getattr(case, "is_mla", False)
+        and case.head_dim > 256
+    ):
+        return f"TRTLLM paged attention supports head_dim <= 256 (got {case.head_dim})"
+
     # The TRTLLM MMHA generation kernel is fast-built in this environment, which
     # omits non-core head sizes (for example Phi-3's head_dim 96). Context FMHA
-    # still covers those configs, so only skip cases that include generation.
+    # still covers those configs, so only skip remaining cases that include
+    # generation.
     if (
         backend == "TRTLLM"
         and getattr(case, "cache", "paged") != "none"
