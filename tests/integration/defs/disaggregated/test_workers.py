@@ -794,73 +794,92 @@ class ConversationRouterTester(BasicWorkerTester):
                 response.raise_for_status()
             return response_dict
 
+    @staticmethod
+    def _apply_conversation_id_transport(request: dict, conv_id: str,
+                                         use_body_params: bool) -> dict | None:
+        if use_body_params:
+            request["conversation_params"] = {"conversation_id": conv_id}
+            return None
+        return {"X-Correlation-ID": conv_id}
+
     async def test_explicit_conversation_id(self):
         """Same conversation_id sticky-routes; different ids load-balance."""
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
                     total=self.req_timeout_secs)) as session:
-                # 1. Same conversation_id always routes to the same server
-                conv_id = "test-explicit-conv-id"
-                prompt = ("Hello, this is a test prompt for "
-                          "conversation routing with explicit id")
-                first_server = None
-                for i in range(6):
-                    req = CompletionRequest(
-                        model=self.model_name,
-                        prompt=prompt,
-                        conversation_params=ConversationParams(
-                            conversation_id=conv_id),
-                        disaggregated_params=DisaggregatedParams(
-                            request_type="context_only"))
-                    server, _ = await self.ctx_router.get_next_server(req)
-                    if first_server is None:
-                        first_server = server
-                    else:
-                        assert server == first_server, (
-                            f"Round {i}: expected {first_server}, "
-                            f"got {server}")
-                    response = await self._send_via_disagg(
-                        session, {
+                for transport_name, use_body_params in [
+                    ("header", False),
+                    ("body", True),
+                ]:
+                    # 1. Same conversation_id always routes to the same server
+                    conv_id = f"test-explicit-conv-id-{transport_name}"
+                    prompt = ("Hello, this is a test prompt for "
+                              "conversation routing with explicit id")
+                    first_server = None
+                    for i in range(6):
+                        req = CompletionRequest(
+                            model=self.model_name,
+                            prompt=prompt,
+                            conversation_params=ConversationParams(
+                                conversation_id=conv_id),
+                            disaggregated_params=DisaggregatedParams(
+                                request_type="context_only"))
+                        server, _ = await self.ctx_router.get_next_server(req)
+                        if first_server is None:
+                            first_server = server
+                        else:
+                            assert server == first_server, (
+                                f"{transport_name} round {i}: expected "
+                                f"{first_server}, got {server}")
+                        request = {
                             "model": self.model_name,
                             "prompt": prompt,
                             "max_tokens": 32,
                             "ignore_eos": True,
                             "temperature": 0.0,
-                        }, {"X-Correlation-ID": conv_id})
-                    assert len(response["choices"]) > 0
-                    await self.ctx_router.finish_request(req)
-                    prompt = prompt + response["choices"][0]["text"]
-                logger.info(
-                    f"Sticky routing passed: all 6 rounds -> {first_server}")
+                        }
+                        headers = self._apply_conversation_id_transport(
+                            request, conv_id, use_body_params)
+                        response = await self._send_via_disagg(
+                            session, request, headers)
+                        assert len(response["choices"]) > 0
+                        await self.ctx_router.finish_request(req)
+                        prompt = prompt + response["choices"][0]["text"]
+                    logger.info(f"{transport_name} sticky routing passed: "
+                                f"all 6 rounds -> {first_server}")
 
-                # 2. Different conversation_ids are load-balanced across
-                #    servers (not all pinned to a single one).
-                servers_seen = set()
-                for i in range(len(self.ctx_servers) * 2):
-                    cid = f"test-diff-conv-{i}"
-                    req = CompletionRequest(
-                        model=self.model_name,
-                        prompt=f"Unique prompt number {i} for load balancing",
-                        conversation_params=ConversationParams(
-                            conversation_id=cid),
-                        disaggregated_params=DisaggregatedParams(
-                            request_type="context_only"))
-                    server, _ = await self.ctx_router.get_next_server(req)
-                    servers_seen.add(server)
-                    response = await self._send_via_disagg(
-                        session, {
+                    # 2. Different conversation_ids are load-balanced across
+                    #    servers (not all pinned to a single one).
+                    servers_seen = set()
+                    for i in range(len(self.ctx_servers) * 2):
+                        cid = f"test-diff-conv-{transport_name}-{i}"
+                        req = CompletionRequest(
+                            model=self.model_name,
+                            prompt=
+                            f"Unique prompt number {i} for load balancing",
+                            conversation_params=ConversationParams(
+                                conversation_id=cid),
+                            disaggregated_params=DisaggregatedParams(
+                                request_type="context_only"))
+                        server, _ = await self.ctx_router.get_next_server(req)
+                        servers_seen.add(server)
+                        request = {
                             "model": self.model_name,
                             "prompt": f"Unique prompt number {i}",
                             "max_tokens": 1,
                             "temperature": 0.0,
-                        }, {"X-Correlation-ID": cid})
-                    assert len(response["choices"]) > 0
-                    await self.ctx_router.finish_request(req)
-                assert len(servers_seen) > 1, (
-                    f"Different conv_ids all routed to same server: "
-                    f"{servers_seen}")
-                logger.info(
-                    f"Load balancing passed: {len(servers_seen)} servers used")
+                        }
+                        headers = self._apply_conversation_id_transport(
+                            request, cid, use_body_params)
+                        response = await self._send_via_disagg(
+                            session, request, headers)
+                        assert len(response["choices"]) > 0
+                        await self.ctx_router.finish_request(req)
+                    assert len(servers_seen) > 1, (
+                        f"{transport_name} different conv_ids all routed to "
+                        f"same server: {servers_seen}")
+                    logger.info(f"{transport_name} load balancing passed: "
+                                f"{len(servers_seen)} servers used")
         finally:
             await self.ctx_router.close()
 
