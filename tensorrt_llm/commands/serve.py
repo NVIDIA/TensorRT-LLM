@@ -1,17 +1,4 @@
 import asyncio
-
-# Install uvloop as the default asyncio event loop policy before any module
-# retrieves a running loop. libuv-backed event loops have significantly lower
-# per-await overhead than the cpython default; this affects every coroutine
-# in the server. uvloop is a declared dependency, so the import is expected
-# to succeed; the try-block here is only present so ruff doesn't flag the
-# subsequent module-level imports as E402 (post-statement imports).
-try:
-    import uvloop
-    uvloop.install()
-except ImportError:
-    raise
-
 import gc
 import importlib
 import inspect
@@ -28,6 +15,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Set
 
 import click
 import torch
+import uvloop
 import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
@@ -65,6 +53,12 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.visual_gen import VisualGen
 from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+# Install uvloop as the default asyncio event loop policy before anything
+# in this process creates a loop. libuv-backed event loops have significantly
+# lower per-await overhead than the cpython default; this affects every
+# coroutine in the server.
+uvloop.install()
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
