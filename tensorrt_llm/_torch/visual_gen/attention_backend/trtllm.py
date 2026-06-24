@@ -44,8 +44,6 @@ class TrtllmAttentionMetadata:
     - Automatically reallocates when batch_size or seq_len exceeds current capacity
 
     Args:
-        max_batch_size: Initial batch size hint. Will grow automatically if exceeded.
-        max_seq_len: Initial sequence length hint. Will grow automatically if exceeded.
         device: Target device for tensors.
         attention_metadata_state: Mutable model-scoped state shared by all
             attention layers in one model instance.
@@ -53,14 +51,9 @@ class TrtllmAttentionMetadata:
 
     def __init__(
         self,
-        max_batch_size: int = 16,
-        max_seq_len: int = 4096,
         device: Optional[torch.device] = None,
         attention_metadata_state: Optional[dict] = None,
     ):
-        # These are initial hints, not hard limits - capacity grows as needed
-        self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
         self.device = device or torch.device("cuda")
         if attention_metadata_state is None:
             raise ValueError(
@@ -79,10 +72,6 @@ class TrtllmAttentionMetadata:
         # Track prepared state
         self._cached_seq_lens: Optional[torch.Tensor] = None
         self._prepared = False
-
-    def _needs_new_metadata(self, batch_size: int, max_seq_len: int) -> bool:
-        """Check if we need to create new metadata (capacity change)."""
-        return self._metadata is None
 
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
         """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
@@ -155,6 +144,7 @@ class TrtllmAttentionMetadata:
         cached = self._metadata_cache.get(cache_key)
         if cached is None:
             self._create_metadata(batch_size, max_seq_len)
+            self._cached_seq_lens = None
             cached = {
                 "metadata": self._metadata,
                 "prepared": False,
@@ -167,17 +157,15 @@ class TrtllmAttentionMetadata:
             self._cached_seq_lens = cached["seq_lens"]
 
         if self._needs_prepare(batch_size, seq_lens_tensor):
-            self._metadata.seq_lens = seq_lens_tensor
+            cached_seq_lens = seq_lens_tensor.clone()
+            self._metadata.seq_lens = cached_seq_lens
             self._metadata.num_contexts = batch_size
             self._metadata.max_seq_len = max_seq_len
             self._metadata.request_ids = list(range(batch_size))
             self._metadata.prepare()
 
-            # Cache for next comparison
-            if self._cached_seq_lens is None or self._cached_seq_lens.shape[0] < batch_size:
-                self._cached_seq_lens = seq_lens_tensor.clone()
-            else:
-                self._cached_seq_lens[:batch_size].copy_(seq_lens_tensor)
+            # Cache per-shape state without sharing the tensor across entries.
+            self._cached_seq_lens = cached_seq_lens
             self._prepared = True
             cached["prepared"] = True
             cached["seq_lens"] = self._cached_seq_lens
@@ -226,8 +214,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         self._preferred_layout = AttentionTensorLayout.NHD
 
         self.metadata = TrtllmAttentionMetadata(
-            max_batch_size=max_batch_size,
-            max_seq_len=max_seq_len,
             attention_metadata_state=attention_metadata_state,
         )
 
