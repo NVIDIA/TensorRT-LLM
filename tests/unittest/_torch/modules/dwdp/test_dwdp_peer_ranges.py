@@ -33,7 +33,11 @@ Cases covered:
 
 import unittest
 
+import pytest
+
 from tensorrt_llm._torch.modules.dwdp.specs import compute_peer_ranges, lookup_owner
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestComputePeerRanges(unittest.TestCase):

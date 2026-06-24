@@ -27,6 +27,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
 )
 from tensorrt_llm.executor.base_worker import BaseWorker
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_mock_iteration_stats(kv_cache_stats_json=None):
     """Create a mock IterationStats object with to_json_str()."""

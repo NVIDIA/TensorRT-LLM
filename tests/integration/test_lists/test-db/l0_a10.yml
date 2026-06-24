@@ -30,8 +30,6 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_step3p7.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
-  - unittest/_torch/executor/test_async_transfer_manager.py
-  - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
   - unittest/_torch/executor/test_kv_cache_budget_split.py
   - unittest/_torch/executor/test_kv_pool_rebalance.py
@@ -40,19 +38,11 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
-  - unittest/_torch/modules/dwdp/test_dwdp_manager.py
-  - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
-  - unittest/_torch/modules/dwdp/test_dwdp_peer_ranges.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
   - unittest/_torch/weight_sharing
-  - unittest/inputs/test_chat_template_dispatch.py
-  - unittest/inputs/test_content_format.py
-  - unittest/inputs/test_url_validation.py
-  - unittest/inputs/test_multimodal.py
   - unittest/inputs/test_multimodal_input_processor.py
-  - unittest/inputs/test_video_decode.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py
@@ -135,25 +125,13 @@ l0_a10:
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   # llmapi
-  - unittest/llmapi/test_llm_utils.py
-  - unittest/llmapi/test_gc_utils.py
-  - unittest/llmapi/test_reasoning_parser.py
-  - unittest/llmapi/test_serialization.py
-  - unittest/llmapi/test_utils.py
   - unittest/llmapi/test_llm_args.py
-  - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
-  - unittest/llmapi/test_request_priority.py
   # executor
-  - unittest/executor/test_ipc.py
-  - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_proxy_postproc_terminate.py
   - unittest/executor/test_proxy_fast_death.py
   # trtllm-serve CPU-only
-  - unittest/llmapi/apps/test_chat_utils.py
-  - unittest/llmapi/apps/test_tool_parsers.py
-  - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_encode_batcher.py
   - unittest/llmapi/test_embedding_arch_routing.py
   # usage telemetry

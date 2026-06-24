@@ -13,5 +13,33 @@ l0_cpu_x86:
       backend: generic
       orchestrator: mpi
   tests:
+  # Sync the list with l0_cpu_arm.yml
+  - unittest/_torch/distributed
+  - unittest/_torch/executor
+  - unittest/_torch/lora
+  - unittest/_torch/modules
+  - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
+  - unittest/_torch/speculative/hw_agnostic
+  - unittest/executor/test_base_worker.py ISOLATION
+  - unittest/executor/test_fatal_error_health_check.py
+  - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
+  - unittest/executor/test_stats_serializer.py
+  - unittest/inputs
+  - unittest/llmapi/apps/test_chat_utils.py
+  - unittest/llmapi/apps/test_harmony_channel_validation.py
+  - unittest/llmapi/apps/test_tool_parsers.py
+  - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
+  - unittest/llmapi/test_executor.py
+  - unittest/llmapi/test_gc_utils.py
+  - unittest/llmapi/test_kv_cache_dtype_override.py
+  - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_llm_quant.py
+  - unittest/llmapi/test_llm_telemetry.py
+  - unittest/llmapi/test_llm_utils.py
+  - unittest/llmapi/test_mpi_session.py ISOLATION
+  - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_request_priority.py
+  - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_utils.py

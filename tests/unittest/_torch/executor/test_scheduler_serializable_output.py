@@ -1,7 +1,11 @@
 import pickle
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests, SerializableSchedulerOutput
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_request(request_id: int) -> LlmRequest:

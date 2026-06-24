@@ -41,6 +41,8 @@ from __future__ import annotations
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
     _ITERATION_STATS_OPTIONAL_FIELDS,
     _ITERATION_STATS_SCALAR_FIELDS,
@@ -48,6 +50,8 @@ from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _StubRequest:

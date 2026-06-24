@@ -18,6 +18,8 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def mock_dist():

@@ -15,9 +15,13 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
+
+pytestmark = pytest.mark.cpu_only
 
 
 def create_mock_request(request_id: int):

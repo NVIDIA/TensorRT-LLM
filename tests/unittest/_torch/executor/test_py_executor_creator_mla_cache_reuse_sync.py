@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.quantization import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _DummyCalibrator:
     """Mock calibrator for testing that bypasses actual calibration logic."""
