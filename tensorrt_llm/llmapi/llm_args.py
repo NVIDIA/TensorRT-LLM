@@ -3475,6 +3475,18 @@ class BaseLlmArgs(StrictBaseModel):
         "The tokenizer class must implement 'from_pretrained(path, **kwargs)' and the TokenizerBase interface.",
         status="prototype")
 
+    post_processor_hook: Optional[str] = Field(
+        default=None,
+        description=
+        "Python import path of a user post-processing hook applied after "
+        "detokenization and before the per-endpoint response formatter (e.g. "
+        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable and "
+        "picklable, take no constructor arguments, and be callable as "
+        "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
+        "It runs once per output, per streaming chunk, and may rewrite, "
+        "suppress, or terminate the output; it owns its own per-request state.",
+        status="prototype")
+
     skip_tokenizer_init: bool = Field(
         default=False,
         description="Whether to skip the tokenizer initialization.")
@@ -3829,6 +3841,16 @@ class BaseLlmArgs(StrictBaseModel):
     def validate_and_init_tokenizer(self):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
+            # The post-processing hook is a text-based guardrail
+            # and needs detokenized text to inspect; without a tokenizer it could
+            # never run, so reject the combination rather than silently disabling
+            # the guardrail (mirrors the harmony fail-fast in OpenAIServer).
+            if self.post_processor_hook is not None:
+                raise ValueError(
+                    "post_processor_hook is not supported together with "
+                    "skip_tokenizer_init: the post-processing hook operates on "
+                    "detokenized text, which is unavailable when the tokenizer "
+                    "is skipped.")
             self.tokenizer = None
         elif self.custom_tokenizer:
             # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
