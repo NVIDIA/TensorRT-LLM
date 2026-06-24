@@ -28,6 +28,7 @@ import gc
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
@@ -38,12 +39,19 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
     COSMOS3_DURATION_TEMPLATE,
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
+    _condition_pixel_frame_count,
+    _normalize_condition_frame_indexes_vision,
+    _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ACTION_PARAMS,
+    COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+    COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+    COSMOS3_EXTRA_SPECS,
     COSMOS3_T2I_PARAMS,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -236,11 +244,48 @@ def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_siz
     assert not torch.isinf(af).any()
 
 
+def _scheduler_use_karras_sigmas(scheduler) -> bool | None:
+    value = getattr(scheduler.config, "use_karras_sigmas", None)
+    return None if value is None else bool(value)
+
+
+def _assert_scheduler_config(
+    pipeline,
+    *,
+    flow_shift: float,
+    use_karras_sigmas: bool | None,
+):
+    assert float(getattr(pipeline.scheduler.config, "flow_shift")) == pytest.approx(
+        float(flow_shift)
+    )
+    assert float(pipeline._current_flow_shift) == pytest.approx(float(flow_shift))
+    assert pipeline._current_scheduler_use_karras_sigmas == use_karras_sigmas
+    assert _scheduler_use_karras_sigmas(pipeline.scheduler) == use_karras_sigmas
+
+
+def _assert_default_video_scheduler_config(pipeline):
+    _assert_scheduler_config(
+        pipeline,
+        flow_shift=pipeline._engine_init_flow_shift,
+        use_karras_sigmas=pipeline._base_scheduler_use_karras_sigmas,
+    )
+
+
 def _make_test_image() -> PIL.Image.Image:
     image_path = os.environ.get("COSMOS3_TEST_IMAGE")
     if image_path and os.path.exists(image_path):
         return PIL.Image.open(image_path).convert("RGB")
     return PIL.Image.new("RGB", (WIDTH, HEIGHT), color=(64, 128, 192))
+
+
+def _make_test_video(
+    num_frames: int = NUM_FRAMES,
+    *,
+    width: int = WIDTH,
+    height: int = HEIGHT,
+) -> list[PIL.Image.Image]:
+    image = _make_test_image().resize((width, height))
+    return [image.copy() for _ in range(num_frames)]
 
 
 @pytest.fixture
@@ -317,6 +362,70 @@ class TestFormatPromptWithMetadataPlainText:
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, '["a", "b"]')
         assert result.startswith('["a", "b"].')
         assert "720x1280" in result
+
+
+class _CapturingTokenizer:
+    eos_token_id = 99
+    pad_token_id = 0
+
+    def __init__(self):
+        self.conversations = []
+
+    def apply_chat_template(
+        self,
+        conversations,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    ):
+        assert tokenize is True
+        assert add_generation_prompt is True
+        assert return_dict is False
+        self.conversations.append(conversations)
+        return [1, 2, 3]
+
+    def convert_tokens_to_ids(self, token):
+        assert token == "<|vision_start|>"
+        return 98
+
+
+class TestTokenizePrompt:
+    def test_system_prompt_included_when_enabled(self, cosmos3_format_pipeline):
+        tokenizer = _CapturingTokenizer()
+        cosmos3_format_pipeline.tokenizer = tokenizer
+        cosmos3_format_pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+
+        input_ids, attention_mask = cosmos3_format_pipeline._tokenize_prompt(
+            "Describe motion.",
+            max_sequence_length=8,
+            use_system_prompt=True,
+            system_prompt="System text.",
+        )
+
+        assert tokenizer.conversations == [
+            [
+                {"role": "system", "content": "System text."},
+                {"role": "user", "content": "Describe motion."},
+            ]
+        ]
+        assert input_ids.tolist() == [[1, 2, 3, 99, 98, 0, 0, 0]]
+        assert attention_mask.tolist() == [[1, 1, 1, 1, 1, 0, 0, 0]]
+
+    def test_system_prompt_omitted_when_disabled(self, cosmos3_format_pipeline):
+        tokenizer = _CapturingTokenizer()
+        cosmos3_format_pipeline.tokenizer = tokenizer
+        cosmos3_format_pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+
+        cosmos3_format_pipeline._tokenize_prompt(
+            "Describe motion.",
+            max_sequence_length=8,
+            use_system_prompt=False,
+            system_prompt="System text.",
+        )
+
+        assert tokenizer.conversations == [
+            [{"role": "user", "content": "Describe motion."}]
+        ]
 
 
 class TestFormatPromptWithMetadataJson:
@@ -412,6 +521,7 @@ class TestCosmos3T2V:
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
+        _assert_default_video_scheduler_config(cosmos3_pipeline)
 
 
 @pytest.mark.integration
@@ -423,6 +533,161 @@ class TestCosmos3I2V:
         result = _run_forward(cosmos3_pipeline, image=image, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
+        _assert_default_video_scheduler_config(cosmos3_pipeline)
+
+
+class TestCosmos3V2VExtraParams:
+    def test_condition_defaults_are_declared(self):
+        assert COSMOS3_EXTRA_SPECS["condition_frame_indexes_vision"].default == list(
+            COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION
+        )
+        assert (
+            COSMOS3_EXTRA_SPECS["condition_video_keep"].default
+            == COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP
+        )
+
+    def test_flow_shift_default_is_request_optional(self):
+        spec = COSMOS3_EXTRA_SPECS["flow_shift"]
+        assert spec.type == "float"
+        assert spec.default is None
+
+    def test_video_spec_declares_path_or_list_input(self):
+        spec = COSMOS3_EXTRA_SPECS["video"]
+        assert spec.type == "path_or_list"
+        assert spec.default is None
+
+
+class TestCosmos3V2VConditioningParams:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (None, (0, 1)),
+            (0, (0,)),
+            ([0, 2], (0, 2)),
+            ((1, 3), (1, 3)),
+            ("0, 2", (0, 2)),
+        ],
+    )
+    def test_normalize_condition_frame_indexes_vision(self, value, expected):
+        assert _normalize_condition_frame_indexes_vision(value) == expected
+
+    @pytest.mark.parametrize("value", [[], "", [-1], "0, -1", [0, -2]])
+    def test_invalid_condition_frame_indexes_vision_raise(self, value):
+        with pytest.raises(ValueError):
+            _normalize_condition_frame_indexes_vision(value)
+
+    @pytest.mark.parametrize(
+        "indexes,expected",
+        [
+            ((0,), 1),
+            ((0, 1), 5),
+            ((2,), 9),
+        ],
+    )
+    def test_condition_pixel_frame_count(self, indexes, expected):
+        assert _condition_pixel_frame_count(indexes, temporal_compression=4) == expected
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (None, "first"),
+            ("first", "first"),
+            ("FIRST", "first"),
+            (" last ", "last"),
+        ],
+    )
+    def test_normalize_condition_video_keep(self, value, expected):
+        assert _normalize_condition_video_keep(value) == expected
+
+    def test_invalid_condition_video_keep_raises(self):
+        with pytest.raises(ValueError, match="first or last"):
+            _normalize_condition_video_keep("middle")
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_v2v
+@pytest.mark.high_cuda_memory
+class TestCosmos3V2V:
+    def test_v2v_smoke(self, cosmos3_pipeline):
+        video = _make_test_video(NUM_FRAMES)
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            video=video,
+            num_frames=NUM_FRAMES,
+            condition_frame_indexes_vision=[0, 1],
+            condition_video_keep="first",
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
+        assert result.frame_rate == FRAME_RATE
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+        )
+
+    def test_v2v_flow_shift_override_request_path(self):
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        pipeline.audio_gen = False
+        calls = []
+        token_calls = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        def fake_set_flow_shift(target, *, use_karras_sigmas=None):
+            calls.append((target, use_karras_sigmas))
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            token_calls.append((text, max_sequence_length, use_system_prompt, system_prompt))
+            raise StopAfterTokenize
+
+        pipeline._set_flow_shift = fake_set_flow_shift
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="continue",
+                video=_make_test_video(5, width=16, height=16),
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+                flow_shift=7.0,
+            )
+
+        assert calls == [(7.0, False)]
+        assert token_calls[0][2] is True
+        assert token_calls[0][3] == COSMOS3_DEFAULT_SYSTEM_PROMPT
+
+    def test_image_and_video_rejected(self, cosmos3_pipeline):
+        with pytest.raises(ValueError, match="not both image and video"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=_make_test_image(),
+                video=_make_test_video(5),
+            )
+
+    def test_t2i_and_video_rejected(self, cosmos3_pipeline):
+        with pytest.raises(ValueError, match="supported only for video outputs"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=None,
+                video=_make_test_video(5),
+                output_type="image",
+                height=T2I_HEIGHT,
+                width=T2I_WIDTH,
+            )
 
 
 @pytest.mark.integration
@@ -440,6 +705,11 @@ class TestCosmos3T2I:
         )
         assert result.video is None
         _assert_valid_image(result.image, height=T2I_HEIGHT, width=T2I_WIDTH)
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=COSMOS3_T2I_PARAMS["flow_shift"],
+            use_karras_sigmas=cosmos3_pipeline._base_scheduler_use_karras_sigmas,
+        )
 
 
 @pytest.mark.integration
@@ -492,6 +762,11 @@ class TestCosmos3Action:
         )
         assert result.action_mode == "policy"
         assert result.domain_id == 7
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=COSMOS3_ACTION_PARAMS["flow_shift"],
+            use_karras_sigmas=cosmos3_pipeline._base_scheduler_use_karras_sigmas,
+        )
 
     def test_forward_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
@@ -519,6 +794,11 @@ class TestCosmos3Action:
             result.action,
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=self.ACTION_CHUNK,
+        )
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=COSMOS3_ACTION_PARAMS["flow_shift"],
+            use_karras_sigmas=cosmos3_pipeline._base_scheduler_use_karras_sigmas,
         )
 
     def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
@@ -548,6 +828,11 @@ class TestCosmos3Action:
             result.action,
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=NUM_FRAMES,
+        )
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=COSMOS3_ACTION_PARAMS["flow_shift"],
+            use_karras_sigmas=cosmos3_pipeline._base_scheduler_use_karras_sigmas,
         )
 
     def test_action_and_audio_rejected(self, cosmos3_pipeline):
@@ -584,8 +869,9 @@ class TestCosmos3PromptTemplates:
             (True, True, True),
             (False, False, False),
             (False, False, True),
+            (False, False, None),
         ],
-        ids=["all-on", "all-off", "system-prompt-only"],
+        ids=["all-on", "all-off", "system-prompt-only", "system-prompt-default"],
     )
     def test_template_variants(
         self,
