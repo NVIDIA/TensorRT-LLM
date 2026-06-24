@@ -696,6 +696,10 @@ def create_py_executor(
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
 
+    # Sync effective chunked-prefill state back to llm_args so user-facing
+    # config matches runtime behavior after all fallbacks.
+    llm_args.enable_chunked_prefill = enable_chunked_context
+
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block
         max_attention_window = kv_cache_config.max_attention_window
