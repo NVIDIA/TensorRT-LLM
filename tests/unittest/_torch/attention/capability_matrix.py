@@ -118,6 +118,22 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
+    # FlashInfer's paged KV append kernel launches one thread block with
+    # ``blockDim=(head_dim / vec_size, num_kv_heads)``. CUDA rejects launches
+    # above 1024 threads/block, so large MHA shapes such as 128 KV heads x
+    # bf16/fp16 head_dim 128 cannot be represented by this backend path.
+    if backend == "FLASHINFER" and getattr(case, "cache", "paged") != "none":
+        kv_dtype = getattr(case, "kv_dtype", None) or getattr(case, "dtype", None)
+        dtype_size = 1 if kv_dtype == "float8_e4m3fn" else 2
+        vec_size = max(16 // dtype_size, case.head_dim // 32)
+        threads_per_head = case.head_dim // vec_size
+        if threads_per_head * case.num_kv_heads > 1024:
+            return (
+                "FLASHINFER paged KV append exceeds CUDA's 1024 threads/block "
+                f"limit ({threads_per_head} threads/head x "
+                f"{case.num_kv_heads} KV heads)"
+            )
+
     # TRTLLM's fp8 generation (XQA) path computes in fp8 and needs the model's
     # real KV-dequant + output scale state (fed by the Attention module's
     # projection layers). A bare standalone backend lacks it: supplying a unit
