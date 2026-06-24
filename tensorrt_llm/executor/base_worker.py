@@ -27,6 +27,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
@@ -814,7 +815,6 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
-    # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
@@ -846,34 +846,7 @@ class BaseWorker(GenerationExecutor):
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
 
-        # Inject per-iteration KV cache stats (keyed by window size)
-        if kv_iter_stats is not None:
-            stats_dict["kvCacheIterationStats"] = {
-                str(window_size): {
-                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                    "iterReusedBlocks": s.iter_reused_blocks,
-                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                    "iterMissedBlocks": s.iter_missed_blocks,
-                    "iterCacheHitRate": s.iter_cache_hit_rate,
-                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                    "iterOnboardBlocks": s.iter_onboard_blocks,
-                    "iterOnboardBytes": s.iter_onboard_bytes,
-                    "iterOffloadBlocks": s.iter_offload_blocks,
-                    "iterOffloadBytes": s.iter_offload_bytes,
-                    "iterIntraDeviceCopyBlocks":
-                    s.iter_intra_device_copy_blocks,
-                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
-                }
-                for window_size, s in kv_iter_stats.items()
-            }
+        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
 
         # Per-loop CPU wall captured by profile_step() — always a clean
         # single-loop measurement, matching the log line's `host_step_time`.

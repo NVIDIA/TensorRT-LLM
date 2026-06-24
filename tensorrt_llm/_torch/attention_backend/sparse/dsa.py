@@ -130,13 +130,21 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
     indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
     pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
     scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
+    radix_aux_indices = torch.empty((1, 10, top_k),
+                                    dtype=torch.int32,
+                                    device=device)
+    radix_aux_logits = torch.empty((1, 10, top_k),
+                                   dtype=torch.float32,
+                                   device=device)
     torch.ops.trtllm.indexer_topk_decode(logits,
                                          seq_lens,
                                          indices,
                                          1,
                                          top_k,
                                          pre_idx=pre_idx,
-                                         heuristic_scratch=scratch)
+                                         heuristic_scratch=scratch,
+                                         radix_aux_indices=radix_aux_indices,
+                                         radix_aux_logits=radix_aux_logits)
     torch.cuda.synchronize()
 
 
@@ -752,8 +760,29 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
 
+        self._create_radix_aux_buffers(capture_graph=capture_graph)
+
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
+
+    def _create_radix_aux_buffers(self, capture_graph=False):
+        """Create persistent scratch for the fp32 radix split-work TopK path."""
+        max_blocks_per_row = 10
+        max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+        self.radix_aux_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_gen_tokens, max_blocks_per_row, self.num_sparse_topk),
+            cache_name="radix_aux_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.radix_aux_logits = self.get_empty(
+            self.cuda_graph_buffers,
+            (max_gen_tokens, max_blocks_per_row, self.num_sparse_topk),
+            cache_name="radix_aux_logits",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
 
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
@@ -852,6 +881,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.float32,
                     capture_graph=capture_graph,
                 )
+            self._create_radix_aux_buffers(capture_graph=capture_graph)
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
@@ -1430,6 +1460,7 @@ class Indexer(nn.Module):
         self.head_dim = sparse_params.index_head_dim  # 128
         self.index_topk = sparse_params.index_topk  # 2048
         self.layer_idx = layer_idx
+        self.compress_ratio = 1
 
         self.wq_b = Linear(
             self.q_lora_rank,
@@ -2043,7 +2074,8 @@ class Indexer(nn.Module):
                             logits,
                             chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
                             chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
-                            topk_indices_buffer[global_q_start:global_q_end, :])
+                            topk_indices_buffer[global_q_start:global_q_end, :],
+                            self.index_topk)
                     else:
                         topk_indices = logits.topk(min(self.index_topk,
                                                        logits.shape[-1]),
@@ -2095,7 +2127,8 @@ class Indexer(nn.Module):
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
                         logits, cu_seqlen_ks, cu_seqlen_ke,
-                        topk_indices_buffer[:num_ctx_tokens, :])
+                        topk_indices_buffer[:num_ctx_tokens, :],
+                        self.index_topk)
                 else:
                     topk_indices = logits.topk(min(self.index_topk,
                                                    logits.shape[-1]),
@@ -2304,7 +2337,10 @@ class Indexer(nn.Module):
                         next_n,
                         self.index_topk,
                         pre_idx=pre_idx,
-                        heuristic_scratch=heuristic_scratch)
+                        heuristic_scratch=heuristic_scratch,
+                        compress_ratio=self.compress_ratio,
+                        radix_aux_indices=metadata.radix_aux_indices,
+                        radix_aux_logits=metadata.radix_aux_logits)
             else:
                 # padded
                 positions = torch.arange(

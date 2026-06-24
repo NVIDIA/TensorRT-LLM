@@ -34,6 +34,7 @@ class GatedMLP(nn.Module):
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
+        swiglu_limit: Optional[float] = None,
     ):
 
         super().__init__()
@@ -42,6 +43,8 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        self.swiglu_limit = float(
+            swiglu_limit) if swiglu_limit is not None else None
 
         config = config or ModelConfig()
         self.mapping = config.mapping
@@ -139,13 +142,14 @@ class GatedMLP(nn.Module):
                     logger.warning(
                         f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
                     )
-                    return swiglu(x)
+                    return swiglu(x, swiglu_limit=self.swiglu_limit)
                 else:
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
-                                  quant_type=torch.float8_e4m3fn)
+                                  quant_type=torch.float8_e4m3fn,
+                                  swiglu_limit=self.swiglu_limit)
             else:
-                return swiglu(x)
+                return swiglu(x, swiglu_limit=self.swiglu_limit)
         elif callable(self.activation):
             return self.activation(x)
         elif self.activation is None:
@@ -256,14 +260,20 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self._can_fuse_gate_up_swiglu_fp4out():
-            # Get token count for minimum-M check
-            if isinstance(x, (tuple, Fp4QuantizedTensor)):
-                m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+            # During torch.compile the token dim is a SymInt, so `m >= MIN_M`
+            # would create a SymBool guard that breaks piecewise CUDA graph
+            # capture. The kernel internally pads m up to the CTA tile height,
+            # so the fp4out path is safe at any m while compiling.
+            if torch.compiler.is_compiling():
+                fp4_out = True
             else:
-                m = x.reshape(
-                    -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
-            h2 = self._fused_gate_up_swiglu(x,
-                                            fp4_out=m >= GatedMLP._FP4OUT_MIN_M)
+                if isinstance(x, (tuple, Fp4QuantizedTensor)):
+                    m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+                else:
+                    m = x.reshape(
+                        -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
+                fp4_out = m >= GatedMLP._FP4OUT_MIN_M
+            h2 = self._fused_gate_up_swiglu(x, fp4_out=fp4_out)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
         else:
