@@ -45,7 +45,7 @@ WAN_T2V_HEIGHT = 480
 WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
 VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )
@@ -495,7 +495,7 @@ def _generate_flux_lpips_image(model_path, output_path):
 
 def _generate_ltx2_lpips_video(output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     checkpoint_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
@@ -514,7 +514,6 @@ def _generate_ltx2_lpips_video(output_path):
             "spatial_upsampler_path": spatial_upsampler_path,
             "distilled_lora_path": distilled_lora_path,
         },
-        torch_compile_config=TorchCompileConfig(enable=False),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
@@ -553,8 +552,6 @@ def _run_wan_lpips_pipeline(
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import (
         AttentionConfig,
-        CompilationConfig,
-        TorchCompileConfig,
         VisualGenArgs,
     )
 
@@ -562,8 +559,6 @@ def _run_wan_lpips_pipeline(
     _disable_inductor_compile_worker_quiesce()
     args_kwargs = dict(
         model=model_path,
-        compilation_config=CompilationConfig(skip_warmup=True),
-        torch_compile_config=TorchCompileConfig(enable=False),
         attention_config=AttentionConfig(backend=attention_backend),
     )
     if parallel is not None:
