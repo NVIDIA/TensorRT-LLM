@@ -751,6 +751,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 )
 
 
+@skip_pre_blackwell
 class TestStep3_7(LlmapiAccuracyTestHarness):
     # Step-3.7-Flash is a reasoning VLM: a PerceptionEncoder vision tower plus a
     # MoE text decoder, registered under the Step3p7ForConditionalGeneration
@@ -813,7 +814,6 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 
-    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     @parametrize_with_ids("mtp_nextn", [0, 3])
