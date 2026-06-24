@@ -683,7 +683,21 @@ def _run_one_candidate(
                 mapping=mapping,
                 moe_backend=config.backend,
                 use_cuda_graph=bool(config.cuda_graph),
-                max_num_tokens=max(int(local_num_tokens), 1),
+                # CUDA-graph capture cannot cross the multi-chunk MoE scheduler path:
+                # `_forward_multiple_chunks` evaluates a CUDA `chunked_used` tensor in a
+                # host `if` (forces a D2H sync) and overlaps chunks on an aux stream --
+                # both illegal during capture. Production only ever captures the
+                # single-chunk path (num_chunks==1). For non-DP layouts (TTP/DTP) the
+                # bench sets max_num_tokens per-rank while calculate_num_chunks sums all
+                # ranks (num_rows=sum(all_rank_num_tokens)), forcing
+                # num_chunks==world_size>1. Size max_num_tokens to the global token
+                # count under CUDA graph so moe_max_num_tokens>=num_rows -> num_chunks==1
+                # and capture matches the production single-chunk regime.
+                max_num_tokens=(
+                    max(sum(all_rank_num_tokens), 1)
+                    if config.cuda_graph
+                    else max(int(local_num_tokens), 1)
+                ),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
                 enable_perfect_router=enable_perfect_router,
                 dtype=act_dtype,

@@ -103,6 +103,63 @@ def _create_moe_for_benchmark(**kwargs):
     return create_moe(**kwargs)
 
 
+class _UnfusedSharedMoE(torch.nn.Module):
+    """Pre-fusion baseline: routed MoE plus a separate shared-expert GatedMLP.
+
+    The routed MoE is built without fused shared experts; a standalone shared-expert
+    ``GatedMLP`` is summed onto its output, mirroring the pre-#11143 model path. The
+    routed MoE and the shared GatedMLP are run with ``maybe_execute_in_parallel`` on
+    a dedicated aux stream (same mechanism DeepseekV3MoE uses for the unfused path),
+    so the routed grouped GEMM and the shared MLP can overlap. Multi-stream is
+    enabled only under CUDA graph (``use_cuda_graph``), matching the real engine
+    (cuda_graph_runner sets with_multi_stream(True) during capture); in eager the
+    two run serially, since stream-switch host overhead makes overlap a net loss.
+    Exposes the same ``forward(x, router_logits, **kwargs)`` signature as the MoE;
+    introspection attributes (backend / routing_method / ...) delegate to the MoE.
+    """
+
+    def __init__(
+        self,
+        moe: torch.nn.Module,
+        shared_mlp: torch.nn.Module,
+        use_cuda_graph: bool = False,
+    ):
+        super().__init__()
+        self.moe = moe
+        self.shared_mlp = shared_mlp
+        # Overlap only when the case is timed under CUDA graph (mirrors the real
+        # model, which only enables multi-stream during graph capture).
+        self._multi_stream = bool(use_cuda_graph)
+        self.aux_stream = torch.cuda.Stream()
+        self.event_main = torch.cuda.Event()
+        self.event_shared = torch.cuda.Event()
+
+    def __getattr__(self, name):
+        # nn.Module.__getattr__ resolves registered submodules/params/buffers
+        # (incl. ``moe``/``shared_mlp``); anything else (routing_method, backend,
+        # comm, scheduler, ...) is delegated to the wrapped MoE for introspection.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("moe"), name)
+
+    def forward(self, x, router_logits, **kwargs):
+        from tensorrt_llm._torch.modules.multi_stream_utils import (
+            maybe_execute_in_parallel,
+            with_multi_stream,
+        )
+
+        with with_multi_stream(self._multi_stream):
+            routed, shared = maybe_execute_in_parallel(
+                lambda: self.moe.forward(x, router_logits, **kwargs),
+                lambda: self.shared_mlp(x),
+                self.event_main,
+                self.event_shared,
+                self.aux_stream,
+            )
+        return routed + shared
+
+
 def _build_moe_module(
     *,
     model: ModelSpec,
@@ -121,6 +178,20 @@ def _build_moe_module(
 
     Returns ``(moe_module, routing_logits_dtype)``.
     """
+    # Shared-expert support (PR #11143) currently only works in TTP: attention TP
+    # (dp_size==1, so the fusion gate fires) + MoE TP (moe_ep_size==1; the EP fused
+    # path is unimplemented). Reject other multi-GPU layouts (DEP/TEP/DTP) up front
+    # instead of silently dropping the shared experts or hitting the dead EP path.
+    # (Single GPU resolves to dp_size==1/moe_ep_size==1 for every mode, so it passes.)
+    if model.n_shared_experts > 0 and (mapping.dp_size != 1 or mapping.moe_ep_size != 1):
+        raise NotImplementedError(
+            f"bench_moe shared-expert support (n_shared_experts={model.n_shared_experts}) "
+            f"only supports TTP (attention TP + MoE TP: dp_size==1 and moe_ep_size==1). "
+            f"Got parallel_mode={config.parallel_mode!r} -> dp_size={mapping.dp_size}, "
+            f"moe_ep_size={mapping.moe_ep_size}. Re-run with --parallel_mode TTP "
+            f"(or drop --n_shared_experts)."
+        )
+
     if enable_perfect_router:
         os.environ["ENABLE_PERFECT_ROUTER"] = "1"
     else:
@@ -205,5 +276,29 @@ def _build_moe_module(
     moe.load_weights([weights])
     moe.post_load_weights()
     moe.cuda(f"cuda:{torch.cuda.current_device()}")
+
+    # "unfused" baseline: the routed MoE above was built without fused shared
+    # experts (mapping.py forces pretrained_config.n_shared_experts=0 in this mode);
+    # add a standalone shared-expert GatedMLP and sum it, mirroring the pre-fusion
+    # model path so the benchmark can compare against the fused path.
+    if model.n_shared_experts > 0 and model.shared_expert_mode == "unfused":
+        from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+        shared_mlp = GatedMLP(
+            hidden_size=mc.hidden_size,
+            intermediate_size=model.n_shared_experts * mc.intermediate_size,
+            bias=False,
+            dtype=dtype,
+            config=model_config,
+            reduce_output=False,
+            # Route the shared GatedMLP's FP8 block-scale GEMM through cute_dsl
+            # (cute_dsl_fp8_gemm_blackwell) instead of the SM100f default DeepGEMM
+            # `fp8_swap_ab_gemm`. The DeepGEMM path hits an intermittent
+            # cudaErrorIllegalAddress when the routed TRTLLM-Gen MoE and this shared
+            # GatedMLP run in the same process across growing token counts.
+            use_cute_dsl_blockscaling_mm=True,
+        )
+        shared_mlp.cuda(f"cuda:{torch.cuda.current_device()}")
+        moe = _UnfusedSharedMoE(moe, shared_mlp, use_cuda_graph=use_cuda_graph)
 
     return moe, routing_logits_dtype

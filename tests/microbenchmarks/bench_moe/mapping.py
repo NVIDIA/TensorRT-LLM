@@ -142,7 +142,11 @@ def _create_routing_method(
 
 
 def _build_pretrained_config(
-    num_experts: int, hidden_size: int, intermediate_size: int, dtype: torch.dtype
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: torch.dtype,
+    n_shared_experts: int = 0,
 ) -> PretrainedConfig:
     """Construct a HF-style ``PretrainedConfig`` for ``ConfigurableMoE``."""
     pc = PretrainedConfig()
@@ -150,6 +154,10 @@ def _build_pretrained_config(
     pc.hidden_size = hidden_size
     pc.intermediate_size = intermediate_size
     pc.torch_dtype = dtype
+    # TRTLLMGenFusedMoE reads ``n_shared_experts`` off the pretrained config to
+    # decide num_fused_shared_expert (shared-expert fusion). Keep it at 0 unless
+    # explicitly requested so non-fusion cases are unaffected.
+    pc.n_shared_experts = n_shared_experts
     return pc
 
 
@@ -164,8 +172,15 @@ def _build_model_config(
     dtype: torch.dtype,
 ) -> ModelConfig:
     """Build ``ModelConfig`` plumbed into ``create_moe``."""
+    # In "unfused" mode the routed MoE must NOT fuse the shared experts (a separate
+    # GatedMLP is built and summed in build.py instead), so the fused count is 0.
+    fused_n_shared = model.n_shared_experts if model.shared_expert_mode != "unfused" else 0
     pretrained_config = _build_pretrained_config(
-        model.num_experts, model.hidden_size, model.intermediate_size, dtype
+        model.num_experts,
+        model.hidden_size,
+        model.intermediate_size,
+        dtype,
+        n_shared_experts=fused_n_shared,
     )
 
     quant_algo = model.quant_algo_enum
