@@ -72,6 +72,68 @@ def _run_multi_gpu(world_size, test_fn):
     )
 
 
+def _row_major_coords(rank, dim_names, dim_sizes):
+    # Mirrors torch.distributed.device_mesh.init_device_mesh row-major layout;
+    # the existing multi-GPU mapping tests anchor this assumption against real DeviceMesh.
+    coords = {}
+    remaining = rank
+    for dim in reversed(dim_names):
+        size = dim_sizes[dim]
+        coords[dim] = remaining % size
+        remaining //= size
+    return coords
+
+
+class _FakeDeviceMeshView:
+    def __init__(self, dim_names, dim_sizes, rank, group_dims):
+        self._dim_names = dim_names
+        self._dim_sizes = dim_sizes
+        self._rank = rank
+        self._group_dims = tuple(group_dims)
+        self._coords = _row_major_coords(rank, dim_names, dim_sizes)
+        self._world_size = 1
+        for size in dim_sizes.values():
+            self._world_size *= size
+
+    def __getitem__(self, dim):
+        if isinstance(dim, tuple):
+            group_dims = dim
+        else:
+            group_dims = (dim,)
+        return _FakeDeviceMeshView(
+            self._dim_names,
+            self._dim_sizes,
+            self._rank,
+            group_dims,
+        )
+
+    def _flatten(self, mesh_dim_name):
+        return _FakeDeviceMeshView(
+            self._dim_names,
+            self._dim_sizes,
+            self._rank,
+            self._group_dims,
+        )
+
+    def get_local_rank(self):
+        assert len(self._group_dims) == 1
+        return self._coords[self._group_dims[0]]
+
+    def get_group(self):
+        fixed_dims = set(self._dim_names) - set(self._group_dims)
+        group = []
+        for rank in range(self._world_size):
+            coords = _row_major_coords(rank, self._dim_names, self._dim_sizes)
+            if all(coords[dim] == self._coords[dim] for dim in fixed_dims):
+                group.append(rank)
+        return tuple(group)
+
+
+class _FakeDeviceMesh(_FakeDeviceMeshView):
+    def __init__(self, dim_names, dim_sizes, rank):
+        super().__init__(dim_names, dim_sizes, rank, dim_names)
+
+
 # =============================================================================
 # Single-GPU tests (no dist required)
 # =============================================================================
@@ -275,6 +337,123 @@ class TestToLlmMapping:
         m = vgm.to_llm_mapping()
         assert m.tp_size == 2
         assert m.world_size == 2
+
+
+class TestRankLinearizationWithoutDist:
+    def test_world_size_16_cfg_attn2d_ulysses_rank_groups(self):
+        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+        old_mesh = DeviceMeshTopologyImpl.device_mesh
+        old_seq_mesh = VisualGenMapping.seq_mesh
+        try:
+            for rank in range(16):
+                DeviceMeshTopologyImpl.device_mesh = None
+                VisualGenMapping.seq_mesh = None
+                vgm = VisualGenMapping(
+                    world_size=16,
+                    rank=rank,
+                    cfg_size=2,
+                    attn2d_row_size=2,
+                    attn2d_col_size=2,
+                    ulysses_size=2,
+                )
+
+                fake_mesh = _FakeDeviceMesh(vgm._dim_names, vgm._dim_sizes, rank)
+                DeviceMeshTopologyImpl.device_mesh = fake_mesh
+                VisualGenMapping.seq_mesh = fake_mesh["cp_row", "cp_col", "ulysses"]._flatten(
+                    mesh_dim_name="seq"
+                )
+                vgm._attach_attn2d_groups_from_device_mesh()
+
+                expected_cfg_rank = rank // 8
+                expected_cp_row_rank = (rank // 4) % 2
+                expected_cp_col_rank = (rank // 2) % 2
+                expected_ulysses_rank = rank % 2
+                expected_cp_rank = expected_cp_row_rank * 2 + expected_cp_col_rank
+                expected_seq_rank = expected_cp_rank * 2 + expected_ulysses_rank
+
+                assert vgm.cfg_rank == expected_cfg_rank
+                assert vgm.tp_rank == 0
+                assert vgm.cp_row_rank == expected_cp_row_rank
+                assert vgm.cp_col_rank == expected_cp_col_rank
+                assert vgm.cp_rank == expected_cp_rank
+                assert vgm.attn2d_mesh_rank == expected_cp_rank
+                assert vgm.ulysses_rank == expected_ulysses_rank
+                assert vgm.seq_rank == expected_seq_rank
+                assert vgm.seq_size == 8
+                assert vgm.is_cfg_conditional == (rank < 8)
+
+                cfg_pair_start = rank % 8
+                ulysses_pair_start = rank - expected_ulysses_rank
+                seq_group_start = expected_cfg_rank * 8
+                cp_group_start = expected_cfg_rank * 8 + expected_ulysses_rank
+                row_group_start = (
+                    expected_cfg_rank * 8 + expected_cp_row_rank * 4 + expected_ulysses_rank
+                )
+                col_group_start = (
+                    expected_cfg_rank * 8 + expected_cp_col_rank * 2 + expected_ulysses_rank
+                )
+
+                assert vgm.cfg_group == (cfg_pair_start, cfg_pair_start + 8)
+                assert vgm.ulysses_group == (ulysses_pair_start, ulysses_pair_start + 1)
+                assert vgm.cp_group == tuple(cp_group_start + stride for stride in (0, 2, 4, 6))
+                assert vgm.attn2d_mesh_group == vgm.cp_group
+                assert vgm.attn2d_row_group == (row_group_start, row_group_start + 2)
+                assert vgm.attn2d_col_group == (col_group_start, col_group_start + 4)
+                assert vgm.seq_group() == tuple(range(seq_group_start, seq_group_start + 8))
+        finally:
+            DeviceMeshTopologyImpl.device_mesh = old_mesh
+            VisualGenMapping.seq_mesh = old_seq_mesh
+
+    def test_world_size_16_cfg_ring_ulysses_rank_groups(self):
+        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+        old_mesh = DeviceMeshTopologyImpl.device_mesh
+        old_seq_mesh = VisualGenMapping.seq_mesh
+        try:
+            for rank in range(16):
+                DeviceMeshTopologyImpl.device_mesh = None
+                VisualGenMapping.seq_mesh = None
+                vgm = VisualGenMapping(
+                    world_size=16,
+                    rank=rank,
+                    cfg_size=2,
+                    ring_size=4,
+                    ulysses_size=2,
+                )
+
+                fake_mesh = _FakeDeviceMesh(vgm._dim_names, vgm._dim_sizes, rank)
+                DeviceMeshTopologyImpl.device_mesh = fake_mesh
+                VisualGenMapping.seq_mesh = fake_mesh["cp", "ulysses"]._flatten(mesh_dim_name="seq")
+
+                expected_cfg_rank = rank // 8
+                expected_cp_rank = (rank // 2) % 4
+                expected_ulysses_rank = rank % 2
+                expected_seq_rank = expected_cp_rank * 2 + expected_ulysses_rank
+
+                assert vgm.cfg_rank == expected_cfg_rank
+                assert vgm.tp_rank == 0
+                assert vgm.cp_rank == expected_cp_rank
+                assert vgm.ring_rank == expected_cp_rank
+                assert vgm.ulysses_rank == expected_ulysses_rank
+                assert vgm.seq_rank == expected_seq_rank
+                assert vgm.seq_size == 8
+                assert vgm.is_cfg_conditional == (rank < 8)
+
+                cfg_pair_start = rank % 8
+                ulysses_pair_start = rank - expected_ulysses_rank
+                seq_group_start = expected_cfg_rank * 8
+                cp_group_start = expected_cfg_rank * 8 + expected_ulysses_rank
+
+                assert vgm.cfg_group == (cfg_pair_start, cfg_pair_start + 8)
+                assert vgm.tp_group_pg == (rank,)
+                assert vgm.ulysses_group == (ulysses_pair_start, ulysses_pair_start + 1)
+                assert vgm.cp_group == tuple(cp_group_start + stride for stride in (0, 2, 4, 6))
+                assert vgm.ring_group == vgm.cp_group
+                assert vgm.seq_group() == tuple(range(seq_group_start, seq_group_start + 8))
+        finally:
+            DeviceMeshTopologyImpl.device_mesh = old_mesh
+            VisualGenMapping.seq_mesh = old_seq_mesh
 
 
 # =============================================================================
