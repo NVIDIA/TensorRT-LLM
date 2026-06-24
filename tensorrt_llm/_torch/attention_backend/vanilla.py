@@ -617,7 +617,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 **kwargs) -> torch.Tensor:
         forward_args = merge_attention_forward_args(forward_args, kwargs)
 
-        if forward_args.multi_item_part_lens is not None:
+        if metadata.multi_item_part_lens is not None:
             raise ValueError(
                 "Vanilla Attention does not support multi-item scoring")
 
