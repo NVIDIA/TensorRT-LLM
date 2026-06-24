@@ -96,6 +96,79 @@ class CuteDslMlaFmha(PhasedFmha):
         return None
 
     @staticmethod
+    def _kernel_can_implement(
+        kernel_dtype: torch.dtype,
+        batch_size: int,
+        seq_len_q: int,
+        page_size: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+    ) -> tuple[bool, str]:
+        """Ask the CuTe DSL kernel's own ``can_implement`` whether it accepts
+        this problem under the tiler the FMHA library launches with.
+
+        The custom op only runs ``can_implement`` when the AutoTuner is engaged
+        (``CuteDSLNVMlaDecodeBlackwellRunner.get_valid_tactics``); the FMHA
+        library calls the op directly with ``tactic=None`` -> the default
+        ``((128, 128), (128, 256))`` tiler, bypassing that check. Mirror the
+        op's launch configuration here so the gate refuses any request the
+        kernel cannot actually serve instead of failing at launch.
+        """
+        import cutlass
+
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import (
+            BlackwellMultiHeadLatentAttentionForwardFP8,
+        )
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import (
+            BlackwellMultiHeadLatentAttentionForwardFP16,
+        )
+
+        if kernel_dtype == torch.float8_e4m3fn:
+            kernel_class = BlackwellMultiHeadLatentAttentionForwardFP8
+            in_dtype, out_dtype = cutlass.Float8E4M3FN, cutlass.BFloat16
+        elif kernel_dtype == torch.float16:
+            kernel_class = BlackwellMultiHeadLatentAttentionForwardFP16
+            in_dtype, out_dtype = cutlass.Float16, cutlass.Float16
+        elif kernel_dtype == torch.bfloat16:
+            kernel_class = BlackwellMultiHeadLatentAttentionForwardFP16
+            in_dtype, out_dtype = cutlass.BFloat16, cutlass.BFloat16
+        else:
+            return False, f"Unsupported CuTe DSL kernel dtype {kernel_dtype}."
+
+        # Default launch tiler and flags -- keep in sync with
+        # ``CuteDSLNVMlaDecodeBlackwellRunner`` in cute_dsl_custom_ops.py
+        # (the ``tactic=None`` path that ``_run_mla_decode`` exercises).
+        mma_qk_tiler_mn, mma_pv_tiler_mn = (128, 128), (128, 256)
+        if not kernel_class.can_implement(
+            batch_size,
+            seq_len_q,
+            page_size,  # K -- mirrors the op's get_valid_tactics call
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            in_dtype,
+            out_dtype,
+            cutlass.Float32,  # acc_dtype
+            cutlass.Float32,  # lse_dtype
+            mma_qk_tiler_mn,
+            mma_pv_tiler_mn,
+            1,  # split_kv
+            True,  # is_persistent
+            True,  # is_var_seq
+            False,  # is_var_split_kv
+            page_size,
+        ):
+            return (
+                False,
+                "CuTe DSL MLA kernel can_implement rejected the problem "
+                f"(dtype={kernel_dtype}, H={num_heads}, L={kv_lora_rank}, "
+                f"R={qk_rope_head_dim}, S={seq_len_q}, B={batch_size}, "
+                f"page_size={page_size}).",
+            )
+        return True, ""
+
+    @staticmethod
     def _select_page_table_layer(
         block_offsets: torch.Tensor,
         layer_idx: int,
@@ -152,13 +225,18 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
+        # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
+        # kernel applies the implicit causal mask (q token t attends to KV
+        # [0, K - (seq_len_q - 1) + t)). Tree / dynamic-tree spec-decode carries
+        # an explicit packed mask the kernel cannot express, and an explicit
+        # CUSTOM mask is likewise unsupported -> fall back to TRTLLM for those.
         if (
             fwd.attention_mask == CustomAttentionMask.CUSTOM
             or fwd.attention_mask_data is not None
-            or getattr(meta, "use_spec_decoding", False)
-            or getattr(meta, "is_spec_decoding_enabled", False)
+            or getattr(meta, "is_spec_dec_tree", False)
+            or getattr(meta, "is_spec_dec_dynamic_tree", False)
         ):
-            return False, "CuTe DSL MLA FMHA does not support custom/speculative masks."
+            return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
         if q.shape[0] % meta.num_generations != 0:
             return (
                 False,
@@ -221,7 +299,19 @@ class CuteDslMlaFmha(PhasedFmha):
                     f"KV cache dtype, got {kv_pool_dtype}.",
                 )
 
-        return True, ""
+        # Final authority: the kernel's own can_implement under the default
+        # tiler the op launches with (the FMHA library bypasses the AutoTuner's
+        # can_implement filter), so a request that reaches the gate is one the
+        # kernel can actually serve.
+        return self._kernel_can_implement(
+            kernel_dtype,
+            meta.num_generations,
+            seq_len_q,
+            tokens_per_block,
+            attn.num_heads,
+            attn.kv_lora_rank,
+            attn.qk_rope_head_dim,
+        )
 
     def _run_mla_decode(
         self,
@@ -394,53 +484,57 @@ class CuteDslMlaFmha(PhasedFmha):
 
         out_kernel_dtype = torch.bfloat16 if kernel_dtype == torch.float8_e4m3fn else kernel_dtype
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
-        for query_idx in range(seq_len_q):
-            q_step = q_view[:, query_idx : query_idx + 1, :, :]
-            q_latent = q_step[..., :d_latent].permute(2, 3, 1, 0)
-            q_rope = q_step[..., d_latent:].permute(2, 3, 1, 0)
 
-            o_storage = torch.empty(
-                (batch_size, 1, num_heads, d_latent),
-                dtype=out_kernel_dtype,
-                device=q.device,
-            )
-            o_kernel = o_storage.permute(2, 3, 1, 0)
-            lse_storage = torch.empty(
-                (batch_size, 1, num_heads),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            lse = lse_storage.permute(2, 1, 0)
+        # Single fused decode over all ``seq_len_q`` query tokens. For
+        # multi-query (MTP / linear spec-decode) the kernel applies the causal
+        # mask internally: query token ``t`` attends to KV positions
+        # ``[0, K - (seq_len_q - 1) + t)``. ``cache_seqs_base`` already counts
+        # every freshly-appended token of this step (K), so token ``t``'s bound
+        # equals ``cache_seqs_base - (seq_len_q - 1) + t`` -- exactly the
+        # per-query trim the previous one-token-at-a-time loop applied. For
+        # ``seq_len_q == 1`` this reduces to a plain decode.
+        q_latent = q_view[..., :d_latent].permute(2, 3, 1, 0)
+        q_rope = q_view[..., d_latent:].permute(2, 3, 1, 0)
 
-            # MLA RoPE generation has already appended all query tokens in this
-            # step. For multi-query decode, trim the effective KV length so each
-            # query attends only through its own generated token.
-            cache_seqs = cache_seqs_base - (seq_len_q - query_idx - 1)
+        o_storage = torch.empty(
+            (batch_size, seq_len_q, num_heads, d_latent),
+            dtype=out_kernel_dtype,
+            device=q.device,
+        )
+        o_kernel = o_storage.permute(2, 3, 1, 0)
+        lse_storage = torch.empty(
+            (batch_size, seq_len_q, num_heads),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        lse = lse_storage.permute(2, 1, 0)
 
-            op(
-                q_latent,
-                q_rope,
-                c_pool_latent,
-                c_pool_rope,
-                page_table,
-                cache_seqs,
-                block_split_kvs,
-                o_kernel,
-                lse,
-                workspace,
-                num_heads,
-                1,  # seq_len_q
-                page_size,
-                True,  # is_persistent
-                True,  # is_var_seq
-                False,  # is_var_split_kv
-                split_kv,
-                softmax_scale,
-                output_scale,
-            )
+        op(
+            q_latent,
+            q_rope,
+            c_pool_latent,
+            c_pool_rope,
+            page_table,
+            cache_seqs_base,
+            block_split_kvs,
+            o_kernel,
+            lse,
+            workspace,
+            num_heads,
+            seq_len_q,
+            page_size,
+            True,  # is_persistent
+            True,  # is_var_seq
+            False,  # is_var_split_kv
+            split_kv,
+            softmax_scale,
+            output_scale,
+        )
 
-            attn_out = o_kernel.permute(3, 2, 0, 1).reshape(batch_size, num_heads, d_latent)
-            output_view[:, query_idx, :, :].copy_(attn_out.to(output.dtype))
+        # o_kernel is [num_heads, d_latent, seq_len_q, batch_size]; restore the
+        # [batch_size, seq_len_q, num_heads, d_latent] view to match output_view.
+        attn_out = o_kernel.permute(3, 2, 0, 1)
+        output_view.copy_(attn_out.to(output.dtype))
 
     def run_mla_generation(
         self,

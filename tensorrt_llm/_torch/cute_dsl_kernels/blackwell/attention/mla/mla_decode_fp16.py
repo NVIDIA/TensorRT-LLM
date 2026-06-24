@@ -139,6 +139,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
+        num_heads: int = 128,
+        seq_len_q: int = 1,
+        fold_sq: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -162,6 +165,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type is_var_seq: bool
         :param is_var_split_kv: Whether to use variable split KV
         :type is_var_split_kv: bool
+        :param num_heads: Number of attention heads (pre-fold). Used for the
+            per-row spec-decoding (MTP) causal mask q_token_index computation.
+        :type num_heads: int
+        :param seq_len_q: Query sequence length (pre-fold). Combined with
+            ``num_heads`` to derive the per-row q_token used by the causal mask.
+        :type seq_len_q: int
+        :param fold_sq: Whether to fold tokens of ``seq_len_q`` into the head
+            dimension so the M tile becomes [F sub_q_tok][num_heads heads].
+            Required when ``num_heads < mma_qk_tiler_mn[0]`` and ``seq_len_q > 1``
+            so the M tile is fully populated.
+        :type fold_sq: bool
         """
 
         self.latent_dim = 512
@@ -176,6 +190,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.page_size = page_size
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
+        # Original (pre-fold) num_heads and seq_len_q used for per-row
+        # spec-decoding (MTP) causal q_token_index computation. When fold_sq is
+        # True the M tile is laid out as [F sub_q_tok][num_heads heads]; the
+        # full q_tok for row r is blk_coord[1] * F + (r // num_heads).
+        self.num_heads = num_heads
+        self.seq_len_q = seq_len_q
+        # fold_sq (caller-controlled): whether the folding code path is enabled.
+        # fold_sq_ratio (derived): fold factor F >= 1; the largest divisor of
+        # seq_len_q with num_heads * F <= M_tile and F <= seq_len_q. When the
+        # caller passes fold_sq=False, the kernel ignores the ratio.
+        # When fold_sq=True but the derived ratio is 1, the folding branch
+        # is taken with F=1 (a no-op transform).
+        self.fold_sq = fold_sq
+        self.fold_sq_ratio = (
+            BlackwellMultiHeadLatentAttentionForwardFP16.compute_fold_sq_ratio(
+                num_heads, seq_len_q, mma_qk_tiler_mn[0]))
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -183,7 +213,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.warps_in_n = 2
         self.num_compute_warps = 4
         self.threads_per_warp = 32
-        mma_qk_tiler_k = self.rope_dim
+        mma_qk_tiler_k = self.rope_dim if self.seq_len_q == 1 else self.rope_dim * 2
         self.mma_qk_tiler = (
             self.mma_qk_tiler_mn[0],
             self.mma_qk_tiler_mn[1],
@@ -251,7 +281,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         """
 
         self.load_q_stage = 1
-        self.load_kv_stage = 15
+        self.load_kv_stage = 15 if self.seq_len_q == 1 else 7
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
@@ -346,6 +376,48 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             raise ValueError("o must have leading dimension 1")
         if cutlass.const_expr(lse.stride[0] != 1):
             raise ValueError("lse must have leading dimension 0")
+
+        # When num_heads < M tile, fold up to F = fold_sq_ratio tokens of
+        # seq_len_q into the head dimension so M_eff = num_heads * F (<= M_tile).
+        # E.g., H=32, S_q=4 -> F=4, M_eff=128, S_q_eff=1
+        # E.g., H=32, S_q=8 -> F=4, M_eff=128, S_q_eff=2
+        # This works because MLA shares KV across all heads/queries independently.
+        # Tensor layout: [H, D, S_q, B] -> [H*F, D, S_q/F, B]; relies on
+        # stride_S == stride_H * H (always true for contiguous [B, S_q, H, D]
+        # tensors after the host-side permute).
+        if cutlass.const_expr(self.fold_sq):
+            F = self.fold_sq_ratio
+
+            def _fold_sq_4d(t):
+                return cute.make_tensor(
+                    t.iterator,
+                    cute.make_layout(
+                        (
+                            t.shape[0] * F,
+                            t.shape[1],
+                            t.shape[2] // F,
+                            t.shape[3],
+                        ),
+                        stride=(
+                            t.stride[0],
+                            t.stride[1],
+                            t.stride[2] * F,
+                            t.stride[3],
+                        ),
+                    ),
+                )
+
+            q_latent = _fold_sq_4d(q_latent)
+            q_rope = _fold_sq_4d(q_rope)
+            o = _fold_sq_4d(o)
+            # LSE: [H, S_q, B] -> [H*F, S_q/F, B]
+            lse = cute.make_tensor(
+                lse.iterator,
+                cute.make_layout(
+                    (lse.shape[0] * F, lse.shape[1] // F, lse.shape[2]),
+                    stride=(lse.stride[0], lse.stride[1] * F, lse.stride[2]),
+                ),
+            )
 
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
@@ -2175,8 +2247,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         correction_factor = self.acc_dtype(1)
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
 
-        # no mask applied
-        while k_tile_count > 1:
+        # Number of tiles from the global-K end that may contain causal-masked
+        # positions. Min k_bound = K - (S_q-1), which can span up to
+        # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
+        # S_q=1 this reduces to 1 tile -- identical to a plain K-bound check.
+        tile_n = self.mma_qk_tiler[1]
+        mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
+
+        # first_mask_tile_idx is the global index of the first tile that may
+        # need masking. Runtime because it depends on K (per-batch in
+        # var-seq / split-KV).
+        first_mask_tile_idx = k_tile_total - mask_tile_count
+
+        # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
+        while k_tile_count > 1 and k_index < first_mask_tile_idx:
             (
                 mma_s_consumer_state,
                 p_mma_producer_state,
@@ -2200,8 +2284,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             k_index = k_index + 1
             k_tile_count = k_tile_count - 1
 
-        # mask applied
-        if cutlass.const_expr(common_params.mAccO is not None):
+        # Phase 2: intermediate tiles that overlap the causal/K-bound region
+        # but are not this work-split's final tile.
+        while k_tile_count > 1:
             (
                 mma_s_consumer_state,
                 p_mma_producer_state,
@@ -2219,7 +2304,35 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 row_max,
                 row_sum,
                 correction_factor,
-                k_index == k_tile_total - 1,
+                True,
+                False,
+            )
+            k_index = k_index + 1
+            k_tile_count = k_tile_count - 1
+
+        # Phase 3: this work-split's final tile.
+        if cutlass.const_expr(common_params.mAccO is not None):
+            # Split-KV: only apply mask when this final tile is globally in
+            # the mask region (covers both last-split last-tile and straddling
+            # splits). Runtime comparison.
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                k_index >= first_mask_tile_idx,
                 True,
             )
         else:
@@ -2367,7 +2480,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         row_max: cutlass.Float32,
         row_sum: cutlass.Float32,
         correction_factor: cutlass.Float32,
-        is_last_tile: bool,
+        apply_mask: bool,
         is_local_last_tile: cutlass.Boolean,
     ) -> tuple[
             pipeline.PipelineState,
@@ -2397,8 +2510,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type row_sum: cutlass.Float32
         :param correction_factor: The correction factor
         :type correction_factor: cutlass.Float32
-        :param is_last_tile: Whether the last tile
-        :type is_last_tile: bool
+        :param apply_mask: Whether the tile needs K-bound / causal masking (Python bool
+            for the unmasked/masked bulk loops; runtime cutlass.Boolean for the
+            split-KV final iter where mask only applies on the global last tile).
+        :type apply_mask: bool | cutlass.Boolean
         :param is_local_last_tile: Whether the last tile is local
         :type is_local_last_tile: cutlass.Boolean
 
@@ -2441,15 +2556,35 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
 
         row_max_new = row_max
+        # Spec-decoding (MTP) causal mask: each row represents one (q_token, head)
+        # pair; row r's effective K bound is K - (S_q - 1 - q_tok(r)).
+        # With fold factor F = self.fold_sq_ratio (fold_sq=True), the M tile is
+        # laid out as [F sub_q_tok][num_heads heads] and there are S_q/F outer
+        # chunks indexed by blk_coord[1]:
+        #   q_tok(r) = blk_coord[1] * F + (r_global // num_heads)
+        # r_global = row_in_cta + cluster_idx * (M_tile / cluster_m)
+        # When fold_sq=False this reduces to q_tok = blk_coord[1]. For S_q=1
+        # this further reduces to k_bound = K (plain K-bound check).
+        # Masked positions are filled with a large negative sentinel (not -inf)
+        # to avoid NaN propagation when an entire row becomes masked.
+        cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                if is_last_tile:
+                if apply_mask:
+                    if cutlass.const_expr(self.fold_sq):
+                        q_tok = (common_params.blk_coord[1] * self.fold_sq_ratio
+                                 + (tTR_tS[i][0] +
+                                    common_params.blk_coord[0] * cta_m_rows) //
+                                 self.num_heads)
+                    else:
+                        q_tok = common_params.blk_coord[1]
+                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                        common_params.K,
-                    ) else -self.acc_dtype.inf)
+                        k_bound,
+                    ) else self.acc_dtype(-1.0e6))
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                  row_max_new, 0)
@@ -2476,13 +2611,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (tTR_rAcc_red, tTR_rMax),
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
-            if is_last_tile:
+            if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                    if cutlass.const_expr(self.fold_sq):
+                        q_tok = (common_params.blk_coord[1] * self.fold_sq_ratio
+                                 + (tTR_tS[i][0] +
+                                    common_params.blk_coord[0] * cta_m_rows) //
+                                 self.num_heads)
+                    else:
+                        q_tok = common_params.blk_coord[1]
+                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
-                        common_params.K,
-                    ) else -self.acc_dtype.inf)
-                # reduction for row_max
+                        k_bound,
+                    ) else self.acc_dtype(-1.0e6))
+                # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                      row_max_new, 0)
             else:
@@ -3190,6 +3333,26 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         return tile_sched_params, grid
 
     @staticmethod
+    def compute_fold_sq_ratio(num_heads: int, seq_len_q: int,
+                              m_tile: int) -> int:
+        """Derive the seq_len_q-into-heads fold factor F.
+
+        Returns the largest integer F such that:
+          - F divides seq_len_q evenly
+          - num_heads * F <= m_tile
+          - 1 <= F <= seq_len_q
+
+        F=1 means no folding (i.e. ``fold_sq`` should be False at the caller).
+        """
+        if num_heads >= m_tile:
+            return 1
+        max_fold = min(seq_len_q, m_tile // num_heads)
+        for f in range(max_fold, 0, -1):
+            if seq_len_q % f == 0:
+                return f
+        return 1
+
+    @staticmethod
     def get_workspace_size(
         H: int,
         S: int,
@@ -3354,9 +3517,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             return False
         if is_var_split_kv and not is_var_seq:
             return False
-        if H > 128 or (H < 128 and split_kv != 1):
+        if mma_qk_tiler_mn[0] < H:
             return False
-        if S < 1 or S > 4:
+        # When H < M tile, fold up to F tokens of S into H (M_eff = H*F <= M_tile).
+        # F is auto-picked as the largest divisor of S with H*F <= M_tile.
+        # F=1 always works, so any (H <= M_tile, S >= 1) is implementable.
+        if S < 1:
             return False
         if K <= 0:
             return False
@@ -3663,10 +3829,20 @@ def run(
 
     def create_workspace(num_heads, seq_len_q, latent_dim, batch_size, split_kv,
                          acc_dtype):
+        # When folding S_q into heads, the kernel allocates the per-split
+        # workspace using the effective (folded) dims [H*F, S_q/F]. Mirror that
+        # here so the host-allocated workspace matches. get_workspace_size
+        # uses H*S directly, so H*F * (S_q/F) == H*S_q -> identical size; this
+        # is kept explicit for clarity / parity with the integration layer.
+        fold_ratio = (
+            BlackwellMultiHeadLatentAttentionForwardFP16.compute_fold_sq_ratio(
+                num_heads, seq_len_q, mma_qk_tiler_mn[0]))
+        num_heads_eff = num_heads * fold_ratio
+        seq_len_q_eff = seq_len_q // fold_ratio
         workspace_size = (
             BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-                num_heads,
-                seq_len_q,
+                num_heads_eff,
+                seq_len_q_eff,
                 latent_dim,
                 batch_size,
                 split_kv,
@@ -3755,6 +3931,14 @@ def run(
                                                   latent_dim, batch_size,
                                                   split_kv, acc_dtype)
 
+    # Derive the seq_len_q-into-heads fold factor. F > 1 means the kernel
+    # repacks the [H, S_q] tile to [H*F, S_q/F] internally so MTP / spec-decoding
+    # with H < 128 fully populates the 128-wide MMA-M tile.
+    fold_sq_ratio = (
+        BlackwellMultiHeadLatentAttentionForwardFP16.compute_fold_sq_ratio(
+            num_heads, seq_len_q, mma_qk_tiler_mn[0]))
+    fold_sq = fold_sq_ratio > 1
+
     mla = BlackwellMultiHeadLatentAttentionForwardFP16(
         acc_dtype,
         lse_dtype,
@@ -3766,6 +3950,9 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        fold_sq=fold_sq,
     )
 
     # Get current CUDA stream from PyTorch
@@ -3802,7 +3989,12 @@ def run(
         cache_seqs,
         softmax_scale=1.0,
         output_scale=1.0,
+        apply_mtp_mask=False,
     ):
+        # When apply_mtp_mask is True, applies the spec-decoding (MTP) causal
+        # mask the monolithic kernel uses: for q_token qi in [0, q_len), valid
+        # KV positions are [0, seq_len - q_len + 1 + qi). For q_len == 1 this
+        # reduces to the plain K-bound check (no-op).
         # expand and concat q_latent and q_rope to have the dimension of sequence length for q
         q_ref = torch.cat([q_latent, q_rope], dim=1).permute(3, 2, 0, 1)
         # expand and concat c_latent and c_rope to have the dimension of num_heads for k and v
@@ -3833,16 +4025,37 @@ def run(
             v_ref[b, :, cache_seqs_ref[b]:, :] = 0
         import torch.nn.functional as F
 
+        # Spec-decoding (MTP) causal mask. q_ref is [B, S_q, H, D] (the SDPA
+        # batch dims are [B, S_q]; head dim H is the query length). Row q-token
+        # qi's effective K bound is seq_len - (S_q - 1) + qi. Build an additive
+        # mask of shape [B, S_q, 1, K] that broadcasts across heads.
+        attn_mask = None
+        if apply_mtp_mask and seq_len_q > 1:
+            attn_mask = torch.zeros(
+                [batch_size, seq_len_q, 1, max_seq_len],
+                dtype=torch.float32,
+            )
+            for b in range(batch_size):
+                seq_len_b = int(cache_seqs_ref[b])
+                for qi in range(seq_len_q):
+                    upper = max(0, seq_len_b - seq_len_q + 1 + qi)
+                    if upper < max_seq_len:
+                        attn_mask[b, qi, 0, upper:] = float("-inf")
+
         o_ref = F.scaled_dot_product_attention(
             q_ref,
             k_ref,
             v_ref,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=0.0,
             scale=softmax_scale,
             is_causal=False,
         )
         s_ref = torch.einsum("bhld,bhsd->bhls", q_ref, k_ref)
+        # Apply the same MTP mask before the LSE reduction. s_ref is
+        # [B, S_q, H, K]; attn_mask [B, S_q, 1, K] broadcasts across heads.
+        if attn_mask is not None:
+            s_ref = s_ref + attn_mask
         s_ref_max, s_ref_max_pos = torch.max(s_ref, dim=-1, keepdim=True)
         softmax_scale_log2 = LOG2_E * softmax_scale
         s_ref_sum = torch.sum(torch.exp2(
@@ -3894,6 +4107,7 @@ def run(
             cache_seqs,
             softmax_scale,
             output_scale,
+            apply_mtp_mask=True,
         )
 
         if out_dtype in [cutlass.Float8E5M2, cutlass.Float8E4M3FN]:
