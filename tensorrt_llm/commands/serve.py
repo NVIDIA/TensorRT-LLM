@@ -1,4 +1,16 @@
 import asyncio
+
+# Install uvloop as the default asyncio event loop policy before any module
+# retrieves a running loop. libuv-backed event loops have significantly lower
+# per-await overhead than the cpython default; this affects every coroutine
+# in the server. Falls back to the default loop when uvloop is not installed.
+try:
+    import uvloop as _uvloop  # type: ignore[import-not-found]
+
+    _uvloop.install()
+except ImportError:
+    pass
+
 import gc
 import importlib
 import inspect
