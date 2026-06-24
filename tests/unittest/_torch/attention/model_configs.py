@@ -314,7 +314,7 @@ _STANDARD = [
     # NoPE decoder self-attention (learned/relative positional embeddings are
     # handled outside the dense backend).
     ModelAttnConfig(
-        "t5_6_self_nope",
+        "flan_t5_small_self_nope",
         "FLAN-T5-small / ByT5-small decoder self-attention",
         num_heads=6,
         num_kv_heads=6,
@@ -322,7 +322,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "t5_8_self_nope",
+        "t5_small_self_nope",
         "T5-small decoder self-attention",
         num_heads=8,
         num_kv_heads=8,
@@ -330,7 +330,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "t5_12_self_nope",
+        "t5_base_self_nope",
         "T5-base decoder self-attention",
         num_heads=12,
         num_kv_heads=12,
@@ -346,7 +346,7 @@ _STANDARD = [
         rope=None,
     ),
     ModelAttnConfig(
-        "t5_32_self_nope",
+        "flan_t5_xl_self_nope",
         "FLAN-T5-XL decoder self-attention",
         num_heads=32,
         num_kv_heads=32,
@@ -550,15 +550,6 @@ _STANDARD = [
         mask="sliding",
         sliding_window=1024,
     ),
-    # MQA (single KV head): SYNTHETIC -- no current supported model uses it, but
-    # it is the GQA extreme (n_rep == num_heads) and worth guarding.
-    ModelAttnConfig(
-        "mqa_synthetic",
-        "(synthetic MQA -- no model; GQA extreme)",
-        num_heads=16,
-        num_kv_heads=1,
-        head_dim=128,
-    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -607,15 +598,42 @@ _MLA = [
         qk_rope_head_dim=64,
         v_head_dim=128,
     ),
-    # DeepSeek-V3 MLA *context* pass: the module up-projects compressed_kv to
-    # full per-head K/V, so attention is MHA (num_kv_heads == num_heads) with
+    # MLA *context* pass: the module up-projects compressed_kv to full
+    # per-head K/V, so attention is MHA (num_kv_heads == num_heads) with
     # asymmetric K/V -- K head_dim = qk_nope + qk_rope = 192, V head_dim = 128.
-    # (Heads scaled down from 128 for test speed; the tuple shape is the point.)
     ModelAttnConfig(
         "deepseekv3_mla_ctx",
-        "DeepSeek-V3 (MLA up-proj context, asymmetric K/V)",
-        num_heads=16,
-        num_kv_heads=16,
+        "DeepSeek-V3 / R1 / V3.2 MLA context",
+        num_heads=128,
+        num_kv_heads=128,
+        head_dim=192,
+        mla_context=True,
+        is_mla=True,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+    ),
+    ModelAttnConfig(
+        "hunyuan_mla_ctx",
+        "Hunyuan-Dense / DeepSeek-V3-Lite MLA context",
+        num_heads=32,
+        num_kv_heads=32,
+        head_dim=192,
+        mla_context=True,
+        is_mla=True,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+    ),
+    ModelAttnConfig(
+        "kimi_k25_mla_ctx",
+        "Kimi-K2/K2.5 MLA context",
+        num_heads=64,
+        num_kv_heads=64,
         head_dim=192,
         mla_context=True,
         is_mla=True,
@@ -632,7 +650,7 @@ _MLA = [
 # ---------------------------------------------------------------------------
 _CROSS = [
     ModelAttnConfig(
-        "t5_6_cross",
+        "flan_t5_small_cross",
         "FLAN-T5-small / ByT5-small cross-attention",
         num_heads=6,
         num_kv_heads=6,
@@ -642,7 +660,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "t5_8_cross",
+        "t5_small_cross",
         "T5-small cross-attention",
         num_heads=8,
         num_kv_heads=8,
@@ -652,7 +670,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "t5_cross",
+        "t5_base_cross",
         "T5-base cross-attention",
         num_heads=12,
         num_kv_heads=12,
@@ -672,7 +690,7 @@ _CROSS = [
         is_cross=True,
     ),
     ModelAttnConfig(
-        "t5_32_cross",
+        "flan_t5_xl_cross",
         "FLAN-T5-XL cross-attention",
         num_heads=32,
         num_kv_heads=32,
@@ -699,7 +717,7 @@ _CROSS = [
 # ---------------------------------------------------------------------------
 _NO_CACHE = [
     ModelAttnConfig(
-        "t5_6_encoder",
+        "t5_small_encoder",
         "FLAN-T5-small / ByT5-small encoder",
         num_heads=6,
         num_kv_heads=6,
@@ -749,7 +767,7 @@ _NO_CACHE = [
         no_cache=True,
     ),
     ModelAttnConfig(
-        "t5_32_encoder",
+        "flan_t5_xl_encoder",
         "FLAN-T5-XL encoder",
         num_heads=32,
         num_kv_heads=32,

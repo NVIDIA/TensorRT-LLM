@@ -43,7 +43,7 @@ _FP8 = ("bfloat16", "float8_e4m3fn")
 _CORE_PRECISIONS, _CORE_LAYOUTS, _CORE_PAGES = [_BF16, _FP8], ["HND"], [32]
 _EXTRA_PRECISIONS = [_FP16, _BF16, _FP8]
 _EXTRA_LAYOUTS, _EXTRA_PAGES = ["HND", "NHD"], [32, 64]
-_EXTRA_CONFIG_IDS = ("llama3_gqa", "mha_32x32_hd128", "mqa_synthetic")
+_EXTRA_CONFIG_IDS = ("llama3_gqa", "mha_32x32_hd128", "gemma3_1b_mqa_hd256")
 
 # Standard self-attention batch phases.
 _PHASES = {
