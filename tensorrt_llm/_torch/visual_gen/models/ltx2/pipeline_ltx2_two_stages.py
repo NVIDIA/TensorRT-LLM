@@ -4,7 +4,6 @@
 
 import json
 import math
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -50,8 +49,6 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # Baseline BF16 peak memory ~75 GiB, saving BF16 weights snopshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
-_LTX2_PERSISTENT_LORA_WEIGHTS_ENV = "TRTLLM_LTX2_PERSISTENT_LORA_WEIGHTS"
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +97,6 @@ def _should_save_bf16_weights(
         f"{relation} {threshold_gib:.2f} GiB threshold"
     )
     return save_state
-
-
-def _persistent_lora_weights_enabled() -> bool:
-    return os.environ.get(_LTX2_PERSISTENT_LORA_WEIGHTS_ENV, "").strip().lower() in _TRUE_ENV_VALUES
 
 
 def _load_lora_deltas(
@@ -1010,26 +1003,25 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
-            if _persistent_lora_weights_enabled():
-                try:
-                    self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
-                        self.transformer,
-                        self._distilled_lora_deltas,
-                    )
-                except torch.cuda.OutOfMemoryError as exc:
-                    logger.warning(
-                        "Persistent LTX-2 LoRA weights disabled after CUDA OOM "
-                        f"during cache build: {exc}"
-                    )
-                    torch.cuda.empty_cache()
-                    self._distilled_lora_weight_cache = None
-                else:
-                    self._distilled_lora_weight_cache.bind_original()
-                    logger.info(
-                        "Persistent LTX-2 LoRA weights ready: "
-                        f"{self._distilled_lora_weight_cache.applied_count} params, "
-                        f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
-                    )
+            try:
+                self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                logger.warning(
+                    "Persistent LTX-2 LoRA weights disabled after CUDA OOM "
+                    f"during cache build: {exc}"
+                )
+                torch.cuda.empty_cache()
+                self._distilled_lora_weight_cache = None
+            else:
+                self._distilled_lora_weight_cache.bind_original()
+                logger.info(
+                    "Persistent LTX-2 LoRA weights ready: "
+                    f"{self._distilled_lora_weight_cache.applied_count} params, "
+                    f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
+                )
 
     # ------------------------------------------------------------------
     # Inference entry point
@@ -1169,11 +1161,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 2: refinement denoising with distilled LoRA
         # ================================================================
-        # The default path merges LoRA per request and restores afterwards.
-        # When TRTLLM_LTX2_PERSISTENT_LORA_WEIGHTS is enabled, the resident
-        # cache already owns original and merged tensors. Stage 2 only rebinds
-        # pointers and FP4 quant_method state, so no per-request clone, merge, or
-        # unmerge math is needed.
+        # The persistent cache owns original and merged tensors when it can be
+        # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
+        # state, so no per-request clone, merge, or unmerge math is needed.
         lora_cache = self._distilled_lora_weight_cache
         using_persistent_lora = lora_cache is not None
         saved_lora_state: Dict[str, Any] = {}
