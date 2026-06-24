@@ -3,13 +3,14 @@ import asyncio
 # Install uvloop as the default asyncio event loop policy before any module
 # retrieves a running loop. libuv-backed event loops have significantly lower
 # per-await overhead than the cpython default; this affects every coroutine
-# in the server. Falls back to the default loop when uvloop is not installed.
+# in the server. uvloop is a declared dependency, so the import is expected
+# to succeed; the try-block here is only present so ruff doesn't flag the
+# subsequent module-level imports as E402 (post-statement imports).
 try:
-    import uvloop as _uvloop  # type: ignore[import-not-found]
-
-    _uvloop.install()
+    import uvloop
+    uvloop.install()
 except ImportError:
-    pass
+    raise
 
 import gc
 import importlib

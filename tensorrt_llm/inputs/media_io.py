@@ -28,12 +28,29 @@ from PIL import Image
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
 
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    """Parse a positive-int env var, falling back to ``default`` on bad values."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using default %d", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%d must be >= 1; using default %d", name, value, default)
+        return default
+    return value
+
+
 # Dedicated executor for blocking media-load work (bytes / base64 / file
 # decode). The cpython default asyncio.to_thread executor is shared across
 # the whole server, so decodes would otherwise contend for thread slots with
 # unrelated to_thread() callers (URL validation, etc.). A dedicated pool
 # isolates this work and lets the size be tuned independently.
-_MEDIA_LOAD_WORKERS = int(os.environ.get("TRTLLM_MEDIA_LOAD_WORKERS", "8"))
+_MEDIA_LOAD_WORKERS = _read_positive_int_env("TRTLLM_MEDIA_LOAD_WORKERS", 8)
 _MEDIA_LOAD_EXECUTOR = ThreadPoolExecutor(
     max_workers=_MEDIA_LOAD_WORKERS,
     thread_name_prefix="trtllm_media_load",
@@ -333,8 +350,54 @@ def extract_audio_from_video(
     return audio, target_sr
 
 
+def _select_cv2_stream_buffered_backend() -> Optional[int]:
+    """Return a VideoCapture backend that can read from a Python ``BytesIO``.
+
+    Returns ``None`` if no such backend is available in this OpenCV build.
+    Plugin-provided backends must implement the stream-buffered API at
+    version 1.2+; older plugins exist that load fine but crash on stream
+    open. Built-in backends (the FFMPEG path in the PyPI wheels) are always
+    safe to use.
+    """
+    import cv2
+
+    try:
+        from cv2 import videoio_registry as vr
+    except ImportError:
+        return None
+    try:
+        for backend in vr.getStreamBufferedBackends():
+            if not vr.hasBackend(backend):
+                continue
+            if not vr.isBackendBuiltIn(backend):
+                _, abi, api = vr.getStreamBufferedBackendPluginVersion(backend)
+                if abi < 1 or (abi == 1 and api < 2):
+                    continue
+            return backend
+    except (AttributeError, cv2.error):
+        # Older cv2 without the stream-buffered registry API, or a backend
+        # query failure — caller falls back to the tempfile path.
+        pass
+    return None
+
+
+def _write_video_tempfile(data: bytes) -> str:
+    """Persist mp4 bytes to a named tempfile and return its path.
+
+    Used as a fallback when no cv2 stream-buffered backend is available.
+    The caller owns the returned path and must ``os.unlink`` it when done.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    try:
+        tmp.write(data)
+        tmp.flush()
+    finally:
+        tmp.close()
+    return tmp.name
+
+
 def _load_video_by_cv2(
-    video,
+    video: Union[str, bytes],
     num_frames: int = 10,
     fps: int = 30,
     format: str = "pt",
@@ -353,37 +416,24 @@ def _load_video_by_cv2(
 
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
-    # In-memory fast path. The BytesIO must be kept alive for the duration
-    # of decoding — cv2 holds a non-owning view into the buffer.
-    _video_buf = None
+    # Open the source. Three cases:
+    #   (a) ``video`` is a file path / URL str -> hand it straight to cv2.
+    #   (b) ``video`` is mp4 bytes AND cv2 has a stream-buffered backend ->
+    #       feed cv2 from an in-memory BytesIO. The buffer is held alive in
+    #       ``_video_buf`` because cv2 keeps a non-owning view into it.
+    #   (c) ``video`` is mp4 bytes but no stream-buffered backend -> spill
+    #       to a tempfile and open it. The path is unlinked at end of fn.
+    _video_buf: Optional[BytesIO] = None
+    _tmp_path: Optional[str] = None
     if isinstance(video, (bytes, bytearray, memoryview)):
-        from cv2 import videoio_registry as _vr
-
-        _api_pref = None
-        try:
-            for _backend in _vr.getStreamBufferedBackends():
-                if not _vr.hasBackend(_backend):
-                    continue
-                if not _vr.isBackendBuiltIn(_backend):
-                    _, _abi, _api = _vr.getStreamBufferedBackendPluginVersion(_backend)
-                    if _abi < 1 or (_abi == 1 and _api < 2):
-                        continue
-                _api_pref = _backend
-                break
-        except Exception:
-            _api_pref = None
-        if _api_pref is not None:
-            _video_buf = BytesIO(bytes(video))
-            vidcap = cv2.VideoCapture(_video_buf, _api_pref, [])
+        data = bytes(video)
+        api = _select_cv2_stream_buffered_backend()
+        if api is not None:
+            _video_buf = BytesIO(data)
+            vidcap = cv2.VideoCapture(_video_buf, api, [])
         else:
-            # No stream-buffered backend; fall back to a tempfile.
-            _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            try:
-                _tmp.write(bytes(video))
-                _tmp.flush()
-            finally:
-                _tmp.close()
-            video = _tmp.name
+            _tmp_path = _write_video_tempfile(data)
+            video = _tmp_path
             vidcap = cv2.VideoCapture(video)
     else:
         vidcap = cv2.VideoCapture(video)
@@ -437,11 +487,15 @@ def _load_video_by_cv2(
 
         valid_indices = [i for i in indices if i in raw_frames]
         if format == "pt":
-            # Return uint8 HWC numpy frames. The downstream HF processor's
-            # do_rescale=True path rescales and permutes the stacked
-            # (N, H, W, 3) array as one vectorized op, so per-frame Python
-            # torch conversion here is redundant work.
-            loaded_frames = [raw_frames[i] for i in valid_indices]
+            # uint8 -> float32 + /255 rescale done once on the stacked buffer
+            # so the dtype conversion is a single memory pass and there's one
+            # Python torch call instead of one per frame.
+            stacked_uint8 = np.stack([raw_frames[i] for i in valid_indices])
+            stacked_f32 = stacked_uint8.astype(np.float32) * (1.0 / 255.0)
+            tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
+            if device != "cpu":
+                tensor_nchw = tensor_nchw.to(device)
+            loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
         else:
             loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
 
@@ -458,10 +512,11 @@ def _load_video_by_cv2(
 
     audio = None
     if extract_audio:
-        # extract_audio_from_video accepts Union[str, BytesIO]. If the
+        # extract_audio_from_video accepts Union[str, BytesIO]. When the
         # in-memory cv2 path was taken, ``video`` is still the original
         # bytes parameter — wrap in a fresh BytesIO (the one consumed by
-        # cv2 is at end-of-stream).
+        # cv2 is at end-of-stream). When the tempfile fallback was used,
+        # ``video`` is the file path string and is passed through as-is.
         _audio_source = (
             BytesIO(bytes(video)) if isinstance(video, (bytes, bytearray, memoryview)) else video
         )
@@ -473,6 +528,14 @@ def _load_video_by_cv2(
                 logger.warning("Video has no audio track, skipping audio extraction.")
             else:
                 raise
+
+    # Clean up the fallback tempfile (if any). Done after audio extraction
+    # since that path may still read from the file.
+    if _tmp_path is not None:
+        try:
+            os.unlink(_tmp_path)
+        except OSError:
+            pass
 
     return VideoData(frames=loaded_frames, metadata=metadata, audio=audio)
 

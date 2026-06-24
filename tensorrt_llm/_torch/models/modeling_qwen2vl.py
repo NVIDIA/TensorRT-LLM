@@ -104,7 +104,8 @@ def _install_merge_kwargs_cache(processor) -> None:
     def _cached_merge_kwargs(*args, **kwargs):
         try:
             key = repr(sorted(kwargs.items()))
-        except Exception:
+        except TypeError:
+            # Unsortable / un-repr-able kwargs — fall back to uncached call.
             return orig(*args, **kwargs)
         hit = cache.get(key)
         if hit is not None:

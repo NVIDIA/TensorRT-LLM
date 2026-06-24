@@ -266,9 +266,13 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # frames or take a slower path due to the metadata/frame-count
         # mismatch). Caller-supplied kwargs other than fps/num_frames are
         # preserved.
+        # do_sample_frames is intentionally non-overridable: the IO loader has
+        # already sampled to the target frame count, so letting a caller flip
+        # it back to True would re-enter the HF sample_frames branch on
+        # already-sampled input and break the contract this patch establishes.
         proc_kwargs = {"do_sample_frames": False}
         for _k, _v in dict(mm_processor_kwargs).items():
-            if _k not in ("num_frames", "fps"):
+            if _k not in ("num_frames", "fps", "do_sample_frames"):
                 proc_kwargs[_k] = _v
 
         return self.processor(

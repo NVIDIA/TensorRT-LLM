@@ -94,12 +94,35 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    """Parse a positive-int env var, falling back to ``default`` on bad values.
+
+    Avoids crashing server startup on invalid values like ``foo``, ``0``, or
+    ``-1`` — logs a warning and uses ``default`` instead.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using default %d", name, raw,
+                       default)
+        return default
+    if value < 1:
+        logger.warning("%s=%d must be >= 1; using default %d", name, value,
+                       default)
+        return default
+    return value
+
+
 # Dedicated executor for HF input-processor / preprocess work on the chat
 # and completion endpoints. Same rationale as the media-load executor in
 # inputs/media_io.py: isolate this CPU-bound work from unrelated
 # to_thread() callers on the default asyncio pool and allow independent
 # tuning.
-_INPUT_PROC_WORKERS = int(os.environ.get("TRTLLM_INPUT_PROC_WORKERS", "8"))
+_INPUT_PROC_WORKERS = _read_positive_int_env("TRTLLM_INPUT_PROC_WORKERS", 8)
 _INPUT_PROC_EXECUTOR = ThreadPoolExecutor(
     max_workers=_INPUT_PROC_WORKERS,
     thread_name_prefix="trtllm_inputproc",
