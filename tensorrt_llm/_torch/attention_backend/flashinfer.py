@@ -1385,33 +1385,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
 
-    def mla_rope_generation(
-        self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
-        latent_cache: torch.Tensor,
-        metadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale,
-        mla_bmm2_scale,
-        quant_q_buffer,
-        out_scale=None,
-    ) -> None:
-        """Stub for MLA generation rope step used when FlashInfer is the mqa backend.
-
-        FlashInferAttention does not fuse RoPE (support_fused_rope returns False),
-        so RoPE is applied externally in MLA.forward_impl before this point.
-        q_pe already has RoPE applied; we just copy it into the rope slot of
-        fused_q so that forward_absorption_generation can pass fused_q directly
-        to _mla_forward_generation.  The latent_cache KV-cache append is handled
-        inside _mla_forward_generation when forward() is called.
-        """
-        # fused_q shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
-        # q_pe shape:    [num_tokens, num_heads, qk_rope_head_dim]
-        fused_q[..., self.kv_lora_rank:] = q_pe
-
     def _get_mla_caches(
         self,
         metadata: "FlashInferAttentionMetadata",

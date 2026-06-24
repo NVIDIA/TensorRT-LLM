@@ -859,6 +859,10 @@ class AttentionForwardArgs:
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
     fmha_scheduler_counter: Optional[torch.Tensor] = None
+    # Testing only: skip the RoPE step of MLA generation (the standalone harness
+    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
+    # and inits the trtllm-gen scheduler buffers itself.
+    skip_mla_rope_generation: bool = False
 
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None

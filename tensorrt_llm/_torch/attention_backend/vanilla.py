@@ -118,20 +118,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
     def support_mla(cls) -> bool:
         return True
 
-    def mla_rope_generation(self, fused_q: torch.Tensor, q_pe: torch.Tensor,
-                            latent_cache: torch.Tensor, metadata, *args,
-                            **kwargs) -> None:
-        """Place the already-RoPE'd ``q_pe`` into the rope slot of ``fused_q``.
-
-        Mirrors :meth:`FlashInferAttention.mla_rope_generation`: neither backend
-        fuses RoPE, so ``MLA.forward_impl`` rotates ``q_pe`` / ``k_pe`` before
-        this call. Here we only copy ``q_pe`` into ``fused_q``'s rope portion;
-        the latent-cache append happens in :meth:`_mla_forward_generation`.
-        """
-        # fused_q: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
-        # q_pe:    [num_tokens, num_heads, qk_rope_head_dim]
-        fused_q[..., self.kv_lora_rank:] = q_pe
-
     def _single_request_sparse_attn_predict(
             self, q: torch.Tensor, k: Optional[torch.Tensor],
             v: Optional[torch.Tensor], kv_cache_tensor: torch.Tensor,
@@ -512,7 +498,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         (head_dim ``kv_lora_rank + qk_rope_head_dim``). Each query head attends to
         it (MQA); the value is the ``kv_lora_rank`` slice of the same entries, so
         the output head_dim is ``kv_lora_rank``. RoPE is already applied to the
-        rope portions (q_pe via ``mla_rope_generation`` and k_pe upstream).
+        rope portions of ``fused_q`` / ``latent_cache`` by the MLA module
+        (``forward_absorption_generation``) before ``forward`` is called.
 
         Mirrors :meth:`FlashInferAttention._mla_forward_generation`: the new
         ``latent_cache`` tokens are appended to the paged cache, then attention

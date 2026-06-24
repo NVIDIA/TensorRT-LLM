@@ -1473,6 +1473,37 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if forward_args.cu_kv_seqlens is None:
             forward_args.cu_kv_seqlens = metadata.cu_kv_seqlens
 
+        # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
+        # new latent to the paged cache, and fills the trtllm-gen scheduler
+        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
+        # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
+        # so we skip only the RoPE and do the append + scheduler init here: the
+        # generation FMHA only reads the cache, and the fallback path needs the
+        # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
+        if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and forward_args.attention_input_type
+                == AttentionInputType.generation_only):
+            num_ctx = metadata.num_contexts
+            n_gen = metadata.num_generations
+            # Use the GPU-resident length tensors (no host->device copy) so this
+            # stays CUDA-graph-capturable.
+            gen_q_lens = metadata.seq_lens_cuda[num_ctx:num_ctx + n_gen].to(
+                torch.int32)
+            gen_kv_lens = metadata.kv_lens_cuda_runtime[num_ctx:num_ctx +
+                                                        n_gen].to(torch.int32)
+            cu_q = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
+            cu_kv = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
+            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(torch.int32)
+            cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
+            forward_args.cu_q_seqlens = cu_q
+            forward_args.cu_kv_seqlens = cu_kv
+            if forward_args.fmha_scheduler_counter is None:
+                forward_args.fmha_scheduler_counter = torch.zeros(
+                    1, dtype=torch.uint32, device=q.device)
+            else:
+                forward_args.fmha_scheduler_counter.zero_()
+            self._append_mla_gen_latent(metadata, forward_args.latent_cache)
+
         # RocketKV and DSA predict which blocks to keep, so build their sparse
         # index tensors here. Skip-softmax needs no prediction.
         sparse_params = self.sparse_params
@@ -1853,6 +1884,35 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             Predict sparse attn indices. It's implemented in the derived class.
         """
         raise NotImplementedError
+
+    def _append_mla_gen_latent(self, metadata: TrtllmAttentionMetadata,
+                               latent_cache: torch.Tensor) -> None:
+        """Write the new generation latent into the paged MLA cache (no RoPE).
+
+        Testing-only counterpart to the cache append ``mla_rope_generation``
+        performs in production. Used when ``skip_mla_rope_generation`` is set:
+        the generation FMHA only reads the cache, so the new latent tokens must
+        be present at ``[num_cached, num_cached + q_len)`` per request.
+        """
+        layer = self.get_local_layer_idx(metadata)
+        # [num_pages, 1, tokens_per_block, 1, kv_lora_rank + qk_rope_head_dim]
+        buf = metadata.kv_cache_manager.get_buffers(layer)
+        tokens_per_block = buf.shape[2]
+        blocks_per_req = metadata.kv_cache_manager.get_batch_cache_indices(
+            metadata.request_ids, layer)
+        num_cached = metadata.kv_cache_params.num_cached_tokens_per_seq
+        seq_lens = metadata.seq_lens.tolist()
+        tok = 0
+        for i in range(metadata.num_contexts, metadata.num_seqs):
+            blocks = [b for b in blocks_per_req[i] if b != -1]
+            q_len = int(seq_lens[i])
+            start = int(num_cached[i])
+            for j in range(q_len):
+                pos = start + j
+                blk = blocks[pos // tokens_per_block]
+                buf[blk, 0, pos % tokens_per_block,
+                    0, :].copy_(latent_cache[tok + j])
+            tok += q_len
 
     def mla_rope_generation(
         self,

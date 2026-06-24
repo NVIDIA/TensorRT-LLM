@@ -112,10 +112,12 @@ class BackendCase:
     # MLA latent dims (only meaningful when is_mla). The unified harness runs the
     # *absorbed generation* MLA path: fused_q does MQA over a single-latent cache
     # ([compressed_kv | k_pe]); value is the kv_lora_rank slice. Validated as the
-    # Vanilla golden vs FlashInfer (the non-fusion backends). TRTLLM MLA fuses
-    # RoPE + appends in mla_rope_generation, so it is validated in
-    # test_attention_mla.py instead. MLA *context* (up-projected K/V) also lives
-    # there.
+    # Vanilla golden vs FlashInfer and TRTLLM. The harness skips
+    # mla_rope_generation (feeding a pre-formed fused_q), so all three backends
+    # run RoPE-free and stay aligned; TRTLLM additionally pre-writes the new
+    # latent into the cache and Python-initializes the trtllm-gen scheduler
+    # buffers. MLA *context* (up-projected K/V) runs on Vanilla/FlashInfer; the
+    # TRTLLM context FMHA fuses RoPE and is validated in test_attention_mla.py.
     v_head_dim: Optional[int] = None
     q_lora_rank: Optional[int] = None
     kv_lora_rank: Optional[int] = None
@@ -392,7 +394,12 @@ def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Te
     fused_q = inputs["fused_q"]
     latent_cache = inputs["latent_cache"]
     fwd_kwargs = dict(
-        latent_cache=latent_cache, attention_input_type=AttentionInputType.generation_only
+        latent_cache=latent_cache,
+        attention_input_type=AttentionInputType.generation_only,
+        # The harness feeds a pre-RoPE'd fused_q, so skip the RoPE step; the
+        # TRTLLM backend still appends the new latent and inits its scheduler
+        # buffers. Vanilla/FlashInfer ignore this flag (they append in forward).
+        skip_mla_rope_generation=True,
     )
 
     def _forward(metadata, q):

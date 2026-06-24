@@ -233,18 +233,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
                 "and FlashInfer validates fp8 decode"
             )
 
-    # TRTLLM fuses RoPE for MLA (support_fused_rope), so its absorbed-generation
-    # invocation differs (RoPE applied inside mla_rope_generation, with cu_seqlens
-    # / scheduler buffers). This unified harness exercises the *non-fusion* MLA
-    # path shared by Vanilla (golden) and FlashInfer; TRTLLM MLA is validated in
-    # test_attention_mla.py instead.
-    if backend == "TRTLLM" and getattr(case, "is_mla", False):
-        return (
-            "TRTLLM MLA uses fused RoPE (distinct invocation); validated via "
-            "test_attention_mla.py. This harness checks the non-fusion MLA path "
-            "(Vanilla golden vs FlashInfer)"
-        )
-
     # TRTLLM cross-attention works through the standard plumbing (prepare()
     # derives the cross kv_lens from seq_lens_kv; the backend builds cross_kv from
     # k/v). The aligned q_len == kv_len case is exercised on TRTLLM. The
