@@ -17,6 +17,7 @@ Extracted from ``router.py`` so the surface routers there can share a single
 implementation of block hashing without importing the whole router module.
 """
 
+import json
 import os
 from collections import OrderedDict
 from typing import Iterable, List, Optional, Union
@@ -188,19 +189,23 @@ class BlockHashMixin:
         tokens_per_block: Optional[int] = None,
         custom_tokenizer: Optional[str] = None,
         tokenizer_dir: Optional[str] = None,
-    ):
+        use_harmony: Optional[bool] = None,
+    ) -> None:
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
         self._tpb_auto = tokens_per_block is None
         self._tokens_per_block = 32 if tokens_per_block is None else tokens_per_block
         self._tokenizers: dict = {}
+        self._model_types: dict[str, Optional[str]] = {}
         self._custom_tokenizer = custom_tokenizer
         self._tokenizer_dir = tokenizer_dir
+        self._use_harmony = use_harmony
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
             f", custom_tokenizer={self._custom_tokenizer}"
+            f", use_harmony={self._use_harmony}"
         )
 
     def _get_tokenizer(self, model: str):
@@ -218,6 +223,55 @@ class BlockHashMixin:
                 )
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
+
+    def _get_model_type(self, model: str) -> Optional[str]:
+        if model not in self._model_types:
+            model_type = None
+            model_path = self._tokenizer_dir or model
+            normalized_model = model_path.lower().replace("_", "-")
+            if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
+                model_type = "gpt_oss"
+            else:
+                config_path = os.path.join(model_path, "config.json")
+                if os.path.isfile(config_path):
+                    try:
+                        with open(config_path, encoding="utf-8") as config_file:
+                            config = json.load(config_file)
+                        if isinstance(config, dict):
+                            raw_model_type = config.get("model_type")
+                            if isinstance(raw_model_type, str):
+                                model_type = raw_model_type
+                    except (OSError, json.JSONDecodeError) as e:
+                        logger.debug(f"BlockHashMixin: failed to read model config for {model_path}: {e}")
+            self._model_types[model] = model_type
+        return self._model_types[model]
+
+    def _uses_harmony_tokenization(self, request: ChatCompletionRequest) -> bool:
+        if self._use_harmony is not None:
+            return self._use_harmony
+        return self._get_model_type(request.model) == "gpt_oss"
+
+    @staticmethod
+    def _tool_dicts(request: ChatCompletionRequest) -> Optional[list[dict[str, object]]]:
+        if request.tools is None:
+            return None
+        return [
+            tool.model_dump() if hasattr(tool, "model_dump") else tool for tool in request.tools
+        ]
+
+    def _tokenize_harmony_chat(self, request: ChatCompletionRequest) -> list[list[int]]:
+        from tensorrt_llm.serve import harmony_adapter
+
+        tools = self._tool_dicts(request) if request.tools else None
+        result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
+            request.messages,
+            tools,
+            reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
+                request.reasoning_effort
+            ),
+            tool_choice=request.tool_choice,
+        )
+        return [result]
 
     def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
         cache = getattr(self, "_tok_prefix_cache", None)
@@ -241,26 +295,16 @@ class BlockHashMixin:
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
+            if self._uses_harmony_tokenization(request):
+                return self._tokenize_harmony_chat(request)
             tokenizer = self._get_tokenizer(request.model)
-            tool_dicts = (
-                None
-                if getattr(request, "tools", None) is None
-                else [
-                    tool.model_dump() if hasattr(tool, "model_dump") else tool
-                    for tool in request.tools
-                ]
-            )
-            chat_template_kwargs = (
-                request.chat_template_kwargs
-                if getattr(request, "chat_template_kwargs", None)
-                else {}
-            )
+            chat_template_kwargs = dict(request.chat_template_kwargs or {})
+            chat_template_kwargs["tools"] = self._tool_dicts(request)
             rendered = tokenizer.apply_chat_template(
                 [msg if isinstance(msg, dict) else dict(msg) for msg in request.messages],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=False,
                 return_dict=False,
-                tools=tool_dicts,
                 **chat_template_kwargs,
             )
             if isinstance(rendered, str):
