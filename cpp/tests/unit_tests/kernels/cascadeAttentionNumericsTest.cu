@@ -18,7 +18,7 @@
 //
 // Strategy:
 //   1. Construct a realistic beam-search MMHA scenario with random Q/KV data.
-//   2. Call baseline MMHA (via the external API, env-var off → cascade disabled).
+//   2. Call baseline MMHA (via the external API, env-var off -> cascade disabled).
 //   3. Call cascade attention directly (bypasses env-var check).
 //   4. Compare outputs element-by-element with FP16 tolerance.
 
@@ -27,6 +27,7 @@
 #include <cstring>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <cuda_fp16.h>
@@ -45,17 +46,8 @@ namespace tc = tensorrt_llm::common;
 namespace
 {
 
-// Test configuration constants.
+// Fixed head dimension — cascade kernel only supports Dh == 128.
 constexpr int kDh = 128;
-constexpr int kNumHeads = 8;
-constexpr int kNumKvHeads = 8;
-constexpr int kBeamWidth = 4;
-constexpr int kNumRequests = 2;
-constexpr int kBatchSize = kNumRequests * kBeamWidth; // = 8
-constexpr int kPrefixLen = 64;
-constexpr int kSuffixLen = 16;
-constexpr int kTotalLen = kPrefixLen + kSuffixLen; // = 80
-constexpr int kMaxSeqLen = 256;
 
 // FP16 tolerance: allow |a - b| <= atol + rtol * |b|.
 inline bool almostEqualFp16(float a, float b, float atol = 5e-3f, float rtol = 1e-2f)
@@ -117,9 +109,30 @@ void fillRandomHalf(half* dst, size_t count, std::mt19937& rng, float mean = 0.0
     }
 }
 
+// Parameters that vary across test cases.
+struct CascadeTestParams
+{
+    int numHeads;
+    int numKvHeads;
+    int beamWidth;
+    int numRequests;
+    int prefixLen;
+    int suffixLen;
+    int maxSeqLen;
+};
+
+// Pretty-print for gtest output.
+std::string PrintCascadeTestParams(testing::TestParamInfo<CascadeTestParams> const& info)
+{
+    auto const& p = info.param;
+    return "H" + std::to_string(p.numHeads) + "_KVH" + std::to_string(p.numKvHeads) + "_B"
+        + std::to_string(p.beamWidth) + "_R" + std::to_string(p.numRequests) + "_P" + std::to_string(p.prefixLen) + "_S"
+        + std::to_string(p.suffixLen);
+}
+
 } // namespace
 
-class CascadeAttentionNumericsTest : public ::testing::Test
+class CascadeAttentionNumericsTest : public ::testing::TestWithParam<CascadeTestParams>
 {
 protected:
     void SetUp() override
@@ -133,80 +146,97 @@ protected:
 };
 
 // Core test: cascade output must match baseline MMHA output for beam-search decode.
-TEST_F(CascadeAttentionNumericsTest, CascadeMatchesBaselineBeamSearch)
+TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
 {
+    auto const& tp = GetParam();
+    int const batchSize = tp.numRequests * tp.beamWidth;
+    int const totalLen = tp.prefixLen + tp.suffixLen;
+
     std::mt19937 rng(42);
     cudaStream_t stream;
     TLLM_CUDA_CHECK(cudaStreamCreate(&stream));
 
     // ----- Allocate host data -----
-    size_t const q_elems = static_cast<size_t>(kBatchSize) * kNumHeads * kDh;
-    size_t const kv_cache_size_per_seq = 2 * kNumKvHeads * kDh; // K+V per token
-    size_t const kv_cache_total = static_cast<size_t>(kBatchSize) * kMaxSeqLen * kv_cache_size_per_seq;
-    size_t const cache_indir_elems = static_cast<size_t>(kBatchSize) * kMaxSeqLen;
+    size_t const q_elems = static_cast<size_t>(batchSize) * tp.numHeads * kDh;
+    // KVLinearBuffer layout: [B, 2(K/V), H, S, D].  sizePerToken is per-K (or
+    // per-V) only; the buffer internally doubles via mValidRowsPerSeq=2.
+    size_t const kv_elems_per_token = static_cast<size_t>(tp.numKvHeads) * kDh;
+    size_t const sizePerToken = kv_elems_per_token * sizeof(half);
+    size_t const kv_cache_total = static_cast<size_t>(batchSize) * 2 * tp.maxSeqLen * kv_elems_per_token;
+    size_t const cache_indir_elems = static_cast<size_t>(batchSize) * tp.maxSeqLen;
 
     std::vector<half> h_q(q_elems);
     std::vector<half> h_kv_cache(kv_cache_total);
+    // Current-step K and V inputs: the MMHA kernel reads these and writes them
+    // into the KV cache at position `timestep`.
+    size_t const kv_step_elems = static_cast<size_t>(batchSize) * tp.numKvHeads * kDh;
+    std::vector<half> h_k(kv_step_elems);
+    std::vector<half> h_v(kv_step_elems);
     std::vector<int> h_cache_indir(cache_indir_elems, 0);
-    std::vector<int> h_input_lengths(kBatchSize, kPrefixLen);
-    std::vector<int> h_length_per_sample(kBatchSize, kTotalLen);
+    std::vector<int> h_input_lengths(batchSize, tp.prefixLen);
+    std::vector<int> h_length_per_sample(batchSize, totalLen);
 
     fillRandomHalf(h_q.data(), q_elems, rng);
     fillRandomHalf(h_kv_cache.data(), kv_cache_total, rng);
+    fillRandomHalf(h_k.data(), kv_step_elems, rng);
+    fillRandomHalf(h_v.data(), kv_step_elems, rng);
 
-    // Set up cache_indir: for beam search, beam 0 of each request is the
-    // "parent". Simple identity mapping for test (no beam divergence at suffix).
-    for (int seq = 0; seq < kBatchSize; ++seq)
+    // Set up cache_indir: the kernel reads beam_offset = cache_indir[batch_beam * max_attn_win + t]
+    // and computes seqIdx = batch_idx * beam_width + beam_offset.  So the stored
+    // value must be the *beam-local* index (0 .. beam_width-1), not the global
+    // batch-beam index.
+    for (int seq = 0; seq < batchSize; ++seq)
     {
-        int req = seq / kBeamWidth;
-        int beam0_seq = req * kBeamWidth; // first beam of the request
-        for (int t = 0; t < kTotalLen; ++t)
+        int beam = seq % tp.beamWidth;
+        for (int t = 0; t < totalLen; ++t)
         {
-            // Before prefix end: all beams share parent beam 0.
-            // After prefix: each beam is its own parent (identity).
-            h_cache_indir[seq * kMaxSeqLen + t] = (t < kPrefixLen) ? beam0_seq : seq;
+            h_cache_indir[seq * tp.maxSeqLen + t] = (t < tp.prefixLen) ? 0 : beam;
         }
     }
 
     // ----- Allocate device memory -----
     CudaBuf d_q(q_elems * sizeof(half));
+    CudaBuf d_k(kv_step_elems * sizeof(half));
+    CudaBuf d_v(kv_step_elems * sizeof(half));
     CudaBuf d_kv_cache(kv_cache_total * sizeof(half));
     CudaBuf d_cache_indir(cache_indir_elems * sizeof(int));
-    CudaBuf d_input_lengths(kBatchSize * sizeof(int));
-    CudaBuf d_length_per_sample(kBatchSize * sizeof(int));
+    CudaBuf d_input_lengths(batchSize * sizeof(int));
+    CudaBuf d_length_per_sample(batchSize * sizeof(int));
     CudaBuf d_out_baseline(q_elems * sizeof(half));
     CudaBuf d_out_cascade(q_elems * sizeof(half));
 
     // Baseline multi-block workspace (generous allocation).
     int const max_seq_len_tile = 64;
-    CudaBuf d_partial_out(static_cast<size_t>(max_seq_len_tile) * kBatchSize * kNumHeads * kDh * sizeof(float));
-    CudaBuf d_partial_sum(static_cast<size_t>(max_seq_len_tile) * kBatchSize * kNumHeads * sizeof(float));
-    CudaBuf d_partial_max(static_cast<size_t>(max_seq_len_tile) * kBatchSize * kNumHeads * sizeof(float));
-    CudaBuf d_block_counter(static_cast<size_t>(kBatchSize) * kNumHeads * sizeof(int));
+    CudaBuf d_partial_out(
+        static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * kDh * sizeof(float));
+    CudaBuf d_partial_sum(static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * sizeof(float));
+    CudaBuf d_partial_max(static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * sizeof(float));
+    CudaBuf d_block_counter(static_cast<size_t>(batchSize) * tp.numHeads * sizeof(int));
 
     // Cascade workspace.
-    auto ws = tk::mmha::cascade::getCascadeWorkspaceSizes(kBatchSize, kNumHeads, kDh);
+    auto ws = tk::mmha::cascade::getCascadeWorkspaceSizes(batchSize, tp.numHeads, kDh);
     CudaBuf d_cascade_out(ws.out);
     CudaBuf d_cascade_max(ws.mMax);
     CudaBuf d_cascade_sum(ws.lSum);
 
     // ----- H2D copies -----
     TLLM_CUDA_CHECK(cudaMemcpy(d_q.ptr, h_q.data(), q_elems * sizeof(half), cudaMemcpyHostToDevice));
+    TLLM_CUDA_CHECK(cudaMemcpy(d_k.ptr, h_k.data(), kv_step_elems * sizeof(half), cudaMemcpyHostToDevice));
+    TLLM_CUDA_CHECK(cudaMemcpy(d_v.ptr, h_v.data(), kv_step_elems * sizeof(half), cudaMemcpyHostToDevice));
     TLLM_CUDA_CHECK(
         cudaMemcpy(d_kv_cache.ptr, h_kv_cache.data(), kv_cache_total * sizeof(half), cudaMemcpyHostToDevice));
     TLLM_CUDA_CHECK(
         cudaMemcpy(d_cache_indir.ptr, h_cache_indir.data(), cache_indir_elems * sizeof(int), cudaMemcpyHostToDevice));
     TLLM_CUDA_CHECK(
-        cudaMemcpy(d_input_lengths.ptr, h_input_lengths.data(), kBatchSize * sizeof(int), cudaMemcpyHostToDevice));
+        cudaMemcpy(d_input_lengths.ptr, h_input_lengths.data(), batchSize * sizeof(int), cudaMemcpyHostToDevice));
     TLLM_CUDA_CHECK(cudaMemcpy(
-        d_length_per_sample.ptr, h_length_per_sample.data(), kBatchSize * sizeof(int), cudaMemcpyHostToDevice));
+        d_length_per_sample.ptr, h_length_per_sample.data(), batchSize * sizeof(int), cudaMemcpyHostToDevice));
 
     // ----- Build KVLinearBuffer -----
-    // KVLinearBuffer layout: [batch_size, max_seq_len, 2 * kv_heads * Dh]
-    // Data pointer type is int8_t (raw bytes).
-    int const sizePerToken = kv_cache_size_per_seq * sizeof(half);
-    tk::KVLinearBuffer kv_buffer(
-        kBatchSize, kMaxSeqLen, sizePerToken, kMaxSeqLen, /*sinkTokenLen=*/0, false, d_kv_cache.as<int8_t>());
+    // KVLinearBuffer layout: [B, 2(K/V), H, S, D].
+    // sizePerToken is per-K (or per-V); mValidRowsPerSeq=2 handles the x2.
+    tk::KVLinearBuffer kv_buffer(batchSize, tp.maxSeqLen, static_cast<int32_t>(sizePerToken), tp.maxSeqLen,
+        /*sinkTokenLen=*/0, /*onlyKorV=*/false, d_kv_cache.as<int8_t>());
     // shift_k_cache is unused when position_shift is disabled; pass a dummy.
     tk::KVLinearBuffer shift_k_cache(0, 0, 0, 0, 0, false, nullptr);
 
@@ -216,17 +246,17 @@ TEST_F(CascadeAttentionNumericsTest, CascadeMatchesBaselineBeamSearch)
         tk::Masked_multihead_attention_params<half> p{};
         p.out = out_ptr;
         p.q = d_q.as<half>();
-        p.k = nullptr; // K/V come from cache for decode
-        p.v = nullptr;
+        p.k = d_k.as<half>();
+        p.v = d_v.as<half>();
         p.cache_indir = d_cache_indir.as<int>();
-        p.batch_size = kBatchSize;
-        p.beam_width = kBeamWidth;
-        p.num_heads = kNumHeads;
-        p.num_kv_heads = kNumKvHeads;
+        p.batch_size = batchSize;
+        p.beam_width = tp.beamWidth;
+        p.num_heads = tp.numHeads;
+        p.num_kv_heads = tp.numKvHeads;
         p.hidden_size_per_head = kDh;
         p.inv_sqrt_dh = 1.0f / sqrtf(static_cast<float>(kDh));
-        p.timestep = kTotalLen - 1; // 0-indexed last token position
-        p.max_decoder_seq_len = kMaxSeqLen;
+        p.timestep = totalLen - 1;
+        p.max_decoder_seq_len = tp.maxSeqLen;
         p.input_lengths = d_input_lengths.as<int>();
         p.length_per_sample = d_length_per_sample.as<int>();
         p.position_embedding_type = tk::PositionEmbeddingType::kLEARNED_ABSOLUTE;
@@ -239,8 +269,8 @@ TEST_F(CascadeAttentionNumericsTest, CascadeMatchesBaselineBeamSearch)
         p.attention_sinks = nullptr;
         p.int8_kv_cache = false;
         p.fp8_kv_cache = false;
-        p.cyclic_attention_window_size = kMaxSeqLen;
-        p.max_attention_window_size = kMaxSeqLen;
+        p.cyclic_attention_window_size = tp.maxSeqLen;
+        p.max_attention_window_size = tp.maxSeqLen;
         p.chunked_attention_size = INT_MAX;
         p.sink_token_length = 0;
         // Multi-block mode workspace (for baseline).
@@ -262,7 +292,6 @@ TEST_F(CascadeAttentionNumericsTest, CascadeMatchesBaselineBeamSearch)
     // ----- Run baseline MMHA -----
     {
         auto params = buildParams(d_out_baseline.ptr);
-        // Use reinterpret_cast because the external API uses uint16_t for half.
         auto const& params_u16 = reinterpret_cast<tk::Masked_multihead_attention_params<uint16_t> const&>(params);
         tk::masked_multihead_attention(params_u16, kv_buffer, shift_k_cache, stream);
         TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -295,8 +324,8 @@ TEST_F(CascadeAttentionNumericsTest, CascadeMatchesBaselineBeamSearch)
         {
             if (mismatches < kMaxMismatchPrint)
             {
-                int seq = static_cast<int>(i / (kNumHeads * kDh));
-                int head = static_cast<int>((i % (kNumHeads * kDh)) / kDh);
+                int seq = static_cast<int>(i / (tp.numHeads * kDh));
+                int head = static_cast<int>((i % (tp.numHeads * kDh)) / kDh);
                 int ch = static_cast<int>(i % kDh);
                 TLLM_LOG_ERROR("Mismatch at [seq=%d, head=%d, ch=%d]: baseline=%e, cascade=%e, diff=%e", seq, head, ch,
                     baseline_val, cascade_val, cascade_val - baseline_val);
@@ -310,3 +339,17 @@ TEST_F(CascadeAttentionNumericsTest, CascadeMatchesBaselineBeamSearch)
 
     TLLM_CUDA_CHECK(cudaStreamDestroy(stream));
 }
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(CascadeNumerics, CascadeAttentionNumericsTest,
+    ::testing::Values(
+        //                          numHeads  numKvHeads  beamWidth  numRequests  prefixLen  suffixLen  maxSeqLen
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256},
+        CascadeTestParams{               8,         8,         2,           4,        64,        16,       256},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512},
+        CascadeTestParams{              16,        16,         4,           2,       256,         8,       512},
+        CascadeTestParams{               8,         8,         4,           1,        32,         4,       128},
+        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256}
+    ),
+    PrintCascadeTestParams);
+// clang-format on
