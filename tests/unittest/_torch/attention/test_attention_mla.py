@@ -505,9 +505,7 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
         f"--------------------------------Test for scenario: {scenario} start--------------------------------"
     )
 
-    import os
-    backend_name = os.environ.get("MLA_TEST_BACKEND", "TRTLLM")
-    _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
+    _run_test_for_backend("TRTLLM", num_heads, num_kv_heads, num_layers,
                           q_lora_rank, kv_lora_rank, qk_nope_head_dim,
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,

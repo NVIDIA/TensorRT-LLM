@@ -424,6 +424,10 @@ class Runner:
                 disable_finalize_fusion=False,
                 use_low_precision_moe_combine=use_low_precision_moe_combine,
             ),
+            # CuteDSL MLA decode is an FMHA library selected inside the TRTLLM
+            # backend via the TLLM_FMHA_LIBS env (e.g. "cute_dsl_mla,fallback"),
+            # not a standalone attn_backend. Always request TRTLLM and let the
+            # env drive the decode FMHA library.
             attn_backend="TRTLLM",
             kv_cache_config=KvCacheConfig(
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype

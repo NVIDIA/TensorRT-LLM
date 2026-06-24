@@ -7552,6 +7552,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[1] *
                     _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[2])
 
+                # Fold seq_len_q into the head dimension when the head count
+                # alone does not fill the MMA M tile (num_heads < M) and there
+                # is more than one query token (MTP / spec-decode). The kernel
+                # derives the actual fold factor; this flag just enables the
+                # folding code path. For seq_len_q == 1 it is always False, so
+                # plain decode is unchanged.
+                fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
+                           and self.seq_len_q > 1)
+
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
@@ -7563,6 +7572,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.is_persistent,
                     self.is_var_seq,
                     self.is_var_split_kv,
+                    num_heads=self.num_heads,
+                    seq_len_q=self.seq_len_q,
+                    fold_sq=fold_sq,
                 )
 
                 q_latent_ct = cute.runtime.from_dlpack(
