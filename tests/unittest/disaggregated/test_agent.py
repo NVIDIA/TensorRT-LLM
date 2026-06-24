@@ -107,13 +107,29 @@ def alloc(memory_manager, memory_size, memory_type):
     return src_descs, dst_descs
 
 
+def _ensure_cuda_context(device_id: int = 0) -> None:
+    """Ensure a CUDA primary context exists in the current thread.
+
+    Must be called before constructing a transfer agent. Without this, the
+    agent's C++ ``queryCurrentDevice()`` runs while the calling thread has no
+    current context, ``cuCtxGetDevice`` fails with error 201, and
+    ``mLocalDevice`` silently defaults to 0, which later corrupts CUDA IPC
+    paths.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
+        torch.cuda.synchronize()
+
+
 @pytest.fixture
 def transfer_agent_src():
+    _ensure_cuda_context()
     return NixlTransferAgent(name="src_agent")
 
 
 @pytest.fixture
 def transfer_agent_dst():
+    _ensure_cuda_context()
     return NixlTransferAgent(name="dst_agent")
 
 

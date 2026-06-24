@@ -926,6 +926,9 @@ void P2pHandleExporter::exportSingleChunkCudaIpc(CUdeviceptr poolBase, size_t po
     {
         TLLM_LOG_WARNING(
             "P2pTransfer: failed to get CUDA IPC handle for ptr=0x%lx, error=%d", poolBase, static_cast<int>(err));
+        // Clear runtime API thread-local last-error so downstream torch / NIXL CUDA calls
+        // don't pick up the failed status via cudaPeekAtLastError.
+        (void) cudaGetLastError();
         return;
     }
 
@@ -1544,6 +1547,10 @@ void P2pRemoteMappingRegistry::importAndMap(std::string const& name, P2pMemInfo 
             {
                 TLLM_LOG_WARNING("P2pTransfer: cudaIpcOpenMemHandle failed for '%s' error=%d (%s)", name.c_str(),
                     static_cast<int>(cudaErr), cudaGetErrorString(cudaErr));
+                // Clear runtime API thread-local last-error so downstream torch / NIXL CUDA
+                // calls don't pick up the failed status via cudaPeekAtLastError. (Required
+                // because torch checks last-error after every op.)
+                (void) cudaGetLastError();
                 anyImportFailed = true;
                 continue;
             }
