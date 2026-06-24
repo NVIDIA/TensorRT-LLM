@@ -1,5 +1,12 @@
 from typing import Any, Mapping, Optional, Protocol
 
+# Supported HTTP header protocol for external clients, gateways, or proxies
+# that carry a stable multi-turn identifier outside the JSON body. Body
+# ``conversation_params.conversation_id`` is canonical when both body and
+# headers are set; the serve edge copies the first non-empty header value into
+# ``request.conversation_params`` only when the body omits it. Routers then read
+# ``conversation_params.conversation_id`` to keep later turns of the same
+# conversation on the same backend when sticky conversation routing is enabled.
 CONVERSATION_ID_HEADERS = (
     "x-session-id",
     "x-correlation-id",
