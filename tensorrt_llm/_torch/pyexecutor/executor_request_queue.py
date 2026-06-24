@@ -1,5 +1,6 @@
 import dataclasses
 import datetime
+import functools
 import queue
 import threading
 import time
@@ -29,6 +30,18 @@ class RequestQueueItem:
     # step boundary with in-flight requests still in the engine.
     # See ``PyExecutor.control_action``.
     control_requires_drain: bool = True
+
+    @functools.cached_property
+    def input_length(self) -> int:
+        """Input token count, materialized once.
+
+        ``request.input_token_ids`` is a pybind vector->list conversion, so plain
+        ``len(...)`` re-materializes the whole prompt on every call. Caching is
+        safe because the prompt is read-only and fixed for the item's lifetime
+        (multi-turn submits a fresh item; generated tokens live on ``LlmRequest``).
+        """
+        return len(getattr(self.request, "input_token_ids",
+                           [])) if self.request else 0
 
     @property
     def is_shutdown_request(self):

@@ -61,6 +61,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
     item.request = MagicMock()
     item.request.py_scheduling_params = scheduling_params
     item.request.input_token_ids = list(range(num_tokens))
+    item.input_length = num_tokens
     return item
 
 

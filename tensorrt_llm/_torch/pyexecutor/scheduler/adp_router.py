@@ -393,19 +393,15 @@ class DefaultADPRouter(ADPRouter):
 
         heapq.heapify(all_ranks_new_requests_heap)
 
-        new_requests = sorted(
-            new_requests,
-            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
-            reverse=True,
-        )
+        # Sort by cached input_length: plain len(request.input_token_ids) is a
+        # pybind vector->list conversion that re-materializes the prompt each
+        # call (dominated route_requests at long ISL).
+        new_requests = sorted(new_requests, key=lambda r: r.input_length, reverse=True)
 
         for req_item in new_requests:
             val = heapq.heappop(all_ranks_new_requests_heap)
-            token_count = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
             val = val._replace(
-                num_tokens=val.num_tokens + token_count,
+                num_tokens=val.num_tokens + req_item.input_length,
                 num_requests=val.num_requests + 1,
             )
 

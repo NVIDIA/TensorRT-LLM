@@ -748,6 +748,7 @@ def _make_unscheduled_request_item(req_id=None):
     req_item = Mock()
     req_item.request.py_scheduling_params = None
     req_item.request.input_token_ids = [1, 2, 3]
+    req_item.input_length = len(req_item.request.input_token_ids)
     req_item.id = req_id if req_id is not None else id(req_item)
     return req_item
 
