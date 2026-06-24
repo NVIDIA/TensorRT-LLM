@@ -138,6 +138,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _paged_kv_last_page_len: torch.Tensor = field(init=False)
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
+    _ragged_qo_indptr_buf: torch.Tensor = field(init=False)
+    _ragged_kv_indptr_buf: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
@@ -510,6 +512,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.max_num_requests + 1, device='cuda',
             dtype=torch.int) if self.is_cross else self._qo_indptr
 
+        self._ragged_qo_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_qo_indptr_buf",
+            capture_graph=capture_graph,
+        )
+        self._ragged_kv_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_kv_indptr_buf",
+            capture_graph=capture_graph,
+        )
+
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
@@ -709,10 +726,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             assert isinstance(ragged_prefill_wrapper,
                               flashinfer.BatchPrefillWithRaggedKVCacheWrapper)
             max_key_value_tokens_per_sequence = max_query_tokens_per_sequence
+            # Do not pass v_indptr/o_indptr for self-attention. When they are omitted, FlashInfer
+            # aliases them to the CUDA-graph-stable kv/qo buffers; passing them explicitly creates
+            # fresh CUDA tensors during plan(), leaving replay with stale captured offset pointers.
             plan_kwargs = dict(
                 kv_indptr=key_value_indptr,
-                v_indptr=key_value_indptr,
-                o_indptr=query_output_indptr,
                 seq_lens=q_and_kv_seqlens_cuda,
                 seq_lens_q=q_and_kv_seqlens_cuda,
                 max_sequence_kv=
@@ -1159,15 +1177,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is None:
-            if self.is_cuda_graph:
-                raise NotImplementedError(
-                    "FlashInfer without a KV cache manager does not support "
-                    "CUDA graph capture; use the TRTLLM attention backend.")
             if plan_params.multi_item_params is None:
                 ragged_builder = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
                 # NB: cuDNN chosen in https://github.com/NVIDIA/TensorRT-LLM/pull/12911
                 ragged_flashinfer_backend = "cudnn" if not _FORCE_RAGGED_FA2 else "fa2"
             else:
+                if self.is_cuda_graph:
+                    raise NotImplementedError(
+                        "FlashInfer multi-item masking without a KV cache manager "
+                        "does not support CUDA graph capture.")
                 ragged_flashinfer_backend = flashinfer_backend
                 # BatchPrefillWithRaggedKVCacheWrapper silently ignores multi-item scoring arguments,
                 # using flashinfer.BatchPrefillWithPagedKVCacheWrapper with page_size=1 instead.
@@ -1179,10 +1197,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 assert ragged_prefill_wrapper is not None
                 assert ragged_prefill_wrapper._backend == ragged_flashinfer_backend
             else:
+                wrapper_kwargs: Dict[str, Any] = {}
+                if plan_params.multi_item_params is None:
+                    qo_indptr_buf = self._ragged_qo_indptr_buf[:self.
+                                                               num_contexts + 1]
+                    kv_indptr_buf = self._ragged_kv_indptr_buf[:self.
+                                                               num_contexts + 1]
+                    wrapper_kwargs = dict(
+                        use_cuda_graph=self.is_cuda_graph,
+                        qo_indptr_buf=qo_indptr_buf,
+                        kv_indptr_buf=kv_indptr_buf,
+                    )
                 ragged_prefill_wrapper = ragged_builder(
                     self.workspace_buffer,
                     "NHD",  # ragged KVs use always NHD
                     backend=ragged_flashinfer_backend,
+                    **wrapper_kwargs,
                 )
             if self.num_contexts <= 0:
                 raise ValueError(
