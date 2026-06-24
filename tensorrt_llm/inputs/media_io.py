@@ -4,12 +4,14 @@
 
 import asyncio
 import base64
+import functools
 import ipaddress
 import math
 import os
 import socket
 import tempfile
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from types import MappingProxyType
@@ -25,6 +27,25 @@ from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
+
+# Dedicated executor for blocking media-load work (bytes / base64 / file
+# decode). The cpython default asyncio.to_thread executor is shared across
+# the whole server, so decodes would otherwise contend for thread slots with
+# unrelated to_thread() callers (URL validation, etc.). A dedicated pool
+# isolates this work and lets the size be tuned independently.
+_MEDIA_LOAD_WORKERS = int(os.environ.get("TRTLLM_MEDIA_LOAD_WORKERS", "8"))
+_MEDIA_LOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_MEDIA_LOAD_WORKERS,
+    thread_name_prefix="trtllm_media_load",
+)
+
+
+async def _media_load_run(fn, *args, **kwargs):
+    """Run a blocking media-load callable on the dedicated executor."""
+    if kwargs:
+        fn = functools.partial(fn, **kwargs)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_MEDIA_LOAD_EXECUTOR, fn, *args)
 
 
 def rgba_to_rgb(
@@ -482,7 +503,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         if parsed.scheme in ("http", "https"):
             session = await _get_aiohttp_session()
             data = await _safe_aiohttp_get(url, session=session)
-            return await asyncio.to_thread(self.load_bytes, data)
+            return await _media_load_run(self.load_bytes, data)
         elif parsed.scheme == "data":
             data_spec, b64_data = parsed.path.split(",", 1)
             parts = data_spec.split(";", 1)
@@ -490,9 +511,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             encoding = parts[1] if len(parts) > 1 else ""
             if encoding != "base64":
                 raise NotImplementedError("Only base64 data URLs are supported for now.")
-            return await asyncio.to_thread(self.load_base64, media_type, b64_data)
+            return await _media_load_run(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
-            return await asyncio.to_thread(self.load_file, url)
+            return await _media_load_run(self.load_file, url)
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
