@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from transformers import PretrainedConfig
@@ -68,7 +68,7 @@ class _QwenImageBenchModelMixin:
     def load_weights(
         self,
         weights: Dict[str, torch.Tensor],
-        _weight_mapper: BaseWeightMapper,
+        weight_mapper: Optional[BaseWeightMapper] = None,
     ):
         if not _is_mm_disagg():
             self.mm_encoder.load_weights(weights)
