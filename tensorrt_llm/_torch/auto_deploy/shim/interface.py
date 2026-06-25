@@ -1422,7 +1422,7 @@ class CachedSequenceInterface:
             f"max_tokens={s['max_tokens']}"
         )
 
-        if self._replay_work_items is not None:
+        if self.info.batch_info.is_use_replay():
             # Wrapper takes **kwargs to satisfy the host-prepare callable protocol;
             # prepare_replay_metadata reads everything it needs from self, so no
             # graph-input args are requested (empty arg list).

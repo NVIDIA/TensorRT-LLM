@@ -343,19 +343,19 @@ def _build_interface_with_replay_buffers(num_heads, head_dim, d_state, n_groups,
     return interface
 
 
-def test_extend_replay_no_ima(mamba_env):
+def test_extend_replay_init_buffers(mamba_env):
     """The replay path must not cause an out-of-bounds access on the replay buffers.
 
-    Behavioral guard for the replay path: the replay work-items buffer is filled with
-    garbage (an out-of-bounds cache slot, simulating uninitialized memory), then the
-    production metadata-prep path runs and the real replay op executes; the test asserts
-    no CUDA fault. With the fix, prep populates the buffer before the kernel reads it, so
-    the garbage never reaches the kernel; without it the out-of-bounds slot survives and
-    faults.
+    Behavioral guard for the replay path: every buffer the prepare hook populates (the
+    work-items buffer and the n-writes count) is filled with garbage (out-of-bounds
+    values, simulating uninitialized memory), then the production metadata-prep path runs
+    and the real replay op executes; the test asserts no CUDA fault. With the fix, prep
+    populates the buffers before the kernel reads them, so the garbage never reaches the
+    kernel; without it the out-of-bounds values survive and fault.
 
-    Filling the buffer directly keeps the poison confined to this one buffer and makes
-    the failure deterministic: fresh CUDA memory is often benign, so a poison-free run
-    cannot reliably reproduce the bug.
+    Filling the buffers directly keeps the poison confined to them and makes the failure
+    deterministic: fresh CUDA memory is often benign, so a poison-free run cannot
+    reliably reproduce the bug.
     """
     device = mamba_env["device"]
     dtype = mamba_env["dtype"]
@@ -374,10 +374,12 @@ def test_extend_replay_no_ima(mamba_env):
     )
     interface.initialize_resources()
 
-    # Fill the work-items buffer with an out-of-bounds cache slot, simulating garbage /
-    # uninitialized memory. The production metadata-prep below must overwrite it before
-    # the kernel reads it; if prep is missing (the bug) this poison survives and faults.
-    interface._replay_work_items.fill_(0x7FFFFFFF)  # int32-max: out-of-bounds slot
+    # Poison every buffer the prepare hook populates -- the work-items buffer and the
+    # n-writes count -- with out-of-bounds values, simulating garbage / uninitialized
+    # memory. The production metadata-prep below must overwrite them before the kernel
+    # reads them; if prep is missing (the bug) the poison survives and faults.
+    interface._replay_work_items.fill_(0x7FFFFFFF)  # int32-max: out-of-bounds cache slot
+    interface._replay_n_writes.fill_(0x7FFFFFFF)  # int32-max: out-of-bounds write count
 
     # Drive the production metadata-prep path -- the same one cudagraph capture uses --
     # so the replay work-items / n-writes buffers are populated exactly as in real runs
