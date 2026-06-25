@@ -494,6 +494,14 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
 
+        # Per-call host staging buffers for copy_batch_block_offsets, kept alive
+        # until their consuming async gather kernel drains (nvbug 6293536). Each
+        # entry is (cuda_event, host_block_offsets, copy_index); retired once the
+        # event completes. See copy_batch_block_offsets for the rationale.
+        self._inflight_block_offset_buffers: List[
+            Tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]
+        ] = []
+
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is not None:
             self.max_attention_window_vec = (
@@ -1930,14 +1938,64 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
 
+        # nvbug 6293536: copy_batch_block_offsets_to_device launches an
+        # asynchronous gather kernel that reads its host inputs at *execution*
+        # time, not enqueue time. Two of those inputs are reused in place across
+        # iterations: host_kv_cache_block_offsets (the C++ KV cache writes page
+        # indices straight into a sequence's slot, and a freed slot is rebound to
+        # a different request on reuse) and copy_idx (a slice of the IndexMapper's
+        # single persistent copyIndex_ buffer, overwritten by the next
+        # get_copy_index call). Under the overlap scheduler the CPU runs an
+        # iteration ahead, so either could be clobbered before this iteration's
+        # still-pending kernel drains, making the kernel gather another batch's
+        # blocks. Snapshot the rows this call needs into a fresh pinned buffer
+        # and feed the kernel an identity index. Unlike the v1
+        # KVCacheManager.copy_batch_block_offsets fix, we cannot rely on PyTorch's
+        # caching host allocator to keep the freed buffer alive: that protection
+        # is only recorded for cudaMemcpyAsync out of pinned memory, not for a
+        # custom kernel reading host memory directly. So keep an explicit
+        # reference to each per-call buffer and retire it only once a CUDA event
+        # recorded after the kernel completes (see _inflight_block_offset_buffers).
+        #
+        # The persistent host_kv_cache_block_offsets attribute is intentionally
+        # left in place: the C++ KV cache holds raw pointers into it
+        # (set_base_page_index_buf) and same-iteration CPU readers (DSA sparse
+        # attention) expect it to hold the current page table.
+
+        # Retire buffers whose consuming kernel has drained. Kernels run in order
+        # on a single stream, so their events complete FIFO.
+        inflight = self._inflight_block_offset_buffers
+        while inflight and inflight[0][0].query():
+            inflight.pop(0)
+
+        host_block_offsets = torch.zeros(
+            self.num_pools,
+            num_seqs,
+            2,  # key and value; only the key row is read by the gather kernel
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+        host_block_offsets[:, :, 0, :] = self.host_kv_cache_block_offsets[
+            :, copy_idx.to(torch.long), 0, :
+        ]
+        identity_idx = torch.arange(
+            num_seqs, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+
         copy_batch_block_offsets_to_device(
-            self.host_kv_cache_block_offsets,
+            host_block_offsets,
             dst_tensor,
-            copy_idx,
+            identity_idx,
             self.index_scales,
             self.kv_offset,
             self._stream.cuda_stream,
         )
+
+        done = torch.cuda.Event()
+        done.record(self._stream)
+        inflight.append((done, host_block_offsets, identity_idx))
 
     def _create_kv_cache(
         self,
