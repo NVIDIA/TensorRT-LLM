@@ -1389,7 +1389,6 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
         if self.use_flashinfer:
-            top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
             if self.seed is None:
                 self.seed = torch.tensor([0],
                                          dtype=torch.int64,
@@ -1621,7 +1620,6 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
-                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0],

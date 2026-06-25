@@ -777,8 +777,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 self.offset = torch.tensor([0], dtype=torch.int64, device=logits.device)
             self.seed.add_(1).remainder_(2**31)
             top_ks = spec_metadata.top_ks[:num_flat_tokens]
-            if self.use_flashinfer:
-                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
             sampled = sampling_batch_spec_dec_one_model(
                 logits,
                 spec_metadata.temperatures[:num_flat_tokens],
@@ -885,8 +883,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Context tokens bypass the rejection kernel — sample them directly.
         if num_contexts > 0:
             top_ks_ctx = spec_metadata.top_ks[:num_contexts]
-            if self.use_flashinfer:
-                top_ks_ctx = top_ks_ctx.clamp(min=1, max=vocab_size - 1)
             sampled_ctx = sampling_batch_spec_dec_one_model(
                 logits[:num_contexts],
                 spec_metadata.temperatures[:num_contexts],

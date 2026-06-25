@@ -91,6 +91,20 @@ def apply_temperature(
     return logits.div_(temp.unsqueeze(dim=1))
 
 
+def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Map ``top_k`` into a backend-safe range before top-k filtering.
+
+    Per ``SamplingParams``, ``top_k == 0`` means "all logits" (top-k disabled),
+    but the flashinfer (``top_k_mask_logits``) and PyTorch-native top-k paths
+    break on a literal 0 — they mask the entire row (all-zero probs) or gather
+    out of bounds. Mirror the C++ op (``dynamicTreeKernels.cu``): map any
+    non-positive value (and any oversized disable sentinel such as
+    ``INT32_MAX``) to ``vocab_size`` (== keep all tokens), leaving genuine
+    top_k values untouched.
+    """
+    return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
+
+
 @torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model(
     logits: torch.Tensor,
@@ -108,6 +122,7 @@ def sampling_batch_spec_dec_one_model(
     be slower than a torch.argmax for greedy requests. This is why advanced
     sampling is opt-in for now.
     """
+    top_k = sanitize_top_k(top_k, logits.shape[-1])
     logits = apply_temperature(logits, temperatures)
     if use_flashinfer:
         if top_k_top_p_sampling_from_logits is None:
@@ -135,6 +150,9 @@ def compute_probs_from_logits(
        O(N log N)).
     3. CPU: manual PyTorch fallback.
     """
+    if top_k is not None:
+        top_k = sanitize_top_k(top_k, logits.shape[-1])
+
     if logits.is_cuda and IS_FLASHINFER_AVAILABLE:
         # Fast path: flashinfer composition (O(N) per row, friendly to small
         # batch sizes). skip_temperature is ignored — flashinfer's softmax
