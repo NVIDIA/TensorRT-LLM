@@ -80,12 +80,12 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 
 _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES = (
     ("text_encoder",),
-    ("denoising_transformer",),
+    ("transformer",),
 )
 _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
     ("text_encoder",),
-    ("denoising_transformer",),
-    ("denoising_transformer_2",),
+    ("transformer",),
+    ("transformer_2",),
 )
 
 
@@ -213,20 +213,9 @@ class WanPipeline(BasePipeline):
         """Return WAN offload stages for the loaded transformer topology.
 
         Only invoked when ``cpu_offload_config.enable`` is true (the base
-        class short-circuits before calling this). Defaults are CPU-staged
-        today; non-CPU offload devices skip the defaults and require
-        explicit ``cpu_offload_config.stages`` from the user.
+        class short-circuits before calling this). Stages are held in CPU
+        storage while inactive and moved onto the pipeline GPU when active.
         """
-        cpu_offload_config = self.pipeline_config.cpu_offload_config
-        if cpu_offload_config.device != "cpu":
-            logger.warning(
-                "Wan default offload stages are CPU-only; "
-                f"cpu_offload_config.device='{cpu_offload_config.device}' has no "
-                "default stages. Set cpu_offload_config.stages explicitly to "
-                "stage components on a non-CPU device."
-            )
-            return ()
-
         if self.transformer_2 is not None:
             return _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES
         return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES
@@ -582,8 +571,9 @@ class WanPipeline(BasePipeline):
             # Extract scalar timestep
             current_t = timestep if timestep.dim() == 0 else timestep[0]
 
-            # Select model based on timestep (if two-stage denoising is enabled)
-            offload_stage = "denoising_transformer"
+            # Select the transformer for this timestep and keep its public
+            # component name paired for optional offload staging.
+            transformer_component_name = "transformer"
             if boundary_timestep is not None and self.transformer_2 is not None:
                 if current_t >= boundary_timestep:
                     current_model = self.transformer
@@ -591,7 +581,7 @@ class WanPipeline(BasePipeline):
                 else:
                     current_model = self.transformer_2
                     model_name = "transformer_2 (low-noise)"
-                    offload_stage = "denoising_transformer_2"
+                    transformer_component_name = "transformer_2"
 
                 # Log when switching models
                 if last_model_used[0] != model_name:
@@ -615,7 +605,7 @@ class WanPipeline(BasePipeline):
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
 
-            with self.offloader.context_if_requested(offload_stage):
+            with self.offloader.context_if_requested(transformer_component_name):
                 return current_model(
                     hidden_states=latents,
                     timestep=timestep / self.scheduler.config.num_train_timesteps,

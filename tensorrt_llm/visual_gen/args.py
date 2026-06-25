@@ -450,7 +450,7 @@ class CpuOffloadConfig(StrictBaseModel):
     Terminology (used consistently across these fields):
 
     - **component**: a named, public sub-model of the pipeline, e.g.
-      ``text_encoder``, ``denoising_transformer``, ``vae``.
+      ``text_encoder``, ``transformer``, ``vae``.
     - **stage**: one step of the offload schedule — a single component, or a
       group of components that are co-resident on the GPU and run together
       before being evicted. The ordered list of stages is set by ``stages``.
@@ -460,11 +460,6 @@ class CpuOffloadConfig(StrictBaseModel):
         False,
         status="prototype",
         description="Enable offloading of model components to CPU between pipeline stages.",
-    )
-    device: Literal["cpu", "cuda"] = Field(
-        "cpu",
-        status="prototype",
-        description="Device where components are held while not the active stage on the GPU.",
     )
     pin_memory: bool = Field(
         True,
@@ -478,7 +473,7 @@ class CpuOffloadConfig(StrictBaseModel):
             "Optional ordered list of stages, named with model-specific public component "
             "names. Each entry is a single component, or a list of components that are "
             "co-resident on the GPU and run together as one stage, e.g. "
-            "['text_encoder', 'denoising_transformer', 'vae'] for Wan T2V, or "
+            "['text_encoder', 'transformer', 'vae'] for Wan T2V, or "
             "['reasoner', 'generator', 'text_guardrail', 'video_guardrail', 'vae'] for Cosmos3. "
             "If omitted, the model chooses default stages."
         ),

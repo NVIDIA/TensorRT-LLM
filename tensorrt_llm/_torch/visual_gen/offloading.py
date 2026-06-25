@@ -17,7 +17,7 @@
 Terminology used throughout this module:
 
 - **component**: a named, public sub-model of the pipeline (e.g. ``text_encoder``,
-  ``denoising_transformer``, ``vae``).
+  ``transformer``, ``vae``).
 - **stage**: one step of the offload schedule — a single component, or a group
   of components that are co-resident on the GPU and run together before being
   evicted back to CPU.
@@ -49,11 +49,12 @@ def _align_offset(offset: int, alignment: int = 256) -> int:
 
 
 def transformer_component_offload_name(component_name: str, transformer_prefix: str) -> str:
-    """Map an internal transformer attribute to its public offload component name."""
-    if component_name == transformer_prefix:
-        return "denoising_transformer"
-    if component_name.startswith(f"{transformer_prefix}_"):
-        return f"denoising_transformer_{component_name[len(transformer_prefix) + 1 :]}"
+    """Map an internal transformer attribute to its public offload component name.
+
+    Transformer component names follow the diffusers ``model_index.json`` keys
+    such as ``transformer`` and ``transformer_2``.
+    """
+    del transformer_prefix
     return component_name
 
 

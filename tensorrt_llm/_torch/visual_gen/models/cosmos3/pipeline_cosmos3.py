@@ -95,19 +95,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """Offload the reasoner and generator towers as separate stages.
 
         Only invoked when ``cpu_offload_config.enable`` is true (the base class
-        short-circuits before calling this). Defaults are CPU-staged today;
-        non-CPU offload devices skip the defaults and require explicit
-        ``cpu_offload_config.stages`` from the user.
+        short-circuits before calling this). Stages are held in CPU storage
+        while inactive and moved onto the pipeline GPU when active.
         """
-        cpu_offload_config = self.pipeline_config.cpu_offload_config
-        if cpu_offload_config.device != "cpu":
-            logger.warning(
-                "Cosmos3 default offload stages are CPU-only; "
-                f"cpu_offload_config.device='{cpu_offload_config.device}' has no "
-                "default stages. Set cpu_offload_config.stages explicitly to "
-                "stage components on a non-CPU device."
-            )
-            return ()
         return _COSMOS3_DEFAULT_OFFLOAD_STAGES
 
     def offload_pipeline_components(self) -> dict[str, nn.Module]:

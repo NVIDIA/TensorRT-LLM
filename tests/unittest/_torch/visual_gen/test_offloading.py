@@ -63,7 +63,7 @@ class _OffloadCudaGraphPipeline(BasePipeline):
         self.transformer = _ToyModule(weight_value=1.0, bias_value=10.0)
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
-        return (("denoising_transformer",),)
+        return (("transformer",),)
 
 
 class _CustomOffloadPipeline(BasePipeline):
@@ -147,40 +147,38 @@ def test_configured_offload_stages_override_model_defaults_and_expose_vae():
         _make_config(
             offload_stages=[
                 "text_encoder",
-                ["denoising_transformer", "vae"],
-                "denoising_transformer_2",
+                ["transformer", "vae"],
+                "transformer_2",
             ]
         )
     )
 
     assert pipeline.offloader.stages() == (
         ("text_encoder",),
-        ("denoising_transformer", "vae"),
-        ("denoising_transformer_2",),
+        ("transformer", "vae"),
+        ("transformer_2",),
     )
 
     components = pipeline.offload_pipeline_components()
     assert components["text_encoder"] is pipeline.text_encoder
-    assert components["denoising_transformer"] is pipeline.transformer.blocks
+    assert components["transformer"] is pipeline.transformer.blocks
     assert components["vae"] is pipeline.vae
 
     assert pipeline.offloader.filter_available_stages(pipeline.offloader.stages(), components) == (
         ("text_encoder",),
-        ("denoising_transformer", "vae"),
+        ("transformer", "vae"),
     )
 
 
 def test_offload_context_resolves_component_to_stageed_stage():
-    pipeline = _CustomOffloadPipeline(
-        _make_config(offload_stages=[["denoising_transformer", "vae"]])
-    )
+    pipeline = _CustomOffloadPipeline(_make_config(offload_stages=[["transformer", "vae"]]))
     pipeline.initialize_offload_pipeline()
 
     with pipeline.offloader.context("vae"):
         assert pipeline.offloader.offload_pipeline is not None
         assert (
             pipeline.offloader.offload_pipeline.manager.active_stage_name
-            == "denoising_transformer+vae"
+            == "transformer+vae"
         )
 
     pipeline.cleanup()
@@ -188,12 +186,12 @@ def test_offload_context_resolves_component_to_stageed_stage():
 
 def test_initialize_rejects_configured_stage_components_that_are_unavailable_for_model():
     pipeline = _CustomOffloadPipeline(
-        _make_config(offload_stages=[["denoising_transformer", "denoising_transformer_2"]])
+        _make_config(offload_stages=[["transformer", "transformer_2"]])
     )
 
     with pytest.raises(
         ValueError,
-        match=r"Unknown cpu_offload_config\.stages entries.*denoising_transformer_2.*denoising_transformer",
+        match=r"Unknown cpu_offload_config\.stages entries.*transformer_2.*transformer",
     ):
         pipeline.initialize_offload_pipeline()
 
@@ -206,7 +204,7 @@ cpu_offload_config:
   enable: true
   stages:
     - text_encoder
-    - [denoising_transformer, vae]
+    - [transformer, vae]
 """,
         encoding="utf-8",
     )
@@ -216,7 +214,7 @@ cpu_offload_config:
     assert args.cpu_offload_config.enable is True
     assert args.cpu_offload_config.stages == [
         "text_encoder",
-        ["denoising_transformer", "vae"],
+        ["transformer", "vae"],
     ]
 
 
@@ -236,7 +234,7 @@ def test_pipeline_rejects_unknown_offload_stage_names_for_this_model():
 
     with pytest.raises(
         ValueError,
-        match=r"Unknown cpu_offload_config\.stages entries.*transformer\.blocks.*denoising_transformer",
+        match=r"Unknown cpu_offload_config\.stages entries.*transformer\.blocks.*transformer",
     ):
         pipeline.initialize_offload_pipeline()
 
