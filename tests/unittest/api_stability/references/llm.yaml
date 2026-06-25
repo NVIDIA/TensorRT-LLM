@@ -64,10 +64,6 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
-      post_processor_hook:
-        annotation: Optional[str]
-        default: null
-        status: prototype
       # reasoning
       reasoning_parser:
         annotation: Optional[str]
