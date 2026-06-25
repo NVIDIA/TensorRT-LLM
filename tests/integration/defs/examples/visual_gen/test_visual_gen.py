@@ -14,6 +14,7 @@
 # limitations under the License.
 """Integration tests for VisualGen examples and visual quality checks."""
 
+import contextlib
 import gc
 import glob
 import json
@@ -372,6 +373,17 @@ def _cleanup_cuda():
     shutdown_compile_workers()
 
 
+@contextlib.contextmanager
+def _lpips_deterministic_algorithms():
+    previous = torch.are_deterministic_algorithms_enabled()
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
 def _save_lpips_video_mp4(video, output_path, frame_rate):
     from tensorrt_llm.media.encoding import save_video
 
@@ -434,26 +446,28 @@ def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, gen
     )
 
     env = os.environ.copy()
+    env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     env["PYTHONPATH"] = (
         f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else REPO_ROOT
     )
-    result = subprocess.run(
-        [
-            sys.executable,
-            VISUAL_GEN_LPIPS_EVAL_SCRIPT,
-            "--dataset",
-            str(dataset_path),
-            "--output-json",
-            str(output_json),
-            "--json",
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
+    with _lpips_deterministic_algorithms():
+        result = subprocess.run(
+            [
+                sys.executable,
+                VISUAL_GEN_LPIPS_EVAL_SCRIPT,
+                "--dataset",
+                str(dataset_path),
+                "--output-json",
+                str(output_json),
+                "--json",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
     if result.returncode != 0:
         pytest.fail(f"LPIPS eval script failed for {sample_id}:\n{result.stdout}")
 
@@ -474,21 +488,22 @@ def _generate_flux_lpips_image(model_path, output_path):
 
     _skip_if_missing(model_path, "FLUX checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
-    args = VisualGenArgs(model=model_path)
-    pipeline = PipelineLoader(args).load(skip_warmup=True)
-    try:
-        result = pipeline.forward(
-            prompt=FLUX_LPIPS_PROMPT,
-            height=FLUX_LPIPS_HEIGHT,
-            width=FLUX_LPIPS_WIDTH,
-            num_inference_steps=FLUX_LPIPS_NUM_INFERENCE_STEPS,
-            guidance_scale=FLUX_LPIPS_GUIDANCE_SCALE,
-            seed=FLUX_LPIPS_SEED,
-        )
-        generated_image = result.image[0].detach().cpu()
-    finally:
-        del pipeline
-        _cleanup_cuda()
+    with _lpips_deterministic_algorithms():
+        args = VisualGenArgs(model=model_path)
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            result = pipeline.forward(
+                prompt=FLUX_LPIPS_PROMPT,
+                height=FLUX_LPIPS_HEIGHT,
+                width=FLUX_LPIPS_WIDTH,
+                num_inference_steps=FLUX_LPIPS_NUM_INFERENCE_STEPS,
+                guidance_scale=FLUX_LPIPS_GUIDANCE_SCALE,
+                seed=FLUX_LPIPS_SEED,
+            )
+            generated_image = result.image[0].detach().cpu()
+        finally:
+            del pipeline
+            _cleanup_cuda()
 
     save_image(generated_image, output_path)
 
@@ -507,31 +522,32 @@ def _generate_ltx2_lpips_video(output_path):
     _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
     _disable_inductor_compile_worker_quiesce()
 
-    args = VisualGenArgs(
-        model=checkpoint_path,
-        pipeline_config={
-            "text_encoder_path": text_encoder_path,
-            "spatial_upsampler_path": spatial_upsampler_path,
-            "distilled_lora_path": distilled_lora_path,
-        },
-    )
-    pipeline = PipelineLoader(args).load(skip_warmup=True)
-    try:
-        with torch.no_grad():
-            result = pipeline.forward(
-                prompt=LTX2_T2V_PROMPT,
-                negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
-                height=LTX2_T2V_HEIGHT,
-                width=LTX2_T2V_WIDTH,
-                num_frames=LTX2_LPIPS_NUM_FRAMES,
-                num_inference_steps=LTX2_LPIPS_NUM_INFERENCE_STEPS,
-                guidance_scale=LTX2_T2V_GUIDANCE_SCALE,
-                seed=LTX2_T2V_SEED,
-            )
-        generated_video = result.video.detach().cpu()
-    finally:
-        del pipeline
-        _cleanup_cuda()
+    with _lpips_deterministic_algorithms():
+        args = VisualGenArgs(
+            model=checkpoint_path,
+            pipeline_config={
+                "text_encoder_path": text_encoder_path,
+                "spatial_upsampler_path": spatial_upsampler_path,
+                "distilled_lora_path": distilled_lora_path,
+            },
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt=LTX2_T2V_PROMPT,
+                    negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
+                    height=LTX2_T2V_HEIGHT,
+                    width=LTX2_T2V_WIDTH,
+                    num_frames=LTX2_LPIPS_NUM_FRAMES,
+                    num_inference_steps=LTX2_LPIPS_NUM_INFERENCE_STEPS,
+                    guidance_scale=LTX2_T2V_GUIDANCE_SCALE,
+                    seed=LTX2_T2V_SEED,
+                )
+            generated_video = result.video.detach().cpu()
+        finally:
+            del pipeline
+            _cleanup_cuda()
 
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
@@ -560,26 +576,27 @@ def _run_wan_lpips_pipeline(
     )
     if parallel is not None:
         args_kwargs["parallel_config"] = parallel
-    args = VisualGenArgs(**args_kwargs)
-    pipeline = PipelineLoader(args).load(skip_warmup=True)
-    try:
-        with torch.no_grad():
-            result = pipeline.forward(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                seed=seed,
-            )
-        if result is None or result.video is None:
-            return None
-        return result.video.detach().cpu()
-    finally:
-        del pipeline
-        _cleanup_cuda()
+    with _lpips_deterministic_algorithms():
+        args = VisualGenArgs(**args_kwargs)
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                )
+            if result is None or result.video is None:
+                return None
+            return result.video.detach().cpu()
+        finally:
+            del pipeline
+            _cleanup_cuda()
 
 
 def _generate_wan_lpips_video(
