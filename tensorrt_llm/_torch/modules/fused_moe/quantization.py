@@ -2840,7 +2840,7 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             module.tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        dst_base = dst_w3_w1_weight.storage().data_ptr()
+        dst_base = dst_w3_w1_weight.untyped_storage().data_ptr()
         dict_key = (dst_base, expert_idx)
         expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight
@@ -2927,6 +2927,113 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                     module.local_shared_w2_scale_tensors[expert_idx])
 
         super().process_weights_after_loading(module)
+
+
+class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
+    """NVFP4 MoE quantization method for the Marlin backend.
+
+    Inherits weight loading from the CUTLASS method, then transforms the loaded
+    weights to Marlin tiled format in ``post_load_weights``.
+
+    The Marlin kernel is W4A16 (BF16 activations, no activation quantization),
+    so global_scale must be the raw ``weight_scale_2`` — not the CUTLASS alpha
+    which folds in ``input_scale``.  We intercept alpha loading to save the
+    raw ``weight_scale_2`` values.
+    """
+
+    # Marlin's ``post_load_weights`` repacks weights into Marlin tiled format
+    # and rebuilds the module parameters, which is incompatible with dynamic
+    # EPLB weight migration.
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+
+    def load_expert_fc31_alpha_nvfp4(self, w1_weight_scale_2, w3_weight_scale_2,
+                                     final_fc31_input_scale, dst_fc31_alpha):
+        # Store raw weight_scale_2 for Marlin (W4A16: no input_scale needed).
+        w1_ws2 = w1_weight_scale_2[...].reshape([])
+        dst_fc31_alpha.copy_(w1_ws2)
+
+    def load_expert_fc2_alpha_nvfp4(self, w2_weight_scale_2,
+                                    final_fc2_input_scale, dst_w2_alpha):
+        w2_ws2 = w2_weight_scale_2[...].reshape([])
+        dst_w2_alpha.copy_(w2_ws2)
+
+    def post_load_weights(self, module):
+        """Transform CUTLASS-format NVFP4 weights to Marlin tiled format."""
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        # Standard CUTLASS loading (swizzles scales, computes alpha, etc.)
+        super().post_load_weights(module)
+
+        num_experts = module.expert_size_per_partition
+        hidden_size = module.hidden_size
+        intermediate_size = module.intermediate_size_per_partition
+        is_act_and_mul = module.intermediate_size_expand_ratio == 2
+        group_size = module.scaling_vector_size  # 16
+
+        # Actual (unpadded) dimensions
+        N1 = intermediate_size * (2 if is_act_and_mul else 1)
+        K1 = hidden_size
+        N2 = hidden_size
+        K2 = intermediate_size
+
+        def unswizzle_scales(scale_3d, N_actual, K_actual):
+            """Unswizzle packed int32 scales -> FP8 [num_experts, N, num_groups]."""
+            num_groups = K_actual // group_size
+            result = []
+            for i in range(num_experts):
+                # [N_padded, K//64] int32 -> float4_sf_dtype -> reverse -> FP8
+                s_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                    scale_3d[i].view(float4_sf_dtype))
+                s_fp8 = s_unswizzled.view(
+                    torch.float8_e4m3fn)[:N_actual, :num_groups]
+                result.append(s_fp8.unsqueeze(0))
+            return torch.cat(result, 0)
+
+        w13_scale = unswizzle_scales(module.w3_w1_weight_scale, N1, K1)
+        w2_scale = unswizzle_scales(module.w2_weight_scale, N2, K2)
+        w13_weight = module.w3_w1_weight.view(torch.uint8)[:, :N1, :K1 //
+                                                           2].contiguous()
+        w2_weight = module.w2_weight.view(torch.uint8)[:, :N2, :K2 //
+                                                       2].contiguous()
+
+        w13_gs = module.fc31_alpha.data.clone()
+        w2_gs = module.fc2_alpha.data.clone()
+
+        (w13, w13_s, w13_gs, w2, w2_s,
+         w2_gs) = marlin_utils.prepare_nvfp4_moe_weights_for_marlin(
+             w13=w13_weight,
+             w13_scale=w13_scale,
+             w13_global_scale=w13_gs,
+             w2=w2_weight,
+             w2_scale=w2_scale,
+             w2_global_scale=w2_gs,
+             hidden_size=hidden_size,
+             intermediate_size_per_partition=intermediate_size,
+             num_experts=num_experts,
+             is_act_and_mul=is_act_and_mul,
+             param_dtype=torch.bfloat16,
+         )
+
+        for name in (
+                "w3_w1_weight",
+                "w2_weight",
+                "w3_w1_weight_scale",
+                "w2_weight_scale",
+                "fc31_alpha",
+                "fc2_alpha",
+        ):
+            getattr(module, name).data.untyped_storage().resize_(0)
+
+        module.w3_w1_weight = nn.Parameter(w13.view(torch.int64),
+                                           requires_grad=False)
+        module.w3_w1_weight_scale = nn.Parameter(w13_s.view(torch.int32),
+                                                 requires_grad=False)
+        module.fc31_alpha = nn.Parameter(w13_gs, requires_grad=False)
+        module.w2_weight = nn.Parameter(w2.view(torch.int64),
+                                        requires_grad=False)
+        module.w2_weight_scale = nn.Parameter(w2_s.view(torch.int32),
+                                              requires_grad=False)
+        module.fc2_alpha = nn.Parameter(w2_gs, requires_grad=False)
 
 
 class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
