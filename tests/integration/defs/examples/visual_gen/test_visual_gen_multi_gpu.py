@@ -340,8 +340,8 @@ def _run_wan22_multinode_slurm_parent(variant_name):
         os.environ.get("TLLM_SPAWN_PROXY_PROCESS") == "1"
         and _trtllm_launch_wrapper_world_size() >= WAN22_LPIPS_MULTINODE_WORLD_SIZE
     ):
-        pytest.skip(
-            "VisualGen SLURM external-launch coverage is skipped under "
+        pytest.fail(
+            "VisualGen SLURM external-launch coverage cannot run under "
             "trtllm-llmapi-launch because that wrapper removes SLURM_* env "
             "before user code. Run this nodeid with direct srun so "
             "_detect_external_launch() sees the real SLURM rank environment."

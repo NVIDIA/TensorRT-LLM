@@ -56,6 +56,26 @@ env | sort
 
 echo "Full Command: $pytestCommand"
 
+if [[ "${TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT:-0}" == "1" ]]; then
+    install_done_dir="${jobWorkspace}/visual_gen_multinode_install_done"
+    mkdir -p "$install_done_dir"
+    if [[ "${SLURM_LOCALID:-0}" == "0" ]]; then
+        touch "${install_done_dir}/node_${SLURM_NODEID:-0}"
+    fi
+
+    if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
+        expected_nodes="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
+        while [[ "$(find "$install_done_dir" -maxdepth 1 -type f -name 'node_*' | wc -l)" -lt "$expected_nodes" ]]; do
+            echo "Waiting for VisualGen multi-node install markers in $install_done_dir"
+            sleep 10
+        done
+        pytestCommand="env -u SLURM_PROCID -u SLURM_NTASKS -u SLURM_LOCALID -u SLURM_NODEID -u SLURM_GTIDS ${pytestCommand}"
+    else
+        echo "Rank${SLURM_PROCID} finished setup; rank0 will run the VisualGen SLURM parent pytest"
+        exit 0
+    fi
+fi
+
 # For single-node test runs or disaggregated benchmark/server runs, clear all
 # environment variables related to Slurm and MPI. This prevents test processes
 # (e.g., pytest) from incorrectly initializing MPI when running under a
