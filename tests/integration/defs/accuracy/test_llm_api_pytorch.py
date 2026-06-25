@@ -6650,6 +6650,163 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    # --- NeMo-Skills accuracy guards (graded by NeMo-Skills with thinking on). ---
+    # Prerequisites:
+    #    Please install the NeMo-Skills lib (`bash examples/trtllm-eval/install_nemo_skills.sh`).
+    # Note:
+    #    1. Set NS_ACC_BENCH_INFRA to the shared ns_acc_bench_infra folder (default <LLM_MODELS_ROOT>/datasets/ns_acc_bench_infra).
+    #    2. We use self-judge model to save judge efforts and keep stability.
+    NEMO_SKILLS_NVFP4 = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    def _run_nemo_skills_guard(self,
+                               evaluator_cls,
+                               threshold,
+                               max_output_length=32768,
+                               max_num_tokens=None,
+                               num_samples=None,
+                               require_files=(),
+                               llm_kwargs=None):
+        # One-line setup hint reused across every skip below so a fresh env knows
+        # exactly how to make these guards run instead of silently skipping.
+        setup_hint = (
+            "install the lib with `bash "
+            "examples/trtllm-eval/install_nemo_skills.sh` and point "
+            "NS_ACC_BENCH_INFRA at the shared ns_acc_bench_infra folder "
+            "(see examples/trtllm-eval/README.md).")
+        pytest.importorskip(
+            "nemo_skills",
+            reason=f"nemo_skills is not installed -- {setup_hint}")
+        from tensorrt_llm.evaluate.nemo_skills_eval import \
+            autowire_nemo_skills_infra
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        # Autowire the shared infra (env knobs + grader-path redirects + sandbox);
+        # a no-op returning None when the infra folder is absent.
+        infra = autowire_nemo_skills_infra()
+        if infra is None:
+            pytest.skip(f"NeMo-Skills infra folder not found -- {setup_hint}")
+        # Per-bench grader assets, given as infra-relative paths; skip if missing.
+        for rel in require_files:
+            if not os.path.exists(os.path.join(infra, rel)):
+                pytest.skip(f"NeMo-Skills guard needs {rel} under the infra "
+                            f"folder (grader asset) -- {setup_hint}")
+        # The evaluator resolves the dataset dir from the autowired env.
+        data_dir = os.environ.get("NEMO_SKILLS_DATA_DIR")
+        # Optional quick-check override: cap the sample count (e.g. for a fast
+        # smoke run of the slow multi-step benches) without changing the
+        # committed defaults. Does not raise a guard's effective threshold.
+        num_samples_override = os.environ.get("NEMO_SKILLS_NUM_SAMPLES")
+        if num_samples_override is not None:
+            num_samples = int(num_samples_override)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="float16",
+                                        free_gpu_memory_fraction=0.5)
+        # Some benches (e.g. scicode, multi-step) have prompts longer than the
+        # default max_num_tokens; raise it when the caller requests.
+        extra_llm_kwargs = dict(llm_kwargs or {})
+        if max_num_tokens is not None:
+            extra_llm_kwargs["max_num_tokens"] = max_num_tokens
+        with LLM(self.NEMO_SKILLS_NVFP4,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=32,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 enable_attention_dp=True,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                   enable_padding=True),
+                 **extra_llm_kwargs) as llm:
+            try:
+                evaluator = evaluator_cls(
+                    data_dir=data_dir,
+                    num_samples=num_samples,
+                    apply_chat_template=True,
+                    chat_template_kwargs=dict(enable_thinking=True),
+                    force_self_judge=True)
+            except FileNotFoundError as e:
+                pytest.skip(
+                    f"NeMo-Skills dataset not prepared ({e}) -- {setup_hint}")
+            accuracy = evaluator.evaluate(
+                llm,
+                SamplingParams(max_tokens=max_output_length,
+                               temperature=0.6,
+                               top_p=0.95))
+            assert accuracy >= threshold, (
+                f"{evaluator_cls.__name__} accuracy {accuracy:.2f} below "
+                f"guard {threshold}")
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_nemo_skills_gpqa(self):
+        from tensorrt_llm.evaluate import GPQANemoSkills
+
+        self._run_nemo_skills_guard(GPQANemoSkills, threshold=60.0)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_nemo_skills_ifbench(self):
+        from tensorrt_llm.evaluate import IFBench
+
+        self._run_nemo_skills_guard(
+            IFBench,
+            threshold=60.0,
+            max_output_length=16384,
+            require_files=("patches/IFBench/run_eval.py", ))
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_nemo_skills_scicode(self):
+        from tensorrt_llm.evaluate import SciCode
+
+        # Measured in-test (full set, thinking on): problem_accuracy 3.08%
+        # (2/65), subtask_accuracy 30.6% (88/288). problem_accuracy is near-floor
+        # and noisy, so this stays a run-guard (>=0) that verifies the bench runs
+        # end-to-end through the sandbox rather than asserting a regression bound.
+        self._run_nemo_skills_guard(SciCode,
+                                    threshold=0.0,
+                                    max_output_length=16384,
+                                    max_num_tokens=32768,
+                                    require_files=("datasets/test_data.h5", ))
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_nemo_skills_hle(self):
+        from tensorrt_llm.evaluate import HLE
+
+        self._run_nemo_skills_guard(HLE,
+                                    threshold=7.0,
+                                    max_output_length=32768,
+                                    max_num_tokens=32768,
+                                    num_samples=100)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_nemo_skills_aalcr(self):
+        from tensorrt_llm.evaluate import AALCR
+
+        self._run_nemo_skills_guard(
+            AALCR,
+            threshold=15.0,
+            max_output_length=8192,
+            max_num_tokens=8192,
+            num_samples=20,
+            llm_kwargs=dict(enable_chunked_prefill=True))
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_nemo_skills_arena_hard(self):
+        from tensorrt_llm.evaluate import ArenaHard
+
+        self._run_nemo_skills_guard(ArenaHard,
+                                    threshold=60.0,
+                                    max_output_length=8192,
+                                    num_samples=50)
+
 
 class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
