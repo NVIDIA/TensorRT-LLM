@@ -43,8 +43,8 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
-                                                UCompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams, ModelCard,
+                                                ModelList, UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -165,6 +165,7 @@ class OpenAIDisaggServer:
     def register_routes(self):
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
+        self.app.add_api_route("/v1/models", self.get_models, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -243,6 +244,32 @@ class OpenAIDisaggServer:
             logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
+
+    async def get_models(self) -> JSONResponse:
+        """Return model list compatible with OpenAI API /v1/models endpoint.
+
+        When service discovery is enabled, server_configs is empty, so we
+        instead fetch /v1/models directly from a worker via the router.
+        """
+        for router in [self._ctx_router, self._gen_router]:
+            servers = router.servers
+            if servers:
+                server = servers[0]
+                server_scheme = "http://" if not server.startswith("http://") else ""
+                url = f"{server_scheme}{server}/v1/models"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                                url,
+                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                return JSONResponse(content=await resp.json())
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch /v1/models from worker {server}: {e}"
+                    )
+        model_list = ModelList(data=[ModelCard(id="unknown")])
+        return JSONResponse(content=model_list.model_dump())
 
     async def health(self) -> Response:
         if not await self._service.is_ready():
