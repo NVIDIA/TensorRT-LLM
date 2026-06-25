@@ -77,9 +77,24 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm -k "AllGatherReduceScatter"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm -k "DeepEP and not DeepEPLowLatency"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm -k "DeepEPLowLatency"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm -k "NVLinkOneSided"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm -k "NVLinkTwoSided and not NVLinkTwoSidedFlashinfer"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm -k "NVLinkTwoSidedFlashinfer"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary -k "AllGatherReduceScatter"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary -k "DeepEP and not DeepEPLowLatency"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary -k "DeepEPLowLatency"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary -k "NVLinkOneSided"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary -k "NVLinkTwoSided and not NVLinkTwoSidedFlashinfer"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary -k "NVLinkTwoSidedFlashinfer"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant -k "AllGatherReduceScatter"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant -k "DeepEP and not DeepEPLowLatency"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant -k "DeepEPLowLatency"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant -k "NVLinkOneSided"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant -k "NVLinkTwoSided and not NVLinkTwoSidedFlashinfer"
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant -k "NVLinkTwoSidedFlashinfer"
 
 - condition:
     ranges:
