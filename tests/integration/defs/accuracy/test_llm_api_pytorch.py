@@ -5731,13 +5731,13 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False)
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig(
-                                  enable_padding=True, max_batch_size=32))
+                                  enable_padding=True, max_batch_size=128))
 
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
-                max_num_tokens=16384,
-                max_batch_size=32,
+                max_num_tokens=8192,
+                max_batch_size=128,
                 moe_config=MoeConfig(backend="CUTLASS"),
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
@@ -5779,13 +5779,13 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config.mamba_state_cache_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=32, enable_padding=True))
+                                  max_batch_size=512, enable_padding=True))
         moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  max_num_tokens=16384,
-                 max_batch_size=32,
+                 max_batch_size=512,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  enable_attention_dp=attention_dp,

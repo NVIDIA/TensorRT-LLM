@@ -3,6 +3,9 @@ import subprocess
 
 import pytest
 
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+
 
 def test_load_agent_missing_module():
     """_load_agent returns (None, ImportError) for a non-existent module.
