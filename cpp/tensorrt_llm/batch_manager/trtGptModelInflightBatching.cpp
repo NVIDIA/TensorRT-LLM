@@ -25,6 +25,7 @@
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/disaggTransferAdmissionController.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/handleContextLogits.h"
 #include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
@@ -333,6 +334,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         mCacheTransceiver
             = CacheTransceiverFactory::createCacheTransceiver(mKvCacheManager.get(), mModelConfig, mWorldConfig,
                 executor::kv_cache::CacheState::AttentionType::kDEFAULT, executorConfig.getCacheTransceiverConfig());
+        mDisaggTransferAdmissionController = std::make_unique<DisaggTransferAdmissionController>(
+            cacheTransceiverConfig.getMaxTokensInBuffer(), mModelConfig.getTokensPerBlock());
     }
 
     if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
@@ -1020,6 +1023,22 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         // Remove from fitting requests the requests that cannot be scheduled due to disagg KV cache transfer
         if (mModelConfig.isTransformerBased() && getKVCacheManager() && mCacheTransceiver)
         {
+            if (mDisaggTransferAdmissionController && mDisaggTransferAdmissionController->enabled()
+                && !fittingDisaggGenInitRequests.empty())
+            {
+                auto admissionResult
+                    = mDisaggTransferAdmissionController->select(activeRequests, fittingDisaggGenInitRequests);
+                if (admissionResult.deferredRequestCount > 0)
+                {
+                    TLLM_LOG_DEBUG(
+                        "Disagg transfer admission deferred %zu requests; active transfer blocks=%zu, admitted "
+                        "transfer blocks=%zu, budget=%zu",
+                        admissionResult.deferredRequestCount, admissionResult.activeTransferBlocks,
+                        admissionResult.admittedTransferBlocks,
+                        mDisaggTransferAdmissionController->getMaxTransferBlocks().value_or(0));
+                }
+                fittingDisaggGenInitRequests = std::move(admissionResult.admittedRequests);
+            }
             prepareDisaggGenInitRequests(activeRequests, fittingDisaggGenInitRequests);
         }
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())

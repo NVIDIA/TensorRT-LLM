@@ -20,6 +20,7 @@
 
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/disaggTransferAdmissionController.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
@@ -847,6 +848,64 @@ TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
             << "policy=" << static_cast<int>(capacitySchedulerPolicy);
         EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
     }
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionDisabledPreservesCandidates)
+{
+    auto req0 = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto req1 = createRequest(20, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(std::nullopt, 10);
+    auto result = controller.select(RequestList{}, RequestVector{req0, req1});
+
+    EXPECT_FALSE(controller.enabled());
+    ASSERT_EQ(result.admittedRequests.size(), 2u);
+    EXPECT_EQ(result.admittedRequests.at(0)->mRequestId, req0->mRequestId);
+    EXPECT_EQ(result.admittedRequests.at(1)->mRequestId, req1->mRequestId);
+    EXPECT_EQ(result.deferredRequestCount, 0u);
+    EXPECT_FALSE(result.limitedByBudget);
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionUsesFcfsEstimatedBlockBudget)
+{
+    auto activeTransferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto req1 = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto req2 = createRequest(20, 40, 2, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto req3 = createRequest(10, 40, 3, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(/*maxTokensInBuffer=*/30, /*tokensPerBlock=*/10);
+    auto result = controller.select(RequestList{activeTransferReq}, RequestVector{req1, req2, req3});
+
+    ASSERT_EQ(result.admittedRequests.size(), 1u);
+    EXPECT_EQ(result.admittedRequests.front()->mRequestId, req1->mRequestId);
+    EXPECT_EQ(result.activeTransferBlocks, 1u);
+    EXPECT_EQ(result.admittedTransferBlocks, 1u);
+    EXPECT_EQ(result.deferredRequestCount, 2u);
+    EXPECT_TRUE(result.limitedByBudget);
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionAdmitsOversizedHeadWhenIdle)
+{
+    auto oversizedReq = createRequest(30, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto laterReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(/*maxTokensInBuffer=*/10, /*tokensPerBlock=*/10);
+    auto result = controller.select(RequestList{}, RequestVector{oversizedReq, laterReq});
+
+    ASSERT_EQ(result.admittedRequests.size(), 1u);
+    EXPECT_EQ(result.admittedRequests.front()->mRequestId, oversizedReq->mRequestId);
+    EXPECT_EQ(result.activeTransferBlocks, 0u);
+    EXPECT_EQ(result.admittedTransferBlocks, 3u);
+    EXPECT_EQ(result.deferredRequestCount, 1u);
+    EXPECT_TRUE(result.limitedByBudget);
 }
 
 TEST_F(CapacitySchedulerTest, RequestsSortedByPriorities)
