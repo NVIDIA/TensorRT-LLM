@@ -81,6 +81,7 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+from .trace_log_utils import log_mem_snapshot
 
 
 class ModelEngine(ABC):
@@ -1023,6 +1024,7 @@ class PyTorchModelEngine(ModelEngine):
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
+        log_mem_snapshot("warmup/before_warmup")
         self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
         if can_run_general_warmup:
@@ -1040,10 +1042,12 @@ class PyTorchModelEngine(ModelEngine):
                 # Memory pool will be warmed up later.
                 gc.collect()
                 torch.cuda.empty_cache()
+
         # Autotuner warmup uses context-only requests. Helix CP
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
+            log_mem_snapshot("warmup/after_autotuner")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
             # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
@@ -1052,12 +1056,14 @@ class PyTorchModelEngine(ModelEngine):
             torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
+        log_mem_snapshot("warmup/after_cuda_graph_capture")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
+            log_mem_snapshot("warmup/after_memory_pool_prepop")
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
