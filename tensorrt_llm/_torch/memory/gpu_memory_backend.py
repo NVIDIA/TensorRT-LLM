@@ -36,8 +36,16 @@ Operating modes:
   CUDA memory pool. After loading, weights are committed for read-only
   access by other workers and the client transitions to RO mode in place.
 - **RO (Read-Only)**: Subsequent workers zero-copy import already-committed
-  weights from the GMS pool. `post_load_weights()` must run BEFORE
-  materialization so that module aliases are set up correctly.
+  weights from the GMS pool. `setup_aliases()` must run BEFORE
+  materialization so that module aliases are set up correctly, while derived
+  state is refreshed after real tensors are bound. RO is validated for models
+  whose `post_load_weights()` is pure alias wiring; models that additionally
+  rely on plain Python attributes set inside `post_load_weights()` (rather
+  than registered `nn.Buffer` / `nn.Parameter` assignments) need to migrate
+  those side effects to `cache_derived_state()` or another path that runs on
+  RO readers. The GMS RO reader runs `setup_aliases()` before
+  `materialize_module()` and `cache_derived_state()` afterward; it does not
+  run `transform_weights()`.
 """
 
 from contextlib import contextmanager
@@ -477,7 +485,7 @@ class GMSBackend:
         by GPU pointers from the shared memory region — no data copies,
         no disk I/O, just CUDA VMM remapping. The model's submodule
         layout must already match the writer's at commit time, including
-        any aliases / derived buffers introduced by `post_load_weights`.
+        any aliases introduced by `setup_aliases`.
 
         Args:
             model: The `nn.Module` to materialize. Walks the full
@@ -489,11 +497,10 @@ class GMSBackend:
             RuntimeError: If `connect()` has not been called yet.
 
         Note:
-            `post_load_weights()` must be called on the model BEFORE
-            this method. The order ensures that any aliases / derived
-            parameters created by post-load hooks are present on the
-            module tree at materialization time, so they are bound to
-            the same GMS storage as their primary tensor.
+            `setup_aliases()` must be called on the model BEFORE this method.
+            The order ensures that any structural aliases created by post-load
+            hooks are present on the module tree at materialization time, so
+            they are bound to the same GMS storage as their primary tensor.
         """
         if self._client is None:
             raise RuntimeError("GMS client not connected. Call connect() first.")

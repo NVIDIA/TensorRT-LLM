@@ -56,6 +56,7 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_gemma3"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
+  - unittest/_torch/modeling/test_multimodal_encoder_graph.py
   - unittest/disaggregated/test_disagg_utils.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
@@ -73,7 +74,20 @@ l0_h100:
   - unittest/disaggregated/test_request_id.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
-  - unittest/disaggregated/test_cache_transceiver_single_process.py
+  # Split the large cache transceiver parametrization into readable chunks.
+  # Main transfer matrix.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v1 and no_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v1 and uniform_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and no_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and uniform_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver -k "v2 and vswa"
+  # Uneven pipeline-parallel layer distribution.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "no_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "uniform_window"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "v2 and vswa"
+  # Boundary request lengths.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v1"
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
@@ -166,6 +180,37 @@ l0_h100:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-off-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-greedy-batch2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-cuda-graph-off-greedy-batch2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-small0]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-base]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-large]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-base]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-large]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-xl]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-xxl]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-small1]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-off-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v1-cuda-graph-off-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-off-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v1-cuda-graph-off-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-off-greedy-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-off-greedy-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-byt5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-beam2-batch2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-beam2-batch2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-greedy-batch2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-cuda-graph-off-greedy-batch2-t5-small]
   - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-non-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
@@ -273,8 +318,8 @@ l0_h100:
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
-  - examples/test_visual_gen.py::test_visual_gen_quickstart
-  - examples/test_visual_gen.py::test_visual_gen_api_walkthrough
+  - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized
   - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]

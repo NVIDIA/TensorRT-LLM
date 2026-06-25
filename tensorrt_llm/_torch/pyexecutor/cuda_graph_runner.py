@@ -8,7 +8,8 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
-                                          DecodingBaseConfig)
+                                          DecodingBaseConfig,
+                                          SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -18,6 +19,7 @@ from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.eagle3 import Eagle3ResourceManager
+from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
@@ -29,7 +31,7 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-KeyType: TypeAlias = Tuple[int, int, bool, bool]
+KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
 @dataclass
@@ -150,8 +152,8 @@ class CUDAGraphRunner:
             self,
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None):
-        if self.sparse_config is not None and self.sparse_config.needs_separate_short_long_cuda_graphs(
-        ):
+        if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
+                and self.sparse_config.needs_separate_short_long_cuda_graphs()):
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
             # For example, the DSA can skip the MQA and Top-K in the indexer for short sequences to reduce the
             # computational overhead. To support this feature, we need to capture separate CUDA graphs for short
@@ -197,11 +199,20 @@ class CUDAGraphRunner:
             self,
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
+            spec_resource_manager: Optional[BaseResourceManager] = None,
+            spec_metadata: Optional[SpecMetadata] = None):
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
         short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
+
+        # Spec one-engine sampler has two code paths (argmax fast-path vs
+        # advanced sampling kernel). Include this in the key so we capture
+        # both variants and dispatch at replay based on actual batch state.
+        # Default to True (greedy fast-path) when the metadata doesn't carry
+        # this field (non-one-engine paths or non-spec batches).
+        is_all_greedy_sample = bool(
+            getattr(spec_metadata, "is_all_greedy_sample", True))
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -209,7 +220,7 @@ class CUDAGraphRunner:
             # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode)
+                   short_seq_len_mode, is_all_greedy_sample)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -219,7 +230,8 @@ class CUDAGraphRunner:
             draft_len = max(draft_len_list)
             assert len(
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
-            key = (batch_size, draft_len, False, short_seq_len_mode)
+            key = (batch_size, draft_len, False, short_seq_len_mode,
+                   is_all_greedy_sample)
         return key
 
     def __del__(self):
@@ -230,7 +242,7 @@ class CUDAGraphRunner:
         batch: ScheduledRequests,
         enable_spec_decode: bool,
         attn_metadata: Any,
-        spec_metadata: Optional[Any] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         draft_tokens_cuda: Optional[torch.Tensor] = None,
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
@@ -273,7 +285,7 @@ class CUDAGraphRunner:
             # can replay CUDA graphs using the cache.
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager)
+                                 spec_resource_manager, spec_metadata)
 
         if key in self.graphs:
             return self.graph_metadata[key][
@@ -816,6 +828,14 @@ class EncoderCUDAGraphRunner:
         # New key not yet captured. Only create metadata if capture is
         # allowed (warmup time); otherwise fall back to eager.
         if not self._capture_allowed:
+            return None, None
+
+        if "multi_item_part_lens" in inputs:
+            # See model_engine.py for more details
+            logger.warning_once(
+                "Encoder CUDA graph does not support multi-item scoring; "
+                "falling back to eager.",
+                key="encoder_cuda_graph_multi_item_scoring_warning")
             return None, None
 
         if attn_metadata.has_cross_sub_metadata:

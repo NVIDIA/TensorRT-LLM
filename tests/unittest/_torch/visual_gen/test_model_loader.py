@@ -1,5 +1,6 @@
 """Test PipelineLoader with VisualGenArgs API."""
 
+import json
 import os
 from pathlib import Path
 
@@ -68,6 +69,59 @@ def test_meta_init_mode_creates_meta_tensors(checkpoint_exists):
     # Verify tensors are on meta device (no GPU memory allocated)
     param = next(pipeline.transformer.parameters())
     assert param.device.type == "meta", f"Expected meta device, got {param.device}"
+
+
+def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
+    """Diffusers checkpoints with two transformers get one model config per component."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # Construct a minimal Wan-style two-transformer checkpoint. The expected
+    # behavior is that both component config.json files are loaded into
+    # separate DiffusionModelConfig objects, instead of transformer_2 reusing
+    # the primary transformer's config data or mutable per-model config objects.
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "boundary_ratio": 0.875,
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "transformer_2": ["diffusers", "WanTransformer3DModel"],
+            }
+        )
+    )
+    for component_name, num_layers, num_attention_heads in (
+        ("transformer", 40, 40),
+        ("transformer_2", 48, 32),
+    ):
+        component_dir = tmp_path / component_name
+        component_dir.mkdir()
+        (component_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "_class_name": "WanTransformer3DModel",
+                    "num_layers": num_layers,
+                    "num_attention_heads": num_attention_heads,
+                }
+            )
+        )
+
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path),
+        args=VisualGenArgs(model=str(tmp_path)),
+    )
+
+    assert set(config.model_configs) == {"transformer", "transformer_2"}
+    transformer_config = config.model_configs["transformer"]
+    transformer_2_config = config.model_configs["transformer_2"]
+    assert transformer_config is not transformer_2_config
+    assert transformer_config.pretrained_config is not transformer_2_config.pretrained_config
+    assert transformer_config.attention is not transformer_2_config.attention
+    assert transformer_config.attention is not config.attention
+    assert transformer_config.pretrained_config.num_layers == 40
+    assert transformer_config.pretrained_config.num_attention_heads == 40
+    assert transformer_2_config.pretrained_config.num_layers == 48
+    assert transformer_2_config.pretrained_config.num_attention_heads == 32
 
 
 def test_load_wan_pipeline_basic(checkpoint_exists):
