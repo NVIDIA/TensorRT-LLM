@@ -113,11 +113,12 @@ class BackendCase:
     # *absorbed generation* MLA path: fused_q does MQA over a single-latent cache
     # ([compressed_kv | k_pe]); value is the kv_lora_rank slice. Validated as the
     # Vanilla golden vs FlashInfer and TRTLLM. The harness skips
-    # mla_rope_generation (feeding a pre-formed fused_q), so all three backends
-    # run RoPE-free and stay aligned; TRTLLM additionally pre-writes the new
-    # latent into the cache and Python-initializes the trtllm-gen scheduler
-    # buffers. MLA *context* (up-projected K/V) runs on Vanilla/FlashInfer; the
-    # TRTLLM context FMHA fuses RoPE and is validated in test_attention_mla.py.
+    # mla_rope_generation (feeding a pre-formed fused_q and explicit q_pe), so
+    # all three backends run RoPE-free and stay aligned; TRTLLM additionally
+    # pre-writes the new latent into the cache and Python-initializes the
+    # trtllm-gen scheduler buffers. MLA *context* (up-projected K/V) runs on
+    # Vanilla/FlashInfer; the TRTLLM context FMHA fuses RoPE and is validated in
+    # test_attention_mla.py.
     v_head_dim: Optional[int] = None
     q_lora_rank: Optional[int] = None
     kv_lora_rank: Optional[int] = None
@@ -310,8 +311,8 @@ def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
 def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
     """Random absorbed-MLA generation inputs (shared by all backends).
 
-    ``fused_q`` already contains the rope slot (the would-be ``q_pe``) so the
-    harness never calls ``mla_rope_generation`` -- that op ropes inside the
+    ``fused_q`` already contains the rope slot (also returned as ``q_pe``) so
+    the harness never calls ``mla_rope_generation`` -- that op ropes inside the
     kernel for fusing backends but not for non-fusing ones, which would desync
     the comparison. Feeding identical pre-formed ``fused_q`` to every backend
     keeps them aligned.
@@ -320,9 +321,13 @@ def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
     cdt = case.compute_dtype
     H = case.num_heads
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    fused_q = _randn(gen, cdt, case.nnz_q, H * d_latent)
     return dict(
         # [num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim)].
-        fused_q=_randn(gen, cdt, case.nnz_q, H * d_latent),
+        fused_q=fused_q,
+        # The q_pe view is passed explicitly when the backend's fused MLA RoPE
+        # step is skipped.
+        q_pe=fused_q.view(case.nnz_q, H, d_latent)[..., case.kv_lora_rank :],
         # New latent token per query token: [compressed_kv | k_pe].
         latent_cache=_randn(gen, cdt, case.nnz_q, d_latent),
         # Cached latent prefix per request.
@@ -484,6 +489,7 @@ def _run_mla_gen_backend(
     mgr.add_dummy_requests(request_ids, case.token_nums)
     _fill_mla_cache(mgr, 0, request_ids, inputs["cached_latent"], kv_layout=kv_layout)
     fused_q = inputs["fused_q"]
+    q_pe = inputs["q_pe"]
     latent_cache = inputs["latent_cache"]
     expected_latents = _split_packed_tokens(latent_cache, case.seq_lens)
     fwd_kwargs = dict(
@@ -495,8 +501,8 @@ def _run_mla_gen_backend(
         skip_mla_rope_generation=True,
     )
 
-    def _forward(metadata, q):
-        out = attn.forward(q, None, None, metadata, **fwd_kwargs)
+    def _forward(metadata, q, q_pe):
+        out = attn.forward(q, None, None, metadata, q_pe=q_pe, **fwd_kwargs)
         return out[0] if isinstance(out, tuple) else out
 
     def _create_metadata(AttentionCls, case, mgr):
@@ -521,8 +527,8 @@ def _run_mla_gen_backend(
                 case,
                 mgr,
                 _create_metadata,
-                {"q": fused_q},
-                lambda md, bufs: _forward(md, bufs["q"]),
+                {"q": fused_q, "q_pe": q_pe},
+                lambda md, bufs: _forward(md, bufs["q"], bufs["q_pe"]),
             )
             _assert_cache_contains_new_tokens(
                 mgr,
@@ -537,7 +543,7 @@ def _run_mla_gen_backend(
             return out
         metadata = _create_metadata(AttentionCls, case, mgr)
         metadata.prepare()
-        out = _forward(metadata, fused_q)[: case.nnz_q].contiguous()
+        out = _forward(metadata, fused_q, q_pe)[: case.nnz_q].contiguous()
         _assert_cache_contains_new_tokens(
             mgr,
             0,

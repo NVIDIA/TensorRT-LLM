@@ -245,6 +245,7 @@ def test_split_consistency(backend):
     # Two context + two generation requests.
     ctx_lens = _PHASES["ctx"]["seq_lens"][:2]
     gen_cached_lens = _PHASES["gen"]["num_cached_tokens"][:2]
+    kv_layout = "NHD" if backend == "VANILLA" else "HND"
     full = BackendCase(
         num_heads=8,
         num_kv_heads=2,
@@ -252,12 +253,13 @@ def test_split_consistency(backend):
         seq_lens=[*ctx_lens, 1, 1],
         num_cached_tokens=[0, 0, *gen_cached_lens],
         num_contexts=2,
+        kv_layout=kv_layout,
     )
     if unsupported_reason(backend, full) is not None:
         pytest.skip(unsupported_reason(backend, full))
 
     inputs = generate_inputs(full, seed=0)
-    out_full = run_backend(full, backend, inputs, kv_dtype=full.compute_dtype)
+    out_full = run_backend(full, backend, inputs, kv_dtype=full.compute_dtype, kv_layout=kv_layout)
 
     # Run request 0 (ctx) + request 2 (gen) as a sub-batch with the SAME inputs.
     # The per-request slices of the packed tensors must reproduce the full run.
@@ -269,6 +271,7 @@ def test_split_consistency(backend):
         seq_lens=[ctx_lens[0], 1],
         num_cached_tokens=[0, gen_cached_lens[0]],
         num_contexts=1,
+        kv_layout=kv_layout,
     )
     # Slice inputs for requests {0, 2}: context request 0 plus generation
     # request 0 after the two contexts.
@@ -297,7 +300,7 @@ def test_split_consistency(backend):
         cached_k=[inputs["cached_k"][0], inputs["cached_k"][2]],
         cached_v=[inputs["cached_v"][0], inputs["cached_v"][2]],
     )
-    out_sub = run_backend(sub, backend, sub_inputs, kv_dtype=sub.compute_dtype)
+    out_sub = run_backend(sub, backend, sub_inputs, kv_dtype=sub.compute_dtype, kv_layout=kv_layout)
 
     ctx0_end = ctx_lens[0]
     gen_full_start = q_offsets[2]

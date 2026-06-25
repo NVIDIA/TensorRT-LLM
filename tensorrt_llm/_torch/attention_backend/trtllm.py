@@ -1493,7 +1493,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                         n_gen].to(torch.int32)
             cu_q = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
             cu_kv = torch.zeros(n_gen + 1, dtype=torch.int32, device=q.device)
-            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(torch.int32)
+            cu_q[1:] = torch.cumsum(gen_q_lens, dim=0).to(
+                torch.int32) * self.num_heads
             cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
             forward_args.cu_q_seqlens = cu_q
             forward_args.cu_kv_seqlens = cu_kv

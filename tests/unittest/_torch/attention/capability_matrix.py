@@ -202,6 +202,44 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     ):
         return "TRTLLM Blackwell no-cache fallback is unstable for head_dim 80"
 
+    # TRTLLM MLA context is validated by test_attention_mla.py through the
+    # production MLA module path. This standalone backend harness feeds already
+    # up-projected random K/V tensors, which does not match the TRTLLM MLA
+    # context op contract and produces invalid output, while Vanilla/FlashInfer
+    # can still validate the up-projected context math and cache append.
+    if (
+        backend == "TRTLLM"
+        and getattr(case, "is_mla", False)
+        and getattr(case, "num_contexts", 0) == len(getattr(case, "seq_lens", ()))
+    ):
+        return (
+            "TRTLLM MLA context is covered by test_attention_mla.py via the "
+            "production MLA module path; standalone up-projected backend "
+            "inputs are validated with Vanilla/FlashInfer"
+        )
+
+    # On Blackwell, TRTLLM-Gen is the supported MLA generation path. The current
+    # kernel set explicitly lacks the DeepSeek-family decode shape at page_size
+    # 32, and the generic fallback then tries to JIT an unsupported generated
+    # kernel. FlashInfer/Vanilla still validate these standalone MLA gen cases.
+    if (
+        backend == "TRTLLM"
+        and sm >= 100
+        and getattr(case, "is_mla", False)
+        and getattr(case, "num_contexts", 0) == 0
+    ):
+        head_dim_qk = getattr(case, "kv_lora_rank", 0) + getattr(case, "qk_rope_head_dim", 0)
+        head_dim_v = getattr(case, "kv_lora_rank", 0)
+        if (head_dim_qk, head_dim_v, getattr(case, "page_size", None)) == (
+            576,
+            512,
+            32,
+        ):
+            return (
+                "TRTLLM-Gen Blackwell MLA generation is missing the decode "
+                "kernel for headDimQk=576, headDimV=512, page_size=32"
+            )
+
     # The TRTLLM MMHA generation kernel is fast-built in this environment, which
     # omits non-core head sizes (for example Phi-3's head_dim 96). Context FMHA
     # covers those configs only on some architectures, so skip remaining cases
