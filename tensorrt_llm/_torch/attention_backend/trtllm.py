@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
@@ -1452,6 +1454,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # (https://nvbugs/6273845).
         if (get_sm_version() in (120, 121) and self.has_fp8_kv_cache
                 and self.head_dim not in (128, 192, 576)):
+            logger.warning_once(
+                f"SM120/121 fp8 KV cache with head_dim={self.head_dim} is "
+                "not supported by Q_PAGED_KV context-FMHA; disabling "
+                "paged-context FMHA while keeping the fp8 paged KV cache "
+                "(https://nvbugs/6273845).",
+                key="sm120_fp8_kv_cache_unsupported_paged_context_fmha")
             metadata.use_paged_context_fmha = False
 
         if forward_args.output is None:
