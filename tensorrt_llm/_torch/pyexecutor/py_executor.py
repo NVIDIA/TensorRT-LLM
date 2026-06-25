@@ -3261,9 +3261,11 @@ class PyExecutor:
 
         Mirrors the inline sequence in ``_executor_loop_overlap`` that
         handles ``previous_batch``.  Unlike the inline code we are not
-        guarded by ``should_process_previous_batch``: the rebalance gate
-        already excludes the multi-rank-divergence cases that flag exists
-        to handle.
+        guarded by ``should_process_previous_batch``; instead the caller
+        (``_maybe_rebalance_kv_pools``) only drains when every attention-DP
+        rank agrees on ``previous_batch`` presence, so the two tp_gathers
+        below (``_flush_pending_transfer_responses`` and
+        ``_process_previous_batch`` -> ``_handle_responses``) stay lockstep.
         """
         if self.previous_batch is None:
             return
@@ -3304,6 +3306,22 @@ class PyExecutor:
         if self.dist.tp_size > 1:
             want = self.dist.tp_allreduce(int(want_local), op=ReduceOp.MAX)
             if not want:
+                return
+            # The drain below (_consume_previous_batch_for_rebalance) runs two
+            # attention-DP collectives -- the tp_gather in
+            # _flush_pending_transfer_responses and the one in
+            # _process_previous_batch -> _handle_responses -- but it skips both
+            # when previous_batch is None.  previous_batch legitimately diverges
+            # across attention-DP ranks (a rank whose local batch was empty last
+            # iteration cleared it to None), so a rank that drains would block in
+            # tp_gather while a peer with nothing to drain races ahead to
+            # tp_barrier() -> NCCL deadlock.  Only drain when every rank is in the
+            # same state; otherwise defer the whole rebalance.  need_adjustment is
+            # sticky (sample counter + cooldown), so nothing is lost -- the next
+            # iteration with uniform previous_batch state rebalances.
+            have_prev = self.dist.tp_allreduce(
+                int(self.previous_batch is not None), op=ReduceOp.SUM)
+            if have_prev not in (0, self.dist.tp_size):
                 return
         elif not want_local:
             return

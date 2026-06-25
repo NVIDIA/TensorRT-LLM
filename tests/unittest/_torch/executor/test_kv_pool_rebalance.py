@@ -27,7 +27,7 @@ preserves generated tokens) is covered by the integration accuracy test;
 here we only verify the call chain and gate logic.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -259,14 +259,18 @@ class TestMaybeRebalanceKvPoolsAttentionDP:
         exe = _make_executor(
             tp_size=2, enable_attention_dp=True, need_adjustment=True, active_requests=reqs
         )
-        exe.dist.tp_allreduce.return_value = 1
+        # want vote -> yes; previous-batch presence SUM -> 0 (no rank has one).
+        exe.dist.tp_allreduce.side_effect = [1, 0]
         exe._consume_previous_batch_for_rebalance = MagicMock()
         monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
 
         PyExecutor._maybe_rebalance_kv_pools(exe)
 
-        # Voted with the local need via a MAX (logical-OR) reduction.
-        exe.dist.tp_allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
+        # Voted on local need (MAX/OR), then on previous_batch presence (SUM).
+        assert exe.dist.tp_allreduce.call_args_list == [
+            call(1, op=ReduceOp.MAX),
+            call(0, op=ReduceOp.SUM),
+        ]
         exe._consume_previous_batch_for_rebalance.assert_called_once()
         exe.kv_cache_manager.impl.adjust.assert_called_once()
         assert exe.kv_cache_manager.suspend_request.call_count == 2
@@ -300,14 +304,18 @@ class TestMaybeRebalanceKvPoolsAttentionDP:
         exe = _make_executor(
             tp_size=2, enable_attention_dp=True, need_adjustment=False, active_requests=reqs
         )
-        # Local need is 0 but a peer wants in -> MAX vote returns 1.
-        exe.dist.tp_allreduce.return_value = 1
+        # Local need is 0 but a peer wants in -> MAX vote returns 1;
+        # presence SUM -> 0 (no rank has a pending previous_batch).
+        exe.dist.tp_allreduce.side_effect = [1, 0]
         exe._consume_previous_batch_for_rebalance = MagicMock()
         monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
 
         PyExecutor._maybe_rebalance_kv_pools(exe)
 
-        exe.dist.tp_allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        assert exe.dist.tp_allreduce.call_args_list == [
+            call(0, op=ReduceOp.MAX),
+            call(0, op=ReduceOp.SUM),
+        ]
         # Lockstep pause happens...
         exe._consume_previous_batch_for_rebalance.assert_called_once()
         exe.kv_cache_manager.suspend_request.assert_called_once()
@@ -315,6 +323,37 @@ class TestMaybeRebalanceKvPoolsAttentionDP:
         exe.dist.tp_barrier.assert_called_once()
         # ...but this rank does not adjust its own pools.
         exe.kv_cache_manager.impl.adjust.assert_not_called()
+
+    def test_divergent_previous_batch_defers_rebalance(self, monkeypatch):
+        """Rebalance is deferred when previous_batch presence differs across
+        attention-DP ranks, so the drain's tp_gathers cannot deadlock."""
+        reqs = [_make_request(1)]
+        exe = _make_executor(
+            tp_size=2,
+            enable_attention_dp=True,
+            need_adjustment=True,
+            active_requests=reqs,
+            previous_batch=MagicMock(),  # this rank has a pending batch...
+        )
+        # want vote -> yes; presence SUM -> 1 of 2 ranks (the peer has none).
+        exe.dist.tp_allreduce.side_effect = [1, 1]
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        sync = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", sync)
+
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+        # Mixed presence (1 of 2) -> defer before any drain / suspend /
+        # adjust / resume / barrier; no CUDA sync either.
+        assert exe.dist.tp_allreduce.call_args_list == [
+            call(1, op=ReduceOp.MAX),
+            call(1, op=ReduceOp.SUM),
+        ]
+        exe._consume_previous_batch_for_rebalance.assert_not_called()
+        exe.kv_cache_manager.impl.adjust.assert_not_called()
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        exe.dist.tp_barrier.assert_not_called()
+        sync.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
