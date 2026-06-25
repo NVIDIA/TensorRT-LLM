@@ -48,7 +48,6 @@ def _load_tests_file(path: str) -> List[str]:
 
 # Regex to parse Jenkins stage configurations from Groovy files
 # Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
-# Some stage entries append boolean flags after the GPU count.
 #
 # Pattern breakdown:
 #   "(?P<stage>[^"]+)"     - Captures stage name in quotes (group 'stage')
@@ -57,11 +56,10 @@ def _load_tests_file(path: str) -> List[str]:
 #   "[^"]+"              - Matches platform string in quotes (ignored)
 #   ,\s*                 - Matches comma with optional whitespace
 #   "(?P<yml>[^"]+)"     - Captures yaml filename in quotes (group 'yml')
-#   (?:,\s*[^\]]+)*     - Matches zero or more comma-separated stage args
+#   (?:,\s*\d+)*         - Matches zero or more comma-separated numbers (split_id, split_count, gpu_count)
 #   \s*\]                - Matches closing bracket with optional whitespace
 _STAGE_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*[^\]]+)*\s*\]'
-)
+    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*\d+)*\s*\]')
 
 
 def _extract_terms(entry):
@@ -155,10 +153,6 @@ class StageQuery:
         return backend_keywords
 
     def search_tests(self, pattern: str):
-        for prefix in ("tests/integration/defs/", "tests/"):
-            if pattern.startswith(prefix):
-                pattern = pattern[len(prefix):]
-                break
         parts = pattern.split()
         result = []
         for test in self.test_map:
@@ -251,8 +245,7 @@ def main():
     if args.tests or args.test_list:
         patterns = []
         if args.tests:
-            for tests_arg in args.tests:
-                patterns.extend(tests_arg.split())
+            patterns.extend(args.tests)
         if args.test_list:
             patterns.extend(_load_tests_file(args.test_list))
 

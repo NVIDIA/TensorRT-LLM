@@ -50,6 +50,9 @@ l0_dgx_b200:
   - disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_adp_lmtp_tp4]
   - accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[pp4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False] TIMEOUT (60)
+  - unittest/_torch/modeling/test_modeling_deepseekv4.py
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
   # ------------- NVBug 6025177: trtllm-serve cross-request KV contamination (OpenAI) ---------------
   - test_e2e.py::test_openai_kv_cache_contamination TIMEOUT (120)
   # ------------- DSA FP4 indexer (Blackwell-only) ---------------

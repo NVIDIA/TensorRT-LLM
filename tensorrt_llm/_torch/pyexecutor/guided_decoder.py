@@ -475,22 +475,6 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # See: https://github.com/pytorch/pytorch/issues/163061
         torch.compiler.set_stance("force_eager")
 
-    def _ensure_new_tokens_capacity(self, new_tokens: torch.Tensor) -> None:
-        if new_tokens.dim() != 2:
-            raise ValueError(
-                f"new_tokens must be a 2D tensor, got shape {new_tokens.shape}")
-
-        token_steps, num_sequences = new_tokens.shape
-        if (token_steps <= self.new_tokens.shape[0]
-                and num_sequences <= self.new_tokens.shape[1]):
-            return
-
-        self.new_tokens = torch.empty(
-            (max(token_steps, self.new_tokens.shape[0]),
-             max(num_sequences, self.new_tokens.shape[1])),
-            dtype=torch.int32,
-            pin_memory=prefer_pinned())
-
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
@@ -503,10 +487,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self.requests = GuidedRequests.from_scheduled_requests(
             scheduled_requests, num_draft_tokens)
         if new_tokens is not None:
-            new_tokens = new_tokens.squeeze(-1)
-            self._ensure_new_tokens_capacity(new_tokens)
-            self.new_tokens[:new_tokens.shape[0], :new_tokens.shape[1]].copy_(
-                new_tokens, non_blocking=True)
+            self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
         # self.token_event.record() should be called inside CUDA graph capturing;
         # currently, it is in PyTorchModelEngine._preprocess_inputs.

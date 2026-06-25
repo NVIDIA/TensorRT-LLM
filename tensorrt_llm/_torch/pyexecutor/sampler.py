@@ -4867,14 +4867,14 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         self.max_attention_window = (
             max(max_attn_window) if max_attn_window is not None else max_seq_len
         )
+        self.max_batch_size = max_batch_size
+        self.max_beam_width = max_beam_width
+        self.max_num_sequences = mapping.pp_size * max_batch_size
+        self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = (
             mapping.pp_size if mapping.pp_size > 1 else (2 if self.is_trt_overlap else 1)
         )
-        self.max_batch_size = max_batch_size
-        self.max_beam_width = max_beam_width
-        self.max_num_sequences = self.num_micro_batches * max_batch_size
-        self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.micro_batch_idx = 0
 
         if mpi_disabled():
