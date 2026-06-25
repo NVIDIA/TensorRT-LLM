@@ -112,6 +112,11 @@ class NcclEP(Communication):
 
     def _get_context(self):
         if self._ctx is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "NcclEP context must be initialized before CUDA graph capture. "
+                    "Run an eager warmup forward before enabling or capturing CUDA graphs."
+                )
             from nccl.ep import Layout
 
             from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import get_nccl_ep_context
@@ -130,6 +135,11 @@ class NcclEP(Communication):
     def _setup_handle(self, ctx, topk_nd, stream):
         """Ensure self._handle exists; rebind topk via handle.update on subsequent calls."""
         if self._handle is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "NcclEP dispatch handle must be initialized before CUDA graph capture. "
+                    "Run an eager warmup forward before enabling or capturing CUDA graphs."
+                )
             self._handle = ctx.ep_group.create_handle(
                 ctx.layout,
                 topk_nd,

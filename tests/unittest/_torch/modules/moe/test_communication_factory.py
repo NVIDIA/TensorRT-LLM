@@ -24,6 +24,7 @@ from tensorrt_llm._torch.modules.fused_moe.communication import communication_fa
 from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
+from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
 
 
 def _make_model_config(
@@ -180,3 +181,35 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+def test_nccl_ep_context_init_rejects_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    strategy = object.__new__(NcclEP)
+    strategy._ctx = None
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="context must be initialized before CUDA graph capture"):
+        strategy._get_context()
+
+
+def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    strategy = object.__new__(NcclEP)
+    strategy._handle = None
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def fail_create_handle(*args, **kwargs):
+        raise AssertionError("create_handle should not run during CUDA graph capture")
+
+    ctx = SimpleNamespace(
+        ep_group=SimpleNamespace(create_handle=fail_create_handle),
+        layout=object(),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
+    ):
+        strategy._setup_handle(ctx, object(), 0)
