@@ -1596,8 +1596,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = Field(
         default=None,
         description=
-        "The number of eagle layers. Will not be used in pytorch flow, just for compatibility with TRT flow."
-    )
+        "Deprecated TensorRT-only field with different semantics from draft model "
+        "layer count. Do not use on the PyTorch backend.")
+    _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
     eagle3_one_model: Optional[bool] = Field(
