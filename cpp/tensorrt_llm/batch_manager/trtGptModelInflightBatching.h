@@ -74,6 +74,18 @@ namespace rnn_state_manager
 class RnnStateManager;
 } // namespace rnn_state_manager
 
+namespace detail
+{
+
+inline runtime::SizeType32 getRuntimeBatchTuningCapacity(
+    runtime::SizeType32 maxCapacityBatchSize, bool isPipelineParallel, runtime::SizeType32 pipelineParallelism)
+{
+    TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Pipeline parallelism must be positive, got %d", pipelineParallelism);
+    return isPipelineParallel ? maxCapacityBatchSize / pipelineParallelism : maxCapacityBatchSize;
+}
+
+} // namespace detail
+
 class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;

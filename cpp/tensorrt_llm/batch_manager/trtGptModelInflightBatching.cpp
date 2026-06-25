@@ -2947,7 +2947,8 @@ nvinfer1::Dims TrtGptModelInflightBatching::getTensorShape(std::string const& na
 
 SizeType32 TrtGptModelInflightBatching::getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const
 {
-    return mKvCacheManager->getMaxCapacityBatchSize(inputLength, outputLength);
+    return detail::getRuntimeBatchTuningCapacity(mKvCacheManager->getMaxCapacityBatchSize(inputLength, outputLength),
+        mWorldConfig.isPipelineParallel(), mWorldConfig.getPipelineParallelism());
 }
 
 /*
