@@ -1650,6 +1650,91 @@ def _make_postquant_test_params():
     return _make_grouped_params(configs)
 
 
+def _make_premerge_test_params():
+    """Generate a focused smoke matrix for GB200 pre-merge CI.
+
+    Keep every communication backend covered, but sample by risk dimension
+    instead of running the full main/boundary/post-quant cartesian product.
+    """
+
+    def make_config(
+        comm_type: str,
+        ep_size: int,
+        top_k: int,
+        all_num_tokens: List[int],
+        *,
+        num_experts: int = FIXED_NUM_EXPERTS,
+        hidden_size: int = DEFAULT_HIDDEN_SIZE,
+        quant_mode: str = "none",
+        use_low_precision_combine: bool = False,
+    ) -> CommTestConfig:
+        return CommTestConfig(
+            comm_type=comm_type,
+            ep_size=ep_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            all_num_tokens=all_num_tokens,
+            quant_mode=quant_mode,
+            use_low_precision_combine=use_low_precision_combine,
+        )
+
+    configs = [
+        # NVLinkOneSided: main, low-precision combine, post-quant, non-divisible EP.
+        make_config(COMM_NVLINK_ONE_SIDED, 4, 2, [16, 32, 48, 64]),
+        make_config(
+            COMM_NVLINK_ONE_SIDED,
+            4,
+            4,
+            [8, 8, 8, 8],
+            use_low_precision_combine=True,
+        ),
+        make_config(COMM_NVLINK_ONE_SIDED, 2, 2, [16, 16], quant_mode="nvfp4"),
+        make_config(COMM_NVLINK_ONE_SIDED, 4, 2, [16, 16, 16, 16], num_experts=17),
+        # NVLinkTwoSided: main, low-precision combine, post-quant, zero-token boundary.
+        make_config(COMM_NVLINK_TWO_SIDED, 4, 2, [16, 32, 48, 64]),
+        make_config(
+            COMM_NVLINK_TWO_SIDED,
+            4,
+            4,
+            [8, 8, 8, 8],
+            use_low_precision_combine=True,
+        ),
+        make_config(COMM_NVLINK_TWO_SIDED, 2, 2, [16, 16], quant_mode="nvfp4"),
+        make_config(COMM_NVLINK_TWO_SIDED, 4, 2, [32, 0, 16, 0]),
+        # AllGatherReduceScatter: fallback smoke plus zero-token/non-divisible coverage.
+        make_config(COMM_ALLGATHER_RS, 4, 2, [16, 32, 48, 64]),
+        make_config(COMM_ALLGATHER_RS, 4, 2, [32, 0, 16, 0], num_experts=17),
+        # DeepEP: main, h2048 boundary, zero-token boundary, nvfp4 post-quant.
+        make_config(COMM_DEEP_EP, 4, 2, [16, 32, 48, 64]),
+        make_config(COMM_DEEP_EP, 2, 2, [16, 16], hidden_size=2048),
+        make_config(COMM_DEEP_EP, 4, 2, [32, 0, 16, 0]),
+        make_config(COMM_DEEP_EP, 2, 2, [16, 16], quant_mode="nvfp4"),
+        # DeepEPLowLatency: main, h2048 boundary, fp8 post-quant, nvfp4 low-precision combine.
+        make_config(COMM_DEEP_EP_LL, 4, 2, [16, 32, 48, 64]),
+        make_config(COMM_DEEP_EP_LL, 2, 2, [16, 16], hidden_size=2048),
+        make_config(COMM_DEEP_EP_LL, 2, 2, [16, 16], quant_mode="fp8"),
+        make_config(
+            COMM_DEEP_EP_LL,
+            2,
+            2,
+            [16, 16],
+            quant_mode="nvfp4",
+            use_low_precision_combine=True,
+        ),
+        # FlashInfer variant: fixed top_k=8 for 16-byte payload alignment.
+        make_config(COMM_NVLINK_TWO_SIDED_FLASHINFER, 4, 8, [16, 32, 48, 64]),
+        make_config(
+            COMM_NVLINK_TWO_SIDED_FLASHINFER,
+            2,
+            8,
+            [16, 16],
+            quant_mode="nvfp4",
+        ),
+    ]
+    return _make_grouped_params([config for config in configs if _is_static_feasible(config)])
+
+
 # ============================================================================
 # Pytest Fixtures & Test Runner
 # ============================================================================
@@ -1811,6 +1896,16 @@ class TestMoEComm:
     )
     def test_moe_comm_postquant(self, mpi_pool_executor, group: CommTestGroup):
         """Verify post-quant dispatch -> dequant -> MoE -> combine pipeline."""
+        _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,group",
+        _make_premerge_test_params(),
+        indirect=["mpi_pool_executor"],
+    )
+    def test_moe_comm_premerge(self, mpi_pool_executor, group: CommTestGroup):
+        """Run the focused communication smoke matrix used by pre-merge CI."""
         _run_full_test_group(mpi_pool_executor, group)
 
     @pytest.mark.threadleak(enabled=False)
