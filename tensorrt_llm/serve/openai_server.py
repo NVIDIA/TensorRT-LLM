@@ -93,57 +93,31 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
 
-def _build_tool_strict_guided_decoding_params(tools,
-                                              tool_parser_name,
-                                              forced_tool_name=None):
-    """Build GuidedDecodingParams with structural tags for tool calls.
+def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
+    """Build GuidedDecodingParams with structural tags for tools with strict=True.
 
-    Two modes are supported:
+    When a tool has ``strict=True`` in its function definition, the server
+    should use constrained decoding to guarantee that the generated tool call
+    arguments exactly match the function's ``parameters`` JSON Schema.
 
-    * **Forced tool call** (``forced_tool_name`` is set): used when the request
-      passes ``tool_choice={"type": "function", "function": {"name": "X"}}``.
-      The model is constrained to emit exactly one tool call to function ``X``.
-      The function's ``parameters`` JSON Schema (when present) is used to
-      constrain the generated arguments.
-    * **Strict tools** (``forced_tool_name`` is ``None``): when one or more
-      tools have ``strict=True``, constrained decoding guarantees that
-      generated arguments match the function's ``parameters`` JSON Schema.
+    This function builds structural tag items from each tool parser's
+    ``structure_info()`` and the tool's ``parameters`` schema, then returns
+    a ``GuidedDecodingParams`` with the structural tag format.
 
-    Raises:
-        ValueError: if ``forced_tool_name`` does not match any function name
-            in ``tools``.
-        ValueError: if ``forced_tool_name`` is set but ``tool_parser_name`` is
-            empty or the parser does not support structural tags.
-
-    Returns ``None`` if no constrained decoding is needed (no strict tool and
-    no forced name).
+    Returns None if no tool has strict=True or the parser doesn't support
+    structural tags.
     """
-    if forced_tool_name is None:
-        if not tools or not tool_parser_name:
-            return None
+    if not tools or not tool_parser_name:
+        return None
 
-        # Check if any tool has strict=True
-        has_strict = any(tool.function.strict for tool in tools
-                         if tool.function.strict)
-        if not has_strict:
-            return None
-    else:
-        if not tools:
-            raise ValueError(
-                "tool_choice requires a named function "
-                f"'{forced_tool_name}' but no tools were provided.")
-        if not tool_parser_name:
-            raise ValueError(
-                "tool_choice with a named function requires a tool parser "
-                "to be configured on the server (use --tool_parser).")
+    # Check if any tool has strict=True
+    has_strict = any(tool.function.strict for tool in tools
+                     if tool.function.strict)
+    if not has_strict:
+        return None
 
-    tool_parser_cls = ToolParserFactory.parsers.get(
-        tool_parser_name.lower()) if tool_parser_name else None
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
     if tool_parser_cls is None:
-        if forced_tool_name is not None:
-            raise ValueError(
-                f"Tool parser '{tool_parser_name}' is not registered; cannot "
-                f"force tool_choice to function '{forced_tool_name}'.")
         logger.warning(
             "Tool parser '%s' not found, cannot enforce strict mode for tools.",
             tool_parser_name)
@@ -151,11 +125,6 @@ def _build_tool_strict_guided_decoding_params(tools,
 
     parser = tool_parser_cls()
     if not parser.supports_structural_tag():
-        if forced_tool_name is not None:
-            raise ValueError(
-                f"Tool parser '{tool_parser_name}' does not support "
-                "structural tags, which are required to honor "
-                "tool_choice with a named function.")
         logger.warning(
             "Tool parser '%s' does not support structural tags, "
             "cannot enforce strict mode for tools.", tool_parser_name)
@@ -165,52 +134,25 @@ def _build_tool_strict_guided_decoding_params(tools,
 
     tags = []
     triggers = set()
-
-    if forced_tool_name is not None:
-        # Force the model to call exactly the named function.
-        forced_tool = next(
-            (t for t in tools if t.function.name == forced_tool_name), None)
-        if forced_tool is None:
-            available = sorted(t.function.name for t in tools
-                               if t.function.name)
-            raise ValueError(
-                f"tool_choice requested function '{forced_tool_name}' which "
-                f"is not present in `tools`. Available functions: {available}.")
-
-        info = get_info(forced_tool.function.name)
+    for tool in tools:
+        info = get_info(tool.function.name)
         triggers.add(info.trigger)
-        if forced_tool.function.parameters:
+
+        if tool.function.strict and tool.function.parameters:
+            # Strict tool: constrain arguments to match the JSON Schema
             content = {
                 "type": "json_schema",
-                "json_schema": forced_tool.function.parameters,
+                "json_schema": tool.function.parameters,
             }
         else:
+            # Non-strict tool or no parameters: allow any text
             content = {"type": "any_text"}
+
         tags.append({
             "begin": info.begin,
             "content": content,
             "end": info.end,
         })
-    else:
-        for tool in tools:
-            info = get_info(tool.function.name)
-            triggers.add(info.trigger)
-
-            if tool.function.strict and tool.function.parameters:
-                # Strict tool: constrain arguments to match the JSON Schema
-                content = {
-                    "type": "json_schema",
-                    "json_schema": tool.function.parameters,
-                }
-            else:
-                # Non-strict tool or no parameters: allow any text
-                content = {"type": "any_text"}
-
-            tags.append({
-                "begin": info.begin,
-                "content": content,
-                "end": info.end,
-            })
 
     stag_format = {
         "type": "triggered_tags",
@@ -221,6 +163,75 @@ def _build_tool_strict_guided_decoding_params(tools,
     resp_format = ResponseFormat(type="structural_tag", format=stag_format)
     return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
         by_alias=True, exclude_none=True))
+
+
+def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
+    r"""Build the (begin_prefix, GuidedDecodingParams) pair used to honor a
+    named ``tool_choice``.
+
+    OpenAI / Azure spec: ``tool_choice={"type":"function","function":{"name":"X"}}``
+    must force the model to emit exactly one tool call to function ``X``.
+
+    Unlike the strict-tools path (which relies on xgrammar's *triggered*
+    structural tags and is therefore non-mandatory by design), this path
+    forces the call by:
+
+    1. Asking the caller to prepend ``begin_prefix`` (e.g.
+       ``<tool_call>\n{"name":"X", "arguments":``) to the rendered prompt
+       so the model starts generation *already inside* the tool call.
+    2. Constraining what follows with a plain JSON-schema (or json-object)
+       guided-decoding mode so the arguments are guaranteed to be valid
+       against ``tool.function.parameters``.
+
+    The caller is then responsible for synthesizing the resulting
+    ``tool_calls`` entry — the raw model output is the JSON arguments
+    string of the forced function call.
+
+    Raises:
+        ValueError: if ``tools`` is empty, ``tool_parser_name`` is unset, the
+            parser is not registered, the parser does not support structural
+            tags, or ``forced_tool_name`` is not in ``tools``.
+    """
+    if not tools:
+        raise ValueError("tool_choice requires a named function "
+                         f"'{forced_tool_name}' but no tools were provided.")
+    if not tool_parser_name:
+        raise ValueError(
+            "tool_choice with a named function requires a tool parser "
+            "to be configured on the server (use --tool_parser).")
+
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    if tool_parser_cls is None:
+        raise ValueError(
+            f"Tool parser '{tool_parser_name}' is not registered; cannot "
+            f"force tool_choice to function '{forced_tool_name}'.")
+
+    parser = tool_parser_cls()
+    if not parser.supports_structural_tag():
+        raise ValueError(
+            f"Tool parser '{tool_parser_name}' does not support structural "
+            "tags, which are required to honor tool_choice with a named "
+            "function.")
+
+    forced_tool = next(
+        (t for t in tools if t.function.name == forced_tool_name), None)
+    if forced_tool is None:
+        available = sorted(t.function.name for t in tools if t.function.name)
+        raise ValueError(
+            f"tool_choice requested function '{forced_tool_name}' which is "
+            f"not present in `tools`. Available functions: {available}.")
+
+    info = parser.structure_info()(forced_tool.function.name)
+    begin_prefix = info.begin
+
+    if forced_tool.function.parameters:
+        guided = GuidedDecodingParams(json=forced_tool.function.parameters)
+    else:
+        # No parameters declared — still require a JSON object (typically ``{}``)
+        # so the synthesized ``arguments`` field is well-formed JSON.
+        guided = GuidedDecodingParams(json_object=True)
+
+    return begin_prefix, guided
 
 
 def _normalize_image_output(image) -> list:
@@ -1256,15 +1267,34 @@ class OpenAIServer(_VideoRoutesMixin):
             # Resolve a named tool_choice (OpenAI spec / Azure compat):
             #   tool_choice = {"type": "function", "function": {"name": "X"}}
             # forces the model to call exactly function X. We honor this by
-            # routing through the structural-tag guided-decoding path, regardless
-            # of whether any tool has strict=True.
+            # (a) prefix-injecting the tool parser's ``begin`` string into the
+            # rendered chat prompt so the model starts generation already inside
+            # a tool call, and (b) constraining the generated arguments with
+            # plain JSON-schema guided decoding. The post-processor then
+            # synthesizes the resulting ``tool_calls`` entry. Unlike the
+            # ``triggered_tags`` structural-tag path used for ``strict`` tools,
+            # this path is mandatory by construction — the model cannot escape
+            # the tool call.
             forced_tool_name = None
+            forced_tool_begin_prefix = None
             if isinstance(request.tool_choice,
                           ChatCompletionNamedToolChoiceParam):
                 if not request.tools:
                     return self.create_error_response(
                         message=("tool_choice with a named function requires "
                                  "`tools` to be set."),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.BAD_REQUEST)
+                if request.prompt_token_ids is not None:
+                    # Tokenizing and concatenating the ``begin_prefix`` onto a
+                    # pre-tokenized prompt correctly across all tokenizers is
+                    # fragile (token-boundary issues with special tokens).
+                    # Reject the combination explicitly until there is a
+                    # demonstrated use case.
+                    return self.create_error_response(
+                        message=("tool_choice with a named function is not "
+                                 "supported alongside `prompt_token_ids`; pass "
+                                 "`messages` instead."),
                         err_type="BadRequestError",
                         status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
@@ -1275,23 +1305,30 @@ class OpenAIServer(_VideoRoutesMixin):
                 if tool_parser_cls and getattr(
                         tool_parser_cls, 'needs_raw_special_tokens', False):
                     sampling_params.skip_special_tokens = False
-                # Apply structural-tag guided decoding when:
-                #   - any tool has strict=True, OR
-                #   - tool_choice is a named function
-                # (skip if response_format already set guided decoding).
                 if sampling_params.guided_decoding is None:
-                    try:
+                    if forced_tool_name is not None:
+                        # Forced-call path: build the begin-prefix + JSON-schema
+                        # guided decoding. The prefix is injected into the
+                        # prompt after ``apply_chat_template`` below.
+                        try:
+                            forced_tool_begin_prefix, forced_guided = (
+                                _build_forced_tool_call_decoding(
+                                    request.tools, self.tool_parser,
+                                    forced_tool_name))
+                        except ValueError as e:
+                            return self.create_error_response(
+                                message=str(e),
+                                err_type="BadRequestError",
+                                status_code=HTTPStatus.BAD_REQUEST)
+                        sampling_params.guided_decoding = forced_guided
+                    else:
+                        # Strict-tools path: structural tags with the existing
+                        # ``triggered_tags`` semantics. Engages only when at
+                        # least one tool has ``strict=True``.
                         strict_guided = _build_tool_strict_guided_decoding_params(
-                            request.tools,
-                            self.tool_parser,
-                            forced_tool_name=forced_tool_name)
-                    except ValueError as e:
-                        return self.create_error_response(
-                            message=str(e),
-                            err_type="BadRequestError",
-                            status_code=HTTPStatus.BAD_REQUEST)
-                    if strict_guided is not None:
-                        sampling_params.guided_decoding = strict_guided
+                            request.tools, self.tool_parser)
+                        if strict_guided is not None:
+                            sampling_params.guided_decoding = strict_guided
             elif forced_tool_name is not None:
                 # tools were provided but the server has no tool_parser configured.
                 return self.create_error_response(
@@ -1334,6 +1371,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                if forced_tool_begin_prefix is not None:
+                    # Force the model to start generation inside the tool call.
+                    # See ``_build_forced_tool_call_decoding`` for details.
+                    prompt = prompt + forced_tool_begin_prefix
             prompt = prompt_inputs(prompt)
 
             mm_data, mm_embeddings = await mm_coroutines
@@ -1352,6 +1393,7 @@ class OpenAIServer(_VideoRoutesMixin):
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
+            postproc_args.forced_tool_name = forced_tool_name
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]

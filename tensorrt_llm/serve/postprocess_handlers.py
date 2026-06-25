@@ -88,6 +88,19 @@ class ChatPostprocArgs(PostprocArgs):
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
+    # When set, ``tool_choice = {"type": "function", "function": {"name": X}}``
+    # was requested. The server prefix-injects the parser's tool-call ``begin``
+    # string into the prompt and constrains the args with JSON-schema guided
+    # decoding (see ``_build_forced_tool_call_decoding`` in openai_server.py),
+    # so the raw model output IS the JSON ``arguments`` string of the forced
+    # call. The chat post-processors below short-circuit the tool parser and
+    # synthesize a single ``ToolCall`` for this function.
+    forced_tool_name: Optional[str] = None
+    # Per-output flag tracking whether the streaming forced-call path has
+    # already emitted the opening delta (with id and function name). The id is
+    # generated once on the first non-empty delta; subsequent deltas omit it
+    # and only stream argument fragments.
+    forced_tool_name_sent: dict[int, bool] = field(default_factory=dict)
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -279,36 +292,67 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             True,
             finished=(output.finish_reason is not None))
 
-        # Note: even when tool_choice forces a named function, guided decoding
-        # constrains the model to emit a structurally-tagged tool call (e.g.
-        # ``<tool_call>\n{"name":"X","arguments":{...}}\n</tool_call>``); the
-        # standard tool parser handles that uniformly with the auto path, so
-        # there is no longer a separate ChatCompletionNamedToolChoiceParam
-        # branch here.
-        delta_text, calls = apply_tool_parser(args, i, delta_text, True)
-        tool_calls = []
-        for call_item in calls:
-            # Tool call ID should be generated only once per tool call
-            if call_item.name:
-                # First chunk: include ID and function name
-                tool_call_id = make_tool_call_id(id_type=args.tool_call_id_type,
-                                                 func_name=call_item.name,
-                                                 idx=call_item.tool_index)
-                function_name = call_item.name
-            else:
-                # Subsequent chunks: null ID and name for argument deltas
-                tool_call_id = None
-                function_name = None
+        # Forced-call path: ``tool_choice = {"type":"function","function":
+        # {"name":X}}`` was requested. The server prefix-injected the parser's
+        # ``begin`` string into the prompt and constrained the args with
+        # JSON-schema guided decoding, so ``delta_text`` IS the next chunk of
+        # the JSON ``arguments`` string for function X. Synthesize a single
+        # DeltaToolCall and bypass the tool parser entirely.
+        if args.forced_tool_name is not None:
+            tool_calls = []
+            if delta_text:
+                if not args.forced_tool_name_sent.get(i, False):
+                    tool_call_id = make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=args.forced_tool_name,
+                        idx=0)
+                    args.forced_tool_name_sent[i] = True
+                    tool_calls.append(
+                        DeltaToolCall(
+                            id=tool_call_id,
+                            index=0,
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name=args.forced_tool_name,
+                                arguments=delta_text,
+                            ),
+                        ))
+                else:
+                    tool_calls.append(
+                        DeltaToolCall(
+                            index=0,
+                            function=DeltaFunctionCall(arguments=delta_text, ),
+                        ))
+            # Forced calls never produce assistant text content.
+            delta_text = ""
+            # Make sure the final chunk's finish_reason flips to "tool_calls".
+            args.has_tool_call[i] = True
+        else:
+            delta_text, calls = apply_tool_parser(args, i, delta_text, True)
+            tool_calls = []
+            for call_item in calls:
+                # Tool call ID should be generated only once per tool call
+                if call_item.name:
+                    # First chunk: include ID and function name
+                    tool_call_id = make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=call_item.name,
+                        idx=call_item.tool_index)
+                    function_name = call_item.name
+                else:
+                    # Subsequent chunks: null ID and name for argument deltas
+                    tool_call_id = None
+                    function_name = None
 
-            tool_calls.append(
-                DeltaToolCall(
-                    id=tool_call_id,
-                    index=call_item.tool_index,
-                    function=DeltaFunctionCall(
-                        name=function_name,
-                        arguments=call_item.parameters,
-                    ),
-                ))
+                tool_calls.append(
+                    DeltaToolCall(
+                        id=tool_call_id,
+                        index=call_item.tool_index,
+                        function=DeltaFunctionCall(
+                            name=function_name,
+                            arguments=call_item.parameters,
+                        ),
+                    ))
         # Keep token-bearing chunks visible even when detokenization has no
         # text to flush yet.
         if (tool_calls or delta_text or reasoning_delta_text
@@ -386,18 +430,34 @@ def chat_response_post_processor(
         text, reasoning_text = apply_reasoning_parser(args, output.index,
                                                       output.text, False)
 
-        # Named tool_choice is honored by the server via guided decoding (the
-        # model is constrained to emit a tagged tool-call wrapper around the
-        # forced function); the standard tool parser then extracts the call
-        # name and arguments uniformly with the "auto" path.
         if text is None:
             text = ""
-        text, calls = apply_tool_parser(args, output.index, text, False)
-        tool_calls = [
-            ToolCall(function=FunctionCall(name=call.name or "",
-                                           arguments=call.parameters))
-            for call in calls
-        ]
+
+        # Forced-call path: ``tool_choice = {"type":"function","function":
+        # {"name":X}}`` was requested. The server prefix-injected the parser's
+        # ``begin`` string into the prompt and constrained the args with
+        # JSON-schema guided decoding, so ``text`` IS the JSON ``arguments``
+        # string of the forced call. Skip the tool parser and synthesize the
+        # call directly.
+        if args.forced_tool_name is not None:
+            tool_call_id = make_tool_call_id(id_type=args.tool_call_id_type,
+                                             func_name=args.forced_tool_name,
+                                             idx=0)
+            tool_calls = [
+                ToolCall(id=tool_call_id,
+                         function=FunctionCall(name=args.forced_tool_name,
+                                               arguments=text))
+            ]
+            # Forced calls never produce assistant text content.
+            text = ""
+            args.has_tool_call[output.index] = True
+        else:
+            text, calls = apply_tool_parser(args, output.index, text, False)
+            tool_calls = [
+                ToolCall(function=FunctionCall(name=call.name or "",
+                                               arguments=call.parameters))
+                for call in calls
+            ]
         message = ChatMessage(role=role,
                               content=text,
                               reasoning_content=reasoning_text,

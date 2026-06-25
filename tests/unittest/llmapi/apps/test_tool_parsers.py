@@ -3683,49 +3683,61 @@ _SCHEMA_QUERY = {
 }
 
 
-class TestBuildToolForcedNameGuidedDecoding:
-    """Test the forced_tool_name path of _build_tool_strict_guided_decoding_params.
+class TestBuildForcedToolCallDecoding:
+    """Test ``_build_forced_tool_call_decoding`` from openai_server.
 
     Covers OpenAI-spec ``tool_choice = {"type": "function",
     "function": {"name": "X"}}`` for non-harmony tool parsers (TRTLLM-12758).
+    The helper returns ``(begin_prefix, GuidedDecodingParams)``: the caller
+    prefix-injects ``begin_prefix`` into the rendered chat prompt and applies
+    the guided-decoding params to the request, so the model is forced to
+    start generation inside the tool call and the resulting arguments are
+    JSON-schema valid.
     """
 
     @pytest.mark.parametrize(
         "parser_name",
         ["qwen3", "deepseek_v3", "kimi_k2", "gemma4"],
     )
-    def test_forced_name_builds_single_tag(self, parser_name):
-        """Forcing a name yields a single structural tag.
+    def test_forced_name_returns_prefix_and_json_schema(self, parser_name):
+        """Forced-name path returns a parser-specific prefix and JSON schema.
 
-        Across multiple parser families, the tag's ``begin`` must contain the
-        forced function name.
+        Across parser families, ``begin_prefix`` must contain the forced
+        function name and the guided-decoding params must constrain the args
+        to the function's ``parameters`` JSON Schema.
         """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION),
                             ("search_web", _SCHEMA_QUERY))
-        result = _build_tool_strict_guided_decoding_params(
-            tools, parser_name, forced_tool_name="get_weather")
-        assert result is not None
-        assert result.structural_tag is not None
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, parser_name, "get_weather")
 
-        stag = json.loads(result.structural_tag)
-        assert stag["type"] == "structural_tag"
-        fmt = stag["format"]
-        assert fmt["type"] == "triggered_tags"
-        # Exactly one tag — the forced function only.
-        assert len(fmt["tags"]) == 1
-        tag = fmt["tags"][0]
-        assert "get_weather" in tag["begin"]
-        # Forced name with parameters → json_schema constraint.
-        assert tag["content"]["type"] == "json_schema"
-        assert tag["content"]["json_schema"] == _SCHEMA_LOCATION
+        # ``begin_prefix`` is exactly the parser's tool-call begin string.
+        parser = ToolParserFactory.parsers[parser_name.lower()]()
+        expected_begin = parser.structure_info()("get_weather").begin
+        assert begin_prefix == expected_begin
+        assert "get_weather" in begin_prefix
 
-    def test_forced_name_no_parameters_uses_any_text(self):
-        """When the forced function has no parameters, fall back to any_text."""
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json == _SCHEMA_LOCATION
+        assert guided.json_object is False
+        assert guided.structural_tag is None
+
+    def test_forced_name_no_parameters_uses_json_object(self):
+        """Forced-name path falls back to ``json_object`` when no schema.
+
+        When the forced function has no ``parameters``, the helper falls back
+        to ``json_object=True`` so the synthesized ``arguments`` field is still
+        well-formed JSON (typically ``{}``).
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
 
         tools = [
             ChatCompletionToolsParam(
@@ -3738,98 +3750,90 @@ class TestBuildToolForcedNameGuidedDecoding:
                                             parameters=_SCHEMA_QUERY),
             ),
         ]
-        result = _build_tool_strict_guided_decoding_params(
-            tools, "qwen3", forced_tool_name="ping")
-        assert result is not None
-        stag = json.loads(result.structural_tag)
-        tag = stag["format"]["tags"][0]
-        assert "ping" in tag["begin"]
-        assert tag["content"]["type"] == "any_text"
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "ping")
+        assert "ping" in begin_prefix
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json is None
+        assert guided.json_object is True
 
     def test_forced_name_ignores_strict_flag(self):
-        """Forced name constrains decoding even when no tool has strict=True.
-
-        Otherwise the OpenAI spec semantics for a named ``tool_choice`` would
-        not be honored.
-        """
-        from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+        """The forced-call path engages regardless of any ``strict=True``."""
+        from tensorrt_llm.serve.openai_server import (
+            _build_forced_tool_call_decoding,
+            _build_tool_strict_guided_decoding_params)
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
-        # Without forced_tool_name, no strict→None.
+        # Strict-tools path is unchanged: no strict → None.
         assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
-        # With forced_tool_name, structural tag is built regardless.
-        forced = _build_tool_strict_guided_decoding_params(
-            tools, "qwen3", forced_tool_name="get_weather")
-        assert forced is not None
+        # Forced-call path: always constrains.
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "get_weather")
+        assert begin_prefix
+        assert guided is not None
 
     def test_forced_name_missing_raises_value_error(self):
         """Forcing a function that is not in tools must raise ValueError."""
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
         with pytest.raises(ValueError) as exc:
-            _build_tool_strict_guided_decoding_params(
-                tools, "qwen3", forced_tool_name="missing_fn")
+            _build_forced_tool_call_decoding(tools, "qwen3", "missing_fn")
         msg = str(exc.value)
         assert "missing_fn" in msg
-        # Available functions should be reported in the error message.
-        assert "get_weather" in msg
+        assert "get_weather" in msg  # available functions reported
 
     def test_forced_name_no_tools_raises_value_error(self):
         """Forcing a function without any tools provided is a 4xx-class error."""
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
 
         with pytest.raises(ValueError):
-            _build_tool_strict_guided_decoding_params(
-                [], "qwen3", forced_tool_name="get_weather")
+            _build_forced_tool_call_decoding([], "qwen3", "get_weather")
         with pytest.raises(ValueError):
-            _build_tool_strict_guided_decoding_params(
-                None, "qwen3", forced_tool_name="get_weather")
+            _build_forced_tool_call_decoding(None, "qwen3", "get_weather")
 
     def test_forced_name_no_parser_raises_value_error(self):
         """Forcing a function on a server without a tool_parser is a 4xx."""
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
         with pytest.raises(ValueError):
-            _build_tool_strict_guided_decoding_params(
-                tools, None, forced_tool_name="get_weather")
+            _build_forced_tool_call_decoding(tools, None, "get_weather")
         with pytest.raises(ValueError):
-            _build_tool_strict_guided_decoding_params(
-                tools, "", forced_tool_name="get_weather")
+            _build_forced_tool_call_decoding(tools, "", "get_weather")
 
     def test_forced_name_unsupported_parser_raises_value_error(self):
         """Parsers that do not support structural tags cannot honor forced names."""
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
         # glm4, glm47, qwen3_coder, minimax_m2 do not support structural tags.
         for parser_name in ("glm4", "glm47", "qwen3_coder", "minimax_m2"):
             with pytest.raises(ValueError) as exc:
-                _build_tool_strict_guided_decoding_params(
-                    tools, parser_name, forced_tool_name="get_weather")
+                _build_forced_tool_call_decoding(tools, parser_name,
+                                                 "get_weather")
             assert "structural" in str(exc.value).lower()
 
     def test_forced_name_unknown_parser_raises_value_error(self):
-        """An unregistered parser name should also raise on forced_tool_name."""
+        """An unregistered parser name should also raise."""
         from tensorrt_llm.serve.openai_server import \
-            _build_tool_strict_guided_decoding_params
+            _build_forced_tool_call_decoding
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
         with pytest.raises(ValueError):
-            _build_tool_strict_guided_decoding_params(
-                tools, "no_such_parser", forced_tool_name="get_weather")
+            _build_forced_tool_call_decoding(tools, "no_such_parser",
+                                             "get_weather")
 
     def test_strict_path_unchanged_by_default(self):
-        """Strict-tools path is unchanged when no forced name is requested.
+        """Strict-tools path stays untouched without ``strict=True``.
 
-        Regression for existing ``tool_choice='auto'`` behavior: must still
-        return ``None`` when no tool has ``strict=True``.
+        Regression guard: ``_build_tool_strict_guided_decoding_params`` must
+        still return ``None`` when no tool has ``strict=True``, independent of
+        the new forced-call helper.
         """
         from tensorrt_llm.serve.openai_server import \
             _build_tool_strict_guided_decoding_params
