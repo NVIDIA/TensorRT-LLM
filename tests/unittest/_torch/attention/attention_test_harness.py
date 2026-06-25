@@ -22,6 +22,7 @@ from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
     AttentionInputType,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
@@ -492,17 +493,23 @@ def _run_mla_gen_backend(
     q_pe = inputs["q_pe"]
     latent_cache = inputs["latent_cache"]
     expected_latents = _split_packed_tokens(latent_cache, case.seq_lens)
-    fwd_kwargs = dict(
-        latent_cache=latent_cache,
-        attention_input_type=AttentionInputType.generation_only,
-        # The harness feeds a pre-RoPE'd fused_q, so skip the RoPE step; the
-        # TRTLLM backend still appends the new latent and inits its scheduler
-        # buffers. Vanilla/FlashInfer ignore this flag (they append in forward).
-        skip_mla_rope_generation=True,
-    )
 
     def _forward(metadata, q, q_pe):
-        out = attn.forward(q, None, None, metadata, q_pe=q_pe, **fwd_kwargs)
+        out = attn.forward(
+            q,
+            None,
+            None,
+            metadata,
+            forward_args=AttentionForwardArgs(
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+                attention_input_type=AttentionInputType.generation_only,
+                # The harness feeds a pre-RoPE'd fused_q, so skip the RoPE step;
+                # the TRTLLM backend still appends the new latent and inits its
+                # scheduler buffers. Vanilla/FlashInfer ignore this flag.
+                skip_mla_rope_generation=True,
+            ),
+        )
         return out[0] if isinstance(out, tuple) else out
 
     def _create_metadata(AttentionCls, case, mgr):
@@ -616,8 +623,10 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
             inputs["k"],
             inputs["v"],
             metadata,
-            latent_cache=inputs["latent_cache"],
-            attention_input_type=AttentionInputType.context_only,
+            forward_args=AttentionForwardArgs(
+                latent_cache=inputs["latent_cache"],
+                attention_input_type=AttentionInputType.context_only,
+            ),
         )
         if isinstance(out, tuple):
             out = out[0]
@@ -816,9 +825,10 @@ def run_backend(
         pos_embd_params=pos_embd_params,
     )
 
-    fwd_kwargs = dict(attention_mask=mask)
-    if case.sliding_window:
-        fwd_kwargs["attention_window_size"] = case.sliding_window
+    forward_args = AttentionForwardArgs(
+        attention_mask=mask,
+        attention_window_size=case.sliding_window if case.sliding_window else None,
+    )
 
     # TRTLLM fuses QKV for self-attention, but cross-attention needs separate
     # q/k/v (it sets is_fused_qkv = not is_cross and k is None).
@@ -871,7 +881,13 @@ def run_backend(
             )
 
             def _cg_fwd(md, b):
-                out = attn.forward(b["q"], b.get("k"), b.get("v"), md, **fwd_kwargs)
+                out = attn.forward(
+                    b["q"],
+                    b.get("k"),
+                    b.get("v"),
+                    md,
+                    forward_args=forward_args,
+                )
                 return out[0] if isinstance(out, tuple) else out
 
             try:
@@ -919,9 +935,9 @@ def run_backend(
     try:
         if use_fused_qkv:
             qkv = torch.cat([q, new_k, new_v], dim=-1)
-            out = attn.forward(qkv, None, None, metadata, **fwd_kwargs)
+            out = attn.forward(qkv, None, None, metadata, forward_args=forward_args)
         else:
-            out = attn.forward(q, new_k, new_v, metadata, **fwd_kwargs)
+            out = attn.forward(q, new_k, new_v, metadata, forward_args=forward_args)
         if isinstance(out, tuple):
             out = out[0]
         if mgr is not None and expected_cache_tokens is not None:
