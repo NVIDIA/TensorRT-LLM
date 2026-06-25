@@ -120,6 +120,7 @@ struct CascadeTestParams
     int suffixLen;
     int maxSeqLen;
     bool useBias; // when true, populate q/k/v_bias (qkv_bias enabled, e.g. Qwen2)
+    bool useRope; // when true, use GPT-NeoX RoPE instead of learned-absolute
 };
 
 // Pretty-print for gtest output.
@@ -128,7 +129,7 @@ std::string PrintCascadeTestParams(testing::TestParamInfo<CascadeTestParams> con
     auto const& p = info.param;
     return "H" + std::to_string(p.numHeads) + "_KVH" + std::to_string(p.numKvHeads) + "_B" + std::to_string(p.beamWidth)
         + "_R" + std::to_string(p.numRequests) + "_P" + std::to_string(p.prefixLen) + "_S" + std::to_string(p.suffixLen)
-        + (p.useBias ? "_bias" : "");
+        + (p.useBias ? "_bias" : "") + (p.useRope ? "_rope" : "");
 }
 
 } // namespace
@@ -285,7 +286,22 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
         p.max_decoder_seq_len = tp.maxSeqLen;
         p.input_lengths = d_input_lengths.as<int>();
         p.length_per_sample = d_length_per_sample.as<int>();
-        p.position_embedding_type = tk::PositionEmbeddingType::kLEARNED_ABSOLUTE;
+        if (tp.useRope)
+        {
+            // GPT-NeoX full-head RoPE, no scaling.  m_scale (=1.0) and vision_start/
+            // length (=-1) come from the param struct defaults, so cascade (which
+            // hardcodes mscale=1.0 and no vision shift) and baseline compute the
+            // exact same rotary coefficients via rotary_embedding_coefficient().
+            p.position_embedding_type = tk::PositionEmbeddingType::kROPE_GPT_NEOX;
+            p.rotary_embedding_dim = kDh;
+            p.rotary_embedding_base = 1000000.0f;
+            p.rotary_embedding_scale = 1.0f;
+            p.rotary_embedding_scale_type = tk::RotaryScalingType::kNONE;
+        }
+        else
+        {
+            p.position_embedding_type = tk::PositionEmbeddingType::kLEARNED_ABSOLUTE;
+        }
         p.position_shift_enabled = false;
         p.block_sparse_attention = false;
         p.attn_logit_softcapping_scale = 0.0f;
@@ -375,18 +391,25 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
 // clang-format off
 INSTANTIATE_TEST_SUITE_P(CascadeNumerics, CascadeAttentionNumericsTest,
     ::testing::Values(
-        //                          numHeads  numKvHeads  beamWidth  numRequests  prefixLen  suffixLen  maxSeqLen  useBias
-        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    false},
-        CascadeTestParams{               8,         8,         2,           4,        64,        16,       256,    false},
-        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    false},
-        CascadeTestParams{              16,        16,         4,           2,       256,         8,       512,    false},
-        CascadeTestParams{               8,         8,         4,           1,        32,         4,       128,    false},
-        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    false},
-        // qkv_bias enabled: exercises q_bias/k_bias/v_bias add against baseline
-        // MMHA (which applies bias before RoPE).  MHA / GQA / MQA head groupings.
-        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    true},
-        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    true},
-        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    true}
+        //                       numHeads  numKvHeads  beamWidth  numRequests  prefixLen  suffixLen  maxSeqLen  useBias  useRope
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    false,   false},
+        CascadeTestParams{               8,         8,         2,           4,        64,        16,       256,    false,   false},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    false,   false},
+        CascadeTestParams{              16,        16,         4,           2,       256,         8,       512,    false,   false},
+        CascadeTestParams{               8,         8,         4,           1,        32,         4,       128,    false,   false},
+        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    false,   false},
+        // qkv_bias enabled (learned-absolute): exercises q_bias/k_bias/v_bias add.
+        // MHA / GQA / MQA head groupings.
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    true,    false},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    true,    false},
+        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    true,    false},
+        // GPT-NeoX RoPE, no bias: covers the cascade RoPE path numerically.
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    false,   true},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    false,   true},
+        // GPT-NeoX RoPE + qkv_bias: the real Qwen2-style config (bias before RoPE).
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    true,    true},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    true,    true},
+        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    true,    true}
     ),
     PrintCascadeTestParams);
 // clang-format on
