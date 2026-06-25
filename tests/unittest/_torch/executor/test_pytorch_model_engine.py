@@ -12,7 +12,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine, _build_request_multimodal_input)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # isort: off
@@ -146,6 +147,44 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_build_request_multimodal_input_preserves_uuids(self) -> None:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[0, 1, 2],
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(1),
+            is_streaming=False,
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_uuids=["image-0"],
+        )
+
+        multimodal_input = _build_request_multimodal_input(request,
+                                                           cache_enabled=True)
+
+        self.assertIsNotNone(multimodal_input)
+        self.assertEqual(multimodal_input.multimodal_uuids, ["image-0"])
+
+    def test_build_request_multimodal_input_skips_when_cache_disabled(
+            self) -> None:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[0, 1, 2],
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(1),
+            is_streaming=False,
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_uuids=["image-0"],
+        )
+
+        # With the encoder cache disabled, nothing consumes `multimodal_input`,
+        # so it should not be built at all.
+        self.assertIsNone(
+            _build_request_multimodal_input(request, cache_enabled=False))
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
