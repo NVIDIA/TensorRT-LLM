@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,6 +80,7 @@ jobs:
         "byshiue",
         "CarstyYou",
         "cascade812",
+        "caitlinw",
         "chang-l",
         "chenfeiz0326",
         "cherichy",
@@ -113,6 +114,7 @@ jobs:
         "elvischenv",
         "EmmaQiaoCh",
         "eopXD",
+        "erictsai-nv",
         "esha-nvidia",
         "etz-lmn",
         "evezhier",
@@ -184,6 +186,7 @@ jobs:
         "katec846",
         "Kefeng-Duan",
         "KingsleyLiu-NV",
+        "KleinBlueC",
         "kris1025",
         "KrishnanPrash",
         "kunlunl",

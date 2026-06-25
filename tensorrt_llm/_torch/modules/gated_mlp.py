@@ -47,6 +47,8 @@ class GatedMLP(nn.Module):
             swiglu_limit) if swiglu_limit is not None else None
 
         config = config or ModelConfig()
+        use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
+                                         False)
         self.mapping = config.mapping
         if overridden_tp_size is not None:
             assert config.mapping.tp_size % overridden_tp_size == 0
@@ -87,6 +89,7 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
@@ -117,6 +120,7 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )

@@ -64,6 +64,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      post_processor_hook:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # reasoning
       reasoning_parser:
         annotation: Optional[str]
@@ -83,6 +87,10 @@ methods:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
+      multimodal_config:
+        annotation: tensorrt_llm.llmapi.llm_args.MultimodalConfig
+        default: null
+        status: prototype
       attention_dp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
@@ -228,7 +236,11 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        default: null
+        status: prototype
+      kv_cache_compression_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheCompressionConfig]
         default: null
         status: prototype
       otlp_traces_endpoint:
