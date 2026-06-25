@@ -23,8 +23,9 @@ from typing import Any, Callable, Generator, cast
 
 import pytest
 import torch
-from test_beam_search_util import (BeamSearchTestOutput, DummyConfigLoader,
-                                   DummyWeightLoader, get_expected_outputs)
+from test_beam_search_util import (BeamSearchTestOutput, DummyConfig,
+                                   DummyConfigLoader, DummyWeightLoader,
+                                   get_expected_outputs)
 from utils.llm_data import llm_models_root
 from utils.util import assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
@@ -541,6 +542,76 @@ def test_beam_search_disagg_e2e(
     finally:
         ctx_llm.shutdown()
         gen_llm.shutdown()
+
+
+@pytest.mark.parametrize("beam_width", [10])
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_large_beam_width_regression(
+    beam_width: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Fix https://nvbugs/6242591
+    """
+    num_prompts = 2
+    input_prompts = [[1, 2, 3], [4, 5, 6]]
+    vocab_size = DummyConfig().vocab_size
+    # The dummy model pushes each beam towards (token + 3) mod vocab_size, so an
+    # end id a few multiples of 3 ahead of the prompt is reachable and different
+    # beams hit it at different steps -> exercises the finished-slot reuse path.
+    end_id = 24
+
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=DummyWeightLoader(),
+        config_loader=DummyConfigLoader(),
+    )
+
+    gc.collect(2)  # force destruction of any other LLM instances
+    with _single_process_context():
+        llm = LLM(
+            model=_pl.Path("dummy_path"),
+            checkpoint_loader=checkpoint_loader,
+            sampler_type="TRTLLMSampler",
+            max_beam_width=beam_width,
+            max_batch_size=beam_width * num_prompts,
+            max_seq_len=64,
+            kv_cache_config=KvCacheConfig(max_tokens=10000),
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+        )
+        with llm:
+            sampling_params = SamplingParams(
+                max_tokens=16,
+                n=beam_width,
+                best_of=beam_width,
+                use_beam_search=True,
+                beam_search_diversity_rate=0.5,
+                early_stopping=1,
+                length_penalty=0.5,
+                end_id=end_id,
+            )
+            outputs = llm.generate(deepcopy(input_prompts),
+                                   sampling_params=deepcopy(sampling_params))
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == num_prompts
+    for output in outputs:
+        beams = output.outputs
+        assert len(beams) == beam_width, (
+            f"expected {beam_width} beams, but got {len(beams)}")
+        beam_sequences = []
+        for beam_idx, beam in enumerate(beams):
+            token_ids = beam.token_ids
+            assert token_ids is not None, f"beam {beam_idx} has no token_ids"
+            assert len(token_ids) > 0, f"beam {beam_idx} is empty"
+            assert all(0 <= t < vocab_size for t in token_ids), (
+                f"beam {beam_idx} has out-of-vocab tokens: {token_ids}")
+            beam_sequences.append(tuple(token_ids))
+        # Beams must not all collapse to the same sequence: corrupted state
+        # produced duplicated / garbled beams. With a non-zero diversity rate
+        # the beams are expected to differ.
+        assert len(set(beam_sequences)) > 1, (
+            f"all {beam_width} beams are identical: {beam_sequences[0]}")
 
 
 ###########################################################################
