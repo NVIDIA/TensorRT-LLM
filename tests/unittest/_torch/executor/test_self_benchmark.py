@@ -117,6 +117,13 @@ def test_torch_llm_args_self_benchmark_rejects_attention_dp():
                      self_benchmark_config=SelfBenchmarkConfig())
 
 
+def test_torch_llm_args_self_benchmark_rejects_multi_rank():
+    with pytest.raises(ValueError, match="world_size=1"):
+        TorchLlmArgs(model="dummy",
+                     tensor_parallel_size=2,
+                     self_benchmark_config=SelfBenchmarkConfig())
+
+
 def test_grid_generation_uses_executor_limits():
     config = SelfBenchmarkConfig(
         mode="agg",
@@ -203,6 +210,20 @@ def test_prefill_queue_item_marks_executor_request():
     assert items[0].request.py_self_benchmark_point_id == 0
 
 
+def test_shutdown_finishes_benchmark_without_starting_next_point(tmp_path):
+    output_path = tmp_path / "benchmark.json"
+    config = SelfBenchmarkConfig(mode="prefill",
+                                 output_path=str(output_path),
+                                 warmup_iterations=0)
+    executor = _make_executor(config)
+    executor.is_shutdown = True
+    benchmark = SelfBenchmark(executor)
+
+    assert benchmark.make_prefill_queue_items([], []) == []
+    assert benchmark.active is False
+    assert output_path.exists()
+
+
 def test_prefill_seed_and_measure_requests_share_cache_salt():
     config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
@@ -224,9 +245,9 @@ def test_prefill_seed_and_measure_requests_share_cache_salt():
     measure_items = benchmark.make_prefill_queue_items([], [])
 
     assert seed_items[0].request.input_token_ids == [1, 1, 1, 1]
-    assert seed_items[0].request.cache_salt_id == 123
+    assert seed_items[0].request.cache_salt == "123"
     assert measure_items[0].request.input_token_ids == [1] * 8
-    assert measure_items[0].request.cache_salt_id == 123
+    assert measure_items[0].request.cache_salt == "123"
 
 
 def test_decode_injection_uses_dummy_kv_path():
@@ -316,6 +337,40 @@ def test_observe_iteration_records_cache_hit_validation():
         "expectedKvReadTokens": 4,
         "observedCachedTokens": 4,
         "cacheHitValidated": True,
+    }
+
+
+def test_observe_iteration_records_cache_hit_mismatch_without_skip():
+    config = SelfBenchmarkConfig(mode="prefill", warmup_iterations=0)
+    benchmark = SelfBenchmark(_make_executor(config))
+    point = BenchmarkPoint(point_type="prefill",
+                           index=0,
+                           isl=8,
+                           kv_read_tokens=4)
+    benchmark._current = BenchmarkPointResult(point=point)
+    request = types.SimpleNamespace(is_self_benchmark_request=True,
+                                    py_self_benchmark_point_id=0,
+                                    cached_tokens=0,
+                                    is_dummy=False)
+    stats = {
+        "numQueuedRequests": 0,
+        "inflightBatchingStats": {
+            "numContextRequests": 1,
+        },
+    }
+
+    consumed = benchmark.observe_iteration(_FakeScheduledBatch([request]),
+                                           stats)
+
+    assert consumed is True
+    result = benchmark._results[0]
+    assert result.skipped_reason is None
+    assert result.observed_kv_read_tokens == 0
+    assert result.cache_hit_validated is False
+    assert result.stats[0]["selfBenchmark"] == {
+        "expectedKvReadTokens": 4,
+        "observedCachedTokens": 0,
+        "cacheHitValidated": False,
     }
 
 

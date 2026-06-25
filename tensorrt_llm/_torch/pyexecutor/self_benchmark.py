@@ -261,7 +261,7 @@ class SelfBenchmark:
             pad_id=0,
             output_config=output_config,
             return_all_generated_tokens=False,
-            cache_salt_id=cache_salt_id)
+            cache_salt=str(cache_salt_id))
         request.py_is_self_benchmark_request = True
         request.py_self_benchmark_point_id = point.index
         return request
@@ -274,6 +274,12 @@ class SelfBenchmark:
     def _can_start_next_point(self, active_requests: list["LlmRequest"],
                               waiting_queue: WaitingQueue) -> bool:
         if self._done or self._current is not None:
+            return False
+        if getattr(self._executor, "is_shutdown", False):
+            logger.info(
+                "Self-benchmark stopping early because shutdown was requested."
+            )
+            self._finish()
             return False
         if self.config is not None and (
                 time.monotonic() - self._started_at) >= self.config.timeout_s:
@@ -347,9 +353,6 @@ class SelfBenchmark:
             "cacheHitValidated": validated,
         }
         if not validated:
-            self._current.skipped_reason = (
-                "expected cached_tokens >= "
-                f"{point.kv_read_tokens}, observed {observed}")
             logger.warning("Self-benchmark cache-hit validation failed for "
                            "point %s: observed cached_tokens=%s",
                            point, observed)
