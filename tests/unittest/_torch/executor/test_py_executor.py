@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -286,12 +287,15 @@ def _make_gen_request(num_draft_tokens=0):
     return req
 
 
-def _make_disagg_transfer_request(request_id, prompt_len, in_progress=False):
+def _make_disagg_transfer_request(
+    request_id, prompt_len, in_progress=False, total_input_len_cp=None
+):
     """Helper to create a mock disaggregated generation transfer request."""
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
     req.py_prompt_len = prompt_len
+    req.total_input_len_cp = prompt_len if total_input_len_cp is None else total_input_len_cp
     req.is_disagg_generation_transmission_in_progress = in_progress
     return req
 
@@ -349,6 +353,17 @@ class TestDisaggTransferAdmissionController:
         assert result.limited_by_budget
         assert not result.is_blocked_by_active_transfers()
 
+    def test_uses_global_cp_prompt_length_for_transfer_cost(self):
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=128, tokens_per_block=32
+        )
+        request = _make_disagg_transfer_request(1, 32, total_input_len_cp=96)
+
+        result = controller.select(active_requests=[], candidates=[request])
+
+        assert result.admitted_requests == [request]
+        assert result.admitted_transfer_blocks == 3
+
     def test_apply_reverts_deferred_v2_allocations(self):
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
@@ -379,6 +394,15 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
 
+    def test_gen_transfer_status_enters_without_local_active_transfers(self):
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = []
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
     def test_polls_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
@@ -398,8 +422,8 @@ class TestDisaggTransferIdleProgress:
 
     def test_peer_rank_enters_bounded_progress_poll(self):
         executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=2)
-        executor.dist.tp_allreduce.return_value = 1
+        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
+        executor.dist.allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -413,6 +437,7 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
 
     def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
         executor = object.__new__(PyExecutor)
@@ -430,6 +455,26 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+
+    def test_peer_cp_rank_enters_context_progress_poll(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
+        executor.dist.allreduce.return_value = 0
+        executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=1,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_called_once_with(0)
 
 
 class TestDisaggTransferAdmissionPP:

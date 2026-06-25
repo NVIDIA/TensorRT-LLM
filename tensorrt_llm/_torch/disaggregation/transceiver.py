@@ -519,7 +519,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
-        if not self._ever_had_send_session and not self._ctx_need_pp_sync:
+        if not self._ever_had_send_session and not (
+            self._ctx_need_tp_sync or self._ctx_need_pp_sync
+        ):
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -576,7 +578,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
-        if not self._ever_had_recv_session and not self._ctx_need_pp_sync:
+        if not self._ever_had_recv_session and not self._gen_need_sync:
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0

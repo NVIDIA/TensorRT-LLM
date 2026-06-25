@@ -186,12 +186,25 @@ class DisaggTransferAdmissionController:
             return None
         return (max_tokens_in_buffer + tokens_per_block - 1) // tokens_per_block
 
+    @staticmethod
+    def _to_nonnegative_int(value) -> Optional[int]:
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _get_request_transfer_token_count(self, request: LlmRequest) -> int:
+        for attr_name in ("total_input_len_cp", "py_prompt_len", "prompt_len"):
+            token_count = self._to_nonnegative_int(
+                getattr(request, attr_name, None))
+            if token_count is not None:
+                return token_count
+        return 0
+
     def _estimate_request_blocks(self, request: LlmRequest) -> int:
         if self.tokens_per_block <= 0:
             return 0
-        prompt_len = getattr(request, "py_prompt_len",
-                             getattr(request, "prompt_len", 0))
-        prompt_len = max(int(prompt_len), 0)
+        prompt_len = self._get_request_transfer_token_count(request)
         return (prompt_len + self.tokens_per_block - 1) // self.tokens_per_block
 
     def _estimate_requests_blocks(self, requests: Iterable[LlmRequest]) -> int:
@@ -2183,16 +2196,6 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    # [disagg-ctx-deadlock-fix] Mirror of the OR-gated entry in
-                    # _executor_loop: ensure every TP rank either calls
-                    # _check_disagg_ctx_cache_transfer_status together or skips
-                    # it together, so the internal allgather in
-                    # CacheTransceiver::checkContextTransferStatus always has
-                    # full quorum. The C++ syncComm inside that helper is at
-                    # most TP-wide (mGroupTensorParaComm; mGroupTPInDPComm
-                    # with attention_dp), so a TP-scoped OR vote is sufficient.
-                    # Using WORLD allreduce here serialized the disagg prefill
-                    # host loop on every iter (nvbug/6280060).
                     self._check_disagg_transfer_progress_when_idle(
                         num_fitting_reqs, fitting_disagg_gen_init_requests,
                         wait_for_disagg_gen_transfer_progress, all_gen_first)
@@ -2751,6 +2754,26 @@ class PyExecutor:
         if deferred_requests:
             self._revert_ctx_alloc(deferred_requests)
 
+    @staticmethod
+    def _dist_size(dist, name: str) -> int:
+        try:
+            return int(getattr(dist, name))
+        except (AttributeError, TypeError, ValueError):
+            return 1
+
+    def _sync_disagg_gen_status_entry(self, local_need_check: bool) -> int:
+        if self._dist_size(self.dist, "world_size") > 1:
+            return self.dist.allreduce(int(local_need_check), op=ReduceOp.MAX)
+        return int(local_need_check)
+
+    def _sync_disagg_ctx_status_entry(self, local_need_check: bool) -> int:
+        if self._dist_size(self.dist, "cp_size") > 1:
+            return int(any(self.dist.tp_cp_allgather(int(local_need_check))))
+        if self._dist_size(self.dist, "tp_size") > 1:
+            return self.dist.tp_allreduce(int(local_need_check),
+                                          op=ReduceOp.MAX)
+        return int(local_need_check)
+
     def _check_disagg_transfer_progress_when_idle(
             self, num_fitting_reqs: int,
             fitting_disagg_gen_init_requests: List[LlmRequest],
@@ -2761,27 +2784,17 @@ class PyExecutor:
         local_need_gen_check = (local_need_check
                                 and wait_for_disagg_gen_transfer_progress)
 
-        if self.dist.tp_size > 1:
-            any_need_gen_check = self.dist.tp_allreduce(
-                int(local_need_gen_check), op=ReduceOp.MAX)
-        else:
-            any_need_gen_check = int(local_need_gen_check)
-
+        any_need_gen_check = self._sync_disagg_gen_status_entry(
+            local_need_gen_check)
         if any_need_gen_check > 0:
             if local_need_gen_check:
                 logger.debug(
                     "Waiting for generation KV cache transfer progress to free "
                     "disagg admission budget")
-                self._check_disagg_gen_cache_transfer_status(1)
-            else:
-                self._check_disagg_gen_cache_transfer_status(1)
+            self._check_disagg_gen_cache_transfer_status(1)
             return
 
-        if self.dist.tp_size > 1:
-            any_need_check = self.dist.tp_allreduce(int(local_need_check),
-                                                    op=ReduceOp.MAX)
-        else:
-            any_need_check = int(local_need_check)
+        any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
         if any_need_check > 0:
             if local_need_check and not all_gen_first:
                 logger.warning(
@@ -2880,19 +2893,6 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            # [disagg-ctx-deadlock-fix] _check_disagg_ctx_cache_transfer_status
-            # internally invokes a TP-scoped allgather inside
-            # CacheTransceiver::checkContextTransferStatus. Gating the call on
-            # rank-local `num_fitting_reqs` (which can drift between ranks by
-            # one block due to per-rank UCX/CUDA-event-sync timing variance)
-            # lets some ranks enter the allgather while others skip ahead to
-            # model_forward / kv_connector → cross-rank collective-mismatch
-            # deadlock. OR the decision across TP ranks: if ANY rank wants the
-            # call, ALL ranks call it. Ranks that don't locally need it use the
-            # non-blocking variant so the collective stays in sync without
-            # holding any individual rank. Use TP-scoped allreduce (matches
-            # the C++ syncComm scope) instead of WORLD to avoid serializing
-            # the disagg prefill host loop on every iter (nvbug/6280060).
             self._check_disagg_transfer_progress_when_idle(
                 num_fitting_reqs, fitting_disagg_gen_init_requests,
                 wait_for_disagg_gen_transfer_progress, all_gen_first)
@@ -4459,16 +4459,10 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-
-        need_check = any([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
-
-        if need_check:
-            self._check_disagg_gen_cache_transfer_status(0)
-
-        return
+        # Gen-transfer status performs cross-rank consensus internally.
+        # Enter it symmetrically; ranks with no ready local future contribute
+        # an empty ready set.
+        self._check_disagg_gen_cache_transfer_status(0)
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):

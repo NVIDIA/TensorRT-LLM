@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+from unittest.mock import Mock
 
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
@@ -182,6 +183,46 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert 13 not in transceiver._send_sessions
     assert 13 not in transceiver._send_reqs
+
+
+def test_context_transfer_status_enters_consensus_when_tp_sync_required() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = False
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._ctx_consensus = Mock(return_value=[])
+    transceiver._build_to_process = Mock(return_value=[])
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == []
+    transceiver._ctx_consensus.assert_called_once_with([])
+    assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = False
+    transceiver._gen_need_sync = True
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._gen_consensus = Mock(return_value=[])
+    transceiver._build_to_process = Mock(return_value=[])
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+
+    assert completed == []
+    assert failed == []
+    assert cancelled == []
+    transceiver._gen_consensus.assert_called_once_with([])
 
 
 def test_tx_session_wait_complete_defaults_to_blocking() -> None:
