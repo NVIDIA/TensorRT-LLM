@@ -69,8 +69,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import (MultimodalEncoderOutput,
-                                        MultimodalModelMixin)
+from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
@@ -1769,9 +1768,9 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
-    def encode_multimodal_inputs(
-            self, multimodal_params: List[MultimodalParams],
-            **encoder_kwargs: Any) -> MultimodalEncoderOutput:
+    def encode_multimodal_inputs(self,
+                                 multimodal_params: List[MultimodalParams],
+                                 **encoder_kwargs: Any) -> torch.Tensor:
         """Uniform encoder entry (``MultimodalModelMixin`` contract).
 
         Runs the vision encoder over ``multimodal_params`` and returns the
@@ -1783,7 +1782,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         mm_embeds = get_multimodal_embeddings(
             encoder_forward_fn=self.mm_encoder.forward,
             multimodal_params=list(multimodal_params))
-        return MultimodalEncoderOutput(embeddings=mm_embeds[0])
+        return mm_embeds[0]
 
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
