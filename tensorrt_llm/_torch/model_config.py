@@ -20,7 +20,6 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          DeepSeekV4SparseAttentionConfig,
                                           KvCacheConfig, MoeLoadBalancerConfig,
                                           MultimodalConfig)
 from tensorrt_llm.logger import logger
@@ -641,61 +640,6 @@ class ModelConfig(Generic[TConfig]):
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
                             indexer_k_dtype=indexer_k_dtype)
-                elif pretrained_config.architectures[
-                        0] == "DeepseekV4ForCausalLM":
-                    sparse_attention_config = kwargs.get(
-                        'sparse_attention_config')
-                    if sparse_attention_config:
-                        index_n_heads = sparse_attention_config.index_n_heads or getattr(
-                            pretrained_config, 'index_n_heads', None)
-                        index_head_dim = sparse_attention_config.index_head_dim or getattr(
-                            pretrained_config, 'index_head_dim', None)
-                        index_topk = sparse_attention_config.index_topk or getattr(
-                            pretrained_config, 'index_topk', 512)
-                        indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
-                        skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
-                        use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
-                        use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
-                        q_split_threshold = sparse_attention_config.q_split_threshold
-                        enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
-                        indexer_k_dtype = sparse_attention_config.indexer_k_dtype
-                        compress_ratios = sparse_attention_config.compress_ratios
-                        window_size = sparse_attention_config.window_size
-                    else:
-                        index_n_heads = getattr(pretrained_config,
-                                                'index_n_heads', None)
-                        index_head_dim = getattr(pretrained_config,
-                                                 'index_head_dim', None)
-                        index_topk = getattr(pretrained_config, 'index_topk',
-                                             512)
-                        indexer_max_chunk_size = None
-                        skip_indexer_for_short_seqs = False
-                        use_cute_dsl_topk = False
-                        use_cute_dsl_paged_mqa_logits = False
-                        q_split_threshold = 8192
-                        enable_heuristic_topk = False
-                        indexer_k_dtype = "fp8"
-                        compress_ratios = getattr(pretrained_config,
-                                                  'compress_ratios',
-                                                  [1, 1, 4, 128, 4, 128, 4])
-                        window_size = getattr(pretrained_config, 'window_size',
-                                              128)
-                    kwargs[
-                        'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
-                            index_n_heads=index_n_heads,
-                            index_head_dim=index_head_dim,
-                            index_topk=index_topk,
-                            indexer_max_chunk_size=indexer_max_chunk_size,
-                            skip_indexer_for_short_seqs=
-                            skip_indexer_for_short_seqs,
-                            use_cute_dsl_topk=use_cute_dsl_topk,
-                            use_cute_dsl_paged_mqa_logits=
-                            use_cute_dsl_paged_mqa_logits,
-                            q_split_threshold=q_split_threshold,
-                            enable_heuristic_topk=enable_heuristic_topk,
-                            indexer_k_dtype=indexer_k_dtype,
-                            compress_ratios=compress_ratios,
-                            window_size=window_size)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

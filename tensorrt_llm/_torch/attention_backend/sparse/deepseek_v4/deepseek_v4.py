@@ -171,6 +171,60 @@ class DeepSeekV4MetadataParams(DSAMetadataParams):
     window_size: int = 128
 
 
+def _sparse_config_value(
+    sparse_attention_config: "SparseAttentionConfig", pretrained_config, name: str, default=None
+):
+    value = getattr(sparse_attention_config, name)
+    if value is not None:
+        return value
+    if pretrained_config is not None:
+        return getattr(pretrained_config, name, default)
+    return default
+
+
+def make_deepseek_v4_sparse_params(
+    sparse_attention_config: "SparseAttentionConfig",
+    pretrained_config=None,
+) -> DeepSeekV4Params:
+    return DeepSeekV4Params(
+        index_n_heads=_sparse_config_value(
+            sparse_attention_config, pretrained_config, "index_n_heads"
+        ),
+        index_head_dim=_sparse_config_value(
+            sparse_attention_config, pretrained_config, "index_head_dim"
+        ),
+        index_topk=_sparse_config_value(sparse_attention_config, pretrained_config, "index_topk"),
+        indexer_max_chunk_size=sparse_attention_config.indexer_max_chunk_size,
+        skip_indexer_for_short_seqs=(sparse_attention_config.skip_indexer_for_short_seqs),
+        use_cute_dsl_topk=sparse_attention_config.use_cute_dsl_topk,
+        use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
+        q_split_threshold=sparse_attention_config.q_split_threshold,
+        indexer_rope_interleave=(sparse_attention_config.indexer_rope_interleave),
+        enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
+        indexer_k_dtype=sparse_attention_config.indexer_k_dtype,
+        compress_ratios=sparse_attention_config.compress_ratios,
+        window_size=sparse_attention_config.window_size,
+    )
+
+
+def make_deepseek_v4_sparse_metadata_params(
+    sparse_attention_config: "SparseAttentionConfig",
+    pretrained_config=None,
+) -> DeepSeekV4MetadataParams:
+    return DeepSeekV4MetadataParams(
+        indexer_max_chunk_size=(sparse_attention_config.indexer_max_chunk_size or 32768),
+        max_sparse_topk=_sparse_config_value(
+            sparse_attention_config, pretrained_config, "index_topk"
+        ),
+        enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
+        enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
+        use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
+        q_split_threshold=sparse_attention_config.q_split_threshold,
+        compress_ratios=sparse_attention_config.compress_ratios,
+        window_size=sparse_attention_config.window_size,
+    )
+
+
 class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
@@ -1196,8 +1250,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         assert sparse_attention_config is not None, (
             "sparse_attention_config is required for DeepseekV4TrtllmAttention and cannot be None"
         )
-        if sparse_params is None and hasattr(sparse_attention_config, "to_sparse_params"):
-            sparse_params = sparse_attention_config.to_sparse_params()
+        if sparse_params is None:
+            sparse_params = make_deepseek_v4_sparse_params(sparse_attention_config)
         assert sparse_params is not None, (
             "sparse_params is required for DeepseekV4TrtllmAttention and cannot be None"
         )

@@ -42,6 +42,19 @@ except ImportError:
     flash_mla_sparse_fwd = None
 
 
+def _lower_sparse_attention_params(sparse_attn_cfg,
+                                   pretrained_config=None,
+                                   layer_idx: Optional[int] = None):
+    if getattr(sparse_attn_cfg, "algorithm", None) == "deepseek_v4":
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+            make_deepseek_v4_sparse_params
+
+        return make_deepseek_v4_sparse_params(
+            sparse_attn_cfg, pretrained_config=pretrained_config)
+    return sparse_attn_cfg.to_sparse_params(pretrained_config=pretrained_config,
+                                            layer_idx=layer_idx)
+
+
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
     extra_attrs = get_model_extra_attrs()
@@ -536,7 +549,8 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
 
         sparse_attn_cfg = config.sparse_attention_config
-        sparse_params = (sparse_attn_cfg.to_sparse_params(
+        sparse_params = (_lower_sparse_attention_params(
+            sparse_attn_cfg,
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 
@@ -1290,7 +1304,8 @@ class MLA(nn.Module):
 
         config = config or ModelConfig()
         sparse_attn_cfg = config.sparse_attention_config
-        sparse_params = (sparse_attn_cfg.to_sparse_params(
+        sparse_params = (_lower_sparse_attention_params(
+            sparse_attn_cfg,
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 

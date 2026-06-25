@@ -28,8 +28,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
-    DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4CacheManager, make_deepseek_v4_sparse_metadata_params)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -2013,7 +2013,11 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                          num_heads * v_head_dim,
                          dtype=dtype,
                          device=device)
-    sparse_metadata_params = (sparse_config.to_sparse_metadata_params())
+    if sparse_config.algorithm == "deepseek_v4":
+        sparse_metadata_params = make_deepseek_v4_sparse_metadata_params(
+            sparse_config)
+    else:
+        sparse_metadata_params = sparse_config.to_sparse_metadata_params()
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(batch_query_lens, dtype=torch.int),
