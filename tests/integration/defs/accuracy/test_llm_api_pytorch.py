@@ -7607,6 +7607,7 @@ class TestGLM5FP8(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_blackwell
 class TestStep3_7(LlmapiAccuracyTestHarness):
     # Step-3.7-Flash is a MoE model registered under the multimodal
     # architecture (Step3p7ForConditionalGeneration); text-only GSM8K exercises
@@ -7659,7 +7660,6 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     @parametrize_with_ids("mtp_nextn", [0, 3])
