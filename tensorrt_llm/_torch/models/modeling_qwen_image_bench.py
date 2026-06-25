@@ -6,7 +6,7 @@ from typing import Dict, List
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 
 from ...inputs import (
     ContentFormat,
@@ -70,7 +70,7 @@ class _QwenImageBenchModelMixin:
         weights: Dict[str, torch.Tensor],
         _weight_mapper: BaseWeightMapper,
     ):
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder.load_weights(weights)
 
         qwen3_5_weight_mapper = Qwen3_5MoeHfWeightMapper()
