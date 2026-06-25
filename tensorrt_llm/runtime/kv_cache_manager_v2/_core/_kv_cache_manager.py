@@ -42,7 +42,7 @@ from .._page import Page, _PageHolder
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
-from .._storage_manager import StorageManager, StorageStatistics
+from .._storage_manager import StorageManager
 from .._utils import (
     HalfOpenRange,
     HomoTuple,
@@ -183,12 +183,10 @@ class PageIndexConverter:
 
 
 @dataclass(slots=True, frozen=True)
-class _StorageLevelStats:
-    pool_group_stats: TypedIndexList[PoolGroupIndex, StorageStatistics]
-    max_num_blocks: int
-    free_num_blocks: int
-    used_num_blocks: int
-    allocated_bytes: int
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
 
 
 class KVCacheManager:
@@ -211,6 +209,7 @@ class KVCacheManager:
         "_stats_enabled",
         "_committed_stats",
         "_iteration_stats_by_life_cycle",
+        "_iteration_peak_num_blocks_by_cache_level",
         "_dirty_stats_kv_cache_ids",
         "_stats_excluded_kv_cache_ids",
     )
@@ -239,6 +238,9 @@ class KVCacheManager:
     _stats_enabled: bool
     _committed_stats: KVCacheStatsDelta
     _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _iteration_peak_num_blocks_by_cache_level: TypedIndexList[
+        CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]
+    ]
     _dirty_stats_kv_cache_ids: set[int]
     _stats_excluded_kv_cache_ids: set[int]
 
@@ -277,6 +279,7 @@ class KVCacheManager:
         self._stats_enabled = config.enable_stats
         self._committed_stats = KVCacheStatsDelta()
         self._iteration_stats_by_life_cycle = {}
+        self._reset_iteration_peak_num_blocks()
         self._dirty_stats_kv_cache_ids = set()
         self._stats_excluded_kv_cache_ids = set()
 
@@ -457,17 +460,53 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
 
-    def _get_storage_level_stats(self, cache_level: CacheLevel) -> _StorageLevelStats:
-        pool_group_stats = self._storage.get_statistics(cache_level)
-        max_num_blocks = sum(stat.total for stat in pool_group_stats)
-        free_num_blocks = sum(stat.available for stat in pool_group_stats)
-        return _StorageLevelStats(
-            pool_group_stats=pool_group_stats,
-            max_num_blocks=max_num_blocks,
-            free_num_blocks=free_num_blocks,
-            used_num_blocks=max_num_blocks - free_num_blocks,
-            allocated_bytes=self.get_quota(cache_level),
+    def _current_block_stats_by_cache_level(
+        self,
+    ) -> TypedIndexList[CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]]:
+        def collect(
+            cache_level: CacheLevel,
+        ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:
+            stats_by_pool_group = self._storage.get_statistics(cache_level)
+            return make_typed(
+                lambda pool_group_index: PoolGroupPeakBlockStats(
+                    available=stats_by_pool_group[pool_group_index].available,
+                    unavailable=stats_by_pool_group[pool_group_index].unavailable,
+                    evictable=stats_by_pool_group[pool_group_index].evictable,
+                ),
+                self._storage.num_pool_groups,
+            )
+
+        return make_typed(collect, self._storage.num_cache_levels)
+
+    def _reset_iteration_peak_num_blocks(self, cache_level: CacheLevel | None = None) -> None:
+        if cache_level is None:
+            self._iteration_peak_num_blocks_by_cache_level = (
+                self._current_block_stats_by_cache_level()
+            )
+            return
+        stats_by_pool_group = self._storage.get_statistics(cache_level)
+        self._iteration_peak_num_blocks_by_cache_level[cache_level] = make_typed(
+            lambda pool_group_index: PoolGroupPeakBlockStats(
+                available=stats_by_pool_group[pool_group_index].available,
+                unavailable=stats_by_pool_group[pool_group_index].unavailable,
+                evictable=stats_by_pool_group[pool_group_index].evictable,
+            ),
+            self._storage.num_pool_groups,
         )
+
+    def _update_iteration_peak_num_blocks(self) -> None:
+        current = self._current_block_stats_by_cache_level()
+        for cache_level in typed_range(self._storage.num_cache_levels):
+            peak = self._iteration_peak_num_blocks_by_cache_level[cache_level]
+            current_level = current[cache_level]
+            for pool_group_index in typed_range(self._storage.num_pool_groups):
+                peak_stats = peak[pool_group_index]
+                current_stats = current_level[pool_group_index]
+                peak[pool_group_index] = PoolGroupPeakBlockStats(
+                    available=max(peak_stats.available, current_stats.available),
+                    unavailable=max(peak_stats.unavailable, current_stats.unavailable),
+                    evictable=max(peak_stats.evictable, current_stats.evictable),
+                )
 
     def commit_stats(
         self,
@@ -476,6 +515,7 @@ class KVCacheManager:
     ) -> None:
         if not self._stats_enabled:
             return
+        self._update_iteration_peak_num_blocks()
         self._committed_stats.add(stats)
         if iteration_stats_by_life_cycle is None:
             return
@@ -498,6 +538,27 @@ class KVCacheManager:
         }
         self._iteration_stats_by_life_cycle.clear()
         return stats
+
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]:
+        self._update_iteration_peak_num_blocks()
+        peak = make_typed(
+            lambda pool_group_index: PoolGroupPeakBlockStats(
+                available=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].available,
+                unavailable=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].unavailable,
+                evictable=self._iteration_peak_num_blocks_by_cache_level[cache_level][
+                    pool_group_index
+                ].evictable,
+            ),
+            self._storage.num_pool_groups,
+        )
+        self._reset_iteration_peak_num_blocks(cache_level)
+        return peak
 
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
         if kv_cache_id is not None:

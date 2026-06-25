@@ -89,6 +89,13 @@ from .scheduler.adp_router import ADPRouter
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+_UNBOUNDED_STATS_MAX_LEN = -1
+
+
+def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
+    return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
+
+
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -490,7 +497,7 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
-        self.max_stats_len = max(self.llm_args.max_stats_len, 1)
+        self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
@@ -1912,10 +1919,11 @@ class PyExecutor:
                     # same iteration lands in the buffer atomically; evicting
                     # during the append loop would let partial iterations
                     # survive at the head of self.stats.
-                    cap = self.max_stats_len * tp_size
-                    overflow = max(0, len(self.stats) + len(gathered) - cap)
-                    if overflow:
-                        del self.stats[:overflow]
+                    if not _stats_buffer_is_unbounded(self.max_stats_len):
+                        cap = self.max_stats_len * tp_size
+                        overflow = max(0, len(self.stats) + len(gathered) - cap)
+                        if overflow:
+                            del self.stats[:overflow]
                     for d in gathered:
                         self.stats.append(("per_rank_dict", d))
             return
@@ -1932,7 +1940,8 @@ class PyExecutor:
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
         with self.stats_lock:
-            if len(self.stats) > self.max_stats_len:
+            if (not _stats_buffer_is_unbounded(self.max_stats_len)
+                    and len(self.stats) > self.max_stats_len):
                 self.stats.pop(0)
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,

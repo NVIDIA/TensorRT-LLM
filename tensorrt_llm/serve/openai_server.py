@@ -1,4 +1,18 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import asyncio
 import base64
 import json
@@ -212,14 +226,10 @@ class OpenAIServer(_VideoRoutesMixin):
         self.perf_metrics = None
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
+        self._iteration_stats_lock = asyncio.Lock()
+        self._iteration_stats_buffer = deque(
+            maxlen=self._get_iteration_stats_buffer_maxlen())
         self._iteration_stats_wakeup_event = asyncio.Event()
-        # Bounded snapshot of iteration stats for the GET /metrics handler.
-        # When the background Prometheus collector loop is active, it is the
-        # sole consumer of the engine's stats queue and appends each drained
-        # stat here; /metrics then serves from this buffer instead of racing
-        # the loop for the queue. Created lazily when the loop starts.
-        # See nvbug 6102381.
-        self._iteration_stats_buffer: Optional[deque] = None
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -340,6 +350,15 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
+
+    def _get_iteration_stats_buffer_maxlen(self) -> Optional[int]:
+        if isinstance(self.generator, VisualGen):
+            return None
+
+        max_iterations = self.generator.args.iter_stats_max_iterations
+        if max_iterations is None or max_iterations < 0:
+            return None
+        return max_iterations
 
     def _init_visual_gen(self):
         self.processor = None
@@ -902,22 +921,22 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
-        # When the background collector loop is active it is the sole
-        # consumer of the engine stats queue; serve /metrics from the tee
-        # buffer it populates so we do not race it for queue items. Racing
-        # caused >80% iteration loss and ~2s per-call latency (nvbug 6102381).
-        # The caller receives the stats accumulated since the previous /metrics
-        # call (up to iter_stats_max_iterations) and the buffer is cleared.
-        if self._iteration_stats_buffer is not None:
+        async with self._iteration_stats_lock:
+            await self._drain_iteration_stats_to_sinks_unlocked(timeout=2)
             stats = list(self._iteration_stats_buffer)
             self._iteration_stats_buffer.clear()
-            return JSONResponse(content=stats)
-
-        # Legacy path: no background collector -> read the queue directly.
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def _drain_iteration_stats_to_sinks_unlocked(self,
+                                                       timeout: float) -> None:
+        async for llm_stat in self.generator.get_stats_async(timeout):
+            if self.metrics_collector:
+                self.metrics_collector.log_iteration_stats(llm_stat)
+            self._iteration_stats_buffer.append(llm_stat)
+
+    async def _drain_iteration_stats_to_sinks(self, timeout: float) -> None:
+        async with self._iteration_stats_lock:
+            await self._drain_iteration_stats_to_sinks_unlocked(timeout)
 
     async def get_energy_metrics(self) -> JSONResponse:
         if self.energy_monitor is None:
@@ -1108,13 +1127,13 @@ class OpenAIServer(_VideoRoutesMixin):
         """Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
-        stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
-        (kv_cache_hit_rate, kv_cache_utilization, kv_cache_iter_reuse_rate) are naturally
-        overwritten with the latest value, while counters (missed_blocks_total,
-        gen_alloc_blocks_total, etc.) must be incremented by *every* per-iteration delta
-        to remain accurate.  Logging only the latest stat would drop counter deltas from
-        earlier iterations and could leave gauges unset if the latest iteration had no
-        context-phase activity.
+        stats from the engine's stats queue, logging every stat to Prometheus and buffering
+        it for the /metrics endpoint.  Gauges (kv_cache_hit_rate, kv_cache_utilization,
+        kv_cache_iter_reuse_rate) are naturally overwritten with the latest value, while
+        counters (missed_blocks_total, gen_alloc_blocks_total, etc.) must be incremented by
+        *every* per-iteration delta to remain accurate.  Logging only the latest stat would
+        drop counter deltas from earlier iterations and could leave gauges unset if the
+        latest iteration had no context-phase activity.
 
         The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
         requests complete.
@@ -1130,16 +1149,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
 
-                # Drain all available iteration stats and log each one to Prometheus.
+                # Drain all available iteration stats once, then fan out to
+                # Prometheus and the /metrics response buffer.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
-                        self.metrics_collector.log_iteration_stats(llm_stat)
-                        # Tee into the /metrics snapshot buffer so the HTTP
-                        # handler can serve without competing for the engine
-                        # queue (nvbug 6102381).
-                        if self._iteration_stats_buffer is not None:
-                            self._iteration_stats_buffer.append(llm_stat)
+                    await self._drain_iteration_stats_to_sinks(timeout=0.5)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",

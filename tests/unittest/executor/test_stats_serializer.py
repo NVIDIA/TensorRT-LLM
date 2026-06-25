@@ -49,6 +49,17 @@ def _make_mock_kv_iter_stats(
     window_size=16,
     primary_used=10,
     primary_max=20,
+    primary_evictable=0,
+    primary_peak_free=None,
+    primary_peak_used=None,
+    primary_peak_evictable=None,
+    secondary_max=None,
+    secondary_free=0,
+    secondary_used=0,
+    secondary_evictable=0,
+    secondary_peak_free=None,
+    secondary_peak_used=None,
+    secondary_peak_evictable=None,
     reused=5,
     full_reused=4,
     partial_reused=1,
@@ -56,13 +67,36 @@ def _make_mock_kv_iter_stats(
     gen_alloc=2,
 ):
     """Create a mock KvCacheIterationStats nanobind object."""
+    primary_free = primary_max - primary_used
+    if primary_peak_free is None:
+        primary_peak_free = primary_free
+    if primary_peak_used is None:
+        primary_peak_used = primary_used
+    if primary_peak_evictable is None:
+        primary_peak_evictable = primary_evictable
+    if secondary_max is None:
+        secondary_max = secondary_free + secondary_used
+    if secondary_peak_free is None:
+        secondary_peak_free = secondary_free
+    if secondary_peak_used is None:
+        secondary_peak_used = secondary_used
+    if secondary_peak_evictable is None:
+        secondary_peak_evictable = secondary_evictable
     s = SimpleNamespace(
         primary_max_num_blocks=primary_max,
-        primary_free_num_blocks=primary_max - primary_used,
+        primary_free_num_blocks=primary_free,
         primary_used_num_blocks=primary_used,
-        secondary_max_num_blocks=0,
-        secondary_free_num_blocks=0,
-        secondary_used_num_blocks=0,
+        primary_evictable_num_blocks=primary_evictable,
+        primary_peak_free_num_blocks=primary_peak_free,
+        primary_peak_used_num_blocks=primary_peak_used,
+        primary_peak_evictable_num_blocks=primary_peak_evictable,
+        secondary_max_num_blocks=secondary_max,
+        secondary_free_num_blocks=secondary_free,
+        secondary_used_num_blocks=secondary_used,
+        secondary_evictable_num_blocks=secondary_evictable,
+        secondary_peak_free_num_blocks=secondary_peak_free,
+        secondary_peak_used_num_blocks=secondary_peak_used,
+        secondary_peak_evictable_num_blocks=secondary_peak_evictable,
         iter_alloc_total_blocks=reused + missed,
         iter_alloc_new_blocks=missed,
         iter_reused_blocks=reused,
@@ -77,8 +111,40 @@ def _make_mock_kv_iter_stats(
         iter_offload_bytes=0,
         iter_intra_device_copy_blocks=2,
         iter_intra_device_copy_bytes=8192,
+        iter_host_dropped_blocks=0,
+        iter_host_dropped_bytes=0,
     )
     return {window_size: s}
+
+
+class _FakeStorageStatistics(SimpleNamespace):
+    @property
+    def unavailable(self):
+        return self.total - self.available
+
+
+class _FakePeakStorage:
+    num_pool_groups = 2
+    num_cache_levels = 2
+
+    def __init__(self):
+        self._levels = []
+        self.primary_stats = [
+            _FakeStorageStatistics(total=10, available=8, evictable=1),
+            _FakeStorageStatistics(total=10, available=9, evictable=0),
+        ]
+        self.secondary_stats = [
+            _FakeStorageStatistics(total=5, available=4, evictable=1),
+            _FakeStorageStatistics(total=5, available=5, evictable=0),
+        ]
+
+    def get_statistics(self, level):
+        if int(level) == 0:
+            return self.primary_stats
+        return self.secondary_stats
+
+    def destroy(self):
+        pass
 
 
 class TestStatsSerializer:
@@ -123,6 +189,12 @@ class TestStatsSerializer:
         assert ws_stats["primaryMaxNumBlocks"] == 20
         assert ws_stats["primaryUsedNumBlocks"] == 10
         assert ws_stats["primaryFreeNumBlocks"] == 10
+        assert ws_stats["primaryPeakFreeNumBlocks"] == 10
+        assert ws_stats["primaryPeakUsedNumBlocks"] == 10
+        assert ws_stats["primaryPeakEvictableNumBlocks"] == 0
+        assert ws_stats["secondaryPeakFreeNumBlocks"] == 0
+        assert ws_stats["secondaryPeakUsedNumBlocks"] == 0
+        assert ws_stats["secondaryPeakEvictableNumBlocks"] == 0
         assert ws_stats["iterReusedBlocks"] == 5
         assert ws_stats["iterFullReusedBlocks"] == 4
         assert ws_stats["iterPartialReusedBlocks"] == 1
@@ -250,6 +322,17 @@ class TestStatsSerializer:
             window_size=16,
             primary_used=10,
             primary_max=20,
+            primary_evictable=2,
+            primary_peak_free=12,
+            primary_peak_used=15,
+            primary_peak_evictable=4,
+            secondary_max=8,
+            secondary_free=5,
+            secondary_used=3,
+            secondary_evictable=1,
+            secondary_peak_free=6,
+            secondary_peak_used=4,
+            secondary_peak_evictable=2,
             reused=5,
             full_reused=4,
             partial_reused=1,
@@ -260,6 +343,17 @@ class TestStatsSerializer:
             window_size=16,
             primary_used=10,
             primary_max=20,
+            primary_evictable=2,
+            primary_peak_free=12,
+            primary_peak_used=15,
+            primary_peak_evictable=4,
+            secondary_max=8,
+            secondary_free=5,
+            secondary_used=3,
+            secondary_evictable=1,
+            secondary_peak_free=6,
+            secondary_peak_used=4,
+            secondary_peak_evictable=2,
             reused=0,
             full_reused=0,
             partial_reused=0,
@@ -301,11 +395,23 @@ class TestStatsSerializer:
         d = json.loads(result)
 
         assert d["kvCacheIterationStats"]["16"]["iterReusedBlocks"] == 5
+        assert d["kvCacheIterationStats"]["16"]["primaryPeakFreeNumBlocks"] == 12
+        assert d["kvCacheIterationStats"]["16"]["primaryPeakUsedNumBlocks"] == 15
+        assert d["kvCacheIterationStats"]["16"]["primaryPeakEvictableNumBlocks"] == 4
+        assert d["kvCacheIterationStats"]["16"]["secondaryPeakFreeNumBlocks"] == 6
+        assert d["kvCacheIterationStats"]["16"]["secondaryPeakUsedNumBlocks"] == 4
+        assert d["kvCacheIterationStats"]["16"]["secondaryPeakEvictableNumBlocks"] == 2
         assert "kvCacheIterationStatsByPoolGroup" in d
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["7"]
         assert pool_group["poolGroupId"] == 7
         assert pool_group["slotSize"] == [2 << 20]
         assert pool_group["windowSizes"] == [16, 64]
+        assert pool_group["primaryPeakFreeNumBlocks"] == 12
+        assert pool_group["primaryPeakUsedNumBlocks"] == 15
+        assert pool_group["primaryPeakEvictableNumBlocks"] == 4
+        assert pool_group["secondaryPeakFreeNumBlocks"] == 6
+        assert pool_group["secondaryPeakUsedNumBlocks"] == 4
+        assert pool_group["secondaryPeakEvictableNumBlocks"] == 2
         assert pool_group["iterGenAllocBlocks"] == 2
         assert "iterReusedBlocks" not in pool_group
         assert "iterMissedBlocks" not in pool_group
@@ -319,3 +425,46 @@ class TestStatsSerializer:
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle
+
+    def test_v2_peak_block_stats_reset_tracks_interval_peak(self):
+        """Peak block stats should cover the interval since the previous reset."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel
+        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache_manager import KVCacheManager
+
+        storage = _FakePeakStorage()
+        manager = object.__new__(KVCacheManager)
+        manager._storage = storage
+        manager._radix_tree = SimpleNamespace(clear=lambda: [])
+        manager._reset_iteration_peak_num_blocks()
+
+        # Some gauges rise above the reset baseline, then fall before drain.
+        storage.primary_stats[0].available = 5  # primary used = 5
+        storage.primary_stats[0].evictable = 3
+        storage.primary_stats[1].available = 6  # primary used = 4
+        storage.primary_stats[1].evictable = 4
+        storage.secondary_stats[0].available = 2  # secondary used = 3
+        storage.secondary_stats[0].evictable = 2
+        manager._update_iteration_peak_num_blocks()
+        storage.primary_stats[0].available = 7  # primary used = 3
+        storage.primary_stats[0].evictable = 1
+        storage.secondary_stats[0].available = 4  # secondary used = 1
+        storage.secondary_stats[0].evictable = 1
+
+        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
+        assert [stats.available for stats in primary_peak] == [8, 9]
+        assert [stats.unavailable for stats in primary_peak] == [5, 4]
+        assert [stats.evictable for stats in primary_peak] == [3, 4]
+        assert [stats.available for stats in secondary_peak] == [4, 5]
+        assert [stats.unavailable for stats in secondary_peak] == [3, 0]
+        assert [stats.evictable for stats in secondary_peak] == [2, 0]
+
+        # The next interval starts from current usage, not zero.
+        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
+        assert [stats.available for stats in primary_peak] == [7, 6]
+        assert [stats.unavailable for stats in primary_peak] == [3, 4]
+        assert [stats.evictable for stats in primary_peak] == [1, 4]
+        assert [stats.available for stats in secondary_peak] == [4, 5]
+        assert [stats.unavailable for stats in secondary_peak] == [1, 0]
+        assert [stats.evictable for stats in secondary_peak] == [1, 0]

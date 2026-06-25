@@ -1798,6 +1798,16 @@ def test_executor_config():
     assert config.mm_embedding_offloading is False
     assert config.enable_trt_overlap is False
 
+    unbounded_stats_config = trtllm.ExecutorConfig(
+        iter_stats_max_iterations=-1, request_stats_max_iterations=-1)
+    assert unbounded_stats_config.iter_stats_max_iterations == -1
+    assert unbounded_stats_config.request_stats_max_iterations == -1
+
+    with pytest.raises(Exception):
+        trtllm.ExecutorConfig(iter_stats_max_iterations=-2)
+    with pytest.raises(Exception):
+        trtllm.ExecutorConfig(request_stats_max_iterations=-2)
+
     kwargs = {
         "max_beam_width":
         2,
