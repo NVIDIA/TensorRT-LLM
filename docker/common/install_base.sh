@@ -102,7 +102,7 @@ init_ubuntu() {
   # PEP 668: Allow break system packages for ubuntu24.04,
   # and ubuntu22.04 (currently not used) shouldn't be affected.
   pip3 config set global.break-system-packages true
-  pip3 install --ignore-installed pip setuptools wheel
+  pip3 install pip setuptools wheel
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   # Remove previous TRT installation
