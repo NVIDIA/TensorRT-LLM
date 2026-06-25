@@ -1021,6 +1021,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         auto [fittingRequests, fittingDisaggGenInitRequests, requestsToPause]
             = (*mCapacityScheduler)(activeRequests, mKvCacheManager, mPeftCacheManager, mCrossKvCacheManager);
         // Remove from fitting requests the requests that cannot be scheduled due to disagg KV cache transfer
+        bool waitForDisaggGenTransferProgress = false;
         if (mModelConfig.isTransformerBased() && getKVCacheManager() && mCacheTransceiver)
         {
             if (mDisaggTransferAdmissionController && mDisaggTransferAdmissionController->enabled()
@@ -1028,6 +1029,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 auto admissionResult
                     = mDisaggTransferAdmissionController->select(activeRequests, fittingDisaggGenInitRequests);
+                waitForDisaggGenTransferProgress = admissionResult.isBlockedByActiveTransfers();
                 if (admissionResult.deferredRequestCount > 0)
                 {
                     TLLM_LOG_DEBUG(
@@ -1050,8 +1052,16 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 mIterCounter);
             if (mCacheTransceiver)
             {
-                mCacheTransceiver->checkContextTransferStatus(1, true);
-                // will free kvCache in next iteration.
+                if (waitForDisaggGenTransferProgress)
+                {
+                    TLLM_LOG_DEBUG("Waiting for one generation KV cache transfer to free disagg admission budget");
+                    mCacheTransceiver->checkGenTransferStatus(1);
+                }
+                else
+                {
+                    mCacheTransceiver->checkContextTransferStatus(1, true);
+                    // will free kvCache in next iteration.
+                }
             }
         }
         std::tie(currRequests.contextRequests, currRequests.generationRequests)

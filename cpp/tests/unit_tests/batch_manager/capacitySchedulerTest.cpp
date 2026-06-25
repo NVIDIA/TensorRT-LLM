@@ -866,6 +866,7 @@ TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionDisabledPreservesCandidates
     EXPECT_EQ(result.admittedRequests.at(1)->mRequestId, req1->mRequestId);
     EXPECT_EQ(result.deferredRequestCount, 0u);
     EXPECT_FALSE(result.limitedByBudget);
+    EXPECT_FALSE(result.isBlockedByActiveTransfers());
 }
 
 TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionUsesFcfsEstimatedBlockBudget)
@@ -888,6 +889,25 @@ TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionUsesFcfsEstimatedBlockBudge
     EXPECT_EQ(result.admittedTransferBlocks, 1u);
     EXPECT_EQ(result.deferredRequestCount, 2u);
     EXPECT_TRUE(result.limitedByBudget);
+    EXPECT_FALSE(result.isBlockedByActiveTransfers());
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionReportsActiveTransferBudgetBlock)
+{
+    auto activeTransferReq = createRequest(20, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(/*maxTokensInBuffer=*/20, /*tokensPerBlock=*/10);
+    auto result = controller.select(RequestList{activeTransferReq}, RequestVector{pendingReq});
+
+    EXPECT_TRUE(result.admittedRequests.empty());
+    EXPECT_EQ(result.activeTransferBlocks, 2u);
+    EXPECT_EQ(result.admittedTransferBlocks, 0u);
+    EXPECT_EQ(result.deferredRequestCount, 1u);
+    EXPECT_TRUE(result.limitedByBudget);
+    EXPECT_TRUE(result.isBlockedByActiveTransfers());
 }
 
 TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionAdmitsOversizedHeadWhenIdle)
@@ -906,6 +926,7 @@ TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionAdmitsOversizedHeadWhenIdle
     EXPECT_EQ(result.admittedTransferBlocks, 3u);
     EXPECT_EQ(result.deferredRequestCount, 1u);
     EXPECT_TRUE(result.limitedByBudget);
+    EXPECT_FALSE(result.isBlockedByActiveTransfers());
 }
 
 TEST_F(CapacitySchedulerTest, RequestsSortedByPriorities)

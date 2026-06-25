@@ -41,6 +41,11 @@ public:
         std::size_t admittedTransferBlocks{};
         std::size_t deferredRequestCount{};
         bool limitedByBudget{};
+
+        [[nodiscard]] bool isBlockedByActiveTransfers() const
+        {
+            return limitedByBudget && admittedRequests.empty() && activeTransferBlocks > 0;
+        }
     };
 
     explicit DisaggTransferAdmissionController(std::optional<std::size_t> maxTokensInBuffer, SizeType32 tokensPerBlock,
