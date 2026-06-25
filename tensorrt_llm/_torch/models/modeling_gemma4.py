@@ -444,7 +444,11 @@ class Gemma4MoeRoutingMethod(BaseMoeRoutingMethod):
         self.callable_per_expert_scale = callable_per_expert_scale
         self.output_dtype = output_dtype
 
-    def apply(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def apply(
+        self,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # softmax over all experts
         router_probs = F.softmax(router_logits.to(self.output_dtype), dim=-1)
         # top-k selection
