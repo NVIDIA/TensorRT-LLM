@@ -40,8 +40,10 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          PybindMirror, RayPlacementConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
+                                          MultimodalEncoderCudaGraphConfig,
+                                          PeftCacheConfig, PybindMirror,
+                                          RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
@@ -226,6 +228,20 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
 
+def test_post_processor_hook_rejected_with_skip_tokenizer_init():
+    """post_processor_hook + skip_tokenizer_init must fail fast.
+
+    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
+    detokenized text) must be rejected rather than silently disabling it.
+    """
+    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     skip_tokenizer_init=True,
+                     post_processor_hook="my_pkg.guardrail.Hook")
+    # skip_tokenizer_init alone (no hook) is still fine.
+    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
+
+
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
@@ -380,6 +396,85 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
     with pytest.raises(ValidationError) as exc_info:
         KvCacheConfig(disk_cache_size=2048)
     assert "disk_cache_path" in str(exc_info.value)
+
+
+class TestMultimodalEncoderCudaGraphConfig:
+
+    def test_minimal_required_fields(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
+        assert config.buckets == [(1035, 1)]
+        assert config.enable_padding is True
+        assert config.warmup_steps == 2
+        assert config.enable_replay_stats is False
+
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)],
+                                                  enable_replay_stats=True)
+        assert config.enable_replay_stats is True
+
+    def test_explicit_buckets_deduped_and_sorted(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(2069,
+                                                            2), (1035,
+                                                                 1), (2069, 2)])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    def test_explicit_buckets_accept_yaml_style_lists(self):
+        config = MultimodalEncoderCudaGraphConfig(
+            buckets=[[2069, 2], [1035, 1]])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    @pytest.mark.parametrize("kwargs", [{
+        "buckets": []
+    }, {}],
+                             ids=["empty", "missing"])
+    def test_rejects_absent_buckets(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    @pytest.mark.parametrize("buckets", [[(0, 1)], [(1, -2)], [(3, 0)]])
+    def test_rejects_non_positive_buckets(self, buckets):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=buckets)
+
+    def test_rejects_buckets_with_too_few_tokens(self):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=[(1, 2)])
+
+
+class TestMultimodalConfig:
+
+    def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().encoder_cuda_graph is None
+
+    def test_torch_llm_args_default_multimodal_config(self):
+        args = TorchLlmArgs(model=llama_model_path)
+        assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.encoder_cuda_graph is None
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(
+                encoder_cuda_graph={
+                    "vision":
+                    MultimodalEncoderCudaGraphConfig(buckets=[(1035,
+                                                               1), (2069, 2)])
+                }))
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets_yaml(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config={
+                "encoder_cuda_graph": {
+                    "vision": {
+                        "buckets": [[2069, 2], [1035, 1]]
+                    }
+                }
+            },
+        )
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
 
 
 def test_CapacitySchedulerPolicy():

@@ -132,9 +132,30 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
 
     # reload() uses self.weight_mapper unconditionally; MX success must
     # initialize it even though the initial load skipped _call_load_weights.
+    model._weights_transformed = True
+    model.linear._weights_transformed = True
     loader.reload(model, {"reloaded": MagicMock()})
     assert loader._call_load_weights.call_count == 1
+    assert model._weights_transformed is False
+    assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
+
+
+def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    loader.weight_mapper = MagicMock(name="weight_mapper")
+    model = _TinyModel(events)
+    model._weights_transformed = True
+    model.linear._weights_transformed = True
+
+    loader.reload(model, {"reloaded": MagicMock()}, allow_partial_loading=True)
+
+    assert loader._call_load_weights.call_count == 1
+    assert loader._call_load_weights.call_args.kwargs["allow_partial_loading"] is True
+    assert model._weights_transformed is True
+    assert model.linear._weights_transformed is True
+    assert events == ["load_weights"]
 
 
 def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
@@ -194,17 +215,17 @@ class _HookRecorder(nn.Module):
         if transformed is not None:
             self._weights_transformed = transformed
 
-    def setup_aliases(self):
+    def setup_aliases(self) -> None:
         self.events.append((self.name, "setup_aliases"))
 
-    def transform_weights(self):
+    def transform_weights(self) -> None:
         self.events.append((self.name, "transform_weights"))
         self._weights_transformed = True
 
-    def cache_derived_state(self):
+    def cache_derived_state(self) -> None:
         self.events.append((self.name, "cache_derived_state"))
 
-    def post_load_weights(self):
+    def post_load_weights(self) -> None:
         self.events.append((self.name, "post_load_weights"))
 
 
@@ -216,13 +237,17 @@ class _HookModel(_HookRecorder):
         self.removed_child = _HookRecorder("removed_child", events, removed=True)
 
 
-def test_staged_hook_setup_aliases_is_top_level_only():
+def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
 
     ModelLoader._setup_aliases(model)
 
-    assert events == [("model", "setup_aliases")]
+    assert events == [
+        ("model", "setup_aliases"),
+        ("child", "setup_aliases"),
+        ("transformed_child", "setup_aliases"),
+    ]
 
 
 def test_staged_hook_walks_skip_removed_and_transformed_modules():
