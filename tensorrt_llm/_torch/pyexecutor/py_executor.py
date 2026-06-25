@@ -3995,7 +3995,9 @@ class PyExecutor:
                 new_requests.extend(
                     self.executor_request_queue.get_from_request_queue(timeout))
 
-        # Broadcast requests and handle Python objects
+        # Broadcast requests and handle Python objects. RequestBroadcaster probes
+        # the request count first and can skip the heavy payload broadcast on
+        # empty iterations.
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
             new_requests)
 
@@ -4101,7 +4103,8 @@ class PyExecutor:
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
-            if self.adp_router.needs_prefix_matches:
+            # Symmetric skip — after _pop_from_waiting_queue all ranks see identical new_requests.
+            if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
             all_ranks_new_requests, self.expected_num_active_requests = \
