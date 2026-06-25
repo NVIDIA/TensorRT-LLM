@@ -1475,6 +1475,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
                     return
                 }
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
 
                 testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -1585,6 +1589,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping x86_64 tests (PLC container scanning)"
                     return
                 }
 
