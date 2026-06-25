@@ -2799,7 +2799,7 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
 class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
     """NVFP4 Linear method backed by the Marlin W4A16 kernel (Hopper only)."""
 
-    def post_load_weights(self, module: Linear):
+    def transform_weights(self, module: Linear) -> None:
         from tensorrt_llm.quantization.utils import marlin_utils
 
         weight = module.weight.data
@@ -2881,7 +2881,7 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
         assert is_nvfp4_marlin_enabled()
         size_k = module.in_features
         size_n = module.out_features
-        # Set by post_load_weights; equal to size_k/size_n when 64-aligned.
+        # Set by transform_weights; equal to size_k/size_n when 64-aligned.
         size_k_pad = getattr(module, "_marlin_size_k", size_k)
         size_n_pad = getattr(module, "_marlin_size_n", size_n)
 
