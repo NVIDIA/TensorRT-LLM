@@ -130,6 +130,10 @@ class MegaMoEDeepGemm(MoE):
     # SymmBuffer; ConfigurableMoE must NOT layer host-side comm on top.
     scheduler_kind = MoESchedulerKind.FUSED_COMM
 
+    # MegaMoE partitions the global slot table, not just the raw expert count.
+    # Let backend-specific num_slots checks handle EPLB/non-divisible layouts.
+    _supports_non_divisible_ep: bool = True
+
     # ------------------------------------------------------------------
     # Capability gating
     # ------------------------------------------------------------------

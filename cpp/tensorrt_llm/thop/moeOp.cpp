@@ -39,6 +39,7 @@
 
 #include <ATen/native/cuda/Resize.h>
 
+#include <algorithm>
 #include <functional>
 #include <map>
 
@@ -334,6 +335,8 @@ public:
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+        replaceUnsupportedProfiles(mGemm1Profiles);
+        replaceUnsupportedProfiles(mGemm2Profiles);
         cuInit(0);
     }
 
@@ -991,6 +994,28 @@ private:
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mGemm1Profiles;
     std::vector<Profile> mGemm2Profiles;
+
+    void replaceUnsupportedProfiles(std::vector<Profile>& profiles) const
+    {
+        if (!mUseW4GroupScaling && !mUseFusedFinalize)
+        {
+            return;
+        }
+
+        auto const unsupported = [](Profile const& profile)
+        { return profile.epilogue_schedule == tensorrt_llm::cutlass_extensions::EpilogueScheduleType::NO_SMEM; };
+        auto const replacement = std::find_if(
+            profiles.begin(), profiles.end(), [&](Profile const& profile) { return !unsupported(profile); });
+        TORCH_CHECK(replacement != profiles.end(),
+            "No supported MoE GEMM tactic remains after replacing unsupported NO_SMEM epilogues.");
+        for (auto& profile : profiles)
+        {
+            if (unsupported(profile))
+            {
+                profile = *replacement;
+            }
+        }
+    }
 
     // ===== Routed-expert LoRA state =====
     // Pinned-host and persistent-device buffers for the capture-safe MoE LoRA

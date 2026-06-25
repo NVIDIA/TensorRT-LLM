@@ -6347,6 +6347,11 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         ``MegaMoEDeepGemm._alloc_symm_buffer``.
         """
         assert module._weights_loaded, "post_load_weights before load_weights"
+        if module.num_slots % module.ep_size != 0:
+            raise ValueError(
+                f"MegaMoEDeepGemm requires num_slots ({module.num_slots}) "
+                f"divisible by ep_size ({module.ep_size}). Adjust the EPLB "
+                f"replication factor or ep_size.")
         self._transform_main_weights(module)
         self._setup_shared_weights_for_eplb(module)
         self._attach_initial_weight_assignments(module)
