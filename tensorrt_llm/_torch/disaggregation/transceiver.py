@@ -98,6 +98,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
         self._chunk_size_blocks = cache_transceiver_config.chunk_size_blocks
+        self._enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
+        # Track per-request pipelined chunk state: maps rid -> chunk_block_offset
+        self._pipelined_chunk_offsets: Dict[int, int] = {}
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -299,6 +302,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     mamba_state_index=base_slice.mamba_state_index,
                     token_range=base_slice.token_range,
                     chunk_block_offset=block_offset,
+                    cuda_event=None, # TODO(athenac): revisit this for pipelined transfer implementation
                 )
             )
             # Use the max length across layer groups to advance the receiver
@@ -540,17 +544,138 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
         self._send_reqs[rid] = req
 
+    @property
+    def enable_pipelined_transfer(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return self._enable_pipelined_transfer and self._chunk_size_blocks is not None
+
+    def send_prefill_chunk(
+        self,
+        req: LlmRequest,
+        chunk_start_block: int,
+        chunk_end_block: int,
+        is_last_chunk: bool,
+    ) -> None:
+        """Send one prefill chunk's KV data during ongoing prefill.
+
+        Called after each prefill chunk completes (before the next
+        chunk's forward begins).  Creates the TxSession on the first
+        call for a request and adds slices incrementally.  A CUDA
+        event is recorded on the current stream to ensure GPU writes
+        are visible before RDMA.
+
+        Args:
+            req: The context-only request being prefilled.
+            chunk_start_block: First block index for this chunk
+                (across layer groups).
+            chunk_end_block: One-past-last block index for this chunk.
+            is_last_chunk: Whether this is the final prefill chunk.
+                When True, aux data is sent and context_phase_params
+                is populated.
+        """
+        rid = get_unique_rid(req)
+        assert rid is not None
+
+        cuda_event = torch.cuda.Event()
+        cuda_event.record()
+
+        if rid not in self._send_sessions:
+            self._send_sessions[rid] = self._get_or_create_send_session(req)
+            self._ever_had_send_session = True
+            self._pipelined_chunk_offsets[rid] = 0
+
+
+        session = self._send_sessions[rid]
+        chunk_block_offset = self._pipelined_chunk_offsets[rid]
+
+        base_slice = self._collect_base_slice(req)
+        chunk_block_ids = [
+            block_ids[chunk_start_block:chunk_end_block]
+            for block_ids in base_slice.block_ids_per_layer_groups
+        ]
+
+        kv_slice = KVSlice(
+            is_last_slice=is_last_chunk,
+            block_ids_per_layer_groups=chunk_block_ids,
+            chunk_block_offset=chunk_block_offset,
+            cuda_event=cuda_event,
+            token_range=base_slice.token_range, # TODO(athenac): is this correct? probably not. what is token range used for?
+            mamba_state_index=base_slice.mamba_state_index, # TODO(athenac): is this correct?
+            layer_range=base_slice.layer_range, # TODO(athenac): is this correct?
+        )
+
+        session.send(kv_slice)
+        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS # TODO(athenac): is this correct?
+
+        num_blocks_this_chunk = max((len(ids) for ids in chunk_block_ids), default=0)
+        self._pipelined_chunk_offsets[rid] = chunk_block_offset + num_blocks_this_chunk # TODO(athenac): this might be a faulty calculation
+
+        if is_last_chunk:
+            # Final chunk: send aux data and set context phase params
+            if self._need_aux_transfer(req):
+                session.pack_aux(req)
+                session.send_aux()
+            req.context_phase_params = ContextPhaseParams(
+                first_gen_tokens=[],
+                req_id=rid,
+                opaque_state=None,
+                draft_tokens=None,
+                ctx_dp_rank=self._dp_rank,
+                disagg_info_endpoint=self._context_info_endpoint,
+            )
+            self._send_reqs[rid] = req
+            self._pipelined_chunk_offsets.pop(rid, None)
+            self._finalize_send(req, session) # TODO(athenac): what is this for?
+
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
-    def respond_and_send_async(self, req: LlmRequest):
-        self._ever_had_send_session = True
-        session = self._get_or_create_send_session(req)
+    def respond_and_send_async(self, req: LlmRequest) -> None: # TODO(athenac): there is some redundancy here with send_prefill_chunk, we could refactor this
+        """Start background KV cache transfer to the generation server.
+
+        Creates (or reuses) a ``TxSession`` and sends each KV slice with
+        its chunk block offset.
+
+        When pipelined transfer is enabled and chunks were already sent
+        via ``send_prefill_chunk``, this method skips re-sending the
+        KV data (it was already sent incrementally during prefill).
+
+        Args:
+            req: The completed context request whose KV cache to transfer.
+        """
+        rid = get_unique_rid(req)
+        assert rid is not None
+
+        # If pipelined transfer already sent all chunks, skip re-sending.
+        if rid in self._send_sessions and rid not in self._pipelined_chunk_offsets: return
+
+        if rid not in self._send_sessions:
+            self._send_sessions[rid] = self._get_or_create_send_session(req)
+            self._ever_had_send_session = True
+
+        session = self._send_sessions[rid]
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        for kv_slice in self._create_kv_slices(req):
+
+        # TODO(athenac): this should use _pipelined_chunk_offsets to create the slices which are not redundant, make sure the chunk_block_offsets are set correctly
+        kv_slices = self._create_kv_slices(req)
+        for kv_slice in kv_slices:
             session.send(kv_slice)
-        self._finalize_send(req, session)
+
+        if self._need_aux_transfer(req):
+            session.pack_aux(req)
+            session.send_aux()
+        req.context_phase_params = ContextPhaseParams(
+            first_gen_tokens=[], # TODO(athenac): why is this empty? when is it set?
+            req_id=rid,
+            opaque_state=None,
+            draft_tokens=None,
+            ctx_dp_rank=self._dp_rank,
+            disagg_info_endpoint=self._context_info_endpoint,
+        )
+        self._send_reqs[rid] = req
+        self._pipelined_chunk_offsets.pop(rid, None)
+        self._finalize_send(req, session) # TODO(athenac): what is this for?
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
-    def request_and_receive_sync(self, req: LlmRequest):
+    def request_and_receive_sync(self, req: LlmRequest): # TODO(athenac): do I need to modify for pipelining too?
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(

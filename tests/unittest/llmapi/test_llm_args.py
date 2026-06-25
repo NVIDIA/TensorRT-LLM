@@ -1748,6 +1748,7 @@ class TestStrictBaseModelArbitraryArgs:
             CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
+    # TODO: add tests for enable_pipelined_transfer? this is also in test_chunked_transfer.py for some reason
     def test_cache_transceiver_config_chunk_size_blocks(self):
         """Test chunk_size_blocks field validation."""
         config = CacheTransceiverConfig(chunk_size_blocks=64)

@@ -1767,6 +1767,111 @@ def test_session_has_transferring_tasks_false():
         ctx_transfer_worker.shutdown()
         gen_transfer_worker.shutdown()
 
+def add_and_verify_pipelined_request(
+    setup,
+    ctx_request_id,
+    gen_request_id,
+    request_len,
+    chunk_size_blocks,
+):
+    """Pipelined transfer: sender sends chunks with CUDA events, receiver sends 1."""
+    import math
+
+    ctx_transfer_workers = setup["ctx_transfer_workers"]
+    gen_transfer_workers = setup["gen_transfer_workers"]
+
+    ctx_info = _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len)
+    ctx_block_ids = ctx_info["ctx_block_ids"]
+    gen_block_ids = ctx_info["gen_block_ids"]
+
+    sender_sessions = [tw.create_tx_session(ctx_info["ctx_request"]) for tw in ctx_transfer_workers]
+    send_futures = []
+    for sender_session, block_ids_per_groups in zip(sender_sessions, ctx_block_ids):
+        max_blocks = max(len(ids) for ids in block_ids_per_groups)
+        num_chunks = math.ceil(max_blocks / chunk_size_blocks)
+        chunk_offset = 0
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_size_blocks
+            end = start + chunk_size_blocks
+            is_last = chunk_idx == num_chunks - 1
+            chunk_block_ids = [ids[start:end] for ids in block_ids_per_groups]
+            kv_slice = KVSlice(
+                is_last_slice=is_last,
+                block_ids_per_layer_groups=chunk_block_ids,
+            )
+            cuda_event = torch.cuda.Event()
+            cuda_event.record()
+            send_futures.append(
+                sender_session.send(
+                    kv_slice, chunk_block_offset=chunk_offset, cuda_event=cuda_event
+                )
+            )
+            chunk_offset += max(len(ids) for ids in chunk_block_ids)
+
+    receiver_sessions = [
+        tw.create_rx_session(ctx_info["gen_request"]) for tw in gen_transfer_workers
+    ]
+    recv_futures = []
+    for recv_session, block_ids_per_groups in zip(receiver_sessions, gen_block_ids):
+        full_slice = KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=block_ids_per_groups,
+        )
+        recv_futures.append(recv_session.receive(full_slice))
+
+    for f in send_futures:
+        f.result()
+    for f in recv_futures:
+        f.result()
+
+    _verify_and_cleanup_chunked(setup, ctx_info, sender_sessions, receiver_sessions)
+
+
+PIPELINED_TEST_CONFIGS = [
+    (1, 1, False, 1, 1, False, False, True, "v2_tp1_pp1_pipelined"),
+    (1, 1, False, 1, 1, False, False, False, "v1_tp1_pp1_pipelined"),
+]
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp,is_mla,use_v2",
+    [(c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) for c in PIPELINED_TEST_CONFIGS],
+    ids=[c[8] for c in PIPELINED_TEST_CONFIGS],
+)
+def test_transfer_worker_pipelined(
+    ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
+):
+    """Test pipelined transfer: chunks sent with CUDA events for V1 and V2."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    tensorrt_llm.logger.set_level("info")
+    logger.info(f"Test transfer worker {'V2' if use_v2 else 'V1'} with pipelined transfer")
+
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=is_mla,
+        use_v2=use_v2,
+    )
+
+    request_len = setup["request_len"]
+    tokens_per_block = setup["tokens_per_block"]
+    total_blocks = (request_len + tokens_per_block - 1) // tokens_per_block
+    chunk_size = max(1, total_blocks // 2)
+
+    try:
+        add_and_verify_pipelined_request(setup, 0, 1, request_len, chunk_size_blocks=chunk_size)
+        add_and_verify_pipelined_request(setup, 2, 3, request_len * 2, chunk_size_blocks=chunk_size)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 if __name__ == "__main__":
     test_transfer_worker_v1(1, 1, False, 1, 1, False, False)

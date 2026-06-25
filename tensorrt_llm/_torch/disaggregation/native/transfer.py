@@ -208,6 +208,7 @@ class KVSendTask(SendTaskBase):
         kv_slice: The KV slice describing which blocks to transfer.
             The slice's ``chunk_block_offset`` field indicates the
             offset into the receiver's destination block list.
+            The slice's ``cuda_event`` is an optional CUDA event to synchronize before initiating the RDMA transfer.
         params: Disaggregated serving parameters for this request.
         slice_id: Index of this slice within the session's task list.
     """
@@ -484,6 +485,13 @@ class Sender(SenderBase):
         assert write_meta.slice_id is not None
         task = session.kv_tasks[write_meta.slice_id]
         timer = task._perf_timer
+
+        # For pipelined prefill-transfer: wait for the GPU forward
+        # to finish writing KV data before starting RDMA.  This
+        # blocks only this worker thread, not the GPU or main thread.
+        if task._slice.cuda_event is not None: # TODO: should I sync after the task status is set to TRANSFERRING?
+            task._slice.cuda_event.synchronize()
+
         if timer:
             timer.record_push_end(write_meta.peer_rank)
         # Hold session.lock to serialize the INIT→TRANSFERRING transition with

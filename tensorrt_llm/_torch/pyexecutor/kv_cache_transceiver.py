@@ -141,6 +141,11 @@ def create_kv_cache_transceiver(
 
 class KvCacheTransceiver(ABC):
 
+    @property
+    def enable_pipelined_transfer(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return False
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError

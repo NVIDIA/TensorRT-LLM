@@ -10,7 +10,7 @@ import numpy as np
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
-
+import torch
 @dataclass
 class TokenRange:
     """Range of tokens in the sequence dimension."""
@@ -66,6 +66,7 @@ class KVSlice:
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
     chunk_block_offset: int = 0
+    cuda_event: Optional[torch.cuda.Event] = None
 
 
 class SessionStatus(Enum):
@@ -167,6 +168,7 @@ class TxSessionBase(_SessionBase):
                 The slice's ``chunk_block_offset`` field indicates the offset
                 into the receiver's destination block list for sender-side
                 chunking.
+                The slice's ``cuda_event`` is an optional CUDA event to synchronize before initiating the RDMA transfer.
         """
         ...
 
