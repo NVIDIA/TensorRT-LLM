@@ -3935,6 +3935,8 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_requests'] = num_ctx_requests
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
+        # Count the already-cached prefix for the sequences scheduled this iteration.
+        self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
