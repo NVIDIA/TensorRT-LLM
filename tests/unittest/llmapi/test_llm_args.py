@@ -229,6 +229,20 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
 
+def test_post_processor_hook_rejected_with_skip_tokenizer_init():
+    """post_processor_hook + skip_tokenizer_init must fail fast.
+
+    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
+    detokenized text) must be rejected rather than silently disabling it.
+    """
+    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     skip_tokenizer_init=True,
+                     post_processor_hook="my_pkg.guardrail.Hook")
+    # skip_tokenizer_init alone (no hook) is still fine.
+    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
+
+
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
