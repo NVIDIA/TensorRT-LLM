@@ -31,8 +31,19 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
+# Trailing temporal frames cached across chunks so the causal Conv3d (temporal
+# kernel size 3, i.e. 2 frames of left context) stays continuous when encode /
+# decode run frame-by-frame.
 CACHE_T = 2
-LAYOUT_MODES = ("channels_last", "contiguous")
+
+# Default latent normalization statistics, copied verbatim from the diffusers
+# AutoencoderKLWan constructor defaults (the 16-channel Wan2.1 values). They are
+# used only as a fallback when a checkpoint's vae/config.json omits
+# latents_mean / latents_std; checkpoints that ship their own values (e.g.
+# Wan2.2-TI2V-5B, which has 48 latent channels) override these via
+# WanVAEConfig.__post_init__. Keeping them byte-identical to diffusers ensures
+# latent normalization matches the reference for checkpoints that rely on the
+# defaults.
 WAN_VAE_LATENTS_MEAN = [
     -0.7571,
     -0.7089,
@@ -71,20 +82,6 @@ WAN_VAE_LATENTS_STD = [
 ]
 
 
-def _validate_layout_mode(layout_mode: str) -> str:
-    if layout_mode not in LAYOUT_MODES:
-        raise ValueError(
-            f"Unsupported Wan VAE layout_mode={layout_mode!r}; expected one of {LAYOUT_MODES}"
-        )
-    return layout_mode
-
-
-def _contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
-    if x.is_contiguous():
-        return x
-    return x.contiguous()
-
-
 def _channels_last_3d_if_needed(x: torch.Tensor) -> torch.Tensor:
     if x.is_contiguous(memory_format=torch.channels_last_3d):
         return x
@@ -103,36 +100,11 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
     return x.to(device)
 
 
-def _format_5d_activation(x: torch.Tensor, layout_mode: str) -> torch.Tensor:
-    if layout_mode == "channels_last":
-        return _channels_last_3d_if_needed(x)
-    return _contiguous_if_needed(x)
-
-
-def _format_4d_activation(x: torch.Tensor, layout_mode: str) -> torch.Tensor:
-    if layout_mode == "channels_last":
-        return _channels_last_2d_if_needed(x)
-    return _contiguous_if_needed(x)
-
-
-def _format_conv_weight(module: nn.Module, layout_mode: str) -> None:
+def _to_channels_last(module: nn.Module) -> None:
     if isinstance(module, nn.Conv3d):
-        memory_format = (
-            torch.channels_last_3d if layout_mode == "channels_last" else torch.contiguous_format
-        )
-        module.to(memory_format=memory_format)
+        module.to(memory_format=torch.channels_last_3d)
     elif isinstance(module, nn.Conv2d):
-        memory_format = (
-            torch.channels_last if layout_mode == "channels_last" else torch.contiguous_format
-        )
-        module.to(memory_format=memory_format)
-
-
-class LayoutAwareModule:
-    layout_mode: str
-
-    def set_layout_mode(self, layout_mode: str) -> None:
-        self.layout_mode = _validate_layout_mode(layout_mode)
+        module.to(memory_format=torch.channels_last)
 
 
 def _activation(name: str):
@@ -184,9 +156,6 @@ class WanVAEConfig:
     def from_json_file(cls, path: str | Path) -> "WanVAEConfig":
         with open(path, encoding="utf-8") as config_file:
             return cls.from_dict(json.load(config_file))
-
-    def get(self, name: str, default: Any = None) -> Any:
-        return getattr(self, name, default)
 
     @property
     def public_video_channels(self) -> int:
@@ -285,7 +254,7 @@ class DupUp3D(nn.Module):
         return x
 
 
-class WanCausalConv3d(nn.Conv3d, LayoutAwareModule):
+class WanCausalConv3d(nn.Conv3d):
     def __init__(
         self,
         in_channels: int,
@@ -301,7 +270,6 @@ class WanCausalConv3d(nn.Conv3d, LayoutAwareModule):
             stride=stride,
             padding=padding,
         )
-        self.layout_mode = "contiguous"
         self._padding = (
             0,
             0,
@@ -313,41 +281,25 @@ class WanCausalConv3d(nn.Conv3d, LayoutAwareModule):
         self.padding = (0, self.padding[1], self.padding[2])
 
     def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
-        if self.layout_mode == "channels_last":
-            x = _channels_last_3d_if_needed(x)
+        x = _channels_last_3d_if_needed(x)
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = _to_device_if_needed(cache_x, x.device)
-            if self.layout_mode == "channels_last":
-                cache_x = _channels_last_3d_if_needed(cache_x)
+            cache_x = _channels_last_3d_if_needed(cache_x)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
         if any(padding):
             x = F.pad(x, padding)
-        if self.layout_mode == "channels_last":
-            x = _channels_last_3d_if_needed(x)
-        else:
-            x = _contiguous_if_needed(x)
+        x = _channels_last_3d_if_needed(x)
         x = super().forward(x)
-        if self.layout_mode == "channels_last":
-            return _channels_last_3d_if_needed(x)
-        return x
+        return _channels_last_3d_if_needed(x)
 
 
-class WanConv2d(nn.Conv2d, LayoutAwareModule):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.layout_mode = "contiguous"
-
+class WanConv2d(nn.Conv2d):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.layout_mode == "channels_last":
-            x = _channels_last_2d_if_needed(x)
-        else:
-            x = _contiguous_if_needed(x)
+        x = _channels_last_2d_if_needed(x)
         x = super().forward(x)
-        if self.layout_mode == "channels_last":
-            return _channels_last_2d_if_needed(x)
-        return x
+        return _channels_last_2d_if_needed(x)
 
 
 class WanRMSNorm(nn.Module):
@@ -369,7 +321,13 @@ class WanRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm_dim = 1 if self.channel_first else -1
-        return F.normalize(x, dim=norm_dim) * self.scale * self.gamma + self.bias
+        # Normalize in fp32 for low-precision dtypes, then cast back, to avoid
+        # eps underflow producing NaNs (matches diffusers AutoencoderKLWan >=0.38.0).
+        needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
+            t in str(x.dtype) for t in ("float4_", "float8_")
+        )
+        normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=norm_dim).to(x.dtype)
+        return normalized * self.scale * self.gamma + self.bias
 
 
 class WanUpsample(nn.Upsample):
@@ -377,10 +335,9 @@ class WanUpsample(nn.Upsample):
         return super().forward(x.float()).type_as(x)
 
 
-class WanResample(nn.Module, LayoutAwareModule):
+class WanResample(nn.Module):
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
         super().__init__()
-        self.layout_mode = "contiguous"
         self.dim = dim
         self.mode = mode
         if upsample_out_dim is None:
@@ -455,10 +412,10 @@ class WanResample(nn.Module, LayoutAwareModule):
 
         frames = x.shape[2]
         x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
-        x = _format_4d_activation(x_4d, self.layout_mode)
+        x = _channels_last_2d_if_needed(x_4d)
         x = self.resample(x)
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
-        x = _format_5d_activation(x_5d, self.layout_mode)
+        x = _channels_last_3d_if_needed(x_5d)
 
         if self.mode == "downsample3d" and feat_cache is not None and feat_idx is not None:
             idx = feat_idx[0]
@@ -473,12 +430,11 @@ class WanResample(nn.Module, LayoutAwareModule):
         return x
 
 
-class WanResidualBlock(nn.Module, LayoutAwareModule):
+class WanResidualBlock(nn.Module):
     def __init__(
         self, in_dim: int, out_dim: int, dropout: float = 0.0, non_linearity: str = "silu"
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.nonlinearity = _activation(non_linearity)
@@ -543,13 +499,12 @@ class WanResidualBlock(nn.Module, LayoutAwareModule):
         else:
             x = self.conv2(x)
 
-        return _format_5d_activation(x + residual, self.layout_mode)
+        return _channels_last_3d_if_needed(x + residual)
 
 
-class WanAttentionBlock(nn.Module, LayoutAwareModule):
+class WanAttentionBlock(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.layout_mode = "contiguous"
         self.dim = dim
         self.norm = WanRMSNorm(dim)
         self.to_qkv = WanConv2d(dim, dim * 3, 1)
@@ -559,7 +514,7 @@ class WanAttentionBlock(nn.Module, LayoutAwareModule):
         residual = x
         batch_size, channels, frames, height, width = x.size()
         x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
-        x = _format_4d_activation(x, self.layout_mode)
+        x = _channels_last_2d_if_needed(x)
         x = self.norm(x)
 
         qkv = self.to_qkv(x)
@@ -570,15 +525,14 @@ class WanAttentionBlock(nn.Module, LayoutAwareModule):
         x = x.squeeze(1).permute(0, 2, 1).reshape(batch_size * frames, channels, height, width)
         x = self.proj(x)
         x = x.reshape(batch_size, frames, channels, height, width).permute(0, 2, 1, 3, 4)
-        return _format_5d_activation(x + residual, self.layout_mode)
+        return _channels_last_3d_if_needed(x + residual)
 
 
-class WanMidBlock(nn.Module, LayoutAwareModule):
+class WanMidBlock(nn.Module):
     def __init__(
         self, dim: int, dropout: float = 0.0, non_linearity: str = "silu", num_layers: int = 1
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         resnets = [WanResidualBlock(dim, dim, dropout, non_linearity)]
         attentions = []
         for _ in range(num_layers):
@@ -598,10 +552,10 @@ class WanMidBlock(nn.Module, LayoutAwareModule):
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             x = attn(x)
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        return _format_5d_activation(x, self.layout_mode)
+        return _channels_last_3d_if_needed(x)
 
 
-class WanResidualDownBlock(nn.Module, LayoutAwareModule):
+class WanResidualDownBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -612,7 +566,6 @@ class WanResidualDownBlock(nn.Module, LayoutAwareModule):
         down_flag: bool = False,
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         self.avg_shortcut = AvgDown3D(
             in_dim,
             out_dim,
@@ -640,10 +593,10 @@ class WanResidualDownBlock(nn.Module, LayoutAwareModule):
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
         if self.downsampler is not None:
             x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        return _format_5d_activation(x + self.avg_shortcut(residual), self.layout_mode)
+        return _channels_last_3d_if_needed(x + self.avg_shortcut(residual))
 
 
-class WanEncoder3d(nn.Module, LayoutAwareModule):
+class WanEncoder3d(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
@@ -658,7 +611,6 @@ class WanEncoder3d(nn.Module, LayoutAwareModule):
         is_residual: bool = False,
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         attn_scales = [] if attn_scales is None else attn_scales
         temperal_downsample = (
@@ -754,10 +706,10 @@ class WanEncoder3d(nn.Module, LayoutAwareModule):
             feat_idx[0] += 1
         else:
             x = self.conv_out(x)
-        return _format_5d_activation(x, self.layout_mode)
+        return _channels_last_3d_if_needed(x)
 
 
-class WanResidualUpBlock(nn.Module, LayoutAwareModule):
+class WanResidualUpBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -769,7 +721,6 @@ class WanResidualUpBlock(nn.Module, LayoutAwareModule):
         non_linearity: str = "silu",
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         self.avg_shortcut = None
         if up_flag:
             self.avg_shortcut = DupUp3D(
@@ -803,10 +754,10 @@ class WanResidualUpBlock(nn.Module, LayoutAwareModule):
             x = self.upsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
         if self.avg_shortcut is not None:
             x = x + self.avg_shortcut(residual, first_chunk=first_chunk)
-        return _format_5d_activation(x, self.layout_mode)
+        return _channels_last_3d_if_needed(x)
 
 
-class WanUpBlock(nn.Module, LayoutAwareModule):
+class WanUpBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -817,7 +768,6 @@ class WanUpBlock(nn.Module, LayoutAwareModule):
         non_linearity: str = "silu",
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         current_dim = in_dim
         resnets = []
         for _ in range(num_res_blocks + 1):
@@ -841,10 +791,10 @@ class WanUpBlock(nn.Module, LayoutAwareModule):
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
         if self.upsamplers is not None:
             x = self.upsamplers[0](x, feat_cache=feat_cache, feat_idx=feat_idx)
-        return _format_5d_activation(x, self.layout_mode)
+        return _channels_last_3d_if_needed(x)
 
 
-class WanDecoder3d(nn.Module, LayoutAwareModule):
+class WanDecoder3d(nn.Module):
     def __init__(
         self,
         dim: int = 128,
@@ -859,7 +809,6 @@ class WanDecoder3d(nn.Module, LayoutAwareModule):
         is_residual: bool = False,
     ):
         super().__init__()
-        self.layout_mode = "contiguous"
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         attn_scales = [] if attn_scales is None else attn_scales
         del attn_scales
@@ -957,7 +906,7 @@ class WanDecoder3d(nn.Module, LayoutAwareModule):
             feat_idx[0] += 1
         else:
             x = self.conv_out(x)
-        return _format_5d_activation(x, self.layout_mode)
+        return _channels_last_3d_if_needed(x)
 
 
 def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -1007,7 +956,6 @@ class WanVAE(nn.Module):
     def __init__(
         self,
         config: WanVAEConfig | dict[str, Any] | None = None,
-        layout_mode: str = "contiguous",
     ) -> None:
         super().__init__()
         if config is None:
@@ -1047,8 +995,11 @@ class WanVAE(nn.Module):
         self.spatial_compression_ratio = config.scale_factor_spatial
         self.use_slicing = False
         self.use_tiling = False
-        self.layout_mode = _validate_layout_mode(layout_mode)
-        self.set_layout_mode(self.layout_mode)
+        # Wan VAE always runs in channels-last: convert every conv weight's
+        # memory format up front so weights and activations share one layout.
+        for module in self.modules():
+            if module is not self:
+                _to_channels_last(module)
         self._cached_conv_counts = {
             "decoder": sum(
                 isinstance(module, WanCausalConv3d) for module in self.decoder.modules()
@@ -1059,22 +1010,9 @@ class WanVAE(nn.Module):
         }
         self.clear_cache()
 
-    @classmethod
-    def from_config_file(cls, path: str | Path, layout_mode: str = "contiguous") -> "WanVAE":
-        return cls(WanVAEConfig.from_json_file(path), layout_mode=layout_mode)
-
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
-
-    def set_layout_mode(self, layout_mode: str) -> None:
-        self.layout_mode = _validate_layout_mode(layout_mode)
-        for module in self.modules():
-            if module is self:
-                continue
-            if isinstance(module, LayoutAwareModule):
-                module.set_layout_mode(self.layout_mode)
-            _format_conv_weight(module, self.layout_mode)
 
     def load_diffusers_state_dict(
         self,
@@ -1103,7 +1041,7 @@ class WanVAE(nn.Module):
         self.clear_cache()
         if self.config.patch_size is not None:
             x = patchify(x, patch_size=self.config.patch_size)
-        x = _format_5d_activation(x, self.layout_mode)
+        x = _channels_last_3d_if_needed(x)
 
         num_chunks = 1 + (num_frame - 1) // 4
         out_chunks: list[torch.Tensor] = []
@@ -1127,7 +1065,7 @@ class WanVAE(nn.Module):
             out = torch.cat(out_chunks, dim=2)
 
         enc = self.quant_conv(out)
-        enc = _format_5d_activation(enc, self.layout_mode)
+        enc = _channels_last_3d_if_needed(enc)
         self.clear_cache()
         return enc
 
@@ -1155,7 +1093,7 @@ class WanVAE(nn.Module):
             raise NotImplementedError("WanVAE tiled decode is not implemented")
 
         self.clear_cache()
-        z = _format_5d_activation(z, self.layout_mode)
+        z = _channels_last_3d_if_needed(z)
         x = self.post_quant_conv(z)
         out_chunks: list[torch.Tensor] = []
         for i in range(num_frame):
@@ -1175,7 +1113,7 @@ class WanVAE(nn.Module):
 
         if self.config.patch_size is not None:
             out = unpatchify(out, patch_size=self.config.patch_size)
-        out = _format_5d_activation(out, self.layout_mode)
+        out = _channels_last_3d_if_needed(out)
         out = torch.clamp(out, min=-1.0, max=1.0)
 
         self.clear_cache()

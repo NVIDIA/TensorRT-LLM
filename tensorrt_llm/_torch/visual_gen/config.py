@@ -165,7 +165,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     """
 
     model_configs: Dict[str, DiffusionModelConfig] = PydanticField(default_factory=dict)
-    pipeline_config: Dict[str, Any] = PydanticField(default_factory=dict)
     mapping: Mapping = PydanticField(default_factory=Mapping)
     skip_create_weights_in_init: bool = False
     force_dynamic_quantization: bool = False
@@ -614,7 +613,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         )
 
         pipeline_config = cls(
-            pipeline_config=dict(resolved_pipeline_config),
             quant_config=quant_config,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
