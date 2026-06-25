@@ -569,6 +569,61 @@ bool getEnvPrintSkipSoftmaxStat()
     return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
 }
 
+bool getEnvKvTransferP2pDisable()
+{
+    static bool const disabled = getBoolEnv("TRTLLM_KV_TRANSFER_P2P_DISABLE");
+    return disabled;
+}
+
+namespace
+{
+template <typename T, typename Getter>
+T getEnvWithDefault(char const* name, Getter getter, T defaultValue)
+{
+    try
+    {
+        return static_cast<T>(getter(name).value_or(defaultValue));
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("Invalid value for %s (%s); falling back to default.", name, e.what());
+        return defaultValue;
+    }
+}
+} // namespace
+
+size_t getEnvKvTransferP2pBatchThresholdKB()
+{
+    static size_t const threshold
+        = getEnvWithDefault<size_t>("TRTLLM_KV_TRANSFER_P2P_BATCH_THRESHOLD_KB", getUInt64Env, 16);
+    return threshold;
+}
+
+int getEnvKvTransferP2pBatchCopyThreads()
+{
+    static int const threads = getEnvWithDefault<int>("TRTLLM_KV_TRANSFER_P2P_BATCH_COPY_THREADS", getIntEnv, 2);
+    return threads;
+}
+
+size_t getEnvKvTransferP2pBatchCopyMinOps()
+{
+    static size_t const minOps
+        = getEnvWithDefault<size_t>("TRTLLM_KV_TRANSFER_P2P_BATCH_COPY_MIN_OPS", getUInt64Env, 4096);
+    return minOps;
+}
+
+bool getEnvKvTransferP2pCubZeroCopy()
+{
+    static bool const zeroCopy = getEnvWithDefault<int>("TRTLLM_KV_TRANSFER_P2P_CUB_ZERO_COPY", getIntEnv, 0) != 0;
+    return zeroCopy;
+}
+
+bool getEnvKvTransferP2pMixedDisable()
+{
+    static bool const disabled = getBoolEnv("TRTLLM_KV_TRANSFER_P2P_MIXED_DISABLE");
+    return disabled;
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

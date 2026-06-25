@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -245,7 +245,9 @@ struct VramRegionMeta
 
 // `AgentDesc` represents the unique identifier for reading and writing to the agent.
 // By accessing this identifier, the backend can establish the correct connection.
-// It also carries VMM region metadata so that remote agents can split at chunk boundaries.
+// It also carries VMM region metadata so that remote agents can split at chunk boundaries,
+// and an opaque P2P blob (e.g. fabric / POSIX-FD / CUDA-IPC handle export) used by the P2P
+// fast path to import remote memory directly. The blob is empty when P2P is disabled.
 class AgentDesc final
 {
 public:
@@ -260,6 +262,13 @@ public:
     {
     }
 
+    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions, std::string p2pBlob)
+        : mBackendAgentDesc{std::move(backendAgentDesc)}
+        , mVramRegions{std::move(vramRegions)}
+        , mP2pBlob{std::move(p2pBlob)}
+    {
+    }
+
     [[nodiscard]] std::string const& getBackendAgentDesc() const noexcept
     {
         return mBackendAgentDesc;
@@ -270,7 +279,13 @@ public:
         return mVramRegions;
     }
 
-    /// Serialize the entire AgentDesc (backend blob + VMM regions) into an opaque string.
+    /// Opaque P2P blob (empty when not set). Typically a serialized P2pMemInfo.
+    [[nodiscard]] std::string const& getP2pBlob() const noexcept
+    {
+        return mP2pBlob;
+    }
+
+    /// Serialize the entire AgentDesc (backend blob + VMM regions + P2P blob) into an opaque string.
     [[nodiscard]] std::string serialize() const;
 
     /// Deserialize an opaque string back into an AgentDesc.
@@ -279,6 +294,7 @@ public:
 private:
     std::string mBackendAgentDesc;
     std::vector<VramRegionMeta> mVramRegions;
+    std::string mP2pBlob;
 };
 
 // `TransferOp` is an enumeration that represents the types of transfer operations.

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,10 @@
 #include "tensorrt_llm/executor/serialization.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#ifdef TEST_NIXL_BACKEND
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/p2pTransferAgent.h"
+#endif
 
 #include <filesystem>
 #include <vector>
@@ -473,6 +477,100 @@ TEST(AgentDescTest, DeserializeTruncatedData)
     std::string truncated = serialized.substr(0, serialized.size() / 2);
     EXPECT_THROW(AgentDesc::deserialize(truncated), std::exception);
 }
+
+#ifdef TEST_NIXL_BACKEND
+// ── AgentDesc p2pBlob round-trip (requires NIXL backend for P2pMemInfo symbols) ──
+//
+// These tests exercise the AgentDesc↔AgentDesc->P2pMemInfo chain used in production:
+//   sender:   P2pMemInfo::serialize  -> AgentDesc(.., .., blob).serialize
+//   receiver: AgentDesc::deserialize -> AgentDesc::getP2pBlob -> P2pMemInfo::deserialize
+// Without these, regressions in either serializer can silently drop p2pBlob on the wire
+// and the peer falls through to NIXL with no signal.
+
+TEST(AgentDescTest, SerializeDeserializeEmptyP2pBlob)
+{
+    std::string nixlBlob = "nixl_md";
+    std::vector<VramRegionMeta> regions{{0x1000UL, 4096, 4096}};
+    AgentDesc original{nixlBlob, regions, /*p2pBlob=*/""};
+    auto serialized = original.serialize();
+
+    auto decoded = AgentDesc::deserialize(serialized);
+    EXPECT_EQ(decoded.getBackendAgentDesc(), nixlBlob);
+    ASSERT_EQ(decoded.getVramRegions().size(), 1);
+    EXPECT_TRUE(decoded.getP2pBlob().empty());
+}
+
+TEST(AgentDescTest, SerializeDeserializePosixFdP2pBlob)
+{
+    P2pMemInfo info;
+    info.supported = true;
+    info.handleType = VmmHandleType::kPosixFd;
+    info.udsPath = "/tmp/trtllm_p2p_test_uds_socket";
+    P2pMemPool pool;
+    pool.deviceId = 0;
+    pool.poolBaseAddr = 0x7f0000000000UL;
+    pool.poolTotalSize = 64 * 1024 * 1024;
+    pool.registeredAddr = pool.poolBaseAddr;
+    pool.registeredSize = pool.poolTotalSize;
+    pool.mappedOffset = 0;
+    pool.mappedSize = pool.poolTotalSize;
+    P2pMemChunk chunk;
+    chunk.virtAddrOffset = 0;
+    chunk.size = 2 * 1024 * 1024;
+    std::memset(chunk.fabricHandle, 0, sizeof(chunk.fabricHandle));
+    pool.chunks.push_back(chunk);
+    info.pools.push_back(pool);
+
+    std::string p2pBlob = info.serialize();
+    ASSERT_FALSE(p2pBlob.empty());
+
+    std::string nixlBlob = "nixl_md_with_p2p";
+    std::vector<VramRegionMeta> regions{{pool.poolBaseAddr, pool.poolTotalSize, chunk.size}};
+    AgentDesc original{nixlBlob, regions, p2pBlob};
+
+    auto serialized = original.serialize();
+    auto decoded = AgentDesc::deserialize(serialized);
+
+    EXPECT_EQ(decoded.getBackendAgentDesc(), nixlBlob);
+    ASSERT_EQ(decoded.getVramRegions().size(), 1);
+    ASSERT_FALSE(decoded.getP2pBlob().empty());
+    EXPECT_EQ(decoded.getP2pBlob(), p2pBlob) << "p2pBlob bytes must survive AgentDesc round-trip intact";
+
+    // Down-stream: P2pMemInfo must also parse from the round-tripped blob.
+    auto redecoded = P2pMemInfo::deserialize(decoded.getP2pBlob());
+    ASSERT_TRUE(redecoded.has_value());
+    EXPECT_TRUE(redecoded->supported);
+    EXPECT_EQ(redecoded->handleType, VmmHandleType::kPosixFd);
+    EXPECT_EQ(redecoded->udsPath, info.udsPath);
+    ASSERT_EQ(redecoded->pools.size(), 1);
+    EXPECT_EQ(redecoded->pools[0].poolBaseAddr, pool.poolBaseAddr);
+    EXPECT_EQ(redecoded->pools[0].poolTotalSize, pool.poolTotalSize);
+    ASSERT_EQ(redecoded->pools[0].chunks.size(), 1);
+    EXPECT_EQ(redecoded->pools[0].chunks[0].size, chunk.size);
+}
+
+TEST(AgentDescTest, SerializeDeserializeP2pBlobWithBinaryNullBytes)
+{
+    // The p2pBlob contains arbitrary binary data (including zero bytes from the
+    // serialized fabricHandle array). Make sure the AgentDesc serializer doesn't
+    // truncate at the first null — a regression here would silently shorten the
+    // blob on the wire.
+    std::string p2pBlob(128, '\0');
+    for (size_t i = 0; i < p2pBlob.size(); ++i)
+    {
+        p2pBlob[i] = static_cast<char>((i * 7) & 0xFF);
+    }
+    p2pBlob[10] = '\0';
+    p2pBlob[64] = '\0';
+    p2pBlob[127] = '\0';
+
+    AgentDesc original{"nixl", /*vramRegions=*/{}, p2pBlob};
+    auto serialized = original.serialize();
+    auto decoded = AgentDesc::deserialize(serialized);
+    EXPECT_EQ(decoded.getP2pBlob().size(), p2pBlob.size());
+    EXPECT_EQ(decoded.getP2pBlob(), p2pBlob);
+}
+#endif // TEST_NIXL_BACKEND
 
 // ── VmmDescSplitter tests (backend-agnostic, no NIXL dependency) ──
 

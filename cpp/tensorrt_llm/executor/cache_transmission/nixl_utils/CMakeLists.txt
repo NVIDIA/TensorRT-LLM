@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -28,7 +28,8 @@ if(NIXL_ROOT)
   set(NIXL_WRAPPER_TARGET "tensorrt_llm_nixl_wrapper")
 
   # Add the NIXL wrapper target
-  add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
+  add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp
+                                            p2pTransferAgent.cu)
   target_compile_options(${NIXL_WRAPPER_TARGET} PRIVATE -Wno-error)
 
   # Add include directories

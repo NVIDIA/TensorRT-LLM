@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -49,6 +49,37 @@ endif()
 if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
   add_gtest(agentCommTest agentCommTest.cpp)
   add_gtest(transferAgentTest transferAgentTest.cpp)
+  if(NIXL_ROOT)
+    # The P2P-specific tests rely on the NIXL wrapper, so they are gated on
+    # NIXL_ROOT and live inside this branch alongside their link configuration.
+    add_gtest(p2pMemInfoTest p2pMemInfoTest.cu)
+    add_gtest(p2pTransferAgentTest p2pTransferAgentTest.cu)
+    target_link_libraries(p2pMemInfoTest PRIVATE tensorrt_llm_nixl_wrapper)
+    target_link_libraries(p2pTransferAgentTest PRIVATE tensorrt_llm_nixl_wrapper
+                                                       CUDA::cudart)
+    # End-to-end test: drives two NixlTransferAgents through all three P2P path
+    # branches. Requires a P2P-capable GPU (POSIX-FD or FABRIC VMM handles) and
+    # same-host UDS — not suitable for the default l0 stage. Link against the
+    # NIXL wrapper so the test can call NixlTransferAgent::getPathCounters()
+    # directly.
+    #
+    # The two EnvGated_* tests inside this binary are stateless about env: they
+    # skip unless TRTLLM_KV_TRANSFER_P2P_DISABLE /
+    # TRTLLM_KV_TRANSFER_P2P_MIXED_DISABLE was set at process launch (envUtils
+    # caches the value in a `static bool const`, so it can't be flipped inside
+    # the test). To exercise them, run the binary from CI / from a shell wrapper
+    # with the env set, e.g.: TRTLLM_KV_TRANSFER_P2P_DISABLE=1 ./nixlP2pE2ETest
+    # \ --gtest_filter=NixlP2pE2ETest.EnvGated_P2pDisabled
+    # TRTLLM_KV_TRANSFER_P2P_MIXED_DISABLE=1 ./nixlP2pE2ETest \
+    # --gtest_filter=NixlP2pE2ETest.EnvGated_MixedDisabledFallsBackFullNixl
+    add_gtest(nixlP2pE2ETest nixlP2pE2ETest.cu)
+    # nixl.h is transitively included via nixl_utils/transferAgent.h, so the
+    # test needs NIXL::nixl's headers in addition to the wrapper library itself.
+    target_link_libraries(
+      nixlP2pE2ETest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl CUDA::cudart
+                             CUDA::cuda_driver)
+    target_compile_definitions(nixlP2pE2ETest PRIVATE TEST_NIXL_BACKEND=1)
+  endif()
 
   if(NIXL_ROOT)
     target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)

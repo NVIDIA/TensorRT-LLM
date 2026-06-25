@@ -160,6 +160,36 @@ bool getEnvEplbForceGdrcopy();
 
 bool getEnvPrintSkipSoftmaxStat();
 
+// ============================================================================
+// P2P transfer optimization for disaggregated KV cache
+// ============================================================================
+
+/// Whether to disable the KV-transfer P2P fast path (fabric / POSIX FD / CUDA IPC).
+bool getEnvKvTransferP2pDisable();
+
+/// Threshold in KB for choosing cub::DeviceMemcpy::Batched vs cudaMemcpyBatchAsync.
+/// Segments smaller than this use cub, larger use cudaMemcpyBatchAsync. Default 16KB.
+size_t getEnvKvTransferP2pBatchThresholdKB();
+
+/// Number of threads used to submit cudaMemcpyBatchAsync in parallel.
+/// Each thread gets its own stream. Default 2. Set to 1 to disable multi-thread submission.
+int getEnvKvTransferP2pBatchCopyThreads();
+
+/// Minimum number of segments before the multi-thread cudaMemcpyBatchAsync path kicks in.
+/// Below this, the caller thread issues a single cudaMemcpyBatchAsync itself — the cost of
+/// dispatching to a worker pool isn't worth it for small batches. Default 4096.
+size_t getEnvKvTransferP2pBatchCopyMinOps();
+
+/// Whether cub reads pointer arrays directly from pinned host memory (zero-copy).
+/// 0 = H2D copy then read from HBM (default), 1 = read pinned host over PCIe directly.
+bool getEnvKvTransferP2pCubZeroCopy();
+
+/// Safety valve that disables per-segment mixed P2P/NIXL routing. When set, any request
+/// with at least one unmapped segment falls back entirely to NIXL (pre-mixed behavior).
+/// Use when the mixed path causes regressions; P2P-only and NIXL-only paths are unaffected.
+/// Default: 0 (mixed enabled).
+bool getEnvKvTransferP2pMixedDisable();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

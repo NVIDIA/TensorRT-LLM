@@ -58,13 +58,20 @@ class NativePhysMemAllocator:
         prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self._device_id
         prop.allocFlags.gpuDirectRDMACapable = 1
+        # Prefer FABRIC (cross-node via NVSwitch) → POSIX FD (same-machine, shareable) → NONE.
+        # The P2P fast path imports whichever handle type we end up with. POSIX FD lets two
+        # ranks on the same host share VMM allocations even when fabric isn't available.
         prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         if not _is_prop_supported(prop):
-            prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+            prop.requestedHandleTypes = (
+                drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
             if not _is_prop_supported(prop):
-                prop.allocFlags.gpuDirectRDMACapable = 0
+                prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
                 if not _is_prop_supported(prop):
-                    raise ValueError("Failed to create physical memory allocation property")
+                    prop.allocFlags.gpuDirectRDMACapable = 0
+                    if not _is_prop_supported(prop):
+                        raise ValueError("Failed to create physical memory allocation property")
         self._prop = prop
         self._outstanding_handles = set()
 
