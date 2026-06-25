@@ -73,6 +73,7 @@ from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashi
     NVLinkTwoSidedFlashinfer,
 )
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
+from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -113,11 +114,6 @@ FIXED_NUM_EXPERTS = 32
 # Force consistent NVLinkOneSided workspace size across varying top_k
 # to avoid _WORKSPACE singleton assertion failures.
 NVLINK_WORKSPACE_MB = "512"
-
-# Must match kRankMaskWords in
-# cpp/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h.
-EP_MASK_NUM_WORDS = 2
-
 
 # ============================================================================
 # Test Configuration
@@ -197,11 +193,11 @@ def _safe_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 
 def _ep_mask_words(ep_size: int, dead_ranks: Set[int]) -> torch.Tensor:
-    """Build the uint64[EP_MASK_NUM_WORDS] CPU tensor expected by moe_a2a ops."""
-    mask_int = ((1 << ep_size) - 1) & ~sum(1 << rank for rank in dead_ranks)
-    word_mask = (1 << 64) - 1
-    words = [(mask_int >> (i * 64)) & word_mask for i in range(EP_MASK_NUM_WORDS)]
-    return torch.tensor(words, dtype=torch.uint64, device="cpu")
+    """Build the CPU active-rank mask tensor expected by moe_a2a ops."""
+    health = EPGroupHealth(ep_size)
+    for rank in dead_ranks:
+        health.mark_failed(rank)
+    return torch.tensor(health.get_mask_words(), dtype=torch.uint64, device="cpu")
 
 
 def _make_rank_mask_payload(local_num_tokens: int, hidden_size: int, rank: int) -> torch.Tensor:
