@@ -2,6 +2,7 @@ import json
 import pickle
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -414,6 +415,28 @@ def test_llm_request():
     logits = torch.tensor([-5, -6 - 7], dtype=torch.float)
     llm_request.draft_logits = logits
     assert torch.equal(llm_request.draft_logits, logits)
+
+
+def test_llm_request_kv_cache_transfer_metric_bindings():
+    request = _tb.internal.batch_manager.LlmRequest(
+        request_id=0,
+        max_new_tokens=5,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[0, 1, 2],
+        is_streaming=True,
+    )
+    offset = _tb.internal.batch_manager.LlmRequest.global_steady_clock_offset
+    offset = offset if offset is not None else timedelta()
+    start = timedelta(seconds=1.25)
+    end = timedelta(seconds=2.5)
+
+    request.set_kv_cache_transfer_start(start)
+    request.set_kv_cache_transfer_end(end)
+    request.set_kv_cache_size(128)
+
+    assert request.kv_cache_transfer_start == start + offset
+    assert request.kv_cache_transfer_end == end + offset
+    assert request.kv_cache_size == 128
 
 
 def test_Mpicomm():
