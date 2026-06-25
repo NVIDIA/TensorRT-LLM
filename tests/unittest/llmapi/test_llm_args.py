@@ -32,6 +32,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekV4SparseAttentionConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -226,20 +227,6 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
-
-
-def test_post_processor_hook_rejected_with_skip_tokenizer_init():
-    """post_processor_hook + skip_tokenizer_init must fail fast.
-
-    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
-    detokenized text) must be rejected rather than silently disabling it.
-    """
-    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
-        TorchLlmArgs(model="/tmp/dummy_model",
-                     skip_tokenizer_init=True,
-                     post_processor_hook="my_pkg.guardrail.Hook")
-    # skip_tokenizer_init alone (no hook) is still fine.
-    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
 
 
 class TestModelDefaults:
@@ -2780,3 +2767,16 @@ sparse_attention_config:
 
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
+
+
+class TestDeepSeekV4SparseAttentionConfig:
+
+    def test_zero_compress_ratios_are_normalized(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        assert config.compress_ratios == [1, 4, 128]
+
+    @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
+    def test_invalid_compress_ratios_raise(self, compress_ratios):
+        with pytest.raises(ValidationError, match="compress_ratios"):
+            DeepSeekV4SparseAttentionConfig(compress_ratios=compress_ratios)

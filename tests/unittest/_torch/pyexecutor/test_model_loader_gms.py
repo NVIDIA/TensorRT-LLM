@@ -44,7 +44,13 @@ class _TinyModel(nn.Module):
     def load_weights(self, weights, mapper):
         self._events.append("load_weights")
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
+        self._events.append("setup_aliases")
+
+    def cache_derived_state(self) -> None:
+        self._events.append("cache_derived_state")
+
+    def post_load_weights(self) -> None:
         self._events.append("post_load_weights")
 
 
@@ -76,7 +82,9 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     loader._call_load_weights = MagicMock(
         side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
     )
-    loader._load_and_validate_config = MagicMock(return_value=SimpleNamespace(name="config"))
+    loader._load_and_validate_config = MagicMock(
+        return_value=SimpleNamespace(name="config", mapping=SimpleNamespace())
+    )
 
     monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
@@ -147,7 +155,7 @@ def _spec_config_needing_draft_weights():
         ),
         pytest.param(
             False,
-            ["post_load_weights", "materialize"],
+            ["setup_aliases", "materialize", "cache_derived_state"],
             id="ro",
         ),
     ],
@@ -161,8 +169,9 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
             (``_apply`` for meta materialization, ``to('cuda')``, weight
             load, ``post_load_weights``) inside the pool, then commits via
             ``finalize_write`` once the scope exits.
-        ro: the reader runs ``post_load_weights`` to wire module aliases
-            first, then GMS materializes weights via zero-copy mapping.
+        ro: the reader runs ``setup_aliases`` to wire module aliases, checks
+            identity compatibility, materializes weights via zero-copy mapping,
+            then refreshes derived state from real tensors.
     """
     events = []
     loader = _make_loader(monkeypatch, events=events)
@@ -196,11 +205,53 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         backend.move_untracked_params.assert_called_once_with(model)
         backend.finalize_write.assert_called_once_with(model)
     else:
-        # RO: post_load_weights() must run before the GMS materialize
-        # step so module aliases are wired up before zero-copy mapping.
+        # RO: setup_aliases() must run before the GMS materialize step so
+        # module aliases are wired up before zero-copy mapping.
         checkpoint_loader.load_weights.assert_not_called()
         loader._call_load_weights.assert_not_called()
         backend.materialize_module.assert_called_once_with(model)
+
+
+def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    backend = _build_gms_backend(is_rw=False, events=events)
+    _install_gms_backend(monkeypatch, backend)
+
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    def record(event):
+        def _append(*_args, **_kwargs):
+            events.append(event)
+
+        return _append
+
+    checkpoint_loader.post_load_apply.side_effect = record("post_load_apply")
+    checkpoint_loader.post_load_publish.side_effect = record("post_load_publish")
+
+    # The STRICT pre-materialize identity gate runs between alias setup and
+    # materialization; record it to pin the ordering without exercising the
+    # comparison logic, which is covered in test_source_identity.py.
+    monkeypatch.setattr(
+        model_loader_mod,
+        "check_weight_sharing_compatibility",
+        lambda *_args, **_kwargs: events.append("check_source_identity"),
+    )
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert events == [
+        "post_load_apply",
+        "setup_aliases",
+        "check_source_identity",
+        "materialize",
+        "cache_derived_state",
+        "post_load_publish",
+    ]
+    assert "post_load_weights" not in events
+    checkpoint_loader.load_weights.assert_not_called()
+    backend.materialize_module.assert_called_once()
 
 
 def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
