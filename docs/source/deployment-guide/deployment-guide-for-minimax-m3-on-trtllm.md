@@ -21,7 +21,6 @@ The guide is intended for developers and practitioners seeking high-throughput o
 * OS: Linux
 * Drivers: CUDA Driver 575 or later
 * Container runtime with NVIDIA GPU support on each node
-* Minimum TensorRT LLM version: 1.3.0rc20
 
 ## Models
 
@@ -54,7 +53,7 @@ MiniMax-M3 is deployed across 2 nodes (8x GB200 total) using Slurm with the pyxi
 The TensorRT LLM NVIDIA NGC image is used as the Slurm container:
 
 ```text
-nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20
+nvcr.io/nvidia/tensorrt-llm/release:x.y.z
 ```
 
 Note:
@@ -96,7 +95,7 @@ export MODEL=/models/MiniMax-M3   # path on the shared filesystem; mounted into 
 srun -N 2 \
     --ntasks 8 --ntasks-per-node 4 \
     --mpi=pmix --gres=gpu:4 \
-    --container-image=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20 \
+    --container-image=nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
     --container-mounts=/models:/models,/workspace:/workspace \
     --container-workdir /workspace \
     bash -c "trtllm-llmapi-launch \
@@ -173,44 +172,7 @@ When `Status: 200` is returned, the server is ready for queries. Note that the v
 
 ### Basic Test
 
-After the TensorRT LLM server is set up and shows *Application startup complete*, you can send requests to the server.
-
-```bash
-curl http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-      "model": "MiniMaxAI/MiniMax-M3",
-      "prompt": "What is the capital of France?",
-      "max_tokens": 16,
-      "temperature": 0
-  }'
-```
-
-Example response:
-
-```json
-{
-  "id": "cmpl-...",
-  "object": "text_completion",
-  "model": "MiniMaxAI/MiniMax-M3",
-  "choices": [
-    {
-      "index": 0,
-      "text": "The capital of France is Paris. Paris is the largest city",
-      "finish_reason": "length"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 8,
-    "total_tokens": 24,
-    "completion_tokens": 16
-  }
-}
-```
-
-### Chat Completions Test
-
-MiniMax-M3 is a reasoning model. Using the `/v1/chat/completions` endpoint with the configured chat template and reasoning parser, the reasoning trace is returned separately in the `reasoning_content` field.
+After the TensorRT LLM server is set up and shows *Application startup complete*, you can send requests to the server. MiniMax-M3 is a reasoning model, so use the `/v1/chat/completions` endpoint — that path applies the chat template and, together with the configured reasoning parser, returns the reasoning trace separately in `reasoning_content`. (The `/v1/completions` endpoint does not apply the chat template and is not recommended for this model.)
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -225,7 +187,33 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-The `message` object in the response contains both the visible `content` and, when the model emits a `<mm:think>...</mm:think>` block, the parsed `reasoning_content`.
+Example response:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "model": "MiniMaxAI/MiniMax-M3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The capital of France is **Paris**.",
+        "reasoning_content": "The user is asking a simple factual question..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 134,
+    "total_tokens": 181,
+    "completion_tokens": 47
+  }
+}
+```
+
+The `message` object contains the visible answer in `content` and, when the model emits a `<mm:think>...</mm:think>` block, the parsed `reasoning_content`.
 
 ## Troubleshooting Tips
 
