@@ -1703,38 +1703,37 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-// CBTS Layer 2.5: a narrowed stage runs K = min(narrowed count, default splits) shards. Returns [skip, splits, splitId].
-def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
+// CBTS Layer 2.5: slice each narrowed stage to its CBTS duration-sized split count k.
+def cbtsResizeSplits(configs) {
     def cbts = testFilter[(CBTS_RESULT)]
-    // No CBTS or tarball not uploaded (renderTestDB then runs full source) -> keep default splits.
     if (cbts == null || !cbts.cbts_test_db_artifact_path) {
-        return [skip: false, splits: splits, splitId: splitId]
+        return configs  // no CBTS / tarball absent -> keep default splits
     }
-    def counts = cbts.affected_stage_test_counts
-    def count = counts ? counts[stageName] : null
-    if (count == null) {
-        return [skip: false, splits: splits, splitId: splitId]
+    def kByStage = cbts.affected_stage_split_counts
+    if (!kByStage) {
+        return configs
     }
-    int k = Math.max(1, Math.min(count as int, splits as int))
-    if (k >= splits) {
-        return [skip: false, splits: splits, splitId: splitId]
+    def resized = [:]
+    configs.each { key, values ->
+        def k = kByStage[key]
+        if (k == null) {
+            resized[key] = values  // stage not narrowed -> unchanged
+            return
+        }
+        int kk = Math.max(1, k as int)
+        if ((values[2] as int) > kk) {
+            echo "CBTS [${cbts.scope}]: ${key} narrowed -> ${kk} shard(s); dropping group ${values[2]}"
+            return  // drop shards beyond k
+        }
+        def v = values.collect()
+        v[3] = kk  // splitId<=k kept; rewrite split total to k
+        resized[key] = v
     }
-    if (splitId > k) {
-        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} tests → ${k}/${splits} shards, skipping group ${splitId}"
-        return [skip: true, splits: splits, splitId: splitId]
-    }
-    return [skip: false, splits: k, splitId: splitId]
+    return resized
 }
 
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false)
 {
-  def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
-  if (collapse.skip) {
-    return
-  }
-  splits = collapse.splits
-  splitId = collapse.splitId
-
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
   def attempt = 0
@@ -3816,13 +3815,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // and junit() for intermediate retryable failures).
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
-    def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
-    if (collapse.skip) {
-        return
-    }
-    splits = collapse.splits
-    splitId = collapse.splitId
-
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag, useClusterDurations)
     }, {
@@ -4432,6 +4424,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
+    x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
@@ -4519,6 +4512,7 @@ def launchTestJobs(pipeline, testFilter)
         16,
         2
     )
+    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -4553,6 +4547,7 @@ def launchTestJobs(pipeline, testFilter)
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
+    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
@@ -4587,6 +4582,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
     ]
+    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
@@ -4779,6 +4775,7 @@ def launchTestJobs(pipeline, testFilter)
         36,
         9
     )
+    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {

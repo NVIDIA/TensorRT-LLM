@@ -12,7 +12,7 @@ CBTS narrows test cases only; Build always runs.
 | Layer | Where | Action |
 |---|---|---|
 | **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages always excluded. Empty affectedSet + nothing force-kept → no-op. |
-| **2.5. Split-collapse** | `L0_Test.groovy::runLLMTestlistOn*` entries | Narrowed test count < 20 → collapse pytest-split to splits=1 (only group 1 runs); else default splits stand. |
+| **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
 CBTS only subtracts; anything it can't narrow → fallback to the existing
@@ -180,6 +180,7 @@ Decision JSON:
   ],
   "test_db_dir_override": "cbts_test_db",
   "affected_stage_test_counts": {"A10-PyTorch-1": 5, "A10-PyTorch-2": 5},
+  "affected_stage_split_counts": {"A10-PyTorch-1": 1, "A10-PyTorch-2": 1},
   "sanity_required": false,
   "perfsanity_required": false
 }
@@ -191,8 +192,8 @@ Decision JSON:
   `perfsanity_required`.
 - `test_db_dir_override: null` → no Layer 3 narrowing; trt-test-db reads
   the source test-db.
-- `affected_stage_test_counts` → per-stage post-keep-filter test count for
-  Layer 2.5 split-collapse.
+- `affected_stage_test_counts` → per-stage kept-entry count (telemetry).
+- `affected_stage_split_counts` → per-stage duration-sized split count (Layer 2.5).
 
 ## Cross-job seed for stage agents
 
@@ -211,15 +212,14 @@ absent and `renderTestDB` falls back to the source test-db. Layer 2 still
 applies. The tarball carries only the narrowed YAMLs, so no PR diff text
 travels between jobs.
 
-## Split-collapse heuristic (Layer 2.5)
+## Split-resize heuristic (Layer 2.5)
 
-In `_cbtsMaybeCollapseSplits`, when the stage's narrowed count < 20:
-- `splitId == 1` → run as splits=1 (single agent runs the full list).
-- `splitId > 1` → early return; no agent allocated.
-
-At/above 20, default splits stand. The count is computed by
-`blocks.compute_stage_test_counts` using the same keep filter as
-`write_filtered_test_db`.
+`blocks.compute_stage_split_counts` sizes each narrowed stage to
+`k = clamp(ceil(est_seconds / 2h), 1, stage.total_splits)` (cap parsed from
+`L0_Test.groovy`). `est_seconds` sums the `.test_durations` cache over the
+stage's kept entries (exact node-id, else subtree-sum, else average — over-counts
+toward the cap, never under-sizes). `launchTestJobs::cbtsResizeSplits` keeps only
+shards `1..k`; pytest-split then balances within them via `least_duration`.
 
 ## Adding a new rule
 
