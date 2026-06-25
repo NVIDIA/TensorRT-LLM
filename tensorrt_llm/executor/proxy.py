@@ -327,14 +327,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            # The result may already be finalized and popped below — e.g. a
-            # `terminate` verdict sent a final Output while the
-            # engine still has in-flight responses (abort is async). Drop such
-            # late responses instead of crashing with a KeyError.
-            result = self._results.get(client_id)
-            if result is None:
-                return
-            queue = result.queue
+            queue = self._results[client_id].queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
                 async_queues.append(queue)
@@ -349,7 +342,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res,
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
-                self._results.pop(client_id, None)
+                self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
 
