@@ -597,7 +597,9 @@ def create_standalone_package(output_dir: str) -> None:
     #     left untouched.
     runner_count = _copy_runners(output_dir)
     runner_rewrites = _rewrite_imports_in_dir(os.path.join(output_dir, "runners"))
-    print(f"  Copied {runner_count} runner files to runners/trtllm/ ({runner_rewrites} import rewrites)")
+    print(
+        f"  Copied {runner_count} runner files to runners/trtllm/ ({runner_rewrites} import rewrites)"
+    )
 
     # 3. Resolve dependencies and create pyproject.toml
     pinned = _read_pinned_versions(TRTLLM_REQUIREMENTS)
