@@ -9,7 +9,7 @@ set in the environment.
 
 | File | Role |
 |---|---|
-| `sitecustomize.py` | Starts coverage in each Python process under `CBTS_COVERAGE_CONFIG`; workers poll a marker file to switch the test-context. |
+| `sitecustomize.py` | Starts coverage in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, `ninja`, … — which opt out themselves and their spawned subtree); workers poll a marker file to switch the test-context. |
 | `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per-test `cov.switch_context()`, and patches `mpi_session._start_mpi_pool` so workers inherit the coverage env. |
 | `coveragerc.template` | Template for the runtime `.coveragerc`. |
 | `make_coveragerc.sh` | Substitutes `@...@` placeholders in the template; writes `$JOB_WORKSPACE/.coveragerc`. |

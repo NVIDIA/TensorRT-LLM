@@ -248,18 +248,47 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
-            // CBTS: scp per-process .coverage.<stage>* files back into ${stageName}/cbts/ to bundle into the standard results-<stage>.tar.gz.
+            // CBTS: bundle the per-process .coverage.<stage>* files (parallel=True
+            // produces one per worker/server process, often hundreds) into a single
+            // archive on the login node, transfer that one file, and unpack it into
+            // ${stageName}/cbts/ to ride along in results-<stage>.tar.gz. A glob scp of
+            // the individual files is dominated by per-file round trips (~6 min) and can
+            // exceed this stage's timeout; one compressed stream transfers in seconds.
+            // The pull is bounded and non-fatal so a slow or empty coverage set never
+            // aborts a stage whose tests already passed.
             if (isCbtsStage(stageName)) {
                 def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
                 def cbtsLocalDir = "${stageName}/cbts"
+                def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
                 sh "mkdir -p ${cbtsLocalDir}"
-                // Glob match against the parallel=True per-process pattern.
-                Utils.exec(
-                    pipeline,
-                    script: scpFromRemoteCmd(remote, "${remoteWs}/.coverage.${stageName}*", "${cbtsLocalDir}/"),
-                    returnStatus: true,
-                    numRetries: 3,
-                )
+                try {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        // Pack on the login node; remove any partial archive when no
+                        // coverage files match so the scp below fails cleanly.
+                        Utils.exec(
+                            pipeline,
+                            script: Utils.sshUserCmd(
+                                remote,
+                                "\"cd '${remoteWs}' && tar czf '${cbtsArchive}' .coverage.${stageName}* 2>/dev/null || rm -f '${cbtsArchive}'\""
+                            ),
+                            returnStatus: true,
+                            numRetries: 3,
+                        )
+                        def gotArchive = Utils.exec(
+                            pipeline,
+                            script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                            returnStatus: true,
+                            numRetries: 3,
+                        ) == 0
+                        if (gotArchive) {
+                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                        } else {
+                            echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
+                        }
+                    }
+                } catch (Exception e) {
+                    echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
+                }
             }
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"

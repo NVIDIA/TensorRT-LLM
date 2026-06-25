@@ -27,6 +27,35 @@ def _parent_is_pytest():
     return any(b"pytest" in part for part in parent_cmdline)
 
 
+def _is_dependency_build_process():
+    """Return True for pip / setuptools / native build-tool processes.
+
+    Tests that build third-party deps at runtime (e.g. the verl fixture's
+    ``python setup.py install`` for DeepEP) spawn these via ``subprocess`` with the
+    parent env, so they inherit ``CBTS_COVERAGE_CONFIG`` and import this file. They
+    fork their own build subprocesses, where the coverage background-save threads
+    started below can cause fork-with-threads deadlocks, and they hold no product
+    source to cover. Detect them so the whole build subtree opts out.
+    """
+    argv = getattr(sys, "orig_argv", sys.argv) or [""]
+    # Scan every token's basename: shebang launches put the tool in argv[1]
+    # (e.g. ["python3", "/usr/local/bin/pip", "install", ...]), bare launches in
+    # argv[0] (["pip", "install", ...]), and "python setup.py" in argv[1:].
+    tools = {"pip", "pip3", "cmake", "ninja", "ninja-build", "meson"}
+    for a in argv:
+        base = os.path.basename(a or "").lower()
+        if base in tools or base == "setup.py" or (a or "").endswith("setup.py"):
+            return True
+    joined = " ".join(argv)
+    return any(n in joined for n in ("-m pip", "-m build", "_in_process", "pyproject_hooks"))
+
+
+# Dependency build/install tooling must not be instrumented. Drop the gate var so
+# this process -- and everything it spawns, which inherits the env -- opts out.
+if os.getenv("CBTS_COVERAGE_CONFIG") and _is_dependency_build_process():
+    os.environ.pop("CBTS_COVERAGE_CONFIG", None)
+
+
 if os.getenv("CBTS_COVERAGE_CONFIG"):
     import atexit
 
@@ -55,6 +84,19 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _stop_event = threading.Event()
     # Serialize switch_context/save/stop across the daemon threads and atexit.
     _cov_lock = threading.Lock()
+
+    # Fork safety: an instrumented product process may fork (e.g. a test using
+    # multiprocessing). Hold the coverage lock across the fork so a background save
+    # can never leave the child holding a permanently-locked mutex; the child keeps
+    # none of the daemon threads, so it just releases and carries on.
+    try:
+        os.register_at_fork(
+            before=_cov_lock.acquire,
+            after_in_parent=_cov_lock.release,
+            after_in_child=_cov_lock.release,
+        )
+    except (AttributeError, ValueError):
+        pass
 
     def _periodic_save():
         while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):

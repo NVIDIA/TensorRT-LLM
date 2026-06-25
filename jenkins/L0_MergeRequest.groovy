@@ -1247,6 +1247,9 @@ source1 =
 source2 =
     ${CUR_PATH}/llm/tensorrt_llm/
     */tensorrt_llm/
+
+[html]
+show_contexts = True
 EOF
                         cat ${coverageConfigFile}
                     """
@@ -1254,8 +1257,9 @@ EOF
                     sh "cd cov && coverage combine"
                     sh "cd cov && find . -type f"
                     // Render the HTML report from the combined data (default .coverage) before renaming.
+                    // --show-contexts emits the per-test covering-test annotations captured via switch_context.
                     sh "cd cov && coverage report -i || true"
-                    sh "cd cov && coverage html -d test_coverage_html -i"
+                    sh "cd cov && coverage html --show-contexts -d test_coverage_html -i"
                     // The HTML report is a directory of many files; compress it into a single tarball before upload.
                     sh "cd cov && tar czf coverage-report.tar.gz test_coverage_html"
                     trtllm_utils.uploadArtifacts("cov/coverage-report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
