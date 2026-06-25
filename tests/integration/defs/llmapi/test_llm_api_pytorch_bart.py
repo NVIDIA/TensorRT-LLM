@@ -63,6 +63,7 @@ def _test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
+    kv_cache_dtype: str = "auto",
 ):
     expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
     assert not exact_match or expected_output_token_ids is not None
@@ -75,6 +76,7 @@ def _test_case(
         num_beams,
         num_return_sequences,
         exact_match,
+        kv_cache_dtype,
         id=f"{feature_id}-{_MODEL_NAME}",
     )
 
@@ -245,12 +247,7 @@ def _assert_expected_generation(
     assert token_ids_by_output == expected_token_ids_by_output
 
 
-@pytest.mark.parametrize(
-    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
-    _TEST_CASES,
-)
-def test_bart_pytorch_generate_encoder_decoder_end_to_end(
+def _run_bart_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     expected_output_token_ids_by_output: list[list[int]] | None,
     torch_dtype: str,
@@ -259,6 +256,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     num_beams: int,
     num_return_sequences: int,
     exact_match: bool,
+    kv_cache_dtype: str = "auto",
 ) -> None:
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
@@ -267,7 +265,8 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
+        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
+        f"kv_dtype={kv_cache_dtype}"
     )
     sampling_params = _sampling_params(num_beams, num_return_sequences)
 
@@ -285,6 +284,7 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            dtype=kv_cache_dtype,
         ),
         max_batch_size=1,
         max_beam_width=num_beams,
@@ -310,6 +310,35 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
             exact_match,
             expected_output_token_ids_by_output,
         )
+
+
+@pytest.mark.parametrize(
+    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
+    "enable_cuda_graph,num_beams,num_return_sequences,exact_match,kv_cache_dtype",
+    _TEST_CASES,
+)
+def test_bart_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    expected_output_token_ids_by_output: list[list[int]] | None,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    enable_cuda_graph: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    exact_match: bool,
+    kv_cache_dtype: str,
+) -> None:
+    _run_bart_pytorch_generate_encoder_decoder(
+        monkeypatch,
+        expected_output_token_ids_by_output,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        enable_cuda_graph,
+        num_beams,
+        num_return_sequences,
+        exact_match,
+        kv_cache_dtype,
+    )
 
 
 @pytest.mark.parametrize(

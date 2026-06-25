@@ -253,7 +253,10 @@ def _register_fake():
           next_n,
           index_topk,
           pre_idx=None,
-          heuristic_scratch=None):
+          heuristic_scratch=None,
+          compress_ratio=1,
+          radix_aux_indices=None,
+          radix_aux_logits=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -266,6 +269,21 @@ def _register_fake():
         m = a.shape[0]
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
+
+    @torch.library.register_fake("trtllm::gate_forward")
+    def _(
+        scores_in: torch.Tensor,
+        bias: torch.Tensor,
+        input_ids: torch.Tensor,
+        tid2eid: torch.Tensor,
+        out_weights: torch.Tensor,
+        out_indices: torch.Tensor,
+        topk: int,
+        route_scale: float,
+        is_hash: bool,
+    ) -> None:
+        # In-place operation, no return value.
+        pass
 
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):
@@ -1106,6 +1124,61 @@ def _register_fake():
         m = mat_a.shape[0]
         n = mat_b.shape[0]
         return mat_a.new_empty((m, n), dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::marlin_nvfp4_gemm")
+    def _(mat_a: torch.Tensor,
+          mat_b: torch.Tensor,
+          scale_a: torch.Tensor,
+          scale_b: torch.Tensor,
+          alpha: torch.Tensor,
+          weight_global_scale: torch.Tensor,
+          bias: Optional[torch.Tensor],
+          out_dtype: Optional[torch.dtype],
+          size_n: int,
+          size_k: int,
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
+        # mat_a: [M, K/2] FP4 packed (or BF16 when W4A16)
+        # mat_b: Marlin-packed weights
+        # Output: [M, size_n] with dtype=out_dtype
+        m = mat_a.shape[0]
+        return mat_a.new_empty((m, size_n), dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::marlin_nvfp4_moe_gemm")
+    def _(a: torch.Tensor,
+          b_q_weight: torch.Tensor,
+          b_scales: torch.Tensor,
+          global_scale: torch.Tensor,
+          workspace: torch.Tensor,
+          sorted_token_ids: torch.Tensor,
+          expert_ids: torch.Tensor,
+          num_tokens_past_padded: torch.Tensor,
+          topk_weights: torch.Tensor,
+          moe_block_size: int,
+          top_k: int,
+          mul_topk_weights: bool,
+          size_n: int,
+          size_k: int,
+          out_dtype: Optional[torch.dtype],
+          use_fp32_reduce: bool = False):
+        # a: [M, K] BF16, b_q_weight: [num_experts, ...] Marlin-packed FP4
+        # Output: [M * top_k, size_n]
+        m = a.shape[0]
+        dtype = out_dtype if out_dtype is not None else torch.bfloat16
+        return a.new_empty((m * top_k, size_n), dtype=dtype)
+
+    @torch.library.register_fake("trtllm::gptq_marlin_repack")
+    def _(b_q_weight: torch.Tensor,
+          perm: torch.Tensor,
+          size_k: int,
+          size_n: int,
+          num_bits: int,
+          is_a_8bit: bool = False):
+        pack_factor = 32 // num_bits
+        tile_size = 16
+        return b_q_weight.new_empty(
+            (size_k // tile_size, size_n * tile_size // pack_factor),
+            dtype=b_q_weight.dtype)
 
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(
