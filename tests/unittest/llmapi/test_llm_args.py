@@ -1743,6 +1743,15 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
+        # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
+        # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
+        # the v2 transceiver, so it is intentionally not part of _to_pybind().
+        assert config.kv_cache_bounce_size_mb == 0
+        assert CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
+
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
