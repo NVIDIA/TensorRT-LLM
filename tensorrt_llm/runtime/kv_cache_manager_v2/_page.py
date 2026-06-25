@@ -445,6 +445,7 @@ def batched_lock_to_gpu(
     tasks: Sequence[BatchedLockTarget],
     migration_recorder: Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
     | None = None,
+    drop_recorder: Callable[[Sequence[Page], CacheLevel], None] | None = None,
 ) -> list["_SharedPageLock"]:
     "Lock pages after migrating all pages to GPU. If migration fails, no locking happens."
     storage = kv_cache.manager._storage
@@ -460,7 +461,7 @@ def batched_lock_to_gpu(
         requirements[lc2pg[t.life_cycle]] += 1
 
     try:
-        storage.prepare_free_slots(GPU_LEVEL, requirements, migration_recorder)
+        storage.prepare_free_slots(GPU_LEVEL, requirements, migration_recorder, drop_recorder)
         partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
