@@ -102,13 +102,16 @@ FP8_MAX, E2M1_MAX = 448.0, 6.0
 
 
 def fp4_quantize_ref(normed: torch.Tensor, sf_scale: torch.Tensor):
-    """Unfused baseline: the standalone NVFP4 quantize the fusion replaces."""
+    """Unfused baseline: the exact standalone NVFP4 input-quantize the fusion
+    replaces. Mirrors the production static-NVFP4 call in
+    NVFP4LinearMethod._input_prepare (linear.py):
+        torch.ops.trtllm.fp4_quantize(input, input_scale, scaling_vector_size, False)
+    i.e. sfVecSize=16, sfUseUE8M0=False, isSfSwizzledLayout defaulting to True."""
     return torch.ops.trtllm.fp4_quantize(
         normed.contiguous(),
         sf_scale,
         SF_VEC,
-        False,  # use_ue8m0
-        True,  # is_sf_swizzled_layout
+        False,  # sfUseUE8M0
     )
 
 
