@@ -97,6 +97,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
 
+        # Sticky role markers; flip True once any session opens, used to short-circuit
+        # per-iter tp_allgather when this transceiver never sends/receives.
+        self._ever_had_send_session: bool = False
+        self._ever_had_recv_session: bool = False
+
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
             name = str(uuid.uuid4())
@@ -151,6 +156,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs.clear()
         self._transfer_worker.shutdown()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
+
     def _create_kv_slice(
         self,
         req: LlmRequest,
@@ -170,7 +181,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         if token_range is None and req.prompt_len > 0:
-            token_range = TokenRange(start=0, end=req.prompt_len)
+            # Align with KV cache allocation (resize_context /
+            # _get_context_bytes), which reserves prompt_len +
+            # num_extra_kv_tokens slots for speculative decoding methods
+            # (e.g. EAGLE3) that consume extra KV positions per request.
+            num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
+            token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
@@ -444,6 +460,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
+        self._ever_had_send_session = True
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         session.send(self._create_kv_slice(req))
@@ -469,6 +486,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if result == WaitResult.COMPLETED:
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
+                self._trim_kv_to_prompt_history(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -483,6 +501,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
+        self._ever_had_recv_session = True
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -498,6 +517,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
+        if not self._ever_had_send_session and not self._ctx_need_pp_sync:
+            return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
@@ -551,6 +572,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
+        if not self._ever_had_recv_session and not self._ctx_need_pp_sync:
+            return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
@@ -595,16 +618,52 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
+            self._trim_kv_to_prompt_history(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
+        if failed:
+            logger.warning(
+                f"Disagg gen transfer FAILED rank={self._dist.rank} "
+                f"rids={failed} gen_need_sync={self._gen_need_sync}"
+            )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
         return completed, failed, cancelled_reqs
 
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
+
+    def _trim_kv_to_prompt_history(self, req: LlmRequest) -> None:
+        """Mark received KV as historic so SWA pools release pre-window blocks.
+
+        Call right before the TRANS_COMPLETE state transition.  The cache
+        was sized to hold the full prompt by ``resize_context`` and just
+        got fully populated by the transfer; setting ``history_length`` to
+        the prompt length triggers ``_unlock_stale_blocks`` inside V2's
+        ``resize()`` for any sliding-window life cycle, releasing blocks
+        before the window back to their pool group.
+
+        This closes the gap between transfer completion and
+        ``update_resources`` (which only runs after the *first* forward
+        pass and would otherwise be the first thing to update
+        ``history_length``).  In benchmark fill-phase the first forward
+        is gated until every disagg-gen request is ready, so without
+        this trim the SWA / sparse-attn pool groups stay 100% occupied
+        with pre-window prompt blocks and the V2 scheduler deadlocks
+        on the next ``resize(+1)``.
+
+        No-op for V1 managers and for V2 caches with only full-context
+        life cycles.
+        """
+        trim = getattr(self._kv_cache_manager, "trim_to_history", None)
+        if trim is None:
+            return
+        prompt_len = getattr(req, "prompt_len", None)
+        if not prompt_len or prompt_len <= 0:
+            return
+        trim(req, prompt_len)
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
@@ -638,7 +697,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 del self._recv_sessions[rid]
 
         if has_transferring:
-            return False  # mid-write; caller must retry
+            return False
         return True
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
