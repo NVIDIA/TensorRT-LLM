@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
+    EncodeCudaGraphConfig,
     KvCacheConfig,
     RequestOutput,
     SamplingParams,
@@ -95,6 +97,7 @@ _MIXED_ENCODER_EXPECTED_TEXT_FRAGMENTS_BY_MODEL = {
     "t5-small": [_EXPECTED_TRANSLATION_FRAGMENT, "Buch"],
     "flan-t5-small": [_EXPECTED_TRANSLATION_FRAGMENT, "Buch"],
 }
+_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS = 8
 
 
 def _test_case(
@@ -509,13 +512,61 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
 def _cuda_graph_config(
     enabled: bool,
     batch_sizes: list[int] | None = None,
-) -> CudaGraphConfig | None:
-    return CudaGraphConfig(batch_sizes=batch_sizes or [1]) if enabled else None
+) -> CudaGraphConfig | EncodeCudaGraphConfig | None:
+    if not enabled:
+        return None
+    return EncodeCudaGraphConfig(
+        batch_sizes=batch_sizes or [1],
+        max_num_token=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        enable_padding=True,
+    )
+
+
+def _assert_encoder_decoder_cuda_graph_state(
+    llm: LLM,
+    enabled: bool,
+    batch_sizes: list[int] | None,
+) -> None:
+    model_engine = llm._executor.engine.model_engine
+
+    if not enabled:
+        assert not model_engine.encoder_cuda_graph_runner.enabled
+        assert not model_engine.cuda_graph_runner.enabled
+        assert not model_engine.encoder_cuda_graph_runner.graphs
+        assert not model_engine.cuda_graph_runner.graphs
+        return
+
+    assert model_engine.encoder_cuda_graph_runner.enabled
+    assert model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
+    if batch_sizes is not None:
+        assert model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+def _assert_mixed_context_generation_cuda_graph_state(llm: LLM) -> None:
+    model_engine = llm._executor.engine.model_engine
+
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
+    assert model_engine.encoder_cuda_graph_runner.enabled
+    assert model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+class _SleepLogitsProcessor:
+    def __init__(self, delay_seconds: float) -> None:
+        self.delay_seconds = delay_seconds
+
+    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id) -> None:
+        time.sleep(self.delay_seconds)
 
 
 def _assert_t5_response(
     response: RequestOutput,
     num_return_sequences: int,
+    max_tokens: int = _MAX_NEW_TOKENS,
 ) -> list[list[int]]:
     assert response.finished
 
@@ -523,7 +574,7 @@ def _assert_t5_response(
     token_ids_by_output = []
     for output in response.outputs:
         assert output.token_ids is not None
-        assert 0 < len(output.token_ids) <= _MAX_NEW_TOKENS
+        assert 0 < len(output.token_ids) <= max_tokens
         token_ids_by_output.append(output.token_ids)
     return token_ids_by_output
 
@@ -623,6 +674,11 @@ def _run_t5_pytorch_generate_encoder_decoder(
             token_ids,
             exact_match,
             expected_output_token_ids_by_output,
+        )
+        _assert_encoder_decoder_cuda_graph_state(
+            llm,
+            enable_cuda_graph,
+            cuda_graph_batch_sizes,
         )
 
 
@@ -741,3 +797,71 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
                 expected_token_ids_by_output=expected_token_ids,
                 expected_text_fragment=expected_text_fragment,
             )
+
+
+def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_name = "t5-small"
+    model_path = _get_t5_model_path(model_name)
+    first_sampling_params = SamplingParams(
+        max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
+        temperature=0.0,
+        ignore_eos=True,
+        logits_processor=_SleepLogitsProcessor(delay_seconds=0.02),
+    )
+    second_sampling_params = SamplingParams(
+        max_tokens=_MAX_NEW_TOKENS,
+        temperature=0.0,
+    )
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=_cuda_graph_config(True, [2]),
+        disable_overlap_scheduler=True,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=False,
+        ),
+        max_batch_size=2,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        first_response = llm.generate_async(
+            _SOURCE_TEXT,
+            sampling_params=first_sampling_params,
+            streaming=True,
+        )
+        first_stream_step = next(first_response)
+        assert not first_stream_step.finished
+
+        second_response = llm.generate_async(
+            _MIXED_ENCODER_SOURCE_TEXTS[1],
+            sampling_params=second_sampling_params,
+            streaming=False,
+        )
+
+        first_response.result()
+        second_response.result()
+
+        _assert_t5_response(
+            first_response,
+            num_return_sequences=1,
+            max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
+        )
+        _assert_t5_response(second_response, num_return_sequences=1)
+        _assert_mixed_context_generation_cuda_graph_state(llm)

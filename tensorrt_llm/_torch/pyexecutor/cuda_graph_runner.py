@@ -658,11 +658,11 @@ class EncoderCUDAGraphRunnerConfig:
 
 
 class EncoderCUDAGraphRunner:
-    """CUDA graph runner for models using encode_only path.
+    """CUDA graph runner for no-cache encoder forward passes.
 
-    Designed for the `LLM.encode()` API — consumes raw inputs dicts with
-    `input_ids` (flat [total_tokens]), `seq_lens` ([batch_size]). Encoder CUDA graphs
-    are keyed on the 3-tuple (padded_batch_size, padded_num_tokens, padded_max_seq_len)
+    Designed for encoder inputs with `input_ids` (flat [total_tokens]) and
+    `seq_lens` ([batch_size]). Encoder CUDA graphs are keyed on the 3-tuple
+    (padded_batch_size, padded_num_tokens, padded_max_seq_len).
 
     Restricted to `TrtllmAttentionMetadata` — FlashInfer's per-batch planner state is not compatible with CUDA graph capture/replay.
     """

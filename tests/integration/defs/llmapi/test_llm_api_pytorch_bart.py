@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
+    EncodeCudaGraphConfig,
     KvCacheConfig,
     RequestOutput,
     SamplingParams,
@@ -223,24 +224,37 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
 def _cuda_graph_config(
     enabled: bool,
     batch_sizes: list[int] | None = None,
-) -> CudaGraphConfig | None:
+) -> CudaGraphConfig | EncodeCudaGraphConfig | None:
     if not enabled:
         return None
-    return CudaGraphConfig(batch_sizes=batch_sizes or [1], enable_padding=True)
+    return EncodeCudaGraphConfig(
+        batch_sizes=batch_sizes or [1],
+        max_num_token=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        enable_padding=True,
+    )
 
 
-def _assert_cuda_graphs_captured(llm: LLM, enabled: bool) -> None:
+def _assert_encoder_decoder_cuda_graph_state(
+    llm: LLM,
+    enabled: bool,
+    batch_sizes: list[int] | None,
+) -> None:
+    model_engine = llm._executor.engine.model_engine
+
     if not enabled:
+        assert not model_engine.encoder_cuda_graph_runner.enabled
+        assert not model_engine.cuda_graph_runner.enabled
+        assert not model_engine.encoder_cuda_graph_runner.graphs
+        assert not model_engine.cuda_graph_runner.graphs
         return
-    model_engine = llm._executor.engine.model_engine
+
+    assert model_engine.encoder_cuda_graph_runner.enabled
+    assert model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.graphs
-
-
-def _assert_cuda_graph_padding_used(llm: LLM, batch_sizes: list[int] | None) -> None:
-    if batch_sizes is None:
-        return
-    model_engine = llm._executor.engine.model_engine
-    assert model_engine.cuda_graph_runner.padding_dummy_requests
+    if batch_sizes is not None:
+        assert model_engine.cuda_graph_runner.padding_dummy_requests
 
 
 def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -301,11 +315,6 @@ def _assert_expected_generation(
     assert token_ids_by_output == expected_token_ids_by_output
 
 
-@pytest.mark.parametrize(
-    "expected_output_token_ids_by_output,torch_dtype,use_kv_cache_manager_v2,"
-    "enable_cuda_graph,num_beams,num_return_sequences,exact_match",
-    _TEST_CASES,
-)
 def _run_bart_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     expected_output_token_ids_by_output: list[list[int]] | None,
@@ -368,8 +377,11 @@ def _run_bart_pytorch_generate_encoder_decoder(
             exact_match,
             expected_output_token_ids_by_output,
         )
-        _assert_cuda_graphs_captured(llm, enable_cuda_graph)
-        _assert_cuda_graph_padding_used(llm, cuda_graph_batch_sizes)
+        _assert_encoder_decoder_cuda_graph_state(
+            llm,
+            enable_cuda_graph,
+            cuda_graph_batch_sizes,
+        )
 
 
 @pytest.mark.parametrize(
