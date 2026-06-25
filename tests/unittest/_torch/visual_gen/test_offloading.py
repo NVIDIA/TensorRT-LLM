@@ -176,10 +176,7 @@ def test_offload_context_resolves_component_to_stageed_stage():
 
     with pipeline.offloader.context("vae"):
         assert pipeline.offloader.offload_pipeline is not None
-        assert (
-            pipeline.offloader.offload_pipeline.manager.active_stage_name
-            == "transformer+vae"
-        )
+        assert pipeline.offloader.offload_pipeline.manager.active_stage_name == "transformer+vae"
 
     pipeline.cleanup()
 
