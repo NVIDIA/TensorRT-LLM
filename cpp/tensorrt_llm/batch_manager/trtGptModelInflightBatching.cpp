@@ -1054,7 +1054,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             {
                 if (waitForDisaggGenTransferProgress)
                 {
-                    TLLM_LOG_DEBUG("Waiting for one generation KV cache transfer to free disagg admission budget");
+                    TLLM_LOG_DEBUG("Waiting for generation KV cache transfer progress to free disagg admission budget");
                     mCacheTransceiver->checkGenTransferStatus(1);
                 }
                 else
@@ -1658,10 +1658,10 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
         auto const blockTransfer = std::all_of(activeRequests.begin(), activeRequests.end(),
             [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "newGenReqs.size():%ld requests, activeRequests.size():%ld checkGenTransferStatus :%d original "
+            "newGenReqs.size():%ld requests, activeRequests.size():%ld allTransferInProgress:%d original "
             "gen_only_requests_num:%ld",
             newGenReqs.size(), activeRequests.size(), blockTransfer, genInitReqNum);
-        mCacheTransceiver->checkGenTransferStatus(blockTransfer ? 1 : 0);
+        mCacheTransceiver->checkGenTransferStatus(0);
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -1690,21 +1690,14 @@ void TrtGptModelInflightBatching::checkDisaggGenTransferStatus(RequestList const
 
     if (needCheck)
     {
-        auto const needCheckOne = std::all_of(activeRequests.begin(), activeRequests.end(),
-            [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
-
-        int atLeastNum = needCheckOne ? 1 : 0;
-        TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "noPreppared requests, checkGenTransferStatus atLeastNum:%d", atLeastNum);
-
-        mCacheTransceiver->checkGenTransferStatus(atLeastNum);
+        mCacheTransceiver->checkGenTransferStatus(0);
 
         auto timeEnd = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "no Prepare checkDisaggGenTransferStatus time:%f ms, "
-            "needCheckOne:%d,needCheck:%ld,activeRequests.size():%ld",
-            duration, needCheckOne, needCheck, activeRequests.size());
+            "needCheck:%d,activeRequests.size():%ld",
+            duration, needCheck, activeRequests.size());
     }
 }
 

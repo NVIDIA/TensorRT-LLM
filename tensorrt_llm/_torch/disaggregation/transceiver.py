@@ -1,3 +1,4 @@
+import time
 import uuid
 from collections import defaultdict
 from itertools import chain
@@ -63,6 +64,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
@@ -578,12 +580,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
         to_process = self._build_to_process(
             self._recv_sessions,
             self._gen_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -633,6 +638,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
         return completed, failed, cancelled_reqs
+
+    def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
+        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        deadline = time.monotonic() + poll_interval_s
+        while True:
+            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            if len(completed) + len(failed) >= wait_num:
+                return
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return
+            for session in self._recv_sessions.values():
+                session.wait_complete(blocking=False)
+            time.sleep(min(0.001, remaining_s))
 
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0

@@ -893,12 +893,37 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool const blockAll = !atLeastRequestNum.has_value();
-    std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
-    for (auto&& [request, future] : mRequesterFutures)
+    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
+    std::optional<int> genTransferPollIntervalMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
     {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        genTransferPollIntervalMs = mCacheTransceiverConfig->getKvTransferPollIntervalMs();
+    }
+    auto const futureWaitInterval = getTransferFutureWaitInterval(genTransferPollIntervalMs, needsProgress);
+
+    std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
+    auto collectReadyRequestIds = [&]()
+    {
+        genTransferReadyRequestIds.clear();
+        for (auto&& [request, future] : mRequesterFutures)
         {
-            genTransferReadyRequestIds.push_back(request->mRequestId);
+            if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+            {
+                genTransferReadyRequestIds.push_back(request->mRequestId);
+            }
+        }
+    };
+    collectReadyRequestIds();
+    if (needsProgress)
+    {
+        auto const deadline = std::chrono::steady_clock::now() + futureWaitInterval;
+        while (static_cast<int>(genTransferReadyRequestIds.size()) < atLeastRequestNum.value()
+            && std::chrono::steady_clock::now() < deadline)
+        {
+            auto const remaining
+                = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            std::this_thread::sleep_for(std::min(std::chrono::milliseconds(kTransferFuturePollIntervalMs), remaining));
+            collectReadyRequestIds();
         }
     }
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
@@ -927,53 +952,6 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         [](std::pair<LlmRequest::RequestIdType, int> const& left,
             std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
     std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
-    size_t idx = 0;
-    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
-    {
-        if (idx >= freqVec.size())
-        {
-            break;
-        }
-        toCompleteIdSet.insert(freqVec.at(idx).first);
-        if (useMPI())
-        {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
-        }
-        else
-        {
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
-        }
-        idx++;
-    }
-    idx = 0;
-
-    // insert order
-    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
-    {
-        if (idx >= mRequesterFutures.size())
-        {
-            break;
-        }
-        if (toCompleteIdSet.find(mRequesterFutures.at(idx).first->mRequestId) == toCompleteIdSet.end())
-        {
-            toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
-            if (useMPI())
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
-            }
-            else
-            {
-                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
-            }
-        }
-        idx++;
-    }
     for (auto&& [requestId, freq] : freqVec)
     {
         if (freq == ((syncComm != nullptr) ? syncComm->getSize() : 1))
@@ -1003,13 +981,6 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
-    std::optional<int> requesterFutureTimeoutMs = std::nullopt;
-    if (mCacheTransceiverConfig.has_value())
-    {
-        requesterFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
-    }
-    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
-    auto const futureWaitInterval = getTransferFutureWaitInterval(requesterFutureTimeoutMs, needsProgress);
 
     // Observe-only: gen-side mirror of the context-side timeout WARN.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
