@@ -37,6 +37,9 @@ def _new_loader(local_identity, source_identity, fetched=True):
     """Construct a loader bypassing heavy base __init__, wire the seams."""
     loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
     loader._local_source_identity = local_identity
+    loader._mx_server_url = "http://mx:8001"
+    loader._auto_start_local_server = False
+    loader._local_server_launch_attempted = False
     # Patch the single fetch seam to return the publisher identity (or None).
     loader._fetch_source_identity = lambda *a, **k: source_identity if fetched else None
     return loader
@@ -79,6 +82,7 @@ def test_fetch_source_identity_returns_none_when_metadata_unavailable():
     loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
     loader._mx_server_url = "http://mx:8001"
     loader._model_name = None
+    loader._local_source_identity = None
 
     class _Client:
         def __init__(self, *, server_url):
@@ -95,6 +99,7 @@ def test_fetch_source_identity_from_source_metadata():
     loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
     loader._mx_server_url = "http://mx:8001"
     loader._model_name = None
+    loader._local_source_identity = source
 
     class _Client:
         def __init__(self, *, server_url):
@@ -107,6 +112,38 @@ def test_fetch_source_identity_from_source_metadata():
     assert loader._fetch_source_identity("ckpt", _Client, lambda **_kw: object()) == source
 
 
+def test_fetch_source_identity_returns_local_identity_for_matching_mx_source():
+    local = _identity()
+    loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
+    loader._local_source_identity = local
+    loader._mx_server_url = "http://mx:8001"
+    loader._model_name = None
+
+    class _Client:
+        def __init__(self, *, server_url):
+            self.server_url = server_url
+
+        def list_sources(self, *, identity):
+            self.identity = identity
+            return type(
+                "ListResponse",
+                (),
+                {"instances": [type("Instance", (), {"worker_rank": local.rank})()]},
+            )()
+
+        def close(self):
+            pass
+
+    mx_identity = type("MxIdentity", (), {"extra_parameters": {}})()
+
+    def _build_identity(model_name):
+        assert model_name == "ckpt"
+        return mx_identity
+
+    assert loader._fetch_source_identity("ckpt", _Client, _build_identity) is local
+    assert "trtllm_source_identity" in mx_identity.extra_parameters
+
+
 def test_load_weights_pops_source_identity_kwarg():
     # source_identity must be consumed by load_weights and never leak into the
     # HfCheckpointLoader disk-fallback signature. With no server URL configured
@@ -114,6 +151,8 @@ def test_load_weights_pops_source_identity_kwarg():
     # stored and not forwarded.
     loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
     loader._mx_server_url = None
+    loader._auto_start_local_server = False
+    loader._local_server_launch_attempted = False
     loader._p2p_succeeded = False
     captured = {}
 

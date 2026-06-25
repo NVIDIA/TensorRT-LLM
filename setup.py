@@ -109,6 +109,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+mx_deps = ["modelexpress>=0.5.0,<0.6.0"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -449,10 +450,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        # MX remains prototype-only and is intentionally not declared as an
-        # optional package extra until its external dependency completes OSS
-        # allowlist onboarding. Keep install instructions in docs/PR text
-        # rather than packaging metadata.
+        "mx": mx_deps,
     },
     zip_safe=True,
     install_requires=required_deps,

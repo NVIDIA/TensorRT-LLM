@@ -240,6 +240,15 @@ def _construct_checkpoint_loader(
                 extra_kwargs["mx_server_url"] = mx_config.server_url
                 extra_kwargs[
                     "query_timeout_s"] = mx_config.server_query_timeout_s
+                extra_kwargs[
+                    "auto_start_local_server"] = mx_config.local_server.enabled
+                extra_kwargs["local_server_port"] = mx_config.local_server.port
+                extra_kwargs[
+                    "local_server_image"] = mx_config.local_server.server_image
+                extra_kwargs[
+                    "local_redis_image"] = mx_config.local_server.redis_image
+                extra_kwargs["local_server_startup_timeout_s"] = (
+                    mx_config.local_server.startup_timeout_s)
             if mx_model_name is not None:
                 extra_kwargs["model_name"] = mx_model_name
 

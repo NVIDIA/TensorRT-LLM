@@ -43,6 +43,13 @@ from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.mx.local_server import (
+    DEFAULT_MX_LOCAL_REDIS_IMAGE,
+    DEFAULT_MX_LOCAL_SERVER_IMAGE,
+    DEFAULT_MX_LOCAL_SERVER_PORT,
+    DEFAULT_MX_LOCAL_SERVER_STARTUP_TIMEOUT_S,
+    ensure_local_mx_server,
+)
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
 from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy,
@@ -61,6 +68,7 @@ from tensorrt_llm.mapping import Mapping
 # can still override via the env var or a future per-loader knob.
 # Tracked as MX-4 in §15 (non-blocking source-query API upstream).
 _MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S = "30"
+_MX_IDENTITY_BUILDER_LOCK = threading.Lock()
 _MX_PUBLISH_ENV_LOCK = threading.Lock()
 _MX_SOURCE_IDENTITY_METADATA_KEY = "trtllm_source_identity"
 _MX_WEIGHT_LAYOUT_METADATA_KEY = "trtllm_weight_layout"
@@ -90,6 +98,63 @@ def _temporary_env(key: str, value: Optional[str]):
             os.environ.pop(key, None)
         else:
             os.environ[key] = prior
+
+
+def _serialize_source_identity(identity: SourceIdentity) -> str:
+    """Serialize TRT-LLM's layout identity for MX's identity map."""
+    return json.dumps(
+        identity.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _attach_source_identity_to_mx_identity(
+    mx_identity: Any, source_identity: Optional[SourceIdentity]
+):
+    """Attach TRT-LLM layout identity to a Modelexpress SourceIdentity."""
+    if source_identity is None:
+        return mx_identity
+
+    extra_parameters = getattr(mx_identity, "extra_parameters", None)
+    if extra_parameters is None:
+        raise RuntimeError(
+            "MX SourceIdentity has no extra_parameters field; cannot attach "
+            "TRT-LLM SourceIdentity for compatibility filtering."
+        )
+
+    try:
+        extra_parameters[_MX_SOURCE_IDENTITY_METADATA_KEY] = _serialize_source_identity(
+            source_identity
+        )
+    except (AttributeError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            "Failed to attach TRT-LLM SourceIdentity to MX SourceIdentity; "
+            "MX P2P compatibility filtering will reject this source."
+        ) from e
+    return mx_identity
+
+
+@contextmanager
+def _patched_trtllm_identity_builder(mx_transfer: Any, source_identity: Optional[SourceIdentity]):
+    """Temporarily wrap upstream TRT-LLM identity construction."""
+    if source_identity is None or not hasattr(mx_transfer, "_build_trtllm_identity"):
+        yield
+        return
+
+    original = mx_transfer._build_trtllm_identity
+
+    def _wrapped_build_identity(*args, **kwargs):
+        return _attach_source_identity_to_mx_identity(
+            original(*args, **kwargs),
+            source_identity,
+        )
+
+    mx_transfer._build_trtllm_identity = _wrapped_build_identity
+    try:
+        yield
+    finally:
+        mx_transfer._build_trtllm_identity = original
 
 
 @register_checkpoint_loader("MX")
@@ -122,6 +187,11 @@ class MXCheckpointLoader(HfCheckpointLoader):
         mx_server_url: Optional[str] = None,
         model_name: Optional[Union[str, Path]] = None,
         query_timeout_s: Optional[int] = None,
+        auto_start_local_server: bool = False,
+        local_server_port: int = DEFAULT_MX_LOCAL_SERVER_PORT,
+        local_server_image: str = DEFAULT_MX_LOCAL_SERVER_IMAGE,
+        local_redis_image: str = DEFAULT_MX_LOCAL_REDIS_IMAGE,
+        local_server_startup_timeout_s: int = (DEFAULT_MX_LOCAL_SERVER_STARTUP_TIMEOUT_S),
     ):
         super().__init__(
             weight_loader=weight_loader,
@@ -140,6 +210,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # :func:`_resolve_mx_model_name` (with HF-snapshot path fallback).
         self._model_name = str(model_name) if model_name is not None else None
         self._query_timeout_s = query_timeout_s
+        self._auto_start_local_server = auto_start_local_server
+        self._local_server_port = local_server_port
+        self._local_server_image = local_server_image
+        self._local_redis_image = local_redis_image
+        self._local_server_startup_timeout_s = local_server_startup_timeout_s
+        self._local_server_launch_attempted = False
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
@@ -170,6 +246,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
     @property
     def query_timeout_s(self) -> Optional[int]:
         return self._query_timeout_s
+
+    @property
+    def auto_start_local_server(self) -> bool:
+        return self._auto_start_local_server
 
     def is_weights_preloaded(self) -> bool:
         """Whether the last :meth:`load_weights` call wired weights directly into the model.
@@ -236,6 +316,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
+        self._ensure_local_server_if_requested()
 
         if self._mx_server_url is None or model is None:
             return self._fallback_to_disk(
@@ -250,10 +331,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
             )
 
         try:
-            from modelexpress.trtllm_live_transfer import (  # type: ignore[import-not-found]
-                MxClient,
-                MxLiveWeightLoader,
-                _build_trtllm_identity,
+            from modelexpress import (
+                trtllm_live_transfer as mx_transfer,  # type: ignore[import-not-found]
             )
         except ImportError:
             logger.warning(
@@ -264,8 +343,20 @@ class MXCheckpointLoader(HfCheckpointLoader):
             )
             return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
 
+        try:
+            MxClient = mx_transfer.MxClient
+            MxLiveWeightLoader = mx_transfer.MxLiveWeightLoader
+            build_trtllm_identity = mx_transfer._build_trtllm_identity
+        except AttributeError:
+            logger.warning(
+                "modelexpress TRT-LLM live-transfer symbols are missing; "
+                "cannot use MX P2P weight transfer. Falling back to disk "
+                "loading."
+            )
+            return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
+
         source_metadata = self._fetch_source_metadata(
-            checkpoint_dir, MxClient, _build_trtllm_identity
+            checkpoint_dir, MxClient, build_trtllm_identity
         )
         # Pre-transfer compatibility gate: on mismatch, skip the transfer
         # before any RDMA work starts and fall back to disk.
@@ -309,16 +400,20 @@ class MXCheckpointLoader(HfCheckpointLoader):
         timeout_override = self._resolve_query_timeout_override(
             checkpoint_dir,
             MxClient,
-            _build_trtllm_identity,
+            build_trtllm_identity,
         )
         with _temporary_env("MX_SOURCE_QUERY_TIMEOUT", timeout_override):
             try:
-                mx_loader = MxLiveWeightLoader(mx_server=self._mx_server_url)
-                fallback_weights = mx_loader.load_weights(
-                    checkpoint_dir,
-                    mapping=mapping,
-                    model=model,
-                )
+                with (
+                    _MX_IDENTITY_BUILDER_LOCK,
+                    _patched_trtllm_identity_builder(mx_transfer, self._local_source_identity),
+                ):
+                    mx_loader = MxLiveWeightLoader(mx_server=self._mx_server_url)
+                    fallback_weights = mx_loader.load_weights(
+                        checkpoint_dir,
+                        mapping=mapping,
+                        model=model,
+                    )
             except Exception:
                 # Deliberately broad: MX is an opportunistic fast path and HF
                 # disk loading remains the correctness path. Preserve the full
@@ -403,7 +498,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
         """Best-effort fast probe for registered MX source instances."""
         client = None
         try:
-            identity = build_identity(model_name=self._resolve_publish_name(checkpoint_dir))
+            identity = self._build_mx_identity(
+                checkpoint_dir, build_identity, self._local_source_identity
+            )
             client = MxClient(server_url=self._mx_server_url)
             list_resp = client.list_sources(identity=identity)
             return bool(getattr(list_resp, "instances", []))
@@ -461,7 +558,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def _fetch_source_identity(
         self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
     ) -> Optional[SourceIdentity]:
-        """Fetch the publisher's serialized :class:`SourceIdentity`.
+        """Verify that MX has a source matching this receiver's identity.
 
         Args:
             checkpoint_dir: The checkpoint directory identifying the source.
@@ -469,11 +566,39 @@ class MXCheckpointLoader(HfCheckpointLoader):
             build_identity: Builder used to derive the publisher identity.
 
         Returns:
-            The publisher's identity, or `None` when it cannot be fetched
-            yet (the compatibility gate then rejects P2P and falls back).
+            The matched publisher identity. Because TRT-LLM's serialized
+            :class:`SourceIdentity` is embedded in MX's identity
+            `extra_parameters`, a source returned by `list_sources(identity=...)`
+            has the same TRT-LLM layout identity as this receiver.
         """
         metadata = self._fetch_source_metadata(checkpoint_dir, MxClient, build_identity)
-        return _source_identity_from_metadata(metadata)
+        source_identity = _source_identity_from_metadata(metadata)
+        if source_identity is not None:
+            return source_identity
+
+        local_identity = self._local_source_identity
+        if local_identity is None:
+            return None
+
+        client = None
+        try:
+            identity = self._build_mx_identity(checkpoint_dir, build_identity, local_identity)
+            client = MxClient(server_url=self._mx_server_url)
+            list_resp = client.list_sources(identity=identity)
+            for instance in _source_instances_from_list_response(list_resp):
+                worker_rank = getattr(instance, "worker_rank", None)
+                if worker_rank is None or int(worker_rank) == local_identity.rank:
+                    return local_identity
+            return None
+        except (AttributeError, RuntimeError, TimeoutError, TypeError, ValueError, grpc.RpcError):
+            logger.warning(
+                f"MX source identity probe failed; falling back to disk loading.\n"
+                f"{traceback.format_exc()}"
+            )
+            return None
+        finally:
+            if client is not None and hasattr(client, "close"):
+                client.close()
 
     def _source_metadata_is_post_transform(
         self, checkpoint_dir: str, mx_client_type: Type[Any], build_identity: Callable[..., Any]
@@ -494,7 +619,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
         """Fetch TRT-LLM metadata for the selected MX source, if available."""
         client = None
         try:
-            identity = build_identity(model_name=self._resolve_publish_name(checkpoint_dir))
+            identity = self._build_mx_identity(
+                checkpoint_dir, build_identity, self._local_source_identity
+            )
             client = MxClient(server_url=self._mx_server_url)
             for method_name in ("get_source_metadata", "get_metadata", "get_worker_metadata"):
                 method = getattr(client, method_name, None)
@@ -527,6 +654,18 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 client.close()
         return None
 
+    def _build_mx_identity(
+        self,
+        checkpoint_dir: str,
+        build_identity: Callable[..., Any],
+        source_identity: Optional[SourceIdentity],
+    ) -> Any:
+        """Build the MX identity used for discovery and attach TRT-LLM identity."""
+        return _attach_source_identity_to_mx_identity(
+            build_identity(model_name=self._resolve_publish_name(checkpoint_dir)),
+            source_identity,
+        )
+
     def _select_source_metadata(
         self, metadata_candidates: list[dict[str, Any]]
     ) -> Optional[dict[str, Any]]:
@@ -558,6 +697,26 @@ class MXCheckpointLoader(HfCheckpointLoader):
             logger.info(f"MX P2P unavailable; loading from disk: {checkpoint_dir}")
         return super().load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 
+    def _ensure_local_server_if_requested(self) -> None:
+        """Start a local MX server when the loader is configured to do so."""
+        if self._mx_server_url is not None or not self._auto_start_local_server:
+            return
+        if self._local_server_launch_attempted:
+            return
+        self._local_server_launch_attempted = True
+
+        try:
+            self._mx_server_url = ensure_local_mx_server(
+                port=self._local_server_port,
+                server_image=self._local_server_image,
+                redis_image=self._local_redis_image,
+                startup_timeout_s=self._local_server_startup_timeout_s,
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "Failed to start local MX server; MX P2P will fall back to disk loading. %s", e
+            )
+
     def publish_as_source(
         self,
         model,
@@ -586,6 +745,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 the same lifecycle point on producer and receiver.
         """
 
+        self._ensure_local_server_if_requested()
         if self._mx_server_url is None:
             return
         if source_identity is None:
@@ -596,11 +756,16 @@ class MXCheckpointLoader(HfCheckpointLoader):
             return
 
         try:
-            from modelexpress.trtllm_live_transfer import (
-                publish_model_params,  # type: ignore[import-not-found]
+            from modelexpress import (
+                trtllm_live_transfer as mx_transfer,  # type: ignore[import-not-found]
             )
         except ImportError:
             logger.debug("modelexpress library not installed; skipping MX publish.")
+            return
+        try:
+            publish_model_params = mx_transfer.publish_model_params
+        except AttributeError:
+            logger.debug("modelexpress publish_model_params is missing; skipping MX publish.")
             return
 
         # THREADSAFETY: upstream publish_model_params reads MODEL_EXPRESS_URL and
@@ -641,7 +806,11 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 os.environ[key] = value
 
             try:
-                publish_model_params(model, **metadata_kwargs)
+                with (
+                    _MX_IDENTITY_BUILDER_LOCK,
+                    _patched_trtllm_identity_builder(mx_transfer, source_identity),
+                ):
+                    publish_model_params(model, **metadata_kwargs)
                 logger.info(
                     "Published post-transform weights to MX server at %s as model=%r",
                     self._mx_server_url,

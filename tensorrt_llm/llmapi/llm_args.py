@@ -4401,6 +4401,52 @@ class LoadFormat(Enum):
     GMS = 3
 
 
+class ModelExpressLocalServerConfig(StrictBaseModel):
+    """Local Docker-backed ModelExpress server configuration."""
+
+    enabled: bool = Field(
+        default=True,
+        description="When checkpoint_format='MX' and no MX server URL is "
+        "configured, start a local Docker-backed ModelExpress server and Redis "
+        "instance for this node.",
+        status="prototype",
+        telemetry=False,
+    )
+
+    port: PositiveInt = Field(
+        default=8001,
+        description="Host TCP port for the local ModelExpress server. The "
+        "server container's port 8001 is mapped to this host port.",
+        status="prototype",
+        telemetry=False,
+    )
+
+    server_image: str = Field(
+        default="nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0",
+        min_length=1,
+        description="Docker image used for the local ModelExpress server.",
+        status="prototype",
+        telemetry=False,
+    )
+
+    redis_image: str = Field(
+        default="redis:8-alpine",
+        min_length=1,
+        description="Docker image used for the Redis metadata backend required "
+        "by the local ModelExpress server.",
+        status="prototype",
+        telemetry=False,
+    )
+
+    startup_timeout_s: PositiveInt = Field(
+        default=30,
+        description="Seconds to wait for the local ModelExpress server to "
+        "start accepting connections.",
+        status="prototype",
+        telemetry=False,
+    )
+
+
 class ModelExpressConfig(StrictBaseModel):
     """Prototype configuration for ModelExpress (MX) weight transfer."""
 
@@ -4421,6 +4467,15 @@ class ModelExpressConfig(StrictBaseModel):
         "no source uses a short 30-second fallback cap, while an existing "
         "source uses modelexpress's default wait for long donor loads.",
         status="prototype")
+
+    local_server: ModelExpressLocalServerConfig = Field(
+        default_factory=ModelExpressLocalServerConfig,
+        description="Local Docker-backed ModelExpress server settings used "
+        "when checkpoint_format='MX' and no explicit server_url or "
+        "MODEL_EXPRESS_URL is configured.",
+        status="prototype",
+        telemetry=False,
+    )
 
     preshard_strategy: str = Field(
         default="per_module",
