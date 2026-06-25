@@ -31,7 +31,7 @@ from tensorrt_llm.logger import logger
 # - Wan2.1-I2V-14B-720P: Single-stage image-to-video
 # - Wan2.2-I2V-14B: Two-stage image-to-video (no CLIP, boundary_ratio for two-stage denoising)
 from .transformer_wan import WanTransformer3DModel
-from .vae_loader import WAN_VAE_PIPELINE_CONFIG_DEFAULTS, load_wan_vae
+from .vae_loader import load_wan_vae
 
 WAN_I2V_TEACACHE_COEFFICIENTS = {
     # Wan 2.1 I2V 14B 480P
@@ -86,7 +86,6 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
         "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
-    defaults=WAN_VAE_PIPELINE_CONFIG_DEFAULTS,
     doc="Wan 2.1 & 2.2 image-to-video family.",
 )
 class WanImageToVideoPipeline(BasePipeline):
@@ -230,6 +229,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 checkpoint_dir,
                 device,
                 self.pipeline_config.visual_gen_mapping,
+                dtype=self.pipeline_config.torch_dtype,
             )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
