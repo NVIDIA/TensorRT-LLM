@@ -710,11 +710,8 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
         self.attn_metadata: Optional[AttentionMetadata] = None
 
-        # Pre-allocated `arange` for the vision block's `rope_position_ids`;
-        # per-call code just slices `[:seq_len]` instead of allocating a fresh
-        # `(seq_len,) int32` + H->D copy. Sized by `setup_attn_metadata` to the
-        # encoder's `max_num_tokens` (engine-driven); `forward` grows it on the
-        # rare miss above the budget.
+        # Vision block's `rope_position_ids` scratch. Registered empty here;
+        # `setup_attn_metadata` allocates it as an `arange` (see there).
         self.register_buffer("_rope_position_ids_buffer", None, persistent=False)
 
     @property
@@ -737,9 +734,11 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
-        # Size the vision-block ``rope_position_ids`` scratch to the encoder
-        # token budget; ``forward`` still grows it on the rare miss (e.g. packed
-        # multi-video batches above the budget).
+        # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
+        # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
+        # code just slices ``[:seq_len]`` instead of allocating a fresh
+        # ``(seq_len,) int32`` + H->D copy; ``forward`` still grows it on the
+        # rare miss above the budget (e.g. packed multi-video batches).
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )

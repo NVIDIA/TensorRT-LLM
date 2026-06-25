@@ -477,12 +477,14 @@ _DUMMY_PROCESSORS = [Qwen2VLInputProcessorBase, Qwen3VLInputProcessorBase]
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_spatial_merge_unit_is_merge_size_squared(processor_cls):
-    proc = _make_dummy_processor(processor_cls, spatial_merge_size=2)
-    assert proc.spatial_merge_unit == 4
-
-    proc3 = _make_dummy_processor(processor_cls, spatial_merge_size=3)
-    assert proc3.spatial_merge_unit == 9
+@pytest.mark.parametrize("spatial_merge_size, expected_spatial_merge_unit",
+                         [(2, 4), (3, 9)])
+def test_spatial_merge_unit_is_merge_size_squared(processor_cls,
+                                                  spatial_merge_size,
+                                                  expected_spatial_merge_unit):
+    proc = _make_dummy_processor(processor_cls,
+                                 spatial_merge_size=spatial_merge_size)
+    assert proc.spatial_merge_unit == expected_spatial_merge_unit
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
@@ -573,9 +575,9 @@ def test_dummy_size_capped_at_max_pixels(processor_cls):
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 def test_get_size_rejects_non_positive_budget(processor_cls):
     proc = _make_dummy_processor(processor_cls)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"max_tokens must be positive"):
         proc.get_size_for_max_tokens(max_tokens=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"max_tokens must be positive"):
         proc.get_size_for_max_tokens(max_tokens=-1)
 
 

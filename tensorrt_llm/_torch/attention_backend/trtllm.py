@@ -480,6 +480,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_is_inactive_rank[:batch_size].copy_(
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
 
+    def _bind_runtime_views(
+        self,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens: torch.Tensor,
+        prompt_lens_cuda: torch.Tensor,
+        prompt_lens_cpu: torch.Tensor,
+        host_request_types: torch.Tensor,
+    ) -> None:
+        """Bind the per-forward ``*_runtime`` views the FMHA kernels read.
+
+        Shared by ``prepare``, ``prepare_encoder_only`` and the encoder CUDA
+        graph binding so the set of runtime views stays in sync across paths.
+        """
+        self.kv_lens_cuda_runtime = kv_lens_cuda
+        self.kv_lens_runtime = kv_lens
+        self.prompt_lens_cuda_runtime = prompt_lens_cuda
+        self.prompt_lens_cpu_runtime = prompt_lens_cpu
+        self.host_request_types_runtime = host_request_types
+
     def prepare(self) -> None:
         super().prepare()
         extra_attrs = get_model_extra_attrs()
@@ -570,15 +590,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.draft_kv_cache_block_offsets, self.request_ids,
                     self.beam_width, self.num_contexts, self.num_seqs)
 
-        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
-        # Don't use self.kv_lens here because it includes extra tokens.
-        # Use actual KV length (without extra tokens) for kv_lens_runtime,
-        # which becomes host_past_key_value_lengths and eventually mMaxSeqLenKv.
-        self.kv_lens_runtime = kv_lens[:self.num_seqs]
-        self.prompt_lens_cuda_runtime = self.prompt_lens_cuda[:self.num_seqs]
-        self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
-        self.host_request_types_runtime = self.host_request_types[:self.
-                                                                  num_seqs]
+        # Don't pass self.kv_lens as kv_lens here because it includes extra
+        # tokens. Use the actual KV length (without extra tokens) for
+        # kv_lens_runtime, which becomes host_past_key_value_lengths and
+        # eventually mMaxSeqLenKv.
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
+            kv_lens=kv_lens[:self.num_seqs],
+            prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
+            prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
+            host_request_types=self.host_request_types[:self.num_seqs],
+        )
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
@@ -606,11 +628,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Graph metadata binds these views once per key; eager refreshes them
         # because batch shape can vary between calls.
         if not self.is_cuda_graph:
-            self.kv_lens_cuda_runtime = self._seq_lens_cuda[:n]
-            self.kv_lens_runtime = self._seq_lens[:n]
-            self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:n]
-            self.prompt_lens_cpu_runtime = self._seq_lens[:n]
-            self.host_request_types_runtime = self.host_request_types[:n]
+            self._bind_runtime_views(
+                kv_lens_cuda=self._seq_lens_cuda[:n],
+                kv_lens=self._seq_lens[:n],
+                prompt_lens_cuda=self._seq_lens_cuda[:n],
+                prompt_lens_cpu=self._seq_lens[:n],
+                host_request_types=self.host_request_types[:n],
+            )
 
     def bind_encoder_cuda_graph_seq_lens(self, seq_lens_host: torch.Tensor,
                                          padded_batch_size: int) -> None:
@@ -619,13 +643,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._num_contexts = padded_batch_size
         self._num_generations = 0
 
-        self.kv_lens_cuda_runtime = self._seq_lens_cuda[:padded_batch_size]
-        self.kv_lens_runtime = self._seq_lens
-        self.prompt_lens_cuda_runtime = self._seq_lens_cuda[:padded_batch_size]
-        self.prompt_lens_cpu_runtime = self._seq_lens
         self.host_request_types[:padded_batch_size].fill_(0)
-        self.host_request_types_runtime = self.host_request_types[:
-                                                                  padded_batch_size]
+        self._bind_runtime_views(
+            kv_lens_cuda=self._seq_lens_cuda[:padded_batch_size],
+            kv_lens=self._seq_lens,
+            prompt_lens_cuda=self._seq_lens_cuda[:padded_batch_size],
+            prompt_lens_cpu=self._seq_lens,
+            host_request_types=self.host_request_types[:padded_batch_size],
+        )
         self.host_total_kv_lens[1] = 0
 
     def prepare_encoder_cuda_graph_replay(self, seq_lens: List[int],

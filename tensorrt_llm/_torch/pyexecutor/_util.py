@@ -706,10 +706,12 @@ class KvCacheCreator:
                 torch_peak_memory = torch.cuda.memory_stats(
                 )["allocated_bytes.all.peak"]
 
-                # Free the held encoder embeddings now that the peak (which they
-                # contributed to) has been recorded, so the steady-state
-                # measurement below doesn't count this transient dummy.
+                # Free the held encoder embeddings and the GPU-resident dummy
+                # encoder inputs now that the peak (which they contributed to)
+                # has been recorded, so the steady-state measurement below
+                # doesn't count these transient dummies.
                 del encoder_profile_output
+                self._dummy_encoder_inputs = []
 
                 # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()

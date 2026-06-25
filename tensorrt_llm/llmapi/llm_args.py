@@ -3772,20 +3772,6 @@ class BaseLlmArgs(StrictBaseModel):
     max_num_tokens: Optional[int] = Field(
         default=8192, description="The maximum number of tokens.")
 
-    encoder_max_batch_size: Optional[PositiveInt] = Field(
-        default=None,
-        description=(
-            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
-            "Falls back to `max_batch_size` when unset."),
-        status="prototype")
-
-    encoder_max_num_tokens: Optional[PositiveInt] = Field(
-        default=None,
-        description=(
-            "Maximum number of tokens for the multimodal encoder's "
-            "AttentionMetadata. Falls back to `max_num_tokens` when unset."),
-        status="prototype")
-
     gather_generation_logits: bool = Field(
         default=False,
         description="Gather generation logits.",
@@ -4078,20 +4064,6 @@ class BaseLlmArgs(StrictBaseModel):
             self.max_num_tokens,
             self.max_seq_len,
             self.max_batch_size,
-        )
-
-    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
-        """Return encoder runtime batch and token limits.
-
-        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
-        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
-        encoder-specific knobs are not set.
-        """
-        return (
-            self.encoder_max_batch_size
-            if self.encoder_max_batch_size is not None else self.max_batch_size,
-            self.encoder_max_num_tokens
-            if self.encoder_max_num_tokens is not None else self.max_num_tokens,
         )
 
 
@@ -4653,6 +4625,32 @@ class TorchLlmArgs(BaseLlmArgs):
         description="DWDP (Distributed Weight Data Parallelism) config.",
         status="prototype")
 
+    encoder_max_batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
+            "Falls back to `max_batch_size` when unset. This budget is shared "
+            "proportionately across all modalities the model encodes, not set "
+            "per modality; per-modality knobs may be added later."),
+        status="prototype")
+
+    encoder_max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum number of tokens for the multimodal encoder's "
+            "AttentionMetadata. Falls back to `max_num_tokens` when unset. This "
+            "budget is shared proportionately across all modalities the model "
+            "encodes, not set per modality; per-modality knobs may be added "
+            "later."),
+        status="prototype")
+
+    @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
+    @classmethod
+    def validate_encoder_runtime_sizes(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("must be a positive integer when set")
+        return v
+
     attn_backend: str = Field(
         default='TRTLLM',
         description="Attention backend to use.",
@@ -4942,6 +4940,20 @@ class TorchLlmArgs(BaseLlmArgs):
     @quant_config.setter
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
+
+    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
+        """Return encoder runtime batch and token limits.
+
+        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
+        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
+        encoder-specific knobs are not set.
+        """
+        return (
+            self.encoder_max_batch_size
+            if self.encoder_max_batch_size is not None else self.max_batch_size,
+            self.encoder_max_num_tokens
+            if self.encoder_max_num_tokens is not None else self.max_num_tokens,
+        )
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(

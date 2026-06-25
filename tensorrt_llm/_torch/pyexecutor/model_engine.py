@@ -1892,10 +1892,9 @@ class PyTorchModelEngine(ModelEngine):
         subclasses ``BaseMultimodalInputProcessor``, which every
         multimodal model necessarily provides at the data boundary.
 
-        TODO: Once all multimodal models inherit ``MultimodalModelMixin``
-        (tracked separately as the ``MultimodalModelMixin`` migration),
-        drop the input-processor fallback so the model class itself is
-        the single source of truth.
+        TODO(TRTLLM-13542): Once all multimodal models inherit
+        ``MultimodalModelMixin``, drop the input-processor fallback so the
+        model class itself is the single source of truth.
         """
         if isinstance(self.model, MultimodalModelMixin):
             return True

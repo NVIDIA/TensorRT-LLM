@@ -62,7 +62,9 @@ def _make_subclass(*, hf_post_merger_tokens: int = 999):
         def call_with_text_prompt(self, *args, **kwargs):
             raise NotImplementedError
 
-    instance = _Sub.__new__(_Sub)
+    # The token-counting path under test reads none of the base constructor's
+    # required args, so pass throwaways; only `_processor` (set below) matters.
+    instance = _Sub(model_path=None, config=None, tokenizer=None)
     # HF processor mock returning the configured post-merger count.
     hf_processor = SimpleNamespace(
         _get_num_multimodal_tokens=MagicMock(
@@ -78,17 +80,19 @@ def _make_subclass(*, hf_post_merger_tokens: int = 999):
 
 def test_get_num_tokens_per_image_delegates_to_hf_processor():
     """The base image token count comes from the HF processor."""
-    sub = _make_subclass(hf_post_merger_tokens=999)
+    expected_tokens = 999
+    sub = _make_subclass(hf_post_merger_tokens=expected_tokens)
     image = Image.new("RGB", (8, 6))
-    assert sub.get_num_tokens_per_image(image=image) == 999
+    assert sub.get_num_tokens_per_image(image=image) == expected_tokens
     sub._processor._get_num_multimodal_tokens.assert_called_once()
 
 
 def test_get_num_tokens_per_video_delegates_to_hf_processor():
     """The base video token count comes from the HF processor."""
-    sub = _make_subclass(hf_post_merger_tokens=777)
+    expected_tokens = 777
+    sub = _make_subclass(hf_post_merger_tokens=expected_tokens)
     frames = [Image.new("RGB", (8, 6)) for _ in range(3)]
-    assert sub.get_num_tokens_per_video(video=frames) == 777
+    assert sub.get_num_tokens_per_video(video=frames) == expected_tokens
     sub._processor._get_num_multimodal_tokens.assert_called_once()
 
 

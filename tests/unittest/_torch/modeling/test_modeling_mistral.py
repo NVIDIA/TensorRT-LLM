@@ -685,7 +685,7 @@ def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
 
 def test_dummy_get_size_rejects_non_positive_budget():
     proc = _make_dummy_processor()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"max_tokens must be positive"):
         proc.get_size_for_max_tokens(max_tokens=0)
 
 

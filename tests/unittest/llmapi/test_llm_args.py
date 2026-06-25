@@ -192,13 +192,15 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
-@pytest.mark.parametrize("llm_args_cls", [TrtLlmArgs, TorchLlmArgs])
+@pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
 class TestEncoderRuntimeSizes:
     """Cover encoder runtime size fields and fallback to LLM limits.
 
     `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
     knobs that size multimodal encoder AttentionMetadata; when unset they
-    fall back to the LLM-side `max_batch_size` / `max_num_tokens`.
+    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
+    PyTorch-backend only (the multimodal encoder profiling path), so they
+    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
     """
 
     def test_defaults_are_none(self, llm_args_cls):
