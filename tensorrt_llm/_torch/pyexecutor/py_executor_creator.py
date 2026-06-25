@@ -929,32 +929,49 @@ def create_py_executor(
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
-        py_executor = create_py_executor_instance(
-            dist=dist,
-            resources=resources,
-            mapping=mapping,
-            llm_args=llm_args,
-            ctx_chunk_config=ctx_chunk_config,
-            model_engine=model_engine,
-            start_worker=False,
-            sampler=sampler,
-            drafter=drafter,
-            guided_decoder=guided_decoder,
-            lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-            kv_connector_manager=kv_connector_manager
-            if not estimating_kv_cache else None,
-            resource_governor_queue=resource_governor_queue,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            peft_cache_config=peft_cache_config,
-            scheduler_config=scheduler_config,
-            cache_transceiver_config=cache_transceiver_config,
-            virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
-            execution_stream=execution_stream,
-        )
+        executor_llm_args = llm_args
+        original_model_engine_llm_args = None
+        if estimating_kv_cache and llm_args.self_benchmark_config is not None:
+            # The temporary KV-estimation executor disables iter stats, so
+            # self-benchmark points cannot observe completion there.
+            logger.debug(
+                "Disabling self_benchmark_config for temporary KV-cache "
+                "estimation executor")
+            executor_llm_args = copy.copy(llm_args)
+            executor_llm_args.self_benchmark_config = None
+            original_model_engine_llm_args = model_engine.llm_args
+            model_engine.llm_args = executor_llm_args
+
+        try:
+            py_executor = create_py_executor_instance(
+                dist=dist,
+                resources=resources,
+                mapping=mapping,
+                llm_args=executor_llm_args,
+                ctx_chunk_config=ctx_chunk_config,
+                model_engine=model_engine,
+                start_worker=False,
+                sampler=sampler,
+                drafter=drafter,
+                guided_decoder=guided_decoder,
+                lora_config=lora_config,
+                garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+                kv_connector_manager=kv_connector_manager
+                if not estimating_kv_cache else None,
+                resource_governor_queue=resource_governor_queue,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
+                peft_cache_config=peft_cache_config,
+                scheduler_config=scheduler_config,
+                cache_transceiver_config=cache_transceiver_config,
+                virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
+                execution_stream=execution_stream,
+            )
+        finally:
+            if original_model_engine_llm_args is not None:
+                model_engine.llm_args = original_model_engine_llm_args
 
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
