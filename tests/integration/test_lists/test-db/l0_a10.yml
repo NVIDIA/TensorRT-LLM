@@ -15,7 +15,7 @@ l0_a10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/sampler/test_torch_sampler.py
-  - unittest/_torch/sampler/test_torch_multi_arange.py
+  - unittest/_torch/test_torch_multi_arange.py
   - unittest/utils/test_util.py
   - unittest/utils/test_logger.py
   - unittest/_torch/test_model_config.py
