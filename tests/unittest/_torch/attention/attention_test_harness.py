@@ -85,7 +85,8 @@ class BackendCase:
 
     # Cross-attention: new KV (encoder) tokens per request. None => self-attention
     # (KV tokens == seq_lens). When set, the case is cross-attention (must be
-    # non-causal); TRTLLM is skipped (it asserts no cross), FlashInfer/Vanilla run.
+    # non-causal). Same-length cross runs on TRTLLM/FlashInfer/Vanilla; unequal
+    # q/kv lengths are gated for TRTLLM in the capability matrix.
     seq_lens_kv: Optional[List[int]] = None
 
     dtype: str = "float16"

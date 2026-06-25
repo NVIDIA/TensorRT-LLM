@@ -7,8 +7,7 @@ backends support different feature subsets. A case that exercises a feature a
 backend lacks is skipped (with a clear reason) rather than failing.
 
 Values are seeded from the backends' ``support_*`` classmethods and known
-asserts (e.g. ``TrtllmAttention`` rejects cross-attention) and are sanity-checked
-by :func:`verify_against_backends` in the synthetic suite.
+backend-specific limitations that this standalone harness must skip.
 """
 
 from typing import Optional
@@ -23,7 +22,7 @@ from utils.util import getSMVersion
 #   no_cache       - ragged/prefill forward with kv_cache_manager=None
 #   sparse         - sparse-attention forward plumbing (degenerate regime here)
 #   mla            - multi-head latent attention
-#   cross_attn     - cross-attention (encoder-decoder; seq_lens_kv != seq_lens)
+#   cross_attn     - cross-attention (encoder-decoder)
 #   kv_layouts     - supported paged-cache block layouts ("NHD" / "HND")
 BACKEND_CAPS = {
     # NOTE on fp4_kv=False: NVFP4 KV cache cannot be exercised in this standalone
@@ -62,11 +61,28 @@ BACKEND_CAPS = {
         sliding_window=True,
         no_cache=True,
         sparse=False,
-        mla=False,
+        mla=True,
         cross_attn=True,
         kv_layouts=("NHD",),  # reads the NHD get_buffers view
     ),
 }
+
+_FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96, 512)
+_FLASHINFER_PAGED_APPEND_OVER_1024_THREADS = (
+    # bf16/fp16 append launches 16 threads/head for head_dim=128. With 128 KV
+    # heads, that exceeds CUDA's 1024 threads/block launch limit.
+    (128, 128, "bfloat16"),
+    (128, 128, "float16"),
+)
+
+_TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
+_TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
+_TRTLLM_FAST_BUILD_GEN_UNSUPPORTED_HEAD_DIMS = (96,)
+_TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE = (
+    # Gemma3-27B local layers and Gemma4-31B sliding layers.
+    (32, 16, 128, 1024),
+    (32, 16, 256, 1024),
+)
 
 
 def required_features(case) -> set:
@@ -118,64 +134,53 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     if kv_layout is not None and kv_layout not in caps.get("kv_layouts", ()):
         return f"{backend} does not support kv_layout '{kv_layout}'"
 
-    # FlashInfer's standard paged path has shape-specific kernel limits. The KV
-    # append kernel supports a fixed head_dim dispatch set and launches one
-    # thread block with ``blockDim=(head_dim / vec_size, num_kv_heads)``. CUDA
-    # rejects launches above 1024 threads/block, so large MHA shapes such as
-    # 128 KV heads x bf16/fp16 head_dim 128 cannot be represented by this
-    # backend path. The paged FA2 attention path also rejects head_dim 512.
+    # FlashInfer's standard paged path has shape-specific kernel limits in this
+    # suite. Keep the skip list explicit so newly supported shapes are not
+    # hidden by a broad dispatch-set predicate.
     if (
         backend == "FLASHINFER"
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
     ):
-        if case.head_dim not in (64, 128, 256, 512):
-            return (
-                "FLASHINFER paged KV append supports only head_dim "
-                f"64/128/256/512 (got {case.head_dim})"
-            )
-        if case.head_dim == 512:
-            return "FLASHINFER paged attention does not support head_dim 512"
         kv_dtype = getattr(case, "kv_dtype", None) or getattr(case, "dtype", None)
-        dtype_size = 1 if kv_dtype == "float8_e4m3fn" else 2
-        vec_size = max(16 // dtype_size, case.head_dim // 32)
-        threads_per_head = case.head_dim // vec_size
-        if threads_per_head * case.num_kv_heads > 1024:
+        if case.head_dim in _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS:
+            return f"FLASHINFER paged attention is unstable for head_dim {case.head_dim}"
+        if (
+            case.head_dim,
+            case.num_kv_heads,
+            kv_dtype,
+        ) in _FLASHINFER_PAGED_APPEND_OVER_1024_THREADS:
             return (
                 "FLASHINFER paged KV append exceeds CUDA's 1024 threads/block "
-                f"limit ({threads_per_head} threads/head x "
-                f"{case.num_kv_heads} KV heads)"
+                f"limit for head_dim={case.head_dim}, "
+                f"num_kv_heads={case.num_kv_heads}, kv_dtype={kv_dtype}"
             )
 
     # TRTLLM's standard paged FMHA/MMHA kernels in this build do not cover the
-    # Gemma4 head_dim 512 path. Smaller non-core context sizes such as Phi-3's
-    # head_dim 96 still run through the fallback FMHA path.
+    # Gemma4 head_dim 512 path.
     if (
         backend == "TRTLLM"
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
-        and case.head_dim > 256
+        and case.head_dim in _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        return f"TRTLLM paged attention supports head_dim <= 256 (got {case.head_dim})"
+        return f"TRTLLM paged attention is unstable for head_dim {case.head_dim}"
 
-    # TRTLLM's Blackwell paged fallback path aborts for non-core head sizes such
-    # as Phi-3's head_dim 96. Hopper covers those context configs, but Blackwell
-    # must skip them before entering the fused op.
+    # TRTLLM's Blackwell paged fallback path aborts for the Phi-3 head_dim 96
+    # shape. Hopper covers that context config, but Blackwell must skip it
+    # before entering the fused op.
     if (
         backend == "TRTLLM"
         and sm >= 100
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
-        and case.head_dim not in (32, 64, 128, 256)
+        and case.head_dim in _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
-        return (
-            "TRTLLM Blackwell paged attention supports only head_dim "
-            f"32/64/128/256 (got {case.head_dim})"
-        )
+        return f"TRTLLM Blackwell paged attention is unstable for head_dim {case.head_dim}"
 
     # TRTLLM's Blackwell pure-decode sliding-window path is numerically unstable
-    # for the Gemma GQA shapes with 16 KV heads. Mixed batches still use a
-    # different path and match the golden.
+    # for the listed Gemma GQA shapes. Mixed batches still use a different path
+    # and match the golden.
     if (
         backend == "TRTLLM"
         and sm >= 100
@@ -183,11 +188,18 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
         and case.num_contexts == 0
-        and case.num_kv_heads >= 16
+        and (
+            case.num_heads,
+            case.num_kv_heads,
+            case.head_dim,
+            case.sliding_window,
+        )
+        in _TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE
     ):
         return (
             "TRTLLM Blackwell sliding-window pure decode is unstable for "
-            f"{case.num_kv_heads} KV heads"
+            f"num_heads={case.num_heads}, num_kv_heads={case.num_kv_heads}, "
+            f"head_dim={case.head_dim}, window={case.sliding_window}"
         )
 
     # TRTLLM's Blackwell no-cache fallback mismatches the Vanilla golden for the
@@ -240,21 +252,17 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
                 "kernel for headDimQk=576, headDimV=512, page_size=32"
             )
 
-    # The TRTLLM MMHA generation kernel is fast-built in this environment, which
-    # omits non-core head sizes (for example Phi-3's head_dim 96). Context FMHA
-    # covers those configs only on some architectures, so skip remaining cases
-    # that include generation.
+    # The TRTLLM MMHA generation kernel is fast-built in this environment and
+    # omits the Phi-3 head_dim 96 generation shape. Context FMHA covers that
+    # config only on some architectures, so skip cases that include generation.
     if (
         backend == "TRTLLM"
         and getattr(case, "cache", "paged") != "none"
         and not getattr(case, "is_mla", False)
         and case.num_contexts < len(case.seq_lens)
-        and case.head_dim not in (32, 64, 128, 256)
+        and case.head_dim in _TRTLLM_FAST_BUILD_GEN_UNSUPPORTED_HEAD_DIMS
     ):
-        return (
-            "TRTLLM fast-build MMHA generation supports only head_dim "
-            f"32/64/128/256 (got {case.head_dim})"
-        )
+        return f"TRTLLM fast-build MMHA generation is missing head_dim {case.head_dim}"
 
     # TRTLLM's fp8 generation (XQA) path computes in fp8 and needs the model's
     # real KV-dequant + output scale state (fed by the Attention module's
