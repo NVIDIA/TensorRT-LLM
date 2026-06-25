@@ -3647,5 +3647,200 @@ class TestBuildToolStrictGuidedDecoding:
         assert "calculate" in fmt["tags"][0]["begin"]
 
 
+# ============================================================================
+# Named tool_choice (forced function call) Tests — TRTLLM-12758
+# ============================================================================
+
+
+def _make_tools(*specs):
+    """Helper: build a list of ChatCompletionToolsParam from (name, params) specs."""
+    return [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(name=name, parameters=params),
+        ) for name, params in specs
+    ]
+
+
+_SCHEMA_LOCATION = {
+    "type": "object",
+    "properties": {
+        "location": {
+            "type": "string"
+        },
+    },
+    "required": ["location"],
+}
+
+_SCHEMA_QUERY = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string"
+        },
+    },
+    "required": ["query"],
+}
+
+
+class TestBuildForcedToolCallDecoding:
+    """Test ``_build_forced_tool_call_decoding`` from openai_server.
+
+    Covers OpenAI-spec ``tool_choice = {"type": "function",
+    "function": {"name": "X"}}`` for non-harmony tool parsers (TRTLLM-12758).
+    The helper returns ``(begin_prefix, GuidedDecodingParams)``: the caller
+    prefix-injects ``begin_prefix`` into the rendered chat prompt and applies
+    the guided-decoding params to the request, so the model is forced to
+    start generation inside the tool call and the resulting arguments are
+    JSON-schema valid.
+    """
+
+    @pytest.mark.parametrize(
+        "parser_name",
+        ["qwen3", "deepseek_v3", "kimi_k2", "gemma4"],
+    )
+    def test_forced_name_returns_prefix_and_json_schema(self, parser_name):
+        """Forced-name path returns a parser-specific prefix and JSON schema.
+
+        Across parser families, ``begin_prefix`` must contain the forced
+        function name and the guided-decoding params must constrain the args
+        to the function's ``parameters`` JSON Schema.
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION),
+                            ("search_web", _SCHEMA_QUERY))
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, parser_name, "get_weather")
+
+        # ``begin_prefix`` is exactly the parser's tool-call begin string.
+        parser = ToolParserFactory.parsers[parser_name.lower()]()
+        expected_begin = parser.structure_info()("get_weather").begin
+        assert begin_prefix == expected_begin
+        assert "get_weather" in begin_prefix
+
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json == _SCHEMA_LOCATION
+        assert guided.json_object is False
+        assert guided.structural_tag is None
+
+    def test_forced_name_no_parameters_uses_json_object(self):
+        """Forced-name path falls back to ``json_object`` when no schema.
+
+        When the forced function has no ``parameters``, the helper falls back
+        to ``json_object=True`` so the synthesized ``arguments`` field is still
+        well-formed JSON (typically ``{}``).
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="ping"),
+            ),
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="other",
+                                            parameters=_SCHEMA_QUERY),
+            ),
+        ]
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "ping")
+        assert "ping" in begin_prefix
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json is None
+        assert guided.json_object is True
+
+    def test_forced_name_ignores_strict_flag(self):
+        """The forced-call path engages regardless of any ``strict=True``."""
+        from tensorrt_llm.serve.openai_server import (
+            _build_forced_tool_call_decoding,
+            _build_tool_strict_guided_decoding_params)
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        # Strict-tools path is unchanged: no strict → None.
+        assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
+        # Forced-call path: always constrains.
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "get_weather")
+        assert begin_prefix
+        assert guided is not None
+
+    def test_forced_name_missing_raises_value_error(self):
+        """Forcing a function that is not in tools must raise ValueError."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError) as exc:
+            _build_forced_tool_call_decoding(tools, "qwen3", "missing_fn")
+        msg = str(exc.value)
+        assert "missing_fn" in msg
+        assert "get_weather" in msg  # available functions reported
+
+    def test_forced_name_no_tools_raises_value_error(self):
+        """Forcing a function without any tools provided is a 4xx-class error."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding([], "qwen3", "get_weather")
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(None, "qwen3", "get_weather")
+
+    def test_forced_name_no_parser_raises_value_error(self):
+        """Forcing a function on a server without a tool_parser is a 4xx."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, None, "get_weather")
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, "", "get_weather")
+
+    def test_forced_name_unsupported_parser_raises_value_error(self):
+        """Parsers that do not support structural tags cannot honor forced names."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        # glm4, glm47, qwen3_coder, minimax_m2 do not support structural tags.
+        for parser_name in ("glm4", "glm47", "qwen3_coder", "minimax_m2"):
+            with pytest.raises(ValueError) as exc:
+                _build_forced_tool_call_decoding(tools, parser_name,
+                                                 "get_weather")
+            assert "structural" in str(exc.value).lower()
+
+    def test_forced_name_unknown_parser_raises_value_error(self):
+        """An unregistered parser name should also raise."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, "no_such_parser",
+                                             "get_weather")
+
+    def test_strict_path_unchanged_by_default(self):
+        """Strict-tools path stays untouched without ``strict=True``.
+
+        Regression guard: ``_build_tool_strict_guided_decoding_params`` must
+        still return ``None`` when no tool has ``strict=True``, independent of
+        the new forced-call helper.
+        """
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
