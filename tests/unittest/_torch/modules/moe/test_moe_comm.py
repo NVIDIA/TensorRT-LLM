@@ -46,6 +46,7 @@ Singleton safety:
 Run with: mpirun -np 8 pytest test_moe_comm.py -x -v
 """
 
+import atexit
 import os
 import pickle
 import sys
@@ -253,7 +254,7 @@ def decode_source_info(
     hidden_states: torch.Tensor,
     dtype: torch.dtype,
     hidden_size: int,
-) -> List[Tuple[int, int]]:
+) -> torch.Tensor:
     """Decode (rank_id, token_idx) from the last 4 bytes of each row."""
     element_size = torch.tensor([], dtype=dtype).element_size()
     row_bytes = hidden_size * element_size
@@ -261,13 +262,13 @@ def decode_source_info(
     num_rows = flat_bytes.numel() // row_bytes
 
     if num_rows == 0:
-        return []
+        return torch.empty(0, 2, dtype=torch.int64)
 
     tail = flat_bytes.reshape(num_rows, row_bytes)[:, -4:].cpu().to(torch.int32)
     rank_ids = (tail[:, 0] << 8) | tail[:, 1]
     token_idxs = (tail[:, 2] << 8) | tail[:, 3]
 
-    return list(zip(rank_ids.tolist(), token_idxs.tolist()))
+    return torch.stack((rank_ids, token_idxs), dim=1).to(torch.int64)
 
 
 # ============================================================================
@@ -419,6 +420,92 @@ def create_comm_object(
 
     else:
         raise ValueError(f"Unknown comm type: {comm_type}")
+
+
+_WORKER_COMM_KEY = None
+_WORKER_COMM = None
+
+
+def _comm_reuse_key(config: CommTestConfig) -> Tuple:
+    """Return the constructor-affecting key used for worker-side comm reuse."""
+    if config.comm_type == COMM_ALLGATHER_RS:
+        return (config.comm_type, config.ep_size)
+
+    if config.comm_type == COMM_DEEP_EP:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.hidden_size,
+            config.quant_mode,
+        )
+
+    if config.comm_type == COMM_DEEP_EP_LL:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.hidden_size,
+            config.quant_mode,
+            max(config.all_num_tokens),
+            config.use_low_precision_combine,
+        )
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.top_k,
+            config.hidden_size,
+            max(config.all_num_tokens),
+            config.use_low_precision_combine,
+        )
+
+    if config.comm_type == COMM_NVLINK_TWO_SIDED:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.top_k,
+            config.use_low_precision_combine,
+        )
+
+    if config.comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.top_k,
+        )
+
+    return (config.comm_type,)
+
+
+def _destroy_cached_worker_comm():
+    """Destroy the cached worker comm object, if present."""
+    global _WORKER_COMM_KEY, _WORKER_COMM
+    if _WORKER_COMM is not None and hasattr(_WORKER_COMM, "destroy"):
+        _WORKER_COMM.destroy()
+    _WORKER_COMM_KEY = None
+    _WORKER_COMM = None
+
+
+def _get_worker_comm(mapping: Mapping, config: CommTestConfig):
+    """Reuse the current worker comm object when the constructor key matches."""
+    global _WORKER_COMM_KEY, _WORKER_COMM
+    key = _comm_reuse_key(config)
+    if _WORKER_COMM is not None and _WORKER_COMM_KEY != key:
+        _destroy_cached_worker_comm()
+
+    if _WORKER_COMM is None:
+        _WORKER_COMM = create_comm_object(config.comm_type, mapping, config)
+        _WORKER_COMM_KEY = key
+
+    return _WORKER_COMM
+
+
+atexit.register(_destroy_cached_worker_comm)
 
 
 # ============================================================================
@@ -762,7 +849,7 @@ def _build_worker_result(
     dispatch_outputs: DispatchOutputs,
     combined: torch.Tensor,
     moe_output: torch.Tensor,
-    recv_source_info: List[Tuple[int, int]],
+    recv_source_info: torch.Tensor,
     config: CommTestConfig,
     recv_hs_bf16: Optional[torch.Tensor] = None,
     moe_output_for_ref: Optional[torch.Tensor] = None,
@@ -830,7 +917,6 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
 
-    comm = None
     try:
         mapping = Mapping(
             rank=rank,
@@ -839,7 +925,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             world_size=config.ep_size,
         )
 
-        comm = create_comm_object(config.comm_type, mapping, config)
+        comm = _get_worker_comm(mapping, config)
 
         worker_inputs = _prepare_worker_inputs(rank, config)
         dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
@@ -900,11 +986,9 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             moe_output_for_ref=moe_output_for_ref,
         )
     except Exception:
+        _destroy_cached_worker_comm()
         traceback.print_exc()
         raise
-    finally:
-        if comm is not None and hasattr(comm, "destroy"):
-            comm.destroy()
 
 
 # ============================================================================
@@ -1036,7 +1120,7 @@ def _validate_dispatch_row_slots(
 
 def _record_received_token(
     recv_hs: torch.Tensor,
-    decoded: List[Tuple[int, int]],
+    decoded: torch.Tensor,
     token_idx: int,
     recv_rank: int,
     original_data: Dict[Tuple[int, int], torch.Tensor],
@@ -1044,7 +1128,7 @@ def _record_received_token(
     actually_received: Set[Tuple[int, int]],
 ) -> None:
     """Record one received token and optionally verify row content."""
-    src_rank, src_idx = decoded[token_idx]
+    src_rank, src_idx = decoded[token_idx].tolist()
     key = (src_rank, src_idx)
     actually_received.add(key)
     if key in original_data and not skip_content_check:
@@ -1098,10 +1182,7 @@ def verify_dispatch_alltoall(
     """
     num_experts = config.num_experts
 
-    # For fp8/w4afp8, data is transported as fp8 viewed as bf16 (half width).
-    # For nvfp4, data is packed uint8 (half width).
     qm = config.quant_mode
-    decode_dtype, decode_hidden = _get_dispatch_decode_spec(config)
 
     # Global lookup: (src_rank, token_idx) -> original hidden_states row.
     # For w4afp8, use original_fp8 (fp8 domain) for content comparison.
@@ -1121,7 +1202,7 @@ def verify_dispatch_alltoall(
         # Per-rank slot range — handles non-divisible EP.
         _, slot_start, slot_end = _compute_ep_partition(num_experts, config.ep_size, recv_rank)
 
-        decoded = decode_source_info(recv_hs, decode_dtype, decode_hidden)
+        decoded = result["recv_source_info"]
         actually_received: Set[Tuple[int, int]] = set()
 
         for i in range(recv_hs.shape[0]):
@@ -1276,9 +1357,9 @@ def _build_combine_reference(
         for proc_result in all_results:
             moe_out = proc_result["moe_output_for_ref"]
             source_info = proc_result["recv_source_info"]
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    ref[token_idx] += moe_out[i].float()
+            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            if target_mask.any():
+                ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
     elif config.use_low_precision_combine and config.comm_type == COMM_NVLINK_TWO_SIDED:
         # Path 1b: NVLinkTwoSided NVFP4 simulation + float32 accumulation.
@@ -1291,9 +1372,9 @@ def _build_combine_reference(
         for proc_result in all_results:
             nvfp4_out = proc_result["moe_output_for_ref"]
             source_info = proc_result["recv_source_info"]
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    ref[token_idx] += nvfp4_out[i].float()
+            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            if target_mask.any():
+                ref.index_add_(0, source_info[target_mask, 1], nvfp4_out[target_mask].float())
 
     elif config.comm_type == COMM_DEEP_EP_LL:
         # Path 2: DeepEPLL weighted reduction.
@@ -1313,13 +1394,16 @@ def _build_combine_reference(
                 config.num_experts, config.ep_size, proc_rank
             )
 
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    for k in range(config.top_k):
-                        eid = recv_slots[i, k].item()
-                        if slot_start <= eid < slot_end:
-                            weight = target_original_scales[token_idx, k].float()
-                            ref[token_idx] += recv_hs_bf16[i].float() * weight
+            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            if target_mask.any():
+                target_source_info = source_info[target_mask]
+                local_slot_mask = (recv_slots[target_mask] >= slot_start) & (
+                    recv_slots[target_mask] < slot_end
+                )
+                weights = target_original_scales[target_source_info[:, 1]].float()
+                local_scale_sum = (weights * local_slot_mask.float()).sum(dim=1)
+                contributions = recv_hs_bf16[target_mask].float() * local_scale_sum.unsqueeze(-1)
+                ref.index_add_(0, target_source_info[:, 1], contributions)
 
     else:
         # Path 3: Default — float32 accumulation.
@@ -1328,9 +1412,9 @@ def _build_combine_reference(
         for proc_result in all_results:
             moe_out = proc_result["moe_output"]
             source_info = proc_result["recv_source_info"]
-            for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    ref[token_idx] += moe_out[i].float()
+            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            if target_mask.any():
+                ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
     return ref.to(torch.bfloat16)
 
