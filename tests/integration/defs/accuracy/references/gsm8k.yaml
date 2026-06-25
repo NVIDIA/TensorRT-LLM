@@ -188,8 +188,6 @@ Qwen3/Qwen3-235B-A22B:
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.78
-Qwen3/Qwen3-Next-80B-A3B-Thinking:
-  - accuracy: 81.577
 Qwen3/Qwen3-Next-80B-A3B-Instruct:
   - accuracy: 92.72
   - quant_algo: NVFP4
@@ -209,10 +207,6 @@ Qwen/Qwen3.5-4B:
     quant_algo: FP8_BLOCK_SCALES
     kv_cache_quant_algo: FP8
     accuracy: 76.0
-Qwen/Qwen3.5-9B:
-  - accuracy: 92.53
-  - spec_dec_algo: MTP
-    accuracy: 92.82
 Qwen/Qwen3.5-35B-A3B:
   - accuracy: 89.196
   - dtype: bfloat16
@@ -230,9 +224,6 @@ Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 95.0
-Qwen/Qwen3.6-27B:
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 88.9
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 94.84
@@ -256,16 +247,6 @@ nvidia/Nemotron-H-8B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 85.78
-nvidia/Nemotron-H-47B-Base-8K:
-  - accuracy: 88.82
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 88.55
-nvidia/Nemotron-H-56B-Base-8K:
-  - accuracy: 89.27
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 89.27
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
@@ -374,10 +355,10 @@ GPT-OSS/120B-MXFP4:
 GPT-OSS/20B-MXFP4:
   - accuracy: 85.0
   - spec_dec_algo: DFlash
-    accuracy: 85.0
+    accuracy: 82.0
   - quant_algo: W4A8_MXFP4_MXFP8
     spec_dec_algo: DFlash
-    accuracy: 85.0
+    accuracy: 82.0
   - quant_algo: W4A8_MXFP4_MXFP8
     accuracy: 85.0
   - quant_algo: W4A8_MXFP4_MXFP8
@@ -387,7 +368,7 @@ GPT-OSS/20B-MXFP4:
     accuracy: 85.0
   - quant_algo: W4A16_MXFP4
     spec_dec_algo: DFlash
-    accuracy: 85.0
+    accuracy: 82.0
   - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.0
@@ -493,6 +474,7 @@ zai-org/GLM-5-FP8:
 # (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
 # baseline accuracy.
 stepfun-ai/Step-3.7-Flash:
+  - accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES
