@@ -31,12 +31,12 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RotaryScalingType,
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_utils import (
+    DeepseekV4AttentionType,
+)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import (
     Compressor,
     KVCacheDtype,
-)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
-    DeepseekV4AttentionType,
 )
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
