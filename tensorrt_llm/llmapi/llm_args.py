@@ -46,7 +46,8 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import _str_to_torch_dtype_dict, mpi_rank, prefer_pinned
+from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
+                      prefer_pinned)
 
 # yapf: disable
 # isort: off
@@ -863,6 +864,53 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
 
+class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
+    """Configuration for DeepSeek-V4 Sparse Attention."""
+
+    algorithm: Literal["deepseek_v4"] = "deepseek_v4"
+    index_head_dim: Optional[int] = Field(
+        default=128,
+        description="The dimension of the DeepSeek-V4 indexer heads.")
+    skip_indexer_for_short_seqs: bool = Field(
+        default=False,
+        description=
+        "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+    compress_ratios: List[int] = Field(
+        default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
+        description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
+        "for uncompressed/SWA-only layers; the LLM API config normalizes "
+        "0 to 1, while checkpoint-facing semantics remain unchanged.")
+    window_size: int = Field(
+        default=128,
+        description="The sliding window size in tokens for SWA layers.")
+    index_topk: Optional[int] = Field(default=512,
+                                      description="The top-k for the indexer.")
+
+    @field_validator("index_head_dim")
+    @classmethod
+    def validate_index_head_dim(cls, index_head_dim):
+        if index_head_dim is None:
+            raise ValueError(
+                "index_head_dim is required for DeepSeek-V4 sparse attention.")
+        return index_head_dim
+
+    @field_validator("compress_ratios")
+    @classmethod
+    def normalize_compress_ratios(cls, compress_ratios):
+        if not compress_ratios:
+            raise ValueError("compress_ratios must not be empty.")
+        if any(ratio < 0 for ratio in compress_ratios):
+            raise ValueError("compress_ratios must be non-negative.")
+        return [1 if ratio == 0 else ratio for ratio in compress_ratios]
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        # DeepSeek-V4 does not support short/long CUDA graph separation.
+        return False
+
+
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = Field(default="skip_softmax")
@@ -1060,7 +1108,7 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1090,7 +1138,7 @@ class MoeConfig(StrictBaseModel):
     )
 
 
-Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
+Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
 # Short aliases for built-in custom tokenizers.
 # Maps alias → full import path (module.ClassName).
@@ -2978,11 +3026,28 @@ SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]
+
+
+class KvCacheCompressionConfig(StrictBaseModel):
+    """Config for KV-cache compression: a compression manager runs a KV-reduction
+    algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
+
+    Kept separate from SparseAttentionConfig by design -- compression changes
+    which KV is stored, not the attention computation. The manager is registered
+    as a resource manager in create_py_executor (_util.py), like the KV cache
+    manager itself. Concrete algorithms subclass this and add their parameters.
+    """
+    algorithm: str = Field(
+        description=
+        "Name of the KV-cache compression algorithm to run; selects which "
+        "compression manager is built. Concrete algorithm configs subclass this "
+        "and set the value.")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3475,18 +3540,6 @@ class BaseLlmArgs(StrictBaseModel):
         "The tokenizer class must implement 'from_pretrained(path, **kwargs)' and the TokenizerBase interface.",
         status="prototype")
 
-    post_processor_hook: Optional[str] = Field(
-        default=None,
-        description=
-        "Python import path of a user post-processing hook applied after "
-        "detokenization and before the per-endpoint response formatter (e.g. "
-        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable and "
-        "picklable, take no constructor arguments, and be callable as "
-        "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
-        "It runs once per output, per streaming chunk, and may rewrite, "
-        "suppress, or terminate the output; it owns its own per-request state.",
-        status="prototype")
-
     skip_tokenizer_init: bool = Field(
         default=False,
         description="Whether to skip the tokenizer initialization.")
@@ -3621,6 +3674,13 @@ class BaseLlmArgs(StrictBaseModel):
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
         default=None,
         description="Sparse attention config.",
+        status="prototype")
+
+    # KV cache compression config (separate from sparse attention: changes which
+    # KV is stored, not the attention computation)
+    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+        default=None,
+        description="KV-cache compression config; None disables compression.",
         status="prototype")
 
     # Speculative decoding parameters
@@ -3841,16 +3901,6 @@ class BaseLlmArgs(StrictBaseModel):
     def validate_and_init_tokenizer(self):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
-            # The post-processing hook is a text-based guardrail
-            # and needs detokenized text to inspect; without a tokenizer it could
-            # never run, so reject the combination rather than silently disabling
-            # the guardrail (mirrors the harmony fail-fast in OpenAIServer).
-            if self.post_processor_hook is not None:
-                raise ValueError(
-                    "post_processor_hook is not supported together with "
-                    "skip_tokenizer_init: the post-processing hook operates on "
-                    "detokenized text, which is unavailable when the tokenizer "
-                    "is skipped.")
             self.tokenizer = None
         elif self.custom_tokenizer:
             # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
@@ -5185,6 +5235,13 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
+        if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
+                and self.pipeline_parallel_size > 1 and is_sm_100f()):
+            logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
+                        "SM100/SM103 PP.")
+            self.use_cute_dsl_bf16_bmm = True
+            self.use_cute_dsl_bf16_gemm = True
+
         if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
             major, minor = torch.cuda.get_device_capability()
             sm = major * 10 + minor
