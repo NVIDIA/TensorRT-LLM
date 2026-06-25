@@ -586,7 +586,10 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
         auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
-    llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+    if (llmRequest->getState() != LlmRequestState::kDISAGG_TRANS_ERROR)
+    {
+        llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+    }
 }
 
 void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest)
@@ -805,8 +808,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
+                    TLLM_LOG_WARNING(
+                        "Timed out waiting for context KV cache transfer for request %ld after %d milliseconds.",
+                        request->mRequestId, senderFutureTimeoutMs.value());
                     ++it;
                 }
                 else
@@ -1089,11 +1093,25 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
     if (llmRequest->isContextOnlyRequest())
     {
-        return mCacheSender->cancelRequest(*llmRequest);
+        bool const cancelled = mCacheSender->cancelRequest(*llmRequest);
+        if (cancelled)
+        {
+            auto it = std::remove_if(mSenderFutures.begin(), mSenderFutures.end(),
+                [llmRequest](auto const& item) { return item.first == llmRequest; });
+            mSenderFutures.erase(it, mSenderFutures.end());
+        }
+        return cancelled;
     }
     else if (llmRequest->isGenerationOnlyRequest())
     {
-        return mCacheReceiver->cancelRequest(*llmRequest);
+        bool const cancelled = mCacheReceiver->cancelRequest(*llmRequest);
+        if (cancelled)
+        {
+            auto it = std::remove_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+                [llmRequest](auto const& item) { return item.first == llmRequest; });
+            mRequesterFutures.erase(it, mRequesterFutures.end());
+        }
+        return cancelled;
     }
     return false;
 }

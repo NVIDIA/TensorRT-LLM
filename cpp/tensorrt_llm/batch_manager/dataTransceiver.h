@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,9 +19,12 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -57,6 +60,12 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 class TransferSession
 {
 public:
+    struct PreAssignedRecvBuffer
+    {
+        BaseTransBufferManager* manager;
+        std::optional<int> bufferId;
+    };
+
     // measures for each single transmission
     struct Measure
     {
@@ -151,6 +160,12 @@ public:
         mCounterPartRanks = std::move(ranks);
     }
 
+    void setPreAssignedRecvBuffers(std::vector<PreAssignedRecvBuffer> buffers);
+
+    void releasePreAssignedRecvBuffers();
+
+    void clearPreAssignedRecvBuffers();
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
@@ -162,6 +177,7 @@ private:
     std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
+    std::vector<PreAssignedRecvBuffer> mPreAssignedRecvBuffers;
 };
 
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;

@@ -51,6 +51,28 @@ void TransferSession::setConnection(size_t idx, Connection const* conn)
     mConnections.at(idx) = conn;
 }
 
+void TransferSession::setPreAssignedRecvBuffers(std::vector<TransferSession::PreAssignedRecvBuffer> buffers)
+{
+    mPreAssignedRecvBuffers = std::move(buffers);
+}
+
+void TransferSession::releasePreAssignedRecvBuffers()
+{
+    for (auto& buffer : mPreAssignedRecvBuffers)
+    {
+        if (buffer.manager != nullptr)
+        {
+            buffer.manager->freeBufferIndexForRecv(buffer.bufferId);
+        }
+    }
+    mPreAssignedRecvBuffers.clear();
+}
+
+void TransferSession::clearPreAssignedRecvBuffers()
+{
+    mPreAssignedRecvBuffers.clear();
+}
+
 DataContext const& TransferSession::getDataContext() const
 {
     return mDataContext;
@@ -881,11 +903,15 @@ public:
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         std::vector<std::optional<size_t>> cacheBufferIds;
+        std::vector<TransferSession::PreAssignedRecvBuffer> preAssignedRecvBuffers;
         if (agentConnectionManager)
         {
             for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
             {
-                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
+                auto bufferId = cacheTransBufferManager->assignBufferIndexForRecv();
+                cacheBufferIds.push_back(
+                    bufferId.has_value() ? std::optional<size_t>{static_cast<size_t>(bufferId.value())} : std::nullopt);
+                preAssignedRecvBuffers.push_back({cacheTransBufferManager, bufferId});
             }
             TLLM_CHECK(!cacheBufferIds.empty());
         }
@@ -974,10 +1000,12 @@ public:
             }
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
-        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+        auto session = TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
             std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
             requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
             !common::getEnvKVCacheTimeOutputPath().empty());
+        session.setPreAssignedRecvBuffers(std::move(preAssignedRecvBuffers));
+        return session;
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -1107,15 +1135,25 @@ private:
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
-        bool isReady = receiveReadySignal(session);
-        if (!isReady)
+        try
         {
-            // Reuse the error state for the cancelled request.
-            llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-            llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
-            return;
+            bool isReady = receiveReadySignal(session);
+            if (!isReady)
+            {
+                // Reuse the error state for the cancelled request.
+                llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+                session.releasePreAssignedRecvBuffers();
+                return;
+            }
+            receiveSync(session);
+            session.clearPreAssignedRecvBuffers();
         }
-        receiveSync(session);
+        catch (...)
+        {
+            session.releasePreAssignedRecvBuffers();
+            throw;
+        }
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
