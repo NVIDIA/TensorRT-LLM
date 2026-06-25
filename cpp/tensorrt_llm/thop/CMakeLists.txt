@@ -76,6 +76,7 @@ add_library(
   fusedDiTSplitNormOp.cpp
   ulyssesPostUnscatterOp.cpp
   ulyssesPermuteScatterOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
