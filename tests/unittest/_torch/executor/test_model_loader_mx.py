@@ -17,6 +17,7 @@ from utils.post_transform_qualification import (
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
+from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.modules import mla as mla_mod
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mla import MLA
@@ -204,6 +205,26 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         lambda: SimpleNamespace(synchronize=lambda: None),
     )
     return loader
+
+
+def test_construct_checkpoint_loader_passes_mx_config():
+    mx_config = SimpleNamespace(
+        server_url="http://mx:8001",
+        server_query_timeout_s=17,
+    )
+
+    checkpoint_loader = model_loader_mod._construct_checkpoint_loader(
+        "pytorch",
+        None,
+        "MX",
+        mx_config=mx_config,
+        mx_model_name="Qwen/Qwen2.5-7B-Instruct",
+    )
+
+    assert isinstance(checkpoint_loader, MXCheckpointLoader)
+    assert checkpoint_loader.mx_server_url == "http://mx:8001"
+    assert checkpoint_loader.query_timeout_s == 17
+    assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
 def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(monkeypatch):
@@ -417,6 +438,12 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(monkeypatch
     assert load_fn == model.load_weights
     assert weights == {"disk.weight": checkpoint_loader._disk_weight}
     assert mapper is loader.weight_mapper
+    checkpoint_loader.post_load_publish.assert_called_once_with(
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=False,
+        source_identity=loader._source_identity,
+    )
     assert events == ["load_weights", "post_load_weights"]
     checkpoint_loader.post_load_publish.assert_not_called()
 
