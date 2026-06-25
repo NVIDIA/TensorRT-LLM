@@ -14,6 +14,7 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
+import os
 from functools import lru_cache
 from typing import Any, List
 
@@ -729,6 +730,7 @@ class _FusedHcWorkspaceCache:
     DEFAULT_MAXSIZE = 48
     # Skip the cache above this B; prefill rides the torch allocator.
     _CACHE_MAX_B = 256
+    _USE_POOL = os.environ.get("TRTLLM_DSV4_MEM_OPTS", "0") == "1"
 
     def __init__(self, n: int, hidden_size: int, maxsize: int = DEFAULT_MAXSIZE):
         self.n = n
@@ -746,6 +748,48 @@ class _FusedHcWorkspaceCache:
         m_batches = (B + tm - 1) // tm
         n2 = n * n
         shape_n = n * (2 + n)
+
+        # Pool routing only applies for B <= _CACHE_MAX_B (decode-sized
+        # shapes). For B > _CACHE_MAX_B (prefill), we fall through to fresh
+        # torch.empty per call, matching the upstream uncached path; this
+        # preserves prefill's no-aliasing semantics where layer N's *_prev
+        # inputs and layer N+1's *_cur outputs live in distinct tensors. At
+        # decode, upstream's cache already returns the same tensor across
+        # layers, so the kernel must already be in-place safe; pool routing
+        # inherits that aliasing without widening it.
+
+        def _alloc_through_pool():
+            from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+            buffers = get_memory_buffers()
+            residual_cur = buffers.get_buffer(
+                [B, n, hidden_size], torch.bfloat16, "mhc_residual_cur", False
+            )
+            post_mix_cur = buffers.get_buffer([B, n], torch.float32, "mhc_post_mix_cur", False)
+            comb_mix_cur = buffers.get_buffer([B, n2], torch.float32, "mhc_comb_mix_cur", False)
+            layer_input_cur = buffers.get_buffer(
+                [B, hidden_size], torch.bfloat16, "mhc_layer_input_cur", False
+            )
+            if ws_ks == 1:
+                y_acc_ws = buffers.get_buffer([B, shape_n], torch.float32, "mhc_y_acc_ws", False)
+                r_acc_ws = buffers.get_buffer([B], torch.float32, "mhc_r_acc_ws", False)
+            else:
+                y_acc_ws = buffers.get_buffer(
+                    [ws_ks, B, shape_n], torch.float32, "mhc_y_acc_ws_ks", False
+                )
+                r_acc_ws = buffers.get_buffer([ws_ks, B], torch.float32, "mhc_r_acc_ws_ks", False)
+            done_counter_ws = buffers.get_buffer(
+                [m_batches], torch.int32, "mhc_done_counter_ws", False
+            )
+            return (
+                residual_cur,
+                post_mix_cur,
+                comb_mix_cur,
+                layer_input_cur,
+                y_acc_ws,
+                r_acc_ws,
+                done_counter_ws,
+            )
 
         def _alloc():
             residual_cur = torch.empty((B, n, hidden_size), dtype=torch.bfloat16, device=device)
@@ -769,8 +813,15 @@ class _FusedHcWorkspaceCache:
                 done_counter_ws,
             )
 
+        # Prefill (B > _CACHE_MAX_B) always uses fresh torch.empty, even when
+        # the pool is on, so prefill keeps upstream's no-aliasing semantics.
         if B > self._CACHE_MAX_B:
             return _alloc()
+
+        # Decode-sized: pool routing returns named buffers (aliased across
+        # layers, matching upstream's cache-hit semantics).
+        if self._USE_POOL:
+            return _alloc_through_pool()
 
         key = (B, ws_ks, m_batches, device)
         hit = self._cache.get(key)
