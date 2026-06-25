@@ -206,6 +206,8 @@ full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_d
 full:H20/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2] SKIP (https://nvbugs/6313314)
 full:H20/accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=3-block_reuse=True-use_py_transceiver=False] SKIP (https://nvbugs/6344108)
 full:H20/accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4 SKIP (https://nvbugs/6344108)
+full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler] SKIP (https://nvbugs/6373530)
+full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-two_model-overlap_scheduler] SKIP (https://nvbugs/6373530)
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
 full:H20/accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=0] SKIP (https://nvbugs/6274932)
 full:H20/accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6274932)
