@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/dynamicBatchTuner.h"
+#include "tensorrt_llm/batch_manager/trtGptModelInflightBatching.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -27,6 +28,7 @@ using ::testing::Invoke;
 
 using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::common;
+using tensorrt_llm::batch_manager::detail::getRuntimeBatchTuningCapacity;
 
 TEST(DynamicBatchTunerTest, Stats)
 {
@@ -71,6 +73,22 @@ TEST(DynamicBatchConfig, RuntimeBatchSize)
     // fall back
     EXPECT_EQ(dynamicBatchTuner.getRuntimeBatchSize(2049), 2048);
     EXPECT_EQ(dynamicBatchTuner.getRuntimeBatchSize(1665), 1665);
+}
+
+TEST(DynamicBatchConfig, RuntimeBatchSizeUsesPerMicroBatchCapacityForPipelineParallelism)
+{
+    DynamicBatchConfig dynamicBatchConfig(true, true, 3);
+    DynamicBatchTuner dynamicBatchTuner(dynamicBatchConfig);
+
+    auto const ppCapacity = getRuntimeBatchTuningCapacity(/*maxCapacityBatchSize=*/640,
+        /*isPipelineParallel=*/true, /*pipelineParallelism=*/2);
+    EXPECT_EQ(ppCapacity, 320);
+    EXPECT_EQ(dynamicBatchTuner.getRuntimeBatchSize(ppCapacity), 256);
+
+    auto const nonPpCapacity = getRuntimeBatchTuningCapacity(/*maxCapacityBatchSize=*/640,
+        /*isPipelineParallel=*/false, /*pipelineParallelism=*/2);
+    EXPECT_EQ(nonPpCapacity, 640);
+    EXPECT_EQ(dynamicBatchTuner.getRuntimeBatchSize(nonPpCapacity), 512);
 }
 
 TEST(DynamicBatchConfig, RuntimeMaxNumTokens)
