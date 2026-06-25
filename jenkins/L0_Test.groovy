@@ -2870,17 +2870,14 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // renderTestDB falls back to the source test-db.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null && cbts.test_db_dir_override && cbts.cbts_test_db_artifact_path) {
-        def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
-        def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
-        if (dirExists != "yes") {
-            try {
-                def artifactUrl = "${URM_ARTIFACTORY_BASE}/${cbts.cbts_test_db_artifact_path}"
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${artifactUrl}' -O /tmp/cbts_test_db.tar.gz && tar xzf /tmp/cbts_test_db.tar.gz -C ${llmSrc}")
-                echo "CBTS Layer 3: extracted cbts_test_db from artifact"
-            } catch (Exception e) {
-                echo "CBTS Layer 3: artifact download failed " +
-                     "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
-            }
+        try {
+            // Always re-fetch: a reused workspace may hold a stale cbts_test_db/ shadowing this build's YAMLs.
+            def artifactUrl = "${URM_ARTIFACTORY_BASE}/${cbts.cbts_test_db_artifact_path}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv '${artifactUrl}' -O /tmp/cbts_test_db.tar.gz && tar xzf /tmp/cbts_test_db.tar.gz -C ${llmSrc}")
+            echo "CBTS Layer 3: extracted cbts_test_db from artifact"
+        } catch (Exception e) {
+            echo "CBTS Layer 3: artifact download failed " +
+                 "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
         }
     }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
