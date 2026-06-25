@@ -39,19 +39,6 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 90.30
   - quant_algo: FP8
     accuracy: 90.30
-meta-llama/Llama-4-Maverick-17B-128E-Instruct:
-  - accuracy: 92.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 92.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: Eagle
-    accuracy: 92.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: Eagle3
-    accuracy: 92.20
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 89.70
   - quant_algo: NVFP4
@@ -247,16 +234,6 @@ nvidia/Nemotron-H-8B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 85.78
-nvidia/Nemotron-H-47B-Base-8K:
-  - accuracy: 88.82
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 88.55
-nvidia/Nemotron-H-56B-Base-8K:
-  - accuracy: 89.27
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 89.27
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
@@ -277,11 +254,6 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
     accuracy: 94.16
 kanana-1.5-2.1b-instruct-2505:
   - accuracy: 75.81
-speakleash/Bielik-11B-v2.2-Instruct:
-  - accuracy: 41.51
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 40.41
 google/gemma-3-1b-it:
   - accuracy: 25.52 # score getting from lm-eval with HF implementation
   - quant_algo: FP8
@@ -318,11 +290,6 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
-microsoft/phi-4:
-  - accuracy: 90.30
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 90.64
 mistralai/Codestral-22B-v0.1:
   - accuracy: 67.10
 openai/gpt-oss-120b:
@@ -484,6 +451,7 @@ zai-org/GLM-5-FP8:
 # (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
 # baseline accuracy.
 stepfun-ai/Step-3.7-Flash:
+  - accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88
   - quant_algo: FP8_BLOCK_SCALES

@@ -46,7 +46,8 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import _str_to_torch_dtype_dict, mpi_rank, prefer_pinned
+from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
+                      prefer_pinned)
 
 # yapf: disable
 # isort: off
@@ -460,6 +461,77 @@ CudaGraphConfigType: TypeAlias = Annotated[
 ]
 
 
+class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
+    """CUDA graph capture for multimodal vision / audio encoders.
+
+    One graph is captured per `buckets` entry; replay falls back to eager when the live workload's
+    padded shape does not match any bucket.
+
+    NOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for
+    `buckets` corresponding to lesser compute.
+    """
+
+    buckets: list[tuple[PositiveInt, PositiveInt]] = Field(
+        min_length=1,
+        description=
+        ("Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair "
+         "captures one graph sized for up to `total_tokens` real encoder tokens across exactly "
+         "`num_contexts` real contexts."),
+        status="prototype",
+    )
+
+    enable_padding: bool = Field(
+        default=True,
+        description=
+        ("Capture a padded variant of each bucket so partial buckets can replay. Padding works "
+         "only when the request has exactly the bucket's `num_contexts` real contexts and no "
+         "more than the bucket's `total_tokens` real encoder tokens. The runner appends one "
+         "dummy padding context and one reserved padding token internally, so bucket values "
+         "should describe only the real workload."),
+        status="prototype",
+    )
+
+    warmup_steps: PositiveInt = Field(
+        default=2,
+        description="Warmup iterations to run per bucket before capturing.",
+        status="prototype",
+    )
+
+    enable_replay_stats: bool = Field(
+        default=False,
+        description=
+        ("Log diagnostic details for encoder CUDA graph bucket hits and misses. "
+         "When enabled, each request's bucket decision is logged at INFO."),
+        status="prototype",
+    )
+
+    @model_validator(mode='after')
+    def _normalize(self) -> 'MultimodalEncoderCudaGraphConfig':
+        for total_tokens, num_contexts in self.buckets:
+            if total_tokens < num_contexts:
+                raise ValueError("`buckets` entries must have total_tokens >= "
+                                 "num_contexts.")
+        self.buckets = sorted(set(self.buckets))
+        return self
+
+
+# TODO(TRTLLM-13352): migrate `TorchLlmArgs.mm_encoder_only` and
+# `TorchLlmArgs.video_pruning_rate` into this class in a follow-up change.
+class MultimodalConfig(StrictBaseModel):
+    """Multimodal model configuration."""
+
+    encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
+        default=None,
+        description=
+        ("CUDA graph capture for multimodal encoders, keyed by modality name. "
+         "This config is not applied automatically - each model must read "
+         "`model_config.multimodal_config.encoder_cuda_graph` and implement capture + replay "
+         "via `MultimodalEncoderCudaGraphRunner` (see "
+         "`tensorrt_llm/_torch/models/multimodal_encoder_graph.py`)."),
+        status="prototype",
+    )
+
+
 class GuidedDecodingConfig(StrictBaseModel):
 
     class GuidedDecodingBackend(Enum):
@@ -792,6 +864,53 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
 
+class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
+    """Configuration for DeepSeek-V4 Sparse Attention."""
+
+    algorithm: Literal["deepseek_v4"] = "deepseek_v4"
+    index_head_dim: Optional[int] = Field(
+        default=128,
+        description="The dimension of the DeepSeek-V4 indexer heads.")
+    skip_indexer_for_short_seqs: bool = Field(
+        default=False,
+        description=
+        "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+    compress_ratios: List[int] = Field(
+        default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
+        description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
+        "for uncompressed/SWA-only layers; the LLM API config normalizes "
+        "0 to 1, while checkpoint-facing semantics remain unchanged.")
+    window_size: int = Field(
+        default=128,
+        description="The sliding window size in tokens for SWA layers.")
+    index_topk: Optional[int] = Field(default=512,
+                                      description="The top-k for the indexer.")
+
+    @field_validator("index_head_dim")
+    @classmethod
+    def validate_index_head_dim(cls, index_head_dim):
+        if index_head_dim is None:
+            raise ValueError(
+                "index_head_dim is required for DeepSeek-V4 sparse attention.")
+        return index_head_dim
+
+    @field_validator("compress_ratios")
+    @classmethod
+    def normalize_compress_ratios(cls, compress_ratios):
+        if not compress_ratios:
+            raise ValueError("compress_ratios must not be empty.")
+        if any(ratio < 0 for ratio in compress_ratios):
+            raise ValueError("compress_ratios must be non-negative.")
+        return [1 if ratio == 0 else ratio for ratio in compress_ratios]
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        # DeepSeek-V4 does not support short/long CUDA graph separation.
+        return False
+
+
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = Field(default="skip_softmax")
@@ -989,7 +1108,7 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1019,7 +1138,7 @@ class MoeConfig(StrictBaseModel):
     )
 
 
-Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
+Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
 # Short aliases for built-in custom tokenizers.
 # Maps alias → full import path (module.ClassName).
@@ -2907,11 +3026,28 @@ SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
     ],
     Field(discriminator="algorithm"),
 ]
+
+
+class KvCacheCompressionConfig(StrictBaseModel):
+    """Config for KV-cache compression: a compression manager runs a KV-reduction
+    algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
+
+    Kept separate from SparseAttentionConfig by design -- compression changes
+    which KV is stored, not the attention computation. The manager is registered
+    as a resource manager in create_py_executor (_util.py), like the KV cache
+    manager itself. Concrete algorithms subclass this and add their parameters.
+    """
+    algorithm: str = Field(
+        description=
+        "Name of the KV-cache compression algorithm to run; selects which "
+        "compression manager is built. Concrete algorithm configs subclass this "
+        "and set the value.")
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3538,6 +3674,13 @@ class BaseLlmArgs(StrictBaseModel):
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
         default=None,
         description="Sparse attention config.",
+        status="prototype")
+
+    # KV cache compression config (separate from sparse attention: changes which
+    # KV is stored, not the attention computation)
+    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+        default=None,
+        description="KV-cache compression config; None disables compression.",
         status="prototype")
 
     # Speculative decoding parameters
@@ -4368,6 +4511,11 @@ class TorchLlmArgs(BaseLlmArgs):
                                         for k in encoder_keys) else "decode"
         return v
 
+    multimodal_config: MultimodalConfig = Field(
+        default_factory=MultimodalConfig,
+        description="Multimodal model configuration.",
+        status="prototype")
+
     attention_dp_config: Optional[AttentionDpConfig] = Field(
         default=None,
         description="Optimized load-balancing for the DP Attention scheduler.",
@@ -5087,6 +5235,13 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
+        if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
+                and self.pipeline_parallel_size > 1 and is_sm_100f()):
+            logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
+                        "SM100/SM103 PP.")
+            self.use_cute_dsl_bf16_bmm = True
+            self.use_cute_dsl_bf16_gemm = True
+
         if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
             major, minor = torch.cuda.get_device_capability()
             sm = major * 10 + minor
