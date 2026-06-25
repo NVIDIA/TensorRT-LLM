@@ -1545,6 +1545,64 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 test_sets=["GSM8K"],
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                             ids=["cache_mgr_v1", "cache_mgr_v2"])
+    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2, mocker):
+        """GPT-OSS disagg, NIXL Python transceiver (v2), KV cache manager v1 and v2 (ctx tp2 + gen tp2)."""
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            run_accuracy_test(
+                llm,
+                model_name,
+                test_sets=["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
+
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
@@ -2085,6 +2143,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
