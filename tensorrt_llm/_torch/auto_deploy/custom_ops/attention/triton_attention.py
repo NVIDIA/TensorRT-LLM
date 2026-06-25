@@ -1171,22 +1171,33 @@ def triton_context(
             k_sdpa = k_sdpa.to(q.dtype)
             v_sdpa = v_sdpa.to(q.dtype)
 
-        q_positions = torch.arange(max_q_len, device=q.device, dtype=cache_lens.dtype)
-        kv_positions = torch.arange(max_kv_len, device=q.device, dtype=kv_lens.dtype)
-        attn_mask = kv_positions.view(1, 1, 1, max_kv_len) < kv_lens.view(num_seq, 1, 1, 1)
-        causal_mask = kv_positions.view(1, 1, 1, max_kv_len) <= (
-            cache_lens.view(num_seq, 1, 1, 1) + q_positions.view(1, 1, max_q_len, 1)
-        )
-        attn_mask = attn_mask & causal_mask
+        # An explicit attn_mask forces SDPA onto the math backend, which
+        # materializes a [num_seq, n_heads, max_q_len, max_kv_len] fp32 score
+        # tensor (e.g. 8 GiB for the 8192-token piecewise cudagraph warmup on
+        # Llama-3.1-8B) and OOMs on memory-tight GPUs like L40S. When
+        # max_q_len == max_kv_len under the all_same_q_len gate, all cache_lens
+        # are 0 and the mask is plain lower-triangular: drop it and let
+        # is_causal=True dispatch to the fused flash kernel.
+        sdpa_scratch_bytes = num_seq * n_heads * max_q_len * max_kv_len * q.element_size()
+        use_is_causal = max_q_len == max_kv_len and sdpa_scratch_bytes > 2 * 1024**3
+        if use_is_causal:
+            attn_mask = None
+        else:
+            q_positions = torch.arange(max_q_len, device=q.device, dtype=cache_lens.dtype)
+            kv_positions = torch.arange(max_kv_len, device=q.device, dtype=kv_lens.dtype)
+            attn_mask = kv_positions.view(1, 1, 1, max_kv_len) < kv_lens.view(num_seq, 1, 1, 1)
+            causal_mask = kv_positions.view(1, 1, 1, max_kv_len) <= (
+                cache_lens.view(num_seq, 1, 1, 1) + q_positions.view(1, 1, max_q_len, 1)
+            )
+            attn_mask = attn_mask & causal_mask
 
-        # SDPA with GQA
         o_sdpa = torch.nn.functional.scaled_dot_product_attention(
             q.view(num_seq, max_q_len, n_heads, head_dim).transpose(1, 2),
             k_sdpa,
             v_sdpa,
             scale=sm_scale,
             attn_mask=attn_mask,
-            is_causal=False,
+            is_causal=use_is_causal,
             enable_gqa=True,
         )
         output.view(num_seq, max_q_len, n_heads, head_dim).copy_(o_sdpa.permute(0, 2, 1, 3))
