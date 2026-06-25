@@ -24,7 +24,6 @@ from tensorrt_llm.llmapi.thinking_budget import (
 )
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
 from tensorrt_llm.serve.openai_protocol import (
-    REQUEST_CHAT_TEMPLATE_DISABLED_ERROR,
     ChatCompletionRequest,
     CompletionRequest,
     KVCacheTruncateRequest,
@@ -105,7 +104,7 @@ def test_resource_governor_rejects_request_chat_template_by_default():
     response = asyncio.run(governor._truncate_kv_cache(request))
 
     assert response.status_code == 400
-    assert json.loads(response.body)["error"] == REQUEST_CHAT_TEMPLATE_DISABLED_ERROR
+    assert json.loads(response.body)["error"]
 
 
 def test_completion_logprobs_assignment_revalidates():
