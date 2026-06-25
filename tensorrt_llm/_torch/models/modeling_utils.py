@@ -738,11 +738,40 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self,
-                     weights: Dict,
+                     weights: dict[str, torch.Tensor],
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: List[str] = [],
-                     params_map: Optional[Dict[str, str]] = None,
+                     skip_modules: list[str] = [],
+                     params_map: dict[str, str] | None = None,
                      allow_partial_loading: bool = False):
+        """Load checkpoint weights into this model.
+
+        Basic function for an LLM class to load weights from a dict of weight
+        tensors.
+        The function walks the model's named modules, select matching tensors
+        from `weights`, and either call each module's `load_weights` method
+        if available, or copy tensors into parameters directly.
+        If `weight_mapper` is not None, uses it to perform custom weight mapping
+        before loading weights to each module; otherwise, perform hardcoded
+        weight fusion for some modules during loading.
+
+        Args:
+            weights: dict[str, Tensor], mapping from checkpoint/state-dict keys
+                to tensors. If the key string does not match LLM class's child
+                module names, you need to use `params_map` or `weight_mapper` to
+                remap them.
+            weight_mapper: Optional mapper initialized for this model and
+                checkpoint format. When provided, it controls model-specific key
+                filtering, fused-module mappings, special module handling, and
+                manual parameter copies.
+            skip_modules: list[str], skip modules which contain these substrings.
+                This is used for LLM classes who have some child modules (e.g.
+                speculative decoding modules) that should be loaded from a
+                different function later.
+            params_map: Optional regex replacement map applied before loading
+                to rename checkpoint keys into the model's expected key space.
+            allow_partial_loading: if true, accept `weights` as an incomplete
+                weight dict and update only the parameters present.
+        """
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
         # this method will be removed.
@@ -1194,69 +1223,77 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) > 0:
-            if weight_mapper.should_skip_module(name):
-                return
+        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
+                name):
+            return
 
+        names = name.split('.')
+
+        # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+        # Currently saved MoE weights don't include 'backend' in their names.
+        # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+        # and weights loading is done in the backend, so module name includes '.backend'.
+        # We need to use parent module name (without .backend) to match saved weight names.
+        # After MoE refactoring is fully complete, all paths will follow this branch.
+        if names[-1] == "backend" and isinstance(module, MoE):
+            name = '.'.join(names[:-1])
             names = name.split('.')
 
-            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
-            # Currently saved MoE weights don't include 'backend' in their names.
-            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
-            # and weights loading is done in the backend, so module name includes '.backend'.
-            # We need to use parent module name (without .backend) to match saved weight names.
-            # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
-                name = '.'.join(names[:-1])
-                names = name.split('.')
+        module_names_breakdown, module_name = names[:-1], names[-1]
 
-            module_names_breakdown, module_name = names[:-1], names[-1]
-
-            if weight_mapper.does_require_special_handling(module_name):
-                module_weights = weight_mapper.apply_callbacks(
+        # check if the module has non-default weight loading, like fusing some weight
+        # tensors together.
+        if weight_mapper.does_require_special_handling(module_name):
+            # Process the weights, e.g. duplicating kv heads to match query heads after
+            # slicing for tensor parallelism.
+            module_weights: list[dict[
+                str, torch.Tensor]] = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
-                module.load_weights(weights=module_weights,
-                                    allow_partial_loading=allow_partial_loading)
+            # Call module's custom `load_weights()` to process weight, e.g. fusing
+            # several GEMM matrices together
+            module.load_weights(weights=module_weights,
+                                allow_partial_loading=allow_partial_loading)
 
-                # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
-                if hasattr(weights, 'mark_consumed'):
-                    for src_name in weight_mapper._mapping.get(module_name, []):
-                        prefix = '.'.join(module_names_breakdown + [src_name])
-                        weights.mark_consumed(prefix)
+            # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
+            if hasattr(weights, 'mark_consumed'):
+                for src_name in weight_mapper.mapping.get(module_name, []):
+                    prefix = '.'.join(module_names_breakdown + [src_name])
+                    weights.mark_consumed(prefix)
+            return
+        module_weights: dict[str, torch.Tensor] = weight_mapper.filter_weights(
+            name, weights)
+        # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+        if not module_weights:
+            return
+        if weight_mapper.is_special_instance_module(module):
+            weight_mapper.handle_special_instance_module(
+                module,
+                module_name,
+                module_weights,
+                allow_partial_loading=allow_partial_loading)
+        elif hasattr(module, 'load_weights'):
+            if "linear_attn.conv1d" in name:
+                module_weights['weight'] = module_weights['weight'].squeeze(
+                    dim=1)
+            args = inspect.getfullargspec(module.load_weights).args
+            if "allow_partial_loading" not in args:
+                assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
+                module.load_weights(weights=[module_weights])
             else:
-                module_weights = weight_mapper.filter_weights(name, weights)
-                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
-                if module_weights:
-                    if weight_mapper.is_special_instance_module(module):
-                        weight_mapper.handle_special_instance_module(
-                            module,
-                            module_name,
-                            module_weights,
-                            allow_partial_loading=allow_partial_loading)
-                    elif hasattr(module, 'load_weights'):
-                        if "linear_attn.conv1d" in name:
-                            module_weights['weight'] = module_weights[
-                                'weight'].squeeze(dim=1)
-                        args = inspect.getfullargspec(module.load_weights).args
-                        if "allow_partial_loading" not in args:
-                            assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
-                            module.load_weights(weights=[module_weights])
-                        else:
-                            module.load_weights(
-                                weights=[module_weights],
-                                allow_partial_loading=allow_partial_loading)
-                    else:
-                        for n, p in module.named_parameters(recurse=False):
-                            weight_mapper.handle_manual_copy(
-                                module_name,
-                                module_weights,
-                                n,
-                                p,
-                                allow_partial_loading=allow_partial_loading)
+                module.load_weights(weights=[module_weights],
+                                    allow_partial_loading=allow_partial_loading)
+        else:
+            for n, p in module.named_parameters(recurse=False):
+                weight_mapper.handle_manual_copy(
+                    module_name,
+                    module_weights,
+                    n,
+                    p,
+                    allow_partial_loading=allow_partial_loading)
 
-                    # Mark consumed weights
-                    if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+        # Mark consumed weights
+        if hasattr(weights, 'mark_consumed'):
+            weights.mark_consumed(name)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:

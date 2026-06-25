@@ -18,7 +18,7 @@ import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List
+from typing import List
 
 import psutil
 import safetensors
@@ -225,7 +225,13 @@ class HfWeightLoader(BaseWeightLoader):
                      checkpoint_dir: str,
                      mapping: Mapping,
                      use_consolidated: bool = False,
-                     **kwargs) -> dict[str, Any]:
+                     **kwargs) -> dict[str, torch.Tensor]:
+        """
+        Load the model weights as a dict of name -> torch.Tensor.
+
+        If CPU memory is large enough, prefetch all files in parallel to warm up OS file cache.
+        Then build and return a `ConsumableWeightsDict` by loading all files in parallel.
+        """
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former unless specified explicitly, as there really is no need
@@ -310,7 +316,7 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _load_safetensors_file(file):
+    def _load_safetensors_file(file) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
