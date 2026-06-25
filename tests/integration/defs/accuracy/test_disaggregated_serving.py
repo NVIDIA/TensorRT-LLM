@@ -272,14 +272,16 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env = base_env.copy()
-        env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        cache_transceiver_config_backend = ctx_server_config.get(
+            "cache_transceiver_config", {}).get("backend", "DEFAULT")
+        # NIXL backend ignores this env-var fallback; skip it.
+        if cache_transceiver_config_backend != "NIXL":
+            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
-        cache_transceiver_config_backend = ctx_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
         if cache_transceiver_config_backend == "NIXL":
             env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
@@ -307,13 +309,15 @@ def launch_disaggregated_llm(
         env = base_env.copy()
         if gen_extra_env:
             env.update(gen_extra_env)
-        env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+        cache_transceiver_config_backend = gen_server_config.get(
+            "cache_transceiver_config", {}).get("backend", "DEFAULT")
+        # NIXL backend ignores this env-var fallback; skip it.
+        if cache_transceiver_config_backend != "NIXL":
+            env["TRTLLM_USE_UCX_KVCACHE"] = "1"
         # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
         env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
-        cache_transceiver_config_backend = gen_server_config.get(
-            "cache_transceiver_config", {}).get("backend", "DEFAULT")
         if cache_transceiver_config_backend == "NIXL":
             env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
@@ -1545,6 +1549,64 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 test_sets=["GSM8K"],
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                             ids=["cache_mgr_v1", "cache_mgr_v2"])
+    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2, mocker):
+        """GPT-OSS disagg, NIXL Python transceiver (v2), KV cache manager v1 and v2 (ctx tp2 + gen tp2)."""
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            run_accuracy_test(
+                llm,
+                model_name,
+                test_sets=["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
+
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
@@ -2176,9 +2238,11 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
             use_py_transceiver=False)
+        # corner case: max_batch_size = 1 + dp for ctx to check if dp dummy requests are handled correctly
+        ctx_cfg["max_batch_size"] = 1
+        ctx_cfg["enable_attention_dp"] = True
         ctx_cfg["tensor_parallel_size"] = 2
         ctx_cfg["moe_expert_parallel_size"] = 2
-        ctx_cfg["enable_attention_dp"] = True
         gen_cfg["tensor_parallel_size"] = 4
         gen_cfg["moe_expert_parallel_size"] = 4
         gen_cfg["pipeline_parallel_size"] = 1

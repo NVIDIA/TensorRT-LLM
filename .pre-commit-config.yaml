@@ -302,6 +302,25 @@ common-files: &common_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/epilogue_refactor.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/fc1_fc2_fuse_sched.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/grid_sync.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/iket_compat.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_constants.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_kernel.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_persistent_scheduler.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_utils.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/ptx_helpers.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sf_swizzle.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sym_buffer.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/token_comm.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/topk_reduce.py |
         tensorrt_llm/_torch/cute_dsl_utils.py |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
@@ -1012,7 +1031,6 @@ common-files: &common_files |
         tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_best_of_n.py |
-        tests/unittest/_torch/sampler/test_torch_multi_arange.py |
         tests/unittest/_torch/sampler/test_trtllm_sampler.py |
         tests/unittest/_torch/speculative/test_draft_target.py |
         tests/unittest/_torch/speculative/test_draft_token_tree_sampling.py |
@@ -1027,6 +1045,7 @@ common-files: &common_files |
         tests/unittest/_torch/speculative/test_torch_rejection_sampling.py |
         tests/unittest/_torch/speculative/test_user_provided.py |
         tests/unittest/_torch/test_connector.py |
+        tests/unittest/_torch/test_torch_multi_arange.py |
         tests/unittest/_torch/thop/parallel/deep_gemm_tests.py |
         tests/unittest/_torch/thop/parallel/test_causal_conv1d_op.py |
         tests/unittest/_torch/thop/parallel/test_cublas_mm.py |
@@ -1658,6 +1677,25 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/custom_ext.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/dynamic_mainloop.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/epilogue_refactor.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/fc1_fc2_fuse_sched.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/grid_sync.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/iket_compat.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/kernel_fc12.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_constants.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/megamoe_kernel.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_persistent_scheduler.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/moe_utils.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/ptx_helpers.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sf_swizzle.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/sym_buffer.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/token_comm.py |
+        tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/topk_reduce.py |
         tensorrt_llm/_torch/cute_dsl_utils.py |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
@@ -2368,7 +2406,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_best_of_n.py |
-        tests/unittest/_torch/sampler/test_torch_multi_arange.py |
         tests/unittest/_torch/sampler/test_trtllm_sampler.py |
         tests/unittest/_torch/speculative/test_draft_target.py |
         tests/unittest/_torch/speculative/test_draft_token_tree_sampling.py |
@@ -2383,6 +2420,7 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/speculative/test_torch_rejection_sampling.py |
         tests/unittest/_torch/speculative/test_user_provided.py |
         tests/unittest/_torch/test_connector.py |
+        tests/unittest/_torch/test_torch_multi_arange.py |
         tests/unittest/_torch/thop/parallel/deep_gemm_tests.py |
         tests/unittest/_torch/thop/parallel/test_causal_conv1d_op.py |
         tests/unittest/_torch/thop/parallel/test_cublas_mm.py |

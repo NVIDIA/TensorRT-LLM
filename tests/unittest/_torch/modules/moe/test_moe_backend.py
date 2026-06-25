@@ -67,9 +67,20 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 logger = logging.getLogger(__name__)
 
 
+_MEGAMOE_BACKEND_TYPES = {
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
+}
+
+
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
-    """MegaMoE resolves an EP ProcessGroup at construction time."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """Every MegaMoE backend (DG + CuteDSL) resolves an EP ProcessGroup
+    at construction time via ``_resolve_ep_pg``. Single-process tests
+    must therefore initialise ``torch.distributed`` even when the test
+    only exercises ``ep_size == 1`` -- otherwise the constructor raises
+    ``MegaMoe*Unavailable``. Both MegaMoE backends need the same fixture
+    so the dist helper must accept the full set."""
+    if backend_type not in _MEGAMOE_BACKEND_TYPES:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
@@ -184,7 +195,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
             moe_tp_size=1,
             moe_ep_size=4,
         ),
-        moe_backend=MoeBackendType.MEGAMOE.value,
+        moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
     with pytest.raises(
@@ -239,7 +250,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
-    - MEGAMOE_DEEPGEMM: token_selected_experts=int64, output_dtype
+    - MegaMoE backends: token_selected_experts=int64, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -270,7 +281,7 @@ def run_backend_moe(
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         args["workspace"] = backend.get_workspace(m_max, 128)
-    elif backend_type == MoeBackendType.MEGAMOE:
+    elif backend_type in _MEGAMOE_BACKEND_TYPES:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
 
@@ -302,8 +313,10 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
-    MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
+    MoeBackendType.MARLIN,
 ]
 
 # Data types to test
@@ -555,6 +568,10 @@ def test_moe_backend(
     # DENSEGEMM: disable fused fc2_alpha path for backend-level testing.
     if backend_type == MoeBackendType.DENSEGEMM:
         monkeypatch.setenv("TRTLLM_MOE_FUSED_FC2_ALPHA", "0")
+
+    # MEGAMOE_CUTEDSL threads per-expert fc31_alpha / fc2_alpha /
+    # fc1_norm_const through the kernel ABI, so NVFP4QuantizeUtil's non-1
+    # weight_scale_2 values compute correctly without a test bypass.
 
     is_gated = is_gated_activation(activation_type)
     swiglu_gptoss_style = False

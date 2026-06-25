@@ -1,9 +1,10 @@
+import math
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal, get_args, get_origin
+from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 
 import pydantic_core
 import pytest
@@ -31,6 +32,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekV4SparseAttentionConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -39,8 +41,11 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
-                                          MTPDecodingConfig, PeftCacheConfig,
-                                          PybindMirror, RayPlacementConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
+                                          MultimodalEncoderCudaGraphConfig,
+                                          PeftCacheConfig, PybindMirror,
+                                          RayPlacementConfig,
+                                          SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs, TrtLlmArgs,
@@ -331,6 +336,8 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
@@ -341,6 +348,7 @@ def test_KvCacheConfig_declaration():
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
+                           kv_cache_event_hash_algo="v2_sha256_64",
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
                            attention_dp_events_gather_period_ms=10)
@@ -356,6 +364,11 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
+    assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert KvCacheConfig(
+        kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
+                         ).kv_cache_event_hash_algo == "v1_block_key"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
@@ -370,6 +383,85 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
     with pytest.raises(ValidationError) as exc_info:
         KvCacheConfig(disk_cache_size=2048)
     assert "disk_cache_path" in str(exc_info.value)
+
+
+class TestMultimodalEncoderCudaGraphConfig:
+
+    def test_minimal_required_fields(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
+        assert config.buckets == [(1035, 1)]
+        assert config.enable_padding is True
+        assert config.warmup_steps == 2
+        assert config.enable_replay_stats is False
+
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)],
+                                                  enable_replay_stats=True)
+        assert config.enable_replay_stats is True
+
+    def test_explicit_buckets_deduped_and_sorted(self):
+        config = MultimodalEncoderCudaGraphConfig(buckets=[(2069,
+                                                            2), (1035,
+                                                                 1), (2069, 2)])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    def test_explicit_buckets_accept_yaml_style_lists(self):
+        config = MultimodalEncoderCudaGraphConfig(
+            buckets=[[2069, 2], [1035, 1]])
+        assert config.buckets == [(1035, 1), (2069, 2)]
+
+    @pytest.mark.parametrize("kwargs", [{
+        "buckets": []
+    }, {}],
+                             ids=["empty", "missing"])
+    def test_rejects_absent_buckets(self, kwargs):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(**kwargs)
+
+    @pytest.mark.parametrize("buckets", [[(0, 1)], [(1, -2)], [(3, 0)]])
+    def test_rejects_non_positive_buckets(self, buckets):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=buckets)
+
+    def test_rejects_buckets_with_too_few_tokens(self):
+        with pytest.raises(ValidationError):
+            MultimodalEncoderCudaGraphConfig(buckets=[(1, 2)])
+
+
+class TestMultimodalConfig:
+
+    def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().encoder_cuda_graph is None
+
+    def test_torch_llm_args_default_multimodal_config(self):
+        args = TorchLlmArgs(model=llama_model_path)
+        assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.encoder_cuda_graph is None
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(
+                encoder_cuda_graph={
+                    "vision":
+                    MultimodalEncoderCudaGraphConfig(buckets=[(1035,
+                                                               1), (2069, 2)])
+                }))
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+    def test_torch_llm_args_with_encoder_cuda_graph_buckets_yaml(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config={
+                "encoder_cuda_graph": {
+                    "vision": {
+                        "buckets": [[2069, 2], [1035, 1]]
+                    }
+                }
+            },
+        )
+        encoder_graph = args.multimodal_config.encoder_cuda_graph
+        assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
 
 
 def test_CapacitySchedulerPolicy():
@@ -2360,75 +2452,331 @@ class TestPydanticBestPractices:
 
 
 class TestSkipSoftmaxAttentionConfig:
+    """Test LLM Skip Softmax Attention config behavior."""
 
-    def test_resolve_computes_thresholds(self):
-        import math
-
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        formula = {
-            'prefill': {
-                'a': 7e-5,
-                'b': 7.929109
+    CHECKPOINT_SPARSE_ATTENTION_CONFIG: ClassVar[dict] = {
+        "config_groups": {
+            "group_0": {
+                "algorithm": "skip_softmax",
+                "threshold_scale_factor": {
+                    "formula": "a * exp(b * target_sparsity)",
+                    "prefill": {
+                        "a": 100.0,
+                        "b": 5.0
+                    },
+                    "decode": {
+                        "a": 0.05,
+                        "b": 10.0
+                    },
+                },
+                "target_sparsity": {
+                    "prefill": 0.5,
+                    "decode": 0.3
+                },
             },
-            'decode': {
-                'a': 7e-5,
-                'b': 16.9025
+        },
+    }
+    CHECKPOINT_CONFIG: ClassVar[dict] = {
+        "sparse_attention_config": CHECKPOINT_SPARSE_ATTENTION_CONFIG,
+    }
+
+    @classmethod
+    def _checkpoint_config(cls) -> dict:
+        import copy
+
+        return copy.deepcopy(cls.CHECKPOINT_CONFIG)
+
+    @staticmethod
+    def _kernel_params(config: SkipSoftmaxAttentionConfig, **kwargs):
+        sparse_params = config.to_sparse_params(**kwargs)
+        return sparse_params.scheduler.get_kernel_params()
+
+    def test_python_api_parses_skip_softmax_config(self):
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            sparse_attention_config={
+                "algorithm": "skip_softmax",
+                "threshold_scale_factor": {
+                    "prefill": 1000.0,
+                    "decode": 500.0,
+                },
+            },
+        )
+
+        config = args.sparse_attention_config
+
+        assert isinstance(config, SkipSoftmaxAttentionConfig)
+        assert config.threshold_scale_factor == {
+            "prefill": 1000.0,
+            "decode": 500.0,
+        }
+
+    def test_yaml_api_parses_skip_softmax_config(self):
+        config_dict = yaml.safe_load("""
+sparse_attention_config:
+  algorithm: skip_softmax
+  target_sparsity:
+    prefill: 0.5
+    decode: 0.3
+""")
+
+        args = TorchLlmArgs(model="/tmp/dummy_model", **config_dict)
+
+        config = args.sparse_attention_config
+        assert isinstance(config, SkipSoftmaxAttentionConfig)
+        assert config.target_sparsity == {
+            "prefill": 0.5,
+            "decode": 0.3,
+        }
+
+    @pytest.mark.parametrize("target_sparsity", [-0.1, 1.1])
+    def test_target_sparsity_scalar_must_be_in_unit_interval(
+            self, target_sparsity):
+        with pytest.raises(ValidationError, match="target_sparsity"):
+            SkipSoftmaxAttentionConfig(target_sparsity=target_sparsity)
+
+    @pytest.mark.parametrize("target_sparsity", [
+        {
+            "prefill": -0.1,
+            "decode": 0.3,
+        },
+        {
+            "prefill": 0.5,
+            "decode": 1.1,
+        },
+    ])
+    def test_target_sparsity_phase_values_must_be_in_unit_interval(
+            self, target_sparsity):
+        with pytest.raises(ValidationError, match="target_sparsity"):
+            SkipSoftmaxAttentionConfig(target_sparsity=target_sparsity)
+
+    def test_direct_threshold_scale_factor_scalar_does_not_need_checkpoint(
+            self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(1000.0)
+
+    def test_direct_threshold_scale_factor_can_be_configured_per_phase(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+            "prefill": 1000.0,
+            "decode": 500.0,
+        })
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+
+    def test_target_sparsity_scalar_uses_checkpoint_formula_for_each_phase(
+            self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.3))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_target_sparsity_can_be_configured_per_phase(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.5,
+            "decode": 0.3,
+        })
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_checkpoint_target_sparsity_default_is_used_when_user_omits_it(
+            self):
+        config = SkipSoftmaxAttentionConfig()
+
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_checkpoint_formula_can_be_shared_by_prefill_and_decode(self):
+        checkpoint_config = {
+            "sparse_attention_config": {
+                "config_groups": {
+                    "group_0": {
+                        "algorithm": "skip_softmax",
+                        "threshold_scale_factor": {
+                            "formula": "sqrt(a + target_sparsity)",
+                            "a": 0.75,
+                        },
+                        "target_sparsity": 0.25,
+                    },
+                },
             },
         }
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            'prefill': 0.5,
-            'decode': 0.5
+        config = SkipSoftmaxAttentionConfig()
+
+        params = self._kernel_params(config,
+                                     checkpoint_config=checkpoint_config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(1.0)
+
+    def test_user_target_sparsity_overrides_checkpoint_default(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.2,
+            "decode": 0.4,
         })
-        resolved = cfg.resolve_for_target_sparsity(formula)
 
-        expected_prefill = 7e-5 * math.exp(7.929109 * 0.5)
-        expected_decode = 7e-5 * math.exp(16.9025 * 0.5)
-        assert resolved.threshold_scale_factor_prefill == pytest.approx(
-            expected_prefill)
-        assert resolved.threshold_scale_factor_decode == pytest.approx(
-            expected_decode)
+        params = self._kernel_params(
+            config,
+            checkpoint_config=self._checkpoint_config(),
+        )
 
-    def test_resolve_scalar_target_sparsity(self):
-        import math
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.2))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.4))
 
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        formula = {
-            'prefill': {
-                'a': 7e-5,
-                'b': 7.929109
+    def test_threshold_scale_factor_wins_over_target_sparsity_without_checkpoint(
+            self):
+        config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": 1000.0,
+                "decode": 500.0,
             },
-            'decode': {
-                'a': 7e-5,
-                'b': 16.9025
-            },
+            target_sparsity=0.9,
+        )
+
+        params = self._kernel_params(config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+
+    def test_target_sparsity_requires_checkpoint_formula(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        with pytest.raises(ValueError, match="formula"):
+            config.to_sparse_params(
+                checkpoint_config={
+                    "sparse_attention_config": {
+                        "config_groups": {
+                            "group_0": {
+                                "algorithm": "skip_softmax",
+                                "target_sparsity": 0.5,
+                            },
+                        },
+                    },
+                })
+
+    def test_other_checkpoint_groups_do_not_affect_skip_softmax_group_selection(
+            self):
+        checkpoint_config = self._checkpoint_config()
+        checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_1"] = {
+                "algorithm": "rocket",
+                "prompt_budget": 2048,
+            }
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+
+        params = self._kernel_params(config,
+                                     checkpoint_config=checkpoint_config)
+
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+
+    def test_checkpoint_ignore_patterns_disable_matching_module_name(self):
+        checkpoint_config = self._checkpoint_config()
+        group = checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_0"]
+        group["ignore"] = [
+            "model.layers.0.self_attn",
+            "model.layers.1.*",
+        ]
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        assert (config.to_sparse_params(
+            module_name="model.layers.0.self_attn",
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        assert (config.to_sparse_params(
+            module_name="model.layers.1.self_attn",
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        params = self._kernel_params(
+            config,
+            module_name="model.layers.2.self_attn",
+            checkpoint_config=checkpoint_config,
+        )
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+
+    def test_checkpoint_ignore_patterns_match_layer_idx_aliases(self):
+        checkpoint_config = self._checkpoint_config()
+        group = checkpoint_config["sparse_attention_config"]["config_groups"][
+            "group_0"]
+        group["ignore"] = ["model.layers.0.self_attn"]
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+
+        assert (config.to_sparse_params(
+            layer_idx=0,
+            checkpoint_config=checkpoint_config,
+        ) is None)
+        params = self._kernel_params(
+            config,
+            layer_idx=1,
+            checkpoint_config=checkpoint_config,
+        )
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+
+    def test_multiple_skip_softmax_checkpoint_groups_are_invalid(self):
+        checkpoint_config = self._checkpoint_config()
+        groups = checkpoint_config["sparse_attention_config"]["config_groups"]
+        groups["group_1"] = {
+            "algorithm": "rocket",
+            "prompt_budget": 2048,
         }
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        resolved = cfg.resolve_for_target_sparsity(formula)
+        groups["group_2"] = dict(groups["group_0"])
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
 
-        assert resolved.threshold_scale_factor_prefill == pytest.approx(
-            7e-5 * math.exp(7.929109 * 0.3))
-        assert resolved.threshold_scale_factor_decode == pytest.approx(
-            7e-5 * math.exp(16.9025 * 0.3))
+        with pytest.raises(ValueError, match="multiple skip-softmax"):
+            config.to_sparse_params(checkpoint_config=checkpoint_config)
 
-    def test_resolve_missing_coefficients_raises(self):
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+    def test_ckpt_sparse_attention_config_can_be_passed_directly(self):
+        config = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
 
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            'prefill': 0.5,
-            'decode': 0.5
-        })
-        with pytest.raises(ValueError, match="missing formula coefficients"):
-            cfg.resolve_for_target_sparsity({})
+        params = self._kernel_params(
+            config,
+            ckpt_sparse_attention_config=self.
+            CHECKPOINT_SPARSE_ATTENTION_CONFIG,
+        )
 
-    def test_threshold_scale_factor_unaffected(self):
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
-            'prefill': 0.001,
-            'decode': 0.002
-        })
-        assert cfg.target_sparsity is None
-        assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
-        assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)
+
+class TestDeepSeekV4SparseAttentionConfig:
+
+    def test_zero_compress_ratios_are_normalized(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        assert config.compress_ratios == [1, 4, 128]
+
+    @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
+    def test_invalid_compress_ratios_raise(self, compress_ratios):
+        with pytest.raises(ValidationError, match="compress_ratios"):
+            DeepSeekV4SparseAttentionConfig(compress_ratios=compress_ratios)
