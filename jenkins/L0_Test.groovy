@@ -1703,11 +1703,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-// CBTS Layer 2.5: slice each narrowed stage to its CBTS duration-sized split count k.
+// CBTS Layer 2.5: rename narrowed stages (reuse-safety) and resize their splits to k.
 def cbtsResizeSplits(configs) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null || !cbts.cbts_test_db_artifact_path) {
-        return configs  // no CBTS / tarball absent -> keep default splits
+        return configs
     }
     def kByStage = cbts.affected_stage_split_counts
     if (!kByStage) {
@@ -1717,17 +1717,17 @@ def cbtsResizeSplits(configs) {
     configs.each { key, values ->
         def k = kByStage[key]
         if (k == null) {
-            resized[key] = values  // stage not narrowed -> unchanged
+            resized[key] = values
             return
         }
         int kk = Math.max(1, k as int)
         if ((values[2] as int) > kk) {
             echo "CBTS [${cbts.scope}]: ${key} narrowed -> ${kk} shard(s); dropping group ${values[2]}"
-            return  // drop shards beyond k
+            return
         }
         def v = values.collect()
-        v[3] = kk  // splitId<=k kept; rewrite split total to k
-        resized[key] = v
+        v[3] = kk
+        resized[key + CBTS_STAGE_SUFFIX] = v
     }
     return resized
 }
@@ -1879,6 +1879,10 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
+@Field
+def CBTS_STAGE_SUFFIX = "-cbts"
 @Field
 def testFilter = [
     (REUSE_TEST): null,
@@ -5197,7 +5201,9 @@ def launchTestJobs(pipeline, testFilter)
     // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
-        def affectedSet = (cbts.affected_stages ?: []) as Set
+        // Match the -cbts rename cbtsResizeSplits applies to narrowed stages.
+        def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
+        def affectedSet = (cbts.affected_stages ?: []).collect { it + stageSuffix } as Set
         def needsSanity = cbts.sanity_required
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->

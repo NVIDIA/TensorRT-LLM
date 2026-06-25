@@ -221,6 +221,13 @@ stage's kept entries (exact node-id, else subtree-sum, else average — over-cou
 toward the cap, never under-sizes). `launchTestJobs::cbtsResizeSplits` keeps only
 shards `1..k`; pytest-split then balances within them via `least_duration`.
 
+`cbtsResizeSplits` also renames each narrowed stage with a `-cbts` suffix so its
+narrowed result is never reused (whole-stage `REUSE_STAGE_LIST` or per-test
+`reusePassedTestResults`) by a non-CBTS full run on the same commit. A suffix (not
+a prefix) keeps the GPU type as the first `-` token, so positional stage-name
+parsers need no change; full sanity / PerfSanity stages keep their original names
+and reuse normally.
+
 ## Adding a new rule
 
 1. **Create `rules/my_rule.py`** subclassing `Rule`:
