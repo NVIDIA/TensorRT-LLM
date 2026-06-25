@@ -334,7 +334,8 @@ def _run_bart_pytorch_generate_encoder_decoder(
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
+        f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
+        f"kv_dtype={kv_cache_dtype}"
     )
     sampling_params = _sampling_params(num_beams, num_return_sequences)
 
@@ -352,6 +353,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            dtype=kv_cache_dtype,
         ),
         max_batch_size=max(cuda_graph_batch_sizes or [1]),
         max_beam_width=num_beams,

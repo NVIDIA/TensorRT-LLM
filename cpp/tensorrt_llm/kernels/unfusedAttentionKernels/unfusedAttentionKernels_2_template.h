@@ -1420,7 +1420,7 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     int const max_seq_len = max(decoder_seq_len, encoder_seq_len);
 
     // Only the first chunk needs to store encoder kv input to the kv cache.
-    bool const store_encoder_kv_cache = (decoder_seq_len == decoder_cache_seq_len);
+    bool const store_encoder_kv_cache = params.cross_kv_input != nullptr && (decoder_seq_len == decoder_cache_seq_len);
 
     // Offsets and strides.
     int const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);

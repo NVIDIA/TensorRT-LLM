@@ -81,8 +81,8 @@ _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS = {
     ("t5-small", 2): [
         _HF_BEAM_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS[("t5-small", 2)],
         [
-            [644, 4675, 229, 219],
             [644, 4675, 4186, 219],
+            [644, 4675, 229, 219],
         ],
     ],
     ("flan-t5-small", 2): [
@@ -412,7 +412,6 @@ def _mixed_batch_test_case(
     num_return_sequences: int,
     exact_match: bool,
     feature_id: str,
-    marks=(),
 ):
     expected_output_token_ids_by_request = (
         _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS.get((model_name, num_beams))
@@ -430,7 +429,6 @@ def _mixed_batch_test_case(
         num_return_sequences,
         exact_match,
         id=f"{feature_id}-{model_name}",
-        marks=marks,
     )
 
 
@@ -600,6 +598,12 @@ def _assert_expected_generation(
     assert all(decoded_text_by_output)
     if expected_token_ids_by_output is None:
         assert all(expected_text_fragment in text for text in decoded_text_by_output)
+    elif exact_match:
+        assert token_ids_by_output == expected_token_ids_by_output
+    elif len(expected_token_ids_by_output) > 1:
+        assert {tuple(token_ids) for token_ids in token_ids_by_output} == {
+            tuple(token_ids) for token_ids in expected_token_ids_by_output
+        }
     else:
         assert token_ids_by_output[0] == expected_token_ids_by_output[0]
     if len(token_ids_by_output) > 1:
