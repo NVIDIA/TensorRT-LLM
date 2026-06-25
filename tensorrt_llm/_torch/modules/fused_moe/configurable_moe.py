@@ -174,6 +174,8 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        if override_quant_config is not None:
+            self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
@@ -225,6 +227,7 @@ class ConfigurableMoE(MoE):
 
         # Validate configuration
         self.validate_config()
+        self.validate_backend(self.backend)
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -321,12 +324,17 @@ class ConfigurableMoE(MoE):
                 swiglu_alpha=kwargs.get("swiglu_alpha"),
                 swiglu_beta=kwargs.get("swiglu_beta"),
                 swiglu_limit=kwargs.get("swiglu_limit"),
+                swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 without_comm=True,
                 activation_type=self.activation_type,
             )
 
-        self.validate_backend(backend)
+        # Backend acceptance is validated at the end of ``__init__`` instead
+        # of here so the validation hook can inspect ``self.comm`` and
+        # ``self.moe_max_num_tokens`` (assigned only after this method
+        # returns). Backends like ``MegaMoECuteDsl`` rely on that to
+        # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
@@ -556,7 +564,7 @@ class ConfigurableMoE(MoE):
 
         DP-padding handling and chunking live in the scheduler.
         """
-        del kwargs
+        input_ids = kwargs.get("input_ids")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -577,6 +585,7 @@ class ConfigurableMoE(MoE):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            input_ids=input_ids,
             lora_params=lora_params,
         )
 
@@ -605,9 +614,15 @@ class ConfigurableMoE(MoE):
         Backend-specific checks are delegated to
         ``backend.validate_configurable_moe(self)``; backends with extra
         constraints (e.g. fused-comm backends rejecting dynamic
-        EPLB) override that hook. EPLB / num_slots / ep_size are already
-        populated on ``self`` by ``MoE.__init__`` -> ``_init_load_balancer``
-        before this is called, so backends may inspect them directly.
+        EPLB) override that hook.
+
+        Call site contract: invoked from ``__init__`` *after* every
+        wrapper-owned attribute is assigned (EPLB / num_slots /
+        ep_size via ``MoE.__init__`` -> ``_init_load_balancer``,
+        ``self.comm`` from ``_create_comm_strategy_auto``, and
+        ``self.moe_max_num_tokens`` from ``model_config``). Backend
+        hooks can therefore inspect them directly without ``getattr``
+        guards or sentinel defaults.
         """
         if backend is None:
             raise ValueError("Backend cannot be None")

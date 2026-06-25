@@ -20,7 +20,8 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig)
+                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -138,6 +139,7 @@ class ModelConfig(Generic[TConfig]):
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     is_generation: bool = True
+    is_encoder_decoder: bool = False
     max_num_tokens: int = 8192
     max_seq_len: Optional[int] = None
 
@@ -185,6 +187,9 @@ class ModelConfig(Generic[TConfig]):
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None
 
+    # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
+    multimodal_config: MultimodalConfig | None = None
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.
@@ -203,6 +208,10 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if self.pretrained_config:
+            self.is_encoder_decoder = self.is_encoder_decoder_model(
+                self.pretrained_config)
+
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
             self.is_generation = self.is_generation_model(
@@ -269,6 +278,18 @@ class ModelConfig(Generic[TConfig]):
             return self.per_layer_quant_configs[name]
 
         raise ValueError(f'quant config of {name} is not found')
+
+    @staticmethod
+    def is_encoder_decoder_model(pretrained_config: Optional[TConfig]) -> bool:
+        if pretrained_config is None:
+            return False
+        text_config = pretrained_config
+        get_text_config = getattr(pretrained_config, "get_text_config", None)
+        if callable(get_text_config):
+            text_config = get_text_config()
+        elif hasattr(pretrained_config, "text_config"):
+            text_config = pretrained_config.text_config
+        return getattr(text_config, "is_encoder_decoder", False)
 
     @staticmethod
     def is_generation_model(model_architectures: Optional[List[str]],

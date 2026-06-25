@@ -1,8 +1,12 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import os
 import random
 import time
 import uuid
+
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -59,11 +63,13 @@ class KvCacheConfigV2:
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
 
     max_gpu_total_bytes: Optional[int] = None
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
+    disk_prefetch_num_reqs: int = 4
     # V2 specific field
     max_util_for_resume: float = 0.95
 
