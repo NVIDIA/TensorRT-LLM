@@ -18,6 +18,7 @@ import functools
 import json
 import math
 import os
+import re
 import types
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -515,6 +516,34 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         return self
 
 
+_BYTE_STRING_PATTERN = re.compile(r"^\s*(\d+)\s*([kmgt]ib|b)?\s*$",
+                                  re.IGNORECASE)
+_BINARY_BYTE_UNITS: dict[Optional[str], int] = {
+    None: 1,
+    "b": 1,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+}
+
+
+def _parse_binary_byte_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    match = _BYTE_STRING_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "Byte strings must be non-negative integers with optional "
+            "B/KiB/MiB/GiB/TiB suffix.")
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = _BINARY_BYTE_UNITS[unit.lower() if unit is not None else None]
+    return amount * multiplier
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -539,6 +568,19 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
+    encoder_cache_max_bytes: NonNegativeInt = Field(
+        default=134_217_728,  # 128 MiB.
+        description=
+        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
+         "Set to 0 to disable. String values such as '512MiB' and '1GiB' use binary units. "
+         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
+         "every item in the request must hit the cache before cached embeddings are reused. "
+         "Only single-modality requests are cacheable for the time being. "
+         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
+         ),
+        status="prototype",
+    )
+
     video_pruning_rate: Optional[float] = Field(
         default=None,
         ge=0.0,
@@ -549,6 +591,11 @@ class MultimodalConfig(StrictBaseModel):
          "in [0, 1) enable pruning."),
         status="prototype",
     )
+
+    @field_validator('encoder_cache_max_bytes', mode='before')
+    @classmethod
+    def parse_encoder_cache_max_bytes(cls, value):
+        return _parse_binary_byte_string(value)
 
     @model_validator(mode='after')
     def validate_side_stream_cuda_graph_exclusive(self) -> 'MultimodalConfig':

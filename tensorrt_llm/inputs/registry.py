@@ -25,10 +25,21 @@ from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
+from .multimodal_data import serialize_item
 
 N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
+
+
+def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
+                              hash_lib=default_hasher) -> Optional[str]:
+    hasher = hash_lib()
+    try:
+        hasher.update(serialize_item(mm_processor_kwargs))
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    return hasher.hexdigest()
 
 
 class InputProcessor(Protocol):
@@ -1081,6 +1092,16 @@ def create_input_processor_with_hash(
 
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
+        mm_processor_kwargs_hash = _hash_mm_processor_kwargs(
+            inputs.get("mm_processor_kwargs") or {}, hash_lib)
+        if extra_processed_inputs is None:
+            extra_processed_inputs = {}
+        multimodal_data = extra_processed_inputs.setdefault(
+            "multimodal_data", {})
+        if not isinstance(multimodal_data, dict):
+            raise TypeError(
+                "extra_processed_inputs['multimodal_data'] must be a dict")
+        multimodal_data["mm_processor_kwargs_hash"] = mm_processor_kwargs_hash
 
         # TODO: here we assume there is only one modality for now
         num_mm_tokens_by_key = find_mm_token_lengths(

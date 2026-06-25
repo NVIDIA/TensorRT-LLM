@@ -680,8 +680,16 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         return self._image_token_ids
 
     @property
-    def text_embedding_layer(self) -> torch.nn.Module:
+    def text_embedding_layer(self) -> Embedding:
         return self.llm.model.embed_tokens
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.text_embedding_layer.embedding_dim
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.text_embedding_layer.weight.dtype
 
     @property
     def draft_config(self):

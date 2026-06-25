@@ -432,6 +432,7 @@ class TestMultimodalConfig:
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
+        assert MultimodalConfig().encoder_cache_max_bytes == 0
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -439,7 +440,28 @@ class TestMultimodalConfig:
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
+        assert args.multimodal_config.encoder_cache_max_bytes == 0
         assert args.multimodal_config.video_pruning_rate is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, 0),
+            ("0", 0),
+            ("512MB", 512 * 1024**2),
+            ("1GB", 1024**3),
+            ("1GiB", 1024**3),
+            ("2TB", 2 * 1024**4),
+        ],
+    )
+    def test_encoder_cache_max_bytes_parses_binary_units(self, value, expected):
+        config = MultimodalConfig(encoder_cache_max_bytes=value)
+        assert config.encoder_cache_max_bytes == expected
+
+    @pytest.mark.parametrize("value", ["-1", "1.5GB", "1XB", "GB", object()])
+    def test_encoder_cache_max_bytes_rejects_invalid_values(self, value):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(encoder_cache_max_bytes=value)
 
     def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
         args = TorchLlmArgs(
