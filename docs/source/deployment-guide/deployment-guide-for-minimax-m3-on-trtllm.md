@@ -65,29 +65,28 @@ Note:
 
 **Treat these as a starting point and tune the parameters for your workload.**
 
-On the shared filesystem, create the extra LLM API options file that selects the MiniMax-M3 block-sparse attention backend and disables KV cache reuse:
+We provide a curated YAML configuration in the TensorRT LLM repository that bundles the MiniMax-M3 sparse-attention backend, the KV-cache settings required by the sparse path, and a tuned set of throughput knobs:
 
-```bash
-cat > /workspace/extra_llm_api.yaml <<EOF
-sparse_attention_config:
-    algorithm: minimax_m3
-kv_cache_config:
-    enable_block_reuse: false
-EOF
+```shell
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/minimax-m3-throughput.yaml
 ```
 
-### Choosing the Parallelism Strategy (TEP vs DEP)
+If you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
 
-MiniMax-M3 distributes its MoE experts with expert parallelism (`--moe_expert_parallel_size 8`). You can pair this with either of two attention-parallelism strategies across the 8 GPUs:
+````{admonition} Show MiniMax-M3 throughput config
+:class: dropdown
 
-* **DEP (Data-Expert Parallelism)** — add `--enable_attention_dp`. The attention layers run data-parallel (each rank processes a slice of the batch), while the MoE experts run expert-parallel. This is the configuration shown below, and typically favors high-throughput / large-batch serving.
-* **TEP (Tensor-Expert Parallelism)** — omit `--enable_attention_dp`. The attention layers run tensor-parallel across all 8 ranks, while the MoE experts run expert-parallel. This can help latency-sensitive / small-batch workloads.
+```{literalinclude} ../../../examples/configs/curated/minimax-m3-throughput.yaml
+:language: yaml
+```
+````
 
-Both strategies use `--tp_size 8 --moe_expert_parallel_size 8`. Benchmark both for your workload before settling on one.
+The configuration uses Data-Expert Parallelism (DEP): `enable_attention_dp: true` runs the attention layers data-parallel across ranks while the MoE experts run expert-parallel, which favors high-throughput / large-batch serving on MiniMax-M3.
 
 ### Launch the TensorRT LLM Server
 
-MiniMax-M3 is launched through the `trtllm-llmapi-launch` wrapper, which sets up the multi-rank (MPI/Slurm) environment that the parallel server requires. The wrapper is run once per rank by Slurm (`srun`), with one task (rank) per GPU. The example below launches the **DEP** configuration across 2 nodes (`-N 2`), 4 GPUs per node (`--ntasks-per-node 4`, 8 ranks total):
+MiniMax-M3 is launched through the `trtllm-llmapi-launch` wrapper, which sets up the multi-rank (MPI/Slurm) environment that the parallel server requires. The wrapper is run once per rank by Slurm (`srun`), with one task (rank) per GPU. The example below launches the server across 2 nodes (`-N 2`), 4 GPUs per node (`--ntasks-per-node 4`, 8 ranks total), using the curated YAML to drive parallelism, batching, and the MiniMax-M3 sparse-attention backend:
 
 ```bash
 export MODEL=/models/MiniMax-M3   # path on the shared filesystem; mounted into the container
@@ -96,65 +95,44 @@ srun -N 2 \
     --ntasks 8 --ntasks-per-node 4 \
     --mpi=pmix --gres=gpu:4 \
     --container-image=nvcr.io/nvidia/tensorrt-llm/release:x.y.z \
-    --container-mounts=/models:/models,/workspace:/workspace \
+    --container-mounts=/models:/models,/workspace:/workspace,${TRTLLM_DIR}:${TRTLLM_DIR} \
     --container-workdir /workspace \
     bash -c "trtllm-llmapi-launch \
         python3 -m tensorrt_llm.commands.serve $MODEL \
-          --tp_size 8 \
-          --moe_expert_parallel_size 8 \
-          --max_batch_size 128 \
-          --enable_attention_dp \
-          --free_gpu_memory_fraction 0.5 \
           --trust_remote_code \
           --reasoning_parser minimax_m3 \
           --tool_parser minimax_m3 \
           --chat_template $MODEL/chat_template.jinja \
           --host 0.0.0.0 \
-          --extra_llm_api_options /workspace/extra_llm_api.yaml"
+          --extra_llm_api_options $EXTRA_LLM_API_FILE"
 ```
 
-> [!NOTE]
-> Adjust `-N`, `--ntasks`, `--ntasks-per-node`, and `--gres=gpu:` to match your cluster's GPUs-per-node. The total number of tasks (ranks) must equal `--tp_size` (`8`). Add the partition / account / node-list flags (`-p`, `-A`, `-w`) required by your Slurm setup, and ensure `/models` and `/workspace` resolve to the same shared paths on both nodes.
-> To run the **TEP** configuration instead, remove the `--enable_attention_dp` flag.
+The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all live in the YAML; no CLI flags need to change to tune them.
 
-> [!WARNING]
-> If you encounter OOM errors, try one or more of the following:
-> - Lower `--free_gpu_memory_fraction` (e.g., `0.4`).
-> - Reduce `--max_batch_size` (e.g., `64` or `32`).
-> - As a workaround for memory fragmentation, set `PYTORCH_ALLOC_CONF=max_split_size_mb:8192`. For more details, refer to the [PyTorch documentation on optimizing memory usage](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf).
+> [!NOTE]
+> Adjust `-N`, `--ntasks`, `--ntasks-per-node`, and `--gres=gpu:` to match your cluster's GPUs-per-node. The total number of tasks (ranks) must equal `tensor_parallel_size` (`8`). Add the partition / account / node-list flags (`-p`, `-A`, `-w`) required by your Slurm setup, and ensure `/models`, `/workspace`, and the TensorRT LLM repository resolve to the same shared paths on both nodes.
 
 ### Command-Line and YAML Options
 
 #### Command-line options
 
-* `--tp_size`: Tensor parallel size. MiniMax-M3 is served with `8` (across the 2 nodes).
-* `--moe_expert_parallel_size` (`--ep_size`): Expert parallel size for the MoE layers. Set to `8` to match the tensor-parallel size.
-* `--max_batch_size`: Maximum number of requests batched together.
-* `--enable_attention_dp`: Enables Data-Expert Parallelism (DEP) by running the attention layers data-parallel across ranks. Omit it to use Tensor-Expert Parallelism (TEP). See [Choosing the Parallelism Strategy](#choosing-the-parallelism-strategy-tep-vs-dep).
-* `--free_gpu_memory_fraction`: Fraction of free GPU memory reserved for the KV cache after the model is loaded. **Recommendation:** If you experience OOM errors, reduce this value.
 * `--trust_remote_code`: Required to load the MiniMax-M3 configuration and custom code from the checkpoint.
 * `--reasoning_parser minimax_m3`: Parses the MiniMax-M3 reasoning trace, which is wrapped in `<mm:think>...</mm:think>` tags, into the structured `reasoning_content` field of chat responses.
 * `--tool_parser minimax_m3`: Parses MiniMax-M3 tool/function calls from the model output.
 * `--chat_template`: Path to the chat template shipped with the checkpoint (`chat_template.jinja`).
-* `--extra_llm_api_options`: Path to the YAML file with additional LLM API options described below.
+* `--extra_llm_api_options`: Path to the YAML configuration file with the LLM API options described below.
 
 #### `--extra_llm_api_options` YAML options
 
-These options provide control over TensorRT LLM's behavior and are set within the YAML file passed via the `--extra_llm_api_options` argument.
+The curated config sets all the YAML knobs; this section only documents the two MiniMax-M3-specific constraints. Every other field in the YAML is a standard TensorRT LLM throughput knob — see the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full reference.
 
-##### `sparse_attention_config`
+##### `sparse_attention_config.algorithm`
 
-* **Description**: Selects and configures the block-sparse attention backend.
-* **Options**:
-  * `algorithm`: Must be set to `minimax_m3` to run MiniMax-M3.
+Must be set to `minimax_m3`. There is no dense fallback for the MiniMax-M3 sparse-attention layers.
 
-##### `kv_cache_config`
+##### `kv_cache_config.enable_block_reuse`
 
-* **Description**: Configuration for the Key-Value (KV) cache.
-* **Options**:
-  * `enable_block_reuse`: Enables KV cache block reuse across requests with shared prefixes. **Must be `false`** for MiniMax-M3, as the sparse-attention path does not support KV cache reuse.
-
-See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
+Must be `false`. The sparse-attention path does not support KV cache block reuse across requests with shared prefixes.
 
 ## Testing API Endpoint
 
@@ -217,12 +195,10 @@ The `message` object contains the visible answer in `content` and, when the mode
 
 ## Troubleshooting Tips
 
-* **CUDA OOM errors:** Try reducing `--max_batch_size` or `--free_gpu_memory_fraction`.
-  * As a workaround for memory fragmentation, you can set `PYTORCH_ALLOC_CONF=max_split_size_mb:8192`. For more details, refer to the [PyTorch documentation on optimizing memory usage](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf).
 * **Sparse attention not applied:** Ensure `sparse_attention_config.algorithm` is set to `minimax_m3` in the YAML file passed to `--extra_llm_api_options`.
 * **KV cache reuse errors:** Confirm `kv_cache_config.enable_block_reuse` is `false`; KV cache reuse is not supported on the sparse-attention path.
 * **Model fails to load:** Make sure `--trust_remote_code` is set and that the checkpoint path is correct and fully downloaded (Git LFS).
-* **Multi-node startup hangs or ranks can't find each other:** Verify that the model weights, `/workspace/extra_llm_api.yaml`, and all mounted paths resolve identically on both nodes (shared filesystem), that the total Slurm task count equals `--tp_size` (`8`), and that the inter-node interconnect (e.g., InfiniBand) is healthy.
+* **Multi-node startup hangs or ranks can't find each other:** Verify that the model weights, the curated YAML, and all mounted paths resolve identically on both nodes (shared filesystem), that the total Slurm task count equals `tensor_parallel_size` (`8`), and that the inter-node interconnect (e.g., InfiniBand) is healthy.
 * **Reasoning/tool output not parsed:** Verify `--reasoning_parser minimax_m3`, `--tool_parser minimax_m3`, and `--chat_template $MODEL/chat_template.jinja` are all passed.
 * **GPU utilization:** For performance issues, check GPU utilization with `nvidia-smi` while the server is running.
 * **Container startup:** If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
