@@ -15,7 +15,7 @@ l0_a10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/sampler/test_torch_sampler.py
-  - unittest/_torch/sampler/test_torch_multi_arange.py
+  - unittest/_torch/test_torch_multi_arange.py
   - unittest/utils/test_util.py
   - unittest/utils/test_logger.py
   - unittest/_torch/test_model_config.py
@@ -34,6 +34,7 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_budget_split.py
   - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
+  - unittest/_torch/pyexecutor/test_kv_cache_compression_manager.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
   - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
@@ -106,6 +107,7 @@ l0_a10:
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
   - test_e2e.py::test_openai_tool_call
+  - test_e2e.py::test_openai_post_processor
   - test_e2e.py::test_openai_responses_entrypoint
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
@@ -114,7 +116,7 @@ l0_a10:
   # visual_gen
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/visual_gen/test_output.py
-  - unittest/media/test_encoding.py
+  - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
@@ -130,6 +132,8 @@ l0_a10:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_fatal_error_health_check.py
+  - unittest/executor/test_postprocessor_hook.py
+  - unittest/executor/test_proxy_postproc_terminate.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py

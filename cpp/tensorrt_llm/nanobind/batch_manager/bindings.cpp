@@ -191,11 +191,19 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_disagg_context_complete_state", &GenLlmReq::isDisaggContextCompleteState)
         .def_prop_ro("stage", &GenLlmReq::getRequestStage)
         .def_prop_ro("kv_cache_transfer_time_ms", &GenLlmReq::getKvCacheTransferTimeMS)
+        .def_prop_ro("kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
+        .def_prop_ro("kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
         .def_prop_ro("kv_cache_size", &GenLlmReq::getKvCacheSize)
+        .def("set_kv_cache_transfer_start", &GenLlmReq::setKvCacheTransferStart, nb::arg("time"))
+        .def("set_kv_cache_transfer_end", &GenLlmReq::setKvCacheTransferEnd, nb::arg("time"))
+        .def("set_kv_cache_size", &GenLlmReq::setKvCacheSize, nb::arg("target_buffer_size"))
+        .def("update_kv_cache_size", &GenLlmReq::updateKvCacheSize, nb::arg("target_buffer_size"))
         .def_prop_ro("avg_decoded_tokens_per_iter", &GenLlmReq::getAvgDecodedTokensPerIter)
         .def_prop_ro("alloc_total_blocks", &GenLlmReq::getAllocTotalBlocksPerRequest)
         .def_prop_ro("alloc_new_blocks", &GenLlmReq::getAllocNewBlocksPerRequest)
         .def("alloc_context_logits", &GenLlmReq::allocContextLogitsHost, nb::arg("vocab_size"), nb::arg("logit_dtype"))
+        .def("update_kv_cache_perf_metrics", &GenLlmReq::updateKvCachePerfMetrics, nb::arg("alloc_total_blocks"),
+            nb::arg("alloc_new_blocks"), nb::arg("reused_blocks"), nb::arg("missed_blocks"))
         .def_prop_ro("reused_blocks", &GenLlmReq::getReusedBlocksPerRequest)
         .def_prop_ro("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_prop_ro("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
@@ -307,7 +315,27 @@ void initBindings(nb::module_& m)
                     return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
                 }
                 return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
-            });
+            })
+        // Encoder-decoder accessors for PyExecutor encoder iteration.
+        // ``encoder_tokens`` returns the source-side tokens used to drive the
+        // encoder forward.  ``encoder_output_len`` is the cross-KV capacity
+        // for the request (number of encoder hidden states the decoder
+        // cross-attention will read), which mirrors the C++
+        // ``getEncoderOutputLen`` contract.
+        // ``try_get_encoder_output_len`` exposes the same value as an
+        // optional probe for decoder-only scheduler paths.
+        .def_prop_ro("encoder_tokens",
+            [](GenLlmReq& self) -> std::optional<GenLlmReq::VecTokens>
+            {
+                auto const& encoderTokens = self.getEncoderTokens();
+                if (encoderTokens.has_value() && encoderTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecTokens>(*encoderTokens.value());
+                }
+                return std::nullopt;
+            })
+        .def("try_get_encoder_output_len", &GenLlmReq::tryGetEncoderOutputLen)
+        .def_prop_ro("encoder_output_len", &GenLlmReq::getEncoderOutputLen);
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(
