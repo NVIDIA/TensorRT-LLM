@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for chunked KV cache transfer (sender-only chunking).
+"""Unit tests for chunked and pipelined KV cache transfer (sender-only chunking).
 
 These tests validate the session state machine using the real
 TxSession/RxSession classes with lightweight stub sender/receiver objects.
@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
@@ -39,6 +40,8 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -388,3 +391,79 @@ def test_rx_session_mid_chunk_failure():
     assert session.status == SessionStatus.ERROR
     result = session.wait_complete()
     assert result == WaitResult.FAILED
+
+# ---------------------------------------------------------------------------
+# Pipelined transfer tests
+# ---------------------------------------------------------------------------
+
+
+def test_pipelined_transfer_disabled_by_default():
+    """enable_pipelined_transfer defaults to False."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = MagicMock()
+    transceiver._enable_pipelined_transfer = False
+    transceiver._chunk_size_blocks = 64
+
+    result = KvCacheTransceiverV2.enable_pipelined_transfer.fget(transceiver)
+    assert result is False
+
+def test_pipelined_transfer_requires_chunked_prefill():
+    """ValueError when pipelined transfer is enabled without chunked prefill."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        enable_pipelined_transfer=True,
+    )
+
+    with pytest.raises(
+            ValueError,
+            match=
+            "enable_chunked_prefill is required when enable_pipelined_transfer is set."
+    ):
+        create_kv_cache_transceiver(
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            cache_transceiver_config,
+            enable_chunked_prefill=False,
+        )
+
+def test_pipelined_transfer_requires_gen_first_flow():
+    """ValueError when a real request is not using gen-first flow."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.is_warmup = False
+    executor.kv_cache_transceiver.enable_pipelined_transfer = True
+    executor._validate_token_id_range = MagicMock()
+    executor.sampler.validate_request = MagicMock()
+
+    request = MagicMock()
+    request.sampling_config = None
+    request.py_disaggregated_params = SimpleNamespace(
+        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST)
+
+    with pytest.raises(
+            ValueError,
+            match=
+            "schedule_style must be generation_first when enable_pipelined_transfer is set."
+    ):
+        PyExecutor._validate_request(executor, request)
+
+def test_cuda_event_stored_on_task():
+    """KVSendTask stores cuda_event correctly."""
+    s = KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0, 1]])
+    event = MagicMock()
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0, cuda_event=event)
+    assert task.cuda_event is event
+
+
+def test_cuda_event_none_by_default():
+    """KVSendTask.cuda_event defaults to None."""
+    s = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]])
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0)
+    assert task.cuda_event is None
+# TODO(athenac): need to add more e2e tests! accuracy tests!

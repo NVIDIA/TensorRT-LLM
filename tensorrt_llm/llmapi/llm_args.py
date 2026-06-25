@@ -3737,9 +3737,14 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "backend (default), the Python transceiver is auto-selected. "
         "Not supported with UCX, MPI, or MOONCAKE backends.")
 
+    enable_pipelined_transfer: bool = Field(
+        default=False,
+        description="When True, start transferring each prefill chunk's KV cache "
+        "as soon as its prefill completes, overlapping GPU compute "
+        "with RDMA transfer. Requires enable_chunked_prefill=True and schedule_style=generation_first.")
+
     def _to_pybind(self):
-        # transfer_chunk_size is consumed by the Python transceiver only
-        # and has no C++ counterpart, so it is intentionally omitted.
+        # enable_pipelined_transfer is consumed by the Python transceiver only and has no C++ counterpart.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,

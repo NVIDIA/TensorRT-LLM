@@ -107,6 +107,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # except under attention DP where the local count already is the total.
         self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
         self._transfer_chunk_size = cache_transceiver_config.transfer_chunk_size
+        self._enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -276,88 +277,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             A ``KVSlice`` with all metadata populated.
         """
         return self._create_kv_slice(req)
-
-    def _create_kv_slices(self, req: LlmRequest) -> List[KVSlice]:
-        """Create one or more KVSlice objects for a request.
-
-        When ``transfer_chunk_size`` is ``None``, returns a single slice
-        covering all blocks.  Otherwise, each layer group's block ID
-        list is partitioned into slices of at most ``transfer_chunk_size``
-        blocks.
-
-        Args:
-            req: The LLM request to create slices for.
-
-        Returns:
-            A list of ``KVSlice`` objects.  Only the last slice has
-            ``is_last_slice=True``.
-
-        Raises:
-            ValueError: If the reassembled block IDs from all slices do not
-                match the original block IDs.
-        """
-        base_slice = self._collect_base_slice(req)
-        all_block_ids = base_slice.block_ids_per_layer_groups
-
-        if self._transfer_chunk_size is None:
-            return [base_slice]
-
-        max_resident_blocks = max((len(ids) for ids in all_block_ids), default=0)
-        if max_resident_blocks == 0:
-            return [base_slice]
-
-        tpb = self._reuse_adapter.tokens_per_block
-        prompt_len = getattr(req, "prompt_len", None)
-        if isinstance(prompt_len, int) and prompt_len > 0:
-            total_blocks = math.ceil(prompt_len / tpb)
-        elif base_slice.token_range is not None:
-            total_blocks = math.ceil(base_slice.token_range.end / tpb)
-        else:
-            total_blocks = max_resident_blocks
-        total_blocks = max(max_resident_blocks, total_blocks)
-
-        num_chunks = math.ceil(total_blocks / self._transfer_chunk_size)
-        slices: List[KVSlice] = []
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * self._transfer_chunk_size
-            is_last = chunk_idx == num_chunks - 1
-            chunk_block_count = min(self._transfer_chunk_size, total_blocks - start)
-            chunk_token_start = start * tpb
-            chunk_token_end = (start + chunk_block_count) * tpb
-            if base_slice.token_range is not None:
-                chunk_token_end = min(chunk_token_end, base_slice.token_range.end)
-            chunk_token_range = TokenRange(start=chunk_token_start, end=chunk_token_end)
-
-            chunk_block_ids = [
-                project_blocks_to_global_chunk(
-                    ids,
-                    chunk_block_offset=start,
-                    chunk_block_count=chunk_block_count,
-                    total_blocks=total_blocks,
-                )
-                for ids in all_block_ids
-            ]
-            slices.append(
-                KVSlice(
-                    is_last_slice=is_last,
-                    block_ids_per_layer_groups=chunk_block_ids,
-                    mamba_state_index=base_slice.mamba_state_index,
-                    token_range=chunk_token_range,
-                    chunk_block_offset=start,
-                    transfer_chunk_size=chunk_block_count,
-                    total_blocks=total_blocks,
-                )
-            )
-
-        for lg_idx, original_ids in enumerate(all_block_ids):
-            reassembled = np.concatenate([s.block_ids_per_layer_groups[lg_idx] for s in slices])
-            if not np.array_equal(reassembled, original_ids):
-                raise ValueError(
-                    f"Chunking integrity check failed for layer group {lg_idx}: "
-                    f"expected {len(original_ids)} blocks, got {len(reassembled)}"
-                )
-
-        return slices
 
     @staticmethod
     def _split_packed_beam_block_ids(
@@ -557,6 +476,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params.draft_tokens = draft_tokens
 
     def _get_or_create_send_session(self, req: LlmRequest) -> TxSessionBase:
+        self._ever_had_send_session = True
         rid = get_unique_rid(req)
         assert rid is not None
         if rid not in self._send_sessions:
@@ -580,13 +500,100 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
         self._send_reqs[rid] = req
 
+    @property
+    def enable_pipelined_transfer(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return self._enable_pipelined_transfer
+
+    def send_prefill_chunk(
+        self,
+        req: LlmRequest,
+        chunk_start_block: int,
+        chunk_end_block: int,
+        is_last_chunk: bool,
+    ) -> None:
+        """Send one prefill chunk's KV data during ongoing prefill.
+
+        Called after each prefill chunk completes, before the next chunk's
+        forward begins. Creates the TxSession on the first call for a request
+        and adds slices incrementally.
+
+        Args:
+            req: The context-only request being prefilled.
+            chunk_start_block: First block index for this chunk
+                (across layer groups).
+            chunk_end_block: One-past-last block index for this chunk.
+            is_last_chunk: Whether this is the final prefill chunk.
+                When True, aux data is sent and context_phase_params
+                is populated.
+        """
+        rid = get_unique_rid(req)
+        assert rid is not None
+        cuda_event = torch.cuda.Event()
+        cuda_event.record(torch.cuda.current_stream())
+
+        session = self._get_or_create_send_session(req)
+        self._send_reqs[rid] = req
+        base_slice = self._collect_base_slice(req)
+        all_block_ids = base_slice.block_ids_per_layer_groups
+        max_resident_blocks = max((len(ids) for ids in all_block_ids), default=0)
+        tpb = self._reuse_adapter.tokens_per_block
+        prompt_len = getattr(req, "prompt_len", None)
+        if isinstance(prompt_len, int) and prompt_len > 0:
+            total_blocks = math.ceil(prompt_len / tpb)
+        elif base_slice.token_range is not None:
+            total_blocks = math.ceil(base_slice.token_range.end / tpb)
+        else:
+            total_blocks = max_resident_blocks
+        total_blocks = max(max_resident_blocks, total_blocks)
+
+        chunk_start = min(chunk_start_block, total_blocks)
+        chunk_end = min(chunk_end_block, total_blocks)
+        chunk_block_count = max(0, chunk_end - chunk_start)
+        chunk_block_ids = [
+            project_blocks_to_global_chunk(
+                block_ids,
+                chunk_block_offset=chunk_start,
+                chunk_block_count=chunk_block_count,
+                total_blocks=total_blocks,
+            )
+            for block_ids in all_block_ids
+        ]
+        chunk_token_range = None
+        if chunk_block_count > 0:
+            chunk_token_range = TokenRange(
+                start=chunk_start * tpb,
+                end=(chunk_start + chunk_block_count) * tpb,
+            )
+
+        kv_slice = KVSlice(
+            is_last_slice=is_last_chunk,
+            block_ids_per_layer_groups=chunk_block_ids,
+            mamba_state_index=base_slice.mamba_state_index,
+            token_range=chunk_token_range,
+            chunk_block_offset=chunk_start,
+            transfer_chunk_size=chunk_block_count,
+            total_blocks=total_blocks,
+            cuda_event=cuda_event,
+        )
+        session.send(kv_slice)
+
+        if is_last_chunk:
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            self._finalize_send(req, session)
+
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
-    def respond_and_send_async(self, req: LlmRequest):
-        self._ever_had_send_session = True
+    def respond_and_send_async(self, req: LlmRequest) -> None:
+        """Start background KV cache transfer to the generation server.
+
+        Creates (or reuses) a ``TxSession`` and sends a monolithic KV slice for each request.
+
+        Args:
+            req: The completed context request whose KV cache to transfer.
+        """
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        for kv_slice in self._create_kv_slices(req):
-            session.send(kv_slice)
+        session.send(self._create_kv_slice(req))
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")

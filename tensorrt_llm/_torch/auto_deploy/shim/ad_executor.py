@@ -1281,6 +1281,8 @@ def create_autodeploy_executor(
             attention_type_cpp,
             cache_transceiver_config,
             mamba_cache_manager=None,
+            enable_chunked_prefill=getattr(ad_config,
+                                           "enable_chunked_prefill", False),
         )
 
     # Guided (structured) decoding.

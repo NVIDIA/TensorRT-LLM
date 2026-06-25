@@ -3954,6 +3954,13 @@ class PyExecutor:
                         )
                         gpu_forward_events_from_perf_pool = True
 
+                    scheduled_request_ids = [
+                        req.py_request_id
+                        for req in scheduled_batch.all_requests()
+                    ]
+                    logger.info(
+                        f"[{time.time()}] Starting forward step for scheduled "
+                        f"batch request_ids={scheduled_request_ids}")
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         if self.dwdp_manager is not None:
@@ -4745,6 +4752,15 @@ class PyExecutor:
 
         # Check token ID ranges
         self._validate_token_id_range(request)
+
+        if (not self.is_warmup and self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.enable_pipelined_transfer):
+            disagg_params = request.py_disaggregated_params
+            if (disagg_params is None or disagg_params.schedule_style
+                    != DisaggScheduleStyle.GENERATION_FIRST):
+                raise ValueError(
+                    "schedule_style must be generation_first when "
+                    "enable_pipelined_transfer is set.")
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
@@ -5673,6 +5689,40 @@ class PyExecutor:
 
         return
 
+    def _maybe_send_prefill_chunk(self, request: LlmRequest) -> None:
+        """Send the just-completed prefill chunk's KV data if pipelined transfer is enabled.
+
+        Called from ``_update_request_states_tp`` after each context chunk's
+        ``move_to_next_context_chunk()``.  Converts token positions to block
+        indices and dispatches the chunk to the transceiver.
+
+        Args:
+            request: The context-only request whose chunk just completed.
+        """
+        if not self.kv_cache_transceiver:
+            return
+        if not request.is_context_only_request:
+            return
+        if not self.kv_cache_transceiver.enable_pipelined_transfer:
+            return
+        if request.is_finished_due_to_cancellation:
+            return
+
+        chunk_start_pos, chunk_end_pos = request.py_last_context_chunk
+        tpb = self.kv_cache_manager.tokens_per_block
+
+        chunk_start_block = chunk_start_pos // tpb
+        chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
+        is_last_chunk = request.context_remaining_length == 0
+
+        logger.info(f"[{time.time()}] Sending prefill chunk for request {request.py_request_id} from block {chunk_start_block} to {chunk_end_block}")
+        self.kv_cache_transceiver.send_prefill_chunk(
+            request,
+            chunk_start_block=chunk_start_block,
+            chunk_end_block=chunk_end_block,
+            is_last_chunk=is_last_chunk,
+        )
+
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
 
@@ -5701,8 +5751,10 @@ class PyExecutor:
                             req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                    self.async_transfer_manager.start_transfer(req) # TODO: I think this is the right place for pipelined transfer?
+                    # If pipelined transfer is enabled, skip re-sending.
+                    if not self.kv_cache_transceiver.enable_pipelined_transfer:
+                        self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
@@ -5936,6 +5988,7 @@ class PyExecutor:
                     request.context_current_position +
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
+                self._maybe_send_prefill_chunk(request)
             if request.context_remaining_length == 0:
                 # Prefill is done for this request; drop pinned encoder outputs
                 # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed

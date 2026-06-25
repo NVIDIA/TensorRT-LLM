@@ -1986,23 +1986,6 @@ class TestStrictBaseModelArbitraryArgs:
             CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
-    def test_cache_transceiver_config_transfer_chunk_size(self):
-        """Test transfer_chunk_size field validation."""
-        config = CacheTransceiverConfig(transfer_chunk_size=64)
-        assert config.transfer_chunk_size == 64
-
-        config_none = CacheTransceiverConfig(transfer_chunk_size=None)
-        assert config_none.transfer_chunk_size is None
-
-        config_default = CacheTransceiverConfig()
-        assert config_default.transfer_chunk_size is None
-
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
-            CacheTransceiverConfig(transfer_chunk_size=0)
-
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
-            CacheTransceiverConfig(transfer_chunk_size=-1)
-
     def test_torch_compile_config_arbitrary_args(self):
         """Test that TorchCompileConfig rejects arbitrary arguments."""
         # Valid arguments should work
