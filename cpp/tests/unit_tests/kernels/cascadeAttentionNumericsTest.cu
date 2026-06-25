@@ -125,8 +125,8 @@ struct CascadeTestParams
 std::string PrintCascadeTestParams(testing::TestParamInfo<CascadeTestParams> const& info)
 {
     auto const& p = info.param;
-    return "H" + std::to_string(p.numHeads) + "_KVH" + std::to_string(p.numKvHeads) + "_B"
-        + std::to_string(p.beamWidth) + "_R" + std::to_string(p.numRequests) + "_P" + std::to_string(p.prefixLen) + "_S"
+    return "H" + std::to_string(p.numHeads) + "_KVH" + std::to_string(p.numKvHeads) + "_B" + std::to_string(p.beamWidth)
+        + "_R" + std::to_string(p.numRequests) + "_P" + std::to_string(p.prefixLen) + "_S"
         + std::to_string(p.suffixLen);
 }
 
@@ -207,8 +207,7 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
 
     // Baseline multi-block workspace (generous allocation).
     int const max_seq_len_tile = 64;
-    CudaBuf d_partial_out(
-        static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * kDh * sizeof(float));
+    CudaBuf d_partial_out(static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * kDh * sizeof(float));
     CudaBuf d_partial_sum(static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * sizeof(float));
     CudaBuf d_partial_max(static_cast<size_t>(max_seq_len_tile) * batchSize * tp.numHeads * sizeof(float));
     CudaBuf d_block_counter(static_cast<size_t>(batchSize) * tp.numHeads * sizeof(int));
