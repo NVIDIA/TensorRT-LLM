@@ -20,7 +20,6 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
-from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import \
     BlockKey as _NativeBlockKey
@@ -825,15 +824,10 @@ class BlockHashMixin:
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model)
             else:
-                from tensorrt_llm.tokenizer import \
-                    maybe_fix_byte_level_tokenizer
-                tokenizer = AutoTokenizer.from_pretrained(
+                from tensorrt_llm.tokenizer import TransformersTokenizer
+                tokenizer = TransformersTokenizer.from_pretrained(
                     model, trust_remote_code=True)
-                # Work around Transformers 5.x LlamaTokenizer overriding
-                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
-                # which silently strips spaces from prompts (see tokenizer.py).
-                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
-                    tokenizer, model, trust_remote_code=True)
+                self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
     def _encode_with_prefix_cache(self, rendered: str, key: int,

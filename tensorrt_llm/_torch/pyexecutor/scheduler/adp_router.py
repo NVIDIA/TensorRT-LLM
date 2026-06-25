@@ -39,7 +39,12 @@ HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_
 def _num_input_tokens(request) -> int:
     """Token count via the cheap num_input_tokens accessor (avoids materializing
     input_token_ids); 0 when request is None."""
-    return request.num_input_tokens if request is not None else 0
+    if request is None:
+        return 0
+    num_input_tokens = getattr(request, "num_input_tokens", None)
+    if isinstance(num_input_tokens, int):
+        return num_input_tokens
+    return len(getattr(request, "input_token_ids", []))
 
 
 @dataclass
