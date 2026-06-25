@@ -281,6 +281,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 
