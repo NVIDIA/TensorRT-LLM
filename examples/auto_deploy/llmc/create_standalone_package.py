@@ -490,17 +490,17 @@ def _create_test_common_stub(tests_dir: str) -> None:
 # Example / e2e harness copying
 # ---------------------------------------------------------------------------
 def _copy_runners(output_dir: str) -> int:
-    """Copy the Tier-1 e2e harness into the standalone package under ``runners/``.
+    """Copy the Tier-1 e2e harness into the standalone package under ``runners/trtllm/``.
 
     ``examples/auto_deploy/build_and_run_ad.py`` is copied to
-    ``runners/build_and_run_llmc_trtllm.py`` (see ``EXAMPLE_FILES``) together with
-    its sibling ``model_registry/``. Because the script resolves the registry
+    ``runners/trtllm/build_and_run_llmc_trtllm.py`` (see ``EXAMPLE_FILES``) together
+    with its sibling ``model_registry/``. Because the script resolves the registry
     relative to its own location (``Path(__file__).parent / "model_registry"``),
     the rename + relocation are safe and ``--use-registry`` keeps working.
     ``.py`` files get the usual ``auto_deploy -> llmc`` import rewrite (applied by
     the caller); the ``model_registry`` YAML is data, copied verbatim.
     """
-    runners_dst = os.path.join(output_dir, "runners")
+    runners_dst = os.path.join(output_dir, "runners", "trtllm")
     count = 0
     for src_name, dst_name in EXAMPLE_FILES.items():
         src = os.path.join(AD_EXAMPLES_SRC, src_name)
@@ -597,7 +597,7 @@ def create_standalone_package(output_dir: str) -> None:
     #     left untouched.
     runner_count = _copy_runners(output_dir)
     runner_rewrites = _rewrite_imports_in_dir(os.path.join(output_dir, "runners"))
-    print(f"  Copied {runner_count} runner files to runners/ ({runner_rewrites} import rewrites)")
+    print(f"  Copied {runner_count} runner files to runners/trtllm/ ({runner_rewrites} import rewrites)")
 
     # 3. Resolve dependencies and create pyproject.toml
     pinned = _read_pinned_versions(TRTLLM_REQUIREMENTS)
@@ -657,7 +657,7 @@ def create_standalone_package(output_dir: str) -> None:
         'To verify:        python -c "from llmc._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
     )
     print(
-        "To run e2e:       python runners/build_and_run_llmc_trtllm.py "
+        "To run e2e:       python runners/trtllm/build_and_run_llmc_trtllm.py "
         "--model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --use-registry  (needs tensorrt-llm installed)"
     )
 
