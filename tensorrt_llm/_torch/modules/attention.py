@@ -28,8 +28,8 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compiled_cat,
-                     maybe_compiled_copy_)
+                     is_nvfp4_marlin_enabled, is_torch_compiling,
+                     maybe_compiled_cat, maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -529,7 +529,8 @@ class Attention(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -541,6 +542,8 @@ class Attention(nn.Module):
 
         attn_cls = get_attention_backend(
             self.attn_backend, sparse_attention_config=sparse_attn_cfg)
+
+        self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -662,7 +665,7 @@ class Attention(nn.Module):
             self.o_proj,
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
-        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale
+        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
@@ -698,7 +701,6 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -738,7 +740,6 @@ class Attention(nn.Module):
                     relative_attention_bias=relative_attention_bias,
                     relative_attention_max_distance=
                     relative_attention_max_distance,
-                    multi_item_part_lens=multi_item_part_lens,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -787,7 +788,6 @@ class Attention(nn.Module):
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
-                multi_item_part_lens=multi_item_part_lens,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -810,7 +810,6 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
     ):
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
@@ -825,7 +824,8 @@ class Attention(nn.Module):
         use_custom_inplace_op = (self.register_to_config
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling())
+                                 and is_torch_compiling()
+                                 and not self.is_marlin_enabled)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
@@ -863,7 +863,6 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
-                multi_item_part_lens=multi_item_part_lens,
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
@@ -884,7 +883,6 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -944,23 +942,6 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
-        if multi_item_part_lens is not None:
-            # adjust RoPE positions for multi-item scoring
-            current_idx = 0
-            for req_multi_item_part_lens in multi_item_part_lens:
-                req_prefix_len, *req_multi_item_part_lens = req_multi_item_part_lens
-                # RoPE for prefix does not need updating and RoPE for delimiter does not matter
-                current_idx += req_prefix_len + 1
-                for item_len in req_multi_item_part_lens:
-                    next_idx = current_idx + item_len
-                    position_ids[0, current_idx:next_idx].copy_(
-                        torch.arange(req_prefix_len,
-                                     req_prefix_len + item_len,
-                                     dtype=position_ids.dtype,
-                                     device=position_ids.device),
-                        non_blocking=True)
-                    current_idx = next_idx + 1  # RoPE for delimiter does not matter
-
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -984,7 +965,6 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
-            multi_item_part_lens=multi_item_part_lens,
         )
 
         if self.attn_output_gate:
@@ -1462,7 +1442,8 @@ class MLA(nn.Module):
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:

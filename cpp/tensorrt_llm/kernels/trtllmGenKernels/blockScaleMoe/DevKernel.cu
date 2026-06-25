@@ -69,6 +69,13 @@ __global__ void activationKernel(KernelParams params)
     }
 #endif
 
+    // FP8 separate-activation path: swiglu_limit is uniform across experts,
+    // passed by value via KernelParams::swigluLimit (gated by hasSwigluLimit).
+    // Apply gate.clamp(max=limit) / up.clamp(-limit, limit) before silu/mul.
+    // Per-expert non-uniform limits are not supported here.
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
+
     for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z)
     {
         // Look over experts per token
@@ -85,8 +92,14 @@ __global__ void activationKernel(KernelParams params)
             {
                 int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
 
-                float x1 = (float) params.inPtr[baseIdx];
-                float x2 = (float) params.inPtr[baseIdx + params.innerDim / 2];
+                float x1 = (float) params.inPtr[baseIdx];                       // up (linear)
+                float x2 = (float) params.inPtr[baseIdx + params.innerDim / 2]; // gate (silu input)
+
+                if (hasSwigluLimit)
+                {
+                    x2 = fminf(x2, swigluLimit);
+                    x1 = fmaxf(fminf(x1, swigluLimit), -swigluLimit);
+                }
 
                 float act = silu(x2);
                 Type out = (Type) (act * x1);
@@ -243,6 +256,14 @@ __global__ void activationDeepSeekKernel(KernelParams params)
     // The largest (finite) value that can be represented using E4m3.
     float constexpr E4m3MaxVal{448.f};
 
+    // FP8 separate-activation path: swiglu_limit is uniform across experts,
+    // passed by value via KernelParams::swigluLimit (gated by hasSwigluLimit).
+    // Apply gate.clamp(max=limit) / up.clamp(-limit, limit) AFTER
+    // dequantization but BEFORE silu/mul. Per-expert non-uniform limits are
+    // not supported here.
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
+
     int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
     // Loop over tokens
     float scale1Arr[NumTokensPerCta];
@@ -305,8 +326,13 @@ __global__ void activationDeepSeekKernel(KernelParams params)
 #pragma unroll
                 for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++)
                 {
-                    float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
-                    float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
+                    float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx]; // up (linear)
+                    float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx]; // gate (silu input)
+                    if (hasSwigluLimit)
+                    {
+                        x2 = fminf(x2, swigluLimit);
+                        x1 = fmaxf(fminf(x1, swigluLimit), -swigluLimit);
+                    }
                     float act = silu(x2);
                     float out = act * x1;
                     outArr[tokenInCtaIdx] = out;
