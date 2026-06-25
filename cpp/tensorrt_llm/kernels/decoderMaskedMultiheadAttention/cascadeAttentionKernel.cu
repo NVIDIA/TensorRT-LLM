@@ -355,6 +355,11 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
             {
                 int const q_offset = (req_idx * beam_width + beam_idx) * q_stride + head_idx * Dh + c;
                 q_val = params.q[q_offset];
+                if (params.q_bias != nullptr)
+                {
+                    q_val = common::cuda_cast<T>(
+                        common::cuda_cast<float>(q_val) + common::cuda_cast<float>(params.q_bias[head_idx * Dh + c]));
+                }
             }
             else
             {
@@ -743,6 +748,11 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
     int const q_offset = seq * q_stride + head_idx * Dh + tid;
     q_smem[tid] = common::cuda_cast<float>(params.q[q_offset]);
+
+    if (params.q_bias != nullptr)
+    {
+        q_smem[tid] += common::cuda_cast<float>(params.q_bias[head_idx * Dh + tid]);
+    }
     __syncthreads();
 
     // Apply RoPE to Q if enabled.  Cached K is already post-RoPE.

@@ -119,6 +119,7 @@ struct CascadeTestParams
     int prefixLen;
     int suffixLen;
     int maxSeqLen;
+    bool useBias; // when true, populate q/k/v_bias (qkv_bias enabled, e.g. Qwen2)
 };
 
 // Pretty-print for gtest output.
@@ -126,8 +127,8 @@ std::string PrintCascadeTestParams(testing::TestParamInfo<CascadeTestParams> con
 {
     auto const& p = info.param;
     return "H" + std::to_string(p.numHeads) + "_KVH" + std::to_string(p.numKvHeads) + "_B" + std::to_string(p.beamWidth)
-        + "_R" + std::to_string(p.numRequests) + "_P" + std::to_string(p.prefixLen) + "_S"
-        + std::to_string(p.suffixLen);
+        + "_R" + std::to_string(p.numRequests) + "_P" + std::to_string(p.prefixLen) + "_S" + std::to_string(p.suffixLen)
+        + (p.useBias ? "_bias" : "");
 }
 
 } // namespace
@@ -181,6 +182,21 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
     fillRandomHalf(h_k.data(), kv_step_elems, rng);
     fillRandomHalf(h_v.data(), kv_step_elems, rng);
 
+    // qkv_bias buffers (only populated when tp.useBias).  Baseline MMHA applies
+    // q/k/v bias before RoPE; the cascade kernels must reproduce the same result.
+    // q_bias is sized per Q head, k/v_bias per KV head (matches kernel indexing).
+    size_t const q_bias_elems = static_cast<size_t>(tp.numHeads) * kDh;
+    size_t const kv_bias_elems = static_cast<size_t>(tp.numKvHeads) * kDh;
+    std::vector<half> h_q_bias(q_bias_elems, __float2half(0.f));
+    std::vector<half> h_k_bias(kv_bias_elems, __float2half(0.f));
+    std::vector<half> h_v_bias(kv_bias_elems, __float2half(0.f));
+    if (tp.useBias)
+    {
+        fillRandomHalf(h_q_bias.data(), q_bias_elems, rng);
+        fillRandomHalf(h_k_bias.data(), kv_bias_elems, rng);
+        fillRandomHalf(h_v_bias.data(), kv_bias_elems, rng);
+    }
+
     // Set up cache_indir: the kernel reads beam_offset = cache_indir[batch_beam * max_attn_win + t]
     // and computes seqIdx = batch_idx * beam_width + beam_offset.  So the stored
     // value must be the *beam-local* index (0 .. beam_width-1), not the global
@@ -204,6 +220,9 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
     CudaBuf d_length_per_sample(batchSize * sizeof(int));
     CudaBuf d_out_baseline(q_elems * sizeof(half));
     CudaBuf d_out_cascade(q_elems * sizeof(half));
+    CudaBuf d_q_bias(q_bias_elems * sizeof(half));
+    CudaBuf d_k_bias(kv_bias_elems * sizeof(half));
+    CudaBuf d_v_bias(kv_bias_elems * sizeof(half));
 
     // Baseline multi-block workspace (generous allocation).
     int const max_seq_len_tile = 64;
@@ -230,6 +249,14 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
         cudaMemcpy(d_input_lengths.ptr, h_input_lengths.data(), batchSize * sizeof(int), cudaMemcpyHostToDevice));
     TLLM_CUDA_CHECK(cudaMemcpy(
         d_length_per_sample.ptr, h_length_per_sample.data(), batchSize * sizeof(int), cudaMemcpyHostToDevice));
+    if (tp.useBias)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpy(d_q_bias.ptr, h_q_bias.data(), q_bias_elems * sizeof(half), cudaMemcpyHostToDevice));
+        TLLM_CUDA_CHECK(
+            cudaMemcpy(d_k_bias.ptr, h_k_bias.data(), kv_bias_elems * sizeof(half), cudaMemcpyHostToDevice));
+        TLLM_CUDA_CHECK(
+            cudaMemcpy(d_v_bias.ptr, h_v_bias.data(), kv_bias_elems * sizeof(half), cudaMemcpyHostToDevice));
+    }
 
     // ----- Build KVLinearBuffer -----
     // KVLinearBuffer layout: [B, 2(K/V), H, S, D].
@@ -285,6 +312,12 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
         p.cascade_partial_out = d_cascade_out.as<float>();
         p.cascade_partial_max = d_cascade_max.as<float>();
         p.cascade_partial_sum = d_cascade_sum.as<float>();
+        if (tp.useBias)
+        {
+            p.q_bias = d_q_bias.as<half>();
+            p.k_bias = d_k_bias.as<half>();
+            p.v_bias = d_v_bias.as<half>();
+        }
         return p;
     };
 
@@ -342,13 +375,18 @@ TEST_P(CascadeAttentionNumericsTest, CascadeMatchesBaseline)
 // clang-format off
 INSTANTIATE_TEST_SUITE_P(CascadeNumerics, CascadeAttentionNumericsTest,
     ::testing::Values(
-        //                          numHeads  numKvHeads  beamWidth  numRequests  prefixLen  suffixLen  maxSeqLen
-        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256},
-        CascadeTestParams{               8,         8,         2,           4,        64,        16,       256},
-        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512},
-        CascadeTestParams{              16,        16,         4,           2,       256,         8,       512},
-        CascadeTestParams{               8,         8,         4,           1,        32,         4,       128},
-        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256}
+        //                          numHeads  numKvHeads  beamWidth  numRequests  prefixLen  suffixLen  maxSeqLen  useBias
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    false},
+        CascadeTestParams{               8,         8,         2,           4,        64,        16,       256,    false},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    false},
+        CascadeTestParams{              16,        16,         4,           2,       256,         8,       512,    false},
+        CascadeTestParams{               8,         8,         4,           1,        32,         4,       128,    false},
+        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    false},
+        // qkv_bias enabled: exercises q_bias/k_bias/v_bias add against baseline
+        // MMHA (which applies bias before RoPE).  MHA / GQA / MQA head groupings.
+        CascadeTestParams{               8,         8,         4,           2,        64,        16,       256,    true},
+        CascadeTestParams{              32,         8,         4,           1,       128,        32,       512,    true},
+        CascadeTestParams{               8,         1,         4,           2,        64,        16,       256,    true}
     ),
     PrintCascadeTestParams);
 // clang-format on
