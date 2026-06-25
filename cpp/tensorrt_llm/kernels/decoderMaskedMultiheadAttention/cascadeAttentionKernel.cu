@@ -748,7 +748,6 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
     int const q_offset = seq * q_stride + head_idx * Dh + tid;
     q_smem[tid] = common::cuda_cast<float>(params.q[q_offset]);
-
     if (params.q_bias != nullptr)
     {
         q_smem[tid] += common::cuda_cast<float>(params.q_bias[head_idx * Dh + tid]);
@@ -1041,6 +1040,14 @@ bool cascade_eligible(KernelParamsType const& params)
         return false;
     }
     if (params.attention_mask != nullptr || params.attention_sinks != nullptr)
+    {
+        return false;
+    }
+    if (params.logn_scaling_ptr != nullptr)
+    {
+        return false;
+    }
+    if (params.ia3_tasks != nullptr)
     {
         return false;
     }
