@@ -1502,7 +1502,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     1, dtype=torch.uint32, device=q.device)
             else:
                 forward_args.fmha_scheduler_counter.zero_()
-            self._append_mla_gen_latent(metadata, forward_args.latent_cache)
+            assert forward_args.latent_cache is not None
+            from .utils import append_mla_latent_cache
+            append_mla_latent_cache(
+                metadata.kv_cache_manager,
+                self.get_local_layer_idx(metadata),
+                metadata.request_ids,
+                metadata.seq_lens.tolist(),
+                metadata.kv_cache_params.num_cached_tokens_per_seq,
+                forward_args.latent_cache,
+                kv_layout=metadata.kv_layout,
+                seq_start=num_ctx,
+            )
 
         # RocketKV and DSA predict which blocks to keep, so build their sparse
         # index tensors here. Skip-softmax needs no prediction.
@@ -1884,35 +1895,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             Predict sparse attn indices. It's implemented in the derived class.
         """
         raise NotImplementedError
-
-    def _append_mla_gen_latent(self, metadata: TrtllmAttentionMetadata,
-                               latent_cache: torch.Tensor) -> None:
-        """Write the new generation latent into the paged MLA cache (no RoPE).
-
-        Testing-only counterpart to the cache append ``mla_rope_generation``
-        performs in production. Used when ``skip_mla_rope_generation`` is set:
-        the generation FMHA only reads the cache, so the new latent tokens must
-        be present at ``[num_cached, num_cached + q_len)`` per request.
-        """
-        layer = self.get_local_layer_idx(metadata)
-        # [num_pages, 1, tokens_per_block, 1, kv_lora_rank + qk_rope_head_dim]
-        buf = metadata.kv_cache_manager.get_buffers(layer)
-        tokens_per_block = buf.shape[2]
-        blocks_per_req = metadata.kv_cache_manager.get_batch_cache_indices(
-            metadata.request_ids, layer)
-        num_cached = metadata.kv_cache_params.num_cached_tokens_per_seq
-        seq_lens = metadata.seq_lens.tolist()
-        tok = 0
-        for i in range(metadata.num_contexts, metadata.num_seqs):
-            blocks = [b for b in blocks_per_req[i] if b != -1]
-            q_len = int(seq_lens[i])
-            start = int(num_cached[i])
-            for j in range(q_len):
-                pos = start + j
-                blk = blocks[pos // tokens_per_block]
-                buf[blk, 0, pos % tokens_per_block,
-                    0, :].copy_(latent_cache[tok + j])
-            tok += q_len
 
     def mla_rope_generation(
         self,

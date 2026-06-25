@@ -489,9 +489,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         result = torch.cat(outputs, dim=0)
         return result.reshape(result.size(0), -1)
 
-    def _mla_forward_generation(
-            self, fused_q: torch.Tensor, latent_cache: torch.Tensor,
-            metadata: VanillaAttentionMetadata) -> torch.Tensor:
+    def _mla_forward_generation(self, fused_q: torch.Tensor,
+                                metadata: VanillaAttentionMetadata,
+                                latent_cache: torch.Tensor) -> torch.Tensor:
         """Absorbed MLA generation: MQA of ``fused_q`` over the latent cache.
 
         The latent cache stores ``[compressed_kv | k_pe]`` with a single KV head
@@ -511,8 +511,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         # MLA KV cache: NHD [num_pages, kv_factor=1, page_size, num_kv_heads=1,
         # kv_lora_rank + qk_rope_head_dim]. Vanilla is single-block per sequence.
-        kv_cache = metadata.kv_cache_manager.get_buffers(
-            self.layer_idx, kv_layout=metadata.kv_layout)
+        from .utils import append_mla_latent_cache
+        kv_cache = append_mla_latent_cache(
+            metadata.kv_cache_manager,
+            self.layer_idx,
+            metadata.request_ids,
+            metadata.seq_lens.tolist(),
+            metadata.kv_cache_params.num_cached_tokens_per_seq,
+            latent_cache,
+            kv_layout=metadata.kv_layout,
+        )
         past = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [
             block_ids[0] for block_ids in metadata.block_ids_per_seq
@@ -527,9 +535,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         for i, q_len in enumerate(metadata.seq_lens.tolist()):
             past_i = int(past[i])
             ci = cache_indices[i]
-            # Append the new latent tokens for this request at [past_i, kv_len).
-            new = latent_cache[offset:offset + q_len].to(kv_cache.dtype)
-            kv_cache[ci, 0, past_i:past_i + q_len, 0, :] = new
             kv_len = past_i + q_len
 
             # K is the full latent ([compressed_kv | k_pe]); V is the kv_lora
@@ -566,17 +571,30 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return torch.cat(outputs, dim=0)
 
-    def _mla_forward_context(
-            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-            metadata: VanillaAttentionMetadata) -> torch.Tensor:
+    def _mla_forward_context(self, q: torch.Tensor, k: torch.Tensor,
+                             v: torch.Tensor,
+                             metadata: VanillaAttentionMetadata,
+                             latent_cache: torch.Tensor) -> torch.Tensor:
         """Up-projected MLA context: causal MHA with asymmetric K/V.
 
         The module up-projects compressed_kv to full per-head K/V, so this is
         ordinary causal self-attention except the K head_dim (qk_nope + qk_rope)
-        differs from the V head_dim (v_head_dim). The latent cache append (for a
-        later generation phase) does not affect this prefill output, so it is
-        left to the production backends; the golden only needs the attention.
+        differs from the V head_dim (v_head_dim). The latent cache append does
+        not affect this prefill output, but later generation reads it from the
+        same cache manager, so Vanilla mirrors the production backends and
+        appends it here.
         """
+        from .utils import append_mla_latent_cache
+        append_mla_latent_cache(
+            metadata.kv_cache_manager,
+            self.layer_idx,
+            metadata.request_ids,
+            metadata.seq_lens.tolist(),
+            metadata.kv_cache_params.num_cached_tokens_per_seq,
+            latent_cache,
+            kv_layout=metadata.kv_layout,
+        )
+
         qk_head = self.qk_nope_head_dim + self.qk_rope_head_dim
         H = self.num_heads
         q = q.view(-1, H, qk_head)
@@ -613,14 +631,18 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 "Vanilla Attention does not support multi-item scoring")
 
         if self.is_mla_enable:
+            if metadata.kv_cache_manager is None:
+                raise ValueError("Vanilla MLA requires a KV cache manager.")
+            if forward_args.latent_cache is None:
+                raise ValueError("Vanilla MLA requires latent_cache.")
             if forward_args.attention_input_type == AttentionInputType.context_only:
                 assert k is not None and v is not None
-                return self._mla_forward_context(q, k, v, metadata)
+                return self._mla_forward_context(q, k, v, metadata,
+                                                 forward_args.latent_cache)
             elif forward_args.attention_input_type == AttentionInputType.generation_only:
-                assert k is None and v is None and forward_args.latent_cache is not None
-                return self._mla_forward_generation(q,
-                                                    forward_args.latent_cache,
-                                                    metadata)
+                assert k is None and v is None
+                return self._mla_forward_generation(q, metadata,
+                                                    forward_args.latent_cache)
             else:
                 raise ValueError(
                     f"Unsupported attention input type: {forward_args.attention_input_type}"

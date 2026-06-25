@@ -330,12 +330,17 @@ def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
     )
 
 
-def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent):
+def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent, *, kv_layout="NHD"):
     """Write the per-request cached latent prefix into the MLA cache pool."""
     if all(c.shape[0] == 0 for c in cached_latent):
         return
-    buf = mgr.get_buffers(layer_idx)  # [pages, 1, page_size, 1, d_latent]
-    tokens_per_block = buf.shape[2]
+    buf = mgr.get_buffers(layer_idx, kv_layout=kv_layout)
+    if kv_layout == "NHD":
+        tokens_per_block = buf.shape[2]
+    elif kv_layout == "HND":
+        tokens_per_block = buf.shape[3]
+    else:
+        raise ValueError(f"Unsupported kv_layout: {kv_layout}")
     blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), layer_idx)
     for i, blocks in enumerate(blocks_per_req):
         blocks = [b for b in blocks if b != -1]
@@ -345,26 +350,113 @@ def _fill_mla_cache(mgr, layer_idx, request_ids, cached_latent):
             if written >= lat.shape[0]:
                 break
             n = min(tokens_per_block, lat.shape[0] - written)
-            buf[blk, 0, :n, 0, :].copy_(lat[written : written + n].to(buf.dtype))
+            if kv_layout == "NHD":
+                buf[blk, 0, :n, 0, :].copy_(lat[written : written + n].to(buf.dtype))
+            else:
+                buf[blk, 0, 0, :n, :].copy_(lat[written : written + n].to(buf.dtype))
             written += n
 
 
-def _mla_metadata(AttentionCls, case, mgr):
-    return AttentionCls.Metadata(
-        num_contexts=0,
-        kv_cache_params=KVCacheParams(
-            use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
-        ),
-        seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
-        max_num_requests=case.num_seqs,
-        max_num_tokens=case.max_num_tokens,
-        kv_cache_manager=mgr,
-        request_ids=list(range(case.num_seqs)),
-        prompt_lens=case.token_nums,
-    )
+def _kv_cache_tokens_per_block(buf: torch.Tensor, kv_layout: str) -> int:
+    if kv_layout == "NHD":
+        return buf.shape[2]
+    if kv_layout == "HND":
+        return buf.shape[3]
+    raise ValueError(f"Unsupported kv_layout: {kv_layout}")
 
 
-def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Tensor:
+def _slice_cache_tokens(
+    buf: torch.Tensor,
+    block: int,
+    block_offset: int,
+    n: int,
+    kv_layout: str,
+    *,
+    cache_kind: str,
+) -> torch.Tensor:
+    if cache_kind == "mla":
+        if kv_layout == "NHD":
+            return buf[block, 0, block_offset : block_offset + n, 0, :]
+        return buf[block, 0, 0, block_offset : block_offset + n, :]
+
+    if cache_kind == "kv":
+        if kv_layout == "NHD":
+            return buf[block, :, block_offset : block_offset + n, :, :]
+        return buf[block, :, :, block_offset : block_offset + n, :].transpose(1, 2)
+
+    raise ValueError(f"Unsupported cache kind: {cache_kind}")
+
+
+def _split_packed_tokens(packed: torch.Tensor, lengths, *tail_shape) -> list[torch.Tensor]:
+    chunks = []
+    offset = 0
+    for length in lengths:
+        chunk = packed[offset : offset + length]
+        if tail_shape:
+            chunk = chunk.view(length, *tail_shape)
+        chunks.append(chunk)
+        offset += length
+    return chunks
+
+
+def _expected_standard_cache_tokens(
+    case: BackendCase, new_k: torch.Tensor, new_v: torch.Tensor
+) -> list[torch.Tensor]:
+    k_per_seq = _split_packed_tokens(new_k, case.kv_new_lens, case.num_kv_heads, case.head_dim)
+    v_per_seq = _split_packed_tokens(new_v, case.kv_new_lens, case.num_kv_heads, case.head_dim)
+    return [torch.stack((k, v), dim=0) for k, v in zip(k_per_seq, v_per_seq, strict=True)]
+
+
+def _assert_cache_contains_new_tokens(
+    mgr,
+    layer_idx,
+    request_ids,
+    new_lens,
+    num_cached_tokens,
+    expected_per_seq: list[torch.Tensor],
+    *,
+    kv_layout: str,
+    cache_kind: str,
+    atol: float = 0.0,
+    rtol: float = 0.0,
+):
+    """Assert the backend appended each request's expected cache tokens."""
+    buf = mgr.get_buffers(layer_idx, kv_layout=kv_layout)
+    tokens_per_block = _kv_cache_tokens_per_block(buf, kv_layout)
+    blocks_per_req = mgr.get_batch_cache_indices(list(request_ids), layer_idx)
+    concat_dim = 1 if cache_kind == "kv" else 0
+    for i, new_len in enumerate(new_lens):
+        if new_len == 0:
+            continue
+        start = num_cached_tokens[i]
+        blocks = [b for b in blocks_per_req[i] if b != -1]
+        pieces = []
+        read = 0
+        while read < new_len:
+            pos = start + read
+            block = blocks[pos // tokens_per_block]
+            block_offset = pos % tokens_per_block
+            n = min(tokens_per_block - block_offset, new_len - read)
+            pieces.append(
+                _slice_cache_tokens(
+                    buf,
+                    block,
+                    block_offset,
+                    n,
+                    kv_layout,
+                    cache_kind=cache_kind,
+                )
+            )
+            read += n
+
+        actual = torch.cat(pieces, dim=concat_dim).to(torch.float32)
+        expected = expected_per_seq[i].to(buf.dtype).to(torch.float32)
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+def _run_mla_gen_backend(
+    case, backend, inputs, *, kv_layout: str, cuda_graph=False
+) -> torch.Tensor:
     """Run one backend's absorbed-MLA generation; return [nnz_q, heads*kv_lora].
 
     No ``mla_rope_generation`` call (see ``generate_mla_gen_inputs``): ``fused_q``
@@ -390,9 +482,10 @@ def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Te
     )
     mgr = _build_mla_kv_cache_manager(case, backend)
     mgr.add_dummy_requests(request_ids, case.token_nums)
-    _fill_mla_cache(mgr, 0, request_ids, inputs["cached_latent"])
+    _fill_mla_cache(mgr, 0, request_ids, inputs["cached_latent"], kv_layout=kv_layout)
     fused_q = inputs["fused_q"]
     latent_cache = inputs["latent_cache"]
+    expected_latents = _split_packed_tokens(latent_cache, case.seq_lens)
     fwd_kwargs = dict(
         latent_cache=latent_cache,
         attention_input_type=AttentionInputType.generation_only,
@@ -406,19 +499,56 @@ def _run_mla_gen_backend(case, backend, inputs, *, cuda_graph=False) -> torch.Te
         out = attn.forward(q, None, None, metadata, **fwd_kwargs)
         return out[0] if isinstance(out, tuple) else out
 
+    def _create_metadata(AttentionCls, case, mgr):
+        return AttentionCls.Metadata(
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=case.num_cached_tokens
+            ),
+            seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+            max_num_requests=case.num_seqs,
+            max_num_tokens=case.max_num_tokens,
+            kv_cache_manager=mgr,
+            request_ids=request_ids,
+            prompt_lens=case.token_nums,
+            kv_layout=kv_layout,
+        )
+
     try:
         if cuda_graph:
-            return _capture_replay(
+            out = _capture_replay(
                 AttentionCls,
                 case,
                 mgr,
-                _mla_metadata,
+                _create_metadata,
                 {"q": fused_q},
                 lambda md, bufs: _forward(md, bufs["q"]),
             )
-        metadata = _mla_metadata(AttentionCls, case, mgr)
+            _assert_cache_contains_new_tokens(
+                mgr,
+                0,
+                request_ids,
+                case.seq_lens,
+                case.num_cached_tokens,
+                expected_latents,
+                kv_layout=kv_layout,
+                cache_kind="mla",
+            )
+            return out
+        metadata = _create_metadata(AttentionCls, case, mgr)
         metadata.prepare()
-        return _forward(metadata, fused_q)[: case.nnz_q].contiguous()
+        out = _forward(metadata, fused_q)[: case.nnz_q].contiguous()
+        _assert_cache_contains_new_tokens(
+            mgr,
+            0,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            expected_latents,
+            kv_layout=metadata.kv_layout,
+            cache_kind="mla",
+        )
+        return out
     finally:
         mgr.shutdown()
 
@@ -438,7 +568,7 @@ def generate_mla_context_inputs(case: BackendCase, seed: int = 0) -> Dict:
     )
 
 
-def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
+def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.Tensor:
     """Run one backend's up-projected MLA context; return [nnz_q, heads*v_head]."""
     AttentionCls = get_attention_backend(backend)
     qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
@@ -459,6 +589,7 @@ def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
     )
     mgr = _build_mla_kv_cache_manager(case, backend)
     mgr.add_dummy_requests(request_ids, case.token_nums)
+    expected_latents = _split_packed_tokens(inputs["latent_cache"], case.seq_lens)
     metadata = AttentionCls.Metadata(
         num_contexts=case.num_contexts,
         kv_cache_params=KVCacheParams(
@@ -470,6 +601,7 @@ def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
         kv_cache_manager=mgr,
         request_ids=request_ids,
         prompt_lens=case.token_nums,
+        kv_layout=kv_layout,
     )
     metadata.prepare()
     try:
@@ -483,6 +615,16 @@ def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
         )
         if isinstance(out, tuple):
             out = out[0]
+        _assert_cache_contains_new_tokens(
+            mgr,
+            0,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            expected_latents,
+            kv_layout=metadata.kv_layout,
+            cache_kind="mla",
+        )
         return out[: case.nnz_q].contiguous()
     finally:
         mgr.shutdown()
@@ -553,6 +695,19 @@ def _maybe_rope(case: BackendCase, inputs, *, fuse_rope: bool):
     return q, new_k, cached_eff
 
 
+def _expected_new_k_for_cache(case: BackendCase, inputs, new_k: torch.Tensor, *, fuse_rope: bool):
+    if not fuse_rope or case.rope is None:
+        return new_k
+
+    rope_params = _rope_params_from_dict(case.rope)
+    is_neox = case.rope.get("is_neox", True)
+    if case.is_cross:
+        k_pos = make_position_ids(case.seq_lens_kv, [0] * case.num_seqs)
+    else:
+        k_pos = make_position_ids(case.seq_lens, case.num_cached_tokens)
+    return apply_rope(inputs["new_k"], k_pos, rope_params, case.head_dim, is_neox=is_neox)
+
+
 def _capture_replay(
     AttentionCls, case, mgr, make_metadata, static_inputs, forward_fn
 ) -> torch.Tensor:
@@ -614,8 +769,10 @@ def run_backend(
     """
     if case.is_mla:
         if case.is_context_only:
-            return _run_mla_context_backend(case, backend, inputs)
-        return _run_mla_gen_backend(case, backend, inputs, cuda_graph=cuda_graph)
+            return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
+        return _run_mla_gen_backend(
+            case, backend, inputs, kv_layout=kv_layout, cuda_graph=cuda_graph
+        )
 
     AttentionCls = get_attention_backend(backend)
     H, Hkv, D = case.num_heads, case.num_kv_heads, case.head_dim
@@ -625,6 +782,11 @@ def run_backend(
     q, new_k, cached_k = _maybe_rope(case, inputs, fuse_rope=fuse_rope)
     new_v = inputs["new_v"]
     cached_v = inputs["cached_v"]
+    cache_new_k = _expected_new_k_for_cache(case, inputs, new_k, fuse_rope=fuse_rope)
+    cache_atol, cache_rtol = _tolerances(case, kv_dtype) if fuse_rope else (0.0, 0.0)
+    expected_cache_tokens = None
+    if case.kv_dtype != "nvfp4":
+        expected_cache_tokens = _expected_standard_cache_tokens(case, cache_new_k, new_v)
 
     pos_embd_params = None
     if fuse_rope and case.rope is not None:
@@ -707,7 +869,7 @@ def run_backend(
                 return out[0] if isinstance(out, tuple) else out
 
             try:
-                return _capture_replay(
+                out = _capture_replay(
                     AttentionCls,
                     case,
                     mgr,
@@ -715,6 +877,20 @@ def run_backend(
                     static,
                     _cg_fwd,
                 )
+                if expected_cache_tokens is not None:
+                    _assert_cache_contains_new_tokens(
+                        mgr,
+                        0,
+                        request_ids,
+                        case.kv_new_lens,
+                        case.num_cached_tokens,
+                        expected_cache_tokens,
+                        kv_layout=kv_layout,
+                        cache_kind="kv",
+                        atol=cache_atol,
+                        rtol=cache_rtol,
+                    )
+                return out
             finally:
                 mgr.shutdown()
         metadata = create_metadata(AttentionCls, case, mgr, num_contexts=case.num_contexts)
@@ -742,6 +918,19 @@ def run_backend(
             out = attn.forward(q, new_k, new_v, metadata, **fwd_kwargs)
         if isinstance(out, tuple):
             out = out[0]
+        if mgr is not None and expected_cache_tokens is not None:
+            _assert_cache_contains_new_tokens(
+                mgr,
+                0,
+                request_ids,
+                case.kv_new_lens,
+                case.num_cached_tokens,
+                expected_cache_tokens,
+                kv_layout=metadata.kv_layout,
+                cache_kind="kv",
+                atol=cache_atol,
+                rtol=cache_rtol,
+            )
         return out[: case.nnz_q].contiguous()
     finally:
         if mgr is not None:
