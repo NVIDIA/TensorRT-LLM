@@ -373,7 +373,6 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_offload_matches_baseline
   - unittest/_torch/visual_gen/test_wan22_t2v_offload.py::TestWan22_A14B_Offload::test_wan22_fp8_offload_matches_baseline
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
-  - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example_with_offloading
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
 # ------------- AutoDeploy Backend Stages ---------------
