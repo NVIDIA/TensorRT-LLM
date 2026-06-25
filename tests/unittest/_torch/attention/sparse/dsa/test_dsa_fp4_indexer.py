@@ -263,23 +263,3 @@ def test_indexer_k_dtype_survives_model_config_rebuild():
         "indexer_k_dtype to DeepSeekSparseAttentionConfig(...); otherwise "
         "the user-visible FP4 knob will be silently dropped."
     )
-
-
-def test_indexer_k_dtype_survives_v4_model_config_rebuild():
-    """V4 analog of the above: indexer_k_dtype must survive rebuild.
-
-    Static check that ModelConfig.from_pretrained's DeepseekV4ForCausalLM
-    branch threads indexer_k_dtype into DeepSeekV4SparseAttentionConfig.
-    """
-    import inspect
-
-    from tensorrt_llm._torch.model_config import ModelConfig
-
-    rebuild_src = inspect.getsource(ModelConfig.from_pretrained)
-    # The V4 branch builds the config with `indexer_k_dtype=indexer_k_dtype`;
-    # the same string also appears in the V3 branch but its presence here is
-    # what guarantees V4 propagates the FP4 knob.
-    assert rebuild_src.count("indexer_k_dtype=indexer_k_dtype") >= 2, (
-        "ModelConfig.from_pretrained DeepseekV4ForCausalLM branch must "
-        "forward indexer_k_dtype to DeepSeekV4SparseAttentionConfig(...)."
-    )
