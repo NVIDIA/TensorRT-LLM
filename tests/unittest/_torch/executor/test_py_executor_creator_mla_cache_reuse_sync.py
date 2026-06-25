@@ -21,7 +21,6 @@ from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.quantization import QuantAlgo
 
-
 _MLA_SUPPORTED_SM_VERSIONS = [90, 100, 103, 120, 121]
 
 
@@ -330,9 +329,7 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
 
 
 @pytest.mark.parametrize("sm_version", _MLA_SUPPORTED_SM_VERSIONS)
-def test_mla_supported_configuration_preserves_cache_reuse(
-    monkeypatch, sm_version
-):
+def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch, sm_version):
     """Verify every supported MLA SM preserves cache reuse in both config and runtime.
 
     When the SM version is in the MLA allowlist and KV quantization is
@@ -351,9 +348,7 @@ def test_mla_supported_configuration_preserves_cache_reuse(
 
 
 @pytest.mark.parametrize("sm_version", _MLA_SUPPORTED_SM_VERSIONS)
-def test_mla_supported_configuration_preserves_chunked_prefill(
-    monkeypatch, sm_version
-):
+def test_mla_supported_configuration_preserves_chunked_prefill(monkeypatch, sm_version):
     """Verify every supported MLA SM preserves chunked prefill when requested."""
     _, _, runtime_chunked_prefill = _run_create_py_executor(
         monkeypatch,
