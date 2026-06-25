@@ -208,12 +208,14 @@ class KVSendTask(SendTaskBase):
         params: DisaggregatedParams,
         slice_id: int,
         prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
         self._prompt_len = prompt_len
+        self._beam_width = beam_width
 
 
 class Sender(SenderBase):
@@ -242,7 +244,9 @@ class Sender(SenderBase):
         self._pre_cancelled_rids: set[int] = set()
         self._shutdown = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
+        # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
+        self._loaded_remote_agents_lock = threading.Lock()
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
@@ -510,9 +514,25 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
+            status = self._agent.submit_transfer_requests(request)
+            if not status.wait():
                 agent_result = AgentResult.FAILED
-                task.fail(RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}"))
+                last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
+                agent_name = getattr(self._agent, "name", "<?>")
+                detail = (
+                    f"KV transfer agent failed: "
+                    f"unique_rid={write_meta.unique_rid} "
+                    f"slice={write_meta.slice_id} "
+                    f"peer_rank={write_meta.peer_rank} "
+                    f"peer_endpoint={write_meta.peer_endpoint} "
+                    f"op={getattr(request, 'op', '?')} "
+                    f"remote={getattr(request, 'remote_name', '?')} "
+                    f"src_size={int(write_meta.src_ptrs.size)} "
+                    f"dst_size={int(write_meta.dst_ptrs.size)} "
+                    f"nixl_status={last_status} agent={agent_name}"
+                )
+                logger.error(detail)
+                task.fail(RuntimeError(detail))
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
@@ -645,6 +665,13 @@ class Sender(SenderBase):
             dst_block_ids[dst_skip : dst_skip + n_transfer],
         )
 
+    @staticmethod
+    def _beam0_block_count(block_ids: np.ndarray, total_blocks: int, beam_width: int) -> int:
+        """Return the number of beam-0 blocks in a packed 1-D beam layout."""
+        if beam_width <= 1 or block_ids.size <= total_blocks:
+            return block_ids.size
+        return max(0, block_ids.size - (beam_width - 1))
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -701,16 +728,22 @@ class Sender(SenderBase):
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.
                 slice_end = token_range.end if token_range is not None else 0
                 total_blocks = (slice_end + tpb - 1) // tpb
-                assert src_block_ids.size <= total_blocks, (
-                    f"src block list ({src_block_ids.size}) exceeds total slice "
+                src_beam0_blocks = Sender._beam0_block_count(
+                    src_block_ids, total_blocks, task._beam_width
+                )
+                dst_beam0_blocks = Sender._beam0_block_count(
+                    dst_block_ids, total_blocks, task._beam_width
+                )
+                assert src_beam0_blocks <= total_blocks, (
+                    f"src beam-0 block list ({src_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                assert dst_block_ids.size <= total_blocks, (
-                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
+                assert dst_beam0_blocks <= total_blocks, (
+                    f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                src_start = (total_blocks - src_block_ids.size) * tpb
-                dst_start = (total_blocks - dst_block_ids.size) * tpb
+                src_start = (total_blocks - src_beam0_blocks) * tpb
+                dst_start = (total_blocks - dst_beam0_blocks) * tpb
                 if req_info.dst_start_token is not None:
                     dst_start = max(dst_start, req_info.dst_start_token)
                 if window_size is not None:
@@ -883,6 +916,9 @@ class Sender(SenderBase):
         self._messenger.start_listener(handle_message)
 
     def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
+        # Skip late messages so we don't race shutdown's invalidate loop.
+        if self._shutdown:
+            return
         torch.cuda.set_device(self._device_id)
         CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
@@ -895,7 +931,8 @@ class Sender(SenderBase):
             ri.instance_name + str(ri.instance_rank),
             ri.transfer_engine_info,
         )
-        self._loaded_remote_agents.add(agent_name)
+        with self._loaded_remote_agents_lock:
+            self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
@@ -1017,26 +1054,32 @@ class Sender(SenderBase):
             return
         self._shutdown = True
 
+        # Quiesce listener before invalidate to avoid set/map mutation races.
+        self._messenger.stop()
+
         for q in self._send_task_queues:
             q.put(None)
         for t in self._worker_threads:
             t.join(timeout=5)
-        # Invalidate all loaded remote agents to release fabric/POSIX FD resources
-        for agent_name in self._loaded_remote_agents:
+
+        # Snapshot under lock as defense in depth.
+        with self._loaded_remote_agents_lock:
+            loaded_agents = list(self._loaded_remote_agents)
+            self._loaded_remote_agents.clear()
+        # Invalidate all loaded remote agents to release fabric/POSIX FD resources.
+        for agent_name in loaded_agents:
             try:
                 self._agent.invalidate_remote_agent(agent_name)
             except Exception as e:
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        self._loaded_remote_agents.clear()
         for dealer in self._dealers.values():
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
         self._dealers.clear()
-        self._messenger.stop()
 
     def __del__(self):
         try:
@@ -1060,8 +1103,12 @@ class TxSession(TxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
-        super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
+        super().__init__(
+            sender,
+            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+        )
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
@@ -1111,7 +1158,13 @@ class TxSession(TxSessionBase):
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
-            task = KVSendTask(slice, params, slice_id, prompt_len=self._base_args.prompt_len)
+            task = KVSendTask(
+                slice,
+                params,
+                slice_id,
+                prompt_len=self._base_args.prompt_len,
+                beam_width=self._base_args.beam_width,
+            )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
@@ -1572,8 +1625,12 @@ class RxSession(RxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
+        beam_width: int = 1,
     ):
-        super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
+        super().__init__(
+            receiver,
+            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+        )
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._receiver: Receiver  # narrow base class type for Pylance
@@ -1660,11 +1717,13 @@ class RxSession(RxSessionBase):
                         ri = self._receiver._registrar.self_rank_info
                         task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
             elif status == AgentResult.FAILED:
-                task.fail(
-                    RuntimeError(
-                        f"KV transfer failed for request {self.request_id} slice={sender_slice_id}"
-                    )
+                detail = (
+                    f"KV transfer failed for request {self.request_id} slice={sender_slice_id} "
+                    f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
+                    f"(reported by remote agent; see sender-side log for nixl_status)"
                 )
+                logger.error(detail)
+                task.fail(RuntimeError(detail))
                 if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
                     self._terminal_status = SessionStatus.ERROR
             else:
@@ -1905,22 +1964,6 @@ def _make_aux_buffer(
     )
 
 
-def _deregister_registered_memory(transfer_agent, registered_memorys):
-    try:
-        if transfer_agent is None or not registered_memorys:
-            return
-        while registered_memorys:
-            register_memory = registered_memorys[0]
-            try:
-                logger.info(f"Deregistering transfer memory: {register_memory}")
-                transfer_agent.deregister_memory(register_memory)
-            except Exception:
-                logger.error("deregister memory failed in finalizer")
-            registered_memorys.pop(0)
-    except Exception:
-        logger.error("unexpected error in _deregister_registered_memory finalizer")
-
-
 @dataclass
 class TransferWorkerConfig:
     kv_cache_manager: KVCacheManager
@@ -1963,6 +2006,7 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
+            beam_width=request.py_beam_width,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -1975,6 +2019,7 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
             prompt_len=request.prompt_len,
+            beam_width=request.py_beam_width,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
@@ -1996,9 +2041,6 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
         self._registered_mem: list = []
-        self._finalizer = weakref.finalize(
-            self, _deregister_registered_memory, self._agent, self._registered_mem
-        )
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
@@ -2008,7 +2050,11 @@ class TransferWorker:
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
-            self._finalizer()
+            # shutdown()'s getattr guards handle whichever attrs got set before the failure.
+            try:
+                self.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker init-failure cleanup: {e}")
             raise
 
     def _register_kv_cache(self):
@@ -2064,12 +2110,22 @@ class TransferWorker:
         receiver = getattr(self, "_receiver", None)
         if receiver is not None:
             receiver.shutdown()
-        # Deregister NIXL memory before shutting down components, so that
-        # pinned GPU memory is released and can be re-allocated (e.g. when
-        # the KV cache manager is recreated after profiling).
-        finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None:
-            finalizer()
+        # Deregister NIXL memory before agent.shutdown so pinned GPU memory is released
+        # (e.g. when the KV cache manager is recreated after profiling).
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            registered = getattr(self, "_registered_mem", [])
+            while registered:
+                desc = registered.pop(0)
+                try:
+                    agent.deregister_memory(desc)
+                except Exception as e:
+                    logger.warning(f"TransferWorker.shutdown: deregister_memory failed: {e}")
+            try:
+                agent.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker.shutdown: agent.shutdown error: {e}")
+            self._agent = None
 
     def __del__(self):
         try:

@@ -46,6 +46,10 @@ from tensorrt_llm.serve.responses_utils import (
 )
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
+# Finish reasons for which a GEN handoff is still pending; any other reason means
+# the CTX request already completed and the disagg KV-cache handoff was never set up.
+_GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
+
 
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
@@ -174,7 +178,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             return ctx_response
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
-        if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
+        if response and response.choices[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
             del response.choices[0].disaggregated_params
             return False
         return True
@@ -383,28 +387,29 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
-            if len(ctx_response.choices) != 1:
-                raise ValueError(
-                    f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
-                )
-            choice = ctx_response.choices[0]
-            if choice.disaggregated_params is None:
-                raise ValueError(
-                    f"Context server did not return disaggregated params."
-                    f" finish_reason={choice.finish_reason!r}"
-                )
-            if choice.disaggregated_params.ctx_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: ctx_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
-                )
-            if choice.disaggregated_params.disagg_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: disagg_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
-                )
+            for idx, choice in enumerate(ctx_response.choices):
+                if choice.disaggregated_params is None:
+                    raise ValueError(
+                        f"Context server choice {idx} did not return disaggregated params."
+                        f" finish_reason={choice.finish_reason!r}"
+                    )
+                # A CTX request that finished early (e.g. EOS during prefill) never
+                # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
+                # stay None. Only enforce them when a GEN handoff is still pending --
+                # mirroring _need_gen, which skips the handoff for these responses.
+                if choice.finish_reason in _GEN_PENDING_FINISH_REASONS:
+                    if choice.disaggregated_params.ctx_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: ctx_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                        )
+                    if choice.disaggregated_params.disagg_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                        )
             return ctx_response
 
     async def _send_disagg_request_gen_first(

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import unittest
 from dataclasses import dataclass
 from unittest.mock import Mock
@@ -611,7 +614,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         multimodal_request.py_multimodal_data = {
             "mrope_config": {
                 "mrope_position_deltas": torch.tensor([[10]], dtype=torch.int32)
-            }
+            },
+            "multimodal_embedding": torch.ones((1, 1), dtype=torch.float16),
         }
 
         dummy_request = _create_request(6, 2)
@@ -639,6 +643,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                 dtype=torch.int32,
                                 device='cuda')
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertNotIn("multimodal_embedding",
+                         multimodal_request.py_multimodal_data)
         kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):

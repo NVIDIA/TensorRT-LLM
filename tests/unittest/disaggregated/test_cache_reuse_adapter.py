@@ -14,13 +14,21 @@
 # limitations under the License.
 """Tests for CacheReuseAdapter, _create_kv_slice SWA trim, and Sender token-start derivation."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
+
 import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
-from tensorrt_llm._torch.disaggregation.resource.cache_reuse import CacheReuseAdapter
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
+    CacheReuseAdapter,
+    _CacheReuseAdapterV1,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 # ---------------------------------------------------------------------------
 # _align_kv_blocks: contract unchanged.
@@ -95,6 +103,152 @@ class TestAlignKvBlocks:
 
 
 # ---------------------------------------------------------------------------
+# Packed 1-D beam block layout.
+# ---------------------------------------------------------------------------
+
+
+class TestPackedBeamBlockLayout:
+    """Verify beam search block IDs stay 1-D with only final tail blocks appended."""
+
+    def test_v1_adapter_uses_request_py_beam_width(self):
+        class _FakeMgr:
+            enable_block_reuse = True
+            tokens_per_block = 32
+
+            def __init__(self):
+                self.beam_width = None
+
+            def get_batch_cache_indices(self, request_ids, layer_idx=None, beam_width=1):
+                self.beam_width = beam_width
+                return [[10, 11, 12, 13]]
+
+        req = _FakeReq(prompt_len=7)
+        req.py_request_id = 1
+        req.py_beam_width = 4
+        req.sampling_config = _FakeSamplingConfig(beam_width=1)
+        mgr = _FakeMgr()
+
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg())
+
+        assert mgr.beam_width == 4
+        np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
+
+    def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):
+        packed = KVCacheManager._pack_beam_cache_indices([[10], [10], [10], [10]])
+
+        assert packed == [10]
+
+    def test_pack_beam_cache_indices_appends_final_unshared_blocks(self):
+        packed = KVCacheManager._pack_beam_cache_indices(
+            [
+                [10, 11, 12],
+                [10, 11, 13],
+                [10, 11, 14],
+                [10, 11, 15],
+            ]
+        )
+
+        assert packed == [10, 11, 12, 13, 14, 15]
+
+    def test_pack_beam_cache_indices_skips_shared_final_blocks(self):
+        packed = KVCacheManager._pack_beam_cache_indices(
+            [
+                [10, 11, 12],
+                [10, 11, 12],
+                [10, 11, 13],
+            ]
+        )
+
+        assert packed == [10, 11, 12, 13]
+
+    def test_beam0_block_count_for_full_packed_prompt(self):
+        block_ids = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
+
+        assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=4) == 3
+
+    def test_beam0_block_count_after_cached_prefix_skip(self):
+        block_ids = np.array([12, 13, 14, 15], dtype=np.int64)
+
+        assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=4) == 1
+
+    def test_beam0_block_count_for_single_beam_unchanged(self):
+        block_ids = np.array([10, 11, 12], dtype=np.int64)
+
+        assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=1) == 3
+
+    def test_align_packed_single_block_prompt_keeps_all_beam_blocks(self):
+        src_block_ids = np.array([10, 10, 10, 10], dtype=np.int64)
+        dst_block_ids = np.array([20, 21, 22, 23], dtype=np.int64)
+        total_blocks = 1
+        tpb = 32
+        src_start = (total_blocks - Sender._beam0_block_count(src_block_ids, total_blocks, 4)) * tpb
+        dst_start = (total_blocks - Sender._beam0_block_count(dst_block_ids, total_blocks, 4)) * tpb
+
+        src, dst = Sender._align_kv_blocks(
+            src_block_ids,
+            dst_block_ids,
+            src_token_start=src_start,
+            dst_token_start=dst_start,
+            tokens_per_block=tpb,
+        )
+
+        np.testing.assert_array_equal(src, [10, 10, 10, 10])
+        np.testing.assert_array_equal(dst, [20, 21, 22, 23])
+
+    def test_trim_single_block_prompt_preserves_packed_beam_tails(self):
+        block_ids = np.array([10, 11, 12, 13], dtype=np.int64)
+
+        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
+            block_ids,
+            beam_width=4,
+            total_blocks=1,
+            expected_valid=1,
+            cache_skip=0,
+        )
+
+        np.testing.assert_array_equal(trimmed, [10, 11, 12, 13])
+
+    def test_trim_long_prompt_preserves_valid_beam0_and_tails(self):
+        block_ids = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
+
+        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
+            block_ids,
+            beam_width=4,
+            total_blocks=3,
+            expected_valid=3,
+            cache_skip=0,
+        )
+
+        np.testing.assert_array_equal(trimmed, [10, 11, 12, 13, 14, 15])
+
+    def test_trim_swa_prefix_preserves_packed_beam_tails(self):
+        block_ids = np.array([10, 11, 12, 13, 14, 15, 16], dtype=np.int64)
+
+        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
+            block_ids,
+            beam_width=4,
+            total_blocks=4,
+            expected_valid=2,
+            cache_skip=0,
+        )
+
+        np.testing.assert_array_equal(trimmed, [12, 13, 14, 15, 16])
+
+    def test_cache_skip_drops_tail_blocks_when_beam0_fully_cached(self):
+        block_ids = np.array([10, 11, 12, 13], dtype=np.int64)
+
+        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
+            block_ids,
+            beam_width=4,
+            total_blocks=1,
+            expected_valid=1,
+            cache_skip=1,
+        )
+
+        assert trimmed.size == 0
+
+
+# ---------------------------------------------------------------------------
 # TokenRange dataclass invariants.
 # ---------------------------------------------------------------------------
 
@@ -112,6 +266,92 @@ class TestTokenRange:
     def test_start_eq_end_rejected(self):
         with pytest.raises(ValueError):
             TokenRange(start=256, end=256)
+
+
+# ---------------------------------------------------------------------------
+# _create_kv_slice: default TokenRange spans prompt_len + num_extra_kv_tokens
+# so transferred KV matches what resize_context / _get_context_bytes allocate.
+# ---------------------------------------------------------------------------
+
+
+def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
+    """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
+
+    Wires only the attributes the method touches:
+      - reuse adapter: tokens_per_block, per-layer-group cached count, block ids
+      - page table:    layer groups
+      - cache manager: num_extra_kv_tokens (read in this code path)
+    """
+    tokens_per_block = 8
+    layer_group = AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1)
+    total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
+    block_ids = np.arange(total_blocks, dtype=np.int64)
+
+    reuse_adapter = SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        get_cached_token_count_per_layer_group=lambda req, layer_groups: [0] * len(layer_groups),
+        get_block_ids=lambda req, idx, lg: block_ids,
+    )
+    page_table = SimpleNamespace(layer_groups=[layer_group])
+    cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._reuse_adapter = reuse_adapter
+    transceiver._page_table = page_table
+    transceiver._kv_cache_manager = cache_manager
+
+    req = SimpleNamespace(
+        prompt_len=prompt_len,
+        py_request_id=0,
+        py_beam_width=1,  # beam search disabled; _trim_packed_beam_block_ids is pass-through
+        is_generation_only_request=lambda: False,
+    )
+    return transceiver, req
+
+
+class TestCreateKvSliceTokenRange:
+    """Default TokenRange built by _create_kv_slice must align with KV-cache allocation.
+
+    KV cache allocation in resize_context (V2) and prepare_resources (V1) reserves
+    prompt_len + num_extra_kv_tokens slots whenever speculative decoding (e.g.
+    EAGLE3, MTP) consumes extra KV positions per request. The transferred token
+    range must cover the same span, otherwise the receiver under-receives KV.
+    """
+
+    def test_includes_num_extra_kv_tokens(self):
+        prompt_len = 17
+        num_extra_kv_tokens = 7
+        transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        assert kv_slice.token_range is not None
+        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (
+            0,
+            prompt_len + num_extra_kv_tokens,
+        )
+
+    def test_defaults_to_prompt_len_when_no_extra(self):
+        prompt_len = 17
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0, prompt_len=prompt_len
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        assert kv_slice.token_range is not None
+        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+
+    def test_respects_explicit_token_range(self):
+        prompt_len = 17
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=7, prompt_len=prompt_len
+        )
+        explicit = TokenRange(start=0, end=8)
+
+        kv_slice = transceiver._create_kv_slice(req, token_range=explicit)
+
+        assert kv_slice.token_range is explicit
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +390,17 @@ class _FakeReq:
         self.prompt_len = prompt_len
 
 
+class _FakeSamplingConfig:
+    def __init__(self, beam_width: int):
+        self.beam_width = beam_width
+
+
 def _lg(window=None):
-    return AttentionLayerGroup(pool_group_idx=0, sliding_window_size=window)
+    return AttentionLayerGroup(
+        pool_group_idx=0,
+        sliding_window_size=window,
+        local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+    )
 
 
 class TestAdapterPerLayerGroup:
@@ -399,3 +648,87 @@ class TestSenderTokenStarts:
         )
         # total_blocks for slice = 2 → raw start = 16; clamped = max(16, 16) = 16.
         assert (src_start, dst_start) == (16, 16)
+
+
+# ---------------------------------------------------------------------------
+# KvCacheTransceiverV2._trim_kv_to_prompt_history: capability-gated, graceful-degrade. (#14258)
+# ---------------------------------------------------------------------------
+class TestTrimKvToPromptHistory:
+    @staticmethod
+    def _tc(kv_cache_manager):
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._kv_cache_manager = kv_cache_manager
+        return tc
+
+    def test_noop_without_trim_capability(self):
+        # V1 / non-V2 managers lack trim_to_history -> getattr None -> no raise.
+        tc = self._tc(SimpleNamespace())
+        assert (
+            tc._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=17, py_request_id=1)) is None
+        )
+
+    def test_noop_when_prompt_len_non_positive(self):
+        trim = Mock(return_value=True)
+        tc = self._tc(SimpleNamespace(trim_to_history=trim))
+        for prompt_len in (0, None):
+            tc._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=prompt_len, py_request_id=1))
+        trim.assert_not_called()
+
+    def test_trims_to_prompt_len_on_success(self):
+        trim = Mock(return_value=True)
+        tc = self._tc(SimpleNamespace(trim_to_history=trim))
+        req = SimpleNamespace(prompt_len=17, py_request_id=1)
+        tc._trim_kv_to_prompt_history(req)
+        trim.assert_called_once_with(req, 17)
+
+    def test_swallows_trim_failure(self):
+        # trim returns False (degraded) -> method still returns None and never
+        # raises, so the downstream TRANS_COMPLETE transition is not gated on it.
+        trim = Mock(return_value=False)
+        tc = self._tc(SimpleNamespace(trim_to_history=trim))
+        req = SimpleNamespace(prompt_len=17, py_request_id=1)
+        assert tc._trim_kv_to_prompt_history(req) is None
+        trim.assert_called_once_with(req, 17)
+
+
+# ---------------------------------------------------------------------------
+# KvCacheTransceiverV2 context-manager (__enter__/__exit__) + shutdown idempotency. (#14137)
+# ---------------------------------------------------------------------------
+class TestTransceiverContextManager:
+    @staticmethod
+    def _tc():
+        # Bypass the heavy __init__ (cuda device, TransferWorker, dist broadcasts).
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._send_sessions = {}
+        tc._recv_sessions = {}
+        tc._send_reqs = {}
+        tc._recv_reqs = {}
+        tc._transfer_worker = MagicMock()
+        return tc
+
+    def test_enter_returns_self(self):
+        tc = self._tc()
+        with tc as ctx:
+            assert ctx is tc
+
+    def test_exit_calls_shutdown(self):
+        tc = self._tc()
+        with tc:
+            pass
+        tc._transfer_worker.shutdown.assert_called_once()
+        assert tc._shutdown is True
+
+    def test_exit_calls_shutdown_on_exception(self):
+        tc = self._tc()
+        with pytest.raises(RuntimeError, match="boom"):
+            with tc:
+                raise RuntimeError("boom")
+        # __exit__ still ran shutdown despite the in-block exception.
+        tc._transfer_worker.shutdown.assert_called_once()
+        assert tc._shutdown is True
+
+    def test_shutdown_is_idempotent(self):
+        tc = self._tc()
+        tc.shutdown()
+        tc.shutdown()  # second call short-circuits on the _shutdown guard.
+        tc._transfer_worker.shutdown.assert_called_once()

@@ -114,6 +114,9 @@ enroot/tensorrt_llm.devel.sqsh
 # MacOSX Files
 .DS_Store
 
+# stress test aiperf output artifacts
+tests/integration/defs/stress_test/artifacts/
+
 # Agent related files
 .claude/agent-memory/
 .claude/agent-tests/perf-test-sync/report.html

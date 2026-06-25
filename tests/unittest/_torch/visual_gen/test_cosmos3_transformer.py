@@ -28,10 +28,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
-from tensorrt_llm.visual_gen.args import TorchCompileConfig
+from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cosmos3
 
@@ -106,7 +106,7 @@ def _load_model_config(checkpoint_dir: str) -> DiffusionModelConfig:
         model=checkpoint_dir,
         torch_compile_config=TorchCompileConfig(enable=False),
     )
-    return DiffusionModelConfig.from_pretrained(checkpoint_dir, args=args)
+    return DiffusionPipelineConfig.from_pretrained(checkpoint_dir, args=args).primary_model_config
 
 
 def _init_all_weights(model: torch.nn.Module, std: float = 0.02) -> None:
@@ -295,7 +295,7 @@ class TestCosmos3TransformerCheckpoint:
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=_SKIP_AUX)
         try:
-            assert pipeline.model_config.quant_config.quant_algo is not None
+            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
             transformer = pipeline.transformer
             c = transformer.latent_channel_size
             hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(

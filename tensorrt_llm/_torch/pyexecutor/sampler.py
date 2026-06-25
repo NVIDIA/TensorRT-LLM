@@ -83,6 +83,7 @@ from tensorrt_llm.sampling_params import (
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
 from ..speculative.spec_tree_manager import SpecTreeManager
+from ..utils import torch_multi_arange
 from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import ResourceManager, ResourceManagerType
@@ -100,7 +101,6 @@ from .sampling_utils import (
     resolve_sampling_strategy,
     sample,
     sample_rejected,
-    torch_multi_arange,
 )
 from .scheduler import ScheduledRequests
 
@@ -3700,6 +3700,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._prev_first_finish_reasons_host[req.py_seq_slot] = (
                         first_finish_reasons_host[req.py_seq_slot]
                     )
+                if req.is_context_only_request:
+                    beam_search_store = self.store.beam_search_store
+                    assert beam_search_store is not None
+                    assert req.py_seq_slot is not None
+                    beam_width = req.py_beam_width
+                    first_gen_scores = (
+                        beam_search_store.cum_log_probs[req.py_seq_slot, :beam_width]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    first_gen_tokens = [
+                        new_tokens_list[0][req.py_seq_slot][beam_idx]
+                        for beam_idx in range(beam_width)
+                    ]
+                    first_gen_log_probs = [
+                        {token_id: Logprob(logprob=log_prob, rank=None)}
+                        for token_id, log_prob in zip(first_gen_tokens, first_gen_scores)
+                    ]
+                    req.py_result.set_first_gen_log_probs(first_gen_log_probs)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
             else:
@@ -4279,9 +4299,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
             0, batch_dest_indices_1d_cuda, batch_next_tokens_cuda_int
         )
-        new_tokens_host = self._copy_to_host(new_tokens_cuda)
-
-        return new_tokens_host
+        return self._copy_to_host(new_tokens_cuda)
 
     @staticmethod
     @torch.inference_mode()

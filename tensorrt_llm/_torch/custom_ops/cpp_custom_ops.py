@@ -80,14 +80,43 @@ def _register_fake():
 
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
-    def _(input, residual, gamma, epsilon, buffer, buffer_flags,
-          rmsnorm_fusion):
-        output = input.new_empty(input.shape)
-        if rmsnorm_fusion:
-            residual_out = residual.new_empty(residual.shape)
-        else:
-            residual_out = None
-        return [output, residual_out]
+    def _(input,
+          gamma,
+          residual,
+          epsilon,
+          buffer,
+          buffer_flags,
+          rmsnorm_fusion,
+          scale=None,
+          fusion_op: int = 0):
+        from tensorrt_llm.functional import AllReduceFusionOp
+        op = AllReduceFusionOp(fusion_op)
+        if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
+            op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+        if op == AllReduceFusionOp.NONE:
+            return [torch.empty_like(input)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            return [torch.empty_like(input), torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            return [quant_out, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+            norm_out = torch.empty_like(input)
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            return [norm_out, quant_out, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [quant_fp4, scale_fp4, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            norm_out = torch.empty_like(input)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [norm_out, quant_fp4, scale_fp4, torch.empty_like(residual)]
+        return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::moe_allreduce")
     def _(residual, norm_weight, device_num_experts, scale_input,
@@ -106,6 +135,10 @@ def _register_fake():
     def _(q, k, norm_weight_q, norm_weight_k, workspace, rank, nranks, eps,
           trigger_completion_at_end):
         return [torch.empty_like(q), torch.empty_like(k)]
+
+    @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
+    def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
+        return torch.empty_like(q)
 
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
@@ -220,7 +253,10 @@ def _register_fake():
           next_n,
           index_topk,
           pre_idx=None,
-          heuristic_scratch=None):
+          heuristic_scratch=None,
+          compress_ratio=1,
+          radix_aux_indices=None,
+          radix_aux_logits=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -233,6 +269,21 @@ def _register_fake():
         m = a.shape[0]
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
+
+    @torch.library.register_fake("trtllm::gate_forward")
+    def _(
+        scores_in: torch.Tensor,
+        bias: torch.Tensor,
+        input_ids: torch.Tensor,
+        tid2eid: torch.Tensor,
+        out_weights: torch.Tensor,
+        out_indices: torch.Tensor,
+        topk: int,
+        route_scale: float,
+        is_hash: bool,
+    ) -> None:
+        # In-place operation, no return value.
+        pass
 
     @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
     def _(input: torch.Tensor):
@@ -634,6 +685,17 @@ def _register_fake():
         packed = pe.new_empty((M, head_dim // 2), dtype=torch.int8)
         scale = pe.new_empty((M, 1), dtype=torch.int32)
         return packed, scale
+
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
+    def _(input: torch.Tensor):
+        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
+        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+        m, k = input.shape[0], input.shape[1]
+        num_n_blocks = (k + 127) // 128
+        num_packed_sf_k = (num_n_blocks + 3) // 4
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    (m, num_packed_sf_k), dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
@@ -1062,6 +1124,61 @@ def _register_fake():
         m = mat_a.shape[0]
         n = mat_b.shape[0]
         return mat_a.new_empty((m, n), dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::marlin_nvfp4_gemm")
+    def _(mat_a: torch.Tensor,
+          mat_b: torch.Tensor,
+          scale_a: torch.Tensor,
+          scale_b: torch.Tensor,
+          alpha: torch.Tensor,
+          weight_global_scale: torch.Tensor,
+          bias: Optional[torch.Tensor],
+          out_dtype: Optional[torch.dtype],
+          size_n: int,
+          size_k: int,
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
+        # mat_a: [M, K/2] FP4 packed (or BF16 when W4A16)
+        # mat_b: Marlin-packed weights
+        # Output: [M, size_n] with dtype=out_dtype
+        m = mat_a.shape[0]
+        return mat_a.new_empty((m, size_n), dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::marlin_nvfp4_moe_gemm")
+    def _(a: torch.Tensor,
+          b_q_weight: torch.Tensor,
+          b_scales: torch.Tensor,
+          global_scale: torch.Tensor,
+          workspace: torch.Tensor,
+          sorted_token_ids: torch.Tensor,
+          expert_ids: torch.Tensor,
+          num_tokens_past_padded: torch.Tensor,
+          topk_weights: torch.Tensor,
+          moe_block_size: int,
+          top_k: int,
+          mul_topk_weights: bool,
+          size_n: int,
+          size_k: int,
+          out_dtype: Optional[torch.dtype],
+          use_fp32_reduce: bool = False):
+        # a: [M, K] BF16, b_q_weight: [num_experts, ...] Marlin-packed FP4
+        # Output: [M * top_k, size_n]
+        m = a.shape[0]
+        dtype = out_dtype if out_dtype is not None else torch.bfloat16
+        return a.new_empty((m * top_k, size_n), dtype=dtype)
+
+    @torch.library.register_fake("trtllm::gptq_marlin_repack")
+    def _(b_q_weight: torch.Tensor,
+          perm: torch.Tensor,
+          size_k: int,
+          size_n: int,
+          num_bits: int,
+          is_a_8bit: bool = False):
+        pack_factor = 32 // num_bits
+        tile_size = 16
+        return b_q_weight.new_empty(
+            (size_k // tile_size, size_n * tile_size // pack_factor),
+            dtype=b_q_weight.dtype)
 
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(
