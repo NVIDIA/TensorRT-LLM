@@ -743,6 +743,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
+        self.is_self_benchmark_request = False
+        self.py_self_benchmark_point_id = None
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
 
@@ -960,7 +962,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 setattr(py_request, attr_name, deepcopy(attr_value))
             elif attr_name in [
                     'is_attention_dp_dummy', 'is_cuda_graph_dummy',
-                    'encoder_tokens', 'encoder_output_len'
+                    'encoder_tokens', 'encoder_output_len',
+                    'is_self_benchmark_request'
             ]:
                 setattr(py_request, attr_name, attr_value)
 
@@ -1191,6 +1194,10 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.is_self_benchmark_request = getattr(
+        executor_request, "py_is_self_benchmark_request", False)
+    llm_request.py_self_benchmark_point_id = getattr(
+        executor_request, "py_self_benchmark_point_id", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

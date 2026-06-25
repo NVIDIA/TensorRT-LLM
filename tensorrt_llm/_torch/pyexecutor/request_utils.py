@@ -528,6 +528,12 @@ class RequestBroadcaster:
             new_requests, "py_disaggregated_params"
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        py_is_self_benchmark_request = collect_py_objects_from_requests(
+            new_requests, "py_is_self_benchmark_request"
+        )
+        py_self_benchmark_point_id = collect_py_objects_from_requests(
+            new_requests, "py_self_benchmark_point_id"
+        )
 
         return tuple(
             filter(
@@ -539,6 +545,8 @@ class RequestBroadcaster:
                     py_num_logprobs,
                     py_disaggregated_params,
                     py_lora_path,
+                    py_is_self_benchmark_request,
+                    py_self_benchmark_point_id,
                 ],
             )
         )
