@@ -781,8 +781,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // download fails.
         if (result.test_db_dir_override) {
             try {
-                sh "tar czf /tmp/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
-                trtllm_utils.uploadArtifacts("/tmp/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
+                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
             } catch (InterruptedException e) {
