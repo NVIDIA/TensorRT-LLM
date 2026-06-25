@@ -502,6 +502,10 @@ class _Qwen35ConfigCompat:
                     rope_scaling["type"] = rope_type
             if rope_scaling:
                 text_config["rope_scaling"] = rope_scaling
+            else:
+                # Clearing rope_scaling locally is not enough — the original key
+                # in text_config still points at the pre-strip dict. Remove it.
+                text_config.pop("rope_scaling", None)
         return text_config
 
 
