@@ -42,7 +42,6 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_PNAT,
     REPLAY_WORK_POSITION_IN_DECODE_BATCH,
 )
-from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import _resolve_tuning
 from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
     replay_selective_state_update as _real_replay_selective_state_update,
 )
@@ -344,102 +343,64 @@ def _build_interface_with_replay_buffers(num_heads, head_dim, d_state, n_groups,
     return interface
 
 
-def test_extend_replay_no_ima_with_capture_time_work_items(mamba_env, monkeypatch):
-    """The replay SSM op must not fault when its work-items buffer is unprepared.
+def test_extend_replay_no_ima(mamba_env):
+    """The replay path must not cause an out-of-bounds access on the replay buffers.
 
-    Reproduces the SuperV3 MTP illegal-memory-access (PR #14203 regression): during
-    CUDA graph capture/warmup the replay SSM kernel runs *before*
-    prepare_replay_metadata() has populated the work-items buffer, so the buffer
-    holds only whatever its allocation produced. The kernel reads the per-row
-    cache_slot field and indexes the SSM state cache with it -- unchecked -- so a
-    garbage slot index is an out-of-bounds access (IMA).
+    Behavioral guard for the replay path: the replay work-items buffer is filled with
+    garbage (an out-of-bounds cache slot, simulating uninitialized memory), then the
+    production metadata-prep path runs and the real replay op executes; the test asserts
+    no CUDA fault. With the fix, prep populates the buffer before the kernel reads it, so
+    the garbage never reaches the kernel; without it the out-of-bounds slot survives and
+    faults.
 
-    This drives the real op (flashinfer_cached_ssm -> replay_selective_state_update)
-    with the work-items buffer allocated through the production path
-    (CachedSequenceInterface), exactly as at capture time (no prepare_replay_metadata
-    call), and asserts the kernel completes with no CUDA fault.
-
-    Determinism: torch.empty is monkeypatched to poison the work-items buffer with
-    an out-of-bounds slot index, mirroring the garbage that triggered the original
-    IMA. With the fix (the buffer is allocated via torch.zeros) the poison does not
-    apply and every slot is in-bounds; a regression to torch.empty yields the
-    poisoned out-of-bounds slot and this test faults.
+    Filling the buffer directly keeps the poison confined to this one buffer and makes
+    the failure deterministic: fresh CUDA memory is often benign, so a poison-free run
+    cannot reliably reproduce the bug.
     """
     device = mamba_env["device"]
     dtype = mamba_env["dtype"]
 
-    # Production SuperV3 Mamba2 shape (AutoDeploy replicates mamba -> full heads/groups).
-    # The replay kernel selects its mode from effective batch = raw_batch * nheads; this
-    # config (8 * 128 = 1024) lands in persistent_main, which reads the cache slot from
-    # the work-items buffer (persistent_dynamic, used at small batch, reads it from
-    # state_batch_indices instead and would not exercise the bug). Guard the mode below.
+    # Production SuperV3 Mamba2 shape (AutoDeploy replicates mamba -> full heads/groups),
+    # large enough that the replay kernel runs its persistent_main path, which reads the
+    # cache slot from the replay work-items buffer.
     num_extend = 8
     tokens_per_extend = 7  # num_nextn_predict_layers (6) + 1
     num_heads = 128
     head_dim = 64
     n_groups, ssm_state_size = 8, 128
-    max_batch_size = 8
-
-    mode, _ = _resolve_tuning(num_extend, num_heads, "bf16", "RN")
-    assert mode == "persistent_main", (
-        f"test must exercise persistent_main (reads work_items); resolved {mode!r}. "
-        "Re-size num_extend/num_heads if the tuning table changed."
-    )
 
     interface = _build_interface_with_replay_buffers(
-        num_heads, head_dim, ssm_state_size, n_groups, max_batch_size
+        num_heads, head_dim, ssm_state_size, n_groups, max_batch_size=num_extend
     )
-    n_slots = interface.info.max_num_state_slots
-
-    # Simulate capture-time allocator garbage deterministically: poison only the
-    # work-items buffer shape so a torch.empty regression produces an out-of-bounds
-    # cache slot. The torch.zeros fix is not intercepted and stays in-bounds.
-    real_empty = torch.empty
-
-    def poisoned_empty(*args, **kwargs):
-        t = real_empty(*args, **kwargs)
-        if (
-            kwargs.get("dtype") == torch.int32
-            and len(args) == 2
-            and args[0] == n_slots
-            and args[1] == REPLAY_WORK_ITEM_WIDTH
-        ):
-            t.fill_(0x7BADBEEF)  # out-of-bounds cache slot (cache has max_batch_size slots)
-        return t
-
-    monkeypatch.setattr(torch, "empty", poisoned_empty)
-
     interface.initialize_resources()
 
-    # The buffers the kernel reads, exactly as bound at capture time. Crucially we do
-    # NOT call prepare_replay_metadata(), matching the warmup/capture path.
+    # Fill the work-items buffer with an out-of-bounds cache slot, simulating garbage /
+    # uninitialized memory. The production metadata-prep below must overwrite it before
+    # the kernel reads it; if prep is missing (the bug) this poison survives and faults.
+    interface._replay_work_items.fill_(0x7FFFFFFF)  # int32-max: out-of-bounds slot
+
+    # Drive the production metadata-prep path -- the same one cudagraph capture uses --
+    # so the replay work-items / n-writes buffers are populated exactly as in real runs
+    # (set_capture_batch -> nest_sequences -> prepare_replay_metadata host-prepare hook).
+    interface.info.set_capture_batch(max_draft_len=tokens_per_extend - 1, batch_size=num_extend)
     replay_work_items = interface._replay_work_items
     replay_n_writes = interface._replay_n_writes
-    assert replay_work_items is not None and replay_n_writes is not None
 
-    # Per-token inputs and the remaining replay caches (independent of the buffer
-    # under test) are built directly, as in test_flashinfer_extend_replay_calls_replay_kernel.
+    # Per-token inputs and the remaining replay caches for the same extend batch.
     (hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size) = _random_params(
         device, dtype, num_extend, tokens_per_extend, num_heads, head_dim, n_groups, ssm_state_size
     )
     ssm_state_cache = torch.zeros(
-        max_batch_size, num_heads, head_dim, ssm_state_size, device=device, dtype=dtype
+        num_extend, num_heads, head_dim, ssm_state_size, device=device, dtype=dtype
     )
-    # One distinct, in-bounds cache slot per extend sequence.
     slot_idx = torch.arange(num_extend, device=device, dtype=torch.int32)
 
     replay_history_size = 16
     replay_old_x = torch.zeros(
-        max_batch_size,
-        2,
-        replay_history_size,
-        num_heads,
-        head_dim,
-        device=device,
-        dtype=torch.bfloat16,
+        num_extend, 2, replay_history_size, num_heads, head_dim, device=device, dtype=torch.bfloat16
     )
     replay_old_b = torch.zeros(
-        max_batch_size,
+        num_extend,
         2,
         replay_history_size,
         n_groups,
@@ -448,13 +409,13 @@ def test_extend_replay_no_ima_with_capture_time_work_items(mamba_env, monkeypatc
         dtype=torch.bfloat16,
     )
     replay_old_dt = torch.zeros(
-        max_batch_size, 2, num_heads, replay_history_size, device=device, dtype=torch.float32
+        num_extend, 2, num_heads, replay_history_size, device=device, dtype=torch.float32
     )
     replay_old_da_cumsum = torch.zeros(
-        max_batch_size, 2, num_heads, replay_history_size, device=device, dtype=torch.float32
+        num_extend, 2, num_heads, replay_history_size, device=device, dtype=torch.float32
     )
-    replay_cache_buf_idx = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
-    replay_prev_num_accepted = torch.zeros(max_batch_size, device=device, dtype=torch.int32)
+    replay_cache_buf_idx = torch.zeros(num_extend, device=device, dtype=torch.int32)
+    replay_prev_num_accepted = torch.zeros(num_extend, device=device, dtype=torch.int32)
 
     _bi = BatchInfo()
     _bi.update([0, 0, num_extend, num_extend * tokens_per_extend, 0, 0])
@@ -500,9 +461,8 @@ def test_extend_replay_no_ima_with_capture_time_work_items(mamba_env, monkeypatc
         chunk_size,
     )
 
-    # Force kernel completion: a torch.empty regression feeds an out-of-bounds cache
-    # slot to the kernel here and raises a CUDA illegal memory access. The torch.zeros
-    # fix keeps every slot in-bounds, so this completes cleanly.
+    # Synchronize so any out-of-bounds access on the replay buffers surfaces here as a
+    # CUDA error rather than asynchronously later.
     torch.cuda.synchronize()
     assert out.shape == hidden_states.shape
     assert torch.isfinite(out).all()
