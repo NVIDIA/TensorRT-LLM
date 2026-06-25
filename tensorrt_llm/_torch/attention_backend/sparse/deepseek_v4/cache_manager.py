@@ -43,7 +43,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
-from .cache_utils import (
+from .compressor import KVCacheDtype
+from .deepseek_v4 import (
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -53,7 +54,6 @@ from .cache_utils import (
     is_overlap_compressor,
     is_sparse_layer,
 )
-from .compressor import KVCacheDtype
 
 
 def _estimate_bytes_per_token(

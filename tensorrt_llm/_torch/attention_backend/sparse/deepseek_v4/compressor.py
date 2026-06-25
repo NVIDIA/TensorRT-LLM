@@ -145,7 +145,7 @@ class Compressor(nn.Module):
             - no compressed tokens:                    (None, None)
         """
         # Import at runtime to avoid circular dependency
-        from .cache_utils import DeepseekV4AttentionType
+        from .deepseek_v4 import DeepseekV4AttentionType
 
         # Extract metadata
         num_contexts = metadata.num_contexts

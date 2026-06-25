@@ -15,6 +15,7 @@
 
 import math
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple
 
 import torch
@@ -44,16 +45,113 @@ from ..dsa import (
     rotate_activation,
 )
 from ..kernel import deepseek_v4_local_to_global_indices
-from .cache_utils import (
-    DEEPSEEK_V4_SPARSE_RATIO,
-    DeepseekV4AttentionType,
-    get_token_bytes,
-    is_compress_layer,
-)
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
+DEEPSEEK_V4_SPARSE_RATIO = 4
+DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO = 4
+
+
+class DeepseekV4AttentionType(Enum):
+    SWA = 0
+    COMPRESS = 1
+    COMPRESSOR_STATE = 2
+    COMPRESSOR_SCORE = 3
+    INDEXER_COMPRESS = 4
+    INDEXER_COMPRESSOR_STATE = 5
+    INDEXER_COMPRESSOR_SCORE = 6
+
+
+def is_overlap_compressor(compress_ratio: int) -> bool:
+    return compress_ratio == DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO
+
+
+def is_sparse_layer(compress_ratio: int) -> bool:
+    return compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
+
+
+def is_compress_layer(compress_ratio: int) -> bool:
+    return compress_ratio > 1
+
+
+def compress_ratio_has_attention(compress_ratio: int, attn_type: DeepseekV4AttentionType) -> bool:
+    is_sparse = is_sparse_layer(compress_ratio)
+    is_compress = is_compress_layer(compress_ratio)
+
+    if attn_type == DeepseekV4AttentionType.SWA:
+        return True
+    if attn_type == DeepseekV4AttentionType.COMPRESS:
+        return is_compress
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
+        return is_compress
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
+        return is_compress
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+        return is_sparse
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
+        return is_sparse
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
+        return is_sparse
+    raise ValueError(f"Unsupported DeepSeek-V4 attention type: {attn_type}")
+
+
+def get_attn_dim(
+    head_dim: int, index_head_dim: int, compress_ratio: int, attn_type: DeepseekV4AttentionType
+) -> int:
+    state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+    if attn_type == DeepseekV4AttentionType.SWA:
+        return head_dim
+    if attn_type == DeepseekV4AttentionType.COMPRESS:
+        return head_dim
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
+        return state_factor * head_dim
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
+        return state_factor * head_dim
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+        return index_head_dim
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
+        return state_factor * index_head_dim
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
+        return state_factor * index_head_dim
+    raise ValueError(f"Unsupported DeepSeek-V4 attention type: {attn_type}")
+
+
+def get_token_bytes(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratio: int,
+    attn_type: DeepseekV4AttentionType,
+    has_fp8_kv_cache: bool,
+    indexer_k_dtype: str = "fp8",
+) -> int:
+    if not compress_ratio_has_attention(compress_ratio, attn_type):
+        raise ValueError(
+            f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
+        )
+
+    attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
+
+    dtype_bytes = 1 if has_fp8_kv_cache else 2
+    if attn_type in [
+        DeepseekV4AttentionType.COMPRESSOR_STATE,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+    ]:
+        dtype_bytes = 4
+
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+        if indexer_k_dtype == "fp8":
+            return attn_dim + index_head_dim // 128 * 4
+        if indexer_k_dtype == "fp4":
+            return index_head_dim // 2 + index_head_dim // 32
+        raise ValueError(
+            f"Unsupported indexer_k_dtype {indexer_k_dtype!r}; expected 'fp8' or 'fp4'."
+        )
+
+    return attn_dim * dtype_bytes
 
 
 @dataclass(frozen=True)
