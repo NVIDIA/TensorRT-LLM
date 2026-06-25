@@ -484,7 +484,7 @@ class Llama4DecoderLayer(DecoderLayer):
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
-        # When post_load_weights() chains layernorms across layers,
+        # When setup_aliases() chains layernorms across layers,
         # this flag is set to True to skip the input layernorm in
         # forward() since it is handled by the previous layer.
         self.skip_input_layernorm = False
@@ -709,7 +709,7 @@ class LlamaDecoderLayer(DecoderLayer):
             quantize_type="nvfp4"
             if not self.disable_nvfp4_layernorm_fusion and self.is_nvfp4
             and not (differ_pp_stage_with_previous_layer) else None)
-        # When post_load_weights() chains layernorms across layers,
+        # When setup_aliases() chains layernorms across layers,
         # this flag is set to True to skip the input layernorm in
         # forward() since it is handled by the previous layer.
         self.skip_input_layernorm = False
@@ -983,7 +983,7 @@ class Llama4Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # When post_load_weights() chains the final norm into the
+        # When setup_aliases() chains the final norm into the
         # last decoder layer, this flag is set to True to skip
         # applying it again in forward().
         self.skip_norm = False
@@ -1088,7 +1088,7 @@ class LlamaModel(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # When post_load_weights() chains the final norm into the
+        # When setup_aliases() chains the final norm into the
         # last decoder layer, this flag is set to True to skip
         # applying it again in forward().
         self.skip_norm = False
@@ -1140,7 +1140,7 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1564,7 +1564,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             if had_mm_encoder:
                 self.mm_encoder = saved_mm_encoder
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

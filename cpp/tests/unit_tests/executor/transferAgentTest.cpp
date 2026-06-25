@@ -21,7 +21,9 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -374,6 +376,107 @@ TEST_P(TransferAgentTest, SyncMessage)
 
     xferAgent0->invalidateRemoteAgent(agent1);
     xferAgent1->invalidateRemoteAgent(agent0);
+}
+
+// Status must survive destruction of its owning agent (#14137 UAF-safety): the
+// status holds a weak_ptr<nixlAgent>; once the agent is reset the weak_ptr expires
+// and orphaned queries must report failure rather than dereference a dangling agent.
+TEST_P(TransferAgentTest, StatusOutlivesAgent)
+{
+    std::string const agent0{"agent0"}, agent1{"agent1"};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
+    auto xferAgent0 = makeTransferAgent(config0);
+    auto xferAgent1 = makeTransferAgent(config1);
+    TLLM_CHECK(xferAgent0);
+    TLLM_CHECK(xferAgent1);
+
+    std::vector<char> memory0(100, 10);
+    std::vector<char> memory1(100, 1);
+
+    // RegisteredHostMemory holds a raw agent pointer and deregisters in its
+    // dtor, so it must NOT outlive its agent. Scope it (and the transfer) so it
+    // deregisters while both agents are alive; only `status` is kept past here.
+    std::unique_ptr<TransferStatus> status;
+    {
+        RegisteredHostMemory regMem0(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory0}}}, xferAgent0.get());
+        RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, xferAgent1.get());
+
+        auto connectionInfo = xferAgent1->getLocalConnectionInfo();
+        xferAgent0->loadRemoteAgent(agent1, connectionInfo);
+        while (!xferAgent0->checkRemoteDescs(agent1, regMem1.getDescs()))
+        {
+        }
+
+        TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
+        status = xferAgent0->submitTransferRequests(writeReq);
+        TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
+    }
+
+    // Destroy the owning agent BEFORE the status. shutdown() resets the
+    // shared_ptr<nixlAgent>, expiring the status's weak_ptr.
+    xferAgent0.reset();
+
+    // Orphaned queries are safe and report failure (no use-after-free):
+    // wait()/isCompleted() see mWeakAgent.lock() == nullptr and return
+    // kFAILURE/false instead of dereferencing the freed agent.
+    EXPECT_FALSE(status->isCompleted());
+    EXPECT_EQ(status->wait(0), TransferState::kFAILURE);
+    // `status` destructor runs at scope exit: weak_ptr.lock() == nullptr ->
+    // early return (no releaseXferReq on a dangling agent).
+}
+
+// Concurrent submitTransferRequests (#14137): submit holds a std::shared_lock and
+// copies reqParams per-request, so many threads can submit at once without racing
+// a shared mExtraParams. All concurrently-submitted transfers must still succeed.
+TEST_P(TransferAgentTest, ConcurrentSubmit)
+{
+    std::string const agent0{"agent0"}, agent1{"agent1"};
+    BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
+    auto xferAgent0 = makeTransferAgent(config0);
+    auto xferAgent1 = makeTransferAgent(config1);
+    TLLM_CHECK(xferAgent0);
+    TLLM_CHECK(xferAgent1);
+
+    std::vector<char> memory0(100, 10);
+    std::vector<char> memory1(100, 1);
+    RegisteredHostMemory regMem0(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory0}}}, xferAgent0.get());
+    RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{memory1}}}, xferAgent1.get());
+
+    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
+    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
+    while (!xferAgent0->checkRemoteDescs(agent1, regMem1.getDescs()))
+    {
+    }
+
+    constexpr int kNumThreads = 8;
+    std::vector<std::thread> threads;
+    std::vector<std::unique_ptr<TransferStatus>> statuses(kNumThreads);
+    std::atomic<int> ready{0};
+    for (int i = 0; i < kNumThreads; ++i)
+    {
+        threads.emplace_back(
+            [&, i]()
+            {
+                TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
+                ready.fetch_add(1);
+                while (ready.load() < kNumThreads)
+                {
+                    // Align thread starts to maximize submit contention.
+                }
+                statuses[i] = xferAgent0->submitTransferRequests(writeReq);
+            });
+    }
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+    for (auto& status : statuses)
+    {
+        TLLM_CHECK(status);
+        EXPECT_EQ(status->wait(), TransferState::kSUCCESS);
+    }
+    TLLM_CHECK(memory0 == memory1);
+    xferAgent0->invalidateRemoteAgent(agent1);
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, TransferAgentTest, ::testing::ValuesIn(getAvailableBackends()),
