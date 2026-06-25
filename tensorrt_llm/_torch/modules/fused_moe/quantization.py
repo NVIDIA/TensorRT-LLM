@@ -2540,6 +2540,19 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         delattr(module, 'tmp_pre_quant_scales')
 
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        """Hook for subclasses to transform the shared weight-scale tensors
+        before they are registered with the load balancer and freed.
+
+        Mirrors ``FusedMoEMethodBase._prepare_shared_weights_for_finalization``
+        but for the NVFP4 block-scale tensors, which are finalized and
+        registered here in ``process_weights_after_loading`` (not in
+        ``_finalize_shared_weights``).  Backends whose kernels expect a
+        backend-specific scale layout (e.g. CuteDsl) must override this so that
+        experts migrated by online EPLB receive correctly-laid-out scales.
+        """
+
     def process_weights_after_loading(self, module: torch.nn.Module):
         if not hasattr(module, 'tmp_raw_input_scales'):
             return  # No quant scales were loaded, nothing to finalize
@@ -2608,6 +2621,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 shared_fc2_alpha, shared_fc31_weight_scale_2,
                 shared_fc2_weight_scale_2,
                 module.layer_load_balancer.get_load_expert_ids())
+            # Let subclasses transform the shared scale tensors into their
+            # backend-specific layout BEFORE they are registered with the load
+            # balancer for online EPLB migration (see hook docstring). Must run
+            # before register_all_parameter_slot_and_to_fix_weight_fns below.
+            self._prepare_shared_weight_scales_for_finalization(module)
             weight_fns = {
                 'w3_w1_weight_scale': module.local_shared_w3_w1_scale_tensors,
                 'w2_weight_scale': module.local_shared_w2_scale_tensors,
@@ -3051,6 +3069,36 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             k).view(n, k // module.scaling_vector_size)
         dst_w3_w1_weight_scale.copy_(
             w3_w1_weight_scale_interleaved.view(dst_w3_w1_weight_scale.dtype))
+
+    def _prepare_shared_weights_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        # The base hook registers the shared (host) w3_w1 weights with the load
+        # balancer for online EPLB migration. Apply the same gate/up interleave
+        # that process_weights_after_loading() applies to the on-device weights,
+        # so experts migrated into a slot land in the layout the fused CuteDsl
+        # kernel expects (otherwise migrated slots are silently corrupted).
+        super()._prepare_shared_weights_for_finalization(module)
+        if not module.is_gated_activation:
+            return
+        shared = getattr(module, 'local_shared_w3_w1_tensors', None)
+        if shared is None:
+            return
+        for expert_idx in range(shared.shape[0]):
+            self._interleave_w3_w1_weight(shared[expert_idx])
+
+    def _prepare_shared_weight_scales_for_finalization(
+            self, module: torch.nn.Module) -> None:
+        # Same as _prepare_shared_weights_for_finalization above, for the shared
+        # (host) w3_w1 block scales.
+        super()._prepare_shared_weight_scales_for_finalization(module)
+        if not module.is_gated_activation:
+            return
+        shared = getattr(module, 'local_shared_w3_w1_scale_tensors', None)
+        if shared is None:
+            return
+        for expert_idx in range(shared.shape[0]):
+            self._interleave_w3_w1_weight_scale_cute_dsl(
+                module, shared[expert_idx])
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         # First let Cutlass parent do cat + pad + block_scale_interleave
