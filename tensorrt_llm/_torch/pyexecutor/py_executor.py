@@ -8,7 +8,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
+from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
                     Tuple, Union)
 
@@ -3744,23 +3744,43 @@ class PyExecutor:
             timeout = datetime.timedelta(0)
 
         new_requests = []
-        if self.self_benchmark is not None and self.self_benchmark.active:
-            if self.dist.rank == 0:
-                new_requests.extend(
-                    self.self_benchmark.make_prefill_queue_items(
-                        self.active_requests, waiting_queue))
-        else:
-            # Fetch requests from rank 0
-            if self.dist.rank == 0:
-                # Process accumulated requests that were queued during control request handling.
-                if len(self.request_accumulated) != 0:
-                    new_requests.extend(self.request_accumulated)
-                    self.request_accumulated.clear()
-                    # Reset timeout to 0 to avoid hanging when no new requests are available
-                    timeout = datetime.timedelta(0)
-                with self.hang_detector.pause():
+        benchmark_active = (self.self_benchmark is not None
+                            and self.self_benchmark.active)
+        # Fetch requests from rank 0
+        if self.dist.rank == 0:
+            queued_requests = []
+            # Process accumulated requests that were queued during control request handling.
+            if len(self.request_accumulated) != 0:
+                queued_requests.extend(self.request_accumulated)
+                self.request_accumulated.clear()
+                # Reset timeout to 0 to avoid hanging when no new requests are available
+                timeout = datetime.timedelta(0)
+            with self.hang_detector.pause():
+                if benchmark_active:
+                    request_queue = (
+                        self.executor_request_queue.get_request_queue())
+                    while True:
+                        try:
+                            queued_requests.append(request_queue.get_nowait())
+                        except Empty:
+                            break
+                else:
+                    queued_requests.extend(
+                        self.executor_request_queue.get_from_request_queue(
+                            timeout))
+
+            if benchmark_active:
+                for req_item in queued_requests:
+                    if req_item.is_normal_request:
+                        self.request_accumulated.append(req_item)
+                    else:
+                        new_requests.append(req_item)
+                if len(new_requests) == 0:
                     new_requests.extend(
-                        self.executor_request_queue.get_from_request_queue(timeout))
+                        self.self_benchmark.make_prefill_queue_items(
+                            self.active_requests, waiting_queue))
+            else:
+                new_requests.extend(queued_requests)
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self.request_broadcaster.broadcast(

@@ -4942,6 +4942,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "self_benchmark_config is not supported with attention data "
                 "parallelism yet. Disable enable_attention_dp to use startup "
                 "self-benchmarking.")
+        if self.parallel_config.world_size != 1:
+            raise ValueError(
+                "self_benchmark_config is only supported with world_size=1 "
+                "until benchmark request injection is synchronized across "
+                "distributed ranks.")
         self.enable_iter_perf_stats = True
         return self
 
