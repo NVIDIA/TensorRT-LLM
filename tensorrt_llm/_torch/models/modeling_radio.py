@@ -755,6 +755,20 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
             model_config.attn_backend).Metadata
         self._attn_backend = model_config.attn_backend
 
+        # Establish default encoder AttentionMetadata at construction (legacy
+        # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
+        # / metadata provider can read `self.attn_metadata` before the engine
+        # re-sizes it via `setup_attn_metadata`.
+        self.setup_attn_metadata(max_num_requests=8192,
+                                 max_num_tokens=model_config.max_num_tokens)
+
+        # CUDA-graph runner for the block stack. None means graphs are off and
+        # the eager path is always taken; the caller opts in via
+        # `enable_blocks_cuda_graph`. Initialized here (not in
+        # `setup_attn_metadata`) so it is always present regardless of call
+        # order.
+        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
+
     def setup_attn_metadata(self, max_num_requests: int,
                             max_num_tokens: int) -> None:
         # Override the default to add `kv_layout="NHD"` for FlashInfer.
@@ -770,11 +784,6 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         if self._attn_backend == "FLASHINFER":
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
-
-        # CUDA-graph runner for the block stack. None means graphs are off and
-        # the eager path is always taken; the caller opts in via
-        # `enable_blocks_cuda_graph`.
-        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
     def enable_blocks_cuda_graph(
         self,
