@@ -52,8 +52,12 @@ _EXTRA_CONFIG_IDS = (
 _NON_SLIDING_PHASE_WINDOW = 1024
 
 
+def get_long_seq_len(window: int) -> int:
+    return window + 17
+
+
 def _phases_from_window(window: int) -> dict:
-    long_len = window + 17
+    long_len = get_long_seq_len(window)
     return {
         "ctx": dict(
             seq_lens=[long_len, 73, 41],
@@ -92,9 +96,7 @@ def _rope_dict(cfg: ModelAttnConfig):
         return None
     max_positions = 8192
     if cfg.sliding_window is not None:
-        # Sliding-window decode uses cached length window+17, so the generated
-        # token needs RoPE position window+17 to be present.
-        max_positions = max(max_positions, cfg.sliding_window + 18)
+        max_positions = max(max_positions, get_long_seq_len(cfg.sliding_window) + 1)
     return dict(
         dim=cfg.head_dim, theta=10000.0, max_positions=max_positions, is_neox=(cfg.rope == "neox")
     )

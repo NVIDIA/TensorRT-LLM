@@ -20,8 +20,6 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 from .sparse.kernel import triton_index_gather
 from .sparse.params import SparseParams
 
-_SLIDING_WINDOW_SDPA_QUERY_CHUNK = 512
-
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -290,48 +288,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             enable_gqa=True,
         )
 
-    def _single_request_sliding_window_attn_forward(
-            self, q, key_states, value_states, past_seen_token: int,
-            attention_window_size: int) -> torch.Tensor:
-        """Run sliding-window attention without materializing a full mask."""
-        key_states = key_states.transpose(1, 2).to(q.dtype)
-        value_states = value_states.transpose(1, 2).to(q.dtype)
-
-        qk_scale = None
-        if self.q_scaling is not None:
-            qk_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
-
-        q_len = q.size(2)
-        outputs = []
-        for q_start in range(0, q_len, _SLIDING_WINDOW_SDPA_QUERY_CHUNK):
-            q_end = min(q_start + _SLIDING_WINDOW_SDPA_QUERY_CHUNK, q_len)
-            q_abs_start = past_seen_token + q_start
-            q_abs_end = past_seen_token + q_end
-            kv_start = max(0, q_abs_start - attention_window_size + 1)
-            kv_end = q_abs_end
-
-            key_slice = key_states[:, :, kv_start:kv_end, :]
-            value_slice = value_states[:, :, kv_start:kv_end, :]
-
-            q_pos = torch.arange(q_abs_start, q_abs_end, device=q.device)
-            kv_pos = torch.arange(kv_start, kv_end, device=q.device)
-            attn_mask = ((kv_pos.unsqueeze(0) <= q_pos.unsqueeze(-1))
-                         & (kv_pos.unsqueeze(0)
-                            > q_pos.unsqueeze(-1) - attention_window_size))
-            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-
-            outputs.append(
-                torch.nn.functional.scaled_dot_product_attention(
-                    q[:, :, q_start:q_end, :],
-                    key_slice,
-                    value_slice,
-                    is_causal=False,
-                    attn_mask=attn_mask,
-                    scale=qk_scale,
-                    enable_gqa=True,
-                ))
-        return torch.cat(outputs, dim=2)
-
     def _single_request_forward(self,
                                 q,
                                 k,
@@ -364,22 +320,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             sparse_indices, kv_len = self._single_request_sparse_attn_predict(
                 q, k, v, kv_cache_tensor, metadata, past_seen_token, sample_idx)
 
-        if (attention_mask == PredefinedAttentionMask.CAUSAL
-                and attention_window_size is not None
-                and sparse_indices is None):
-            attn_output = self._single_request_sliding_window_attn_forward(
-                q, key_states, value_states, past_seen_token,
-                attention_window_size)
-        else:
-            # create attention mask
-            attn_mask, is_causal = self._single_request_create_attention_mask(
-                attention_mask, past_seen_token, kv_len, q.device, q.size(2),
-                attention_window_size)
+        # Create attention mask.
+        attn_mask, is_causal = self._single_request_create_attention_mask(
+            attention_mask, past_seen_token, kv_len, q.device, q.size(2),
+            attention_window_size)
 
-            # attention
-            attn_output = self._single_request_attn_forward(
-                q, key_states, value_states, is_causal, attn_mask,
-                sparse_indices)
+        # Run attention.
+        attn_output = self._single_request_attn_forward(q, key_states,
+                                                        value_states, is_causal,
+                                                        attn_mask,
+                                                        sparse_indices)
 
         return attn_output.squeeze(0)
 

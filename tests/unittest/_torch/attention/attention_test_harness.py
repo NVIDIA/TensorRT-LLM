@@ -173,6 +173,11 @@ class BackendCase:
             return self.compute_dtype
         return _STR_TO_DTYPE[self.kv_dtype]
 
+    @property
+    def max_num_tokens(self) -> int:
+        """Metadata token capacity needed by the largest packed tensor in the case."""
+        return max(DEFAULT_MAX_NUM_TOKENS, self.nnz_q, self.nnz_kv, *self.token_nums)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -195,11 +200,6 @@ def _rope_params_from_dict(d: dict) -> RopeParams:
         if isinstance(kwargs.get(key), list):
             kwargs[key] = tuple(kwargs[key])
     return RopeParams(**kwargs)
-
-
-def _case_max_num_tokens(case: BackendCase) -> int:
-    """Metadata token capacity needed by the largest packed tensor in the case."""
-    return max(DEFAULT_MAX_NUM_TOKENS, case.nnz_q, case.nnz_kv, *case.token_nums)
 
 
 def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
@@ -355,7 +355,7 @@ def _mla_metadata(AttentionCls, case, mgr):
         ),
         seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
         max_num_requests=case.num_seqs,
-        max_num_tokens=_case_max_num_tokens(case),
+        max_num_tokens=case.max_num_tokens,
         kv_cache_manager=mgr,
         request_ids=list(range(case.num_seqs)),
         prompt_lens=case.token_nums,
@@ -459,7 +459,7 @@ def _run_mla_context_backend(case, backend, inputs) -> torch.Tensor:
         ),
         seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
         max_num_requests=case.num_seqs,
-        max_num_tokens=_case_max_num_tokens(case),
+        max_num_tokens=case.max_num_tokens,
         kv_cache_manager=mgr,
         request_ids=request_ids,
         prompt_lens=case.token_nums,
@@ -653,7 +653,7 @@ def run_backend(
     if case.cache == "none":
         metadata = AttentionCls.Metadata(
             max_num_requests=case.num_seqs,
-            max_num_tokens=_case_max_num_tokens(case),
+            max_num_tokens=case.max_num_tokens,
             kv_cache_manager=None,
             mapping=None,
             runtime_features=None,
@@ -681,7 +681,7 @@ def run_backend(
                 seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
                 seq_lens_kv=seq_lens_kv,
                 max_num_requests=case.num_seqs,
-                max_num_tokens=_case_max_num_tokens(case),
+                max_num_tokens=case.max_num_tokens,
                 kv_cache_manager=mgr,
                 request_ids=request_ids,
                 prompt_lens=case.token_nums,
