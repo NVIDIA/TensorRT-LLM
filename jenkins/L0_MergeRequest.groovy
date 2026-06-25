@@ -1745,7 +1745,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
-                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                            'triggerType': "post-merge",
                             'runSanityCheck': false,
                             'defaultTag': defaultTag,
                             'buildInternalRelease': false,
