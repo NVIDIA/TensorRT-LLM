@@ -17,9 +17,9 @@ from tensorrt_llm.bindings.executor import DecodingMode
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
-    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
+    SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -47,8 +47,9 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheManager, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
+                               PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -236,8 +237,6 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
-        # For V2 fallback use only, will be removed after V2 is stable
-        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -247,6 +246,7 @@ class KvCacheCreator:
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine)
@@ -261,30 +261,46 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
-        config = model_config.pretrained_config
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
+        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            cls, model_config, kv_cache_config)
+        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
+        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
+        # state in a separate cache that doesn't honor block reuse. Warn at
+        # the routing site so users see the warning where the decision is
+        # actually made.
+        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
+                and kv_cache_config.enable_block_reuse:
+            uses_v1_mamba_route = self._is_disagg \
+                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
+                or self._speculative_config is not None
+            if uses_v1_mamba_route:
+                logger.warning(
+                    "Block reuse does not work with MTP for hybrid linear models "
+                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
+                )
+        return cls
+
+    def _fallback_if_unsupported_kv_cache_manager_v2(
+            self,
+            kv_cache_manager_cls,
+            model_config: ModelConfig,
+            kv_cache_config: Optional[KvCacheConfig] = None):
+        config = model_config.pretrained_config
         # Use ``issubclass`` rather than identity equality so V2 subclasses
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
-        # also go through the V2-incompatible-feature gate below. The earlier
-        # ``cls == KVCacheManagerV2`` check silently bypassed all V2 subclasses
-        # and let the bare ``assert event_buffer_max_size == 0`` in
-        # ``KVCacheManagerV2.__init__`` trip at executor construction with
-        # a useless error message.
-        if issubclass(cls, KVCacheManagerV2):
+        # also go through the V2-incompatible-feature gate below.
+        if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("beam_width > 1")
-            if kv_cache_config.event_buffer_max_size > 0:
-                incompat.append("event_buffer_max_size > 0")
-            if (self._cache_transceiver_config is not None
-                    and self._cache_transceiver_config.backend is not None):
-                incompat.append("cache_transceiver")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall
@@ -315,24 +331,8 @@ class KvCacheCreator:
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
-                cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
-        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
-        # state in a separate cache that doesn't honor block reuse. Warn at
-        # the routing site so users see the warning where the decision is
-        # actually made.
-        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
-                and kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
-                or self._speculative_config is not None
-            if uses_v1_mamba_route:
-                logger.warning(
-                    "Block reuse does not work with MTP for hybrid linear models "
-                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
-                )
-        return cls
+                return KVCacheManager
+        return kv_cache_manager_cls
 
     def _per_manager_cache_cost(self,
                                 manager_cls,
@@ -945,18 +945,8 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-
-        # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
-                    "Falling back to KVCacheManager for draft model.")
-                draft_kv_cache_manager_cls = KVCacheManager
+        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+            draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
@@ -1881,6 +1871,25 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
+def create_kv_cache_compression_manager(
+    config: KvCacheCompressionConfig,
+    kv_cache_manager: KVCacheManagerV2,
+) -> Optional[BaseKVCacheCompressionManager]:
+    """Build the KV-cache compression manager for ``config.algorithm``, or return
+    None if no algorithm matches.
+
+    Called from ``create_py_executor`` and registered as a resource manager,
+    like the KV cache manager itself. Concrete algorithms add a dispatch branch
+    here; the framework ships none.
+    """
+    logger.warning(
+        "KV-cache compression algorithm '%s' is not registered; running without "
+        "a compression manager.",
+        config.algorithm,
+    )
+    return None
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -2076,13 +2085,30 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    # Register the compression manager (if one is configured) with the other
+    # managers, before building ResourceManager, so it is part of the manager
+    # set from the start. Reads its own config, not the sparse-attention one.
+    kv_cache_compression_config = getattr(llm_args,
+                                          "kv_cache_compression_config", None)
+    if kv_cache_compression_config is not None:
+        compression_manager = create_kv_cache_compression_manager(
+            kv_cache_compression_config, kv_cache_manager)
+        if compression_manager is not None:
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
+
     resource_manager = ResourceManager(resources)
 
-    # Make sure the kv cache managers are always invoked last as they could
-    # depend on the results of other resource managers.
+    # KV cache manager runs last (others may depend on it), except the
+    # compression manager which reconciles after it (below).
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
+    # Compression manager runs after the cache manager: reconciles history once it's resized.
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     cross_kv_cache_manager = resources.get(
         ResourceManagerType.CROSS_KV_CACHE_MANAGER)
@@ -2104,6 +2130,18 @@ def create_py_executor_instance(
                                if cross_kv_cache_manager is not None else
                                LlmRequestState.CONTEXT_INIT)
 
+    # V2 scheduler uses scheduler_capacity as the per-iteration request
+    # budget (BudgetTracker.max_num_requests).  Unlike V1 which has a
+    # separate CapacityScheduler (needs pp_size * max_batch_size to hold
+    # requests across PP stages) and MicroBatchScheduler (uses
+    # max_batch_size for per-forward batch limit), V2 merges both into
+    # one loop.  PP on-the-fly is handled by inflight_request_ids
+    # filtering, so its budget should be based on max_batch_size, not
+    # max_num_sequences (which includes the pp_size multiplier).
+    v2_scheduler_capacity = max_batch_size
+    if v2_scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        v2_scheduler_capacity += 1
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -2119,7 +2157,7 @@ def create_py_executor_instance(
             ctx_chunk_config=ctx_chunk_config,
             peft_cache_manager=peft_cache_manager.impl
             if peft_cache_manager is not None else None,
-            scheduler_capacity=scheduler_capacity,
+            scheduler_capacity=v2_scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,

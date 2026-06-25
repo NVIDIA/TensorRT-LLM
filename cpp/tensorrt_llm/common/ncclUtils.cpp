@@ -90,6 +90,121 @@ struct NcclMemGuard
 namespace tensorrt_llm::common::nccl_util
 {
 
+namespace
+{
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+constexpr int kNcclWindowMinRuntimeVersion = NCCL_VERSION(2, 28, 0);
+constexpr int kNcclGb10WindowFixedVersion = NCCL_VERSION(2, 30, 4);
+constexpr int kGb10RealSmVersion = 121;
+
+bool isGb10Platform(int realSmVersion, bool isIntegrated)
+{
+    return realSmVersion == kGb10RealSmVersion && isIntegrated;
+}
+#endif
+
+bool queryNcclWindowSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int version = 0;
+    if (ncclGetVersion(&version) != ncclSuccess)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] Failed to query NCCL runtime version; falling back to regular tensors.");
+        return false;
+    }
+
+    if (version < kNcclWindowMinRuntimeVersion)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] NCCL runtime version %d.%d.%d does not support window buffers; falling back to regular "
+            "tensors.",
+            version / 10000, (version % 10000) / 100, version % 100);
+        return false;
+    }
+
+    if (version >= kNcclGb10WindowFixedVersion)
+    {
+        return true;
+    }
+
+    int device = -1;
+    cudaError_t const deviceErr = cudaGetDevice(&device);
+    if (deviceErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Failed to query the current CUDA device while checking NCCL window support: %s; "
+            "falling back to regular tensors.",
+            cudaGetErrorString(deviceErr));
+        return false;
+    }
+
+    int isIntegrated = 0;
+    cudaError_t const integratedErr = cudaDeviceGetAttribute(&isIntegrated, cudaDevAttrIntegrated, device);
+    if (integratedErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Failed to query CUDA integrated-device attribute for device %d while checking NCCL window "
+            "support: %s; falling back to regular tensors.",
+            device, cudaGetErrorString(integratedErr));
+        return false;
+    }
+
+    int realSmVersion = -1;
+    try
+    {
+        realSmVersion = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Failed to query real CUDA SM version while checking NCCL window support: %s; falling back "
+            "to regular tensors.",
+            e.what());
+        return false;
+    }
+
+    bool const supported = !isGb10Platform(realSmVersion, isIntegrated != 0);
+    if (!supported)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Disabling NCCL window buffers on integrated SM %d with NCCL runtime version %d.%d.%d; "
+            "GB10 requires NCCL 2.30.4 or newer for symmetric window registration.",
+            realSmVersion, version / 10000, (version % 10000) / 100, version % 100);
+    }
+    return supported;
+#else
+    return false;
+#endif
+}
+
+} // namespace
+
+bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion)
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    if (ncclRuntimeVersion < kNcclWindowMinRuntimeVersion)
+    {
+        return false;
+    }
+
+    return !(ncclRuntimeVersion < kNcclGb10WindowFixedVersion && isGb10Platform(realSmVersion, isIntegrated));
+#else
+    (void) realSmVersion;
+    (void) isIntegrated;
+    (void) ncclRuntimeVersion;
+    return false;
+#endif
+}
+
+bool isNcclWindowSupported()
+{
+    static std::once_flag supportCheckFlag;
+    static bool windowBuffersSupported = false;
+    std::call_once(supportCheckFlag, []() { windowBuffersSupported = queryNcclWindowSupported(); });
+    return windowBuffersSupported;
+}
+
 //==============================================================================
 // NcclCommResourceManager Implementation
 //==============================================================================
@@ -287,26 +402,7 @@ NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 
 NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
 {
-    // One-time runtime version check: the runtime NCCL library must also support window buffers.
-    static std::once_flag versionCheckFlag;
-    static bool runtimeVersionOk = false;
-    std::call_once(versionCheckFlag,
-        []()
-        {
-            int version = 0;
-            if (ncclGetVersion(&version) == ncclSuccess && version >= NCCL_VERSION(2, 28, 0))
-            {
-                runtimeVersionOk = true;
-            }
-            else
-            {
-                TLLM_LOG_WARNING(
-                    "[NCCLUtil] NCCL runtime version %d.%d.%d does not support window buffers; "
-                    "falling back to regular tensors.",
-                    version / 10000, (version % 10000) / 100, version % 100);
-            }
-        });
-    if (!runtimeVersionOk)
+    if (!isNcclWindowSupported())
     {
         return NCCLWindowBuffer();
     }

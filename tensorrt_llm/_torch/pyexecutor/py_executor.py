@@ -64,6 +64,7 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
@@ -486,7 +487,6 @@ class PyExecutor:
             self.max_num_active_requests = derived_cap
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
         # from _send_kv_async the owning DP rank has a response but the other
@@ -494,7 +494,11 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
-
+        # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
+        # updated from observed request types.
+        self._adp_dummy_is_gen: bool = True
+        # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
+        # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
@@ -581,8 +585,11 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
 
         def on_detected():
-            self._handle_errors(
+            logger.error(
                 f"Hang detected on rank {self.global_rank} in PyExecutor.")
+            if self._event_loop_error is None:
+                self._event_loop_error = RuntimeError(
+                    f"Hang detected on rank {self.global_rank} in PyExecutor.")
             self.shutdown_event.set()
             self.is_shutdown = True
 
@@ -1775,34 +1782,7 @@ class PyExecutor:
                 local_dict["requestStats"] = [
                     _json.loads(r.to_json_str()) for r in req_stats
                 ]
-            if kv_iter_stats is not None:
-                local_dict["kvCacheIterationStats"] = {
-                    str(window_size): {
-                        "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                        "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                        "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                        "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                        "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                        "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                        "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                        "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                        "iterReusedBlocks": s.iter_reused_blocks,
-                        "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                        "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                        "iterMissedBlocks": s.iter_missed_blocks,
-                        "iterCacheHitRate": s.iter_cache_hit_rate,
-                        "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                        "iterOnboardBlocks": s.iter_onboard_blocks,
-                        "iterOnboardBytes": s.iter_onboard_bytes,
-                        "iterOffloadBlocks": s.iter_offload_blocks,
-                        "iterOffloadBytes": s.iter_offload_bytes,
-                        "iterIntraDeviceCopyBlocks":
-                        s.iter_intra_device_copy_blocks,
-                        "iterIntraDeviceCopyBytes":
-                        s.iter_intra_device_copy_bytes,
-                    }
-                    for window_size, s in kv_iter_stats.items()
-                }
+            append_kv_cache_iteration_stats(local_dict, kv_iter_stats)
             if host_step_time_ms is not None:
                 local_dict["hostStepTimeMS"] = host_step_time_ms
             if prev_device_step_time_ms is not None:
@@ -2049,6 +2029,8 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                self._handle_disagg_cache_errors_synced()
 
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
@@ -2486,6 +2468,9 @@ class PyExecutor:
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate_pending_requests()
 
+        if executed_batch is not None:
+            self._commit_kv_cache_stats(executed_batch.scheduled_requests)
+
         if self.enable_iter_perf_stats and executed_batch is not None:
             self._process_iter_stats(
                 finished_requests,
@@ -2621,6 +2606,12 @@ class PyExecutor:
         if candidates:
             self.kv_cache_manager.prefetch_for_context_tokens(candidates)
 
+    def _commit_kv_cache_stats(self,
+                               scheduled_batch: ScheduledRequests) -> None:
+        if self._is_kv_manager_v2:
+            self.kv_cache_manager.commit_scheduled_kv_cache_stats(
+                scheduled_batch)
+
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -2736,11 +2727,10 @@ class PyExecutor:
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
-            # simultaneously because generation requests do not release their
-            # KV until the full benchmark batch can run. If the scheduler
-            # cannot fit any INIT request after all benchmark requests have
-            # been fetched, the fill gate would never open; raise an explicit
-            # error instead of hanging forever.
+            # simultaneously. If some requests are stuck in INIT state and the
+            # scheduler could not allocate KV for any of them, the benchmark
+            # will hang forever because in-progress generation requests won't
+            # release their KV cache.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
@@ -2905,6 +2895,28 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    def _handle_disagg_cache_errors_synced(self):
+        """ADP-safe disagg cache error handler.
+
+        Called from the top of every executor iteration so all TP ranks
+        enter ``_handle_errors`` together; otherwise the downstream
+        ``tp_gather`` in ``_enqueue_responses`` deadlocks.
+        """
+        if not (self.kv_cache_transceiver and self.enable_attention_dp
+                and self.dist.world_size != 1):
+            return
+        local_error_requests = self._get_disagg_reqs_in_error_state()
+        any_has_errors = any(self.dist.tp_allgather(bool(local_error_requests)))
+        if not any_has_errors:
+            return
+        logger.warning(f"Disagg KV cache transfer error: rank={self.dist.rank} "
+                       f"local_err_count={len(local_error_requests)}")
+        self._handle_errors(
+            "Disagg KV cache transfer error",
+            requests=local_error_requests,
+            charge_budget=False,
+        )
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2926,6 +2938,8 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
+                self._handle_disagg_cache_errors_synced()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -2935,6 +2949,10 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    if self._is_kv_manager_v2:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -3019,6 +3037,7 @@ class PyExecutor:
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
+                    self._commit_kv_cache_stats(scheduled_batch)
 
                     # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
@@ -3326,6 +3345,8 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
+                self._handle_disagg_cache_errors_synced()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -3335,6 +3356,10 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    if self._is_kv_manager_v2:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -3515,6 +3540,8 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    self._commit_kv_cache_stats(
+                        self.previous_batch.scheduled_requests)
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -3867,6 +3894,11 @@ class PyExecutor:
                     all_rank_states, new_requests,
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
+
+            all_new_flat = [
+                req for reqs in all_ranks_new_requests.values() for req in reqs
+            ]
+            self._update_adp_dummy_role(all_new_flat)
 
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
@@ -4385,6 +4417,25 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
+    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+        if not self.enable_attention_dp or self.kv_cache_transceiver is None:
+            return
+        has_ctx = False
+        has_gen = False
+        for req in candidates:
+            rt = getattr(req, "llm_request_type", None)
+            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+                has_ctx = True
+            elif rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                has_gen = True
+        # Prefer the CTX role when both types are present this iteration: a CTX
+        # dummy is padded to max_num_tokens so idle ranks keep MoE all-to-all
+        # token counts comparable with ranks doing real context work.
+        if has_ctx:
+            self._adp_dummy_is_gen = False
+        elif has_gen:
+            self._adp_dummy_is_gen = True
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -4402,10 +4453,16 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
+            token_nums = None
+            if (not self._adp_dummy_is_gen
+                    and self.kv_cache_transceiver is not None
+                    and self.max_num_tokens is not None):
+                token_nums = [self.max_num_tokens]
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
-                is_gen=True,
+                token_nums=token_nums,
+                is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )[0]
@@ -4691,7 +4748,13 @@ class PyExecutor:
         ]
 
     def _check_cache_transfer_errors(self, error_msg_prefix: str):
-        """Common helper to check for and handle cache transfer errors."""
+        """Check and handle cache transfer errors.
+
+        Under ADP this is a no-op: errors are handled by
+        ``_handle_disagg_cache_errors_synced`` at the loop top.
+        """
+        if self.enable_attention_dp and self.dist.world_size != 1:
+            return
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
             self._handle_errors(
@@ -5331,6 +5394,7 @@ class PyExecutor:
         # included in the return value for stats but not re-terminated here.
         requests_finished_by_transfer = []
         new_active_requests = []
+        timed_out_requests = []
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
         )
@@ -5348,10 +5412,7 @@ class PyExecutor:
             if request.py_kv_transfer_timed_out:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
-                    self._handle_errors(
-                        error_msg=f"Request {request.py_request_id} timed out",
-                        requests=[request],
-                        charge_budget=False)
+                    timed_out_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
@@ -5400,6 +5461,9 @@ class PyExecutor:
                     and not request.is_finished):
                 should_emit = False
             if should_emit:
+                if request.return_perf_metrics:
+                    # Response creation may finalize and copy scalar ctx GPU totals.
+                    self.perf_manager.compute_batch_gpu_times([request])
                 response = request.create_response(False, self.dist.rank)
                 if response:
                     request_done = request.is_finished
@@ -5457,6 +5521,20 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+        if (self.kv_cache_transceiver is not None and self.enable_attention_dp
+                and self.dist.world_size != 1):
+            any_timed_out = any(self.dist.tp_allgather(
+                bool(timed_out_requests)))
+            if any_timed_out:
+                self._handle_errors(error_msg="Request timed out (KV transfer)",
+                                    requests=timed_out_requests,
+                                    charge_budget=False)
+        else:
+            for req in timed_out_requests:
+                self._handle_errors(
+                    error_msg=f"Request {req.py_request_id} timed out",
+                    requests=[req],
+                    charge_budget=False)
         return requests_to_terminate + requests_finished_by_transfer
 
     def _await_any_response(self,

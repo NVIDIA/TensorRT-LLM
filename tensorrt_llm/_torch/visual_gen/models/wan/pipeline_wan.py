@@ -1,3 +1,4 @@
+import os
 import time
 from typing import List, Optional, Union
 
@@ -101,11 +102,16 @@ class WanPipeline(BasePipeline):
         self.is_wan22_14b = self.boundary_ratio is not None
         self.is_wan22_5b = self.expand_timesteps
 
-        # Validate TeaCache compatibility before allocating GPU memory
-        if (self.is_wan22_14b or self.is_wan22_5b) and pipeline_config.cache_backend == "teacache":
-            raise ValueError(
-                "TeaCache is not supported for Wan 2.2 models. "
-                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
+        # Fixed latent for reproducible benchmarking (e.g. MLPerf).
+        # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
+        # noise tensor; it will be used in place of freshly sampled random latents for
+        # all T2V requests.  Loaded once at server startup, reused across requests.
+        self._fixed_latent: Optional[torch.Tensor] = None
+        _fixed_latent_path = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
+        if _fixed_latent_path:
+            self._fixed_latent = torch.load(_fixed_latent_path, weights_only=True)
+            logger.warning(
+                f"Loaded fixed latent from {_fixed_latent_path}, shape={self._fixed_latent.shape}"
             )
 
         super().__init__(pipeline_config)
@@ -318,19 +324,30 @@ class WanPipeline(BasePipeline):
                 )
 
             if not self.is_wan22_14b:
-                self._setup_cache_acceleration(
-                    self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS
-                )
-                self.transformer_cache_backend = self.cache_accelerator
+                self._apply_teacache_coefficients(WAN_TEACACHE_COEFFICIENTS)
+                self._setup_cache_acceleration()
             else:
                 if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration(self.transformer, coefficients=None)
-                # TeaCache is not supported for Wan 2.2 unless using Cache-DiT.
-                self.transformer_cache_backend = self.cache_accelerator
+                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
+
+        # Wan 2.2 TeaCache after both transformers' post_load_weights (FP8 scales, etc.)
+        if (
+            self.transformer is not None
+            and self.transformer_2 is not None
+            and self.pipeline_config.cache_backend == "teacache"
+        ):
+            tc = self.pipeline_config.teacache
+            if tc.coefficients is None or tc.coefficients_2 is None:
+                raise ValueError(
+                    "Wan 2.2 TeaCache requires explicit teacache.coefficients and "
+                    "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
+                    "There is no built-in coefficient table for Wan 2.2."
+                )
+            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -486,6 +503,8 @@ class WanPipeline(BasePipeline):
             latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
                 batch_size, image, height, width, num_frames, generator
             )
+        elif self._fixed_latent is not None:
+            latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
