@@ -1624,15 +1624,21 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
+                    # Record the terminal verdict for the controller to read, then
+                    # always exit 0: reaching this point means the monitor
+                    # successfully observed a terminal SLURM state, so the
+                    # controller's numRetries only re-runs the monitor on an
+                    # SSH/transport failure (no verdict written) -- not on a job
+                    # that already reached a terminal failure state, which a re-run
+                    # cannot change.
+                    printf '%s %s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
-                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
-                        exit 0
                     else
                         echo "Pytest failed in Slurm job \$jobId"
-                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
-                        exit 1
                     fi
+                    echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
+                    exit 0
                 """.replaceAll("(?m)^\\s*", "").trim()
 
                 pipeline.writeFile(file: scriptTrackPathLocal, text: scriptTrack)
@@ -1645,40 +1651,48 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job
-                try {
-                    Utils.exec(
-                        pipeline,
-                        timeout: false,
-                        script: Utils.sshUserCmd(
-                            remote,
-                            scriptTrackPathNode
-                        ),
-                        numRetries: 3
-                    )
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    // The track script squashes the job's terminal SLURM state to
-                    // exit 0/1, so a walltime kill is indistinguishable here from a
-                    // real test failure. Re-query sacct for the allocation-level
-                    // state (SLURM already aggregates it across nodes; TIMEOUT if
-                    // any node hit the walltime) and, when it is TIMEOUT, raise a
-                    // typed UserFailure so neither the SLURM retry loop nor the
-                    // outer K8s pod retry re-runs a job that would just time out
-                    // again. srun --kill-on-bad-exit=1 means a genuine test failure
-                    // surfaces as FAILED, not TIMEOUT, so this stays unambiguous.
-                    def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                // Monitor the SLURM job. The track script always exits 0 once it
+                // has recorded a terminal verdict to slurm_job_result.txt, so
+                // numRetries here only re-runs the monitor on an SSH/transport
+                // failure -- not on a job that already reached a terminal failure
+                // state (a re-run can't change that, and re-running wastes a full
+                // monitor cycle per attempt).
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        scriptTrackPathNode
+                    ),
+                    numRetries: 3
+                )
+
+                // Read the verdict the monitor recorded. "<STATE> <EXIT_CODE>";
+                // success is COMPLETED with exit 0 (srun --kill-on-bad-exit=1
+                // means any rank failure surfaces as a non-COMPLETED state).
+                def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName)
+                def resultFields = jobResult ? jobResult.tokenize(' ') : []
+                def jobState = resultFields ? resultFields[0] : null
+                def jobExit = resultFields.size() > 1 ? resultFields[1] : null
+                if (jobState != "COMPLETED" || jobExit != "0") {
+                    // Prefer the monitor's captured state; fall back to an
+                    // authoritative sacct query if the verdict file was missing.
+                    // SLURM aggregates multi-node state into one allocation row
+                    // (TIMEOUT if any node hit the walltime). A TIMEOUT is a
+                    // walltime kill -- raise a typed UserFailure so neither the
+                    // SLURM retry loop nor the outer K8s pod retry re-runs a job
+                    // that would just time out again.
+                    def slurmState = jobState ?: querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
                     if (slurmState == "TIMEOUT") {
                         throw new UserFailure(
                             "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
                             "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
-                            "Original failure: ${e.message}",
-                            e)
+                            "(state=${slurmState}, exit=${jobExit ?: 'unknown'})",
+                            null)
                     }
-                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
-                         "deferring to failure classifier."
-                    throw e
+                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}, " +
+                         "exit=${jobExit ?: 'unknown'}; deferring to failure classifier."
+                    throw new Exception("Pytest failed in SLURM job ${slurmJobId} for ${stageName}")
                 }
             }
             echo "Finished test stage execution."
