@@ -2709,26 +2709,46 @@ class PyExecutor:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
 
+    def _get_disagg_transfer_admission_controller(
+            self) -> DisaggTransferAdmissionController:
+        controller = getattr(self, "_disagg_transfer_admission_controller",
+                             None)
+        if controller is not None:
+            return controller
+
+        cache_transceiver_config = getattr(getattr(self, "llm_args", None),
+                                           "cache_transceiver_config", None)
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        return DisaggTransferAdmissionController(
+            getattr(cache_transceiver_config, "max_tokens_in_buffer", None),
+            getattr(kv_cache_manager, "tokens_per_block", None),
+        )
+
+    def _uses_kv_manager_v2(self) -> bool:
+        explicit_flag = getattr(self, "_is_kv_manager_v2", None)
+        if explicit_flag is not None:
+            return bool(explicit_flag)
+        return isinstance(getattr(self, "kv_cache_manager", None),
+                          KVCacheManagerV2)
+
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
-        if not (self.kv_cache_transceiver
-                and self._disagg_transfer_admission_controller.enabled()
-                and fitting_disagg_gen_init_requests):
+        controller = self._get_disagg_transfer_admission_controller()
+        if not (getattr(self, "kv_cache_transceiver", None)
+                and controller.enabled() and fitting_disagg_gen_init_requests):
             return fitting_disagg_gen_init_requests, False
 
-        admission_result = self._disagg_transfer_admission_controller.select(
-            self.active_requests, fitting_disagg_gen_init_requests)
+        admission_result = controller.select(self.active_requests,
+                                             fitting_disagg_gen_init_requests)
         if admission_result.deferred_request_count > 0:
-            logger.debug(
-                "Disagg transfer admission deferred "
-                f"{admission_result.deferred_request_count} requests; "
-                f"active transfer blocks="
-                f"{admission_result.active_transfer_blocks}, "
-                f"admitted transfer blocks="
-                f"{admission_result.admitted_transfer_blocks}, "
-                f"budget={self._disagg_transfer_admission_controller.max_transfer_blocks}"
-            )
+            logger.debug("Disagg transfer admission deferred "
+                         f"{admission_result.deferred_request_count} requests; "
+                         f"active transfer blocks="
+                         f"{admission_result.active_transfer_blocks}, "
+                         f"admitted transfer blocks="
+                         f"{admission_result.admitted_transfer_blocks}, "
+                         f"budget={controller.max_transfer_blocks}")
 
         self._revert_deferred_disagg_gen_init_alloc(
             fitting_disagg_gen_init_requests,
@@ -2740,7 +2760,7 @@ class PyExecutor:
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
             admitted_requests: List[LlmRequest]) -> None:
-        if not (self._is_kv_manager_v2 and candidates):
+        if not (self._uses_kv_manager_v2() and candidates):
             return
 
         admitted_request_ids = {
