@@ -159,6 +159,7 @@ def _assert_pipeline_matches_hf(
 ) -> None:
     """Run TRTLLM and HF pipelines sequentially, compare decoded video output."""
     # --- TRTLLM ---
+    trtllm_pipe = None
     try:
         trtllm_pipe = _load_trtllm_pipeline(checkpoint_path)
         trtllm_output = _capture_trtllm_video(
@@ -176,6 +177,7 @@ def _assert_pipeline_matches_hf(
         _teardown_pipeline(trtllm_pipe)
 
     # --- HF reference ---
+    hf_pipe = None
     try:
         hf_pipe = _load_hf_pipeline(checkpoint_path)
         hf_output = _capture_hf_video(
@@ -240,6 +242,7 @@ class TestHunyuanVideo15BatchGeneration:
     def test_single_prompt_backward_compat(self):
         """Single prompt returns (B, T, H, W, C) for backward compatibility."""
 
+        pipe = None
         try:
             pipe = _load_trtllm_pipeline(HUNYUAN_VIDEO_1_5_PATH)
             result = _capture_trtllm_video(
@@ -275,6 +278,7 @@ class TestHunyuanVideo15QuantizationOptimizations:
             "attention_config": AttentionConfig(backend="TRTLLM"),
         }
 
+        pipe = None
         try:
             pipe = _load_trtllm_pipeline(HUNYUAN_VIDEO_1_5_PATH, **pipe_args)
             result = _capture_trtllm_video(
