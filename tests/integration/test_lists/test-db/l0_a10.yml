@@ -118,6 +118,8 @@ l0_a10:
   - unittest/visual_gen/test_output.py
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
+  - unittest/_torch/visual_gen/test_qwen_image_infer.py
+  - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py
