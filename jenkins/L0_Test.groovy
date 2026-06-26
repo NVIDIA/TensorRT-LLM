@@ -2219,6 +2219,12 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
+            // Generate timeout test result xml if there are terminated unexpectedly tests
+            hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+            if (hasTimeoutTest) {
+                echo "There are terminated unexpectedly tests, stage is failed."
+                stageIsFailed = true
+            }
             // Temporarily disable to reduce the log size
             // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
             if (noResultIfSuccess && !stageIsFailed) {
@@ -2259,9 +2265,6 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else {
-                    // Generate timeout test result xml if there are terminated unexpectedly tests
-                    generateTimeoutTestResultXml(pipeline, stageName)
                 }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
