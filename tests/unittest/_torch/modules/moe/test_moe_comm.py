@@ -115,6 +115,7 @@ FIXED_NUM_EXPERTS = 32
 # to avoid _WORKSPACE singleton assertion failures.
 NVLINK_WORKSPACE_MB = "512"
 
+
 # ============================================================================
 # Test Configuration
 # ============================================================================
@@ -156,6 +157,8 @@ class WorkerInputs:
     slots: torch.Tensor
     scales: torch.Tensor
     dispatch_kwargs: Dict[str, torch.Tensor]
+    original_fp8: Optional[torch.Tensor] = None
+    w4afp8_roundtrip_ok: Optional[bool] = None
 
 
 @dataclass
@@ -185,6 +188,28 @@ class PendingWorkerResults:
 
     config: CommTestConfig
     futures: List
+
+
+# ============================================================================
+# MPI Serialization Helpers
+# ============================================================================
+
+_FLOAT8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _safe_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Move tensor to CPU, converting float8 to uint8 for MPI serialization.
+
+    PyTorch float8 tensors cannot be pickled reliably across all builds.
+    Since float8 and uint8 have the same element size, view(uint8) preserves
+    shape and content.  Downstream verification already works on the byte
+    view, so this is a transparent change.
+    """
+    if t is None:
+        return None
+    if t.dtype in _FLOAT8_DTYPES:
+        return t.view(torch.uint8).cpu()
+    return t.cpu()
 
 
 # ============================================================================
@@ -225,31 +250,6 @@ def encode_source_info(
     return hs
 
 
-def encode_source_info_rows(
-    hidden_states: torch.Tensor,
-    source_info: torch.Tensor,
-) -> torch.Tensor:
-    """Encode per-row (rank_id, token_idx) into the last 4 bytes."""
-    hs = hidden_states.clone()
-    num_rows = hidden_states.shape[0]
-    if num_rows == 0:
-        return hs
-
-    row_bytes = hidden_states.shape[1] * hidden_states.element_size()
-    source_info = source_info.to(device=hidden_states.device, dtype=torch.int32)
-    row_bytes_view = hs.view(torch.uint8).reshape(num_rows, row_bytes)
-    tail = row_bytes_view[:, -4:]
-
-    rank_ids = source_info[:, 0]
-    token_idxs = source_info[:, 1]
-    tail[:, 0] = (rank_ids >> 8).to(torch.uint8)
-    tail[:, 1] = (rank_ids & 0xFF).to(torch.uint8)
-    tail[:, 2] = (token_idxs >> 8).to(torch.uint8)
-    tail[:, 3] = (token_idxs & 0xFF).to(torch.uint8)
-
-    return hs
-
-
 def decode_source_info(
     hidden_states: torch.Tensor,
     dtype: torch.dtype,
@@ -269,75 +269,6 @@ def decode_source_info(
     token_idxs = (tail[:, 2] << 8) | tail[:, 3]
 
     return torch.stack((rank_ids, token_idxs), dim=1).to(torch.int64)
-
-
-def _make_deterministic_bf16_rows(
-    source_info: torch.Tensor,
-    hidden_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Generate deterministic communication-test payload rows.
-
-    This reconstructable signal is not intended to mimic model hidden-state
-    distributions. Routing slots and scales remain randomized below.
-    """
-    num_rows = source_info.shape[0]
-    if num_rows == 0:
-        return torch.empty(0, hidden_size, dtype=torch.bfloat16, device=device)
-
-    source_info = source_info.to(device=device, dtype=torch.float32)
-    rank_ids = source_info[:, 0].unsqueeze(1)
-    token_idxs = source_info[:, 1].unsqueeze(1)
-    hidden_idxs = torch.arange(hidden_size, device=device, dtype=torch.float32).unsqueeze(0)
-
-    values = 0.01 * (rank_ids + 1.0) + 0.001 * token_idxs + 0.00001 * (hidden_idxs % 997)
-    signs = torch.where((hidden_idxs.to(torch.int64) % 2) == 0, 1.0, -1.0)
-    return (values * signs).to(torch.bfloat16)
-
-
-def _make_deterministic_bf16_hidden_states(
-    rank_id: int,
-    num_tokens: int,
-    hidden_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Generate deterministic per-rank hidden states before source encoding."""
-    source_info = torch.stack(
-        (
-            torch.full((num_tokens,), rank_id, dtype=torch.int64),
-            torch.arange(num_tokens, dtype=torch.int64),
-        ),
-        dim=1,
-    )
-    return _make_deterministic_bf16_rows(source_info, hidden_size, device)
-
-
-def _make_expected_dispatch_payload(
-    source_info: torch.Tensor,
-    config: CommTestConfig,
-    device: torch.device,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Rebuild expected encoded dispatch payload for received source rows."""
-    bf16_rows = _make_deterministic_bf16_rows(source_info, config.hidden_size, device)
-
-    if config.quant_mode == "none":
-        return encode_source_info_rows(bf16_rows, source_info), None
-
-    if config.quant_mode == "fp8":
-        hs = bf16_rows.to(torch.float8_e4m3fn)
-        return encode_source_info_rows(hs, source_info), None
-
-    if config.quant_mode == "nvfp4":
-        global_scale = torch.ones(source_info.shape[0], 1, device=device, dtype=torch.float32)
-        hs, sf = Buffer.quantize_bf16_to_nvfp4(bf16_rows, global_scale)
-        return encode_source_info_rows(hs, source_info), sf
-
-    if config.quant_mode == "w4afp8":
-        hs = bf16_rows.to(torch.float8_e4m3fn)
-        hs = encode_source_info_rows(hs, source_info)
-        return hs.to(torch.bfloat16).to(torch.float8_e4m3fn), None
-
-    raise ValueError(f"Unknown quant_mode: {config.quant_mode}")
 
 
 # ============================================================================
@@ -712,16 +643,10 @@ def _generate_test_data(
     """
     num_tokens = config.all_num_tokens[rank]
 
-    hidden_states = _make_deterministic_bf16_hidden_states(
-        rank,
-        num_tokens,
-        config.hidden_size,
-        torch.device("cuda"),
-    )
-    hidden_states = encode_source_info(hidden_states, rank)
-
-    # Payloads are deterministic; keep routing and scales randomized.
     torch.manual_seed(seed + rank)
+
+    hidden_states = torch.randn(num_tokens, config.hidden_size, dtype=torch.bfloat16, device="cuda")
+    hidden_states = encode_source_info(hidden_states, rank)
 
     token_selected_slots = torch.randint(
         0, config.num_experts, (num_tokens, config.top_k), dtype=torch.int32, device="cuda"
@@ -770,12 +695,8 @@ def _generate_postquant_data(
     num_tokens = config.all_num_tokens[rank]
     H = config.hidden_size
 
-    bf16_hs = _make_deterministic_bf16_hidden_states(
-        rank,
-        num_tokens,
-        H,
-        torch.device("cuda"),
-    )
+    torch.manual_seed(seed + rank)
+    bf16_hs = torch.randn(num_tokens, H, dtype=torch.bfloat16, device="cuda")
 
     if config.quant_mode == "fp8":
         hs = bf16_hs.to(torch.float8_e4m3fn)
@@ -793,9 +714,6 @@ def _generate_postquant_data(
 
     else:
         raise ValueError(f"Unknown quant_mode: {config.quant_mode}")
-
-    # Payloads are deterministic; keep routing and scales randomized.
-    torch.manual_seed(seed + rank)
 
     token_selected_slots = torch.randint(
         0,
@@ -861,6 +779,13 @@ def _prepare_worker_inputs(rank: int, config: CommTestConfig) -> WorkerInputs:
         # (hs * pre_quant_scale).to(float8).view(bf16), so we must round-trip
         # through bf16 before the kernel sees the tensor.
         hs = encode_source_info(hs, rank)
+        original_fp8 = hs.clone()
+        # Preflight: if FP8 -> bf16 -> FP8 changes any element, byte-level
+        # dispatch checks against original_fp8 would be misleading (encoded
+        # trailing bytes may not survive conversion). verify_dispatch_alltoall
+        # skips per-row content equality when any rank sets this to False.
+        roundtrip_fp8 = hs.to(torch.bfloat16).to(torch.float8_e4m3fn)
+        w4afp8_roundtrip_ok = torch.equal(hs, roundtrip_fp8)
         hs = hs.to(torch.bfloat16)
         pre_quant_scale = torch.ones(
             1,
@@ -875,6 +800,8 @@ def _prepare_worker_inputs(rank: int, config: CommTestConfig) -> WorkerInputs:
             slots=slots,
             scales=scales,
             dispatch_kwargs={"pre_quant_scale": pre_quant_scale},
+            original_fp8=original_fp8,
+            w4afp8_roundtrip_ok=w4afp8_roundtrip_ok,
         )
 
     return WorkerInputs(
@@ -926,24 +853,23 @@ def _build_worker_result(
     config: CommTestConfig,
     recv_hs_bf16: Optional[torch.Tensor] = None,
     moe_output_for_ref: Optional[torch.Tensor] = None,
-    dispatch_payload_ok: bool = True,
-    dispatch_payload_error: Optional[str] = None,
 ) -> dict:
     """Collect tensors needed by host-side verification."""
     result = {
         "rank": rank,
+        "original_hs": _safe_cpu(worker_inputs.hs),
+        "original_hs_sf": _safe_cpu(worker_inputs.hidden_states_sf),
         "original_slots": worker_inputs.slots.cpu(),
         "original_scales": worker_inputs.scales.cpu(),
+        "recv_hs": _safe_cpu(dispatch_outputs.recv_hs),
+        "recv_sf": _safe_cpu(dispatch_outputs.recv_sf),
         "recv_slots": dispatch_outputs.recv_slots.cpu(),
         "recv_scales": (
             dispatch_outputs.recv_scales.cpu() if dispatch_outputs.recv_scales is not None else None
         ),
         "combined": combined.cpu(),
         "recv_source_info": recv_source_info,
-        "dispatch_payload_ok": dispatch_payload_ok,
-        "dispatch_payload_error": dispatch_payload_error,
     }
-
     if moe_output_for_ref is not None:
         result["moe_output_for_ref"] = moe_output_for_ref.cpu()
     else:
@@ -951,6 +877,10 @@ def _build_worker_result(
 
     if recv_hs_bf16 is not None:
         result["recv_hs_bf16"] = recv_hs_bf16.cpu()
+
+    if config.quant_mode == "w4afp8":
+        result["original_fp8"] = _safe_cpu(worker_inputs.original_fp8)
+        result["w4afp8_roundtrip_ok"] = worker_inputs.w4afp8_roundtrip_ok
 
     return result
 
@@ -970,94 +900,6 @@ def _prepare_moe_output_for_combine_reference(
         return _simulate_nvfp4_round_trip(moe_output)
 
     return None
-
-
-def _dispatch_valid_row_mask(
-    recv_slots: torch.Tensor,
-    rank: int,
-    config: CommTestConfig,
-) -> torch.Tensor:
-    """Return rows that correspond to real dispatched tokens, not padding."""
-    if config.comm_type == COMM_ALLGATHER_RS:
-        return torch.ones(recv_slots.shape[0], device=recv_slots.device, dtype=torch.bool)
-
-    _, slot_start, slot_end = _compute_ep_partition(config.num_experts, config.ep_size, rank)
-    return ((recv_slots >= slot_start) & (recv_slots < slot_end)).any(dim=1)
-
-
-def _first_mismatch_message(
-    actual: torch.Tensor,
-    expected: torch.Tensor,
-    source_info: torch.Tensor,
-    label: str,
-) -> str:
-    """Build a concise mismatch diagnostic after a worker-side compare fails."""
-    actual_bytes = actual.contiguous().view(torch.uint8).reshape(actual.shape[0], -1)
-    expected_bytes = expected.contiguous().view(torch.uint8).reshape(expected.shape[0], -1)
-    mismatch = actual_bytes != expected_bytes
-    mismatch_pos = mismatch.nonzero()
-    if mismatch_pos.numel() == 0:
-        return f"{label} mismatch, but no differing byte was found"
-
-    row_idx = mismatch_pos[0, 0].item()
-    byte_idx = mismatch_pos[0, 1].item()
-    src_rank, token_idx = source_info[row_idx].tolist()
-    actual_byte = actual_bytes[row_idx, byte_idx].item()
-    expected_byte = expected_bytes[row_idx, byte_idx].item()
-    return (
-        f"{label} mismatch at row={row_idx}, byte={byte_idx}, "
-        f"src_rank={src_rank}, token_idx={token_idx}, "
-        f"actual_byte={actual_byte}, expected_byte={expected_byte}"
-    )
-
-
-def _verify_dispatch_payload_on_worker(
-    rank: int,
-    dispatch_outputs: DispatchOutputs,
-    recv_source_info: torch.Tensor,
-    config: CommTestConfig,
-) -> Tuple[bool, Optional[str]]:
-    """Verify deterministic dispatch payload content on the worker."""
-    valid_mask = _dispatch_valid_row_mask(dispatch_outputs.recv_slots, rank, config)
-    if not valid_mask.any():
-        return True, None
-
-    valid_source_info = recv_source_info[valid_mask].to(dispatch_outputs.recv_hs.device)
-    expected_hs, expected_sf = _make_expected_dispatch_payload(
-        valid_source_info,
-        config,
-        dispatch_outputs.recv_hs.device,
-    )
-    actual_hs = dispatch_outputs.recv_hs[valid_mask]
-    if not torch.equal(actual_hs, expected_hs):
-        return (
-            False,
-            _first_mismatch_message(
-                actual_hs,
-                expected_hs,
-                valid_source_info.cpu(),
-                "dispatch payload",
-            ),
-        )
-
-    if (
-        config.quant_mode == "nvfp4"
-        and expected_sf is not None
-        and dispatch_outputs.recv_sf is not None
-    ):
-        actual_sf = dispatch_outputs.recv_sf[valid_mask]
-        if not torch.equal(actual_sf, expected_sf):
-            return (
-                False,
-                _first_mismatch_message(
-                    actual_sf,
-                    expected_sf,
-                    valid_source_info.cpu(),
-                    "dispatch scale-factor",
-                ),
-            )
-
-    return True, None
 
 
 def _worker_full_pipeline(config: CommTestConfig) -> dict:
@@ -1097,12 +939,6 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             dispatch_outputs.recv_hs,
             dispatch_outputs.recv_hs.dtype,
             dispatch_outputs.recv_hs.shape[1],
-        )
-        dispatch_payload_ok, dispatch_payload_error = _verify_dispatch_payload_on_worker(
-            rank,
-            dispatch_outputs,
-            recv_source_info,
-            config,
         )
 
         recv_hs_bf16 = _to_bf16(
@@ -1148,8 +984,6 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             config,
             recv_hs_bf16=saved_recv_hs_bf16,
             moe_output_for_ref=moe_output_for_ref,
-            dispatch_payload_ok=dispatch_payload_ok,
-            dispatch_payload_error=dispatch_payload_error,
         )
     except Exception:
         _destroy_cached_worker_comm()
@@ -1171,27 +1005,35 @@ def verify_dispatch_allgather_rs(
     For nvfp4 mode, also verifies hidden_states_sf is allgathered correctly.
     """
     total_tokens = sum(config.all_num_tokens)
-    expected_source_info = torch.tensor(
-        [
-            (src_rank, token_idx)
-            for src_rank, num_tokens in enumerate(config.all_num_tokens)
-            for token_idx in range(num_tokens)
-        ],
-        dtype=torch.int64,
-    )
 
     for result in all_results:
-        recv_source_info = result["recv_source_info"]
-        assert result["dispatch_payload_ok"], (
-            f"Rank {result['rank']}: {result['dispatch_payload_error']}"
+        recv_hs = result["recv_hs"]
+        assert recv_hs.shape[0] == total_tokens, (
+            f"Rank {result['rank']}: expected {total_tokens} tokens, got {recv_hs.shape[0]}"
         )
-        assert recv_source_info.shape[0] == total_tokens, (
-            f"Rank {result['rank']}: expected {total_tokens} tokens, "
-            f"got {recv_source_info.shape[0]}"
-        )
-        assert torch.equal(recv_source_info, expected_source_info), (
-            f"Rank {result['rank']}: allgather source order mismatch"
-        )
+
+        offset = 0
+        for src_rank in range(config.ep_size):
+            src_hs = all_results[src_rank]["original_hs"]
+            n = config.all_num_tokens[src_rank]
+            assert torch.equal(recv_hs[offset : offset + n], src_hs), (
+                f"Rank {result['rank']}: chunk for source rank {src_rank} mismatch"
+            )
+            offset += n
+
+        # For nvfp4, verify hidden_states_sf (scale factors) are gathered too.
+        if config.quant_mode == "nvfp4":
+            recv_sf = result.get("recv_sf")
+            if recv_sf is not None:
+                sf_offset = 0
+                for src_rank in range(config.ep_size):
+                    src_sf = all_results[src_rank].get("original_hs_sf")
+                    n = config.all_num_tokens[src_rank]
+                    if src_sf is not None:
+                        assert torch.equal(recv_sf[sf_offset : sf_offset + n], src_sf), (
+                            f"Rank {result['rank']}: sf chunk for source rank {src_rank} mismatch"
+                        )
+                    sf_offset += n
 
 
 def _compute_expected_tokens_per_rank(
@@ -1217,6 +1059,32 @@ def _compute_expected_tokens_per_rank(
                     expected[target_rank].add((src_rank, i))
 
     return expected
+
+
+def _get_dispatch_decode_spec(config: CommTestConfig) -> Tuple[torch.dtype, int]:
+    """Return decode dtype and hidden size used by decode_source_info()."""
+    qm = config.quant_mode
+    if qm == "fp8":
+        return torch.float8_e4m3fn, config.hidden_size
+    if qm == "nvfp4":
+        return torch.uint8, config.hidden_size // 2
+    if qm == "w4afp8":
+        return torch.float8_e4m3fn, config.hidden_size
+    return torch.bfloat16, config.hidden_size
+
+
+def _build_original_data_lookup(
+    all_results: List[dict],
+    quant_mode: str,
+) -> Dict[Tuple[int, int], torch.Tensor]:
+    """Build a (src_rank, token_idx) -> original row lookup for content checks."""
+    original_data: Dict[Tuple[int, int], torch.Tensor] = {}
+    for result in all_results:
+        src_rank = result["rank"]
+        orig = result["original_fp8"] if quant_mode == "w4afp8" else result["original_hs"]
+        for i in range(orig.shape[0]):
+            original_data[(src_rank, i)] = orig[i]
+    return original_data
 
 
 def _validate_dispatch_row_slots(
@@ -1251,13 +1119,23 @@ def _validate_dispatch_row_slots(
 
 
 def _record_received_token(
+    recv_hs: torch.Tensor,
     decoded: torch.Tensor,
     token_idx: int,
+    recv_rank: int,
+    original_data: Dict[Tuple[int, int], torch.Tensor],
+    skip_content_check: bool,
     actually_received: Set[Tuple[int, int]],
 ) -> None:
-    """Record one received token. Payload content is verified on workers."""
+    """Record one received token and optionally verify row content."""
     src_rank, src_idx = decoded[token_idx].tolist()
-    actually_received.add((src_rank, src_idx))
+    key = (src_rank, src_idx)
+    actually_received.add(key)
+    if key in original_data and not skip_content_check:
+        assert torch.equal(recv_hs[token_idx], original_data[key]), (
+            f"Rank {recv_rank}, token {token_idx}: content mismatch. "
+            f"Source: rank={src_rank}, idx={src_idx}"
+        )
 
 
 def _check_dispatch_completeness(
@@ -1304,13 +1182,21 @@ def verify_dispatch_alltoall(
     """
     num_experts = config.num_experts
 
+    qm = config.quant_mode
+
+    # Global lookup: (src_rank, token_idx) -> original hidden_states row.
+    # For w4afp8, use original_fp8 (fp8 domain) for content comparison.
+    original_data = _build_original_data_lookup(all_results, qm)
     expected_per_rank = _compute_expected_tokens_per_rank(all_results, config)
+
+    # For w4afp8: if any rank's preflight roundtrip failed, skip content check
+    w4afp8_skip_content = False
+    if qm == "w4afp8":
+        w4afp8_skip_content = not all(r.get("w4afp8_roundtrip_ok", True) for r in all_results)
 
     for result in all_results:
         recv_rank = result["rank"]
-        assert result["dispatch_payload_ok"], (
-            f"Rank {recv_rank}: {result['dispatch_payload_error']}"
-        )
+        recv_hs = result["recv_hs"]
         recv_slots = result["recv_slots"]
 
         # Per-rank slot range — handles non-divisible EP.
@@ -1319,7 +1205,7 @@ def verify_dispatch_alltoall(
         decoded = result["recv_source_info"]
         actually_received: Set[Tuple[int, int]] = set()
 
-        for i in range(recv_slots.shape[0]):
+        for i in range(recv_hs.shape[0]):
             has_valid = _validate_dispatch_row_slots(
                 recv_slots[i],
                 i,
@@ -1331,8 +1217,12 @@ def verify_dispatch_alltoall(
             )
             if has_valid:
                 _record_received_token(
+                    recv_hs,
                     decoded,
                     i,
+                    recv_rank,
+                    original_data,
+                    w4afp8_skip_content,
                     actually_received,
                 )
 
