@@ -81,8 +81,8 @@ class Buffers:
 
         if best_fit_block is not None:
             if reserve_buffer:
+                # A suitable buffer was found, so reuse it.
                 best_fit_block.is_reserved = True
-            # A suitable buffer was found, so reuse it.
             return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
 
         for block in list(candidate_blocks):
@@ -95,24 +95,29 @@ class Buffers:
                     torch.cuda.empty_cache()
                 candidate_blocks.remove(block)
 
+        def _create_buffer():
+            return torch.empty((required_memory_size, ),
+                               device='cuda',
+                               dtype=torch.uint8)
+
         # No suitable buffer was found, so allocate a new one.
         # The new buffer is created with uint8 to represent raw bytes.
         new_buffer_tensor = None
         try:
-            with torch.cuda.memory.use_mem_pool(get_shared_pool()):
-                new_buffer_tensor = torch.empty((required_memory_size, ),
-                                                device='cuda',
-                                                dtype=torch.uint8)
+            new_buffer_tensor = _create_buffer()
         except Exception as ex:
-            # Need to check if this is an OOM exception
+            # Need to check if this is an OOM exception``
             logger.debug(
                 f"Exception happened to create tensor from given memory pool: {str(ex)}"
             )
-            # if exception happens during allocating memory from shared pool, retry
-            # to allocate from default pool
-            new_buffer_tensor = torch.empty((required_memory_size, ),
-                                            device='cuda',
-                                            dtype=torch.uint8)
+            # if exception happens during allocating memory from default pool, retry
+            # to allocate from shared pool. Try best to avoid fragmentation in shared pool.
+            mem_pool = get_shared_pool()
+            if mem_pool is not None and not reserve_buffer:
+                with torch.cuda.memory.use_mem_pool(mem_pool):
+                    new_buffer_tensor = _create_buffer()
+            else:
+                raise ex
 
         new_block = BufferBlock(buffer=new_buffer_tensor,
                                 is_reserved=reserve_buffer)
