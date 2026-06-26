@@ -22,9 +22,10 @@ from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
 )
-from tensorrt_llm.llmapi.llm import (
-    _GPT_OSS_FINAL_CHANNEL_TRIGGER,
-    _adapt_gpt_oss_guided_decoding_params,
+from tensorrt_llm.llmapi.reasoning_parser import (
+    HARMONY_FINAL_CHANNEL_TRIGGER,
+    HARMONY_REASONING_PARSER,
+    adapt_guided_decoding_params_for_reasoning_parser,
 )
 from tensorrt_llm.sampling_params import (
     MAX_TOP_LOGPROBS,
@@ -72,10 +73,11 @@ def test_chat_top_logprobs_request_limit():
         )
 
 
-def test_gpt_oss_guided_decoding_triggers_on_final_channel():
+def test_harmony_guided_decoding_triggers_on_final_channel():
     guided_decoding = GuidedDecodingParams(json={"type": "object"})
 
-    adapted = _adapt_gpt_oss_guided_decoding_params(guided_decoding)
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding, HARMONY_REASONING_PARSER)
 
     assert adapted is not guided_decoding
     assert adapted.structural_tag is not None
@@ -84,11 +86,11 @@ def test_gpt_oss_guided_decoding_triggers_on_final_channel():
 
     fmt = stag["format"]
     assert fmt["type"] == "triggered_tags"
-    assert fmt["triggers"] == [_GPT_OSS_FINAL_CHANNEL_TRIGGER]
+    assert fmt["triggers"] == [HARMONY_FINAL_CHANNEL_TRIGGER]
     assert fmt["stop_after_first"] is True
 
     tag = fmt["tags"][0]
-    assert tag["begin"] == _GPT_OSS_FINAL_CHANNEL_TRIGGER
+    assert tag["begin"] == HARMONY_FINAL_CHANNEL_TRIGGER
     assert tag["end"] == ""
     assert tag["content"] == {
         "type": "json_schema",
@@ -98,7 +100,7 @@ def test_gpt_oss_guided_decoding_triggers_on_final_channel():
     }
 
 
-def test_gpt_oss_guided_decoding_accepts_json_schema_string():
+def test_harmony_guided_decoding_accepts_json_schema_string():
     json_schema = {
         "type": "object",
         "properties": {
@@ -109,7 +111,8 @@ def test_gpt_oss_guided_decoding_accepts_json_schema_string():
     }
     guided_decoding = GuidedDecodingParams(json=json.dumps(json_schema))
 
-    adapted = _adapt_gpt_oss_guided_decoding_params(guided_decoding)
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding, HARMONY_REASONING_PARSER)
 
     stag = json.loads(adapted.structural_tag)
     content = stag["format"]["tags"][0]["content"]
@@ -119,12 +122,40 @@ def test_gpt_oss_guided_decoding_accepts_json_schema_string():
     }
 
 
+def test_reasoning_parser_guided_decoding_uses_sequence_for_normal_parser():
+    guided_decoding = GuidedDecodingParams(json_object=True)
+
+    adapted = adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding, "qwen3")
+
+    stag = json.loads(adapted.structural_tag)
+    assert stag["type"] == "structural_tag"
+
+    fmt = stag["format"]
+    assert fmt["type"] == "sequence"
+    reasoning_element, content_element = fmt["elements"]
+    assert reasoning_element == {
+        "type": "tag",
+        "begin": "<think>",
+        "content": {
+            "type": "any_text"
+        },
+        "end": "</think>",
+    }
+    assert content_element == {
+        "type": "json_schema",
+        "json_schema": {
+            "type": "object"
+        },
+    }
+
+
 def test_existing_structural_tag_guided_decoding_is_unchanged():
     guided_decoding = GuidedDecodingParams(
         structural_tag='{"type":"structural_tag","format":{"type":"any_text"}}')
 
-    assert _adapt_gpt_oss_guided_decoding_params(
-        guided_decoding) is guided_decoding
+    assert adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding, HARMONY_REASONING_PARSER) is guided_decoding
 
 
 def test_chat_template_request_override_respects_runtime_policy():

@@ -20,12 +20,17 @@ from pathlib import Path
 from typing import Any, Optional, Type
 
 from tensorrt_llm import logger
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
 @dataclass
 class ReasoningParserResult:
     content: str = ""
     reasoning_content: str = ""
+
+
+HARMONY_REASONING_PARSER = "gpt_oss"
+HARMONY_FINAL_CHANNEL_TRIGGER = "<|start|>assistant<|channel|>final<|message|>"
 
 
 def register_reasoning_parser(*keys: str, **default_kwargs):
@@ -106,6 +111,84 @@ class IdentityReasoningParser(BaseReasoningParser):
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         return ReasoningParserResult(content=delta_text)
+
+
+def _normalize_json_schema_for_structural_tag(json_schema: Any) -> Any:
+    if hasattr(json_schema, "model_json_schema"):
+        json_schema = json_schema.model_json_schema()
+    if isinstance(json_schema, str):
+        json_schema = json.loads(json_schema)
+    if isinstance(json_schema, dict) and "schema" in json_schema:
+        json_schema = json_schema["schema"]
+    return json_schema
+
+
+def _guided_decoding_content(
+        guided_decoding_params: GuidedDecodingParams) -> Optional[dict]:
+    if guided_decoding_params.json is not None:
+        json_schema = _normalize_json_schema_for_structural_tag(
+            guided_decoding_params.json)
+        return {"type": "json_schema", "json_schema": json_schema}
+    if guided_decoding_params.json_object:
+        return {"type": "json_schema", "json_schema": {"type": "object"}}
+    if guided_decoding_params.regex is not None:
+        return {"type": "regex", "pattern": guided_decoding_params.regex}
+    if guided_decoding_params.grammar is not None:
+        return {"type": "grammar", "grammar": guided_decoding_params.grammar}
+    return None
+
+
+def adapt_guided_decoding_params_for_reasoning_parser(
+    guided_decoding_params: Optional[GuidedDecodingParams],
+    reasoning_parser: Optional[str],
+) -> Optional[GuidedDecodingParams]:
+    if guided_decoding_params is None or reasoning_parser is None:
+        return guided_decoding_params
+    if guided_decoding_params.structural_tag is not None:
+        return guided_decoding_params
+
+    content = _guided_decoding_content(guided_decoding_params)
+    if content is None:
+        return guided_decoding_params
+
+    if reasoning_parser == HARMONY_REASONING_PARSER:
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": [HARMONY_FINAL_CHANNEL_TRIGGER],
+            "tags": [{
+                "begin": HARMONY_FINAL_CHANNEL_TRIGGER,
+                "content": content,
+                "end": "",
+            }],
+            "stop_after_first":
+            True,
+        }
+    else:
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+        stag_format = {
+            "type":
+            "sequence",
+            "elements": [
+                {
+                    "type": "tag",
+                    "begin": parser.reasoning_start,
+                    "content": {
+                        "type": "any_text"
+                    },
+                    "end": parser.reasoning_end,
+                },
+                content,
+            ],
+        }
+
+    structural_tag = {
+        "type": "structural_tag",
+        "format": stag_format,
+    }
+    return GuidedDecodingParams(
+        structural_tag=json.dumps(structural_tag, separators=(",", ":")))
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
