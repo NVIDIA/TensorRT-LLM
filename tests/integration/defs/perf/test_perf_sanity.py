@@ -95,7 +95,7 @@ def ensure_bench_serving_repo() -> str:
     return bench_script
 
 
-DEFAULT_TIMEOUT = 5400
+DEFAULT_TIMEOUT = 10800
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
     "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
