@@ -24,6 +24,12 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
+# Ray-backed LLM teardown only fires from RayExecutor.shutdown(), which runs
+# after pytest-threadleak's per-test snapshot — see the matching docstring in
+# tests/unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py
+# (the parent test module this file imports from).
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 @pytest.mark.part0
 @skip_pre_blackwell
