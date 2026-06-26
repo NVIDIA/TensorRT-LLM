@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.modules import attention as attention_mod
+from tensorrt_llm._torch.modules.attention import MLA
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -132,9 +135,30 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
 
     # reload() uses self.weight_mapper unconditionally; MX success must
     # initialize it even though the initial load skipped _call_load_weights.
+    model._weights_transformed = True
+    model.linear._weights_transformed = True
     loader.reload(model, {"reloaded": MagicMock()})
     assert loader._call_load_weights.call_count == 1
+    assert model._weights_transformed is False
+    assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
+
+
+def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    loader.weight_mapper = MagicMock(name="weight_mapper")
+    model = _TinyModel(events)
+    model._weights_transformed = True
+    model.linear._weights_transformed = True
+
+    loader.reload(model, {"reloaded": MagicMock()}, allow_partial_loading=True)
+
+    assert loader._call_load_weights.call_count == 1
+    assert loader._call_load_weights.call_args.kwargs["allow_partial_loading"] is True
+    assert model._weights_transformed is True
+    assert model.linear._weights_transformed is True
+    assert events == ["load_weights"]
 
 
 def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
@@ -194,17 +218,17 @@ class _HookRecorder(nn.Module):
         if transformed is not None:
             self._weights_transformed = transformed
 
-    def setup_aliases(self):
+    def setup_aliases(self) -> None:
         self.events.append((self.name, "setup_aliases"))
 
-    def transform_weights(self):
+    def transform_weights(self) -> None:
         self.events.append((self.name, "transform_weights"))
         self._weights_transformed = True
 
-    def cache_derived_state(self):
+    def cache_derived_state(self) -> None:
         self.events.append((self.name, "cache_derived_state"))
 
-    def post_load_weights(self):
+    def post_load_weights(self) -> None:
         self.events.append((self.name, "post_load_weights"))
 
 
@@ -216,13 +240,17 @@ class _HookModel(_HookRecorder):
         self.removed_child = _HookRecorder("removed_child", events, removed=True)
 
 
-def test_staged_hook_setup_aliases_is_top_level_only():
+def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
 
     ModelLoader._setup_aliases(model)
 
-    assert events == [("model", "setup_aliases")]
+    assert events == [
+        ("model", "setup_aliases"),
+        ("child", "setup_aliases"),
+        ("transformed_child", "setup_aliases"),
+    ]
 
 
 def test_staged_hook_walks_skip_removed_and_transformed_modules():
@@ -257,3 +285,64 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     assert model.child._weights_transformed is False
     assert model.transformed_child._weights_transformed is False
     assert not hasattr(model.removed_child, "_weights_transformed")
+
+
+def test_linear_transform_weights_is_idempotent():
+    linear = Linear(
+        1,
+        1,
+        bias=False,
+        reduce_output=False,
+        skip_create_weights_in_init=True,
+    )
+    linear.quant_method = MagicMock()
+
+    linear.transform_weights()
+    linear.post_load_weights()
+
+    linear.quant_method.transform_weights.assert_called_once_with(linear)
+    assert linear._weights_transformed is True
+
+    linear._weights_transformed = False
+    linear.post_load_weights()
+    assert linear.quant_method.transform_weights.call_count == 2
+
+    linear._weights_transformed = False
+    linear.cache_derived_state()
+    assert linear._weights_transformed is True
+
+
+def test_mla_transform_weights_is_idempotent(monkeypatch):
+    monkeypatch.setattr(attention_mod, "get_sm_version", lambda: 120)
+    quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
+    mla = MLA.__new__(MLA)
+    mla._weights_transformed = False
+    mla.kv_b_proj = SimpleNamespace(quant_config=SimpleNamespace(quant_mode=quant_mode))
+    mla.k_b_proj_trans = "k_weight"
+    mla.k_b_proj_trans_scale = "k_scale"
+    mla.v_b_proj = "v_weight"
+    mla.v_b_proj_scale = "v_scale"
+    calls = []
+
+    def fake_resmooth(weight, scale, recipe):
+        calls.append((weight, scale, recipe))
+        return f"{weight}_transformed", f"{scale}_transformed"
+
+    mla.resmooth_parameters = fake_resmooth
+
+    MLA.transform_weights(mla)
+    MLA.post_load_weights(mla)
+
+    assert calls == [
+        ("k_weight", "k_scale", (1, 128, 128)),
+        ("v_weight", "v_scale", (1, 128, 128)),
+    ]
+    assert mla.k_b_proj_trans == "k_weight_transformed"
+    assert mla.k_b_proj_trans_scale == "k_scale_transformed"
+    assert mla.v_b_proj == "v_weight_transformed"
+    assert mla.v_b_proj_scale == "v_scale_transformed"
+    assert mla._weights_transformed is True
+
+    mla._weights_transformed = False
+    MLA.cache_derived_state(mla)
+    assert mla._weights_transformed is True

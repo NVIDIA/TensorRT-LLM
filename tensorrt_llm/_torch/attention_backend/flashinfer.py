@@ -1,22 +1,29 @@
 import functools
 import math
 import os
+import sys
 import weakref
 from dataclasses import dataclass, field
+from itertools import chain
 from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 import flashinfer
 import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import torch_multi_arange
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
-from ..utils import get_global_attrs, get_model_extra_attrs
+from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
@@ -131,6 +138,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _paged_kv_last_page_len: torch.Tensor = field(init=False)
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
+    _ragged_qo_indptr_buf: torch.Tensor = field(init=False)
+    _ragged_kv_indptr_buf: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
@@ -156,6 +165,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _mla_qo_indptr_buf: Optional[torch.Tensor] = field(init=False, default=None)
     _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
                                                         default=None)
+
+    _multi_item_params: Optional[FlashInferMultiItemParams] = field(
+        init=False, default=None)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -500,6 +512,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.max_num_requests + 1, device='cuda',
             dtype=torch.int) if self.is_cross else self._qo_indptr
 
+        self._ragged_qo_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_qo_indptr_buf",
+            capture_graph=capture_graph,
+        )
+        self._ragged_kv_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_kv_indptr_buf",
+            capture_graph=capture_graph,
+        )
+
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
@@ -595,6 +622,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._mla_ragged_planned = False
         self._mla_context_planned = False
         self._mla_decode_planned = False
+        self._multi_item_params = None
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -698,10 +726,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             assert isinstance(ragged_prefill_wrapper,
                               flashinfer.BatchPrefillWithRaggedKVCacheWrapper)
             max_key_value_tokens_per_sequence = max_query_tokens_per_sequence
+            # Do not pass v_indptr/o_indptr for self-attention. When they are omitted, FlashInfer
+            # aliases them to the CUDA-graph-stable kv/qo buffers; passing them explicitly creates
+            # fresh CUDA tensors during plan(), leaving replay with stale captured offset pointers.
             plan_kwargs = dict(
                 kv_indptr=key_value_indptr,
-                v_indptr=key_value_indptr,
-                o_indptr=query_output_indptr,
                 seq_lens=q_and_kv_seqlens_cuda,
                 seq_lens_q=q_and_kv_seqlens_cuda,
                 max_sequence_kv=
@@ -722,6 +751,93 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             **plan_kwargs,
         )
 
+    def _process_multi_item_part_lens(
+        self,
+        multi_item_part_lens: list[list[int]],
+        *,
+        device: torch.device,
+    ) -> FlashInferMultiItemParams:
+        if self.num_generations > 0:
+            raise ValueError(
+                "\"multi_item_part_lens\" not supported for generation requests."
+            )
+        if len(multi_item_part_lens) != self.num_contexts:
+            raise ValueError(
+                "\"multi_item_part_lens\" needs to be provided for all requests."
+            )
+        if any([len(part_lens) < 2 for part_lens in multi_item_part_lens]):
+            raise ValueError(
+                "\"multi_item_part_lens\" must have at least two elements")
+
+        prefix_len_ptr = torch.tensor(
+            [req_part_lens[0] for req_part_lens in multi_item_part_lens],
+            pin_memory=prefer_pinned(),
+            dtype=torch.uint32,
+        ).to(device=device, non_blocking=True)
+        token_pos_in_items_raw_lens = [  # 'raw' lengths before padding
+            sum(req_part_lens[1:]) + len(req_part_lens)
+            for req_part_lens in multi_item_part_lens
+        ]
+        token_pos_in_items_len = max(token_pos_in_items_raw_lens)
+        max_item_len_ptr = torch.tensor(
+            [max(req_part_lens[1:]) for req_part_lens in multi_item_part_lens],
+            pin_memory=prefer_pinned(),
+            dtype=torch.uint16,
+        ).to(device=device, non_blocking=True)
+
+        # token_pos_in_items_ptr is obtained by concatenating range(item_len + 1) for each item in
+        # every request, followed by [0] (final delimiter) which is fused with padding for simplicity.
+        range_ends = torch.tensor(
+            [
+                item_len + 1
+                for req_part_lens, token_pos_in_items_raw_len in zip(
+                    multi_item_part_lens,
+                    token_pos_in_items_raw_lens,
+                    strict=True) for item_len in
+                chain(req_part_lens[1:],
+                      [token_pos_in_items_len - token_pos_in_items_raw_len])
+            ],
+            pin_memory=prefer_pinned(),
+            dtype=torch.int32,
+        ).to(device=device, non_blocking=True)
+        token_pos_in_items_ptr = torch_multi_arange(
+            range_ends,
+            output_length=(token_pos_in_items_len * len(multi_item_part_lens)),
+        )
+        # next, mask out the padding
+        mask_entries = torch.arange(2, dtype=torch.uint8).to(
+            device=device,
+            non_blocking=True,
+            dtype=torch.bool,
+        ).repeat(len(multi_item_part_lens))  # NB: .expand() does not work here
+        mask_entry_repeats = torch.tensor(
+            [
+                repeat
+                for token_pos_in_items_raw_len in token_pos_in_items_raw_lens
+                for repeat in [
+                    token_pos_in_items_raw_len,
+                    token_pos_in_items_len - token_pos_in_items_raw_len,
+                ]
+            ],
+            pin_memory=prefer_pinned(),
+            dtype=torch.int32,
+        ).to(device=device, non_blocking=True)
+        padding_mask = torch.repeat_interleave(
+            input=mask_entries,
+            repeats=mask_entry_repeats,
+            output_size=token_pos_in_items_ptr.size(0),
+        )
+        token_pos_in_items_ptr.masked_fill_(padding_mask, 0)
+        token_pos_in_items_ptr = token_pos_in_items_ptr.to(dtype=torch.uint16,
+                                                           non_blocking=True)
+
+        return FlashInferMultiItemParams(
+            prefix_len_ptr=prefix_len_ptr,
+            max_item_len_ptr=max_item_len_ptr,
+            token_pos_in_items_ptr=token_pos_in_items_ptr,
+            token_pos_in_items_len=token_pos_in_items_len,
+        )
+
     def _clean_cached_plans(self, *, defer_plan: bool):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             # Generally, plan_params with non-trivial attention masking are relevant only the
@@ -740,10 +856,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
+        assert self.seq_lens_cuda is not None
         torch.cumsum(self.seq_lens_cuda,
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+
+        if self.multi_item_part_lens is not None:
+            self._multi_item_params = self._process_multi_item_part_lens(
+                self.multi_item_part_lens, device=self.seq_lens_cuda.device)
+        else:
+            self._multi_item_params = None
 
         if self.kv_cache_manager is None:
             assert self.request_ids is not None
@@ -760,6 +883,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.num_ctx_cached_tokens = 0
             self._clean_cached_plans(defer_plan=False)
             return
+
+        if self._multi_item_params is not None:
+            raise ValueError(
+                "multi_item_part_lens with KV cache is not supported")
 
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
@@ -1009,7 +1136,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
              q_scaling: Optional[float] = None,
              attention_window_size: Optional[int] = None,
              attention_mask_data: Optional[torch.Tensor] = None,
-             multi_item_params: Optional[FlashInferMultiItemParams] = None,
              flashinfer_backend: str = "fa2") -> PlanParams:
 
         sm_scale = None
@@ -1027,7 +1153,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data,
-            multi_item_params=multi_item_params,
+            multi_item_params=self._multi_item_params,
         )
         return self._plan_with_params(plan_params, flashinfer_backend)
 
@@ -1055,15 +1181,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is None:
-            if self.is_cuda_graph:
-                raise NotImplementedError(
-                    "FlashInfer without a KV cache manager does not support "
-                    "CUDA graph capture; use the TRTLLM attention backend.")
             if plan_params.multi_item_params is None:
                 ragged_builder = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
                 # NB: cuDNN chosen in https://github.com/NVIDIA/TensorRT-LLM/pull/12911
                 ragged_flashinfer_backend = "cudnn" if not _FORCE_RAGGED_FA2 else "fa2"
             else:
+                if self.is_cuda_graph:
+                    raise NotImplementedError(
+                        "FlashInfer multi-item masking without a KV cache manager "
+                        "does not support CUDA graph capture.")
                 ragged_flashinfer_backend = flashinfer_backend
                 # BatchPrefillWithRaggedKVCacheWrapper silently ignores multi-item scoring arguments,
                 # using flashinfer.BatchPrefillWithPagedKVCacheWrapper with page_size=1 instead.
@@ -1075,10 +1201,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 assert ragged_prefill_wrapper is not None
                 assert ragged_prefill_wrapper._backend == ragged_flashinfer_backend
             else:
+                wrapper_kwargs: Dict[str, Any] = {}
+                if plan_params.multi_item_params is None:
+                    qo_indptr_buf = self._ragged_qo_indptr_buf[:self.
+                                                               num_contexts + 1]
+                    kv_indptr_buf = self._ragged_kv_indptr_buf[:self.
+                                                               num_contexts + 1]
+                    wrapper_kwargs = dict(
+                        use_cuda_graph=self.is_cuda_graph,
+                        qo_indptr_buf=qo_indptr_buf,
+                        kv_indptr_buf=kv_indptr_buf,
+                    )
                 ragged_prefill_wrapper = ragged_builder(
                     self.workspace_buffer,
                     "NHD",  # ragged KVs use always NHD
                     backend=ragged_flashinfer_backend,
+                    **wrapper_kwargs,
                 )
             if self.num_contexts <= 0:
                 raise ValueError(
@@ -1214,6 +1352,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
     def support_mla(cls) -> bool:
         return True
 
+    @override
+    @classmethod
+    def support_multi_item_scoring(cls) -> bool:
+        return True
+
     def __init__(
         self,
         layer_idx: int,
@@ -1246,90 +1389,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if self.quant_config:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
-
-    @staticmethod
-    def _process_multi_item_part_lens(
-        multi_item_part_lens: list[list[int]],
-        *,
-        metadata: FlashInferAttentionMetadata,
-        device: torch.device,
-    ) -> FlashInferMultiItemParams:
-        if metadata.num_generations > 0:
-            raise ValueError(
-                "\"multi_item_part_lens\" not supported for generation requests."
-            )
-        if len(multi_item_part_lens) != metadata.num_contexts:
-            raise ValueError(
-                "\"multi_item_part_lens\" needs to be provided for all requests."
-            )
-
-        prefix_len_ptr = torch.tensor(
-            [req_part_lens[0] for req_part_lens in multi_item_part_lens],
-            pin_memory=prefer_pinned(),
-            dtype=torch.uint32,
-        ).to(device=device, non_blocking=True)
-        token_pos_in_items_raw_lens = [  # 'raw' lengths before padding
-            sum(req_part_lens[1:]) + len(req_part_lens)
-            for req_part_lens in multi_item_part_lens
-        ]
-        token_pos_in_items_len = max(token_pos_in_items_raw_lens)
-        max_item_len_ptr = torch.tensor(
-            [max(req_part_lens[1:]) for req_part_lens in multi_item_part_lens],
-            pin_memory=prefer_pinned(),
-            dtype=torch.uint16,
-        ).to(device=device, non_blocking=True)
-
-        # token_pos_in_items_ptr is obtained by concatenating range(item_len + 1) for each item in
-        # every request, followed by [0] (final delimiter) which is fused with padding for simplicity.
-        range_ends = torch.tensor(
-            [
-                item_len + 1
-                for req_part_lens, token_pos_in_items_raw_len in zip(
-                    multi_item_part_lens, token_pos_in_items_raw_lens)
-                for item_len in (
-                    req_part_lens[1:] +
-                    [token_pos_in_items_len - token_pos_in_items_raw_len])
-            ],
-            pin_memory=prefer_pinned(),
-            dtype=torch.int32,
-        ).to(device=device, non_blocking=True)
-        token_pos_in_items_ptr = torch_multi_arange(
-            range_ends,
-            output_length=(token_pos_in_items_len * len(multi_item_part_lens)),
-        )
-        # next, mask out the padding
-        mask_entries = torch.arange(2, dtype=torch.uint8).to(
-            device=device,
-            non_blocking=True,
-            dtype=torch.bool,
-        ).repeat(len(multi_item_part_lens))  # NB: .expand() does not work here
-        mask_entry_repeats = torch.tensor(
-            [
-                repeat
-                for token_pos_in_items_raw_len in token_pos_in_items_raw_lens
-                for repeat in [
-                    token_pos_in_items_raw_len,
-                    token_pos_in_items_len - token_pos_in_items_raw_len,
-                ]
-            ],
-            pin_memory=prefer_pinned(),
-            dtype=torch.int32,
-        ).to(device=device, non_blocking=True)
-        padding_mask = torch.repeat_interleave(
-            input=mask_entries,
-            repeats=mask_entry_repeats,
-            output_size=token_pos_in_items_ptr.size(0),
-        )
-        token_pos_in_items_ptr.masked_fill_(padding_mask, 0)
-        token_pos_in_items_ptr = token_pos_in_items_ptr.to(dtype=torch.uint16,
-                                                           non_blocking=True)
-
-        return FlashInferMultiItemParams(
-            prefix_len_ptr=prefix_len_ptr,
-            max_item_len_ptr=max_item_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-        )
 
     def mla_rope_generation(
         self,
@@ -1610,7 +1669,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         output: torch.Tensor,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_window_size: Optional[int] = None,
-        multi_item_part_lens: Optional[list[list[int]]] = None,
         latent_cache: Optional[torch.Tensor] = None,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
     ) -> None:
@@ -1648,14 +1706,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # Query
         q = q.view(-1, self.num_heads, self.head_dim)
 
-        multi_item_params: FlashInferMultiItemParams | None = None
-        if multi_item_part_lens is not None:
-            multi_item_params = self._process_multi_item_part_lens(
-                multi_item_part_lens,
-                metadata=metadata,
-                device=q.device,
-            )
-
         if metadata.kv_cache_manager is None:
             assert k is not None and v is not None, (
                 "FlashInfer without a KV cache manager requires key/value tensors."
@@ -1670,18 +1720,18 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             assert v.shape == (q.size(0), self.num_kv_heads * self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
-            plan_params = metadata.plan(
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                q_dtype=q.dtype,
-                kv_dtype=k.dtype,
-                q_scaling=self.q_scaling,
-                attention_window_size=attention_window_size,
-                attention_mask_type=attention_mask_type,
-                attention_mask_data=attention_mask_data,
-                multi_item_params=multi_item_params,
-            )
+            with nvtx_range("metadata.plan"):
+                plan_params = metadata.plan(
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_dtype=q.dtype,
+                    kv_dtype=k.dtype,
+                    q_scaling=self.q_scaling,
+                    attention_window_size=attention_window_size,
+                    attention_mask_type=attention_mask_type,
+                    attention_mask_data=attention_mask_data,
+                )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
             if isinstance(wrapper,
                           flashinfer.BatchPrefillWithPagedKVCacheWrapper):
@@ -1699,11 +1749,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     out=output.view(-1, self.num_heads, self.head_dim),
                 )
             return
-
-        if multi_item_part_lens is not None:
-            raise ValueError(
-                "Multi-item masking support not implemented for paged KV cache."
-            )
 
         # Key and Value
         kv_cache = metadata.kv_cache_manager.get_buffers(
@@ -1901,6 +1946,5 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             output=output,
             latent_cache=latent_cache,
             attention_input_type=forward_args.attention_input_type,
-            multi_item_part_lens=forward_args.multi_item_part_lens,
         )
         return output

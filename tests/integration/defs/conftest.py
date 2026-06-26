@@ -1811,6 +1811,11 @@ skip_pre_hopper = pytest.mark.skipif(
     reason="This test is not supported in pre-Hopper architecture",
 )
 
+skip_post_hopper = pytest.mark.skipif(
+    get_sm_version() > 90,
+    reason="This test is not supported in post-Hopper architecture",
+)
+
 skip_pre_blackwell = pytest.mark.skipif(
     get_sm_version() < 100,
     reason="This test is not supported in pre-Blackwell architecture",

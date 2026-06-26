@@ -243,7 +243,8 @@ class FluxPipeline(BasePipeline):
             )
 
             # TeaCache or Cache-DiT
-            self._setup_cache_acceleration(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+            self._apply_teacache_coefficients(FLUX_TEACACHE_COEFFICIENTS)
+            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):

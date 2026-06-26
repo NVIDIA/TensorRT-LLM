@@ -848,6 +848,7 @@ def wrap_parallel_attention(
     *,
     visual_gen_mapping: Optional["VisualGenMapping"] = None,
     enable_sequence_parallel: bool = True,
+    use_ulysses: bool = True,
     async_ulysses: bool = False,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
@@ -858,6 +859,12 @@ def wrap_parallel_attention(
 
     When ``enable_sequence_parallel`` is False, no wrappers are applied (callers
     use this for cross-attention paths that cannot use Ulysses/Ring/Attention2D).
+
+    ``use_ulysses`` gates the Ulysses head-sharding wrap independently of
+    ``ulysses_size``: pass False to skip it even when ``ulysses_size > 1`` (e.g. a
+    SEPARATE_QKV cross-attn that falls back to all-gather and built its inner
+    backend with the full, un-sharded head count). This keeps the wrap consistent
+    with the caller's inner head-count decision.
     """
     if not enable_sequence_parallel or visual_gen_mapping is None:
         return attn
@@ -876,7 +883,7 @@ def wrap_parallel_attention(
     elif ring_size > 1:
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
-    if ulysses_size > 1:
+    if ulysses_size > 1 and use_ulysses:
         attn = UlyssesAttention(
             attn,
             process_group=vgm.ulysses_group,
