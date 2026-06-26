@@ -166,7 +166,11 @@ class DynamicLinearWeightLoader:
         return False
 
     def _maybe_dynamic_quantize(
-        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
+        self,
+        weight_dict: Dict[str, torch.Tensor],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+        group_size: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Conditionally quantize weight at load time on GPU."""
         if not self._should_dynamic_quantize(weight_dict, quant_algo, name):
@@ -182,7 +186,9 @@ class DynamicLinearWeightLoader:
             qweight, scale = quantize_fp8_per_tensor(weight)
             return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-            block_size = self.quant_config.group_size if self.quant_config else 128
+            # Use caller-supplied group_size (from per-layer config) if provided;
+            # fall back to global config, then 128.
+            block_size = group_size or (self.quant_config.group_size if self.quant_config else 128)
             qweight, scale = quantize_fp8_blockwise(weight, block_size=block_size)
             return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.NVFP4:
@@ -268,8 +274,11 @@ class DynamicLinearWeightLoader:
         module_quant_config = getattr(module, "quant_config", None)
         if module_quant_config is not None:
             quant_algo = module_quant_config.quant_algo
+            # Use per-layer group_size if available (covers mixed-precision configs).
+            effective_group_size = getattr(module_quant_config, "group_size", None)
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
+            effective_group_size = None
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
@@ -278,7 +287,8 @@ class DynamicLinearWeightLoader:
             quantized_weight_dicts = self._quantize_fused_nvfp4(weight_dicts)
         else:
             quantized_weight_dicts = [
-                self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
+                self._maybe_dynamic_quantize(wd, quant_algo, name, group_size=effective_group_size)
+                for wd in weight_dicts
             ]
 
         module.load_weights(quantized_weight_dicts)

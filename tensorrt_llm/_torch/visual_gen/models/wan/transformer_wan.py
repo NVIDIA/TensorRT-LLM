@@ -1,3 +1,4 @@
+import fnmatch
 import math
 from typing import Tuple
 
@@ -625,6 +626,19 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
     def apply_quant_config_exclude_modules(self):
         quant_config = self.model_config.quant_config
+        quant_config_dict = self.model_config.quant_config_dict
+
+        # Apply per-layer quant overrides (mixed-precision: first matching pattern wins).
+        if quant_config_dict is not None:
+            for name, module in self.named_modules():
+                if not isinstance(module, Linear):
+                    continue
+                for pattern, layer_cfg in quant_config_dict.items():
+                    if fnmatch.fnmatch(name, pattern):
+                        module.quant_config = layer_cfg
+                        break
+
+        # Apply exclusions (excluded modules revert to no-quant).
         if quant_config is None or quant_config.exclude_modules is None:
             return
 
