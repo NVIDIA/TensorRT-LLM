@@ -7,13 +7,24 @@ from torch import nn
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
+from ..._utils import nvtx_range
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import Fp4QuantizedTensor, relu2
+from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 class MLP(nn.Module):
+    """Standard transformer MLP: ``down_proj(activation(up_proj(x)))``.
+
+    Supports an opt-in fused ``activation + NVFP4 quantize`` fast path for
+    static NVFP4 models: when the ``activation`` is recognized
+    (``F.relu`` -> relu^2 fused kernel, ``gelu_tanh`` sentinel -> GELU-tanh
+    fused kernel) AND ``down_proj`` carries a calibrated ``input_scale``
+    AND the fused kernel symbol is registered, ``forward`` routes the
+    intermediate activation through a single CUDA kernel that emits an
+    ``Fp4QuantizedTensor`` directly consumed by ``down_proj``'s GEMM.
+    """
 
     def __init__(
         self,
@@ -92,15 +103,30 @@ class MLP(nn.Module):
         )
 
         self._use_fused_relu2_quant = False
+        self._use_fused_gelu_tanh_quant = False
 
     def create_weights(self):
+        """Allocate up_proj/down_proj weights and resolve the fused-fast-path gates.
+
+        Sets ``self._use_fused_relu2_quant`` / ``self._use_fused_gelu_tanh_quant``
+        based on (a) whether ``down_proj`` is configured for NVFP4 with a
+        calibrated ``input_scale`` Parameter, (b) whether the corresponding
+        CUDA kernel symbol is registered, and (c) which activation the MLP
+        was constructed with.
+        """
         self.up_proj.create_weights()
         self.down_proj.create_weights()
 
         has_nvfp4 = hasattr(self.down_proj,
                             'has_nvfp4') and self.down_proj.has_nvfp4
         has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
-        has_scale = hasattr(self.down_proj, 'input_scale')
+        # For NVFP4 ``input_scale`` is always allocated as a Parameter by
+        # ``NVFP4LinearMethod.create_weights`` (it is the calibrated global
+        # activation scale), so for the layers this gate actually controls
+        # the ``is not None`` check is purely defensive against a future
+        # code path that might reset it. The fused kernel needs a real
+        # scalar tensor in any case.
+        has_scale = getattr(self.down_proj, 'input_scale', None) is not None
         is_relu2 = self.activation is relu2
         # The fused relu2+fp4_quantize kernel body is guarded by
         # ``__CUDA_ARCH__ >= 1000`` (see fusedActivationQuant.cu). On pre-SM100
@@ -111,18 +137,51 @@ class MLP(nn.Module):
         self._use_fused_relu2_quant = (has_nvfp4 and has_kernel and has_scale
                                        and is_relu2 and is_sm100_or_later)
 
+        # Static-only fast path for GELU(tanh) + NVFP4 down_proj. The Linear
+        # NVFP4 path returns a stale `module.alpha` when handed an
+        # Fp4QuantizedTensor (linear.py:1263-1270); under dynamic quant
+        # `module.alpha` is never calibrated, so we gate on
+        # `not force_dynamic_quantization` to ensure the GEMM sees a valid
+        # calibrated alpha. NVFP4 layers do not set `has_static_input_scale`
+        # (that flag is FP8-only), so `force_dynamic_quantization` plus the
+        # `input_scale is not None` check above are the canonical signals.
+        has_kernel_gelu = hasattr(torch.ops.trtllm, 'fused_gelu_tanh_quantize')
+        is_gelu_tanh = self.activation is gelu_tanh
+        not_dynamic = not getattr(self.down_proj, "force_dynamic_quantization",
+                                  False)
+
+        self._use_fused_gelu_tanh_quant = (has_nvfp4 and has_kernel_gelu
+                                           and has_scale and not_dynamic
+                                           and is_gelu_tanh)
+
     def forward(
         self,
         x: torch.Tensor,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
+        """Run up_proj -> activation -> down_proj.
+
+        When a calibrated ``input_scale`` is present on ``down_proj`` and the
+        activation is relu^2 or GELU-tanh, the activation+NVFP4 quantization is
+        executed as a single fused kernel so that ``down_proj`` consumes an
+        already-quantized ``Fp4QuantizedTensor`` directly (saving one
+        BF16/FP16 read+write of the up_proj output). Otherwise the standard
+        unfused activation runs and the linear layer quantizes internally.
+        """
         if lora_params is not None:
             return self.forward_lora(x, lora_params=lora_params)
 
         x_up = self.up_proj(x)
 
         if self._use_fused_relu2_quant:
-            x_act = self._fused_relu2_quant(x_up)
+            # Distinct NVTX label so the chunk-1 fused activation+quant fast
+            # path is visible in nsys traces (separate from the auto layerwise
+            # marker on `MLP.forward`).
+            with nvtx_range("relu2+NVFP4 fused", color="green"):
+                x_act = self._fused_relu2_quant(x_up)
+        elif self._use_fused_gelu_tanh_quant:
+            with nvtx_range("gelu_tanh+NVFP4 fused", color="green"):
+                x_act = self._fused_gelu_tanh_quant(x_up)
         else:
             x_act = self.activation(x_up)
 
@@ -131,6 +190,18 @@ class MLP(nn.Module):
         return x_down
 
     def _fused_relu2_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """Run the fused ``relu(x)^2 + NVFP4 quantize`` op on the up_proj output.
+
+        Returns an ``Fp4QuantizedTensor`` with the same leading dims as ``x``;
+        the last dim is halved because two FP4 values are packed per byte.
+        """
+        # Preserve the input rank so NVFP4LinearMethod.apply unflattens the
+        # GEMM output to (*x.shape[:-1], out_features). With the original
+        # 2D-only return, a [B, S, H] input came back from down_proj as
+        # [B*S, H] -- silently correct only when B=1. See linear.py's
+        # `isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2`
+        # branch for the unflatten side of this contract.
+        orig_shape = x.shape
         x_flat = x.view(-1, x.shape[-1])
 
         if not x_flat.is_contiguous():
@@ -141,6 +212,36 @@ class MLP(nn.Module):
 
         fp4_tensor, sf_tensor = torch.ops.trtllm.fused_relu2_quantize(
             x_flat, self.down_proj.input_scale, 16)
+
+        if len(orig_shape) > 2:
+            fp4_tensor = fp4_tensor.view(*orig_shape[:-1], orig_shape[-1] // 2)
+
+        return Fp4QuantizedTensor(
+            fp4_tensor=fp4_tensor,
+            scaling_factor=sf_tensor,
+            is_sf_swizzled=True,
+        )
+
+    def _fused_gelu_tanh_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """Run the fused ``GELU-tanh(x) + NVFP4 quantize`` op on the up_proj output.
+
+        Returns an ``Fp4QuantizedTensor`` with the same leading dims as ``x``;
+        the last dim is halved because two FP4 values are packed per byte.
+        """
+        orig_shape = x.shape
+        x_flat = x.view(-1, x.shape[-1])
+
+        if not x_flat.is_contiguous():
+            x_flat = x_flat.contiguous()
+
+        if x_flat.dtype not in (torch.float16, torch.bfloat16):
+            x_flat = x_flat.to(torch.bfloat16)
+
+        fp4_tensor, sf_tensor = torch.ops.trtllm.fused_gelu_tanh_quantize(
+            x_flat, self.down_proj.input_scale, 16)
+
+        if len(orig_shape) > 2:
+            fp4_tensor = fp4_tensor.view(*orig_shape[:-1], orig_shape[-1] // 2)
 
         return Fp4QuantizedTensor(
             fp4_tensor=fp4_tensor,

@@ -191,6 +191,7 @@ set(TRTLLM_LINK_LIBS
     mamba2_mtp_ssm_cache_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
+    fusedLayerNormQuant_src
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src

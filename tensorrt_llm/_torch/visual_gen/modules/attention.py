@@ -523,12 +523,20 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
+        """Run self- or cross-attention.
+
+        ``hidden_states`` is either a ``[B, S, hidden_size]`` ``torch.Tensor``
+        or an ``Fp4QuantizedTensor`` produced by an upstream fused LayerNorm +
+        NVFP4 kernel (e.g. ``WanBlock.norm1/norm2/norm3``). Both wrap a
+        3D shape ``[B, S, *]``; downstream ``Linear`` modules accept either.
+        """
+        if not isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
         kv_seq_len = (
             encoder_hidden_states.shape[1] if encoder_hidden_states is not None else seq_len
