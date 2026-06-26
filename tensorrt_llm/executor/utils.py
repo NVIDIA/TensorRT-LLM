@@ -84,7 +84,7 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
             _read_spawn_proxy_process_ipc_hmac_key_fd(key_fd))
         return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
-    raise AssertionError(
+    raise RuntimeError(
         f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD} is not set. "
         "HMAC encryption is required for IPC communication.")
 

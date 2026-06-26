@@ -50,5 +50,5 @@ def test_get_spawn_proxy_process_ipc_hmac_key_caches_fd_key(monkeypatch):
 def test_get_spawn_proxy_process_ipc_hmac_key_missing(monkeypatch):
     _reset_ipc_hmac_key_env(monkeypatch)
 
-    with pytest.raises(AssertionError, match="HMAC encryption is required"):
+    with pytest.raises(RuntimeError, match="HMAC encryption is required"):
         executor_utils.get_spawn_proxy_process_ipc_hmac_key_env()
