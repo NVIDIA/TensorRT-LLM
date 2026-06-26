@@ -219,6 +219,11 @@ public:
 
     static bool shouldUseNvrtc(FmhaOptions const& options)
     {
+        // Mxfp8 output cubins aren't generated yet.
+        if (options.mDtypeOut == tg::Dtype::MxE4m3)
+        {
+            return true;
+        }
         // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
@@ -922,6 +927,7 @@ private:
         case DATA_TYPE_E2M1: return tg::Dtype::E2m1;
         case DATA_TYPE_E4M3: return tg::Dtype::E4m3;
         case DATA_TYPE_E5M2: return tg::Dtype::E5m2;
+        case DATA_TYPE_MXE4M3: return tg::Dtype::MxE4m3;
         default:
             // Fallback or throw error
             return tg::Dtype::Void;

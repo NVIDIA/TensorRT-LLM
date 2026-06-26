@@ -39,6 +39,7 @@ enum Data_type
     DATA_TYPE_E2M1,
     DATA_TYPE_E4M3,
     DATA_TYPE_E5M2,
+    DATA_TYPE_MXE4M3,
     // Composite kv data types
     DATA_TYPE_KV_FP16_E4M3,
     DATA_TYPE_KV_BF16_E4M3,
@@ -61,6 +62,7 @@ static inline std::string data_type_to_string(Data_type dtype)
     case DATA_TYPE_E2M1: return "e2m1";
     case DATA_TYPE_E4M3: return "e4m3";
     case DATA_TYPE_E5M2: return "e5m2";
+    case DATA_TYPE_MXE4M3: return "mxe4m3";
     case DATA_TYPE_KV_FP16_E4M3: return "fp16+e4m3";
     case DATA_TYPE_KV_BF16_E4M3: return "bf16+e4m3";
     case DATA_TYPE_KV_INT8_E4M3: return "int8+e4m3";
@@ -93,6 +95,7 @@ static inline size_t get_size_in_bits(Data_type dtype)
     case DATA_TYPE_E2M1: return 4;
     case DATA_TYPE_E4M3: return 8;
     case DATA_TYPE_E5M2: return 8;
+    case DATA_TYPE_MXE4M3: return 8;
     default: TLLM_CHECK_WITH_INFO(false, "FMHA Data Type is not supported."); return 0;
     }
 }
@@ -111,6 +114,7 @@ static inline size_t get_size_in_bytes(size_t n, Data_type dtype)
     case DATA_TYPE_E2M1: TLLM_CHECK_WITH_INFO(n % 2 == 0, "Not supported."); return n / 2;
     case DATA_TYPE_E4M3: return n;
     case DATA_TYPE_E5M2: return n;
+    case DATA_TYPE_MXE4M3: return n;
     default: TLLM_CHECK_WITH_INFO(false, "FMHA Data Type is not supported."); return 0;
     }
 }
