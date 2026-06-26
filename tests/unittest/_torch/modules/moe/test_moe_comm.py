@@ -32,7 +32,7 @@ Combine verification:
   Uses simple_moe (weighted sum of hidden_states, no expert-specific
   computation).  Reference matches kernel behavior per comm type:
   - NVLinkOneSided lpc: fp8 quant/dequant simulation (moeA2ACombineKernel)
-  - NVLinkTwoSided lpc: float32 accum (NVFP4 too complex to simulate)
+  - NVLinkTwoSided lpc: NVFP4 quant/dequant simulation
   - DeepEPLL: weighted reduction with real topk_weights
   - Default: float32 accumulation matching kernel registers
   This isolates purely the combine communication error.
@@ -1297,9 +1297,13 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
 
     # output_scale = SFScaleVal / float(sf8)
     # Kernel uses reciprocal_approximate_ftz (~1 ULP); we use exact division.
+    # If the per-group fp8 scale underflows to zero, that group dequantizes to
+    # zero. Avoid computing 0 * inf for zero elements in such groups.
+    valid_scale = (vec_max > 0) & (sf_narrow > 0)
+    safe_sf_narrow = torch.where(valid_scale, sf_narrow, torch.ones_like(sf_narrow))
     output_scale = torch.where(
-        vec_max > 0,
-        sf_scale_val / sf_narrow,
+        valid_scale,
+        sf_scale_val / safe_sf_narrow,
         torch.zeros_like(sf_narrow),
     )
 
@@ -1311,10 +1315,37 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
     e2m1_quantized = e2m1_pos_vals[idx] * sign
 
     # Dequantize: result = e2m1_val * float(sf8) / SFScaleVal
-    dequant_scale = sf_narrow / sf_scale_val
+    dequant_scale = torch.where(
+        sf_narrow > 0,
+        sf_narrow / sf_scale_val,
+        torch.zeros_like(sf_narrow),
+    )
     result = e2m1_quantized * dequant_scale.unsqueeze(-1)
 
     return result.reshape(N, H).to(torch.bfloat16)
+
+
+def _valid_recv_row_mask(proc_result: dict, config: CommTestConfig) -> torch.Tensor:
+    """Return rows that correspond to real dispatched tokens, not padding."""
+    recv_slots = proc_result["recv_slots"]
+    if config.comm_type == COMM_ALLGATHER_RS:
+        return torch.ones(recv_slots.shape[0], dtype=torch.bool)
+
+    proc_rank = proc_result["rank"]
+    _, slot_start, slot_end = _compute_ep_partition(config.num_experts, config.ep_size, proc_rank)
+    return ((recv_slots >= slot_start) & (recv_slots < slot_end)).any(dim=1)
+
+
+def _target_source_mask(
+    proc_result: dict,
+    target_rank: int,
+    num_tokens: int,
+    config: CommTestConfig,
+) -> torch.Tensor:
+    """Return valid rows in proc_result that contribute to target_rank."""
+    source_info = proc_result["recv_source_info"]
+    valid_rows = _valid_recv_row_mask(proc_result, config)
+    return valid_rows & (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
 
 
 def _build_combine_reference(
@@ -1357,7 +1388,7 @@ def _build_combine_reference(
         for proc_result in all_results:
             moe_out = proc_result["moe_output_for_ref"]
             source_info = proc_result["recv_source_info"]
-            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
             if target_mask.any():
                 ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
@@ -1372,7 +1403,7 @@ def _build_combine_reference(
         for proc_result in all_results:
             nvfp4_out = proc_result["moe_output_for_ref"]
             source_info = proc_result["recv_source_info"]
-            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
             if target_mask.any():
                 ref.index_add_(0, source_info[target_mask, 1], nvfp4_out[target_mask].float())
 
@@ -1394,7 +1425,7 @@ def _build_combine_reference(
                 config.num_experts, config.ep_size, proc_rank
             )
 
-            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
             if target_mask.any():
                 target_source_info = source_info[target_mask]
                 local_slot_mask = (recv_slots[target_mask] >= slot_start) & (
@@ -1412,7 +1443,7 @@ def _build_combine_reference(
         for proc_result in all_results:
             moe_out = proc_result["moe_output"]
             source_info = proc_result["recv_source_info"]
-            target_mask = (source_info[:, 0] == target_rank) & (source_info[:, 1] < num_tokens)
+            target_mask = _target_source_mask(proc_result, target_rank, num_tokens, config)
             if target_mask.any():
                 ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
