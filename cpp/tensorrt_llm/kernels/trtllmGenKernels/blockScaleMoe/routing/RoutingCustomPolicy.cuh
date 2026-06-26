@@ -649,8 +649,8 @@ struct DefaultRoutingLaunchConfig
 //   - "fixed 1024" kernels (cluster): numThreads=1024 ≥ MaxNumExperts → unchanged            ✓
 // Kernels with a different internal block size can pass a custom LaunchConfig through the
 // WITH_CONFIG variants and must keep their own launch bounds, blockDim, and gridDim consistent.
-#define LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream,       \
-    PreProc, PostProc, LaunchConfig)                                                                                   \
+#define LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(                                                                         \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, PreProc, PostProc, LaunchConfig)                \
     [&](auto pt_tag_)                                                                                                  \
     {                                                                                                                  \
         using Pairs_ = typename decltype(pt_tag_)::Pairs;                                                              \
@@ -659,7 +659,7 @@ struct DefaultRoutingLaunchConfig
             {                                                                                                          \
                 using LaunchConfig_ = LaunchConfig<decltype(eTag_)::value, decltype(kTag_)::value>;                    \
                 int const effectiveThreads_ = LaunchConfig_::blockDim(data, static_cast<int>(numThreads));             \
-                int const effectiveBlocks_                                                                              \
+                int const effectiveBlocks_                                                                             \
                     = LaunchConfig_::gridDim(data, static_cast<int>(numBlocks), effectiveThreads_);                    \
                 LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_, effectiveThreads_, smemSize,  \
                     stream, PreProc, PostProc, decltype(eTag_)::value, decltype(kTag_)::value);                        \
