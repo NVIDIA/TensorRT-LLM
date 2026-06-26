@@ -63,6 +63,7 @@ def _write_qwen35_moe_vl_config(tmp_path: Path) -> Path:
             "rms_norm_eps": 1e-6,
             "shared_expert_intermediate_size": 512,
             "rope_parameters": {
+                "mrope_interleaved": True,
                 "mrope_section": [11, 11, 10],
                 "partial_rotary_factor": 0.25,
                 "rope_theta": 1000000.0,
@@ -109,6 +110,10 @@ def test_qwen35_moe_vl_config_preserves_vlm_architecture(
     assert config.text_config.partial_rotary_factor == 0.25
     assert config.text_config.rope_scaling["type"] == "mrope"
     assert config.text_config.rope_scaling["mrope_section"] == [11, 11, 10]
+    # mrope_interleaved must survive normalization: the fused QK-norm-RoPE op
+    # gates the mRoPE path on it, and without it position_ids gets flattened to
+    # 3*num_tokens and mismatches the QKV token count.
+    assert config.text_config.rope_scaling["mrope_interleaved"] is True
     assert config.text_config.mamba_ssm_dtype == "float32"
     assert config.get_text_config() is config.text_config
 
@@ -223,6 +228,7 @@ QWEN3_5_VL_MOE_PARITY_CONFIG = {
         "rms_norm_eps": 1e-6,
         "shared_expert_intermediate_size": 512,
         "rope_parameters": {
+            "mrope_interleaved": True,
             "mrope_section": [11, 11, 10],
             "partial_rotary_factor": 0.25,
             "rope_theta": 1000000.0,
@@ -380,7 +386,9 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
                 )
             mrope_gen_position_ids = torch.cat(mrope_gen_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = (
-                (trtllm_inputs["position_ids"] + mrope_gen_position_ids).expand(3, -1, 1).cuda()
+                (trtllm_inputs["position_ids"] + mrope_gen_position_ids)
+                .expand(3, -1, 1)
+                .to(self.device)
             )
             gen_multimodal_params_list = []
             for multimodal_param in multimodal_params_list:
@@ -393,14 +401,35 @@ class TestQwen3_5MoeVL(TestModelingMultimodal):
                 )
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            # Cached-mRoPE read slots (added in #11943): the decode path reads
+            # per-request deltas from the cache by seq slot.
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
         else:
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production `PyTorchModelEngine` and slice each request's
+            # full `mrope_position_ids` to the current chunk's token range —
+            # the fused QK-norm-RoPE op requires position_ids tokens to match
+            # the QKV token count.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq] * len(multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param in multimodal_params_list:
-                mrope_position_ids.append(
-                    multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
-                )
-            position_ids = torch.cat(mrope_position_ids, dim=-1).cuda()
+            for multimodal_param, begin in zip(multimodal_params_list, begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :, begin : begin + chunk_len])
+            position_ids = torch.cat(mrope_position_ids, dim=-1).to(self.device)
             trtllm_inputs["position_ids"] = position_ids
+            # Cached-mRoPE write slots (added in #11943): the context path
+            # writes per-request deltas into the cache by seq slot.
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
 
         return trtllm_inputs
 
