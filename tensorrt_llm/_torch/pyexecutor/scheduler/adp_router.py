@@ -584,13 +584,13 @@ class KVCacheAwareADPRouter(ADPRouter):
             probe_tokens = input_tokens[:-1] if len(input_tokens) > 1 else []
             lora_config = getattr(req, "lora_config", None)
             lora_task_id = lora_config.task_id if lora_config is not None else None
-            # cache_salt_id scopes block reuse on both v1 and v2 backends;
-            # passing None for non-salted requests is a no-op.
-            cache_salt_id = getattr(req, "cache_salt_id", None)
+            # cache_salt scopes block reuse on the backend; passing None for
+            # non-salted requests is a no-op.
+            cache_salt = getattr(req, "cache_salt", None)
             match_len = self.kv_cache_manager.probe_prefix_match_length(
                 probe_tokens,
                 lora_task_id,
-                cache_salt_id=cache_salt_id,
+                cache_salt=cache_salt,
             )
             local_matches.extend([req_item.id, match_len])
 
