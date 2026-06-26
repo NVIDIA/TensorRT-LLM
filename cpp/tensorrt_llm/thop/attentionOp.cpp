@@ -473,6 +473,7 @@ public:
         }
 
         void* workspace_ptr = workspace.data_ptr();
+        auto const workspace_size_bytes = static_cast<uint64_t>(workspace.nbytes());
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
@@ -853,7 +854,7 @@ public:
                     = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
             }
             extractHelixParams(enqueue_params);
-            op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
+            op.enqueueContext<T, KVBlockArray>(enqueue_params, stream, workspace_size_bytes);
         }
         else // generation stage
         {

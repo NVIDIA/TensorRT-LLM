@@ -1398,7 +1398,8 @@ MLA_FUNC_DEFINE(__nv_bfloat16)
 #endif
 
 template <typename T, typename KVCacheBuffer>
-int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream)
+int AttentionOp::enqueueContext(
+    EnqueueContextParams<T> const& params, cudaStream_t stream, uint64_t const workspaceSize)
 {
     int const headSize = getHeadSize();
 
@@ -1580,6 +1581,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     auto const workspaceLayout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
+    TLLM_CHECK_WITH_INFO(workspaceSize >= workspaceLayout.totalSize,
+        "AttentionOp::enqueueContext workspace is too small: provided %llu bytes, required %llu bytes.",
+        static_cast<unsigned long long>(workspaceSize), static_cast<unsigned long long>(workspaceLayout.totalSize));
     auto const workspaceViews = AttentionWorkspaceManager::materializeContext<T>(
         params.workspace, workspaceLayout, cpMaxPadedSequenceLength, getHeadSize(), mNumHeads, mNumKVHeads);
 
@@ -2335,25 +2339,25 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 }
 
 template int AttentionOp::enqueueContext<half, KVLinearBuffer>(
-    EnqueueContextParams<half> const& params, cudaStream_t stream);
+    EnqueueContextParams<half> const& params, cudaStream_t stream, uint64_t const workspaceSize);
 
 template int AttentionOp::enqueueContext<float, KVLinearBuffer>(
-    EnqueueContextParams<float> const& params, cudaStream_t stream);
+    EnqueueContextParams<float> const& params, cudaStream_t stream, uint64_t const workspaceSize);
 
 #ifdef ENABLE_BF16
 template int AttentionOp::enqueueContext<__nv_bfloat16, KVLinearBuffer>(
-    EnqueueContextParams<__nv_bfloat16> const& params, cudaStream_t stream);
+    EnqueueContextParams<__nv_bfloat16> const& params, cudaStream_t stream, uint64_t const workspaceSize);
 #endif
 
 template int AttentionOp::enqueueContext<half, KVBlockArray>(
-    EnqueueContextParams<half> const& params, cudaStream_t stream);
+    EnqueueContextParams<half> const& params, cudaStream_t stream, uint64_t const workspaceSize);
 
 template int AttentionOp::enqueueContext<float, KVBlockArray>(
-    EnqueueContextParams<float> const& params, cudaStream_t stream);
+    EnqueueContextParams<float> const& params, cudaStream_t stream, uint64_t const workspaceSize);
 
 #ifdef ENABLE_BF16
 template int AttentionOp::enqueueContext<__nv_bfloat16, KVBlockArray>(
-    EnqueueContextParams<__nv_bfloat16> const& params, cudaStream_t stream);
+    EnqueueContextParams<__nv_bfloat16> const& params, cudaStream_t stream, uint64_t const workspaceSize);
 #endif
 
 template <typename T, typename KVCacheBuffer>
