@@ -715,9 +715,36 @@ static constexpr int ClusterBlockDim1024 = NumThreads;
 static constexpr int MaxNumTokensClusterScores256 = NumBlocksPerCluster * (ClusterBlockDim256 / WarpSize);
 static constexpr int MaxNumTokensClusterScores512 = NumBlocksPerCluster * (ClusterBlockDim512 / WarpSize);
 
-template <int ClusterBlockDim, typename PreProc, typename PostProc>
-struct ClusterPolicyTraits : PolicyTraits<PreProc, PostProc>
+template <typename TierT, typename TierListT>
+struct PrependTier;
+
+template <typename TierT, typename... Tiers>
+struct PrependTier<TierT, TierList<Tiers...>>
 {
+    using type = TierList<TierT, Tiers...>;
+};
+
+template <int ClusterBlockDim, typename TierListT>
+struct FilterClusterTiers;
+
+template <int ClusterBlockDim>
+struct FilterClusterTiers<ClusterBlockDim, TierList<>>
+{
+    using type = TierList<>;
+};
+
+template <int ClusterBlockDim, typename First, typename... Rest>
+struct FilterClusterTiers<ClusterBlockDim, TierList<First, Rest...>>
+{
+    using Tail = typename FilterClusterTiers<ClusterBlockDim, TierList<Rest...>>::type;
+    static constexpr bool IsValid = First::kExperts <= ClusterBlockDim || First::kExperts % ClusterBlockDim == 0;
+    using type = std::conditional_t<IsValid, typename PrependTier<First, Tail>::type, Tail>;
+};
+
+template <int ClusterBlockDim, typename PreProc, typename PostProc>
+struct ClusterPolicyTraits
+{
+    using Pairs = typename FilterClusterTiers<ClusterBlockDim, typename PolicyTraits<PreProc, PostProc>::Pairs>::type;
 };
 
 template <>
@@ -859,10 +886,10 @@ __global__ void __launch_bounds__(ClusterBlockDim256) routingIndicesClusterKerne
 }
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
-template <int ClusterBlockDim>
-void launchNoOpSoftmaxClusterKernel(Data const& data, void* stream)
+template <int ClusterBlockDim, typename PreProc, typename PostProc>
+void launchClusterKernelForPolicy(Data const& data, void* stream)
 {
-    using Pairs = typename ClusterPolicyTraits<ClusterBlockDim, NoOpPreprocess, SoftmaxPostprocess>::Pairs;
+    using Pairs = typename ClusterPolicyTraits<ClusterBlockDim, PreProc, PostProc>::Pairs;
     bool dispatched = dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
         [&](auto eTag, auto kTag)
         {
@@ -870,22 +897,19 @@ void launchNoOpSoftmaxClusterKernel(Data const& data, void* stream)
             {
                 LAUNCH_ROUTING_WITH_POLICIES(data, false, routingIndicesClusterKernel256, NumBlocksPerCluster,
                     ClusterBlockDim256,
-                    /*smemSize=*/0, stream, NoOpPreprocess, SoftmaxPostprocess, decltype(eTag)::value,
-                    decltype(kTag)::value);
+                    /*smemSize=*/0, stream, PreProc, PostProc, decltype(eTag)::value, decltype(kTag)::value);
             }
             else if constexpr (ClusterBlockDim == ClusterBlockDim512)
             {
                 LAUNCH_ROUTING_WITH_POLICIES(data, false, routingIndicesClusterKernel512, NumBlocksPerCluster,
                     ClusterBlockDim512,
-                    /*smemSize=*/0, stream, NoOpPreprocess, SoftmaxPostprocess, decltype(eTag)::value,
-                    decltype(kTag)::value);
+                    /*smemSize=*/0, stream, PreProc, PostProc, decltype(eTag)::value, decltype(kTag)::value);
             }
             else
             {
                 LAUNCH_ROUTING_WITH_POLICIES(data, false, routingIndicesClusterKernel, NumBlocksPerCluster,
                     ClusterBlockDim1024,
-                    /*smemSize=*/0, stream, NoOpPreprocess, SoftmaxPostprocess, decltype(eTag)::value,
-                    decltype(kTag)::value);
+                    /*smemSize=*/0, stream, PreProc, PostProc, decltype(eTag)::value, decltype(kTag)::value);
             }
         });
     if (!dispatched)
@@ -894,28 +918,37 @@ void launchNoOpSoftmaxClusterKernel(Data const& data, void* stream)
     }
 }
 
+template <int ClusterBlockDim>
+void launchClusterKernelForBlockDim(Data const& data, void* stream)
+{
+    dispatchRoutingPolicy(data,
+        [&](auto preProc, auto postProc)
+        {
+            launchClusterKernelForPolicy<ClusterBlockDim, decltype(preProc), decltype(postProc)>(data, stream);
+        });
+}
+
 void launchClusterKernel(Data const& data, void* stream)
 {
-    // Reduced-thread cluster variants are only used for the raw-score NoOp+Softmax path. In that path
-    // each warp owns one token, so the token capacity scales with the number of warps per block.
-    // Post-topK cluster routing keeps the original 1024-thread launch to preserve its 8192-token
-    // capacity and existing policy coverage.
+    // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
+    // Use them only where the requested token count fits; otherwise keep the original 1024-thread launch.
+    if (data.mNumTokens <= MaxNumTokensClusterScores256)
+    {
+        launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
+        return;
+    }
+    if (data.mNumTokens <= MaxNumTokensClusterScores512)
+    {
+        launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+        return;
+    }
+
     bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr
         && data.mPreprocessType == RoutingPreprocessType::None
         && data.mPostprocessType == RoutingPostprocessType::Softmax;
-    if (useNoOpSoftmaxScores && data.mNumTokens <= MaxNumTokensClusterScores256)
-    {
-        launchNoOpSoftmaxClusterKernel<ClusterBlockDim256>(data, stream);
-        return;
-    }
-    if (useNoOpSoftmaxScores && data.mNumTokens <= MaxNumTokensClusterScores512)
-    {
-        launchNoOpSoftmaxClusterKernel<ClusterBlockDim512>(data, stream);
-        return;
-    }
     if (useNoOpSoftmaxScores)
     {
-        launchNoOpSoftmaxClusterKernel<ClusterBlockDim1024>(data, stream);
+        launchClusterKernelForPolicy<ClusterBlockDim1024, NoOpPreprocess, SoftmaxPostprocess>(data, stream);
         return;
     }
 
@@ -971,6 +1004,11 @@ struct HistogramScoresLaunchConfig : DefaultRoutingLaunchConfig<MaxNumExperts, M
     }
 };
 
+template <typename ExpertSelect, int MaxNumExperts, int MaxNumTopExperts>
+struct HistogramScoresKernelConfig : HistogramScoresLaunchConfig<MaxNumExperts, MaxNumTopExperts>
+{
+};
+
 template <typename PreProc, typename PostProc>
 struct HistogramScoresPolicyTraits : PolicyTraits<PreProc, PostProc>
 {
@@ -985,15 +1023,15 @@ struct HistogramScoresPolicyTraits<NoOpPreprocess, SoftmaxPostprocess>
 };
 
 template <typename KernelParams>
-__global__ void __launch_bounds__(
-    HistogramScoresLaunchConfig<KernelParams::MaxNumExperts, KernelParams::MaxNumTopExperts>::BlockDim)
+__global__ void __launch_bounds__(HistogramScoresKernelConfig<typename KernelParams::ExpertSelectPolicy,
+    KernelParams::MaxNumExperts, KernelParams::MaxNumTopExperts>::BlockDim)
     routingIndicesHistogramScoresKernel(KernelParams params)
 {
     using OutputT = typename KernelParams::OutputT;
     using InputT = typename KernelParams::InputT;
     using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
-    static constexpr int NumThreadsBlock
-        = HistogramScoresLaunchConfig<KernelParams::MaxNumExperts, KernelParams::MaxNumTopExperts>::BlockDim;
+    static constexpr int NumThreadsBlock = HistogramScoresKernelConfig<typename KernelParams::ExpertSelectPolicy,
+        KernelParams::MaxNumExperts, KernelParams::MaxNumTopExperts>::BlockDim;
 
     // VecSize stays based on MaxNumExperts — each warp still processes all experts for one token.
     static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
@@ -1061,7 +1099,9 @@ static void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks,
             bool dispatched = dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
                 [&](auto eTag, auto kTag)
                 {
-                    using LaunchConfig = HistogramScoresLaunchConfig<decltype(eTag)::value, decltype(kTag)::value>;
+                    using ExpertSelect = TopKExpertSelect<PreProc, PostProc>;
+                    using LaunchConfig
+                        = HistogramScoresKernelConfig<ExpertSelect, decltype(eTag)::value, decltype(kTag)::value>;
                     int const effectiveThreads = LaunchConfig::blockDim(data, static_cast<int>(numThreadsHist));
                     int const effectiveBlocks = LaunchConfig::gridDim(data, static_cast<int>(maxNumBlocks), effectiveThreads);
                     LAUNCH_ROUTING_WITH_POLICIES(data, false, routingIndicesHistogramScoresKernel, effectiveBlocks,
