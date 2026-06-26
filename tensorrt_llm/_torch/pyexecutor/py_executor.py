@@ -3185,6 +3185,11 @@ class PyExecutor:
                     f"drain={pending.control_requires_drain} "
                     f"active_requests={len(self.active_requests)} "
                     f"waiting_queue={len(self.waiting_queue)}")
+        # Quiesce the device before the action mutates GPU state. Under the
+        # overlap scheduler a previous batch's forward/sample kernels may still
+        # be in flight, so an in-place update_weights reload (or sleep/wakeup
+        # freeing memory) could race with kernels still reading those tensors.
+        torch.cuda.synchronize()
         self.control_requests.pop(0)
         self.control_request_barrier.set()
         self.control_action_done.wait()
