@@ -192,6 +192,7 @@ full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
 full:H20/accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b] SKIP (https://nvbugs/6276842)
 full:H20/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6344107)
+full:L40S/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2] SKIP (https://nvbugs/6382587)
 full:L40S/accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1] SKIP (https://nvbugs/6322045)
 full:L40S/accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1] SKIP (https://nvbugs/6322045)
 full:L40S/accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-FP8-True] SKIP (https://nvbugs/6327143)
