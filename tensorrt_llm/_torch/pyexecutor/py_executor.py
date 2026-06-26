@@ -3181,7 +3181,7 @@ class PyExecutor:
             # drain=True: keep the sentinel parked until the engine drains.
             return
 
-        logger.info(f"[control_action] firing control request "
+        logger.debug(f"[control_action] firing control request "
                     f"drain={pending.control_requires_drain} "
                     f"active_requests={len(self.active_requests)} "
                     f"waiting_queue={len(self.waiting_queue)}")
@@ -3194,7 +3194,7 @@ class PyExecutor:
         self.control_request_barrier.set()
         self.control_action_done.wait()
         self.control_action_done.clear()
-        logger.info("[control_action] control request finished")
+        logger.debug("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
         """Synchronize and process resource governor requests across all ranks.
