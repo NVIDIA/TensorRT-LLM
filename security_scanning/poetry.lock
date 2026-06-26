@@ -2441,14 +2441,14 @@ typing = ["mypy", "typing_extensions ; python_version < \"3.8\""]
 
 [[package]]
 name = "mistral-common"
-version = "1.11.3"
+version = "1.11.4"
 description = "Mistral-common is a library of common utilities for Mistral AI."
 optional = false
 python-versions = "<3.15,>=3.10.0"
 groups = ["main"]
 files = [
-    {file = "mistral_common-1.11.3-py3-none-any.whl", hash = "sha256:dbfcef9d0c892727ee08a080f0c1039baed5430b291f5425ffd88892bf09e52c"},
-    {file = "mistral_common-1.11.3.tar.gz", hash = "sha256:6437e128fc8a307318440839ca14ddf2e8060056b062233ec0db10352651374c"},
+    {file = "mistral_common-1.11.4-py3-none-any.whl", hash = "sha256:4ebbbcbcb5a73a29b20d737b0324c376b09cfa0913b0c5d5d6d1061734ccff16"},
+    {file = "mistral_common-1.11.4.tar.gz", hash = "sha256:31041695963250634b41f0293e35a424a823aaf4fa4721b05037ccec80b5f50e"},
 ]
 
 [package.dependencies]
