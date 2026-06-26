@@ -77,7 +77,9 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_premerge
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
 
 - condition:
     ranges:
@@ -132,7 +134,3 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
-  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_non_divisible_ep
