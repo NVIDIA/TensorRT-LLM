@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
+from tensorrt_llm.logger import logger
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -98,7 +99,19 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
             module.svdquant_lora_b = nn.Parameter(
                 w["svdquant_lora_b"].to(device), requires_grad=False)
 
+    # Minimum padded token count for the fused kernel; below this the per-call launch
+    # overhead dominates, so the eager path is used instead.
+    _FUSED_MIN_M = 128
+
     def apply(self, module, input, bias):
+        # Fast path: FlashInfer's fused SVDQuant kernel computes the NVFP4 residual and the
+        # LoRA up-projection in a single GEMM. It returns None (falling through to the eager
+        # path below) whenever the kernel is unavailable or the shape is unsupported, so this
+        # method is correct with or without the fused kernel present.
+        fused = self._svd_try_fused(module, input, bias)
+        if fused is not None:
+            return fused
+
         pqs = getattr(module, "pre_quant_scale", None)
         x_hat = input * pqs if pqs is not None else input
         # Residual NVFP4 GEMM on the already-smoothed activation; clear
@@ -115,6 +128,108 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
             lora = torch.matmul(torch.matmul(x_hat, a.t()), b.t())
             out = out + lora.to(out.dtype)
         return out
+
+    def _svd_try_fused(
+        self, module, input: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Run the linear via FlashInfer's fused SVDQuant kernel; return None to fall back.
+
+        Computes ``Y = dequant(nvfp4(X̂) @ nvfp4(R)ᵀ)·α + (X̂ @ L2ᵀ) @ L1ᵀ`` in one GEMM.
+        The activation is quantized with the same TRT-LLM NVFP4 quantizer the residual path
+        uses and injected into the kernel, so the fused result matches eager closely.
+        """
+        if getattr(module, "svdquant_lora_a", None) is None:
+            return None
+        try:
+            from flashinfer.gemm import mm_fp4_svdquant, prepare_svdquant_state
+        except ImportError:
+            return None  # fused SVDQuant kernel unavailable -> eager fallback
+        try:
+            orig_shape = input.shape if input.dim() > 2 else None
+            x2d = input.reshape(-1, input.shape[-1]) if orig_shape is not None else input
+            m = int(x2d.shape[0])
+            if m < self._FUSED_MIN_M:
+                return None
+            in_features = int(module.weight.shape[1]) * 2
+            if x2d.shape[1] != in_features:
+                x2d = F.pad(x2d, (0, in_features - x2d.shape[1]))
+            # Pad M to a multiple of 128: misaligned M is data-dependently inaccurate for both
+            # the block-scaled GEMM and the activation scale-factor injection. The pad rows are
+            # computed then sliced off.
+            m_pad = ((m + 127) // 128) * 128
+            xp = F.pad(x2d, (0, 0, 0, m_pad - m)) if m_pad != m else x2d
+            state = self._svd_fused_state(module, m_pad, prepare_svdquant_state)
+            if state is None:
+                return None
+            pqs = getattr(module, "pre_quant_scale", None)
+            if pqs is not None:
+                p = pqs.reshape(-1)
+                if p.numel() != in_features:
+                    p = F.pad(p, (0, in_features - p.numel()), value=1.0)
+                x_hat = xp * p
+            else:
+                x_hat = xp
+            ext_xq, ext_sf = torch.ops.trtllm.fp4_quantize(
+                x_hat, module.input_scale, 16, False
+            )
+            y = mm_fp4_svdquant(xp, state, ext_xq=ext_xq, ext_sf=ext_sf)
+            y = y[:m, : module.out_features]
+            if orig_shape is not None:
+                y = y.reshape(*orig_shape[:-1], module.out_features)
+            return (y + bias) if bias is not None else y
+        except Exception as e:
+            # Any unsupported shape / runtime issue -> eager fallback (correctness preserved).
+            logger.debug(f"SVDQuant fused path unavailable, using eager: {e!r}")
+            return None
+
+    def _svd_fused_state(self, module, m_pad: int, prepare_svdquant_state):
+        """Build (and cache per padded-M) the fused-kernel state from the module's NVFP4 SVD
+        tensors: residual weight, the NVFP4-MMA-swizzled weight scale factors, LoRA L1/L2,
+        the global scales, and pre_quant_scale."""
+        cache = getattr(module, "_svd_fused_state_cache", None)
+        if cache is None:
+            cache = {}
+            module._svd_fused_state_cache = cache
+        if m_pad in cache:
+            return cache[m_pad]
+        from tensorrt_llm._torch.utils import swizzle_sf, unswizzle_sf
+
+        def _pad_up(x: int, mult: int) -> int:
+            return ((x + mult - 1) // mult) * mult
+
+        rq = module.weight.detach().view(torch.uint8).contiguous()
+        out_features, in_half = int(rq.shape[0]), int(rq.shape[1])
+        in_features = in_half * 2
+        sf_k = in_features // 16
+        ws = module.weight_scale.detach().view(torch.uint8)
+        sf_w = unswizzle_sf(
+            ws, _pad_up(out_features, 128), _pad_up(sf_k, 4) * 16, 16
+        )[:out_features, :sf_k].contiguous()
+        # The fused kernel consumes the weight SF in the NVFP4-MMA swizzle (read as a raw ptr).
+        sf_w = swizzle_sf(sf_w.contiguous().view(torch.uint8), out_features, in_features, 16)
+
+        l2 = module.svdquant_lora_a.detach().to(torch.bfloat16)  # [r, in]
+        l1 = module.svdquant_lora_b.detach().to(torch.bfloat16)  # [out, r]
+        r = int(l2.shape[0])
+        if l2.shape[1] != in_features:
+            l2 = F.pad(l2, (0, in_features - l2.shape[1]))
+        if l1.shape[0] != out_features:
+            l1 = F.pad(l1, (0, 0, 0, out_features - l1.shape[0]))
+
+        gscale_x = float((1.0 / module.input_scale.detach().float()).item())
+        gscale_w = float(module.weight_scale_2.detach().float().item())
+        pqs = getattr(module, "pre_quant_scale", None)
+        if pqs is not None:
+            pqs = pqs.detach().reshape(-1)
+            if pqs.numel() != in_features:
+                pqs = F.pad(pqs, (0, in_features - pqs.numel()), value=1.0)
+
+        state = prepare_svdquant_state(
+            m_pad, rq, sf_w, l1, l2, gscale_x, gscale_w, r,
+            pre_quant_scale=pqs, external_quant=True,
+        )
+        cache[m_pad] = state
+        return state
 
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
