@@ -2130,7 +2130,7 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
                 pipeline,
                 script: Utils.sshUserCmd(
                     remote,
-                    "\"sacct -j ${capturedJobID} --format=NodeList -Pn --allocations 2>/dev/null | head -1 || true\""
+                    "\"bash -c 'sacct -j ${capturedJobID} --format=NodeList -Pn --allocations 2>/dev/null | head -1 || true'\""
                 ),
                 returnStdout: true,
                 numRetries: 1
@@ -2140,7 +2140,7 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
                     pipeline,
                     script: Utils.sshUserCmd(
                         remote,
-                        "\"scontrol show job ${capturedJobID} 2>/dev/null | tr ' ' '\\n' | sed -n 's/^NodeList=//p' | head -1 || true\""
+                        "\"bash -c 'scontrol show job ${capturedJobID} 2>/dev/null | tr \" \" \"\\n\" | sed -n \"s/^NodeList=//p\" | head -1 || true'\""
                     ),
                     returnStdout: true,
                     numRetries: 1

@@ -16,14 +16,13 @@ import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import torch_multi_arange
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
-from ..utils import get_global_attrs, get_model_extra_attrs
+from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
