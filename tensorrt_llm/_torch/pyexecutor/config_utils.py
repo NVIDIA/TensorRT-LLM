@@ -486,6 +486,7 @@ class _Qwen35ConfigCompat:
                 rope_scaling.pop("mrope_section", None)
                 rope_scaling.pop("mrope_interleaved", None)
                 rope_scaling.pop("rope_type", None)
+                rope_scaling.pop("type", None)
                 # After stripping the mRoPE fields, what remains (if anything)
                 # is standard scaling config.  If nothing meaningful is left,
                 # clear rope_scaling to avoid triggering unexpected code paths.

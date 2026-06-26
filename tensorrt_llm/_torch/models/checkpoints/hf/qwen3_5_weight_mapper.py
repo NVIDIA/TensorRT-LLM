@@ -456,7 +456,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             # uniformly to the entire projection.  Forward the scalar from the
             # qkv sub-tensor directly as the fused qkvz/ba key and skip the
             # regular split/pack path entirely.
-            if suffix in _SCALAR_SCALE_SUFFIXES:
+            if suffix in _SCALAR_SCALE_SUFFIXES and all(
+                    t.ndim == 0 for t in tensors.values()):
                 qkvz_candidates = {"qkv", "q", "k", "v", "z"} & tensors.keys()
                 if qkvz_candidates:
                     # Use the scalar from "qkv" if present, else fall back to
