@@ -548,9 +548,6 @@ class TRTLLMGenFusedMoE(MoE):
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
 
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
-
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
 

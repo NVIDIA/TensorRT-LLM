@@ -382,15 +382,16 @@ class LinearMethodBase(ABC):
             self.process_weights_after_loading(module)
 
     def transform_weights(self, module: Linear) -> None:
-        ...
+        return None
 
     def post_load_weights(self, module: Linear) -> None:
         self.transform_weights(module)
 
-    def load_weight_scales(self, weights: List[Dict], *args, **kwargs):
+    def load_weight_scales(self, weights: List[Dict], *args, **kwargs) -> None:
         """
         Load quantized weight scales from the checkpoint.
         """
+        return None
 
     @abstractmethod
     def load_weights_vanilla(self,
@@ -424,7 +425,7 @@ class LinearMethodBase(ABC):
         """
         raise NotImplementedError
 
-    def process_weights_after_loading(self, module: Linear):
+    def process_weights_after_loading(self, module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights.
         """
@@ -438,23 +439,27 @@ class LinearMethodBase(ABC):
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
-    def process_weights_after_loading_vanilla(self, module: Linear):
+    def process_weights_after_loading_vanilla(self, module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights for vanilla linear layer.
         """
+        return None
 
-    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
+    def process_weights_after_loading_fused_qkv_linear(self,
+                                                       module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights for fused QKV linear layer.
         """
+        return None
 
     def process_weights_after_loading_fused_gate_up_linear(
-            self, module: Linear):
+            self, module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights for fused gate up linear layer.
         """
+        return None
 
-    def pre_reload_weights(self, module: Linear):
+    def pre_reload_weights(self, module: Linear) -> None:
         """
         Pre-reload weights for the linear layer.
         """

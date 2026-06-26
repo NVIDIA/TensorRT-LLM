@@ -255,8 +255,8 @@ class Mamba2Mixer(nn.Module):
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        """Post-process after loading weights."""
+    def cache_derived_state(self) -> None:
+        """Recompute state derived from loaded weights."""
         if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
@@ -271,6 +271,9 @@ class Mamba2Mixer(nn.Module):
                                         "h -> h p",
                                         p=self.head_dim)
         self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
