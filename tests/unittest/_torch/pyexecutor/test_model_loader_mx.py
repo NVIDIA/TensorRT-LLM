@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.modules import attention as attention_mod
+from tensorrt_llm._torch.modules import mla as mla_mod
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
@@ -313,7 +313,7 @@ def test_linear_transform_weights_is_idempotent():
 
 
 def test_mla_transform_weights_is_idempotent(monkeypatch):
-    monkeypatch.setattr(attention_mod, "get_sm_version", lambda: 120)
+    monkeypatch.setattr(mla_mod, "get_sm_version", lambda: 120)
     quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
     mla = MLA.__new__(MLA)
     mla._weights_transformed = False
