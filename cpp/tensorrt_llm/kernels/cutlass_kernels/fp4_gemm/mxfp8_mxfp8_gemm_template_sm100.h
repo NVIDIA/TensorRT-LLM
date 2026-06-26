@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +35,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/mxfp8_mxfp4_gemm_template_sm100.h"
 
 #ifndef _WIN32
 #pragma GCC diagnostic pop
@@ -49,85 +51,37 @@ namespace kernels
 namespace cutlass_kernels
 {
 
-#ifdef ENABLE_BF16
-using SafeBF16 = __nv_bfloat16;
-#else
-using SafeBF16 = void;
-#endif
-
-struct __1SM
-{
-};
-
-struct __2SM
-{
-};
-
-template <typename T>
-struct MXSMTypeAdapter
-{
-};
-
-template <>
-struct MXSMTypeAdapter<__1SM>
-{
-    static int const Scale = 1;
-    using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1SmMxf8f6f4;
-    using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100;
-};
-
-template <>
-struct MXSMTypeAdapter<__2SM>
-{
-    static int const Scale = 2;
-    using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2SmMxf8f6f4;
-    using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100;
-};
-
-namespace detail
-{
-template <typename T, typename = void>
-struct has_bias_ptr : std::false_type
-{
-};
-
-template <typename T>
-struct has_bias_ptr<T, std::void_t<decltype(std::declval<T&>().bias_ptr)>> : std::true_type
-{
-};
-} // namespace detail
-
 #ifdef PLACEHOLDER_KERNELS
 
 template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename CGA_M, typename CGA_N, typename CGA_K,
     typename XSM_>
-size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
+size_t genericMXFP8xMXFP8GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
     void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
-    int* occupancy, void const* bias = nullptr)
+    int* occupancy)
 {
     throw std::runtime_error(
-        "[TensorRT LLM Error][FP4 gemm Runner] TensorRT LLM is not compiled with support for this Architecture.");
+        "[TensorRT LLM Error][MXFP8 gemm Runner] TensorRT LLM is not compiled with support for this Architecture.");
 }
 
 #else
 
 template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename CGA_M, typename CGA_N, typename CGA_K,
     typename XSM>
-struct DeviceGemmMXFP8xMXFP4GemmSm100
+struct DeviceGemmMXFP8xMXFP8GemmSm100
 {
     using OutElementType = typename TllmToCutlassTypeAdapter<T>::type;
     using ClusterShape = cute::Shape<int, int, _1>;
     using Arch = cutlass::arch::Sm100;
-    /* // Input A */
+    /* // Input A: MXFP8 (e4m3 + UE8M0 block scales) */
     using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
     using LayoutA = cutlass::layout::RowMajor;
     static constexpr int AlignmentA = 16;
-    /* // Input B */
-    using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+    /* // Input B: MXFP8 (e4m3 + UE8M0 block scales) -- new vs the MXFP4 template */
+    using ElementB = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
     using LayoutB = cutlass::layout::ColumnMajor;
-    static constexpr int AlignmentB = 128;
-    /* // Input C: ElementC=void; per-N bias via LinCombPerColBias EVT. */
+    static constexpr int AlignmentB = 16;
+    /* // Input C */
     using ElementC = void;
     using LayoutC = cutlass::layout::RowMajor;
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
@@ -144,7 +98,7 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<Arch, OperatorClass,
         MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC, LayoutC, AlignmentC,
         OutElementType, LayoutC, AlignmentC, EpilogueSchedule,
-        cutlass::epilogue::fusion::LinCombPerColBias<OutElementType, float, OutElementType, void, float>>::CollectiveOp;
+        cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void, float>>::CollectiveOp;
 
     using CollectiveMainloop =
         typename cutlass::gemm::collective::CollectiveBuilder<Arch, cutlass::arch::OpClassBlockScaledTensorOp, ElementA,
@@ -182,71 +136,12 @@ struct DeviceGemmMXFP8xMXFP4GemmSm100
     using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-template <typename Gemm>
-typename Gemm::Arguments prepareGemmArgsSm100(void* D, void const* A, void const* B, void const* input_sf,
-    void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count, dim3 prefered_cga, int XSM,
-    void const* bias = nullptr)
-{
-    using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
-    using ElementA = typename Gemm::ElementA;
-    using ElementB = typename Gemm::ElementB;
-    using ElementSFA = cutlass::float_ue8m0_t;
-    using ElementSFB = cutlass::float_ue8m0_t;
-    using ElementC = void;
-    using ElementD = typename Gemm::ElementD;
-    using ElementCompute = float;
-
-    typename Gemm::Arguments operator_args;
-    operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-    auto& fusion_args = operator_args.epilogue.thread;
-    fusion_args.alpha_ptr = static_cast<ElementCompute const*>(global_sf);
-    if constexpr (detail::has_bias_ptr<std::decay_t<decltype(fusion_args)>>::value)
-    {
-        fusion_args.bias_ptr = static_cast<ElementD const*>(bias);
-    }
-
-    operator_args.problem_shape = cute::make_shape(m, n, k, batch_count);
-
-    operator_args.mainloop.ptr_A = static_cast<ElementA const*>(A);
-    operator_args.mainloop.ptr_B = static_cast<ElementB const*>(B);
-    operator_args.mainloop.ptr_SFA = static_cast<ElementSFA const*>(input_sf);
-    operator_args.mainloop.ptr_SFB = static_cast<ElementSFB const*>(weight_sf);
-    operator_args.epilogue.ptr_C = static_cast<ElementC const*>(D);
-    operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);
-
-    int const stride_A = batch_count == 1 ? 0 : m * k;
-    int const stride_B = batch_count == 1 ? 0 : n * k;
-    int const stride_C = batch_count == 1 ? 0 : m * n;
-
-    operator_args.mainloop.dA = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, stride_A);
-    operator_args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, stride_B);
-    operator_args.epilogue.dC = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, stride_C);
-    operator_args.epilogue.dD = operator_args.epilogue.dC;
-
-    operator_args.mainloop.layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(operator_args.problem_shape);
-    operator_args.mainloop.layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(operator_args.problem_shape);
-
-    if constexpr (!std::is_const_v<decltype(operator_args.scheduler.max_swizzle_size)>)
-    {
-        operator_args.scheduler.max_swizzle_size = 1;
-    }
-    if constexpr (!std::is_const_v<decltype(operator_args.scheduler.raster_order)>)
-    {
-        using Enum_t = decltype(operator_args.scheduler.raster_order);
-        operator_args.scheduler.raster_order = Enum_t::Heuristic;
-    }
-    operator_args.hw_info.cluster_shape = prefered_cga;
-    operator_args.hw_info.cluster_shape_fallback = dim3(XSM, 1, 1);
-
-    return operator_args;
-}
-
 template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename CGA_M, typename CGA_N, typename CGA_K,
     typename XSM_>
-size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
+size_t genericMXFP8xMXFP8GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
     void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
     tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
-    int* occupancy, void const* bias = nullptr)
+    int* occupancy)
 {
     using ElementOutput__ =
         typename cutlass::platform::conditional<cutlass::platform::is_same<T, half>::value, cutlass::half_t, T>::type;
@@ -257,19 +152,22 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
         typename cutlass::platform::conditional<cutlass::platform::is_same<ElementOutput_, SafeBF16>::value,
             cutlass::bfloat16_t, ElementOutput_>::type;
 
-    using MXFP8xMXFP4GemmOperator =
-        typename DeviceGemmMXFP8xMXFP4GemmSm100<T, CTA_M, CTA_N, CTA_K, CGA_M, CGA_N, CGA_K, XSM_>::Gemm;
-    MXFP8xMXFP4GemmOperator gemm;
-    auto args = prepareGemmArgsSm100<MXFP8xMXFP4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-        batch_count, dim3(CGA_M{}, CGA_N{}, CGA_K{}), MXSMTypeAdapter<XSM_>::Scale, bias);
+    using MXFP8xMXFP8GemmOperator =
+        typename DeviceGemmMXFP8xMXFP8GemmSm100<T, CTA_M, CTA_N, CTA_K, CGA_M, CGA_N, CGA_K, XSM_>::Gemm;
+    MXFP8xMXFP8GemmOperator gemm;
+    // Reuse the MXFP8xMXFP4 argument preparation helper -- the argument layout
+    // is identical (block-scaled SFA/SFB, UE8M0 scales, same problem shape +
+    // strides). Only the B element type differs.
+    auto args = prepareGemmArgsSm100<MXFP8xMXFP8GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+        batch_count, dim3(CGA_M{}, CGA_N{}, CGA_K{}), MXSMTypeAdapter<XSM_>::Scale);
     /* // Check shared memory size; throw when SMEM exceeds */
-    int smem_size = int(sizeof(typename MXFP8xMXFP4GemmOperator::GemmKernel::SharedStorage));
+    int smem_size = int(sizeof(typename MXFP8xMXFP8GemmOperator::GemmKernel::SharedStorage));
     static int mMaxSmemSize = tk::getMaxSharedMemoryPerBlockOptin();
     if (smem_size > mMaxSmemSize)
     {
         std::string errMsg = "SMEM size exceeds maximum allowed. Required " + std::to_string(smem_size) + ", got "
             + std::to_string(mMaxSmemSize);
-        throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][MXFP8 gemm Runner] " + errMsg);
     }
     /* // Return workspace size */
     if (!A && !B && !D)
@@ -280,28 +178,28 @@ size_t genericMXFP8xMXFP4GemmKernelLauncher(void* D, void const* A, void const* 
     {
         std::string errMsg("Requested workspace size insufficient. Required "
             + std::to_string(gemm.get_workspace_size(args)) + ", got " + std::to_string(workspaceBytes));
-        throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][MXFP8 gemm Runner] " + errMsg);
     }
     auto can_implement = gemm.can_implement(args);
     if (can_implement != cutlass::Status::kSuccess)
     {
-        std::string errMsg = "MXFP8xMXFP4 Gemm cutlass kernel will fail for params. Error: "
+        std::string errMsg = "MXFP8xMXFP8 Gemm cutlass kernel will fail for params. Error: "
             + std::string(cutlassGetStatusString(can_implement));
-        throw std::runtime_error("[TensorRT LLM Error][FP4 gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][MXFP8 gemm Runner] " + errMsg);
     }
     auto initStatus = gemm.initialize(args, workspace, stream);
     if (initStatus != cutlass::Status::kSuccess)
     {
-        std::string errMsg = "Failed to initialize cutlass MXFP8xMXFP4 gemm. Error: "
+        std::string errMsg = "Failed to initialize cutlass MXFP8xMXFP8 gemm. Error: "
             + std::string(cutlassGetStatusString(initStatus));
-        throw std::runtime_error("[TensorRT LLM Error][MXFP8xMXFP4 gemm Runner] " + errMsg);
+        throw std::runtime_error("[TensorRT LLM Error][MXFP8xMXFP8 gemm Runner] " + errMsg);
     }
     auto runStatus = gemm.run(args, workspace, stream, nullptr, tensorrt_llm::common::getEnvEnablePDL());
     if (runStatus != cutlass::Status::kSuccess)
     {
         std::string errMsg
-            = "Failed to run cutlass MXFP8xMXFP4 gemm. Error: " + std::string(cutlassGetStatusString(runStatus));
-        throw std::runtime_error("[TensorRT LLM Error][MXFP8xMXFP4 gemm Runner] " + errMsg);
+            = "Failed to run cutlass MXFP8xMXFP8 gemm. Error: " + std::string(cutlassGetStatusString(runStatus));
+        throw std::runtime_error("[TensorRT LLM Error][MXFP8xMXFP8 gemm Runner] " + errMsg);
     }
     return gemm.get_workspace_size(args);
 }
