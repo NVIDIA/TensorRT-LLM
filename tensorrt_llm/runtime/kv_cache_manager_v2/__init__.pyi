@@ -148,6 +148,7 @@ class KVCacheManagerConfig:
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     ssm_reuse_interval: int = 512
+    mamba_save_last_snapshot: bool = False
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     helix_config: HelixConfig | None = None
     @property

@@ -83,6 +83,8 @@ class Role:
     VALUE = DataRole("value")
     KEY_BLOCK_SCALE = DataRole("key_block_scale")
     VALUE_BLOCK_SCALE = DataRole("value_block_scale")
+    SSM_STATE = DataRole("ssm_state")
+    CONV_STATE = DataRole("conv_state")
     ALL = DataRole("all")
 
 
@@ -480,6 +482,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens, draft_loop_tokens)
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.kv_cache_config = kv_cache_config
 
         assert self.event_buffer_max_size == 0, "event_buffer_max_size must be 0"
 
@@ -695,6 +698,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+        self._block_reuse_hit_log_count = 0
+        self._block_reuse_miss_log_count = 0
+        self._block_reuse_commit_log_count = 0
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -721,12 +727,14 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         for pool_id in range(self.num_pools):
             layer_id = self.impl.layer_grouping[pool_id][0]
-            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            index_role = self._get_index_role_for_pool(pool_id)
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, index_role)
+            value_role = self._get_value_role_for_pool(pool_id)
+            if value_role is not None:
                 self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE)
-                    - self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
-                    self.impl.get_page_stride(layer_id, Role.KEY),
+                    self.impl.get_mem_pool_base_address(layer_id, value_role)
+                    - self.impl.get_mem_pool_base_address(layer_id, index_role),
+                    self.impl.get_page_stride(layer_id, index_role),
                 )
             else:
                 self.kv_offset[pool_id] = 0
@@ -744,6 +752,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
+
+    def _get_index_role_for_pool(self, pool_id: int) -> DataRole:
+        return Role.KEY
+
+    def _get_value_role_for_pool(self, pool_id: int) -> Optional[DataRole]:
+        return Role.VALUE if self.kv_cache_type != CacheTypeCpp.SELFKONLY else None
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         kv_cache_pool_pointers = torch.tensor(
@@ -1071,6 +1085,27 @@ class KVCacheManagerV2(BaseResourceManager):
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
 
+    def _log_block_reuse_commit(
+        self,
+        request: LlmRequest,
+        commit_start: int,
+        commit_end: int,
+        *,
+        complete: bool,
+    ) -> None:
+        if commit_end <= commit_start:
+            return
+        self._block_reuse_commit_log_count += 1
+        if self._block_reuse_commit_log_count <= 8 or self._block_reuse_commit_log_count % 512 == 0:
+            logger.info(
+                "KVCacheManagerV2 block reuse commit: "
+                f"request_id={request.py_request_id}, "
+                f"prompt_tokens={request.prompt_len}, "
+                f"commit_range=[{commit_start}, {commit_end}), "
+                f"complete={complete}, "
+                f"commit_count={self._block_reuse_commit_log_count}"
+            )
+
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create _KVCache, handle block reuse, and resume. Does NOT resize.
 
@@ -1092,11 +1127,46 @@ class KVCacheManagerV2(BaseResourceManager):
                 else:
                     tokens = None
                 kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id, tokens, cache_salt=req.cache_salt
+                    req.py_request_id,
+                    req.lora_task_id,
+                    tokens,
+                    cache_salt=getattr(req, "cache_salt", None),
                 )
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
+                if (
+                    self.enable_block_reuse
+                    and tokens is not None
+                    and kv_cache.num_committed_tokens > 0
+                ):
+                    self._block_reuse_hit_log_count += 1
+                    if (
+                        self._block_reuse_hit_log_count <= 8
+                        or self._block_reuse_hit_log_count % 128 == 0
+                    ):
+                        logger.info(
+                            "KVCacheManagerV2 block reuse hit: "
+                            f"request_id={req.py_request_id}, "
+                            f"prompt_tokens={len(all_tokens)}, "
+                            f"lookup_tokens={len(tokens)}, "
+                            f"reused_tokens={kv_cache.num_committed_tokens}, "
+                            f"reused_blocks={kv_cache.num_blocks}, "
+                            f"hit_count={self._block_reuse_hit_log_count}"
+                        )
+                elif self.enable_block_reuse and tokens is not None:
+                    self._block_reuse_miss_log_count += 1
+                    if (
+                        self._block_reuse_miss_log_count <= 8
+                        or self._block_reuse_miss_log_count % 512 == 0
+                    ):
+                        logger.info(
+                            "KVCacheManagerV2 block reuse miss: "
+                            f"request_id={req.py_request_id}, "
+                            f"prompt_tokens={len(all_tokens)}, "
+                            f"lookup_tokens={len(tokens)}, "
+                            f"miss_count={self._block_reuse_miss_log_count}"
+                        )
 
             if not self.enable_block_reuse:
                 kv_cache.stop_committing()
@@ -1219,7 +1289,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
                     kv_cache = self._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, None, cache_salt=req.cache_salt
+                        req.py_request_id,
+                        req.lora_task_id,
+                        None,
+                        cache_salt=getattr(req, "cache_salt", None),
                     )
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
@@ -1455,20 +1528,28 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def try_commit_blocks_for_reuse(self, request: LlmRequest, kv_cache) -> None:
-        if (
-            self.enable_block_reuse
-            and not self.is_draft
-            and not request.is_dummy_request
-            and request.context_current_position > kv_cache.num_committed_tokens
-        ):
+        if not self.enable_block_reuse or self.is_draft or request.is_dummy_request:
+            return
+        if request.context_current_position > kv_cache.num_committed_tokens:
+            commit_start = kv_cache.num_committed_tokens
+            commit_end = request.context_current_position
             tokens = self._augment_tokens_for_block_reuse(
                 request.get_tokens(DEFAULT_BEAM_INDEX),
                 request,
-                start=kv_cache.num_committed_tokens,
-                end=request.context_current_position,
+                start=commit_start,
+                end=commit_end,
             )
             kv_cache.commit(tokens)
-            kv_cache.stop_committing()
+            self._log_block_reuse_commit(
+                request,
+                commit_start,
+                commit_end,
+                complete=request.context_current_position >= request.prompt_len,
+            )
+        if request.context_current_position >= request.prompt_len:
+            kv_cache.stop_committing(
+                save_last_ssm_snapshot=self.kv_cache_config.mamba_save_last_snapshot
+            )
 
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
@@ -1723,15 +1804,25 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
+                    commit_start = kv_cache.num_committed_tokens
+                    commit_end = req.context_current_position
                     tokens = self._augment_tokens_for_block_reuse(
                         req.get_tokens(DEFAULT_BEAM_INDEX),
                         req,
-                        start=kv_cache.num_committed_tokens,
-                        end=req.context_current_position,
+                        start=commit_start,
+                        end=commit_end,
                     )
                     kv_cache.commit(tokens)
+                    self._log_block_reuse_commit(
+                        req,
+                        commit_start,
+                        commit_end,
+                        complete=req.context_remaining_length == 0,
+                    )
                 if req.context_remaining_length == 0:
-                    kv_cache.stop_committing()
+                    kv_cache.stop_committing(
+                        save_last_ssm_snapshot=(self.kv_cache_config.mamba_save_last_snapshot)
+                    )
             else:
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:

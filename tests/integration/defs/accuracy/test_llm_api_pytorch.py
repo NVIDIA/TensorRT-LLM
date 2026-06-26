@@ -45,8 +45,9 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
                         skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2)
+                            GSM8KRepeatShuffleReuse, JsonModeEval,
+                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
+                            MMLURepeatShuffleReuse)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -5933,6 +5934,45 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
+    def test_fp8_block_reuse_interval_repeat_shuffle(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 max_seq_len=4096,
+                 max_batch_size=64,
+                 kv_cache_config=KvCacheConfig(
+                     enable_block_reuse=True,
+                     mamba_state_cache_interval=256,
+                     free_gpu_memory_fraction=0.8,
+                 ),
+                 cuda_graph_config=self.cuda_graph_config) as llm:
+            task = GSM8KRepeatShuffleReuse(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @skip_pre_hopper
+    def test_fp8_block_reuse_save_last_snapshot_repeat_shuffle(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 max_seq_len=4096,
+                 max_batch_size=64,
+                 kv_cache_config=KvCacheConfig(
+                     enable_block_reuse=True,
+                     mamba_state_cache_interval=0,
+                     mamba_save_last_snapshot=True,
+                     free_gpu_memory_fraction=0.8,
+                 ),
+                 cuda_graph_config=self.cuda_graph_config) as llm:
+            task = GSM8KRepeatShuffleReuse(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @skip_pre_hopper
     def test_dflash(self):
         target_model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
@@ -6934,19 +6974,20 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp, is_chat",
         [
-            (1, 1, 256, False, False),
-            (4, 1, 256, False, True),
-            (4, 4, 256, False, False),
-            (4, 4, 256, True, False),
-            (4, 4, 512, True, True),
+            (1, 1, 256, False, False, False),
+            (4, 1, 256, False, True, False),
+            (4, 4, 256, False, False, False),
+            (4, 4, 256, True, False, False),
+            (4, 4, 512, True, True, False),
+            (1, 1, 0, False, False, True),
         ],
-        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
+        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP", "TP1_chat"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
-                                     use_mtp):
+                                     use_mtp, is_chat):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
             pytest.skip(
@@ -6962,6 +7003,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     mamba_state_cache_interval=mamba_state_cache_interval,
+                    mamba_save_last_snapshot=is_chat,
                     free_gpu_memory_fraction=0.8,
                 ),
                 max_batch_size=32,
@@ -6975,10 +7017,15 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 moe_config=MoeConfig(backend="TRTLLM"),
                 speculative_config=mtp_config if use_mtp else None,
         ) as llm:
-            task = MMLU(self.MODEL_NAME)
+            use_repeat_shuffle_reuse = use_mtp or is_chat
+            mmlu_task_cls = (MMLURepeatShuffleReuse
+                             if use_repeat_shuffle_reuse else MMLU)
+            gsm8k_task_cls = (GSM8KRepeatShuffleReuse
+                              if use_repeat_shuffle_reuse else GSM8K)
+            task = mmlu_task_cls(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
+            task = gsm8k_task_cls(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 

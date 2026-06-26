@@ -208,6 +208,23 @@ def find_best_partial_match_in_next_nodes(
     return best_block, best_match_len
 
 
+def find_best_exact_ssm_match_in_next_nodes(
+    block: "Block | RootBlock", tokens: TokenBlock, ssm_lc_id: LifeCycleId
+) -> tuple["Block | None", int]:
+    """Find the longest child block whose full token sequence matches tokens."""
+    if len(block.next) >= 32:
+        return None, 0
+    best_block = None
+    best_match_len = 0
+    for b in block.next.values():
+        block_len = len(b.tokens)
+        if block_len <= len(tokens) and block_len > best_match_len:
+            if b.tokens == tokens[:block_len] and b.storage[ssm_lc_id] is not None:
+                best_block = b
+                best_match_len = block_len
+    return best_block, best_match_len
+
+
 class DuplicateKeyError(Exception):
     "Another block with the same key already exists"
 
@@ -300,7 +317,13 @@ class Block:
     def make_key(prev_key: BlockKey, tokens: Sequence[TokenIdExt]) -> BlockKey:
         return Hasher(prev_key).update(tokens).digest
 
-    def __init__(self, tokens: Sequence[TokenIdExt], prev: "Block | RootBlock") -> None:
+    def __init__(
+        self,
+        tokens: Sequence[TokenIdExt],
+        prev: "Block | RootBlock",
+        allow_covered_partial: bool = False,
+        protected_life_cycles: Iterable[LifeCycleId] = (),
+    ) -> None:
         assert prev.tokens_per_block == prev.prev.tokens_per_block, "prev must be a full block"
         self.key = self.make_key(prev.key, tokens)
         self.tokens = tokens
@@ -312,16 +335,19 @@ class Block:
         # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
         if self.key in prev.next:
             raise UselessBlockError(prev.next[self.key])
-        if len(tokens) < self.tokens_per_block:
+        if len(tokens) < self.tokens_per_block and not allow_covered_partial:
             # @TODO: when we have the database for find_best_partial_match_in_next_nodes, we may use
             # that for faster check.
             for b in prev.next.values():
                 if b.tokens[: len(tokens)] == tokens:
                     raise UselessBlockError(b)
         # If there are sibling blocks fully covered by this block, remove them.
+        protected_life_cycles = tuple(protected_life_cycles)
         to_remove = []
         for k, b in prev.next.items():
             if len(b.tokens) < len(tokens) and tokens[: len(b.tokens)] == b.tokens:
+                if any(b.storage[lc] is not None for lc in protected_life_cycles):
+                    continue
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
         for k in to_remove:
@@ -484,6 +510,15 @@ class BlockRadixTree:
             if partial_block is not None:
                 block = partial_block
                 yield block, match_len
+        elif (
+            mismatched_token_block
+            and (ssm_lc_id := self._life_cycles.ssm_life_cycle_id) is not None
+        ):
+            partial_block, match_len = find_best_exact_ssm_match_in_next_nodes(
+                cast(Block | RootBlock, block), mismatched_token_block, ssm_lc_id
+            )
+            if partial_block is not None:
+                yield partial_block, match_len
 
     def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
         tokens_per_block = self._tokens_per_block
@@ -523,10 +558,8 @@ class BlockRadixTree:
             if ssm_lc_id is not None:
                 ssm_trunc = 0
                 for i in reversed(range(len(matched))):
-                    if matched[i][0].storage[ssm_lc_id] is not None:
-                        assert NDEBUG or matched[i][1] == self._tokens_per_block, (
-                            "SSM reuse snapshot must only be selected from a fully matched block"
-                        )
+                    block, match_len = matched[i]
+                    if block.storage[ssm_lc_id] is not None and match_len == len(block.tokens):
                         ssm_trunc = i + 1
                         break
                 matched = matched[:ssm_trunc]

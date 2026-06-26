@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 # ---------------------------------------------------------------------------
 # State value constants
@@ -1340,6 +1340,70 @@ class TestChunkedContext:
         # has_chunking manifests in sorting behavior — non-last chunks before last
         # We verify indirectly: the request should be scheduled
         assert len(out.context_requests) == 1
+
+    def test_force_chunk_uses_expected_chunking_points(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(0, context_remaining_length=1176)
+        req.expect_chunking_points = [256, 512, 768, 1024, 1176]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+
+    def test_force_chunk_requires_expected_chunking_points(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(0, context_remaining_length=1176)
+
+        with pytest.raises(RuntimeError, match="expect_chunking_points"):
+            sched.schedule_request([req], set())
+
+    def test_force_chunk_uses_next_expected_chunking_point(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(
+            0,
+            context_remaining_length=920,
+            prompt_len=1176,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = 256
+        req.expect_chunking_points = [256, 512, 768, 1024, 1176]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+
+    def test_force_chunk_allows_prompt_end_shorter_than_unit_size(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(0, context_remaining_length=150)
+        req.expect_chunking_points = [150]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 150
 
     def test_multiple_ctx_share_budget(self):
         """Two ctx requests share the budget."""
