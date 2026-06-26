@@ -172,6 +172,10 @@ def scpFromSlurmFrontendCmd(List<Map> remotes, String remotePath, String localPa
         return scpFromRemoteCmd(remotes[0], remotePath, localPath)
     }
 
+    // Decide failover by error message, not exit code: scp/sshpass report
+    // connection failures inconsistently (1, 255, ...), so only the message
+    // reliably distinguishes a dead frontend from a real error. Non-connection
+    // failures fall to the default case and exit with the original rc.
     def retryableConnectionCheck = '''
         __slurm_frontend_message=$(printf '%s' "$__slurm_frontend_output" | tr '[:upper:]' '[:lower:]')
         case "$__slurm_frontend_message" in
@@ -204,9 +208,6 @@ def scpFromSlurmFrontendCmd(List<Map> remotes, String remotePath, String localPa
         printf '%s\\n' "\$__slurm_frontend_output" >&2
         if [ \$__slurm_frontend_rc -eq 0 ]; then
             exit 0
-        fi
-        if [ \$__slurm_frontend_rc -ne 255 ]; then
-            exit \$__slurm_frontend_rc
         fi
         ${retryableConnectionCheck}
     """.stripIndent().trim() }
