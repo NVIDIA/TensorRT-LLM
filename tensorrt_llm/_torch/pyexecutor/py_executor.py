@@ -973,7 +973,8 @@ class PyExecutor:
                 # possible, i.e. MPI executor path (not Ray), sleep_config
                 # enabled, and more than one rank participating.
                 if (self.dist.world_size > 1 and not self._disable_mpi
-                        and self.llm_args.sleep_config is not None):
+                        and getattr(self.llm_args, "sleep_config", None)
+                        is not None):
                     logger.info(
                         "Create new MPI comm for sleep/wakeup control listener."
                     )
