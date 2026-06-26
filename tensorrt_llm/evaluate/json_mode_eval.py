@@ -29,20 +29,20 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .interface import Evaluator
 
 
-def _load_json_from_generation(text: str):
+def _load_json_from_generation(output: RequestOutput):
+    text = output.outputs[0].text
     try:
         return json.loads(text)
     except json.JSONDecodeError as original_error:
-        decoder = json.JSONDecoder()
-        starts = [index for index in (text.find("{"), text.find("["))
-                  if index != -1]
-        for start in sorted(starts):
-            try:
-                parsed, _ = decoder.raw_decode(text[start:])
-                return parsed
-            except json.JSONDecodeError:
-                pass
-        raise original_error
+        try:
+            from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+            parsed_output = get_harmony_adapter().harmony_output_to_openai(
+                output.outputs[0].token_ids)
+            return json.loads(parsed_output["content"])
+        except json.JSONDecodeError:
+            raise
+        except Exception:
+            raise original_error
 
 
 class JsonModeEval(Evaluator):
@@ -92,8 +92,7 @@ class JsonModeEval(Evaluator):
         all_corrections, all_grammar_corrections = [], []
         for output, ref, schema in zip(outputs, references, schemas):
             try:
-                output_json = _load_json_from_generation(
-                    output.outputs[0].text)
+                output_json = _load_json_from_generation(output)
                 jsonschema.validate(output_json, json.loads(schema))
             except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)

@@ -22,9 +22,9 @@ from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
 )
-from tensorrt_llm.llmapi.guided_decoding import (
-    GPT_OSS_FINAL_CHANNEL_TRIGGER,
-    adapt_guided_decoding_for_reasoning_parser,
+from tensorrt_llm.llmapi.llm import (
+    _GPT_OSS_FINAL_CHANNEL_TRIGGER,
+    _adapt_gpt_oss_guided_decoding_params,
 )
 from tensorrt_llm.sampling_params import (
     MAX_TOP_LOGPROBS,
@@ -75,8 +75,7 @@ def test_chat_top_logprobs_request_limit():
 def test_gpt_oss_guided_decoding_triggers_on_final_channel():
     guided_decoding = GuidedDecodingParams(json={"type": "object"})
 
-    adapted = adapt_guided_decoding_for_reasoning_parser(
-        guided_decoding, "gpt_oss")
+    adapted = _adapt_gpt_oss_guided_decoding_params(guided_decoding)
 
     assert adapted is not guided_decoding
     assert adapted.structural_tag is not None
@@ -85,11 +84,11 @@ def test_gpt_oss_guided_decoding_triggers_on_final_channel():
 
     fmt = stag["format"]
     assert fmt["type"] == "triggered_tags"
-    assert fmt["triggers"] == [GPT_OSS_FINAL_CHANNEL_TRIGGER]
+    assert fmt["triggers"] == [_GPT_OSS_FINAL_CHANNEL_TRIGGER]
     assert fmt["stop_after_first"] is True
 
     tag = fmt["tags"][0]
-    assert tag["begin"] == GPT_OSS_FINAL_CHANNEL_TRIGGER
+    assert tag["begin"] == _GPT_OSS_FINAL_CHANNEL_TRIGGER
     assert tag["end"] == ""
     assert tag["content"] == {
         "type": "json_schema",
@@ -110,8 +109,7 @@ def test_gpt_oss_guided_decoding_accepts_json_schema_string():
     }
     guided_decoding = GuidedDecodingParams(json=json.dumps(json_schema))
 
-    adapted = adapt_guided_decoding_for_reasoning_parser(
-        guided_decoding, "gpt_oss")
+    adapted = _adapt_gpt_oss_guided_decoding_params(guided_decoding)
 
     stag = json.loads(adapted.structural_tag)
     content = stag["format"]["tags"][0]["content"]
@@ -121,19 +119,12 @@ def test_gpt_oss_guided_decoding_accepts_json_schema_string():
     }
 
 
-def test_guided_decoding_without_reasoning_parser_is_unchanged():
-    guided_decoding = GuidedDecodingParams(json_object=True)
-
-    assert adapt_guided_decoding_for_reasoning_parser(
-        guided_decoding, None) is guided_decoding
-
-
 def test_existing_structural_tag_guided_decoding_is_unchanged():
     guided_decoding = GuidedDecodingParams(
         structural_tag='{"type":"structural_tag","format":{"type":"any_text"}}')
 
-    assert adapt_guided_decoding_for_reasoning_parser(
-        guided_decoding, "gpt_oss") is guided_decoding
+    assert _adapt_gpt_oss_guided_decoding_params(
+        guided_decoding) is guided_decoding
 
 
 def test_chat_template_request_override_respects_runtime_policy():
