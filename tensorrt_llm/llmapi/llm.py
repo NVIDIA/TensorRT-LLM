@@ -41,8 +41,7 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
-from ..sampling_params import (GuidedDecodingParams, LogitsProcessor,
-                               SamplingParams)
+from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
@@ -50,70 +49,15 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .reasoning_parser import (
+    HARMONY_REASONING_PARSER,
+    adapt_guided_decoding_params_for_reasoning_parser,
+)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
-
-
-_GPT_OSS_FINAL_CHANNEL_TRIGGER = "<|start|>assistant<|channel|>final<|message|>"
-
-
-def _normalize_json_schema_for_structural_tag(json_schema: Any) -> Any:
-    if hasattr(json_schema, "model_json_schema"):
-        json_schema = json_schema.model_json_schema()
-    if isinstance(json_schema, str):
-        json_schema = json.loads(json_schema)
-    if isinstance(json_schema, dict) and "schema" in json_schema:
-        json_schema = json_schema["schema"]
-    return json_schema
-
-
-def _gpt_oss_guided_decoding_content(
-        guided_decoding_params: GuidedDecodingParams) -> Optional[dict]:
-    if guided_decoding_params.json is not None:
-        json_schema = _normalize_json_schema_for_structural_tag(
-            guided_decoding_params.json)
-        return {"type": "json_schema", "json_schema": json_schema}
-    if guided_decoding_params.json_object:
-        return {"type": "json_schema", "json_schema": {"type": "object"}}
-    if guided_decoding_params.regex is not None:
-        return {"type": "regex", "pattern": guided_decoding_params.regex}
-    if guided_decoding_params.grammar is not None:
-        return {"type": "grammar", "grammar": guided_decoding_params.grammar}
-    return None
-
-
-def _adapt_gpt_oss_guided_decoding_params(
-    guided_decoding_params: Optional[GuidedDecodingParams],
-) -> Optional[GuidedDecodingParams]:
-    if guided_decoding_params is None:
-        return None
-    if guided_decoding_params.structural_tag is not None:
-        return guided_decoding_params
-
-    content = _gpt_oss_guided_decoding_content(guided_decoding_params)
-    if content is None:
-        return guided_decoding_params
-
-    structural_tag = {
-        "type": "structural_tag",
-        "format": {
-            "type":
-            "triggered_tags",
-            "triggers": [_GPT_OSS_FINAL_CHANNEL_TRIGGER],
-            "tags": [{
-                "begin": _GPT_OSS_FINAL_CHANNEL_TRIGGER,
-                "content": content,
-                "end": "",
-            }],
-            "stop_after_first":
-            True,
-        },
-    }
-    return GuidedDecodingParams(
-        structural_tag=json.dumps(structural_tag, separators=(",", ":")))
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -260,6 +204,20 @@ def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
             _contains_bart_forced_tokens_logits_processor(item)
             for item in processors)
     return False
+
+
+def _resolve_guided_decoding_reasoning_parser(
+    reasoning_parser: Optional[str],
+    hf_model_config: Any,
+) -> Optional[str]:
+    if reasoning_parser is not None:
+        return reasoning_parser
+
+    # Raw LLM does not go through the serving Harmony path, so infer the same
+    # reasoning format that serving uses for GPT-OSS chat requests.
+    if getattr(hf_model_config, "model_type", None) == "gpt_oss":
+        return HARMONY_REASONING_PARSER
+    return None
 
 
 TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -1327,10 +1285,13 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
-            if getattr(self._hf_model_config, "model_type", None) == "gpt_oss":
-                sampling_params.guided_decoding = (
-                    _adapt_gpt_oss_guided_decoding_params(
-                        sampling_params.guided_decoding))
+            guided_decoding_reasoning_parser = (
+                _resolve_guided_decoding_reasoning_parser(
+                    self.args.reasoning_parser, self._hf_model_config))
+            sampling_params.guided_decoding = (
+                adapt_guided_decoding_params_for_reasoning_parser(
+                    sampling_params.guided_decoding,
+                    guided_decoding_reasoning_parser))
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,

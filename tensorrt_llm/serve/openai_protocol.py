@@ -41,7 +41,9 @@ from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
-from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.llmapi.reasoning_parser import (
+    adapt_guided_decoding_params_for_reasoning_parser,
+)
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
@@ -292,64 +294,8 @@ def _response_format_to_guided_decoding_params(
     else:
         raise ValueError(f"Unsupported response format: {response_format.type}")
 
-    if guided_decoding_params is None or reasoning_parser is None:
-        return guided_decoding_params
-
-    if guided_decoding_params.structural_tag is not None:
-        return guided_decoding_params
-
-    # Adapt guided_decoding_params for reasoning parser
-    if guided_decoding_params.json is not None:
-        content = {
-            "type": "json_schema",
-            "json_schema": guided_decoding_params.json
-        }
-    elif guided_decoding_params.json_object:
-        content = {"type": "json_schema", "json_schema": {"type": "object"}}
-    elif guided_decoding_params.regex is not None:
-        content = {"type": "regex", "pattern": guided_decoding_params.regex}
-    elif guided_decoding_params.grammar is not None:
-        content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
-
-    if reasoning_parser == "gpt_oss":
-        # Trigger user constraint by final channel
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
-            "tags": [
-                {
-                    "begin": "<|start|>assistant<|channel|>final<|message|>",
-                    "content": content,
-                    "end": "",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
-    else:
-        # Force thinking and then trigger user constraint
-        parser = ReasoningParserFactory.create_reasoning_parser(
-            reasoning_parser)
-        stag_format = {
-            "type":
-            "sequence",
-            "elements": [
-                {
-                    "type": "tag",
-                    "begin": parser.reasoning_start,
-                    "content": {
-                        "type": "any_text"
-                    },
-                    "end": parser.reasoning_end,
-                },
-                content,
-            ],
-        }
-
-    stag_format = ResponseFormat(type="structural_tag", format=stag_format)
-    return GuidedDecodingParams(structural_tag=stag_format.model_dump_json(
-        by_alias=True, exclude_none=True))
+    return adapt_guided_decoding_params_for_reasoning_parser(
+        guided_decoding_params, reasoning_parser)
 
 
 def _response_format_text_config_to_guided_decoding_params(
