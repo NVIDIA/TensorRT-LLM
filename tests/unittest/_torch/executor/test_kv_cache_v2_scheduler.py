@@ -586,7 +586,7 @@ class TestKVCacheFailuresCtx:
     def test_ctx_resize_fail_then_smaller_ctx(self):
         call_count = [0]
 
-        def resize_fn(req, n):
+        def resize_fn(req, n, history_length=None):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 
@@ -1261,7 +1261,7 @@ class TestDisagg:
         """resize_context failure skips the request, loop continues."""
         call_count = [0]
 
-        def resize_fn(req, n):
+        def resize_fn(req, n, history_length=None):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 

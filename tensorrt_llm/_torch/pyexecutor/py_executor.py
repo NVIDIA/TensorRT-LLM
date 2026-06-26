@@ -3131,6 +3131,12 @@ class PyExecutor:
 
                 self._handle_disagg_cache_errors_synced()
 
+                # Need to wait for the copy of previous iteration before
+                # modifying any host memory copied to GPU. Scheduler V2
+                # modifies the host page table, so wait before scheduling.
+                # This wait is also needed for legacy scheduler, but it can
+                # be pushed later, e.g. before model_engine._prepare_inputs().
+                self.model_engine.wait_for_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
@@ -3561,6 +3567,12 @@ class PyExecutor:
 
                 self._handle_disagg_cache_errors_synced()
 
+                # Need to wait for the copy of previous iteration before
+                # modifying any host memory copied to GPU. Scheduler V2
+                # modifies the host page table, so wait before scheduling.
+                # This wait is also needed for legacy scheduler, but it can
+                # be pushed later, e.g. before model_engine._prepare_inputs().
+                self.model_engine.wait_for_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
