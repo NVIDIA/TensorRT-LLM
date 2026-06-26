@@ -604,6 +604,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "trtllm-gen does not support sage attention."
         if meta.helix_position_offsets is not None:
             return False, "trtllm-gen does not support helix parallelism."
+        if fwd.mrope_rotary_cos_sin is not None:
+            return False, "trtllm-gen mRoPE numerics regress Qwen-VL MMMU (nvbugs/6316983)."
         sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
         sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
         if (
