@@ -78,7 +78,11 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _orig_argv = getattr(sys, "orig_argv", sys.argv)
     _is_pytest_main = any("pytest" in a for a in _orig_argv[:4])
     _is_nested_pytest = _parent_is_pytest() and _is_pytest_main
-    _skip_daemons = _is_pytest_main
+    # MpiPoolSession spawns each executor worker via `python -m mpi4py.futures.server`.
+    # A worker serves a single test, so it relies on the inherited CBTS_TEST_ID context
+    # and the atexit save and runs no background daemons during the test.
+    _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
+    _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
 
     _PERIODIC_SAVE_SECONDS = 5
     _stop_event = threading.Event()
