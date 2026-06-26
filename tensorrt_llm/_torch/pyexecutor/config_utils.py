@@ -452,17 +452,17 @@ def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: Optional[str] = None,
                            **kwargs) -> transformers.PretrainedConfig:
+    if checkpoint_format in ("mistral", "mistral_large_3"):
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        return MistralConfigLoader().load(model_name_or_path).pretrained_config
+
     config_dict, _ = transformers.PretrainedConfig.get_config_dict(
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
 
-    if checkpoint_format in ("mistral", "mistral_large_3"):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
-        model_config = MistralConfigLoader().load(
-            model_name_or_path).pretrained_config
-    elif model_type in _CONFIG_REGISTRY:
+    if model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)

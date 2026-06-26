@@ -903,8 +903,15 @@ def create_input_processor(
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
+        from tensorrt_llm._torch.models.modeling_mistral import \
+            MistralNativeInputProcessor
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        return MistralNativeInputProcessor(model_path_or_dir,
+                                           config,
+                                           tokenizer,
+                                           trust_remote_code=trust_remote_code,
+                                           **kwargs)
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")

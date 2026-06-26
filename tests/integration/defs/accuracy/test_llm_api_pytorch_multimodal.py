@@ -455,7 +455,11 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         mocker,
     ):
         mocker.patch.dict(
-            MMMU.EVALUATE_KWARGS, {"model_type": "mistral_large_3", "is_force_single_image": True}
+            MMMU.EVALUATE_KWARGS,
+            {
+                "model_type": "mistral_common",
+                "is_force_single_image": True,
+            },
         )
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
