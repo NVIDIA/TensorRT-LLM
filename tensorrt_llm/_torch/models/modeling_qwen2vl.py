@@ -82,42 +82,6 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
-def _install_merge_kwargs_cache(processor) -> None:
-    """Memoize `processor._merge_kwargs` by input kwargs signature.
-
-    `ProcessorMixin._merge_kwargs` is pure but runs on every processor
-    call. When all requests pass the same kwargs (the common deployment
-    case), caching by signature reduces it to an O(1) lookup after the
-    first call.
-
-    Values are deep-copied on get and put because callers mutate the
-    returned dict.
-    """
-    import copy
-
-    if getattr(processor, "_merge_kwargs_cached_installed", False):
-        return
-
-    cache: dict = {}
-    orig = processor._merge_kwargs
-
-    def _cached_merge_kwargs(*args, **kwargs):
-        try:
-            key = repr(sorted(kwargs.items()))
-        except TypeError:
-            # Unsortable / un-repr-able kwargs — fall back to uncached call.
-            return orig(*args, **kwargs)
-        hit = cache.get(key)
-        if hit is not None:
-            return copy.deepcopy(hit)
-        result = orig(*args, **kwargs)
-        cache[key] = copy.deepcopy(result)
-        return result
-
-    processor._merge_kwargs = _cached_merge_kwargs
-    processor._merge_kwargs_cached_installed = True
-
-
 def _prepare_qwen_vl_vision_attn_metadata(
         seq_lens: List[int],
         attn_metadata: AttentionMetadata) -> AttentionMetadata:
@@ -238,7 +202,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             model_path,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
-        _install_merge_kwargs_cache(self._processor)
 
         # temporal patch size for video frames
         self.temporal_patch_size = getattr(self.config.vision_config,
