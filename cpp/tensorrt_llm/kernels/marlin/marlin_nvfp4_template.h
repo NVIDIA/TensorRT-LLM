@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,40 +52,26 @@ namespace MARLIN_NAMESPACE_NAME
 // Empty kernel stub for non-Hopper device passes; see marlin.cuh.
 #if defined(__CUDA_ARCH__) && !(__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000)
 
-template <typename scalar_t,                       // compute dtype, nv_bfloat16
-    int const threads,                             // number of threads in a threadblock
-    int const thread_m_blocks,                     // number of 16x16 blocks in the m
-                                                   // dimension (batchsize) of the
-                                                   // threadblock
-    int const thread_n_blocks,                     // same for n dimension (output)
-    int const thread_k_blocks,                     // same for k dimension (reduction)
-    bool const m_block_size_8,                     // whether m_block_size == 8
-                                                   // only works when thread_m_blocks == 1
-    int const stages,                              // number of stages for the async global->shared
-                                                   // fetch pipeline
-    bool const has_act_order,                      // whether act_order is enabled
-    int group_blocks                               // number of consecutive 16x16 blocks
-                                                   // with a separate quantization scale
-                                                   // (implicit const: trailing NTTP)
+template <typename scalar_t,   // compute dtype, nv_bfloat16
+    int const threads,         // number of threads in a threadblock
+    int const thread_m_blocks, // number of 16x16 blocks in the m
+                               // dimension (batchsize) of the
+                               // threadblock
+    int const thread_n_blocks, // same for n dimension (output)
+    int const thread_k_blocks, // same for k dimension (reduction)
+    bool const m_block_size_8, // whether m_block_size == 8
+                               // only works when thread_m_blocks == 1
+    int const stages,          // number of stages for the async global->shared
+                               // fetch pipeline
+    int group_blocks           // number of consecutive 16x16 blocks
+                               // with a separate quantization scale
+                               // (implicit const: trailing NTTP)
     >
-__global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape mxk
-    int4 const* __restrict__ B,                    // 4bit quantized weight matrix of shape kxn
-    int4* __restrict__ C,                          // fp16 output buffer of shape mxn
-    int4* __restrict__ C_tmp,                      // fp32 tmp output buffer (for reduce)
-    int4 const* __restrict__ scales_ptr,           // fp16 quantization scales of shape
-                                                   // (k/groupsize)xn
-    int const* __restrict__ g_idx,                 // int32 group indices of shape k
-    int num_groups,                                // number of scale groups per output channel
-    int prob_m,                                    // batch dimension m
-    int prob_n,                                    // output dimension n
-    int prob_k,                                    // reduction dimension k
-    int* locks,                                    // extra global storage for barrier synchronization
-    bool use_fp32_reduce                           // whether to use fp32 global reduce
-)
+__global__ void Marlin(MARLIN_KERNEL_PARAMS)
 {
 }
 
-} // namespace marlin
+} // namespace MARLIN_NAMESPACE_NAME
 
 #else
 
