@@ -420,9 +420,7 @@ num_generation_steps = [2]
 
 tokens_per_block = 64
 
-# Keep this sparse MLA integration matrix on BF16 to control runtime. FP8 KV-cache
-# coverage lives in the dedicated DSA FP8 indexer and paged-MQA tests.
-kv_cache_dtype_list = [torch.bfloat16]
+kv_cache_dtype_list = [torch.bfloat16, torch.float8_e4m3fn]
 # DSA only supports rope_append=True
 rope_append_values = [True]
 scenarios = [
@@ -439,6 +437,7 @@ scenarios = [
 
 accuracy_dict = {
     torch.bfloat16: (0.1, 0.01),
+    torch.float8_e4m3fn: (0.12, 0.01),
 }
 
 SPARSE_TOPK = 2048
