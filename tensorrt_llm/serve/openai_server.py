@@ -248,6 +248,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     "server_role": server_role.name,
                     "url": self.binding_addr
                 }
+                dynamo_worker_id = os.getenv(
+                    "TRTLLM_DYNAMO_WORKER_ID") or os.getenv("DYNAMO_WORKER_ID")
+                if dynamo_worker_id is not None:
+                    metadata["dynamo_worker_id"] = int(dynamo_worker_id)
                 # TODO: add more metadata
                 # Register with ETCD using the existing key format
                 self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
