@@ -453,7 +453,9 @@ class CpuOffloadConfig(StrictBaseModel):
       ``text_encoder``, ``transformer``, ``vae``.
     - **stage**: one step of the offload schedule — a single component, or a
       group of components that are co-resident on the GPU and run together
-      before being evicted. The ordered list of stages is set by ``stages``.
+      before being evicted. For example, a stage ``["text_encoder", "transformer"]``
+      keeps both components on GPU until that stage completes. The ordered list
+      of stages is set by ``stages``.
     """
 
     enable: bool = Field(
@@ -472,7 +474,9 @@ class CpuOffloadConfig(StrictBaseModel):
         description=(
             "Optional ordered list of stages, named with model-specific public component "
             "names. Each entry is a single component, or a list of components that are "
-            "co-resident on the GPU and run together as one stage, e.g. "
+            "co-resident on the GPU and run together as one stage. For example, "
+            "[['text_encoder', 'transformer'], 'vae'] keeps text_encoder and "
+            "transformer co-resident before moving to vae. Example components: "
             "['text_encoder', 'transformer', 'vae'] for Wan T2V, or "
             "['reasoner', 'generator', 'text_guardrail', 'video_guardrail', 'vae'] for Cosmos3. "
             "If omitted, the model chooses default stages."
