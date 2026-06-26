@@ -846,6 +846,111 @@ def _distributed_worker_function(world_size, strategy):
     return True
 
 
+def test_choose_one_cache_hit():
+    """choose_one() should cache (runner_id, tactic) and reuse on subsequent calls."""
+    x, w = torch.randn(16, 64), torch.randn(64, 128)
+    runner = GemmRunner()
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner._choose_one_cache.clear()
+
+    # Tune first
+    with autotune():
+        tuner.choose_one("test_choose_one_cache", [runner], tuning_config,
+                         [x, w])
+
+    # First choose_one — cache miss, populates _choose_one_cache
+    runner1, tactic1 = tuner.choose_one("test_choose_one_cache", [runner],
+                                        tuning_config, [x, w])
+    assert runner1 is runner
+    assert isinstance(tactic1, int)
+
+    fast_key = AutoTuner._make_fast_key("test_choose_one_cache", [runner],
+                                        tuning_config, [x, w])
+    assert fast_key in tuner._choose_one_cache, \
+        "_choose_one_cache should have entry after first call"
+
+    # Second choose_one — cache hit, same values
+    runner2, tactic2 = tuner.choose_one("test_choose_one_cache", [runner],
+                                        tuning_config, [x, w])
+    assert runner1 is runner2, "Cached choose_one should return same runner"
+    assert tactic1 == tactic2, "Cached choose_one should return same tactic"
+
+    # Re-tuning should clear _choose_one_cache
+    with autotune():
+        tuner.choose_one("test_choose_one_cache", [runner], tuning_config,
+                         [x, w])
+    assert len(tuner._choose_one_cache) == 0, \
+        "_choose_one_cache should be cleared after re-tuning"
+
+
+def test_choose_one_cache_different_runners_same_op():
+    """choose_one() cache must not collide when different runners share the same custom_op.
+
+    Reproduces the bug where _choose_one_cache key was (custom_op, *bucketed_dims)
+    without runner identity, causing a runner configured for one dtype to be
+    returned for a call with a different dtype (e.g. int8 runner used for int4 data).
+    """
+
+    class TypedRunner(TunableRunner):
+        """Runner whose output depends on a config parameter (simulates weight_dtype)."""
+
+        def __init__(self, scale: float):
+            super().__init__()
+            self.scale = scale
+
+        def unique_id(self):
+            return (self.scale, )
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0]
+
+        def forward(self, /, inputs, *, tactic=0, **kwargs):
+            return inputs[0] @ inputs[1] * self.scale
+
+    x, w = torch.randn(16, 64), torch.randn(64, 128)
+    runner_a = TypedRunner(scale=1.0)
+    runner_b = TypedRunner(scale=2.0)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner._choose_one_cache.clear()
+
+    # Tune both runners under the SAME custom_op name
+    op_name = "test_cache_collision"
+    with autotune():
+        tuner.choose_one(op_name, [runner_a], tuning_config, [x, w])
+    with autotune():
+        tuner.choose_one(op_name, [runner_b], tuning_config, [x, w])
+
+    # First call — runner_a
+    r1, t1 = tuner.choose_one(op_name, [runner_a], tuning_config, [x, w])
+    result_a = r1(inputs=[x, w], tactic=t1)
+
+    # Second call — runner_b (MUST NOT return runner_a's cached result)
+    r2, t2 = tuner.choose_one(op_name, [runner_b], tuning_config, [x, w])
+    result_b = r2(inputs=[x, w], tactic=t2)
+
+    expected_a = x @ w * 1.0
+    expected_b = x @ w * 2.0
+    assert torch.allclose(result_a, expected_a, atol=1e-5), \
+        f"Runner A should produce scale=1.0 result"
+    assert torch.allclose(result_b, expected_b, atol=1e-5), \
+        f"Runner B should produce scale=2.0 result, got scale={result_b[0,0]/expected_a[0,0]:.1f}x (cache collision!)"
+    assert r1 is not r2, "Different runners must not be aliased by cache"
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize(
