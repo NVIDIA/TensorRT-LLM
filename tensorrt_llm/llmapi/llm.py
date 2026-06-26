@@ -1018,6 +1018,10 @@ class BaseLLM:
                 prompt_token_ids = inp_tok["prompt_token_ids"]
                 if multi_item_part_lens is not None:
                     # validate lengths
+                    if len(multi_item_part_lens) < 2:
+                        raise ValueError(
+                            "\"multi_item_part_lens\" must have at least two elements"
+                        )
                     if sum(multi_item_part_lens) + len(
                             multi_item_part_lens) != len(prompt_token_ids):
                         raise ValueError(
