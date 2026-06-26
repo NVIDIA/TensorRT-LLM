@@ -49,12 +49,8 @@ def main():
     args = parser.parse_args()
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
-    if args.visual_gen_args:
-        visual_gen_args = VisualGenArgs.from_yaml(args.visual_gen_args)
-    else:
-        visual_gen_args = VisualGenArgs()
-
-    visual_gen = VisualGen(model=args.model, args=visual_gen_args)
+    extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
+    visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: T2V request construction ---
     # Start from per-model defaults (steps, guidance, seed, etc.) and override resolution/frames.
