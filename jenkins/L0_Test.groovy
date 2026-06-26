@@ -5482,8 +5482,8 @@ pipeline {
                     echo "env.testFilter is: ${env.testFilter}"
                     testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
-                    // CBTS coverage is collected on post-merge pipelines only. Phase 2: swap IS_POST_MERGE for an OFFICIAL_POST_MERGE field from L0_MergeRequest.
-                    CBTS_PIPELINE_ELIGIBLE = testFilter[(IS_POST_MERGE)] ?: false
+                    // CBTS coverage runs on every pipeline (pre- and post-merge).
+                    CBTS_PIPELINE_ELIGIBLE = true
                     echo "CBTS_PIPELINE_ELIGIBLE is: ${CBTS_PIPELINE_ELIGIBLE}"
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
