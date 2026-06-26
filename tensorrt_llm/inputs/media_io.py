@@ -32,6 +32,7 @@ from typing import (
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
+import lazy_loader as lazy
 import numpy as np
 import requests
 import soundfile
@@ -41,6 +42,11 @@ from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
+
+# Lazy import: OpenCV is large and only needed when the cv2-backed video
+# decode path is exercised. The proxy triggers the actual `import cv2` on
+# first attribute access (e.g. `cv2.VideoCapture`).
+cv2 = lazy.load("cv2")
 
 
 def rgba_to_rgb(
@@ -345,16 +351,13 @@ def _select_cv2_stream_buffered_backend() -> Optional[int]:
     open. Built-in backends (the FFMPEG path in the PyPI wheels) are always
     safe to use.
     """
-    # Keep this import local to avoid importing cv2 if not needed.
-    import cv2
-
     # The stream-buffered API was introduced in OpenCV 4.13.0. Older builds
     # don't have `cv2.videoio_registry.getStreamBufferedBackends`, so signal
     # "no usable backend" and let the caller fall back to the tempfile path.
     if Version(cv2.__version__) < Version("4.13.0"):
         return None
 
-    from cv2 import videoio_registry as vr
+    vr = cv2.videoio_registry
 
     # `getStreamBufferedBackends()` enumerates every backend in this OpenCV
     # build that *claims* to support stream-buffered reads. We filter that
@@ -416,9 +419,6 @@ def _load_video_by_cv2(
                       HF processor (its `do_rescale=True` path).
       `"pil"`       - list[PIL.Image], one per sampled frame.
     """
-    # Keep this import local to avoid importing cv2 if not needed
-    import cv2
-
     assert format in ("pt", "hwc_uint8", "pil"), "format must be one of 'pt', 'hwc_uint8', 'pil'"
 
     # Open the source. Two cases:
