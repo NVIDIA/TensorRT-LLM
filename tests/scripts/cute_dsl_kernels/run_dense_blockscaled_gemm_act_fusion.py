@@ -41,11 +41,16 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Functionality and performance test for Sm100 Persistent Dense BlockScaled GEMM with SwiGLU fusion.
+"""Functionality and performance test for Sm100 Persistent Dense BlockScaled GEMM activation fusion.
 
-Functional testing:
+The kernel supports two activations selected via ``--activation``:
+  * ``swiglu`` (default): gated SiLU; output C has N/2 columns.
+  * ``gelu``: non-gated tanh-approx GELU; output C keeps the full N columns,
+    with an optional per-N bias added before the activation (``--bias``).
 
-python run_dense_blockscaled_gemm_swiglu_fusion.py \
+Functional testing (SwiGLU):
+
+python run_dense_blockscaled_gemm_act_fusion.py \
         --mnkl 512,256,256,1 \
         --ab_dtype Float4E2M1FN --c_dtype BFloat16 \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
@@ -53,7 +58,23 @@ python run_dense_blockscaled_gemm_swiglu_fusion.py \
 
 Functional testing with FP4 output + SFC:
 
-python run_dense_blockscaled_gemm_swiglu_fusion.py \
+python run_dense_blockscaled_gemm_act_fusion.py \
+        --mnkl 512,256,256,1 \
+        --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
+        --sf_dtype Float8E4M3FN --sf_vec_size 16 \
+        --mma_tiler_mn 128,128 --cluster_shape_mn 1,1
+
+Functional testing (non-gated GELU, bf16 output):
+
+python run_dense_blockscaled_gemm_act_fusion.py --activation gelu \
+        --mnkl 512,256,256,1 \
+        --ab_dtype Float4E2M1FN --c_dtype BFloat16 \
+        --sf_dtype Float8E4M3FN --sf_vec_size 16 \
+        --mma_tiler_mn 128,128 --cluster_shape_mn 1,1
+
+Functional testing (non-gated GELU + bias, FP4 output + SFC):
+
+python run_dense_blockscaled_gemm_act_fusion.py --activation gelu --bias \
         --mnkl 512,256,256,1 \
         --ab_dtype Float4E2M1FN --c_dtype Float4E2M1FN \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
@@ -61,7 +82,7 @@ python run_dense_blockscaled_gemm_swiglu_fusion.py \
 
 Perf testing:
 
-python run_dense_blockscaled_gemm_swiglu_fusion.py \
+python run_dense_blockscaled_gemm_act_fusion.py \
         --mnkl 4096,7168,2048,1 \
         --ab_dtype Float4E2M1FN --c_dtype BFloat16 \
         --sf_dtype Float8E4M3FN --sf_vec_size 16 \
@@ -69,10 +90,12 @@ python run_dense_blockscaled_gemm_swiglu_fusion.py \
         --vectorized_f32 \
         --skip_ref_check --use_cold_l2 --use_cupti --warmup_iterations 10 --iterations 50
 
-Note: N is the full B matrix width. The output C has N/2 columns after SwiGLU fusion.
+Note: N is the full B matrix width. For SwiGLU the output C has N/2 columns; for
+non-gated GELU the output C keeps the full N columns.
 """
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Tuple, Type
@@ -83,16 +106,18 @@ import cutlass.torch as cutlass_torch
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from tensorrt_llm._torch.utils import ActivationType
+
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
-        dense_blockscaled_gemm_swiglu_fusion as kernel_module,
+        dense_blockscaled_gemm_act_fusion as kernel_module,
     )
 except (ModuleNotFoundError, ImportError):
     sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell import dense_blockscaled_gemm_swiglu_fusion as kernel_module
+    from blackwell import dense_blockscaled_gemm_act_fusion as kernel_module
 
-Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel = (
-    kernel_module.Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
+Sm100BlockScaledPersistentDenseGemmActFusionKernel = (
+    kernel_module.Sm100BlockScaledPersistentDenseGemmActFusionKernel
 )
 cvt_sf_MKL_to_M32x4xrm_K4xrk_L = kernel_module.cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 
@@ -121,16 +146,20 @@ def run(
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
     use_cupti: bool = False,
+    activation: str = "swiglu",
+    use_bias: bool = False,
     **kwargs,
 ):
-    """Runs and benchmarks the persistent batched dense block-scaled GEMM with SwiGLU fusion.
+    """Runs and benchmarks the persistent batched dense block-scaled GEMM with activation fusion.
 
     This function prepares input tensors, launches the kernel, optionally
     validates the results against a reference implementation, and measures
     performance.
 
-    N is the full B matrix width. The output C tensor has N/2 columns
-    after the SwiGLU fusion (interleaved up/gate pairs are combined).
+    N is the full B matrix width. For the gated SwiGLU activation the output C
+    tensor has N/2 columns (interleaved up/gate pairs are combined). For the
+    non-gated GELU activation the output C tensor keeps the full N columns,
+    with an optional per-N bias added before the activation.
 
     Args:
         mnkl (Tuple[int, int, int, int]): The dimensions (M, N, K, L) of the
@@ -159,6 +188,11 @@ def run(
             ensure a cold L2 cache. Defaults to False.
         use_cupti (bool, optional): If True, uses CUPTI to measure execution time.
             Defaults to False.
+        activation (str, optional): Fused activation, "swiglu" (gated, output
+            N/2) or "gelu" (non-gated tanh-approx GELU, output N). Defaults to
+            "swiglu".
+        use_bias (bool, optional): If True (only meaningful for "gelu"), adds a
+            random per-N bias before the activation. Defaults to False.
         **kwargs: Additional keyword arguments.
 
     Returns:
@@ -168,7 +202,9 @@ def run(
         RuntimeError: If no CUDA-capable GPU is available.
         TypeError: If the configuration is not supported by the kernel.
     """
-    print("Running Sm100 Persistent Dense BlockScaled GEMM SwiGLU Fusion test with:")
+    print("Running Sm100 Persistent Dense BlockScaled GEMM Activation Fusion test with:")
+    print(f"Activation: {activation}")
+    print(f"Use bias: {use_bias}")
     print(f"mnkl: {mnkl}")
     print(f"AB dtype: {ab_dtype}, SF dtype: {sf_dtype}, SF Vec size: {sf_vec_size}")
     print(f"C dtype: {c_dtype}")
@@ -185,15 +221,19 @@ def run(
 
     # Unpack parameters
     m, n, k, batch = mnkl
-    n_after_swiglu = n // 2
+    # Gated SwiGLU halves the output width; non-gated GELU keeps the full N.
+    n_out = (n // 2) if activation == "swiglu" else n
+    # Alias kept so the SwiGLU reference path below stays byte-identical.
+    n_after_swiglu = n_out
 
-    assert n % 2 == 0, f"N must be even for SwiGLU fusion, got {n}"
+    if activation == "swiglu":
+        assert n % 2 == 0, f"N must be even for SwiGLU fusion, got {n}"
 
     # If c_dtype is Float4E2M1FN, SFC will be generated
     generate_sfc = c_dtype == cutlass.Float4E2M1FN
 
     # Skip unsupported testcase
-    if not Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel.can_implement(
+    if not Sm100BlockScaledPersistentDenseGemmActFusionKernel.can_implement(
         ab_dtype,
         sf_dtype,
         sf_vec_size,
@@ -387,13 +427,26 @@ def run(
     alpha_torch = torch.tensor([alpha_value], dtype=torch.float32).cuda()
     alpha = from_dlpack(alpha_torch)
 
+    # Create optional per-N bias for the non-gated GELU path. The kernel's
+    # __call__ takes a (m, n_out, l) cute.Tensor with M-stride 0 (broadcast over
+    # rows). We build it from a torch [n_out] vector expanded to (m, n_out, l)
+    # with stride (0, 1, 0) -- the same broadcast layout wrapper() constructs.
+    bias_n_torch = None
+    bias_tensor = None
+    use_gelu_bias = activation == "gelu" and use_bias
+    if use_gelu_bias:
+        bias_n_torch = (torch.randn(n_out, dtype=torch.float32) * 0.1).cuda()
+        bias_bcast = bias_n_torch.view(1, n_out, 1).expand(m, n_out, batch)
+        bias_tensor = from_dlpack(bias_bcast, assumed_align=16)
+
     # Configure gemm kernel
-    gemm = Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel(
+    gemm = Sm100BlockScaledPersistentDenseGemmActFusionKernel(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
         vectorized_f32,
         use_prefetch,
+        activation_type=(ActivationType.Gelu if activation == "gelu" else ActivationType.Swiglu),
     )
 
     # Compute max active clusters on current device
@@ -405,7 +458,10 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
-    # Compile gemm kernel
+    # Compile gemm kernel. bias_tensor is the trailing optional __call__ arg;
+    # it is only supplied for the non-gated GELU + bias path, so the SwiGLU
+    # (and bias-free GELU) compile signatures stay unchanged.
+    compile_bias_kwargs = {"bias_tensor": bias_tensor} if use_gelu_bias else {}
     if generate_sfc:
         compiled_gemm = cute.compile(
             gemm,
@@ -420,6 +476,7 @@ def run(
             lambda x: x,  # epilogue_op (default)
             sfc_tensor,
             norm_const_tensor,
+            **compile_bias_kwargs,
             options="--opt-level 2",
         )
     else:
@@ -433,12 +490,15 @@ def run(
             alpha,
             max_active_clusters,
             current_stream,
+            **compile_bias_kwargs,
             options="--opt-level 2",
         )
 
     # Compute reference result
     if not skip_ref_check:
-        # Execute kernel once for reference checking
+        # Execute kernel once for reference checking. bias_tensor is the trailing
+        # optional arg, supplied only for the non-gated GELU + bias path.
+        run_bias_kwargs = {"bias_tensor": bias_tensor} if use_gelu_bias else {}
         if generate_sfc:
             compiled_gemm(
                 a_tensor,
@@ -450,6 +510,7 @@ def run(
                 current_stream,
                 sfc_tensor,
                 norm_const_tensor,
+                **run_bias_kwargs,
             )
         else:
             compiled_gemm(
@@ -460,6 +521,7 @@ def run(
                 c_tensor,
                 alpha,
                 current_stream,
+                **run_bias_kwargs,
             )
 
         torch.cuda.synchronize()
@@ -471,21 +533,37 @@ def run(
         ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
         # alpha = 1.0, so no scaling needed for ref
 
-        # Apply SwiGLU: split N into interleaved up/gate blocks of 64 columns
-        # (matching epi_tile N=64), compute output = up * silu(gate)
-        group = 64
-        assert n % group == 0, f"N ({n}) must be divisible by {group} for SwiGLU block grouping"
-        num_blocks = n // group
-        assert num_blocks % 2 == 0, "Number of blocks must be even (pairs of up/gate)"
+        # Apply the fused activation, producing ref_after_swiglu with n_out
+        # columns (the variable name is shared by both activations so the
+        # downstream comparison code is identical).
+        if activation == "swiglu":
+            # Apply SwiGLU: split N into interleaved up/gate blocks of 64 columns
+            # (matching epi_tile N=64), compute output = up * silu(gate)
+            group = 64
+            assert n % group == 0, f"N ({n}) must be divisible by {group} for SwiGLU block grouping"
+            num_blocks = n // group
+            assert num_blocks % 2 == 0, "Number of blocks must be even (pairs of up/gate)"
 
-        cols = torch.arange(n, device=ref.device, dtype=torch.long)
-        block_cols = cols.view(num_blocks, group)
-        # Even blocks (0, 2, 4, ...) are 'up', odd blocks (1, 3, 5, ...) are 'gate'
-        up_idx = block_cols[0::2].reshape(-1)
-        gate_idx = block_cols[1::2].reshape(-1)
-        ref_up = ref.index_select(1, up_idx)
-        ref_gate = ref.index_select(1, gate_idx)
-        ref_after_swiglu = ref_up * (ref_gate * torch.sigmoid(ref_gate))
+            cols = torch.arange(n, device=ref.device, dtype=torch.long)
+            block_cols = cols.view(num_blocks, group)
+            # Even blocks (0, 2, 4, ...) are 'up', odd blocks (1, 3, 5, ...) are 'gate'
+            up_idx = block_cols[0::2].reshape(-1)
+            gate_idx = block_cols[1::2].reshape(-1)
+            ref_up = ref.index_select(1, up_idx)
+            ref_gate = ref.index_select(1, gate_idx)
+            ref_after_swiglu = ref_up * (ref_gate * torch.sigmoid(ref_gate))
+        else:
+            # Non-gated tanh-approx GELU on full N: x = alpha * acc + bias
+            # (bias per-N, broadcast over M), then gelu_tanh(x).
+            x = alpha_value * ref
+            if use_gelu_bias:
+                # bias_n_torch is [n_out] (built on CUDA for the kernel); the
+                # reference GEMM `ref` is on CPU, so align the device before add.
+                # Broadcast over M (dim 0) and L (dim 2).
+                x = x + bias_n_torch.view(1, n_out, 1).to(x.device)
+            ref_after_swiglu = (
+                0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3)))
+            )
 
         # Convert kernel output C back to f32 for comparison
         res = c_ref.cuda()
@@ -620,6 +698,10 @@ def run(
         _, sfa_tensor, _ = create_scale_factor_tensor(batch, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, _ = create_scale_factor_tensor(batch, n, k, sf_vec_size, sf_dtype)
 
+        # bias_tensor (read-only broadcast view) is the trailing runtime arg;
+        # appended only for the non-gated GELU + bias path so the bias-free
+        # JitArguments signatures stay unchanged.
+        extra_bias = (bias_tensor,) if use_gelu_bias else ()
         if generate_sfc:
             _, sfc_tensor, _ = create_scale_factor_tensor(
                 batch, m, n_after_swiglu, sf_vec_size, sf_dtype
@@ -636,6 +718,7 @@ def run(
                 current_stream,
                 sfc_tensor,
                 norm_const_tensor,
+                *extra_bias,
             )
         else:
             return cute.testing.JitArguments(
@@ -646,6 +729,7 @@ def run(
                 c_tensor,
                 alpha,
                 current_stream,
+                *extra_bias,
             )
 
     workspace_count = 1
@@ -710,6 +794,21 @@ if __name__ == "__main__":
         type=parse_comma_separated_ints,
         default=(1, 1),
         help="Cluster shape (comma-separated)",
+    )
+    parser.add_argument(
+        "--activation",
+        choices=["swiglu", "gelu"],
+        type=str,
+        default="swiglu",
+        help="Fused activation: 'swiglu' (gated, output N/2) or 'gelu' "
+        "(non-gated tanh-approx GELU, output N).",
+    )
+    parser.add_argument(
+        "--bias",
+        action="store_true",
+        default=False,
+        help="Add a random per-N bias before the activation (only meaningful "
+        "for --activation gelu).",
     )
     parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.Float4E2M1FN)
     parser.add_argument("--sf_dtype", type=cutlass.dtype, default=cutlass.Float8E4M3FN)
@@ -788,6 +887,8 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
         args.use_cupti,
+        activation=args.activation,
+        use_bias=args.bias,
     )
     if args.print_duration:
         print(f"Execution time: {exec_time:.2f} us")

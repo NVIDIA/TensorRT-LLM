@@ -150,6 +150,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (auto-promoted when flashinfer is importable) | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `MegaMoEDeepGemm` | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103 | NVFP4 via ported CuteDSL `Sm100MegaMoEKernel` fused dispatch+FC1+act+FC2+combine kernel; requires CUDA 13 Cutlass DSL runtime (PR #14354) and NVSHMEM provider (hard gate); threads per-expert `fc31_alpha`/`fc2_alpha`/`fc1_norm_const` through the kernel ABI and supports SwiGLU clamp via `swiglu_limit`; default deepgemm graph (topk score folded before fc1-out quant, host `combine_output.sum(dim=1)`) | `FUSED_COMM` |
+| `fused_moe_marlin.py` | `MarlinFusedMoE` | SM90 only | W4A16 NVFP4 on Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); no dynamic EPLB | `EXTERNAL_COMM` |
 | `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
 | `fused_moe_wide_ep.py` | `WideEPMoE` | All GPUs | Deprecating — use ConfigurableMoE instead | (legacy path) |
 | `fused_moe_vanilla.py` | `VanillaMoE` | All devices | Reference / debugging only | (legacy path) |
@@ -197,19 +198,20 @@ is available.
 
 Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style, ...)` method declares supported quantizations. Source of truth: the `can_implement` classmethod in each backend file.
 
-| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | WideEP | Vanilla |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | N | N | N | N | N | N | Y (SM90, BF16) | Y | Y |
-| FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | Y | Y |
-| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | Y (SM100/103) | N | N | N | Y | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y | Y |
-| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
-| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
-| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
-| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N |
-| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
-| W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
-| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | Y | N |
+| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | WideEP | Vanilla |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Unquantized (BF16/FP16) | Y (SM80+) | N | N | N | N | N | N | Y (SM90, BF16) | N | Y | Y |
+| FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y | Y |
+| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | Y (SM100/103) | N | N | N | N | Y | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM90, W4A16) | Y | Y |
+| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
+| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N | N |
+| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N | N |
+| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N | N |
+| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N | N |
+| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N | N |
+| W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N | N |
+| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | Y | N |
 
 ### Scheduler / EPLB Constraints
 

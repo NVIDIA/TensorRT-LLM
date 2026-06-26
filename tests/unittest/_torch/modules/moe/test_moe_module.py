@@ -841,6 +841,7 @@ QUANT_ALGOS = [
     QuantAlgo.W4A16_MXFP4,
     QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
 ]
@@ -855,6 +856,7 @@ BACKEND_TYPES = [
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
+    MoeBackendType.MARLIN,
 ]
 
 # Data types to test
@@ -1605,7 +1607,9 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     model_configs=MOE_MODEL_CONFIGS,
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
-    backend_types=BACKEND_TYPES,
+    backend_types=[
+        b for b in BACKEND_TYPES if b != MoeBackendType.MARLIN
+    ],  # Marlin doesn't support fused routing
     quant_algos=QUANT_ALGOS,
     routing_methods=MULTI_GPU_ROUTING_METHODS,
 )

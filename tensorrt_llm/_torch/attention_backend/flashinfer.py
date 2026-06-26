@@ -4,6 +4,7 @@ import os
 import sys
 import weakref
 from dataclasses import dataclass, field
+from itertools import chain
 from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
@@ -16,14 +17,13 @@ import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import torch_multi_arange
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
-from ..utils import get_global_attrs, get_model_extra_attrs
+from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
@@ -765,6 +765,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             raise ValueError(
                 "\"multi_item_part_lens\" needs to be provided for all requests."
             )
+        if any([len(part_lens) < 2 for part_lens in multi_item_part_lens]):
+            raise ValueError(
+                "\"multi_item_part_lens\" must have at least two elements")
 
         prefix_len_ptr = torch.tensor(
             [req_part_lens[0] for req_part_lens in multi_item_part_lens],
@@ -788,10 +791,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             [
                 item_len + 1
                 for req_part_lens, token_pos_in_items_raw_len in zip(
-                    multi_item_part_lens, token_pos_in_items_raw_lens)
-                for item_len in (
-                    req_part_lens[1:] +
-                    [token_pos_in_items_len - token_pos_in_items_raw_len])
+                    multi_item_part_lens,
+                    token_pos_in_items_raw_lens,
+                    strict=True) for item_len in
+                chain(req_part_lens[1:],
+                      [token_pos_in_items_len - token_pos_in_items_raw_len])
             ],
             pin_memory=prefer_pinned(),
             dtype=torch.int32,

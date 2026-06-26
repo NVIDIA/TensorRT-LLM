@@ -520,6 +520,14 @@ bool KVCacheBlock::isLeaf() const
     return !mLookupNode || !mLookupNode->hasChildren();
 }
 
+bool KVCacheBlock::isDetached() const
+{
+    // A block is "detached" when it is not registered in the reuse lookup tree
+    // (mLookupNode == nullptr), i.e. it holds no state that future requests can reuse.
+    // This mirrors the reuse condition used by isShared().
+    return mLookupNode == nullptr;
+}
+
 // This function calculates the number of block a layer should have, given
 // the total free memory and the window size of each layer.
 // For example, if we have 1 layer of window size 1024, and 2 layer of window
@@ -3130,7 +3138,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            // Send block to front of free queue if it has no reusable state,
+            // so detached blocks are evicted before blocks cached for reuse.
+            mEvictionPolicy->releaseBlock(block, /*toFront = */ block->isDetached());
         }
     }
     // Remove stored block ids in sequence

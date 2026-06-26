@@ -28,8 +28,8 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compiled_cat,
-                     maybe_compiled_copy_)
+                     is_nvfp4_marlin_enabled, is_torch_compiling,
+                     maybe_compiled_cat, maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -529,7 +529,8 @@ class Attention(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -541,6 +542,8 @@ class Attention(nn.Module):
 
         attn_cls = get_attention_backend(
             self.attn_backend, sparse_attention_config=sparse_attn_cfg)
+
+        self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -662,7 +665,7 @@ class Attention(nn.Module):
             self.o_proj,
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
-        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale
+        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
@@ -821,7 +824,8 @@ class Attention(nn.Module):
         use_custom_inplace_op = (self.register_to_config
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling())
+                                 and is_torch_compiling()
+                                 and not self.is_marlin_enabled)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
@@ -1237,6 +1241,7 @@ class MLA(nn.Module):
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
+        self._weights_transformed = False
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
@@ -1438,7 +1443,8 @@ class MLA(nn.Module):
             reduce_output=reduce_output,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
@@ -1624,6 +1630,7 @@ class MLA(nn.Module):
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
+        self._weights_transformed = False
 
     def apply_rope(
         self,
@@ -3003,7 +3010,9 @@ class MLA(nn.Module):
 
         return weight_param, scale_param
 
-    def post_load_weights(self):
+    def transform_weights(self) -> None:
+        if self._weights_transformed:
+            return
         has_fp8_block_scales = (
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
@@ -3016,3 +3025,10 @@ class MLA(nn.Module):
 
             self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
                 self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
+        self._weights_transformed = True
+
+    def post_load_weights(self) -> None:
+        self.transform_weights()
