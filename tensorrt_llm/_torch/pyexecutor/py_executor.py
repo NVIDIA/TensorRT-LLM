@@ -2544,6 +2544,11 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                if self._is_kv_manager_v2:
+                    # Finalize V2 context KV before disagg transfer/response
+                    # handling can terminate the request.
+                    self.kv_cache_manager.update_context_resources(
+                        scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3277,6 +3282,11 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    if self._is_kv_manager_v2:
+                        # Finalize V2 context KV before disagg transfer/response
+                        # handling can terminate the request.
+                        self.kv_cache_manager.update_context_resources(
+                            scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
 
@@ -3742,6 +3752,15 @@ class PyExecutor:
                     # the current input preparation has consumed those buffers.
                     self.model_engine.wait_for_input_copy()
                     self._update_request_states(scheduled_batch)
+
+                    # Update context requests' KV cache so that sliding-window
+                    # blocks freed by this chunk are visible to the next
+                    # iteration's scheduler.
+                    # Only applies to KV cache manager V2 + scheduler V2.
+                    if (self._is_kv_manager_v2
+                            and scheduled_batch.context_requests):
+                        self.kv_cache_manager.update_context_resources(
+                            scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
