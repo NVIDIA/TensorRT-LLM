@@ -46,6 +46,7 @@ from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
                        PybindMirror, TorchLlmArgs, TrtLlmArgs)
+from .guided_decoding import adapt_guided_decoding_for_reasoning_parser
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -1267,6 +1268,7 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
+            self._adapt_guided_decoding_params(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
@@ -1291,6 +1293,20 @@ class BaseLLM:
                                                        "stream_interval", 1)
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
+
+    def _guided_decoding_reasoning_parser(self) -> Optional[str]:
+        if self.args.reasoning_parser is not None:
+            return self.args.reasoning_parser
+        if getattr(self._hf_model_config, "model_type", None) == "gpt_oss":
+            return "gpt_oss"
+        return None
+
+    def _adapt_guided_decoding_params(
+            self, sampling_params: SamplingParams) -> None:
+        sampling_params.guided_decoding = (
+            adapt_guided_decoding_for_reasoning_parser(
+                sampling_params.guided_decoding,
+                self._guided_decoding_reasoning_parser()))
 
     def _add_bart_forced_tokens_logits_processor(
             self, sampling_params: SamplingParams) -> None:
