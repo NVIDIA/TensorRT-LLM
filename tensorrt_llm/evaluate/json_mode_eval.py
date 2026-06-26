@@ -29,6 +29,22 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .interface import Evaluator
 
 
+def _load_json_from_generation(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        starts = [index for index in (text.find("{"), text.find("["))
+                  if index != -1]
+        for start in sorted(starts):
+            try:
+                parsed, _ = decoder.raw_decode(text[start:])
+                return parsed
+            except json.JSONDecodeError:
+                pass
+        raise original_error
+
+
 class JsonModeEval(Evaluator):
 
     def __init__(self,
@@ -76,7 +92,8 @@ class JsonModeEval(Evaluator):
         all_corrections, all_grammar_corrections = [], []
         for output, ref, schema in zip(outputs, references, schemas):
             try:
-                output_json = json.loads(output.outputs[0].text)
+                output_json = _load_json_from_generation(
+                    output.outputs[0].text)
                 jsonschema.validate(output_json, json.loads(schema))
             except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)
