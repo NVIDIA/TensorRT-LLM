@@ -77,7 +77,6 @@ _FLASHINFER_PAGED_APPEND_OVER_1024_THREADS = (
 
 _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
 _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
-_TRTLLM_FAST_BUILD_GEN_UNSUPPORTED_HEAD_DIMS = (96,)
 _TRTLLM_BLACKWELL_SLIDING_DECODE_UNSTABLE = (
     # Gemma3-27B local layers and Gemma4-31B sliding layers.
     (32, 16, 128, 1024),
@@ -251,18 +250,6 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
                 "TRTLLM-Gen Blackwell MLA generation is missing the decode "
                 "kernel for headDimQk=576, headDimV=512, page_size=32"
             )
-
-    # The TRTLLM MMHA generation kernel is fast-built in this environment and
-    # omits the Phi-3 head_dim 96 generation shape. Context FMHA covers that
-    # config only on some architectures, so skip cases that include generation.
-    if (
-        backend == "TRTLLM"
-        and getattr(case, "cache", "paged") != "none"
-        and not getattr(case, "is_mla", False)
-        and case.num_contexts < len(case.seq_lens)
-        and case.head_dim in _TRTLLM_FAST_BUILD_GEN_UNSUPPORTED_HEAD_DIMS
-    ):
-        return f"TRTLLM fast-build MMHA generation is missing head_dim {case.head_dim}"
 
     # TRTLLM's fp8 generation (XQA) path computes in fp8 and needs the model's
     # real KV-dequant + output scale state (fed by the Attention module's
