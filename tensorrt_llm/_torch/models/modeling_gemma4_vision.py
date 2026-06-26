@@ -949,8 +949,12 @@ class Gemma4VisionModel(nn.Module):
 
         hf_hd = first_attn.hf_head_dim
         padded_hd = first_attn.head_dim
-        nh = first_attn.num_heads
-        nkv = first_attn.num_key_value_heads
+        # first_attn.num_heads / num_key_value_heads are already divided by
+        # tp_size, but these weights are still unsharded here, so read the full
+        # head counts from the vision config (no-op at tp1).
+        vc = first_attn.vision_config
+        nh = vc.num_attention_heads
+        nkv = getattr(vc, "num_key_value_heads", nh)
         pad_w = padded_hd - hf_hd
 
         # HF keys at this point have already had ``.linear.`` stripped if the

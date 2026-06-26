@@ -904,7 +904,12 @@ class CachedSequenceInterface:
                     self._caches[buf_name] = global_tensor
 
             if replay_work_items:
-                self._replay_work_items = torch.empty(
+                # Zero-init as an extra precaution (not torch.empty). The
+                # prepare_replay_metadata host-prepare hook (registered in
+                # initialize_resources) populates this buffer on every
+                # nest_sequences -- runtime and cudagraph capture alike -- so the
+                # replay SSM kernel never reads it unprepared.
+                self._replay_work_items = torch.zeros(
                     self.info.max_num_state_slots,
                     REPLAY_WORK_ITEM_WIDTH,
                     device=self.info.device,
@@ -1416,6 +1421,15 @@ class CachedSequenceInterface:
             f"other={s['other']}, "
             f"max_tokens={s['max_tokens']}"
         )
+
+        if self.info.batch_info.is_use_replay():
+            # Wrapper takes **kwargs to satisfy the host-prepare callable protocol;
+            # prepare_replay_metadata reads everything it needs from self, so no
+            # graph-input args are requested (empty arg list).
+            def _replay_metadata_hook(**_sequence_info_args) -> None:
+                self.prepare_replay_metadata()
+
+            self.info.register_host_prepare_for_attention_forward(_replay_metadata_hook, [])
 
         return len(self._caches)
 
