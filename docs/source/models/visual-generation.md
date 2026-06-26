@@ -229,7 +229,7 @@ args = VisualGenArgs(
 
 ### CPU Offloading (Wan T2V only)
 
-CPU offloading stages move selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true` or `--enable_offloading` in the example script.
+CPU offloading stages move selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`
 
 ### Multi-GPU Parallelism
 
