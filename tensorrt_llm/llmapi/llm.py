@@ -41,12 +41,12 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
-from ..sampling_params import LogitsProcessor, SamplingParams
+from ..sampling_params import (GuidedDecodingParams, LogitsProcessor,
+                               SamplingParams)
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
                        PybindMirror, TorchLlmArgs, TrtLlmArgs)
-from .guided_decoding import adapt_guided_decoding_for_reasoning_parser
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -55,6 +55,65 @@ from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+
+
+_GPT_OSS_FINAL_CHANNEL_TRIGGER = "<|start|>assistant<|channel|>final<|message|>"
+
+
+def _normalize_json_schema_for_structural_tag(json_schema: Any) -> Any:
+    if hasattr(json_schema, "model_json_schema"):
+        json_schema = json_schema.model_json_schema()
+    if isinstance(json_schema, str):
+        json_schema = json.loads(json_schema)
+    if isinstance(json_schema, dict) and "schema" in json_schema:
+        json_schema = json_schema["schema"]
+    return json_schema
+
+
+def _gpt_oss_guided_decoding_content(
+        guided_decoding_params: GuidedDecodingParams) -> Optional[dict]:
+    if guided_decoding_params.json is not None:
+        json_schema = _normalize_json_schema_for_structural_tag(
+            guided_decoding_params.json)
+        return {"type": "json_schema", "json_schema": json_schema}
+    if guided_decoding_params.json_object:
+        return {"type": "json_schema", "json_schema": {"type": "object"}}
+    if guided_decoding_params.regex is not None:
+        return {"type": "regex", "pattern": guided_decoding_params.regex}
+    if guided_decoding_params.grammar is not None:
+        return {"type": "grammar", "grammar": guided_decoding_params.grammar}
+    return None
+
+
+def _adapt_gpt_oss_guided_decoding_params(
+    guided_decoding_params: Optional[GuidedDecodingParams],
+) -> Optional[GuidedDecodingParams]:
+    if guided_decoding_params is None:
+        return None
+    if guided_decoding_params.structural_tag is not None:
+        return guided_decoding_params
+
+    content = _gpt_oss_guided_decoding_content(guided_decoding_params)
+    if content is None:
+        return guided_decoding_params
+
+    structural_tag = {
+        "type": "structural_tag",
+        "format": {
+            "type":
+            "triggered_tags",
+            "triggers": [_GPT_OSS_FINAL_CHANNEL_TRIGGER],
+            "tags": [{
+                "begin": _GPT_OSS_FINAL_CHANNEL_TRIGGER,
+                "content": content,
+                "end": "",
+            }],
+            "stop_after_first":
+            True,
+        },
+    }
+    return GuidedDecodingParams(
+        structural_tag=json.dumps(structural_tag, separators=(",", ":")))
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -1268,7 +1327,10 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
-            self._adapt_guided_decoding_params(sampling_params)
+            if getattr(self._hf_model_config, "model_type", None) == "gpt_oss":
+                sampling_params.guided_decoding = (
+                    _adapt_gpt_oss_guided_decoding_params(
+                        sampling_params.guided_decoding))
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
@@ -1293,20 +1355,6 @@ class BaseLLM:
                                                        "stream_interval", 1)
         sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
-
-    def _guided_decoding_reasoning_parser(self) -> Optional[str]:
-        if self.args.reasoning_parser is not None:
-            return self.args.reasoning_parser
-        if getattr(self._hf_model_config, "model_type", None) == "gpt_oss":
-            return "gpt_oss"
-        return None
-
-    def _adapt_guided_decoding_params(
-            self, sampling_params: SamplingParams) -> None:
-        sampling_params.guided_decoding = (
-            adapt_guided_decoding_for_reasoning_parser(
-                sampling_params.guided_decoding,
-                self._guided_decoding_reasoning_parser()))
 
     def _add_bart_forced_tokens_logits_processor(
             self, sampling_params: SamplingParams) -> None:
