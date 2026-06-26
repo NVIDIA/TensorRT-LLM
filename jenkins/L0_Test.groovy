@@ -1624,13 +1624,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
-                    # Record the terminal verdict for the controller to read, then
-                    # always exit 0: reaching this point means the monitor
-                    # successfully observed a terminal SLURM state, so the
-                    # controller's numRetries only re-runs the monitor on an
-                    # SSH/transport failure (no verdict written) -- not on a job
-                    # that already reached a terminal failure state, which a re-run
-                    # cannot change.
+                    # Record the verdict and always exit 0: a re-run can't change a
+                    # terminal state, so numRetries should only fire on transport loss.
                     printf '%s %s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
@@ -1651,12 +1646,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Monitor the SLURM job. The track script always exits 0 once it
-                // has recorded a terminal verdict to slurm_job_result.txt, so
-                // numRetries here only re-runs the monitor on an SSH/transport
-                // failure -- not on a job that already reached a terminal failure
-                // state (a re-run can't change that, and re-running wastes a full
-                // monitor cycle per attempt).
+                // Monitor the job. The track script always exits 0 once it records
+                // a verdict, so numRetries only re-runs on transport loss, not on a
+                // job that already reached a terminal state.
                 Utils.exec(
                     pipeline,
                     timeout: false,
@@ -1667,31 +1659,29 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     numRetries: 3
                 )
 
-                // Read the verdict the monitor recorded. "<STATE> <EXIT_CODE>";
-                // success is COMPLETED with exit 0 (srun --kill-on-bad-exit=1
-                // means any rank failure surfaces as a non-COMPLETED state).
-                def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName)
+                // Verdict: "<STATE> <EXIT_CODE>"; success is COMPLETED + exit 0.
+                def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName, 3)
                 def resultFields = jobResult ? jobResult.tokenize(' ') : []
                 def jobState = resultFields ? resultFields[0] : null
                 def jobExit = resultFields.size() > 1 ? resultFields[1] : null
                 if (jobState != "COMPLETED" || jobExit != "0") {
-                    // Prefer the monitor's captured state; fall back to an
-                    // authoritative sacct query if the verdict file was missing.
-                    // SLURM aggregates multi-node state into one allocation row
-                    // (TIMEOUT if any node hit the walltime). A TIMEOUT is a
-                    // walltime kill -- raise a typed UserFailure so neither the
-                    // SLURM retry loop nor the outer K8s pod retry re-runs a job
-                    // that would just time out again.
+                    // Verdict unreadable: fall back to an authoritative sacct query.
                     def slurmState = jobState ?: querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                    // ... and re-confirm success, so a transient read blip on a job
+                    // that actually passed doesn't fail the stage.
+                    if (jobState == null && slurmState == "COMPLETED") {
+                        echo "[INFRA-RETRY] ${stageName}: verdict unreadable but sacct reports COMPLETED for ${slurmJobId}; treating as success."
+                        return
+                    }
+                    // TIMEOUT is a walltime kill -- typed UserFailure so neither
+                    // retry layer re-runs a job that would just time out again.
                     if (slurmState == "TIMEOUT") {
                         throw new UserFailure(
                             "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
-                            "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
-                            "(state=${slurmState}, exit=${jobExit ?: 'unknown'})",
+                            "(hit partition walltime ${partition?.time}min); not retrying.",
                             null)
                     }
-                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}, " +
-                         "exit=${jobExit ?: 'unknown'}; deferring to failure classifier."
+                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
                     throw new Exception("Pytest failed in SLURM job ${slurmJobId} for ${stageName}")
                 }
             }
