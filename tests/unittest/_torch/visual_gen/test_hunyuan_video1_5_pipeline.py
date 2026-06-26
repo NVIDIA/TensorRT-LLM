@@ -234,8 +234,9 @@ class TestHunyuanVideo15PipelineCorrectness:
 class TestHunyuanVideo15BatchGeneration:
     """Batch generation tests for HunyuanVideo 1.5 pipeline
 
-    Tests that passing a list of prompts produces batched output
-    and matches sequential generation with the same seeds.
+    Validates that single-prompt generation returns (B, T, H, W, C) output and
+    that an effective batch size > 1 (e.g. a list of prompts) is rejected with a
+    ValueError, matching the current pipeline contract.
     """
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -258,6 +259,26 @@ class TestHunyuanVideo15BatchGeneration:
             assert result.video.ndim == 5, f"Expected 5D (B,T,H,W,C), got {result.video.ndim}D"
             B, _T, H, W, C = result.video.shape
             assert B == 1 and H == HEIGHT and W == WIDTH and C == 3
+        finally:
+            _teardown_pipeline(pipe)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_multi_prompt_raises(self):
+        """A list of prompts (effective batch size > 1) raises ValueError."""
+
+        pipe = None
+        try:
+            pipe = _load_trtllm_pipeline(HUNYUAN_VIDEO_1_5_PATH)
+            with torch.no_grad(), pytest.raises(ValueError):
+                pipe.forward(
+                    prompt=[PROMPT, PROMPT],
+                    negative_prompt=NEGATIVE_PROMPT,
+                    height=HEIGHT,
+                    width=WIDTH,
+                    num_frames=NUM_FRAMES,
+                    num_inference_steps=NUM_STEPS,
+                    seed=SEED,
+                )
         finally:
             _teardown_pipeline(pipe)
 
@@ -400,6 +421,7 @@ def _run_transformer(transformer, inputs: dict) -> torch.Tensor:
 class TestHunyuanVideo15PipelineFeatures:
     """Quantization loading, dtype layout, numerical accuracy, and memory for HunyuanVideo1.5."""
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_parameter_dtypes(self):
         """BF16 pipeline: every transformer param is on CUDA; all non-scale params are BF16."""
         pipe = None
