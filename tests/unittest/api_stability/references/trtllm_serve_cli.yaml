@@ -1,0 +1,358 @@
+# Stability reference for the `trtllm-serve` CLI surface.
+#
+# Every Click option on the `serve`, `disaggregated`, `disaggregated_mpi_worker`,
+# and `mm_embedding_serve` subcommands MUST be listed here with an explicit
+# stability status. The CI test (`tests/unittest/api_stability/test_serve_cli.py`)
+# diffs the live Click group against this file and fails on any divergence.
+#
+# Allowed statuses (forward transitions only):
+#     prototype  ->  beta  ->  stable  ->  deprecated  (-> removed after grace period)
+#
+# This is the AUDIT-COMPLETE reference. Every Click option declared on each
+# gated subcommand is listed below with the same status it carries in source
+# (via `help_info_with_stability_tag(...)`). `audit_mode: false` means the gate
+# is strict: adding a new option without a corresponding entry here is a build
+# failure, and so is removing, renaming, or retyping a listed option.
+#
+# Entries are alphabetical within each subcommand to keep diffs clean as new
+# options are added.
+audit_mode: false
+
+commands:
+  serve:
+    options:
+      agent_percentage:
+        type: float
+        default: 0.0
+        status: prototype
+      agent_types:
+        type: str
+        default: null
+        status: prototype
+      allow_request_chat_template:
+        type: bool
+        default: false
+        status: prototype
+      backend:
+        type: Choice(['_autodeploy', 'pytorch', 'tensorrt'])
+        default: pytorch
+        status: beta
+      chat_template:
+        type: str
+        default: null
+        status: prototype
+      context_parallel_size:
+        type: int
+        default: 1
+        status: beta
+        flags:
+        - "--context_parallel_size"
+        - "--cp_size"
+      custom_module_dirs:
+        type: Path
+        default: null
+        status: prototype
+      custom_tokenizer:
+        type: str
+        default: null
+        status: prototype
+      disagg_cluster_uri:
+        type: str
+        default: null
+        status: prototype
+      enable_attention_dp:
+        type: bool
+        default: false
+        status: beta
+      enable_chunked_prefill:
+        type: bool
+        default: false
+        status: prototype
+      extra_llm_api_options:
+        type: str
+        default: null
+        status: prototype
+        flags:
+        - "--config"
+        - "--extra_llm_api_options"
+      fail_fast_on_attention_window_too_large:
+        type: bool
+        default: true
+        status: deprecated
+      free_gpu_memory_fraction:
+        type: float
+        default: 0.9
+        status: beta
+        flags:
+        - "--free_gpu_memory_fraction"
+        - "--kv_cache_free_gpu_memory_fraction"
+      gpus_per_node:
+        type: int
+        default: null
+        status: beta
+      grpc:
+        type: bool
+        default: false
+        status: prototype
+      host:
+        type: str
+        default: localhost
+        status: beta
+      kv_cache_dtype:
+        type: Choice(['auto', 'fp8', 'nvfp4'])
+        default: auto
+        status: prototype
+      log_level:
+        type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
+        default: info
+        status: beta
+      max_batch_size:
+        type: int
+        default: 2048
+        status: beta
+      max_beam_width:
+        type: int
+        default: 1
+        status: beta
+      max_num_tokens:
+        type: int
+        default: 8192
+        status: beta
+      max_seq_len:
+        type: int
+        default: null
+        status: beta
+      media_io_kwargs:
+        type: str
+        default: null
+        status: prototype
+      metadata_server_config_file:
+        type: str
+        default: null
+        status: prototype
+      middleware:
+        type: str
+        default: null
+        status: prototype
+      moe_cluster_parallel_size:
+        type: int
+        default: null
+        status: deprecated
+        flags:
+        - "--cluster_size"
+        - "--moe_cluster_parallel_size"
+      moe_expert_parallel_size:
+        type: int
+        default: null
+        status: beta
+        flags:
+        - "--ep_size"
+        - "--moe_expert_parallel_size"
+      num_postprocess_workers:
+        type: int
+        default: 0
+        status: prototype
+      otlp_traces_endpoint:
+        type: str
+        default: null
+        status: prototype
+      pipeline_parallel_size:
+        type: int
+        default: 1
+        status: beta
+        flags:
+        - "--pipeline_parallel_size"
+        - "--pp_size"
+      port:
+        type: int
+        default: 8000
+        status: beta
+      reasoning_parser:
+        type: Choice(['auto', 'deepseek-r1', 'gemma4', 'kimi_k2', 'kimi_k25', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'qwen3', 'qwen3_5'])
+        default: null
+        status: prototype
+      revision:
+        type: str
+        default: null
+        status: beta
+        flags:
+        - "--hf_revision"
+        - "--revision"
+      served_model_name:
+        type: str
+        default: null
+        status: prototype
+      server_role:
+        type: str
+        default: null
+        status: prototype
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"
+      tensor_parallel_size:
+        type: int
+        default: 1
+        status: beta
+        flags:
+        - "--tensor_parallel_size"
+        - "--tp_size"
+      tokenizer:
+        type: str
+        default: null
+        status: beta
+      tool_parser:
+        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
+        default: null
+        status: prototype
+      trust_remote_code:
+        type: bool
+        default: false
+        status: beta
+      video_pruning_rate:
+        type: float
+        default: null
+        status: prototype
+      visual_gen_args:
+        type: str
+        default: null
+        status: prototype
+
+  disaggregated:
+    options:
+      config_file:
+        type: str
+        default: null
+        status: beta
+        flags:
+        - "--config"
+        - "--config_file"
+        - "-c"
+      log_level:
+        type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
+        default: info
+        status: beta
+        flags:
+        - "--log_level"
+        - "-l"
+      metadata_server_config_file:
+        type: str
+        default: null
+        status: prototype
+        flags:
+        - "--metadata_server_config_file"
+        - "-m"
+      metrics_log_interval:
+        type: int
+        default: 0
+        status: deprecated
+      request_timeout:
+        type: int
+        default: 180
+        status: beta
+        flags:
+        - "--request_timeout"
+        - "-r"
+      schedule_style:
+        type: Choice(['context_first', 'generation_first'])
+        default: null
+        status: beta
+        flags:
+        - "--schedule_style"
+        - "-s"
+      server_start_timeout:
+        type: int
+        default: 180
+        status: beta
+        flags:
+        - "--server_start_timeout"
+        - "-t"
+
+  disaggregated_mpi_worker:
+    options:
+      config_file:
+        type: str
+        default: null
+        status: beta
+        flags:
+        - "--config"
+        - "--config_file"
+        - "-c"
+      log_level:
+        type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
+        default: info
+        status: beta
+
+  mm_embedding_serve:
+    options:
+      allow_request_chat_template:
+        type: bool
+        default: false
+        status: prototype
+      extra_encoder_options:
+        type: str
+        default: null
+        status: prototype
+        flags:
+        - "--config"
+        - "--extra_encoder_options"
+      free_gpu_memory_fraction:
+        type: float
+        default: 0.9
+        status: beta
+      gpus_per_node:
+        type: int
+        default: null
+        status: beta
+      host:
+        type: str
+        default: localhost
+        status: beta
+      log_level:
+        type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
+        default: info
+        status: beta
+      max_batch_size:
+        type: int
+        default: 2048
+        status: beta
+      max_num_tokens:
+        type: int
+        default: 16384
+        status: beta
+      metadata_server_config_file:
+        type: str
+        default: null
+        status: prototype
+      port:
+        type: int
+        default: 8000
+        status: beta
+      revision:
+        type: str
+        default: null
+        status: beta
+        flags:
+        - "--hf_revision"
+        - "--revision"
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"
+      tensor_parallel_size:
+        type: int
+        default: 1
+        status: beta
+        flags:
+        - "--tensor_parallel_size"
+        - "--tp_size"
+      trust_remote_code:
+        type: bool
+        default: false
+        status: beta
