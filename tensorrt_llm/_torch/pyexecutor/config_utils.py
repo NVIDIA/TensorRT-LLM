@@ -339,9 +339,10 @@ class _Qwen35ConfigCompat:
 
         The checkpoint advertises the generic Qwen3.5 VLM architecture, but
         TRT-LLM needs a dedicated architecture key to route it to
-        QwenImageBenchModel. Require both text and vision sub-configs plus
-        multimodal token IDs so plain or malformed Qwen3.5 configs are not
-        rewritten as Qwen-Image-Bench.
+        QwenImageBenchModel. Generic Qwen3.5 text checkpoints can also publish
+        composite text/vision metadata, so require the explicit
+        ``language_model_only: false`` marker from Qwen-Image-Bench before
+        rewriting the architecture.
         """
         architectures = config_dict.get("architectures") or []
         text_config = config_dict.get("text_config")
@@ -352,7 +353,8 @@ class _Qwen35ConfigCompat:
             "vision_start_token_id",
             "vision_end_token_id",
         }
-        return (architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
+        return (config_dict.get("language_model_only") is False
+                and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
                 and isinstance(text_config, dict) and bool(text_config)
                 and isinstance(vision_config, dict) and bool(vision_config)
                 and required_multimodal_token_ids.issubset(config_dict))

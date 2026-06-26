@@ -29,6 +29,7 @@ def _write_qwen_image_bench_config(model_dir):
         "dtype": "bfloat16",
         "eos_token_id": 248046,
         "image_token_id": 248056,
+        "language_model_only": False,
         "model_type": "qwen3_5",
         "pad_token_id": 248044,
         "tie_word_embeddings": False,
@@ -123,6 +124,22 @@ def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path)
     (tmp_path / "config.json").write_text(json.dumps(_qwen3_5_text_config()))
 
     config = load_pretrained_config(str(tmp_path))
+
+    assert isinstance(config, transformers.Qwen3NextConfig)
+    assert config.architectures == ["Qwen3_5ForCausalLM"]
+
+
+def test_qwen3_5_generic_composite_config_does_not_use_image_bench_arch(tmp_path):
+    model_dir = tmp_path / "Qwen3.5-4B"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
+
+    config_path = model_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    del config["language_model_only"]
+    config_path.write_text(json.dumps(config))
+
+    config = load_pretrained_config(str(model_dir))
 
     assert isinstance(config, transformers.Qwen3NextConfig)
     assert config.architectures == ["Qwen3_5ForCausalLM"]
