@@ -400,8 +400,7 @@ def load_pretrained_config(model_name_or_path: str,
         # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
         model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
-            Qwen35ConfigCompat.normalize(config_dict,
-                                         require_text_config=True))
+            Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.

@@ -118,7 +118,8 @@ class Qwen35ConfigCompat:
         treating the top-level dict as the text config.
         """
         text_config = Qwen35ConfigCompat._extract_text_config(
-            config_dict, require_text_config=require_text_config)
+            config_dict, require_text_config=require_text_config
+        )
         text_config = Qwen35ConfigCompat._inherit_quantization_config(config_dict, text_config)
         text_config = Qwen35ConfigCompat._flatten_rope(text_config)
 
@@ -156,16 +157,20 @@ class Qwen35ConfigCompat:
             return dict(text_config)
 
         architectures = config_dict.get("architectures") or []
-        if (architectures
-                and architectures[0] in Qwen35ConfigCompat._VLM_ARCHITECTURES
-                and isinstance(config_dict.get("vision_config"), dict)):
+        if (
+            architectures
+            and architectures[0] in Qwen35ConfigCompat._VLM_ARCHITECTURES
+            and isinstance(config_dict.get("vision_config"), dict)
+        ):
             text_config = config_dict.get("text_config")
             if not isinstance(text_config, dict) or not text_config:
                 raise ValueError("Qwen3.5 composite config is missing a usable text_config")
             text_config = dict(text_config)
-        elif (architectures
-              and architectures[0] in Qwen35ConfigCompat._VLM_ARCHITECTURES
-              and isinstance(config_dict.get("text_config"), dict)):
+        elif (
+            architectures
+            and architectures[0] in Qwen35ConfigCompat._VLM_ARCHITECTURES
+            and isinstance(config_dict.get("text_config"), dict)
+        ):
             text_config = dict(config_dict["text_config"])
         else:
             text_config = dict(config_dict)
