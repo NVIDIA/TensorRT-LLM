@@ -563,6 +563,15 @@ class PyExecutor:
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse
             and not isinstance(self.kv_cache_manager, KVCacheManagerV2))
+        # Eager-store ctx blocks into the reuse trie at transfer start (and
+        # early-terminate via the same path) so a following request can reuse
+        # them immediately. Required for PP>1 disagg: lazy commit-on-terminate
+        # races behind the next request's reuse lookup, yielding a partial
+        # match. store_blocks_for_reuse is V1 KVCacheManager only;
+        # KVCacheManagerV2 has no equivalent yet.
+        self.enable_disagg_partial_reuse_store = (
+            self.enable_partial_reuse_for_disagg
+            and not self.kv_cache_manager.is_vswa)
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -607,12 +616,9 @@ class PyExecutor:
         # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
         # updated from observed request types.
         self._adp_dummy_is_gen: bool = True
-        # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
-        # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
-            should_store_blocks=self.enable_partial_reuse_for_disagg
-            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+            should_store_blocks=self.enable_disagg_partial_reuse_store)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -5717,11 +5723,11 @@ class PyExecutor:
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
 
-                # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
+                # Must stay consistent with should_store_blocks: when blocks
+                # are eager-stored, _end_transfer_and_maybe_terminate skips
+                # termination assuming this early-termination path ran.
                 force_terminate_for_partial_reuse = (
-                    self.enable_partial_reuse_for_disagg
-                    and not self.kv_cache_manager.is_vswa
-                    and self.dist.pp_size == 1)
+                    self.async_transfer_manager.should_store_blocks)
                 if request.is_disagg_context_complete_state:
                     # Already terminated by _check_disagg_ctx_cache_transfer_status;
                     # track for stats only to avoid double-free (nvbug/5961736).
