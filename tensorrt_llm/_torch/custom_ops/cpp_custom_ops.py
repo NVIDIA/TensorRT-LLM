@@ -1195,6 +1195,41 @@ def _register_fake():
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
 
+    @torch.library.register_fake("trtllm::fused_dit_layernorm_shift_scale")
+    def _(
+        x: torch.Tensor,
+        ln_weight: Optional[torch.Tensor],
+        ln_bias: Optional[torch.Tensor],
+        scale_msa: Optional[torch.Tensor],
+        shift_msa: Optional[torch.Tensor],
+        seq_len_per_batch: int,
+        eps: float,
+    ) -> torch.Tensor:
+        return x.new_empty(x.shape, dtype=torch.bfloat16)
+
+    @torch.library.register_fake(
+        "trtllm::fused_dit_layernorm_shift_scale_quant")
+    def _(
+        x: torch.Tensor,
+        ln_weight: Optional[torch.Tensor],
+        ln_bias: Optional[torch.Tensor],
+        scale_msa: Optional[torch.Tensor],
+        shift_msa: Optional[torch.Tensor],
+        sf_scale: torch.Tensor,
+        seq_len_per_batch: int,
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        y_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        sf_out = x.new_empty((scale_shape, ), dtype=torch.uint8)
+        return y_fp4, sf_out
+
     @torch.library.register_fake("trtllm::fused_relu2_quantize")
     def _(
         input: torch.Tensor,

@@ -68,6 +68,7 @@ add_library(
   dsv3FusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedDiTLayerNormShiftScaleOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp

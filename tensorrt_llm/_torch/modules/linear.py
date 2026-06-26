@@ -1382,11 +1382,18 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
-        # GEMM requires 2D. Only plain tensors support for now, skip for
-        # tuple and Fp4QuantizedTensor.
+        # GEMM requires 2D. Fp4QuantizedTensor from fused LayerNorm paths may
+        # arrive as 3D [B, S, D/8] — flatten fp4_tensor and restore after.
         original_shape = None
-        if not isinstance(input,
-                          (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+        if isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
+            original_shape = input.fp4_tensor.shape
+            input = Fp4QuantizedTensor(
+                input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
+                input.scaling_factor,
+                input.is_sf_swizzled,
+            )
+        elif not isinstance(input,
+                            (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
 

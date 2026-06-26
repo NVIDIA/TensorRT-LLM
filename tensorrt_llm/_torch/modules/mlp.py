@@ -99,7 +99,10 @@ class MLP(nn.Module):
         has_nvfp4 = hasattr(self.down_proj,
                             'has_nvfp4') and self.down_proj.has_nvfp4
         has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
-        has_scale = hasattr(self.down_proj, 'input_scale')
+        # NVFP4LinearMethod.create_weights always allocates input_scale as a
+        # Parameter, but excluded layers reset it to None at load time. Check
+        # for a real tensor.
+        has_scale = getattr(self.down_proj, 'input_scale', None) is not None
         is_relu2 = self.activation is relu2
 
         self._use_fused_relu2_quant = has_nvfp4 and has_kernel and has_scale and is_relu2
