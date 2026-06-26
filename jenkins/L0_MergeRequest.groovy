@@ -706,7 +706,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 //
 // Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
 // a result map (or null = defer to existing filter chain). Result keys:
-// scope, affected_stages, reasons, test_db_dir_override, affected_stage_test_counts.
+// scope, affected_stages, reasons, test_db_dir_override,
+// affected_stage_test_counts, affected_stage_split_counts.
 // CBTS narrows test cases only — Build always runs. See cbts/README.md.
 // ============================================================================
 
@@ -780,8 +781,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // download fails.
         if (result.test_db_dir_override) {
             try {
-                sh "tar czf /tmp/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
-                trtllm_utils.uploadArtifacts("/tmp/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
+                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
             } catch (InterruptedException e) {
@@ -889,6 +891,7 @@ def _cbtsParseSelectionResult(String text)
         reasons: data.reasons ?: [],
         test_db_dir_override: data.test_db_dir_override,
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        affected_stage_split_counts: data.affected_stage_split_counts ?: [:],
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
         perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,

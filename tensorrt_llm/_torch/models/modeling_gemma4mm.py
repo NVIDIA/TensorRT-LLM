@@ -769,6 +769,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return self.llm.infer_max_seq_len()
 
     @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
+    @property
     def multimodal_data_device_paths(self) -> List[str]:
         """Dotted paths in ``multimodal_data`` that the engine should ship to
         GPU. Anything not listed stays CPU-resident — notably
