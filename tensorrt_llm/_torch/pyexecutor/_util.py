@@ -334,6 +334,10 @@ class KvCacheCreator:
                 return KVCacheManager
         return kv_cache_manager_cls
 
+    def _enable_kv_cache_stats(self) -> bool:
+        return (self._llm_args.enable_iter_perf_stats
+                or getattr(self._llm_args, "return_perf_metrics", False))
+
     def _per_manager_cache_cost(self,
                                 manager_cls,
                                 model_config,
@@ -837,6 +841,8 @@ class KvCacheCreator:
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
+            enable_kv_cache_stats=self._enable_kv_cache_stats()
+            and not estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
@@ -966,6 +972,8 @@ class KvCacheCreator:
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
+            enable_kv_cache_stats=self._enable_kv_cache_stats()
+            and not estimating_kv_cache,
             execution_stream=self._execution_stream,
             # One-model draft specific overrides
             model_config=effective_draft_config,
@@ -1504,6 +1512,7 @@ def _create_kv_cache_manager(
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
         estimating_kv_cache: bool = False,
+        enable_kv_cache_stats: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
         model_config: Optional[ModelConfig] = None,
@@ -1629,6 +1638,9 @@ def _create_kv_cache_manager(
         per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
             num_key_value_heads, num_hidden_layers, spec_config,
             draft_config_for_kv)
+    manager_extra_kwargs = {}
+    if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+        manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -1654,6 +1666,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            **manager_extra_kwargs,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1759,6 +1772,7 @@ def _create_kv_cache_manager(
             model_type="nemotron_hybrid",
             use_replay_state_update=use_replay,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
+            **manager_extra_kwargs,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1803,6 +1817,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             model_type="qwen3_next",
+            **manager_extra_kwargs,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
@@ -1845,6 +1860,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            **manager_extra_kwargs,
         )
     # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
     # via cache_layer_idx — shared layers use target layer's index for
