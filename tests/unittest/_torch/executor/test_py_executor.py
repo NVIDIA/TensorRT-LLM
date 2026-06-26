@@ -191,14 +191,19 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_waiting_queue_size() == 1
 
 
-def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
+def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, is_kv_manager_v2):
     """Reproduce the termination logic from _handle_responses (py_executor.py).
+
+    Mirrors ``force_terminate_for_partial_reuse = should_store_blocks``: the
+    eager-store/early-terminate path is enabled for partial-reuse disagg on the
+    V1 KVCacheManager regardless of PP size, and disabled for VSWA or
+    KVCacheManagerV2 (which has no store_blocks_for_reuse equivalent).
 
     Returns:
         "terminate" | "stats_only" | "skip"
     """
     force_terminate_for_partial_reuse = (
-        enable_partial_reuse_for_disagg and not is_vswa and pp_size == 1
+        enable_partial_reuse_for_disagg and not is_vswa and not is_kv_manager_v2
     )
     if request.is_disagg_context_complete_state:
         return "stats_only"
@@ -224,38 +229,45 @@ class TestDisaggTerminationGuard:
     def test_normal_path_skips_context_complete(self):
         """Without partial reuse, CONTEXT_COMPLETE goes to stats only."""
         req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, False, False, 1) == "stats_only"
+        assert _classify_termination(req, False, False, False) == "stats_only"
 
     def test_normal_path_skips_transmission_in_progress(self):
         """Without partial reuse, TRANS_IN_PROGRESS is skipped (still in flight)."""
         req = _make_request(complete_state=False, transmission_state=True)
-        assert _classify_termination(req, False, False, 1) == "skip"
+        assert _classify_termination(req, False, False, False) == "skip"
 
     def test_normal_path_terminates_regular_request(self):
         """Without partial reuse, a normal finished request is terminated."""
         req = _make_request(complete_state=False, transmission_state=False)
-        assert _classify_termination(req, False, False, 1) == "terminate"
+        assert _classify_termination(req, False, False, False) == "terminate"
 
     def test_partial_reuse_terminates_non_complete(self):
         """With partial reuse, non-CONTEXT_COMPLETE requests are terminated."""
         for complete, transmission in [(False, True), (False, False)]:
             req = _make_request(complete, transmission)
-            assert _classify_termination(req, True, False, 1) == "terminate"
+            assert _classify_termination(req, True, False, False) == "terminate"
+
+    def test_partial_reuse_terminates_in_transmission_regardless_of_pp(self):
+        """Eager-store path no longer gates on PP size: an in-transmission ctx
+        request is force-terminated whenever partial-reuse store is active."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, False) == "terminate"
 
     def test_partial_reuse_skips_context_complete(self):
         """With partial reuse, CONTEXT_COMPLETE still goes to stats only."""
         req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, False, 1) == "stats_only"
+        assert _classify_termination(req, True, False, False) == "stats_only"
 
     def test_partial_reuse_disabled_by_vswa(self):
         """VSWA disables partial reuse path, falling back to normal logic."""
-        req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, True, 1) == "stats_only"
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, True, False) == "skip"
 
-    def test_partial_reuse_disabled_by_pp(self):
-        """PP > 1 disables partial reuse path, falling back to normal logic."""
-        req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, False, 2) == "stats_only"
+    def test_partial_reuse_disabled_by_kv_manager_v2(self):
+        """KVCacheManagerV2 disables the eager-store path (no
+        store_blocks_for_reuse), falling back to normal logic."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, True) == "skip"
 
 
 # ---------------------------------------------------------------------------
