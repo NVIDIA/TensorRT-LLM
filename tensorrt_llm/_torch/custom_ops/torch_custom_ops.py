@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import enum
 import os
+import platform
 import threading
+from ctypes.util import find_library
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -55,6 +58,55 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
+
+
+@lru_cache(maxsize=None)
+def _get_nccl_runtime_version_code() -> Optional[int]:
+    """Return NCCL's runtime version as a packed integer (major*10000+minor*100+patch),
+    or None when ncclGetVersion cannot be resolved (e.g., libnccl not loadable).
+    """
+    lib_names = ["libnccl.so.2", "libnccl.so"]
+    nccl_lib = find_library("nccl")
+    if nccl_lib is not None and nccl_lib not in lib_names:
+        lib_names.append(nccl_lib)
+
+    for lib_name in lib_names:
+        try:
+            nccl = ctypes.CDLL(lib_name)
+            nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            nccl.ncclGetVersion.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            continue
+
+        version = ctypes.c_int()
+        if nccl.ncclGetVersion(ctypes.byref(version)) == 0:
+            return version.value
+
+    return None
+
+
+@lru_cache(maxsize=None)
+def _init_nccl_init_workaround() -> None:
+    """Disable NCCL NVLS/MNNVL before ncclCommInitRank where they can deadlock.
+
+    NCCL <2.30.4 NVLS/MNNVL static-connection setup (forced by
+    NCCL_RUNTIME_CONNECT=0 in opUtils.cpp::getComm) errors during
+    ncclCommInitRank on x86_64 hosts that have no MNNVL/IMEX fabric
+    (H20, B200, B300) and on GB10 (DGX Spark), surfacing as
+    'unhandled cuda error' from the autotuner's NCCL_SYMMETRIC warmup
+    allreduce.  No-op on NCCL >= 2.30.4 and on other platforms.
+    Honors any user-set values via os.environ.setdefault.
+    """
+    runtime_version = _get_nccl_runtime_version_code()
+    if runtime_version is not None and runtime_version >= 23004:  # NCCL 2.30.4
+        return
+    on_x86_64 = platform.machine() == "x86_64"
+    is_gb10 = not on_x86_64 and "GB10" in torch.cuda.get_device_name()
+    if not (on_x86_64 or is_gb10):
+        return
+    os.environ.setdefault("NCCL_MNNVL_ENABLE", "0")
+    if on_x86_64:
+        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
 
 def _init_deep_gemm_pdl() -> None:
