@@ -684,7 +684,12 @@ class HunyuanVideo15Pipeline(BasePipeline):
         self._num_timesteps = len(timesteps)
 
         def forward_fn(
-            latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             # Concatenate the conditioning latents and binary mask onto the channel
             # dim to build the transformer input (in_channels = latent channels +
