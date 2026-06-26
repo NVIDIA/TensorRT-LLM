@@ -16,7 +16,9 @@
 
 import json
 import socket
-import subprocess
+
+# Docker CLI invocation is intentional for local MX server bootstrap.
+import subprocess  # nosec B404
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
