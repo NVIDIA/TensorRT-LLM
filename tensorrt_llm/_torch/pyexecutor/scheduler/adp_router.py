@@ -836,14 +836,13 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
-        req = getattr(req_item, "request", None)
+        req = req_item.request
         if req is None:
             return None
-        disagg = getattr(req, "py_disaggregated_params", None)
-        if disagg is None:
+        conversation_params = req.py_conversation_params
+        if conversation_params is None:
             return None
-        conv_id = getattr(disagg, "conversation_id", None)
-        return conv_id if conv_id else None
+        return conversation_params.conversation_id
 
     def _record_target_rank(self, conv_id: str, rank: int) -> None:
         """Bind/refresh the rank a conversation is pinned to (LRU-touch + evict)."""

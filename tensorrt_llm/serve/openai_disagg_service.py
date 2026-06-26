@@ -157,13 +157,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 disagg_request_id = ctx_response_disagg_params.disagg_request_id
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         else:
-            # Clear synthetic disaggregated_params that may have been
-            # injected by _extract_conversation_id (e.g. from the
-            # X-Correlation-ID header).  When need_ctx=False the gen
-            # server handles full generation and must not see a stale
-            # request_type="context_only".
+            # When need_ctx=False the gen server handles full generation and
+            # must not see a stale request_type="context_only".
             # _check_gen_only_disagg already sets proper generation_only
-            # params when applicable, so only clear the synthetic ones.
+            # params when applicable.
             if (
                 gen_req.disaggregated_params is not None
                 and gen_req.disaggregated_params.request_type == "context_only"
@@ -320,6 +317,8 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     @staticmethod
     def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
+        if request.conversation_params is not None:
+            return request.conversation_params.conversation_id
         if request.disaggregated_params is not None:
             return request.disaggregated_params.conversation_id
         return None
@@ -327,13 +326,14 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
                     request_type="context_only",
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
-                    conversation_id=self._get_conversation_id(request),
+                    conversation_id=conversation_id,
                 ),
                 "stream": False,
                 "stream_options": None,
