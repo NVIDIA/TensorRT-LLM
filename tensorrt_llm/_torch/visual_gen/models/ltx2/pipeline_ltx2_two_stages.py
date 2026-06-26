@@ -47,7 +47,7 @@ from .pipeline_ltx2 import (
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-# Baseline BF16 peak memory ~75 GiB, saving BF16 weights snopshot total ~108 GiB.
+# Baseline BF16 peak memory ~75 GiB, saving BF16 weights snapshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
 
 
@@ -670,7 +670,8 @@ class _PersistentLoRAParamState:
 class _PersistentLoRAWeightCache:
     """Keep unmerged and merged LoRA-touched weights resident.
 
-    The cache is opt-in and is used only for LTX-2 Stage 2 distilled LoRA.
+    The cache is built when distilled LoRA is loaded and used only for LTX-2
+    Stage 2 distilled LoRA.
     It removes per-request merge/unmerge math by rebinding parameter storage to
     precomputed resident tensors.  FP8 and FP4 keep exact original quantized
     state.  FP4's merged state is BF16 and swaps the parent Linear to
@@ -912,6 +913,29 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def _current_lora_cuda_graph_state(self) -> str:
         return getattr(self, "_lora_cuda_graph_state", "original")
 
+    def _is_cuda_graph_enabled(self) -> bool:
+        for config_name in ("pipeline_config", "model_config"):
+            config = getattr(self, config_name, None)
+            cuda_graph = getattr(config, "cuda_graph", None)
+            if getattr(cuda_graph, "enable", False):
+                return True
+        return False
+
+    def _assert_cuda_graph_safe_lora_bindings(self) -> None:
+        if not self._is_cuda_graph_enabled():
+            return
+        if not getattr(self, "_distilled_lora_deltas", {}):
+            return
+        if getattr(self, "_distilled_lora_weight_cache", None) is not None:
+            return
+
+        raise RuntimeError(
+            "LTX-2 two-stage CUDA graph requires persistent LoRA weights. "
+            "The non-persistent distilled LoRA path mutates parameter storage "
+            "and quantization state during Stage 2, which is not CUDA-graph safe. "
+            "Disable CUDA graph or ensure the persistent LoRA cache can be built."
+        )
+
     def _setup_cuda_graphs(self):
         """Wrap transformer.forward with a LoRA-state-aware CUDA graph key."""
         if not self.pipeline_config.cuda_graph.enable:
@@ -1022,6 +1046,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     f"{self._distilled_lora_weight_cache.applied_count} params, "
                     f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
                 )
+        self._assert_cuda_graph_safe_lora_bindings()
 
     # ------------------------------------------------------------------
     # Inference entry point
@@ -1164,6 +1189,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # The persistent cache owns original and merged tensors when it can be
         # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
         # state, so no per-request clone, merge, or unmerge math is needed.
+        self._assert_cuda_graph_safe_lora_bindings()
         lora_cache = self._distilled_lora_weight_cache
         using_persistent_lora = lora_cache is not None
         saved_lora_state: Dict[str, Any] = {}

@@ -16,6 +16,7 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 import gc
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1203,6 +1204,74 @@ class TestLTX2TwoStageLoRAHelpers:
         assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
         assert runner._lora_state_getter() == "original"
         assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
+
+    def test_cuda_graph_rejects_nonpersistent_lora_bindings(self):
+        """CUDA graph is valid only when distilled LoRA uses persistent bindings."""
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = SimpleNamespace(
+            cuda_graph=SimpleNamespace(enable=True),
+        )
+        pipeline._distilled_lora_deltas = {"proj.weight": torch.ones(1)}
+        pipeline._distilled_lora_weight_cache = None
+
+        with pytest.raises(RuntimeError, match="requires persistent LoRA weights"):
+            pipeline._assert_cuda_graph_safe_lora_bindings()
+
+        pipeline._distilled_lora_weight_cache = object()
+        pipeline._assert_cuda_graph_safe_lora_bindings()
+
+        pipeline.pipeline_config.cuda_graph.enable = False
+        pipeline._distilled_lora_weight_cache = None
+        pipeline._assert_cuda_graph_safe_lora_bindings()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_persistent_lora_cuda_graph_matches_eager_output(self):
+        """Persistent merged LoRA bindings should match eager output under CUDA graph."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.tensor(
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    ),
+                    requires_grad=False,
+                )
+
+            def forward(self, x):
+                return F.linear(x, self.weight)
+
+        module = TinyModule()
+        delta = torch.full_like(module.weight, 0.5)
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"weight": delta},
+        )
+        cache.bind_merged()
+
+        lora_state = {"value": "merged"}
+        runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
+            ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
+            lambda: lora_state["value"],
+        )
+        graphed_forward = runner.wrap(module.forward)
+
+        with torch.inference_mode():
+            x = torch.randn((4, 2), device="cuda", dtype=torch.bfloat16)
+            eager = module(x).detach().clone()
+            graph_out = graphed_forward(x)
+            torch.cuda.synchronize()
+            assert torch.allclose(graph_out, eager, atol=1e-2, rtol=1e-2)
+
+            x2 = torch.randn((4, 2), device="cuda", dtype=torch.bfloat16)
+            eager2 = module(x2).detach().clone()
+            graph_out2 = graphed_forward(x2)
+            torch.cuda.synchronize()
+            assert torch.allclose(graph_out2, eager2, atol=1e-2, rtol=1e-2)
+
+        cache.bind_original()
 
     def test_persistent_bf16_cache_reuses_weight_storage(self):
         """Persistent BF16 cache swaps between the same original and merged tensors."""
