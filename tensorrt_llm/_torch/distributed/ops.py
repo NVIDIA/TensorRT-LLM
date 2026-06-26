@@ -709,6 +709,12 @@ class AllReduce(nn.Module):
 
         self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
+        # nvbugs/6369411 (verl inter-node) and siblings 6276923/6322076/6345827/6373530:
+        # disable NCCL NVLS/MNNVL before the first ncclCommInitRank on NCCL <2.30.4 + x86_64/GB10.
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+            _init_nccl_init_workaround
+        _init_nccl_init_workaround()
+
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
         # read it here and stash the values as class-level attributes that
