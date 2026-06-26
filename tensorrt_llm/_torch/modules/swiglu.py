@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
@@ -25,8 +27,9 @@ def scale_and_clamp(x, scale, dtype):
 
 @triton.jit
 def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
-                        BLOCK_SIZE: tl.constexpr,
-                        HAS_O_SCALE: tl.constexpr) -> None:
+                        swiglu_limit: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                        HAS_O_SCALE: tl.constexpr,
+                        HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
     i = tl.program_id(axis=0).to(tl.int64)
     j = tl.program_id(axis=1)
 
@@ -39,6 +42,10 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
     a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
     b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
 
+    if HAS_SWIGLU_LIMIT:
+        a = tl.minimum(a, swiglu_limit)
+        b = tl.clamp(b, -swiglu_limit, swiglu_limit)
+
     result = tl.sigmoid(a) * a * b
 
     if HAS_O_SCALE:
@@ -48,13 +55,17 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
     tl.store(o_row_ptr + offsets, result, mask=mask)
 
 
-def swiglu(x, quant_scale: torch.Tensor = None, quant_type=None):
+def swiglu(x,
+           quant_scale: Optional[torch.Tensor] = None,
+           quant_type=None,
+           swiglu_limit: Optional[float] = None):
     if quant_scale is not None:
         assert quant_type is not None
         return torch.ops.trtllm.silu_and_mul(
             x,
             scale=quant_scale,
             dtype=quant_type,
+            swiglu_limit=swiglu_limit,
         )
 
-    return torch.ops.trtllm.silu_and_mul(x)
+    return torch.ops.trtllm.silu_and_mul(x, swiglu_limit=swiglu_limit)
