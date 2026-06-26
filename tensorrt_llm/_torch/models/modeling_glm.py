@@ -44,6 +44,8 @@ from .modeling_utils import (
     EagerFusionConfig,
     duplicate_kv_weight,
     filter_weights,
+    gate_up_proj_supports_pre_mlp_nvfp4_fusion,
+    reconcile_pre_mlp_nvfp4_fusion,
     register_auto_model,
 )
 
@@ -773,7 +775,9 @@ class Glm4DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.fusion_config.PRE_MLP_FUSION:
+        if (self.fusion_config.PRE_MLP_FUSION
+                and gate_up_proj_supports_pre_mlp_nvfp4_fusion(
+                    self.mlp.gate_up_proj)):
             act_fp4, act_sf, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -1080,3 +1084,5 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
+            if isinstance(layer.mlp, GatedMLP):
+                reconcile_pre_mlp_nvfp4_fusion(layer.fusion_config, layer.mlp)
