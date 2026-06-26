@@ -427,9 +427,6 @@ MiniMaxAI/MiniMax-M2:
   - accuracy: 89.045
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
-# MiniMax-M2.5 (~230B FP8-block-scale MoE, MiniMaxM2ForCausalLM architecture).
-# Placeholder threshold mirroring the M2 FP8 entry; confirm against the measured
-# TRT-LLM hardpath score from a local run before merge.
 MiniMaxAI/MiniMax-M2.5:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 93.75
