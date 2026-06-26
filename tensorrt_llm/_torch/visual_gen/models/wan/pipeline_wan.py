@@ -598,7 +598,7 @@ class WanPipeline(BasePipeline):
                 with set_vsa_forward_context(vsa_metadata):
                     return current_model(
                         hidden_states=latents,
-                        timestep=timestep,
+                        timestep=timestep / self.scheduler.config.num_train_timesteps,
                         encoder_hidden_states=encoder_hidden_states,
                     )
 
