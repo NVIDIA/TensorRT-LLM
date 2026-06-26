@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
@@ -23,11 +24,80 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 using namespace tensorrt_llm::runtime;
 
 namespace
 {
 #if ENABLE_MULTI_DEVICE
+constexpr int kDefaultNcclCommInitTimeoutSec = 60;
+constexpr int kNcclCommInitPollIntervalMs = 20;
+constexpr char const* kNcclCommInitTimeoutEnv = "TRTLLM_NCCL_COMM_INIT_TIMEOUT_SEC";
+
+int getNcclCommInitTimeoutSec()
+{
+    auto const timeoutSec
+        = tensorrt_llm::common::getIntEnv(kNcclCommInitTimeoutEnv).value_or(kDefaultNcclCommInitTimeoutSec);
+    return timeoutSec > 0 ? timeoutSec : kDefaultNcclCommInitTimeoutSec;
+}
+
+ncclComm_t initNcclCommWithTimeout(ncclUniqueId const& id, int worldSize, int rank, int timeoutSec)
+{
+    ncclComm_t comm{nullptr};
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.blocking = 0;
+
+    auto result = ncclCommInitRankConfig(&comm, worldSize, id, rank, &config);
+    if (result == ncclSuccess)
+    {
+        return comm;
+    }
+    if (result != ncclInProgress)
+    {
+        TLLM_THROW("NCCL communicator initialization failed on rank %d of %d: %s.", rank, worldSize,
+            ncclGetErrorString(result));
+    }
+    if (comm == nullptr)
+    {
+        TLLM_THROW(
+            "NCCL communicator initialization is in progress on rank %d of %d but returned a null "
+            "communicator.",
+            rank, worldSize);
+    }
+
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{timeoutSec};
+    while (true)
+    {
+        ncclResult_t asyncResult = ncclSuccess;
+        result = ncclCommGetAsyncError(comm, &asyncResult);
+        if (result != ncclSuccess)
+        {
+            TLLM_THROW("NCCL communicator initialization failed while polling rank %d of %d: %s.", rank, worldSize,
+                ncclGetErrorString(result));
+        }
+        if (asyncResult == ncclSuccess)
+        {
+            return comm;
+        }
+        if (asyncResult != ncclInProgress)
+        {
+            TLLM_THROW("NCCL communicator initialization failed asynchronously on rank %d of %d: %s.", rank, worldSize,
+                ncclGetErrorString(asyncResult));
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            TLLM_THROW(
+                "NCCL communicator initialization timed out after %d seconds on rank %d of %d in "
+                "NcclCommunicator::createComm. This indicates NCCL init is hung. TensorRT-LLM will not retry "
+                "in-process. Set %s to adjust the timeout.",
+                timeoutSec, rank, worldSize, kNcclCommInitTimeoutEnv);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
+    }
+}
 
 ncclDataType_t toNcclType(nvinfer1::DataType dataType)
 {
@@ -79,16 +149,14 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
         ncclGetUniqueId(&id);
     }
     mpiComm.bcastValue(id, 0);
-    ncclComm_t comm;
-// Need static connection initialization for accurate KV cache size estimation
+// Need static connection initialization for accurate KV cache size estimation.
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
         _putenv_s("NCCL_RUNTIME_CONNECT", "0");
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
 #endif // _WIN32
-    TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
-    return comm;
+    return initNcclCommWithTimeout(id, worldSize, rank, getNcclCommInitTimeoutSec());
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
     // pipeline parallel code-path. To enable this, have an empty communicator with uninitialized state.
