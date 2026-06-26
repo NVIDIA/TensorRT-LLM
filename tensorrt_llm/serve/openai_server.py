@@ -36,6 +36,7 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -93,40 +94,6 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
-
-
-def _read_positive_int_env(name: str, default: int) -> int:
-    """Parse a positive-int env var, falling back to ``default`` on bad values.
-
-    Avoids crashing server startup on invalid values like ``foo``, ``0``, or
-    ``-1`` — logs a warning and uses ``default`` instead.
-    """
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("%s=%r is not an integer; using default %d", name, raw,
-                       default)
-        return default
-    if value < 1:
-        logger.warning("%s=%d must be >= 1; using default %d", name, value,
-                       default)
-        return default
-    return value
-
-
-# Dedicated executor for HF input-processor / preprocess work on the chat
-# and completion endpoints. Same rationale as the media-load executor in
-# inputs/media_io.py: isolate this CPU-bound work from unrelated
-# to_thread() callers on the default asyncio pool and allow independent
-# tuning.
-_INPUT_PROC_WORKERS = _read_positive_int_env("TRTLLM_INPUT_PROC_WORKERS", 8)
-_INPUT_PROC_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_INPUT_PROC_WORKERS,
-    thread_name_prefix="trtllm_inputproc",
-)
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -225,7 +192,9 @@ class OpenAIServer(_VideoRoutesMixin):
             disagg_cluster_config: Optional[DisaggClusterConfig] = None,
             multimodal_server_config: Optional[MultimodalServerConfig] = None,
             chat_template: Optional[str] = None,
-            allow_request_chat_template: bool = False):
+            allow_request_chat_template: bool = False,
+            input_processor_workers: int = 8,
+            media_load_workers: int = 8):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self.tool_parser = tool_parser
@@ -238,6 +207,20 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = None
         self.host = None
         self.port = None
+
+        # Dedicated thread pools for the chat / completion path. Keeping
+        # multimodal preprocessing and decode work off the asyncio default
+        # executor avoids contention with unrelated `to_thread` callers and
+        # lets the two stages be sized independently.
+        self._input_proc_executor = ThreadPoolExecutor(
+            max_workers=input_processor_workers,
+            thread_name_prefix="trtllm_inputproc",
+        )
+        self._media_load_executor = ThreadPoolExecutor(
+            max_workers=media_load_workers,
+            thread_name_prefix="trtllm_media_load",
+        )
+        BaseMediaIO.configure_executor(self._media_load_executor)
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -1356,7 +1339,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if preprocess_fn is not None:
                 loop = asyncio.get_event_loop()
                 generate_inputs = await loop.run_in_executor(
-                    _INPUT_PROC_EXECUTOR,
+                    self._input_proc_executor,
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
@@ -1659,7 +1642,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if prompt.get("prompt") is not None:
                     loop = asyncio.get_event_loop()
                     prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
-                        _INPUT_PROC_EXECUTOR,
+                        self._input_proc_executor,
                         functools.partial(self.generator.input_processor,
                                           prompt, sampling_params))
                     tokens_prompt = TokensPrompt(

@@ -83,9 +83,9 @@ PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/b
 
 
 def _install_merge_kwargs_cache(processor) -> None:
-    """Memoize ``processor._merge_kwargs`` by input kwargs signature.
+    """Memoize `processor._merge_kwargs` by input kwargs signature.
 
-    ``ProcessorMixin._merge_kwargs`` is pure but runs on every processor
+    `ProcessorMixin._merge_kwargs` is pure but runs on every processor
     call. When all requests pass the same kwargs (the common deployment
     case), caching by signature reduces it to an O(1) lookup after the
     first call.
