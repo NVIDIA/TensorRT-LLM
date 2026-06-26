@@ -24,6 +24,20 @@ from transformers import AutoConfig, AutoModel
 from ..attention_backend.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
 
+# Fallback capacity for the encoder ``AttentionMetadata``'s per-segment buffers
+# (``max_num_requests``). The encoder runs one attention segment per vision tile
+# / window, so the real bound is the segment count, which can far exceed the
+# request count (one image can expand into many tiles/windows).
+#
+# TODO: Once the scheduler caps an encoder forward at ``encoder_max_num_tokens``,
+# derive this from the token budget instead -- ``encoder_max_num_tokens //
+# min_tokens_per_segment`` (an exact segment bound). We cannot do that today:
+# ``encoder_max_num_tokens`` is not yet enforced (the attention workspace grows
+# past it), so a low value would under-size these fixed buffers, which -- unlike
+# the token workspace -- cannot grow. Until then, fall back to the legacy
+# worst-case capacity.
+_ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
+
 
 class MultimodalEncoderMixin:
     """Encoder-side counterpart to ``MultimodalModelMixin``.
@@ -42,6 +56,8 @@ class MultimodalEncoderMixin:
 
     def setup_attn_metadata(self, max_num_requests: int,
                             max_num_tokens: int) -> None:
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
         self.attn_metadata = self.metadata_cls(
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,

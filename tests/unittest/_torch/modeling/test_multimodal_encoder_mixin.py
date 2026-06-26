@@ -2,14 +2,18 @@
 
 Verifies that the mixin's default `setup_attn_metadata` builds the encoder's
 AttentionMetadata exactly once with the runtime sizes injected by the engine
-(`max_num_requests`, `max_num_tokens`) and `kv_cache_manager=None`. These
-tests use a stub `metadata_cls` to avoid pulling in any real attention
-backend (and any GPU/CUDA dependency).
+(`max_num_requests`, `max_num_tokens`) and `kv_cache_manager=None`, flooring
+`max_num_requests` at the encoder fallback (one attention segment per vision
+tile can exceed the request count). These tests use a stub `metadata_cls` to
+avoid pulling in any real attention backend (and any GPU/CUDA dependency).
 """
 
 import torch.nn as nn
 
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
+    _ENCODER_FALLBACK_MAX_NUM_REQUESTS,
+    MultimodalEncoderMixin,
+)
 
 
 class _StubMetadata:
@@ -31,13 +35,29 @@ def test_attn_metadata_is_none_before_setup():
 
 
 def test_setup_attn_metadata_builds_with_engine_sizes():
+    """A request count above the encoder fallback passes through unchanged."""
     encoder = _DummyEncoder()
-    encoder.setup_attn_metadata(max_num_requests=42, max_num_tokens=1234)
+    big = _ENCODER_FALLBACK_MAX_NUM_REQUESTS + 100
+    encoder.setup_attn_metadata(max_num_requests=big, max_num_tokens=1234)
 
     assert isinstance(encoder.attn_metadata, _StubMetadata)
     assert encoder.attn_metadata.kwargs == {
-        "max_num_requests": 42,
+        "max_num_requests": big,
         "max_num_tokens": 1234,
+        "kv_cache_manager": None,
+    }
+
+
+def test_setup_attn_metadata_floors_small_request_count():
+    """A request count below the encoder fallback is floored to it: the encoder
+    runs one attention segment per vision tile, which can exceed the request
+    count, so the per-segment buffers must not undersize."""
+    encoder = _DummyEncoder()
+    encoder.setup_attn_metadata(max_num_requests=8, max_num_tokens=100)
+
+    assert encoder.attn_metadata.kwargs == {
+        "max_num_requests": _ENCODER_FALLBACK_MAX_NUM_REQUESTS,
+        "max_num_tokens": 100,
         "kv_cache_manager": None,
     }
 
@@ -48,15 +68,17 @@ def test_setup_attn_metadata_is_idempotent_per_call():
     once at engine init; tests that multiple calls don't crash and that the
     last sizes win)."""
     encoder = _DummyEncoder()
-    encoder.setup_attn_metadata(max_num_requests=8, max_num_tokens=100)
+    big1 = _ENCODER_FALLBACK_MAX_NUM_REQUESTS + 8
+    big2 = _ENCODER_FALLBACK_MAX_NUM_REQUESTS + 16
+    encoder.setup_attn_metadata(max_num_requests=big1, max_num_tokens=100)
     first = encoder.attn_metadata
 
-    encoder.setup_attn_metadata(max_num_requests=16, max_num_tokens=200)
+    encoder.setup_attn_metadata(max_num_requests=big2, max_num_tokens=200)
     second = encoder.attn_metadata
 
     assert first is not second
     assert second.kwargs == {
-        "max_num_requests": 16,
+        "max_num_requests": big2,
         "max_num_tokens": 200,
         "kv_cache_manager": None,
     }

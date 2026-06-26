@@ -68,7 +68,8 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_encoder import (_ENCODER_FALLBACK_MAX_NUM_REQUESTS,
+                                          MultimodalEncoderMixin)
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -1396,14 +1397,13 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         #
         # Windowed attention splits each image into many attention sequences
         # (one per window grid cell), so ``max_num_requests`` here is the
-        # **window** count, not the image count. The window count in one
-        # encoder forward is bounded by the token budget (every window holds
-        # at least one token), NOT by the request count, so floor the request
-        # capacity at ``max_num_tokens``. This also covers callers that leave
-        # ``encoder_max_batch_size`` unset (and thus inherit the much smaller
-        # LLM-side ``max_batch_size``). (The legacy hardcoded floor was 8192,
-        # which is exactly the legacy ``max_num_tokens``.)
-        max_num_requests = max(max_num_requests, max_num_tokens)
+        # **window** count, not the image count, and can far exceed the
+        # LLM-side ``max_batch_size`` that ``encoder_max_batch_size`` falls back
+        # to. Floor it at the same legacy fallback the mixin uses (see the TODO
+        # there: derive from ``encoder_max_num_tokens`` once the scheduler caps
+        # encoder forwards at it).
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
         kwargs = dict(max_num_requests=max_num_requests,
                       max_num_tokens=max_num_tokens,
                       kv_cache_manager=None)

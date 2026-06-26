@@ -21,8 +21,8 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
-    MultimodalEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
+    _ENCODER_FALLBACK_MAX_NUM_REQUESTS, MultimodalEncoderMixin)
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)
@@ -776,6 +776,11 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
         # (kv_cache_manager=None) computes k/v directly from input, which is
         # always in NHD format ([tokens, heads, dim]).
+        # Floor the request capacity at the same legacy fallback as the mixin
+        # default: one attention segment per image, which can exceed the
+        # LLM-side `max_batch_size` that `encoder_max_batch_size` falls back to.
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
         metadata_kwargs = dict(
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
