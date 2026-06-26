@@ -432,6 +432,15 @@ class ModelConfig(Generic[TConfig]):
                 if config.quant_algo == QuantAlgo.W4A16_NVFP4:
                     config.quant_algo = QuantAlgo.NVFP4
                 mixed_quant_configs[layer] = config
+            # Normalize "model.language_model." prefix to "model." so that
+            # quant_config_dict keys match TRT-LLM module names produced by
+            # named_modules() (which don't include the "language_model" level).
+            _LM_PREFIX = "model.language_model."
+            _MODEL_PREFIX = "model."
+            mixed_quant_configs = {
+                (_MODEL_PREFIX + k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k): v
+                for k, v in mixed_quant_configs.items()
+            }
             # LMHead bypasses Linear.create_weights (manual Parameter),
             # so NVFP4 weight scales are never allocated there.  Move
             # lm_head to exclude_modules so it loads as BF16.
