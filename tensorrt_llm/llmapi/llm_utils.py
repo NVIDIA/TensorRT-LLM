@@ -471,9 +471,27 @@ class ModelLoader:
                     'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                     'embedding', 'unembedding'
                 ]
+            # MXFP8 checkpoints (e4m3 weights + UE8M0 1x32 block scales, dynamic
+            # MXFP8 acts).
             elif hf_quant_config.get("quant_method") == "mxfp8":
-                raise NotImplementedError(
-                    "MXFP8 quantization is not supported yet.")
+                quant_config.quant_algo = QuantAlgo.MXFP8
+                block_size = hf_quant_config.get("weight_block_size", [1, 32])
+                # MXFP8 uses 1x32 blocks along the K dim; group_size is the K
+                # block (32).
+                assert tuple(block_size) == (1, 32), (
+                    f"MXFP8 only supports weight_block_size=[1,32], got {block_size}"
+                )
+                quant_config.group_size = block_size[1]
+
+                # Layers the producer left in BF16.
+                ignored = hf_quant_config.get("ignored_layers", [])
+                hf_exclude_modules = hf_quant_config.get(
+                    'modules_to_not_convert', None)
+                if hf_exclude_modules is not None:
+                    quant_config.exclude_modules = list(
+                        dict.fromkeys(hf_exclude_modules + ignored))
+                else:
+                    quant_config.exclude_modules = list(ignored)
             # NOTE: This is for llm-compressor's quantized checkpoints.
             elif hf_quant_config.get("quant_method") == "compressed-tensors":
                 update_quant_config_from_compressed_tensors(

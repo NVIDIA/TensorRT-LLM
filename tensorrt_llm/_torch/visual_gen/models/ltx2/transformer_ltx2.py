@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -170,11 +170,14 @@ class LTX2Attention(Attention):
             # (sharded inner backend + UlyssesAttention) for both self-attn and
             # cross-attn paths.
 
-        # For audio self-attention that may need a runtime Ulysses toggle
-        # (sequence length not always divisible by ulysses_size), create a
-        # plain backend as fallback.  The base class already set self.attn
-        # to UlyssesAttention(inner_backend=sharded_backend).
-        if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
+        # Build a Ulysses/plain dual-attn pair so set_ulysses_active() can toggle
+        # at runtime. Needed for self-attn (audio seq not always divisible by
+        # ulysses_size) and for v2a cross-attn under pure Ulysses (cp_size == 1),
+        # where it lets the block forward use Ulysses a2a instead of all-gathering
+        # the full video K/V. Combined ring/attn2d + Ulysses (cp_size > 1) keeps
+        # cross-attn on the all-gather fallback. The base class already set
+        # self.attn to UlyssesAttention(inner_backend=sharded_backend).
+        if use_ulysses and (cp_size == 1 or not self._is_cross_attn) and ulysses_size > 1:
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
@@ -573,7 +576,7 @@ class BasicAVTransformerBlock(nn.Module):
             hidden_size=cfg.dim,
             intermediate_size=cfg.dim * 4,
             bias=True,
-            activation=lambda x: F.gelu(x, approximate="tanh"),
+            activation=gelu_tanh,  # named (not a lambda) so MLP can detect+fuse GELU+NVFP4
             dtype=dtype,
             config=model_config,
             layer_idx=idx,
@@ -684,6 +687,7 @@ class BasicAVTransformerBlock(nn.Module):
             layer_idx=idx,
             module_name=f"transformer_blocks.{idx}.video_to_audio_attn",
             enable_sequence_parallel=True,
+            use_ulysses=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
         self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
