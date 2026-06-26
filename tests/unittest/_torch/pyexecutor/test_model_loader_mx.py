@@ -10,8 +10,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.modules import attention as attention_mod
-from tensorrt_llm._torch.modules.attention import MLA
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.llmapi.llm_args import LoadFormat
