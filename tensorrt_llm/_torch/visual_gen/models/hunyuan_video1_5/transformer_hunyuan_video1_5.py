@@ -968,7 +968,7 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         image_rotary_emb = self.rope(hidden_states)
 
         # 2. Conditional embeddings
-        timestep_r = timestep_r.to(self.config.dtype) if timestep_r else None
+        timestep_r = timestep_r.to(self.config.dtype) if timestep_r is not None else None
         temb = self.time_embed(timestep.to(self.config.dtype), timestep_r=timestep_r)
 
         hidden_states = self.x_embedder(hidden_states)
