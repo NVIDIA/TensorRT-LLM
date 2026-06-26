@@ -334,6 +334,8 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             for vd in video_datas:
                 m = dict(vd.metadata or {})
                 m["total_num_frames"] = len(vd.frames)
+                # Internal stash; not a field on HF's VideoMetadata dataclass.
+                m.pop("io_loaded_all_frames", None)
                 video_metadata.append(m)
 
         return self.processor(
