@@ -387,6 +387,20 @@ def _register_fake():
         scale_fp8_sf = input.new_empty((sf_size, ), dtype=torch.uint8)
         return val_mxfp8, scale_fp8_sf
 
+    @torch.library.register_fake("trtllm::mxfp8_mxfp8_gemm")
+    def _(
+        act: torch.Tensor,
+        actScale: torch.Tensor,
+        weight: torch.Tensor,
+        weightScale: torch.Tensor,
+        globalScale: torch.Tensor,
+        out_dtype: Optional[torch.dtype] = None,
+    ):
+        m = act.shape[0]
+        n = weight.shape[0]
+        dtype = out_dtype if out_dtype is not None else torch.bfloat16
+        return act.new_empty((m, n), dtype=dtype)
+
     @torch.library.register_fake("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner")
     def _(
         routing_logits: Optional[torch.Tensor],

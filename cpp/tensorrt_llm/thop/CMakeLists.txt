@@ -95,6 +95,7 @@ add_library(
   moeAlignOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
+  mxfp8Gemm.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
