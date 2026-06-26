@@ -2097,6 +2097,13 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
+        # Fill the persistent host buffer in place, exactly as before. CPU-side
+        # consumers read self.host_kv_cache_block_offsets directly and depend on
+        # its persistent, max_batch-sized layout: DSA sparse attention, the
+        # speculative-decoding draft/target swap, and the KV-cache relocation
+        # path. Reassigning this attribute to a per-call, num_seqs-sized buffer
+        # broke those readers (nvbug 6293536 regression), so it must stay the
+        # buffer they see.
         if self.kv_cache_type == CacheTypeCpp.CROSS and beam_width > 1:
             # This branch is reached only via attribute aliasing, never a
             # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
@@ -2119,14 +2126,18 @@ class KVCacheManager(BaseResourceManager):
             # tensor whose rows are decoder-sequence scoped.
             self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                                request_ids, 1, 0)
-            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+            # Snapshot the rows this call reads into a fresh pinned buffer so the
+            # async H2D below has a private, immutable source (see the non-cross
+            # path for the full rationale).
+            num_rows = num_context + num_gen_requests
+            host_block_offsets = self._stage_block_offsets_for_copy(num_rows)
+            for pool_idx in range(self.num_pools):
                 if num_context > 0:
                     dst_tensor[pool_idx, :num_context].copy_(
-                        self.host_kv_cache_block_offsets[
-                            pool_idx, :num_context],
+                        host_block_offsets[pool_idx, :num_context],
                         non_blocking=True)
                 if num_gen_requests > 0:
-                    gen_block_offsets = self.host_kv_cache_block_offsets[
+                    gen_block_offsets = host_block_offsets[
                         pool_idx, num_context:num_context + num_gen_requests]
                     dst_tensor[pool_idx, num_context:num_seqs].copy_(
                         gen_block_offsets.repeat_interleave(beam_width, dim=0),
@@ -2139,10 +2150,36 @@ class KVCacheManager(BaseResourceManager):
                                            request_ids[num_context:],
                                            beam_width, num_context)
 
-        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-            dst_tensor[pool_idx, :num_seqs].copy_(
-                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
-                non_blocking=True)
+        # The H2D copies below are asynchronous, so their source is read at copy
+        # execution time, not enqueue time. With the overlap scheduler the CPU
+        # runs an iteration ahead, so copying straight from the persistent buffer
+        # let the next iteration's in-place refill clobber the source of this
+        # iteration's still-pending H2D -> the attention kernel indexed another
+        # batch's blocks (nvbug 6293536; the window is widened when host
+        # offloading stalls the execution stream in front of the H2D). Stage the
+        # async copy through a freshly-allocated pinned buffer instead; the
+        # caching host allocator holds it until the consuming copy completes,
+        # matching the already-safe kv_lens / block_ids_per_seq staging. The
+        # persistent buffer above is untouched by this and stays valid for the
+        # synchronous CPU readers.
+        host_block_offsets = self._stage_block_offsets_for_copy(num_seqs)
+        for pool_idx in range(self.num_pools):
+            dst_tensor[pool_idx, :num_seqs].copy_(host_block_offsets[pool_idx],
+                                                  non_blocking=True)
+
+    def _stage_block_offsets_for_copy(self, num_rows: int) -> torch.Tensor:
+        """Snapshot the first ``num_rows`` rows of the persistent host block
+        offset buffer into a fresh pinned buffer, to serve as the private source
+        of an asynchronous H2D copy (nvbug 6293536)."""
+        host_block_offsets = torch.empty(self.num_pools,
+                                         num_rows,
+                                         2,
+                                         self.max_blocks_per_seq,
+                                         dtype=torch.int32,
+                                         pin_memory=prefer_pinned(),
+                                         device='cpu')
+        host_block_offsets.copy_(self.host_kv_cache_block_offsets[:, :num_rows])
+        return host_block_offsets
 
     def truncate_blocks(self, target_tokens: List[int],
                         num_tokens_to_keep: int):
