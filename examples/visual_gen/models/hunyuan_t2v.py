@@ -37,7 +37,7 @@ def _output_paths(output_path: str, num_videos: int) -> str | list[str]:
     return [str(path.with_name(f"{path.stem}_{idx + 1}{path.suffix}")) for idx in range(num_videos)]
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="HunyuanVideo 1.5 Text-to-Video example")
     parser.add_argument(
         "--model",
