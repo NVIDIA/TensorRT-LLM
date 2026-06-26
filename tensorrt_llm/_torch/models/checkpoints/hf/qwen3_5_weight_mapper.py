@@ -339,6 +339,92 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
         return updated
 
+
+    def _dequantize_fp8_pertensor_excluded_split_weights(self, weights: dict) -> dict:
+        """Dequantize FP8 per-tensor-scale split linear-attention projections.
+
+        In MIXED_PRECISION checkpoints (e.g. Qwen3.6-35B-A3B-NVFP4) the
+        linear-attention projections are stored as split FP8 tensors:
+          in_proj_qkv.weight  (float8_e4m3fn, per-tensor scalar weight_scale)
+          in_proj_z.weight    (float8_e4m3fn, per-tensor scalar weight_scale)
+        These are packed into ``in_proj_qkvz`` by _pack_split_projections.
+
+        The global quant_algo is MIXED_PRECISION, but TRT-LLM does not have a
+        per-layer FP8 quant entry for the packed ``in_proj_qkvz`` name.  As a
+        result the in_proj_qkvz Linear is constructed with UnquantizedLinearMethod
+        (BF16 weight buffer).  Without this method, ``copy_weight`` performs a raw
+        dtype cast from FP8 to BF16, interpreting FP8 bit-patterns directly —
+        inflating each value by ~1/weight_scale (≈ 1000× for typical scales).
+
+        This method runs BEFORE _pack_split_projections.  For every split FP8
+        linear-attention projection weight that carries a per-tensor scalar
+        weight_scale, it dequantizes the component individually via:
+          bf16 = fp8.to(float32) * weight_scale
+        then removes the associated scale tensors (weight_scale, input_scale) so
+        _pack_split_projections never emits a now-wrong fused scalar scale for
+        the packed BF16 module.
+
+        Only scalar (ndim == 0) per-tensor scales are handled here; 2D-block
+        FP8 scales (from FP8_BLOCK_SCALES checkpoints) are handled by
+        _dequantize_linear_attn_fp8_qkvz which runs after packing.
+
+        Guard: only applies to MIXED_PRECISION quant_algo because that is the
+        only mode where ``in_proj_qkvz`` receives an unquantized (BF16) Linear
+        buffer despite FP8 source weights.  For FP8_BLOCK_SCALES or FP8_QDQ
+        the weight buffer IS FP8-typed so the raw copy is correct.
+        """
+        _FP8_DTYPES = (torch.float8_e4m3fn,)
+        try:
+            _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        except AttributeError:
+            pass
+
+        target_dtype = getattr(
+            self.config.pretrained_config, "torch_dtype", torch.bfloat16
+        ) or torch.bfloat16
+
+        updated = dict(weights)
+        # Walk all FP8 weight keys and find split linear-attention projections
+        # (matching the pattern <prefix>.linear_attn.in_proj_{qkv|q|k|v|z}.weight)
+        # that carry a scalar per-tensor weight_scale.
+        candidates = [
+            k for k, v in weights.items()
+            if k.endswith(".weight") and v.dtype in _FP8_DTYPES
+        ]
+        for weight_key in candidates:
+            # Match the full weight_key, e.g.
+            # "model.layers.0.linear_attn.in_proj_qkv.weight"
+            # Group 3 of the pattern captures the suffix ("weight" here).
+            match = self._SPLIT_PROJ_PATTERN.match(weight_key)
+            if match is None:
+                continue
+            _attn_prefix, proj_name, matched_suffix = match.groups()
+            if matched_suffix != "weight":
+                continue  # skip scale tensors caught by the same pattern
+            if proj_name not in {"qkv", "q", "k", "v", "z", "b", "a"}:
+                continue
+            # Only dequantize projections that will be packed into in_proj_qkvz
+            # or in_proj_ba (both receive BF16 buffers under MIXED_PRECISION).
+            # Check for a scalar per-tensor weight_scale on this split tensor.
+            scale_key = weight_key[:-len(".weight")] + ".weight_scale"
+            if scale_key not in weights:
+                continue
+            scale = weights[scale_key]
+            if scale.ndim != 0:
+                continue  # 2D-block scale — handled by _dequantize_linear_attn_fp8_qkvz
+            # Dequantize: bf16 = fp8.to(float32) * weight_scale
+            updated[weight_key] = (
+                weights[weight_key].to(torch.float32) * scale.to(torch.float32)
+            ).to(target_dtype).contiguous()
+            # Remove scale tensors — the packed BF16 module has no parameter
+            # slots for them, and _pack_split_projections must not emit a
+            # now-stale fused scalar scale under the in_proj_qkvz key.
+            for scale_suffix in ("weight_scale", "input_scale"):
+                scale_k = weight_key[:-len(".weight")] + f".{scale_suffix}"
+                updated.pop(scale_k, None)
+
+        return updated
+
     def _pack_split_projections(self, weights: dict) -> dict:
         config = self.config.pretrained_config
         num_k_groups = config.linear_num_key_heads
@@ -489,6 +575,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
             normalized_weights, quant_algo
         )
+
+        # For MIXED_PRECISION checkpoints with FP8 per-tensor-scale linear-attn
+        # projections (e.g. Qwen3.6-35B-A3B-NVFP4): dequantize the split FP8
+        # weights BEFORE packing so each component uses its own scale.
+        # Must run before _pack_split_projections.
+        if quant_algo == QuantAlgo.MIXED_PRECISION:
+            normalized_weights = self._dequantize_fp8_pertensor_excluded_split_weights(
+                normalized_weights
+            )
 
         packed_weights = self._pack_split_projections(normalized_weights)
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and not is_modelopt_pb_wo:
