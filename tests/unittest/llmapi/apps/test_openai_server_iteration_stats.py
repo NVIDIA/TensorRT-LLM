@@ -44,12 +44,14 @@ class _FakeMetricsCollector:
         self.logged_stats.append(iteration_stats)
 
 
-def _make_server(stat_batches: list[list[dict]]) -> OpenAIServer:
+def _make_server(stat_batches: list[list[dict]], *, with_stats_buffer: bool = True) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
     server.generator = _FakeGenerator(stat_batches)
     server.metrics_collector = _FakeMetricsCollector()
     server._iteration_stats_lock = asyncio.Lock()
-    server._iteration_stats_buffer = deque(maxlen=server._get_iteration_stats_buffer_maxlen())
+    server._iteration_stats_buffer = (
+        deque(maxlen=server._get_iteration_stats_buffer_maxlen()) if with_stats_buffer else None
+    )
     return server
 
 
@@ -81,3 +83,14 @@ async def test_metrics_endpoint_drain_logs_prometheus_metrics():
 
     response = await server.get_iteration_stats()
     assert _response_content(response) == []
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_reads_queue_without_background_buffer():
+    stats = [{"iter": 5}, {"iter": 6}]
+    server = _make_server([stats], with_stats_buffer=False)
+
+    response = await server.get_iteration_stats()
+
+    assert _response_content(response) == stats
+    assert server.metrics_collector.logged_stats == stats

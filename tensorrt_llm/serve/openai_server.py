@@ -227,9 +227,14 @@ class OpenAIServer(_VideoRoutesMixin):
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
         self._iteration_stats_lock = asyncio.Lock()
-        self._iteration_stats_buffer = deque(
-            maxlen=self._get_iteration_stats_buffer_maxlen())
         self._iteration_stats_wakeup_event = asyncio.Event()
+        # Bounded snapshot of iteration stats for the GET /metrics handler.
+        # When the background Prometheus collector loop is active, it is the
+        # sole consumer of the engine's stats queue and appends each drained
+        # stat here; /metrics then serves from this buffer instead of racing
+        # the loop for the queue. Created lazily when the loop starts.
+        # See nvbug 6102381.
+        self._iteration_stats_buffer: Optional[deque] = None
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -294,9 +299,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     # engine stats queue; /metrics reads from a tee buffer
                     # bounded by iter_stats_max_iterations to avoid racing
                     # the loop for the queue (nvbug 6102381).
-                    max_buf = getattr(self.generator.args,
-                                      "iter_stats_max_iterations", 1000) or 1000
-                    self._iteration_stats_buffer = deque(maxlen=max_buf)
+                    self._iteration_stats_buffer = deque(
+                        maxlen=self._get_iteration_stats_buffer_maxlen())
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
                     logger.info(
@@ -921,10 +925,29 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
+        # When the background collector loop is active it is the sole
+        # consumer of the engine stats queue; serve /metrics from the tee
+        # buffer it populates so we do not race it for queue items. Racing
+        # caused >80% iteration loss and ~2s per-call latency (nvbug 6102381).
+        # The caller receives the stats accumulated since the previous /metrics
+        # call (up to iter_stats_max_iterations) and the buffer is cleared.
+        if self._iteration_stats_buffer is not None:
+            async with self._iteration_stats_lock:
+                await self._drain_iteration_stats_to_sinks_unlocked(timeout=2)
+                stats = list(self._iteration_stats_buffer)
+                self._iteration_stats_buffer.clear()
+            return JSONResponse(content=stats)
+
+        # Legacy path: no background collector -> read the queue directly.
         async with self._iteration_stats_lock:
-            await self._drain_iteration_stats_to_sinks_unlocked(timeout=2)
-            stats = list(self._iteration_stats_buffer)
-            self._iteration_stats_buffer.clear()
+            self._iteration_stats_buffer = deque(
+                maxlen=self._get_iteration_stats_buffer_maxlen())
+            try:
+                await self._drain_iteration_stats_to_sinks_unlocked(timeout=2)
+                stats = list(self._iteration_stats_buffer)
+                self._iteration_stats_buffer.clear()
+            finally:
+                self._iteration_stats_buffer = None
         return JSONResponse(content=stats)
 
     async def _drain_iteration_stats_to_sinks_unlocked(self,
@@ -932,7 +955,8 @@ class OpenAIServer(_VideoRoutesMixin):
         async for llm_stat in self.generator.get_stats_async(timeout):
             if self.metrics_collector:
                 self.metrics_collector.log_iteration_stats(llm_stat)
-            self._iteration_stats_buffer.append(llm_stat)
+            if self._iteration_stats_buffer is not None:
+                self._iteration_stats_buffer.append(llm_stat)
 
     async def _drain_iteration_stats_to_sinks(self, timeout: float) -> None:
         async with self._iteration_stats_lock:
