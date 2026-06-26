@@ -2280,12 +2280,16 @@ class W8A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
     ):
-        assert activation_type == ActivationType.Swiglu, (
-            "Only Swiglu activation is supported for W8A16RefGatedMLPFusedMoE"
-        )
+        assert activation_type in (
+            ActivationType.Swiglu,
+            ActivationType.Relu2,
+            ActivationType.Silu,
+        ), f"Unsupported activation for W8A16RefGatedMLPFusedMoE: {activation_type}"
         # Store the original quant_config for assertion in load_weights
         self._original_quant_config = model_config.quant_config if model_config else None
-        # Create experts without quantization config since we'll dequantize weights
+        # Create experts without quantization config since we'll dequantize weights.
+        # Forward activation_type so the base builds gated (Swiglu) or non-gated
+        # (squared-ReLU / SiLU) experts as appropriate.
         super().__init__(
             num_experts=num_experts,
             routing_method=routing_method,
@@ -2294,6 +2298,7 @@ class W8A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
             dtype=dtype,
             model_config=ModelConfig(),  # No quant_config
             bias=bias,
+            activation_type=activation_type,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -2312,24 +2317,33 @@ class W8A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # Get quantized weights and scales
             w1 = weights[f"{expert}.w1.weight"]
             s1 = weights[f"{expert}.w1.weight_scale"]
-            w3 = weights[f"{expert}.w3.weight"]
-            s3 = weights[f"{expert}.w3.weight_scale"]
             w2 = weights[f"{expert}.w2.weight"]
             s2 = weights[f"{expert}.w2.weight_scale"]
 
             # Dequantize weights: w_dequant = (w.float() * scale).to(dtype)
             # Note: weights are (out_features, in_features), need transpose for matmul
             w1_dequant = (w1.T.contiguous().float() * s1).to(self.dtype).T.contiguous()
-            w3_dequant = (w3.T.contiguous().float() * s3).to(self.dtype).T.contiguous()
             w2_dequant = (w2.T.contiguous().float() * s2).to(self.dtype).T.contiguous()
 
             # Load as regular weights (no scales)
-            gate_up_proj_weights = [{}, {}]
             down_proj_weights = [{}]
-            gate_up_proj_weights[0]["weight"] = w1_dequant
-            gate_up_proj_weights[1]["weight"] = w3_dequant
             down_proj_weights[0]["weight"] = w2_dequant
-            self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+
+            # Gated experts pack gate (w3) + up (w1) into gate_up_proj; non-gated
+            # experts (squared-ReLU) have only the up (w1) projection.
+            if self._is_gated:
+                w3 = weights[f"{expert}.w3.weight"]
+                s3 = weights[f"{expert}.w3.weight_scale"]
+                w3_dequant = (w3.T.contiguous().float() * s3).to(self.dtype).T.contiguous()
+                gate_up_proj_weights = [{}, {}]
+                gate_up_proj_weights[0]["weight"] = w1_dequant
+                gate_up_proj_weights[1]["weight"] = w3_dequant
+                self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+            else:
+                up_proj_weights = [{}]
+                up_proj_weights[0]["weight"] = w1_dequant
+                self.experts[expert].up_proj.load_weights(up_proj_weights)
+
             self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def check_accuracy(self, output, ref_output, weight_dtype=torch.int8):
@@ -2367,10 +2381,6 @@ class W8A16QuantizeUtil(BaseQuantizeUtil):
             w2_weight = torch.randint(
                 -128, 127, (self.hidden_size, self.intermediate_size), dtype=torch.int8
             ).cuda()
-            w3_weight = torch.randint(
-                -128, 127, (self.intermediate_size, self.hidden_size), dtype=torch.int8
-            ).cuda()
-
             # Per-channel scales
             w1_scale = (
                 torch.randn(self.intermediate_size, dtype=self.dtype, device="cuda")
@@ -2380,10 +2390,20 @@ class W8A16QuantizeUtil(BaseQuantizeUtil):
                 torch.randn(self.hidden_size, dtype=self.dtype, device="cuda")
                 / self.intermediate_size
             )
-            w3_scale = (
-                torch.randn(self.intermediate_size, dtype=self.dtype, device="cuda")
-                / self.hidden_size
-            )
+
+            # Non-gated experts (e.g. Nemotron-H squared-ReLU) have no gate (w3)
+            # projection, so emit empty w3 tensors. Mirrors NVFP4QuantizeUtil.
+            if self._is_gated:
+                w3_weight = torch.randint(
+                    -128, 127, (self.intermediate_size, self.hidden_size), dtype=torch.int8
+                ).cuda()
+                w3_scale = (
+                    torch.randn(self.intermediate_size, dtype=self.dtype, device="cuda")
+                    / self.hidden_size
+                )
+            else:
+                w3_weight = torch.empty(0, dtype=torch.int8, device="cuda")
+                w3_scale = torch.empty(0, dtype=self.dtype, device="cuda")
 
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
