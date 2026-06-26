@@ -94,7 +94,7 @@ class FallbackFmha(Fmha):
             block_ids_per_seq=metadata.block_ids_per_seq,
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
-            beam_width=metadata.effective_beam_width,
+            beam_width=metadata.beam_width,
             use_paged_context_fmha=metadata.use_paged_context_fmha,
             helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,

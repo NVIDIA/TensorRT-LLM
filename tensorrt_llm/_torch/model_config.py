@@ -20,7 +20,8 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig)
+                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -185,6 +186,9 @@ class ModelConfig(Generic[TConfig]):
 
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None
+
+    # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
+    multimodal_config: MultimodalConfig | None = None
 
     def __setattr__(self, key, value):
         """
@@ -504,6 +508,24 @@ class ModelConfig(Generic[TConfig]):
                     set(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
+
+        # MXFP8 checkpoints (e4m3 weights + UE8M0 1x32 block scales, dynamic MXFP8 acts).
+        elif hf_quant_config.get("quant_method") == "mxfp8":
+            quant_config.quant_algo = QuantAlgo.MXFP8
+            block_size = hf_quant_config.get("weight_block_size", [1, 32])
+            # MXFP8 uses 1x32 blocks along the K dim; group_size is the K block (32).
+            assert tuple(block_size) == (1, 32), (
+                f"MXFP8 only supports weight_block_size=[1,32], got {block_size}"
+            )
+            quant_config.group_size = block_size[1]
+
+            # Layers the producer left in BF16.
+            ignored = hf_quant_config.get("ignored_layers", [])
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(hf_exclude_modules + ignored))
+            else:
+                quant_config.exclude_modules = list(ignored)
 
         # NOTE: This is for llm-compressor's quantized checkpoints.
         elif hf_quant_config.get("quant_method") == "compressed-tensors":
