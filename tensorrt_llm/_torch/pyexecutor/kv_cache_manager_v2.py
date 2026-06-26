@@ -521,7 +521,6 @@ class KVCacheManagerV2(BaseResourceManager):
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
         enable_stats: bool = False,
-        enable_swa_scratch_reuse: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -544,7 +543,9 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
-        self.enable_swa_scratch_reuse = enable_swa_scratch_reuse and not self.is_draft
+        self.enable_swa_scratch_reuse = (
+            kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
+        )
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width

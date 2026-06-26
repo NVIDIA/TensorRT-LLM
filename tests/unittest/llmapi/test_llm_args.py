@@ -349,6 +349,7 @@ def test_KvCacheConfig_declaration():
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
                            kv_cache_event_hash_algo="v2_sha256_64",
+                           enable_swa_scratch_reuse=True,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
                            attention_dp_events_gather_period_ms=10)
@@ -361,6 +362,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.host_cache_size == 1024
     assert config.disk_cache_size == 2048
     assert config.disk_cache_path == "/tmp"
+    assert config.enable_swa_scratch_reuse is True
+    assert KvCacheConfig().enable_swa_scratch_reuse is False
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0

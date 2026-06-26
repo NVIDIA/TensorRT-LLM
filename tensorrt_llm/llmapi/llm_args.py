@@ -3289,6 +3289,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="Whether to use the KV cache manager v2 (experimental).")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_swa_scratch_reuse: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
+
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
             default="auto",
