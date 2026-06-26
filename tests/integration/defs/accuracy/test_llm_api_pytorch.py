@@ -5605,6 +5605,74 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    def _run_nvfp4_4gpus_eplb(self, eplb_config, moe_backend, mocker):
+        model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(max_batch_size=32,
+                                            enable_padding=True)
+        moe_config = MoeConfig(backend=moe_backend, load_balancer=eplb_config)
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=4,
+                 max_num_tokens=16384,
+                 max_batch_size=32,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config,
+                 enable_attention_dp=True,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("moe_backend", ["CUTEDSL", "TRTLLM"])
+    def test_nvfp4_4gpus_static_eplb(self, moe_backend, mocker):
+        model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+        with open(f"{model_path}/config.json") as f:
+            model_cfg = json.load(f)
+        text_cfg = model_cfg.get("text_config", model_cfg)
+        num_experts = text_cfg.get("num_experts", model_cfg.get("num_experts"))
+        num_hidden_layers = text_cfg.get("num_hidden_layers",
+                                         model_cfg.get("num_hidden_layers"))
+        ep_size = 4
+        # num_slots must be >= num_experts and divisible by ep_size; add 16
+        # redundant expert slots per rank.
+        num_slots = num_experts + 16 * ep_size
+        # Qwen3.5 places a MoE block in every decoder layer (no dense/mlp-only
+        # layers), so assign initial slots for all layers.
+        initial_global_assignments = {
+            i: [(i + j) % num_experts for j in range(num_slots)]
+            for i in range(num_hidden_layers)
+        }
+        eplb_config = MoeLoadBalancerConfig(
+            num_slots=num_slots,
+            initial_global_assignments=initial_global_assignments,
+            layer_updates_per_iter=0)
+        self._run_nvfp4_4gpus_eplb(eplb_config, moe_backend, mocker)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_device_not_contain(["GB200"])
+    @parametrize_with_ids("moe_backend", ["CUTEDSL", "TRTLLM"])
+    def test_nvfp4_4gpus_online_eplb(self, moe_backend, mocker):
+        # Qwen3.5-397B-A17B has 512 routed experts.
+        num_experts = 512
+        ep_size = 4
+        num_slots = num_experts + 16 * ep_size
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+        self._run_nvfp4_4gpus_eplb(eplb_config, moe_backend, mocker)
+
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
@@ -6878,6 +6946,42 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
     MODEL_PATH = f"{llm_models_root()}/MiniMax-M2"
+
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, True, True), (True, True, True)])
+    def test_4gpus(self, tp_size, ep_size, attention_dp, cuda_graph,
+                   overlap_scheduler):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(
+                backend="DEEPGEMM" if get_sm_version() >= 100 else "CUTLASS"))
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=4096,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@skip_pre_hopper
+class TestMiniMaxM2_5(LlmapiAccuracyTestHarness):
+    # MiniMax-M2.5 is a ~230B FP8-block-scale MoE checkpoint of the
+    # MiniMaxM2ForCausalLM architecture; this mirrors TestMiniMaxM2 on the
+    # M2.5 checkpoint. The GSM8K reference value is confirmed by a local run
+    # before merge.
+    MODEL_NAME = "MiniMaxAI/MiniMax-M2.5"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M2.5"
 
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     @pytest.mark.skip_less_device(4)

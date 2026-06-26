@@ -1241,6 +1241,7 @@ class MLA(nn.Module):
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
+        self._weights_transformed = False
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
@@ -1629,6 +1630,7 @@ class MLA(nn.Module):
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
+        self._weights_transformed = False
 
     def apply_rope(
         self,
@@ -3008,7 +3010,9 @@ class MLA(nn.Module):
 
         return weight_param, scale_param
 
-    def post_load_weights(self):
+    def transform_weights(self) -> None:
+        if self._weights_transformed:
+            return
         has_fp8_block_scales = (
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
@@ -3021,3 +3025,10 @@ class MLA(nn.Module):
 
             self.v_b_proj, self.v_b_proj_scale = self.resmooth_parameters(
                 self.v_b_proj, self.v_b_proj_scale, recipe=(1, 128, 128))
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
+        self._weights_transformed = True
+
+    def post_load_weights(self) -> None:
+        self.transform_weights()
