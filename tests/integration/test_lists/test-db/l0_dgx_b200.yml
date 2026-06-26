@@ -62,7 +62,6 @@ l0_dgx_b200:
   - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_fused_cat_fp4_dsv32_prefill_shape
   - unittest/_torch/attention/sparse/test_cpp_custom_ops.py::test_indexer_k_cache_gather_contiguous_fp4
   - unittest/_torch/attention/sparse/dsa/test_dsa_fp4_indexer.py
-  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_fp4_indexer.py
 - condition:
     ranges:
       system_gpu_count:
