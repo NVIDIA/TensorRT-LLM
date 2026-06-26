@@ -27,6 +27,23 @@ from tensorrt_llm.logger import logger
 _HARD_KILL_EXIT_CODE = 137
 
 
+def _best_effort_flush_streams() -> None:
+    """Flush stdout/stderr without ever raising; diagnostics must not block hard kill."""
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            stream.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+def _best_effort_log_error(message: str) -> None:
+    """Log at error level without ever raising; diagnostics must not block hard kill."""
+    try:
+        logger.error(message)
+    except Exception:  # noqa: BLE001 - diagnostics must not block hard kill
+        pass
+
+
 def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
     """Hard-kill this rank and propagate the kill to peer ranks.
 
@@ -38,22 +55,28 @@ def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
       ``MPI_THREAD_MULTIPLE``; guarded by ``Query_thread``.
     - Fallback: self-``SIGKILL``. The launcher (``mpirun`` propagates by default;
       ``srun`` needs ``--kill-on-bad-exit``) then tears down peers.
+
+    All flushing and logging is best-effort: a closed/broken stdout, stderr, or
+    logger must never prevent reaching ``MPI_Abort`` or ``os.kill``.
     """
-    sys.stderr.flush()
-    sys.stdout.flush()
+    _best_effort_flush_streams()
     try:
         if ENABLE_MULTI_DEVICE and not mpi_disabled():
             from mpi4py import MPI
 
             if MPI.Is_initialized() and MPI.Query_thread() == MPI.THREAD_MULTIPLE:
-                logger.error("HangDetector: propagating hard-kill to all ranks via MPI_Abort.")
+                _best_effort_log_error(
+                    "HangDetector: propagating hard-kill to all ranks via MPI_Abort."
+                )
                 mpi_comm().Abort(exit_code)
                 return  # not reached; Abort does not return
     except Exception as e:  # noqa: BLE001 - last-resort path must not raise
-        logger.error(
+        _best_effort_log_error(
             f"HangDetector: MPI_Abort propagation failed ({e}); falling back to self-SIGKILL."
         )
-    logger.error("HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks.")
+    _best_effort_log_error(
+        "HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks."
+    )
     os.kill(os.getpid(), signal.SIGKILL)
 
 

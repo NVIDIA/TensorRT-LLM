@@ -31,7 +31,12 @@ def test_detector_fires_after_timeout():
         time.sleep(1.0)
         assert hd.detected() is False
         assert fired == []
-        time.sleep(2.0)
+        # Poll up to a generous deadline rather than asserting at the exact
+        # timeout boundary -- the detector thread may wake a bit after the
+        # configured ``timeout`` and a fixed sleep flakes in CI.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not hd.detected():
+            time.sleep(0.05)
         assert hd.detected() is True
         assert len(fired) == 1
 

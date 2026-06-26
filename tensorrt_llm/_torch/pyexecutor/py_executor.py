@@ -690,10 +690,14 @@ class PyExecutor:
             # The graceful shutdown path can itself deadlock on collectives
             # while peer ranks stay blocked in NCCL holding their GPUs. Hard-kill
             # this rank and propagate the kill outward instead.
-            logger.error(
-                f"Hang detected on rank {self.global_rank} in PyExecutor; "
-                "hard-killing and propagating to peer ranks.")
-            propagate_hard_kill()
+            # Guard the diagnostic log in try/finally so propagate_hard_kill()
+            # always runs even if logging itself raises.
+            try:
+                logger.error(
+                    f"Hang detected on rank {self.global_rank} in PyExecutor; "
+                    "hard-killing and propagating to peer ranks.")
+            finally:
+                propagate_hard_kill()
 
         self.hang_detector = HangDetector(timeout=hang_detection_timeout,
                                           on_detected=on_detected)
