@@ -358,7 +358,6 @@ def test_sparse_kv_predict(batch_size, num_contexts):
         for batch_idx in range(num_contexts):
             start_idx = trtllm_offsets[batch_idx]
             end_idx = trtllm_offsets[batch_idx + 1]
-            end_idx - start_idx
 
             batch_overlaps = []
             for head_idx in range(num_kv_heads):
@@ -669,7 +668,6 @@ def test_sparse_attn_predict(batch_size, num_contexts):
         for batch_idx in range(num_generations):
             start_idx = trtllm_offsets[batch_idx]
             end_idx = trtllm_offsets[batch_idx + 1]
-            end_idx - start_idx
 
             batch_overlaps = []
             for head_idx in range(num_kv_heads):

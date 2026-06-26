@@ -231,15 +231,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of (compress ratio, attention type) for the layers
     attention_type_set: Set[Tuple[int, DeepseekV4AttentionType]]
     # The number of total compressed tokens for each compress ratio
-    num_total_compressed_tokens: Dict[int, int] = {}
+    num_total_compressed_tokens: Dict[int, int]
     # The max number of context compressed tokens for each compress ratio
-    max_ctx_compressed_tokens: Dict[int, int] = {}
+    max_ctx_compressed_tokens: Dict[int, int]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def __post_init__(self):
         super().__post_init__()
+        self.num_total_compressed_tokens = {}
+        self.max_ctx_compressed_tokens = {}
         window_size = getattr(self.sparse_metadata_params, "window_size", None)
         if window_size is None and self.sparse_attention_config is not None:
             window_size = self.sparse_attention_config.window_size

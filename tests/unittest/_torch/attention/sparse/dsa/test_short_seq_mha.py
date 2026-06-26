@@ -381,7 +381,7 @@ def _make_metadata(
 def _run_forward(
     mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices=None
 ):
-    """Run forward_context_dsa on cloned inputs and return the output tensor."""
+    """Run forward_context_sparse_mla on cloned inputs and return the output tensor."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
     mla.forward_context_sparse_mla(
         q=q.clone(),

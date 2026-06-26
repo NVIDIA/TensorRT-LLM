@@ -1350,6 +1350,15 @@ class MLA(nn.Module):
         self.num_heads_tp_cp = self.num_heads_tp // cp_size
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
                                        1) // tp_size
+        if self.is_deepseek_v4:
+            if self.num_groups % tp_size != 0:
+                raise ValueError(
+                    f"DeepSeek-V4 num_groups ({self.num_groups}) must be divisible by tp_size ({tp_size})."
+                )
+            if self.num_heads % self.num_groups != 0:
+                raise ValueError(
+                    f"DeepSeek-V4 num_heads ({self.num_heads}) must be divisible by num_groups ({self.num_groups})."
+                )
         self.n_local_groups = self.num_groups // tp_size
 
         rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
@@ -1556,6 +1565,8 @@ class MLA(nn.Module):
             aux_stream=mqa_aux_stream,
             rope_append=not self.is_deepseek_v4,
         )
+        self.compressor = getattr(self.mqa, "compressor", None)
+        self.indexer = getattr(self.mqa, "indexer", None)
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
 
@@ -2181,9 +2192,11 @@ class MLA(nn.Module):
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
+            ctx_position_ids = (position_ids[..., :num_ctx_tokens]
+                                if position_ids is not None else None)
             if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
+                assert ctx_position_ids is not None
+                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
 
             self.forward_context_sparse_mla(
                 q_ctx,
@@ -2194,7 +2207,7 @@ class MLA(nn.Module):
                 latent_cache_ctx,
                 topk_indices=topk_indices[:num_ctx_tokens, :]
                 if topk_indices is not None else None,
-                position_ids=position_ids,
+                position_ids=ctx_position_ids,
             )
 
         if num_generations > 0:
@@ -2202,9 +2215,11 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+            gen_position_ids = (position_ids[..., num_ctx_tokens:num_tokens]
+                                if position_ids is not None else None)
             if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
+                assert gen_position_ids is not None
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
 
             self.forward_generation_sparse_mla(
                 q_gen,
@@ -2214,6 +2229,7 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
+                position_ids=gen_position_ids,
             )
 
     def forward_impl_with_deepseek_v4(self,
@@ -3441,7 +3457,7 @@ class MLA(nn.Module):
         if self._weights_transformed:
             return
         # In DeepSeek-V4 mode, kv_b_proj doesn't exist
-        if self.is_deepseek_v4:
+        if getattr(self, "is_deepseek_v4", False):
             has_fp8_block_scales = False
         else:
             has_fp8_block_scales = (

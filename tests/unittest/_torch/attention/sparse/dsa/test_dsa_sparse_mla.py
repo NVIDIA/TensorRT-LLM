@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Tests for sparse MLA attention using explicit sparse indices.
 """
@@ -405,6 +420,8 @@ num_generation_steps = [2]
 
 tokens_per_block = 64
 
+# Keep this sparse MLA integration matrix on BF16 to control runtime. FP8 KV-cache
+# coverage lives in the dedicated DSA FP8 indexer and paged-MQA tests.
 kv_cache_dtype_list = [torch.bfloat16]
 # DSA only supports rope_append=True
 rope_append_values = [True]
@@ -422,7 +439,6 @@ scenarios = [
 
 accuracy_dict = {
     torch.bfloat16: (0.1, 0.01),
-    torch.float8_e4m3fn: (0.1, 0.01),
 }
 
 SPARSE_TOPK = 2048
@@ -548,7 +564,7 @@ def _run_test_for_backend(
 
     # Create inputs
     inputs_per_layer = []
-    for layer_idx in range(num_layers):
+    for _ in range(num_layers):
         ctx_compressed_kv = torch.cat(
             [
                 torch.empty(
@@ -787,215 +803,226 @@ def _run_test_for_backend(
         sparse_attn_config=sparse_config,
         model_config=model_config,
     )
-    request_ids = list(range(max_num_contexts))
-    kv_cache_manager.add_dummy_requests(request_ids, context_sequence_lengths)
+    try:
+        request_ids = list(range(max_num_contexts))
+        kv_cache_manager.add_dummy_requests(request_ids, context_sequence_lengths)
 
-    ctx_seq_lens = torch.tensor(context_sequence_lengths, dtype=torch.int)
-    total_ctx_tokens = sum(context_sequence_lengths)
-    attn_metadata = AttentionCls.Metadata(
-        seq_lens=ctx_seq_lens,
-        request_ids=request_ids,
-        max_num_requests=max_num_contexts,
-        num_contexts=max_num_contexts,
-        prompt_lens=context_sequence_lengths,
-        max_num_tokens=total_ctx_tokens,
-        kv_cache_manager=kv_cache_manager,
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
-        ),
-        mapping=mapping,
-        sparse_attention_config=sparse_config,
-    )
-    attn_metadata.prepare()
+        ctx_seq_lens = torch.tensor(context_sequence_lengths, dtype=torch.int)
+        total_ctx_tokens = sum(context_sequence_lengths)
+        attn_metadata = AttentionCls.Metadata(
+            seq_lens=ctx_seq_lens,
+            request_ids=request_ids,
+            max_num_requests=max_num_contexts,
+            num_contexts=max_num_contexts,
+            prompt_lens=context_sequence_lengths,
+            max_num_tokens=total_ctx_tokens,
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
+            ),
+            mapping=mapping,
+            sparse_attention_config=sparse_config,
+        )
+        attn_metadata.prepare()
 
-    # run forward for each step and each layer
-    latent_cache_ref_all_list = [None for _ in range(num_layers)]
-    for step in range(num_generation_steps + 1):
-        if step > 0:
-            _allocate_kv_cache_for_generation(kv_cache_manager, request_ids, generation_seq_len_q)
-            gen_seq_lens = torch.tensor([generation_seq_len_q] * max_num_contexts, dtype=torch.int)
-            total_gen_tokens = max_num_contexts * generation_seq_len_q
-            attn_metadata = AttentionCls.Metadata(
-                seq_lens=gen_seq_lens,
-                request_ids=request_ids,
-                max_num_requests=max_num_contexts,
-                num_contexts=0,
-                prompt_lens=context_sequence_lengths,
-                max_num_tokens=total_gen_tokens,
-                kv_cache_manager=kv_cache_manager,
-                kv_cache_params=KVCacheParams(
-                    use_cache=True,
-                    num_cached_tokens_per_seq=[
-                        ctx_len + (step - 1) * generation_seq_len_q
-                        for ctx_len in context_sequence_lengths
-                    ],
-                ),
-                mapping=mapping,
-                enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
-                sparse_attention_config=sparse_config,
-            )
-            attn_metadata.prepare()
-        for layer_idx in range(num_layers):
-            print(
-                f"--------------------------------step {step} layer {layer_idx} start--------------------------------"
-            )
-            if step == 0:
-                fused_q = inputs_per_layer[layer_idx]["ctx_fused_q"]
-                compressed_kv = inputs_per_layer[layer_idx]["ctx_compressed_kv"]
-                k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
-                latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-                q_pe = inputs_per_layer[layer_idx]["ctx_q_pe"]
-                topk_indices = _build_sparse_topk_indices_context(
-                    context_sequence_lengths, SPARSE_TOPK, device
+        # run forward for each step and each layer
+        latent_cache_ref_all_list = [None for _ in range(num_layers)]
+        for step in range(num_generation_steps + 1):
+            if step > 0:
+                _allocate_kv_cache_for_generation(
+                    kv_cache_manager, request_ids, generation_seq_len_q
                 )
-                result = ctx_layers[layer_idx].forward(
-                    fused_q.clone(),
-                    None,
-                    None,
-                    attn_metadata,
-                    attention_input_type=AttentionInputType.context_only,
-                    latent_cache=latent_cache,
-                    q_pe=q_pe,
-                    topk_indices=topk_indices,
+                gen_seq_lens = torch.tensor(
+                    [generation_seq_len_q] * max_num_contexts, dtype=torch.int
                 )
-                k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_sequence_lengths)
-                latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
-                fused_q_rot = _rotate_fused_q_for_ctx(
-                    fused_q,
-                    rope_cos_sin,
-                    context_sequence_lengths,
-                    num_heads,
-                    kv_lora_rank,
-                    qk_rope_head_dim,
+                total_gen_tokens = max_num_contexts * generation_seq_len_q
+                attn_metadata = AttentionCls.Metadata(
+                    seq_lens=gen_seq_lens,
+                    request_ids=request_ids,
+                    max_num_requests=max_num_contexts,
+                    num_contexts=0,
+                    prompt_lens=context_sequence_lengths,
+                    max_num_tokens=total_gen_tokens,
+                    kv_cache_manager=kv_cache_manager,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=[
+                            ctx_len + (step - 1) * generation_seq_len_q
+                            for ctx_len in context_sequence_lengths
+                        ],
+                    ),
+                    mapping=mapping,
+                    enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
+                    sparse_attention_config=sparse_config,
                 )
-                ref_result = calculate_ref_result_ctx_sparse(
-                    fused_q_rot,
-                    latent_cache_ref,
-                    context_sequence_lengths,
-                    num_heads,
-                    kv_lora_rank,
-                    v_head_dim,
-                    qk_nope_head_dim,
-                    qk_rope_head_dim,
-                    q_scaling,
-                    topk_indices=topk_indices,
-                )
-                latent_cache_ref_all_list[layer_idx] = latent_cache_ref
-            else:
-                fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][step - 1]
-                q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step - 1]
-                compressed_kv = inputs_per_layer[layer_idx]["gen_compressed_kv_list"][step - 1]
-                k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
-                latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-
-                num_tokens = fused_q.size(0)
-                num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
-                cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=fused_q.device)
-                cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=fused_q.device)
-                fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=fused_q.device)
-                has_fp8_kv_cache = (
-                    gen_layers[layer_idx].has_fp8_kv_cache
-                    if hasattr(gen_layers[layer_idx], "has_fp8_kv_cache")
-                    else False
-                )
-
-                if has_fp8_kv_cache:
-                    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=fused_q.device)
-                    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=fused_q.device)
-                    quant_q_buffer = torch.empty(
-                        num_tokens, num_heads * head_dim, dtype=torch.uint8, device=fused_q.device
+                attn_metadata.prepare()
+            for layer_idx in range(num_layers):
+                print(f"---- step {step} layer {layer_idx} start ----")
+                if step == 0:
+                    fused_q = inputs_per_layer[layer_idx]["ctx_fused_q"]
+                    compressed_kv = inputs_per_layer[layer_idx]["ctx_compressed_kv"]
+                    k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+                    q_pe = inputs_per_layer[layer_idx]["ctx_q_pe"]
+                    topk_indices = _build_sparse_topk_indices_context(
+                        context_sequence_lengths, SPARSE_TOPK, device
                     )
+                    result = ctx_layers[layer_idx].forward(
+                        fused_q.clone(),
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.context_only,
+                        latent_cache=latent_cache,
+                        q_pe=q_pe,
+                        topk_indices=topk_indices,
+                    )
+                    k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_sequence_lengths)
+                    latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
+                    fused_q_rot = _rotate_fused_q_for_ctx(
+                        fused_q,
+                        rope_cos_sin,
+                        context_sequence_lengths,
+                        num_heads,
+                        kv_lora_rank,
+                        qk_rope_head_dim,
+                    )
+                    ref_result = calculate_ref_result_ctx_sparse(
+                        fused_q_rot,
+                        latent_cache_ref,
+                        context_sequence_lengths,
+                        num_heads,
+                        kv_lora_rank,
+                        v_head_dim,
+                        qk_nope_head_dim,
+                        qk_rope_head_dim,
+                        q_scaling,
+                        topk_indices=topk_indices,
+                    )
+                    latent_cache_ref_all_list[layer_idx] = latent_cache_ref
                 else:
-                    mla_bmm1_scale = None
-                    mla_bmm2_scale = None
-                    quant_q_buffer = None
+                    fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][step - 1]
+                    q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step - 1]
+                    compressed_kv = inputs_per_layer[layer_idx]["gen_compressed_kv_list"][step - 1]
+                    k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
-                gen_layers[layer_idx].mla_rope_generation(
-                    fused_q,
-                    q_pe,
-                    latent_cache,
-                    attn_metadata,
-                    cu_q_seqlens,
-                    cu_kv_seqlens,
-                    fmha_scheduler_counter,
-                    mla_bmm1_scale,
-                    mla_bmm2_scale,
-                    quant_q_buffer,
-                )
+                    num_tokens = fused_q.size(0)
+                    num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+                    cu_q_seqlens = torch.empty(
+                        num_seqs + 1, dtype=torch.int32, device=fused_q.device
+                    )
+                    cu_kv_seqlens = torch.empty(
+                        num_seqs + 1, dtype=torch.int32, device=fused_q.device
+                    )
+                    fmha_scheduler_counter = torch.empty(
+                        1, dtype=torch.uint32, device=fused_q.device
+                    )
+                    has_fp8_kv_cache = (
+                        gen_layers[layer_idx].has_fp8_kv_cache
+                        if hasattr(gen_layers[layer_idx], "has_fp8_kv_cache")
+                        else False
+                    )
 
-                cached_lens = [
-                    ctx_len + (step - 1) * generation_seq_len_q
-                    for ctx_len in context_sequence_lengths
-                ]
-                topk_indices = _build_sparse_topk_indices_generation(
-                    cached_lens, generation_seq_len_q, SPARSE_TOPK, device
-                )
+                    if has_fp8_kv_cache:
+                        mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=fused_q.device)
+                        mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=fused_q.device)
+                        quant_q_buffer = torch.empty(
+                            num_tokens,
+                            num_heads * head_dim,
+                            dtype=torch.uint8,
+                            device=fused_q.device,
+                        )
+                    else:
+                        mla_bmm1_scale = None
+                        mla_bmm2_scale = None
+                        quant_q_buffer = None
 
-                result = gen_layers[layer_idx].forward(
-                    fused_q,
-                    None,
-                    None,
-                    attn_metadata,
-                    attention_input_type=AttentionInputType.generation_only,
-                    latent_cache=latent_cache,
-                    q_pe=q_pe,
-                    cu_q_seqlens=cu_q_seqlens,
-                    cu_kv_seqlens=cu_kv_seqlens,
-                    fmha_scheduler_counter=fmha_scheduler_counter,
-                    mla_bmm1_scale=mla_bmm1_scale,
-                    mla_bmm2_scale=mla_bmm2_scale,
-                    quant_q_buffer=quant_q_buffer,
-                    topk_indices=topk_indices,
-                )
-                ref_result, latent_cache_ref = calculate_ref_result_gen(
-                    fused_q,
-                    q_pe,
-                    compressed_kv,
-                    k_pe,
-                    latent_cache_ref_all_list[layer_idx],
-                    rope_cos_sin,
-                    num_heads,
-                    kv_lora_rank,
-                    v_head_dim,
-                    qk_nope_head_dim,
-                    qk_rope_head_dim,
-                    [
+                    gen_layers[layer_idx].mla_rope_generation(
+                        fused_q,
+                        q_pe,
+                        latent_cache,
+                        attn_metadata,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                        mla_bmm1_scale,
+                        mla_bmm2_scale,
+                        quant_q_buffer,
+                    )
+
+                    cached_lens = [
                         ctx_len + (step - 1) * generation_seq_len_q
                         for ctx_len in context_sequence_lengths
-                    ],
-                    q_scaling,
-                    topk_indices=topk_indices,
+                    ]
+                    topk_indices = _build_sparse_topk_indices_generation(
+                        cached_lens, generation_seq_len_q, SPARSE_TOPK, device
+                    )
+
+                    result = gen_layers[layer_idx].forward(
+                        fused_q,
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.generation_only,
+                        latent_cache=latent_cache,
+                        q_pe=q_pe,
+                        cu_q_seqlens=cu_q_seqlens,
+                        cu_kv_seqlens=cu_kv_seqlens,
+                        fmha_scheduler_counter=fmha_scheduler_counter,
+                        mla_bmm1_scale=mla_bmm1_scale,
+                        mla_bmm2_scale=mla_bmm2_scale,
+                        quant_q_buffer=quant_q_buffer,
+                        topk_indices=topk_indices,
+                    )
+                    ref_result, latent_cache_ref = calculate_ref_result_gen(
+                        fused_q,
+                        q_pe,
+                        compressed_kv,
+                        k_pe,
+                        latent_cache_ref_all_list[layer_idx],
+                        rope_cos_sin,
+                        num_heads,
+                        kv_lora_rank,
+                        v_head_dim,
+                        qk_nope_head_dim,
+                        qk_rope_head_dim,
+                        [
+                            ctx_len + (step - 1) * generation_seq_len_q
+                            for ctx_len in context_sequence_lengths
+                        ],
+                        q_scaling,
+                        topk_indices=topk_indices,
+                    )
+                    latent_cache_ref_all_list[layer_idx] = latent_cache_ref
+                # Compare results
+                print(
+                    f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
                 )
-                latent_cache_ref_all_list[layer_idx] = latent_cache_ref
-            # Compare results
-            print(
-                f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
-            )
-            print(
-                f"Reference output mean: {ref_result.abs().mean().item()}, max: {ref_result.abs().max().item()}"
-            )
-            print(
-                f"Difference mean: {(result - ref_result).abs().mean().item()}, \
-                    max: {(result - ref_result).abs().max().item()}"
-            )
+                print(
+                    f"Reference output mean: {ref_result.abs().mean().item()}, max: {ref_result.abs().max().item()}"
+                )
+                print(
+                    f"Difference mean: {(result - ref_result).abs().mean().item()}, \
+                        max: {(result - ref_result).abs().max().item()}"
+                )
 
-            # Assert results are close
-            atol, rtol = accuracy_dict[kv_cache_dtype]
-            assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), (
-                f"Results for sparse MLA in {backend_name} backend don't match reference implementation \
-                    at layer {layer_idx} in step {step}"
-            )
+                # Assert results are close
+                atol, rtol = accuracy_dict[kv_cache_dtype]
+                assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), (
+                    f"Results for sparse MLA in {backend_name} backend don't match reference implementation \
+                        at layer {layer_idx} in step {step}"
+                )
 
-            print(
-                f"Test for sparse MLA in {backend_name} backend passed at layer {layer_idx} in step {step}"
-            )
-            print(
-                f"--------------------------------step {step} layer {layer_idx} end--------------------------------"
-            )
+                print(
+                    f"Test for sparse MLA in {backend_name} backend passed at layer {layer_idx} in step {step}"
+                )
+                print(f"---- step {step} layer {layer_idx} end ----")
 
-    print(f"Test for sparse MLA in {backend_name} backend passed")
-    kv_cache_manager.shutdown()
+        print(f"Test for sparse MLA in {backend_name} backend passed")
+    finally:
+        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

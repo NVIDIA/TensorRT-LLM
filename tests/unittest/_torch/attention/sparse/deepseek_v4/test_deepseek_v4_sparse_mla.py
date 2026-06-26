@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Tests for DeepSeek-V4 sparse MLA attention.
 """
@@ -1432,7 +1447,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
     # 3. Allocate 1 gen step for gen requests.
     gen_requests = requests[1:]
     _allocate_kv_cache_for_generation(cache_manager, gen_requests)
-    gen_cached_lens = [cl + generation_seq_len_q for cl in gen_ctx_lengths]
+    gen_cached_lens = gen_ctx_lengths
 
     # Grow compress buffers for gen step.
     gen_kv_lens = [cl + generation_seq_len_q for cl in gen_cached_lens]
@@ -1451,7 +1466,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
     # 4. Mixed metadata: request 0 = context, requests 1..N = generation.
     mixed_seq_lens = [context_lengths[0]] + [generation_seq_len_q] * num_gen
-    mixed_cached_lens = [0] + gen_cached_lens
+    mixed_cached_lens = [0, *gen_cached_lens]
     mixed_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(mixed_seq_lens, dtype=torch.int),
         request_ids=request_ids,

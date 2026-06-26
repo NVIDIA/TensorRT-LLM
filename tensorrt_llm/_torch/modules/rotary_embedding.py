@@ -37,6 +37,7 @@ class RotaryEmbedding(nn.Module):
         However, if k is cached without positional embedding, we need to apply rope to q and k with different values, so we need a separate call for each.
         """
         if IS_FLASHINFER_AVAILABLE and len(targets) == 2:
+            assert not self.inverse, "FlashInfer RoPE path does not support inverse RoPE."
             from ..custom_ops import \
                 flashinfer_apply_rope_with_cos_sin_cache_inplace
             q = targets[0]
