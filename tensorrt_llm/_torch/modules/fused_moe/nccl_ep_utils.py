@@ -31,6 +31,7 @@ from tensorrt_llm.mapping import Mapping
 _MIN_NCCL_RUNTIME_VERSION = "2.30.4"
 _MIN_NCCL_EP_INT32_TOPK_VERSION = "0.2"
 _NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
+_NCCL_AVAILABILITY_ERRORS = (ImportError,) + _NCCL_RUNTIME_ERRORS
 
 _nccl_ep_installed: Optional[bool] = None
 
@@ -59,7 +60,8 @@ def is_nccl_ep_installed() -> bool:
         import nccl.ep  # noqa: F401
 
         _nccl_ep_installed = True
-    except ImportError:
+    except _NCCL_AVAILABILITY_ERRORS as e:
+        logger.info(f"NCCL EP disabled: nccl.ep is not usable ({e!r})")
         _nccl_ep_installed = False
     return _nccl_ep_installed
 

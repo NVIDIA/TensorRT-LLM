@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe import nccl_ep_utils
 from tensorrt_llm._torch.modules.fused_moe.communication import communication_factory
 from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
@@ -53,6 +55,22 @@ def _make_model_config(
 
 def _strategy_unavailable(*args, **kwargs):
     raise RuntimeError("strategy unavailable")
+
+
+def _install_failing_nccl_module(monkeypatch: pytest.MonkeyPatch, error: BaseException):
+    def fail_get_version():
+        raise error
+
+    monkeypatch.setattr(nccl_ep_utils, "_nccl_ep_installed", None)
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(get_version=fail_get_version))
+    monkeypatch.delitem(sys.modules, "nccl.ep", raising=False)
+
+
+def test_nccl_ep_installed_handles_runtime_probe_failure(monkeypatch: pytest.MonkeyPatch):
+    _install_failing_nccl_module(monkeypatch, RuntimeError("missing libnccl_ep"))
+
+    assert nccl_ep_utils.is_nccl_ep_installed() is False
+    assert nccl_ep_utils._nccl_ep_installed is False
 
 
 class _FakeNcclEP:
@@ -170,6 +188,27 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
         raise AssertionError("NcclEP should not be constructed")
 
     monkeypatch.setattr(communication_factory, "NcclEP", fail_if_called)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, AllGatherReduceScatter)
+
+
+def test_auto_selection_falls_back_when_nccl_probe_runtime_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_config = _make_model_config(torch.bfloat16, None)
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    _install_failing_nccl_module(monkeypatch, OSError("missing native NCCL EP library"))
 
     strategy = communication_factory.CommunicationFactory.create_strategy(
         model_config,
