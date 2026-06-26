@@ -98,21 +98,19 @@ class BaseReasoningParser(ABC):
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
 @register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
-# Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
-# pre-injects `<think>\n` into the assistant prompt prefix, so the model
-# output begins inside the reasoning block with no opening tag to search
-# for. That requires `reasoning_at_start=True`. The existing `qwen3` key
-# keeps `reasoning_at_start=False` for back-compat, and `parse()` is
-# binary on this flag (it either requires `<think>` to be present in the
-# output, or assumes the output begins at the start of reasoning) - so
-# the two behaviors must be registered under separate keys.
-@register_reasoning_parser("qwen3_5", reasoning_at_start=True)
+# `qwen3` keeps `reasoning_at_start=False`: classic Qwen3 hybrid models emit
+# their own `<think>` opening tag, so `parse()` searches for it. Models whose
+# chat template pre-injects an unclosed `<think>` into the prompt (so the
+# output begins inside the reasoning block with no opening tag) instead need
+# `reasoning_at_start=True` and are registered under separate keys -- e.g.
+# `deepseek-r1` here, and `qwen3_5` for Qwen3.5 (see Qwen35ReasoningParser,
+# which additionally honors the per-request `enable_thinking` toggle).
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
-    """
+    r"""
     Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
-    Since the latest official tokenizer_config.json initially adds "<think>\\n" at the end of the prompt
+    Since the latest official tokenizer_config.json initially adds "<think>\n" at the end of the prompt
     (https://huggingface.co/deepseek-ai/DeepSeek-R1/blob/main/tokenizer_config.json),
     treat all the text before the </think> tag as `reasoning_content` and the text after as `content`.
     """
@@ -248,8 +246,8 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
-    "qwen3_5": "qwen3",
-    "qwen3_5_moe": "qwen3",
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
@@ -263,11 +261,13 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "minimax_m3_vl": "minimax_m3",
 }
 
+# Classic Qwen3 family whose reasoning variant (hybrid / forced-thinking /
+# forced-non-thinking) must be disambiguated from the chat template. Qwen3.5
+# (qwen3_5 / qwen3_5_moe) is intentionally excluded: it has a dedicated
+# `qwen3_5` parser and is routed directly via MODEL_TYPE_TO_REASONING_PARSER.
 _QWEN3_MODEL_TYPES = frozenset({
     "qwen3",
     "qwen3_moe",
-    "qwen3_5",
-    "qwen3_5_moe",
     "qwen3_next",
 })
 
@@ -471,6 +471,25 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                 content=result.reasoning_content[tc:] + result.content,
                 reasoning_content=result.reasoning_content[:tc])
         return self._maybe_swap_content(result)
+
+
+@register_reasoning_parser("qwen3_5")
+class Qwen35ReasoningParser(NemotronV3ReasoningParser):
+    r"""Reasoning parser for Qwen3.5.
+
+    Qwen3.5's chat template pre-injects an unclosed ``<think>\n`` into the
+    assistant generation prompt when thinking is enabled, so the model output
+    begins inside the reasoning block with no opening ``<think>`` tag -- this
+    requires ``reasoning_at_start=True``. When ``enable_thinking`` is ``False``
+    the template instead emits a closed ``<think>\n\n</think>\n\n`` block and
+    the output is plain content.
+
+    Both behaviors -- plus treating ``<tool_call>`` (which Qwen3.5 also emits)
+    as an implicit end-of-reasoning marker -- are already implemented by
+    :class:`NemotronV3ReasoningParser`, which reads ``enable_thinking`` from
+    ``chat_template_kwargs`` to flip ``reasoning_at_start`` per request, so this
+    parser only needs to register under its own key.
+    """
 
 
 @register_reasoning_parser("gemma4")
