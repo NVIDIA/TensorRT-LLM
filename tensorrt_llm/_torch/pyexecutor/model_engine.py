@@ -14,6 +14,7 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
@@ -498,7 +499,6 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config)
 
         if self.is_spec_decode:
-            self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
@@ -552,6 +552,7 @@ class PyTorchModelEngine(ModelEngine):
         # the model engine.
         self.attn_metadata = None
         self.encoder_attn_metadata = None
+        self.spec_metadata = None
         self.iter_states = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
@@ -1350,33 +1351,70 @@ class PyTorchModelEngine(ModelEngine):
         else:
             max_seq_len_list = [effective_max_seq_len]
 
-        for bs, draft_len in graphs_to_capture:
-            if bs > self.batch_size:
-                continue
-
-            for max_seq_len in max_seq_len_list:
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len, max_seq_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        # No KV cache space, cannot continue capturing graphs
+        def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
+            spec_metadata = self.spec_metadata
+            if force_non_greedy and spec_metadata is not None:
+                spec_metadata._force_non_greedy_for_capture = True
+                # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
+                # to build the graph cache key BEFORE populate runs inside
+                # _prepare_inputs. Pre-flip it here so the very first capture
+                # in this pass uses the non-greedy key; populate's override
+                # below will keep it False on every subsequent iteration.
+                spec_metadata.is_all_greedy_sample = False
+            try:
+                for bs, draft_len in graphs_to_capture:
+                    if bs > self.batch_size:
                         continue
-                    logger.info(
-                        f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
-                    )
-                    self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
-                        self.spec_config is not None
-                        and self.spec_config.spec_dec_mode.use_one_engine())
-                    self._update_draft_inference_state_for_warmup(
-                        batch, draft_len > 0, resource_manager)
-                    self.runtime_draft_len = draft_len
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+
+                    for max_seq_len in max_seq_len_list:
+                        warmup_request = self._create_cuda_graph_warmup_request(
+                            resource_manager, bs, draft_len, max_seq_len)
+                        with self._release_batch_context(
+                                warmup_request, resource_manager) as batch:
+                            if batch is None:
+                                # No KV cache space, cannot continue capturing graphs
+                                continue
+                            logger.info(
+                                f"Run generation-only CUDA graph warmup ({label}) "
+                                f"for batch size={bs}, draft_len={draft_len}, "
+                                f"max_seq_len={max_seq_len}")
+                            self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
+                                self.spec_config is not None and
+                                self.spec_config.spec_dec_mode.use_one_engine())
+                            self._update_draft_inference_state_for_warmup(
+                                batch, draft_len > 0, resource_manager)
+                            self.runtime_draft_len = draft_len
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+            finally:
+                if force_non_greedy and spec_metadata is not None:
+                    spec_metadata._force_non_greedy_for_capture = False
+
+        # Pass 1: greedy fast-path (dummy requests carry no sampling params,
+        # so is_all_greedy_sample is naturally True).
+        _run_capture_pass(force_non_greedy=False, label="greedy")
+        # Pass 2: advanced sampling variant. Required because on-the-fly capture
+        # is disabled outside warmup, so any inference batch that contains a
+        # non-greedy request would otherwise fall back to eager. Only meaningful
+        # for one-engine spec dec (where is_all_greedy_sample participates in
+        # the graph key); other paths default to True and would never key into
+        # this variant.
+        needs_non_greedy_capture = (
+            self.spec_config is not None
+            and self.spec_config.spec_dec_mode.use_one_engine())
+        if needs_non_greedy_capture:
+            _run_capture_pass(force_non_greedy=True, label="advanced sampling")
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
+        # The advanced-sampling capture pass above leaves is_all_greedy_sample
+        # set to False on spec_metadata. Reset it to the default so the first
+        # real iteration's graph-key selection is not seeded with this
+        # capture-only value. (update_is_all_greedy_sample refreshes it every
+        # iteration; this is a defensive guard.)
+        if self.spec_metadata is not None:
+            self.spec_metadata.is_all_greedy_sample = True
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -1630,6 +1668,12 @@ class PyTorchModelEngine(ModelEngine):
         if requests is None:
             return None
 
+        def free_warmup_requests() -> None:
+            for r in requests:
+                kv_cache_manager.free_resources(r)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(r)
+
         # Add one dummy request with the maximum possible sequence length.
         max_seq_len = min(
             self.max_seq_len if max_seq_len is None else max_seq_len,
@@ -1681,10 +1725,7 @@ class PyTorchModelEngine(ModelEngine):
             draft_kv_cache_manager=draft_kv_cache_manager)
 
         if max_seq_len_request is None:
-            for r in requests:
-                kv_cache_manager.free_resources(r)
-                if draft_kv_cache_manager is not None:
-                    draft_kv_cache_manager.free_resources(r)
+            free_warmup_requests()
             return None
         else:
             max_seq_len_request = max_seq_len_request[0]
@@ -3000,6 +3041,17 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
                 input_ids_start_offset=context_start_idx)
+            # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
+            # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
+            # not from the request.
+            # NOTE: the prefetch producer always writes the cached embedding into
+            # `py_multimodal_data` before stamping the event, so whenever the event is present,
+            # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
+            # it.
+            mm_encoder_event = request.py_mm_encoder_event
+            if mm_encoder_event is not None:
+                multimodal_params.encoder_event = mm_encoder_event
+                request.py_mm_encoder_event = None
             if multimodal_params.has_content():
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
@@ -4462,6 +4514,7 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = inputs['input_ids']
         seq_lens = inputs['seq_lens']  # Only seq_lens includes padding
         position_ids = inputs.get('position_ids')
+        multi_item_part_lens = inputs.get('multi_item_part_lens')
         actual_num_tokens = len(input_ids)
         batch_size = len(seq_lens)
 
@@ -4472,11 +4525,49 @@ class PyTorchModelEngine(ModelEngine):
                                        dtype=torch.int,
                                        pin_memory=prefer_pinned())
             if position_ids is None:
-                # Auto-generate packed position IDs: [0..n1-1, 0..n2-1, ...]
-                position_ids_t = torch.cat([
-                    torch.arange(s, dtype=torch.int) for s in seq_lens
-                ])[:actual_num_tokens]
-                position_ids_t = maybe_pin_memory(position_ids_t)
+                if multi_item_part_lens is not None:
+                    if len(multi_item_part_lens) != len(seq_lens):
+                        raise ValueError(
+                            "\"multi_item_part_lens\" must either be provided for all prompts or for none"
+                        )
+
+                    # Scoring items have overlapping position IDs. Position IDs of delimiters
+                    # are irrelevant.
+                    starts_cuda = torch.tensor(
+                        [
+                            start
+                            for req_multi_item_part_lens in multi_item_part_lens
+                            for start in [0] + [req_multi_item_part_lens[0]] *
+                            (len(req_multi_item_part_lens) - 1)
+                        ],
+                        pin_memory=prefer_pinned(),
+                        dtype=torch.int32,
+                    ).to(device=self.position_ids_cuda.device,
+                         non_blocking=True)
+                    ends_cuda = torch.tensor(
+                        [
+                            end + 1
+                            for req_multi_item_part_lens in multi_item_part_lens
+                            for end in [req_multi_item_part_lens[0]] + [
+                                req_multi_item_part_lens[0] + item_len
+                                for item_len in req_multi_item_part_lens[1:]
+                            ]
+                        ],
+                        pin_memory=prefer_pinned(),
+                        dtype=torch.int32,
+                    ).to(device=self.position_ids_cuda.device,
+                         non_blocking=True)
+                    position_ids_t = torch_multi_arange(
+                        starts=starts_cuda,
+                        ends=ends_cuda,
+                        output_length=input_ids_t.numel(),
+                    )
+                else:
+                    # Auto-generate packed position IDs: [0..n1-1, 0..n2-1, ...]
+                    position_ids_t = torch.cat([
+                        torch.arange(s, dtype=torch.int) for s in seq_lens
+                    ])[:actual_num_tokens]
+                    position_ids_t = maybe_pin_memory(position_ids_t)
             elif not isinstance(position_ids, torch.Tensor):
                 position_ids_t = torch.tensor(position_ids,
                                               dtype=torch.int,
@@ -4489,6 +4580,12 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.num_contexts = batch_size
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = list(range(batch_size))
+            if multi_item_part_lens is not None and not self.attn_backend.support_multi_item_scoring(
+            ):
+                raise ValueError(
+                    "The selected attention backend does not support multi-item scoring."
+                )
+            attn_metadata.multi_item_part_lens = multi_item_part_lens
             if hasattr(attn_metadata, 'prepare_encoder_only'):
                 attn_metadata.prepare_encoder_only()
             else:
@@ -4510,6 +4607,11 @@ class PyTorchModelEngine(ModelEngine):
 
         # CUDA graph hit path.
         assert self.encoder_cuda_graph_runner.enabled, "Encoder CUDA graph runner is not enabled"
+
+        # NB: The multi-item scoring arguments lack '_buf' counterparts (cf., e.g.,
+        #     https://github.com/flashinfer-ai/flashinfer/blob/2aa1d49cf140d73ccdd3761051c5f2944406cb83/flashinfer/prefill.py#L1622 ),
+        #     which are typically used to support CUDA graphs in FlashInfer.
+        assert multi_item_part_lens is None, "multi-item scoring with CUDA graph not implemented"
 
         attn_metadata.prepare_encoder_cuda_graph_replay(seq_lens,
                                                         padded_num_tokens)
@@ -4887,6 +4989,17 @@ class PyTorchModelEngine(ModelEngine):
                 self.runtime_draft_len) as padded_requests:
             self._pad_batch_seed_mrope_delta_cache(padded_requests)
 
+            # Refresh is_all_greedy_sample for the *current* batch BEFORE the
+            # CUDA graph key is built below. The key includes this flag to pick
+            # the argmax vs advanced-sampling graph variant; populate (inside
+            # _prepare_inputs) runs later and fills the matching GPU buffers.
+            # Without this pre-scan the key would use the previous iteration's
+            # stale value and could replay the advanced graph against
+            # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
+            if spec_metadata is not None:
+                spec_metadata.update_is_all_greedy_sample(
+                    padded_requests.all_requests())
+
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
                 enable_spec_decode=self.enable_spec_decode,
@@ -5186,6 +5299,10 @@ class PyTorchModelEngine(ModelEngine):
         # Build a fresh, no-cache attention metadata for the encoder
         # pass.  We do not reuse ``self.attn_metadata`` because that
         # object is bound to the decoder's KV-cache manager.
+        sparse_metadata_params = (
+            self.sparse_attention_config.to_sparse_metadata_params(
+                pretrained_config=self.model.model_config.pretrained_config)
+            if self.sparse_attention_config is not None else None)
         encoder_attn_metadata = self.attn_backend.Metadata(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -5196,7 +5313,7 @@ class PyTorchModelEngine(ModelEngine):
             enable_flash_mla=self.model.model_config.enable_flash_mla,
             enable_context_mla_with_cached_kv=False,
             cache_indirection=None,
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
             num_heads_per_kv=1,
         )
         assert isinstance(

@@ -686,6 +686,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 and encoder_output_len is None):
             encoder_output_len = len(encoder_input_tokens)
             kwargs["encoder_output_len"] = encoder_output_len
+
+        # Cross-iter MM encoder prefetch event: stamped by the side-stream
+        # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
+        # and consumed (then cleared) in `model_engine._prepare_inputs` when
+        # the request is next scheduled.
+        self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
+
         if llm_request is not None:
             super().__init__(llm_request)
         else:

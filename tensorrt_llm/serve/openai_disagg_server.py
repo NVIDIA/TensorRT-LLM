@@ -43,9 +43,9 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
-                                                UCompletionRequest,
-                                                UCompletionResponse)
+from tensorrt_llm.serve.openai_protocol import (
+    DisaggregatedParams, UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
@@ -99,6 +99,8 @@ class OpenAIDisaggServer:
         self._server_start_timeout_secs = server_start_timeout_secs
         self._metadata_server_cfg = metadata_server_cfg
         self._metrics_interval_secs = metrics_interval_secs
+        self._allow_request_chat_template = getattr(
+            config, "allow_request_chat_template", False)
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
@@ -218,6 +220,11 @@ class OpenAIDisaggServer:
                     self._perf_metrics_collector.stream_requests.inc()
                 else:
                     self._perf_metrics_collector.nonstream_requests.inc()
+                try:
+                    ensure_request_chat_template_allowed(
+                        req, self._allow_request_chat_template)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)

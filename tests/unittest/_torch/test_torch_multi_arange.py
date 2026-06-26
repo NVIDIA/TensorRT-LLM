@@ -21,10 +21,10 @@ import pytest
 import torch
 from utils.util import assert_no_cuda_sync, force_ampere
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (ACCEPT_SYNC_COMPUTE,
-                                                           torch_multi_arange)
+from tensorrt_llm._torch.utils import ACCEPT_SYNC_COMPUTE, torch_multi_arange
 
 BASE_CASES = [
+    # (starts, ends, steps, expected)
     (None, [], None, []),
     ([], [], None, []),
     (None, [], [], []),
@@ -48,6 +48,16 @@ BASE_CASES = [
     ([2], [5], None, [2, 3, 4]),
     ([2], [5], [2], [2, 4]),
     ([2], [6], [2], [2, 4]),
+    (None, [0, 3], None, [0, 1, 2]),
+    (None, [2, 4, 0, 0, 3], None, [0, 1, 0, 1, 2, 3, 0, 1, 2]),
+    (None, [2, 4, 0, 0], None, [0, 1, 0, 1, 2, 3]),
+    (None, [0, 2, 4], None, [0, 1, 0, 1, 2, 3]),
+    (None, [0, 0, 2, 4], None, [0, 1, 0, 1, 2, 3]),
+    ([1, 4, 2, 6, 3], [3, 5, 2, 4, 7], None, [1, 2, 4, 3, 4, 5, 6]),
+    ([1, 4, 3, 2], [3, 5, 7, 2], None, [1, 2, 4, 3, 4, 5, 6]),
+    ([1, 4, 3, 2, 6], [3, 5, 7, 2, 4], None, [1, 2, 4, 3, 4, 5, 6]),
+    ([6, 1, 4, 3], [4, 3, 5, 7], None, [1, 2, 4, 3, 4, 5, 6]),
+    ([2, 6, 1, 4, 3], [2, 4, 3, 5, 7], None, [1, 2, 4, 3, 4, 5, 6]),
 ]
 
 

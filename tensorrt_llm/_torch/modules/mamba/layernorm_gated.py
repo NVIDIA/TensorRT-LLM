@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
 
 
@@ -226,6 +227,7 @@ class RMSNorm(torch.nn.Module):
         # NVFP4 quantized path - uses optimized fused CUDA kernel
         # Fuses: SiLU gating + Group RMSNorm + FP4 quantization
         if self.is_nvfp4 and z is not None and not self.norm_before_gate and \
+            get_sm_version() >= 100 and \
            fused_gated_rmsnorm_quant_shape_ok(self.hidden_size, self.group_size):
             if self.nvfp4_scale is None:
                 raise ValueError(
