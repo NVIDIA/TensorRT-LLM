@@ -1,5 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """Shared MoE scheduler utilities and online TMA descriptor helpers."""
 
 from abc import ABC, abstractmethod
@@ -179,8 +206,8 @@ def gmem_ptr_to_generic(
 ) -> Pointer:
     if gmem_ptr.memspace != AddressSpace.gmem:
         raise ValueError(
-            f"gmem_ptr_to_generic requires pointer in gmem address space, got {gmem_ptr.memspace}"
-        )
+            f"gmem_ptr_to_generic requires pointer in gmem address space, "
+            f"got {gmem_ptr.memspace}")
     # Get LLVM pointer and cast to generic address space
     llvm_ptr = gmem_ptr.to_llvm_ptr(loc=loc,
                                     ip=ip)  # type: ignore[attr-defined]
@@ -1145,12 +1172,12 @@ class MoEScaledGroupedGemmTensormapConstructor(OnlineTensormapDescCreator):
 
         a_chunks_to_move = (padded_offset // self.sf_vec_size *
                             cute.size(self.sfa_tensor, mode=[0]) // 128)
-        a_elems_to_move = cute.size(
-            self.sfa_tensor, mode=[0]) * padded_offset // self.sf_vec_size
+        a_elems_to_move = (cute.size(self.sfa_tensor, mode=[0]) *
+                           padded_offset // self.sf_vec_size)
         b_chunks_to_move = (padded_offset // self.sf_vec_size *
                             cute.size(self.sfb_tensor, mode=[0]) // 128)
-        b_elems_to_move = cute.size(
-            self.sfb_tensor, mode=[0]) * padded_offset // self.sf_vec_size
+        b_elems_to_move = (cute.size(self.sfb_tensor, mode=[0]) *
+                           padded_offset // self.sf_vec_size)
 
         per_expert_sfa_shape = (self.sfa_tensor.shape[0], padded_size_i, c1
                                 )  # type: ignore[index]
