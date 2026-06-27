@@ -26,6 +26,8 @@ from tqdm import tqdm
 import tensorrt_llm.profiler as profiler
 
 from ..llmapi import RequestOutput
+from ..llmapi.reasoning_parser import (HARMONY_REASONING_PARSER,
+                                       ReasoningParserFactory)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 
@@ -64,6 +66,127 @@ def get_model_context(llm: Any) -> tuple[str, str]:
     if model_type is None:
         raise KeyError(f"'model_type' is missing from {config_path}.")
     return str(model_dir), str(model_type)
+
+
+def _first_output_text(output: RequestOutput) -> str:
+    # Eval scoring has historically used the first completion choice; keep that
+    # selection centralized so reasoning cleanup does not change choice order.
+    return output.outputs[0].text
+
+
+def _extract_harmony_final_content(output: RequestOutput) -> Optional[str]:
+    output_tokens = getattr(output.outputs[0], "token_ids", None)
+    if not output_tokens:
+        return None
+
+    try:
+        # GPT-OSS raw LLM output is a Harmony token transcript. The adapter
+        # returns the OpenAI final-channel content that JSON scoring expects.
+        from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+        parsed_output = get_harmony_adapter().harmony_output_to_openai(
+            output_tokens)
+    except Exception:
+        return None
+
+    content = parsed_output.get("content")
+    return content if isinstance(content, str) else None
+
+
+def _reasoning_parser_markers(parser: Any) -> tuple[str, ...]:
+    # Auto-detection should only run on text that visibly contains a parser's
+    # reasoning markers, otherwise plain JSON could be rewritten by a guess.
+    marker_names = ("reasoning_start", "reasoning_end", "CHANNEL_OPEN",
+                    "CHANNEL_CLOSE")
+    return tuple(getattr(parser, name) for name in marker_names
+                 if isinstance(getattr(parser, name, None), str)
+                 and getattr(parser, name))
+
+
+def _extract_reasoning_parser_content(
+    text: str,
+    reasoning_parser: str,
+    *,
+    require_marker: bool,
+) -> Optional[str]:
+    try:
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+    except Exception:
+        return None
+
+    markers = _reasoning_parser_markers(parser)
+    if require_marker and not any(marker in text for marker in markers):
+        return None
+
+    try:
+        # Normal reasoning models emit delimiter-tagged raw text such as
+        # `<think>...</think>{...}`. Their parser strips reasoning and leaves
+        # the final answer content for task scoring.
+        parsed = parser.parse(text)
+    except Exception:
+        return None
+
+    if not parsed.content:
+        return None
+    if require_marker and parsed.content == text:
+        return None
+    return parsed.content
+
+
+def _extract_any_reasoning_parser_content(text: str) -> Optional[str]:
+    for reasoning_parser in ReasoningParserFactory.keys():
+        content = _extract_reasoning_parser_content(text,
+                                                    reasoning_parser,
+                                                    require_marker=True)
+        if content is not None:
+            return content
+    return None
+
+
+def extract_final_content_from_generation(
+    output: RequestOutput,
+    *,
+    reasoning_parser: Optional[str] = None,
+    fallback_to_raw: bool = True,
+) -> Optional[str]:
+    """Return the scoreable final-answer text from a raw generation.
+
+    Handles plain JSON text, Harmony token transcripts, and normal reasoning
+    parser formats like `<think>...</think>{...}` for eval-only scoring.
+    """
+    text = _first_output_text(output)
+
+    if reasoning_parser == HARMONY_REASONING_PARSER:
+        # Explicit Harmony parser case: GPT-OSS keeps final-answer boundaries in
+        # token ids, not just in the raw text field.
+        content = _extract_harmony_final_content(output)
+        if content is not None:
+            return content
+        return text if fallback_to_raw else None
+
+    if reasoning_parser is not None:
+        # Explicit non-Harmony parser case: callers already know which parser
+        # produced the transcript, so let that parser strip reasoning content.
+        content = _extract_reasoning_parser_content(text,
+                                                    reasoning_parser,
+                                                    require_marker=False)
+        if content is not None:
+            return content
+        return text if fallback_to_raw else None
+
+    # Raw eval outputs do not always carry a parser id. Try Harmony first
+    # because GPT-OSS final-channel structure is reliably recoverable from ids.
+    content = _extract_harmony_final_content(output)
+    if content is not None:
+        return content
+
+    # Then handle visible reasoning tags from non-Harmony parsers, while
+    # requiring markers so plain text is not rewritten by a guessed parser.
+    content = _extract_any_reasoning_parser_content(text)
+    if content is not None:
+        return content
+
+    return text if fallback_to_raw else None
 
 
 class Evaluator(ABC):
