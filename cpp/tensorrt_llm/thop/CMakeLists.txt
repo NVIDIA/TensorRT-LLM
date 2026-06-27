@@ -57,6 +57,7 @@ add_library(
   fp8PerTensorScalingTrtllmGenGemm.cpp
   fp4Op.cpp
   fp4Gemm.cpp
+  nvfp4SvdquantGemm.cpp
   fp4GemmTrtllmGen.cpp
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
