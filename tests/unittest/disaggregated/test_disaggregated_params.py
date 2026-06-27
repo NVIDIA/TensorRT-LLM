@@ -105,6 +105,25 @@ def test_to_llm_disaggregated_params():
     assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
 
 
+def test_opaque_state_rejected_in_openai_protocol():
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    openai_params = OpenAIDisaggregatedParams(
+        request_type="generation_only", encoded_opaque_state="opaque"
+    )
+    with pytest.raises(ValueError, match="encoded_opaque_state"):
+        to_llm_disaggregated_params(openai_params)
+
+    with pytest.raises(ValueError, match="opaque_state"):
+        to_disaggregated_params(
+            DisaggregatedParams(request_type="context_only", opaque_state=b"opaque")
+        )
+
+
 @patch("tensorrt_llm.disaggregated_params.tllme")
 def test_get_context_phase_params_disagg_wins(mock_tllme):
     """disagg_request_id takes priority over ctx_request_id."""

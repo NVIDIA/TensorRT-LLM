@@ -1191,13 +1191,15 @@ class UpdateWeightsRequest(OpenAIBaseModel):
 def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
     if opaque_state is None:
         return None
-    return base64.b64encode(opaque_state).decode("utf-8")
+    raise ValueError(
+        "opaque_state cannot be serialized through the OpenAI protocol")
 
 
 def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
     if encoded_opaque_state is None:
         return None
-    return base64.b64decode(encoded_opaque_state)
+    raise ValueError(
+        "encoded_opaque_state is not accepted from OpenAI requests")
 
 
 def _serialize_first_gen_log_probs(
