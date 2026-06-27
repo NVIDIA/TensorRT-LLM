@@ -462,7 +462,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 if qkvz_candidates:
                     # Use the scalar from "qkv" if present, else fall back to
                     # any available candidate (q/k/v all hold the same value).
-                    representative = tensors.get("qkv") or next(
+                    representative = tensors["qkv"] if "qkv" in tensors else next(
                         v for k, v in tensors.items() if k in {"q", "k", "v"}
                     )
                     assert representative.ndim == 0, (
@@ -477,7 +477,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
                 ba_candidates = {"b", "a"} & tensors.keys()
                 if ba_candidates:
-                    representative_ba = tensors.get("b") or tensors.get("a")
+                    representative_ba = tensors["b"] if "b" in tensors else tensors["a"]
                     assert representative_ba.ndim == 0, (
                         f"Expected scalar (ndim=0) for {prefix}.in_proj_b.{suffix}, "
                         f"got shape {representative_ba.shape}"
