@@ -162,16 +162,6 @@ class BatchDesc:
 
 
 @dataclass(slots=True)
-class HelixConfig:
-    helix_group_size: int
-    helix_gpu_rank: int
-    # number of tokens in one helix shard
-    helix_shard_size: int
-    # must be the same for all ranks in the same helix group and different for different helix groups.
-    shared_comm_port: int
-
-
-@dataclass(slots=True)
 class SwaScratchReuseConfig:
     """
     Configuration for SWA scratch reuse.
@@ -247,9 +237,6 @@ class KVCacheManagerConfig:
     """
     Collect V2 KV cache allocation, reuse, and transfer statistics.
     """
-
-    # unsupported yet
-    helix_config: HelixConfig | None = None
 
     @property
     def enable_swa_scratch_reuse(self) -> bool:

@@ -125,13 +125,6 @@ class BufferConfig:
     tokens_per_block_override: int | None = None
 
 @dataclass(slots=True)
-class HelixConfig:
-    helix_group_size: int
-    helix_gpu_rank: int
-    helix_shard_size: int
-    shared_comm_port: int
-
-@dataclass(slots=True)
 class AttentionLayerConfig:
     layer_id: LayerId
     buffers: list[BufferConfig]
@@ -174,7 +167,6 @@ class KVCacheManagerConfig:
     ssm_reuse_interval: int = 512
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     enable_stats: bool = True
-    helix_config: HelixConfig | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
