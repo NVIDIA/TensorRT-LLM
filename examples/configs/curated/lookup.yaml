@@ -81,8 +81,8 @@
   scenario: Max Throughput
   gpu_compatibility: "B200, GB200"
   disagg: true
-- model: MiniMaxAI/MiniMax-M3
-  arch: MiniMaxM3SparseForCausalLM
+- model: nvidia/MiniMax-M3-MXFP8
+  arch: MiniMaxM3SparseForConditionalGeneration
   config_path: examples/configs/curated/minimax-m3-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "GB200"
