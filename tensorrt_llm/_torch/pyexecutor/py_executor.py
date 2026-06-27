@@ -3165,7 +3165,9 @@ class PyExecutor:
         drain=False: as soon as a fetched batch contains a control request,
             fire the action first, then continue forwarding requests.
         """
-        if len(self.control_requests) == 0:
+        # Return when control_requests is an empty list, or absent (some
+        # unit tests build a mock PyExecutor that never sets the attribute).
+        if not getattr(self, "control_requests", None):
             return
 
         assert len(self.control_requests) == 1, (
