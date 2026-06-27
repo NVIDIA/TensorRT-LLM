@@ -377,6 +377,14 @@ class MnnvlMemory:
         )
 
     @staticmethod
+    @functools.cache
+    def _is_pcie_nvl_sku(dev_id: int) -> bool:
+        # H100/H200 "NVL" PCIe SKUs bond GPUs into NVLink islands joined only
+        # by PCIe/SYS. Per-island NVLink reports all-up, so support_nvlink()
+        # cannot distinguish them from fabric-attached SKUs.
+        return " NVL" in torch.cuda.get_device_name(dev_id)
+
+    @staticmethod
     def supports_mnnvl() -> bool:
         # TODO:
         # We check if it has all NVLink up now.
@@ -388,6 +396,8 @@ class MnnvlMemory:
         if get_sm_version() in (120, 121):
             return False
         dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
+            return False
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
 
