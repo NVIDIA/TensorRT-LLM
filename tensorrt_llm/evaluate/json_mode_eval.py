@@ -24,12 +24,14 @@ import numpy as np
 from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
+from ..llmapi.reasoning_parser import resolve_guided_decoding_reasoning_parser
 from ..logger import logger
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .interface import Evaluator, extract_final_content_from_generation
 
 
-def _load_json_from_generation(output: RequestOutput):
+def _load_json_from_generation(output: RequestOutput,
+                               reasoning_parser: Optional[str] = None):
     text = output.outputs[0].text
     try:
         # Plain/non-reasoning evals already return the constrained JSON as raw
@@ -40,8 +42,8 @@ def _load_json_from_generation(output: RequestOutput):
         # or `<think>...</think>{...}`. Score the final answer content when it
         # can be extracted; otherwise preserve the original JSON failure.
         final_content = extract_final_content_from_generation(
-            output, fallback_to_raw=False)
-        if final_content is None:
+            output, reasoning_parser=reasoning_parser)
+        if final_content == text:
             raise original_error
         return json.loads(final_content)
 
@@ -62,6 +64,7 @@ class JsonModeEval(Evaluator):
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt,
                          output_dir=output_dir)
+        self._reasoning_parser: Optional[str] = None
         if dataset_path is None:
             dataset_path = "NousResearch/json-mode-eval"
         self.data = datasets.load_dataset(dataset_path,
@@ -72,6 +75,21 @@ class JsonModeEval(Evaluator):
             self.num_samples = self.data.num_rows
         else:
             self.num_samples = min(num_samples, self.data.num_rows)
+
+    def evaluate(self,
+                 llm: Union[LLM, PyTorchLLM],
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False) -> float:
+        # Resolve once from the LLM rather than guessing Harmony from every
+        # failed JSON sample. Plain models therefore keep strict raw-text
+        # scoring, while GPT-OSS uses its known final-channel token framing.
+        model_type = getattr(getattr(llm, "_hf_model_config", None),
+                             "model_type", None)
+        self._reasoning_parser = resolve_guided_decoding_reasoning_parser(
+            getattr(getattr(llm, "args", None), "reasoning_parser", None),
+            model_type,
+        )
+        return super().evaluate(llm, sampling_params, streaming)
 
     def generate_samples(self) -> Iterable[tuple]:
         for i, sample in enumerate(self.data):
@@ -93,7 +111,8 @@ class JsonModeEval(Evaluator):
         all_corrections, all_grammar_corrections = [], []
         for output, ref, schema in zip(outputs, references, schemas):
             try:
-                output_json = _load_json_from_generation(output)
+                output_json = _load_json_from_generation(
+                    output, self._reasoning_parser)
                 jsonschema.validate(output_json, json.loads(schema))
             except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)

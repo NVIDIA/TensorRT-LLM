@@ -19,41 +19,47 @@ def test_extract_final_content_returns_raw_plain_text_by_default():
     assert extract_final_content_from_generation(output) == '{"answer": "plain"}'
 
 
-def test_extract_final_content_can_decline_raw_fallback():
-    output = _request_output('{"answer": "plain"}')
-
-    assert extract_final_content_from_generation(
-        output, fallback_to_raw=False) is None
-
-
 def test_extract_final_content_uses_explicit_reasoning_parser():
     output = _request_output('<think>scratch</think>{"answer": "final"}')
 
-    assert extract_final_content_from_generation(
-        output, reasoning_parser="qwen3") == '{"answer": "final"}'
+    assert (
+        extract_final_content_from_generation(output, reasoning_parser="qwen3")
+        == '{"answer": "final"}'
+    )
 
 
 def test_extract_final_content_detects_visible_reasoning_tags():
     output = _request_output('<think>scratch</think>{"answer": "final"}')
 
-    assert extract_final_content_from_generation(
-        output, fallback_to_raw=False) == '{"answer": "final"}'
+    assert extract_final_content_from_generation(output) == '{"answer": "final"}'
+
+
+def test_extract_final_content_does_not_guess_harmony_from_tokens(monkeypatch):
+    harmony_module = types.ModuleType("tensorrt_llm.serve.harmony_adapter")
+
+    def _unexpected_adapter_lookup():
+        raise AssertionError("Harmony must be selected from model context")
+
+    harmony_module.get_harmony_adapter = _unexpected_adapter_lookup
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.serve.harmony_adapter", harmony_module)
+    output = _request_output("not json", token_ids=[1, 2, 3])
+
+    assert extract_final_content_from_generation(output) == "not json"
 
 
 def test_extract_final_content_uses_harmony_tokens(monkeypatch):
     harmony_module = types.ModuleType("tensorrt_llm.serve.harmony_adapter")
 
     class _FakeHarmonyAdapter:
-
         def harmony_output_to_openai(self, token_ids):
             assert token_ids == [1, 2, 3]
             return {"content": '{"answer": "harmony"}'}
 
     harmony_module.get_harmony_adapter = lambda: _FakeHarmonyAdapter()
-    monkeypatch.setitem(sys.modules, "tensorrt_llm.serve.harmony_adapter",
-                        harmony_module)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.serve.harmony_adapter", harmony_module)
     output = _request_output("raw harmony transcript", token_ids=[1, 2, 3])
 
-    assert extract_final_content_from_generation(
-        output, reasoning_parser=HARMONY_REASONING_PARSER
-    ) == '{"answer": "harmony"}'
+    assert (
+        extract_final_content_from_generation(output, reasoning_parser=HARMONY_REASONING_PARSER)
+        == '{"answer": "harmony"}'
+    )
