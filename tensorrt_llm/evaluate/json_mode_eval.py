@@ -26,23 +26,24 @@ from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import GuidedDecodingParams, SamplingParams
-from .interface import Evaluator
+from .interface import Evaluator, extract_final_content_from_generation
 
 
 def _load_json_from_generation(output: RequestOutput):
     text = output.outputs[0].text
     try:
+        # Plain/non-reasoning evals already return the constrained JSON as raw
+        # text, so keep the existing fast path and semantics unchanged.
         return json.loads(text)
     except json.JSONDecodeError as original_error:
-        try:
-            from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
-            parsed_output = get_harmony_adapter().harmony_output_to_openai(
-                output.outputs[0].token_ids)
-            return json.loads(parsed_output["content"])
-        except json.JSONDecodeError:
-            raise
-        except Exception:
+        # Reasoning models may return a raw transcript such as Harmony channels
+        # or `<think>...</think>{...}`. Score the final answer content when it
+        # can be extracted; otherwise preserve the original JSON failure.
+        final_content = extract_final_content_from_generation(
+            output, fallback_to_raw=False)
+        if final_content is None:
             raise original_error
+        return json.loads(final_content)
 
 
 class JsonModeEval(Evaluator):
