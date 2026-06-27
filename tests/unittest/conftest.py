@@ -105,16 +105,9 @@ def pytest_runtest_protocol(item, nextitem):
             import torch
             worker_count = int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', 1))
 
-            if not torch.cuda.is_available():
-                break
-            try:
-                total_memory = torch.cuda.get_device_properties(0).total_memory
-                memory_used = torch.cuda.memory_reserved(
-                    0) + torch.cuda.memory_allocated(0)
-            except RuntimeError:
-                break
-
-            if memory_used >= (total_memory // worker_count) * 0.9:
+            if (torch.cuda.memory_reserved(0) + torch.cuda.memory_allocated(0)
+                ) >= (torch.cuda.get_device_properties(0).total_memory //
+                      worker_count) * 0.9:
                 gc.collect()
                 print("torch.cuda.memory_allocated: %fGB" %
                       (torch.cuda.memory_allocated(0) / 1024 / 1024 / 1024))
@@ -344,7 +337,7 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", params=[2, 4, 8])
 def mpi_pool_executor(request):
     """
     Start an MPIPoolExecutor with `request.param` workers.
@@ -356,25 +349,7 @@ def mpi_pool_executor(request):
         yield executor
 
 
-def _parametrize_marker_mentions(marker: pytest.Mark, argname: str) -> bool:
-    if not marker.args:
-        return False
-    argnames = marker.args[0]
-    if isinstance(argnames, str):
-        names = [name.strip() for name in argnames.split(",")]
-    else:
-        names = list(argnames)
-    return argname in names
-
-
 def pytest_generate_tests(metafunc: pytest.Metafunc):
-    if 'mpi_pool_executor' in metafunc.fixturenames:
-        has_explicit_params = any(
-            _parametrize_marker_mentions(marker, 'mpi_pool_executor')
-            for marker in metafunc.definition.iter_markers('parametrize'))
-        if not has_explicit_params:
-            metafunc.parametrize('mpi_pool_executor', [2, 4, 8], indirect=True)
-
     if metafunc.definition.get_closest_marker('mpi_ray_parity'):
         run_ray = metafunc.config.getoption("--run-ray") or os.environ.get(
             "TLLM_RUN_RAY_TESTS") == "1"

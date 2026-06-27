@@ -39,15 +39,11 @@ def getSMVersion():
     # Init
     err_tuple = cuda_driver.cuInit(0)
     err = err_tuple[0] if isinstance(err_tuple, tuple) else err_tuple
-    if err == cuda_driver.CUresult.CUDA_ERROR_NO_DEVICE:
-        return 0
     if err != cuda_driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"CUDA initialization failed with error code {err}")
 
     # Device
     err, cuDevice = cuda_driver.cuDeviceGet(0)
-    if err == cuda_driver.CUresult.CUDA_ERROR_NO_DEVICE:
-        return 0
     if err != cuda_driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"Failed to get CUDA device with error code {err}")
 
