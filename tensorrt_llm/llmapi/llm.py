@@ -50,9 +50,8 @@ from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .reasoning_parser import (
-    HARMONY_REASONING_PARSER,
     adapt_guided_decoding_params_for_reasoning_parser,
-)
+    resolve_guided_decoding_reasoning_parser)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -204,20 +203,6 @@ def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
             _contains_bart_forced_tokens_logits_processor(item)
             for item in processors)
     return False
-
-
-def _resolve_guided_decoding_reasoning_parser(
-    reasoning_parser: Optional[str],
-    hf_model_config: Any,
-) -> Optional[str]:
-    if reasoning_parser is not None:
-        return reasoning_parser
-
-    # Raw LLM does not go through the serving Harmony path, so infer the same
-    # reasoning format that serving uses for GPT-OSS chat requests.
-    if getattr(hf_model_config, "model_type", None) == "gpt_oss":
-        return HARMONY_REASONING_PARSER
-    return None
 
 
 TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -380,6 +365,14 @@ class BaseLLM:
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
+            # Resolve model-level output framing once. OpenAI serving passes its
+            # parser while constructing SamplingParams; raw LLM callers may pass
+            # pre-built params, so request preparation reuses this resolved value.
+            self._guided_decoding_reasoning_parser = (
+                resolve_guided_decoding_reasoning_parser(
+                    self.args.reasoning_parser,
+                    getattr(self._hf_model_config, "model_type", None),
+                ))
 
         except Exception:
             if self.mpi_session is not None:
@@ -1271,6 +1264,20 @@ class BaseLLM:
                 os.environ[key] = str_value
                 logger.info(f"Setting {key}='{str_value}'")
 
+    def _prepare_guided_decoding_params(
+            self, sampling_params: SamplingParams) -> None:
+        """Normalize a caller-owned guide for the model's reasoning format."""
+        if sampling_params.guided_decoding is None:
+            # Preserve the ordinary generation path without constructing or
+            # replacing any request parameters.
+            return
+
+        sampling_params.guided_decoding = (
+            adapt_guided_decoding_params_for_reasoning_parser(
+                sampling_params.guided_decoding,
+                self._guided_decoding_reasoning_parser,
+            ))
+
     def _prepare_sampling_params(
             self,
             sampling_params: Optional[SamplingParams] = None) -> SamplingParams:
@@ -1285,13 +1292,7 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
-            guided_decoding_reasoning_parser = (
-                _resolve_guided_decoding_reasoning_parser(
-                    self.args.reasoning_parser, self._hf_model_config))
-            sampling_params.guided_decoding = (
-                adapt_guided_decoding_params_for_reasoning_parser(
-                    sampling_params.guided_decoding,
-                    guided_decoding_reasoning_parser))
+            self._prepare_guided_decoding_params(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
