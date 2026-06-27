@@ -51,7 +51,7 @@ from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .reasoning_parser import (
     adapt_guided_decoding_params_for_reasoning_parser,
-    resolve_guided_decoding_reasoning_parser)
+    resolve_raw_guided_decoding_reasoning_parser)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -365,13 +365,14 @@ class BaseLLM:
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
-            # Resolve model-level output framing once. OpenAI serving passes its
-            # parser while constructing SamplingParams; raw LLM callers may pass
-            # pre-built params, so request preparation reuses this resolved value.
+            # Raw SamplingParams need new final-content scoping only for
+            # Harmony+xgrammar. Normal parsers and llguidance keep their
+            # pre-existing raw behavior; serving adapts its params separately.
             self._guided_decoding_reasoning_parser = (
-                resolve_guided_decoding_reasoning_parser(
+                resolve_raw_guided_decoding_reasoning_parser(
                     self.args.reasoning_parser,
                     getattr(self._hf_model_config, "model_type", None),
+                    self.args.guided_decoding_backend,
                 ))
 
         except Exception:
@@ -1278,9 +1279,10 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
-            if sampling_params.guided_decoding is not None:
-                # Raw LLM requests need the same final-content scoping that the
-                # serving path applies while constructing SamplingParams.
+            if (sampling_params.guided_decoding is not None
+                    and self._guided_decoding_reasoning_parser is not None):
+                # The constructor resolves this policy only for the
+                # Harmony+xgrammar case missing from the raw LLM path.
                 sampling_params.guided_decoding = (
                     adapt_guided_decoding_params_for_reasoning_parser(
                         sampling_params.guided_decoding,

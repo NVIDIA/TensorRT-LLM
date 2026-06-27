@@ -23,6 +23,7 @@ from tensorrt_llm.llmapi.reasoning_parser import (
     HARMONY_REASONING_PARSER,
     adapt_guided_decoding_params_for_reasoning_parser,
     resolve_guided_decoding_reasoning_parser,
+    resolve_raw_guided_decoding_reasoning_parser,
 )
 from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
@@ -143,6 +144,49 @@ def test_guided_decoding_preserves_top_level_schema_property():
 )
 def test_resolve_guided_decoding_reasoning_parser(reasoning_parser, model_type, expected):
     assert resolve_guided_decoding_reasoning_parser(reasoning_parser, model_type) == expected
+
+
+@pytest.mark.parametrize(
+    ("reasoning_parser", "model_type", "guided_backend", "expected"),
+    [
+        (None, "gpt_oss", "xgrammar", HARMONY_REASONING_PARSER),
+        (HARMONY_REASONING_PARSER, "llama", "xgrammar", HARMONY_REASONING_PARSER),
+        (None, "gpt_oss", "llguidance", None),
+        ("qwen3", "qwen3", "xgrammar", None),
+        ("gemma4", "gemma4", "xgrammar", None),
+    ],
+)
+def test_resolve_raw_guided_decoding_reasoning_parser(
+    reasoning_parser, model_type, guided_backend, expected
+):
+    assert (
+        resolve_raw_guided_decoding_reasoning_parser(reasoning_parser, model_type, guided_backend)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("reasoning_parser", "model_type", "guided_backend"),
+    [
+        (None, "gpt_oss", "llguidance"),
+        ("qwen3", "qwen3", "xgrammar"),
+        ("gemma4", "gemma4", "xgrammar"),
+    ],
+)
+def test_raw_llm_preserves_guides_outside_harmony_xgrammar(
+    reasoning_parser, model_type, guided_backend
+):
+    guided_decoding = GuidedDecodingParams(json_object=True)
+    resolved_parser = resolve_raw_guided_decoding_reasoning_parser(
+        reasoning_parser, model_type, guided_backend
+    )
+
+    # These combinations worked without raw final-content adaptation before
+    # bug 6284101; keep the caller's ordinary guide unchanged.
+    assert (
+        adapt_guided_decoding_params_for_reasoning_parser(guided_decoding, resolved_parser)
+        is guided_decoding
+    )
 
 
 def test_plain_model_guided_decoding_is_unchanged():
