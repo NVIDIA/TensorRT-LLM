@@ -55,6 +55,7 @@ def _read_spawn_proxy_process_ipc_hmac_key_fd(fd_value: str) -> bytes:
     fd = int(fd_value)
     chunks: list[bytes] = []
     try:
+        os.set_blocking(fd, True)
         while True:
             chunk = os.read(fd, 4096)
             if not chunk:
