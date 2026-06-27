@@ -4929,6 +4929,12 @@ class PyTorchModelEngine(ModelEngine):
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
                 self.model_is_wrapped)
+            # Same tree-decoding sync as in _prepare_tp_inputs: the
+            # attention-warmup path calls forward() before _prepare_tp_inputs
+            # runs, so runtime_draft_len has not yet been raised to the total
+            # tree token count to match the warmup buffer sizing.
+            if not self.spec_config.is_linear_tree:
+                self.runtime_draft_len = self.max_total_draft_tokens
             # Propagate runtime_draft_len (already set on self by py_executor)
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
