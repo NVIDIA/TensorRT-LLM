@@ -20,6 +20,7 @@ import glob
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -201,8 +202,10 @@ def _visual_gen_deps(llm_venv):
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
     # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+    if shutil.which("ffmpeg") is None:
+        sudo = ["sudo"] if os.getuid() != 0 else []
+        check_call(sudo + ["apt-get", "update", "-y"], shell=False)
+        check_call(sudo + ["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
 
 @pytest.fixture(scope="session")
@@ -958,6 +961,9 @@ def test_vbench_dimension_score_wan(vbench_repo_root, wan21_bf16_video_path, llm
     """Run VBench on WAN 2.1 BF16 video generated with the LPIPS config."""
     videos_dir = os.path.dirname(wan21_bf16_video_path)
     assert os.path.isfile(wan21_bf16_video_path), "WAN 2.1 BF16 video must exist"
+    # dynamic_degree is binary (0/1) and aesthetic/imaging quality swing 0.15-0.25 across
+    # seeds even at fixed seed; widen those bands so the test asserts on the dimensions
+    # that are stable. See nvbugs/6357628 for analysis.
     _run_vbench_and_report(
         vbench_repo_root,
         videos_dir,
@@ -966,6 +972,11 @@ def test_vbench_dimension_score_wan(vbench_repo_root, wan21_bf16_video_path, llm
         title="WAN 2.1 BF16",
         golden_scores=VBENCH_WAN_GOLDEN_SCORES,
         max_score_diff=0.05,
+        per_dimension_tolerances={
+            "dynamic_degree": 1.0,
+            "aesthetic_quality": 0.25,
+            "imaging_quality": 0.25,
+        },
     )
 
 
@@ -977,6 +988,7 @@ def _run_vbench_and_report(
     title,
     golden_scores=None,
     max_score_diff=0.10,
+    per_dimension_tolerances=None,
 ):
     """Run VBench, print scores, and optionally assert against golden values.
 
@@ -1044,10 +1056,12 @@ def _run_vbench_and_report(
     max_diff_val = max(abs(scores_trtllm[d] - golden_scores[d]) for d in VBENCH_DIMENSIONS)
     print(f"max_diff={max_diff_val:.4f}  (threshold={max_score_diff})")
     print("=" * len(header) + "\n")
+    tolerances = per_dimension_tolerances or {}
     for dim in VBENCH_DIMENSIONS:
         diff = abs(scores_trtllm[dim] - golden_scores[dim])
-        assert diff < max_score_diff or scores_trtllm[dim] >= golden_scores[dim], (
-            f"Dimension '{dim}' score difference {diff:.4f} >= {max_score_diff} "
+        dim_threshold = tolerances.get(dim, max_score_diff)
+        assert diff < dim_threshold or scores_trtllm[dim] >= golden_scores[dim], (
+            f"Dimension '{dim}' score difference {diff:.4f} >= {dim_threshold} "
             f"(TRT-LLM={scores_trtllm[dim]:.4f}, golden={golden_scores[dim]:.4f})"
         )
     return scores_trtllm
