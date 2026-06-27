@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -38,7 +38,7 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams, SparsePrediction,
+                        PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -1482,7 +1482,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
                                                       forward_args)
-            forward_args.sparse_prediction = SparsePrediction(
+            forward_args.sparse_prediction = replace(
+                forward_args.sparse_prediction,
                 sparse_kv_indices=kv_idx,
                 sparse_kv_offsets=kv_off,
                 sparse_attn_indices=at_idx,

@@ -19,6 +19,7 @@ def get_sparse_attn_kv_cache_manager(
         sparse_attention_config: "SparseAttentionConfig"):
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
+    from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
     from .rocket import RocketKVCacheManager
@@ -26,6 +27,8 @@ def get_sparse_attn_kv_cache_manager(
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
         return DSACacheManager
+    elif sparse_attention_config.algorithm == "deepseek_v4":
+        return DeepseekV4CacheManager
     elif sparse_attention_config.algorithm == "skip_softmax":
         return KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
@@ -54,6 +57,7 @@ def get_trtllm_sparse_attn_attention_backend(
         sparse_attention_config: "SparseAttentionConfig"):
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 
+    from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
     from .minimax_m3 import get_minimax_m3_attention_backend_cls
     from .rocket import RocketTrtllmAttention
@@ -61,6 +65,8 @@ def get_trtllm_sparse_attn_attention_backend(
         return RocketTrtllmAttention
     elif sparse_attention_config.algorithm == "dsa":
         return DSATrtllmAttention
+    elif sparse_attention_config.algorithm == "deepseek_v4":
+        return DeepseekV4TrtllmAttention
     elif sparse_attention_config.algorithm == "skip_softmax":
         return TrtllmAttention
     elif sparse_attention_config.algorithm == "minimax_m3":
