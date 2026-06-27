@@ -137,6 +137,26 @@ def resolve_guided_decoding_reasoning_parser(
         model_type)
 
 
+def resolve_raw_guided_decoding_reasoning_parser(
+    reasoning_parser: Optional[str],
+    model_type: Optional[str],
+    guided_decoding_backend: Optional[str],
+) -> Optional[str]:
+    """Resolve the reasoning format that raw LLM requests should adapt.
+
+    Raw LLM only needs new final-content scoping for Harmony, and structural
+    tags are supported by xgrammar only. Explicit normal parsers and
+    llguidance retain their pre-existing raw guided-decoding behavior.
+    """
+    resolved_parser = resolve_guided_decoding_reasoning_parser(
+        reasoning_parser, model_type)
+    if (resolved_parser is not None
+            and resolved_parser.lower() == HARMONY_REASONING_PARSER
+            and guided_decoding_backend == "xgrammar"):
+        return HARMONY_REASONING_PARSER
+    return None
+
+
 def _normalize_json_schema_for_structural_tag(json_schema: Any) -> Any:
     """Convert supported schema representations to structural-tag JSON."""
     if hasattr(json_schema, "model_json_schema"):
