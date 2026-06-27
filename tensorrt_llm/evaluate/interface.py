@@ -81,9 +81,11 @@ def extract_final_content_from_generation(
     # Eval scoring has historically used the first completion choice.
     text = output.outputs[0].text
 
-    is_harmony = (reasoning_parser is not None
-                  and reasoning_parser.lower() == HARMONY_REASONING_PARSER)
-    if is_harmony:
+    if reasoning_parser is None:
+        # Plain models keep the raw output; never guess a parser from text.
+        return text
+
+    if reasoning_parser.lower() == HARMONY_REASONING_PARSER:
         # Harmony preserves final-channel boundaries in token ids, not text.
         try:
             from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
@@ -98,29 +100,13 @@ def extract_final_content_from_generation(
             return text
         return text
 
-    if reasoning_parser is None:
-        candidates = ReasoningParserFactory.keys()
-    else:
-        candidates = (reasoning_parser, )
-    for candidate in candidates:
-        try:
-            parser = ReasoningParserFactory.create_reasoning_parser(candidate)
-            if reasoning_parser is None:
-                # Guessed parsers may only touch visible reasoning delimiters.
-                marker_names = ("reasoning_start", "reasoning_end",
-                                "CHANNEL_OPEN", "CHANNEL_CLOSE")
-                markers = (getattr(parser, name, None) for name in marker_names)
-                if not any(
-                        isinstance(marker, str) and marker in text
-                        for marker in markers):
-                    continue
-            content = parser.parse(text).content
-            if content and (reasoning_parser is not None or content != text):
-                return content
-        except Exception:
-            continue
-
-    return text
+    try:
+        # Normal reasoning formats expose final content through their parser.
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+        return parser.parse(text).content or text
+    except Exception:
+        return text
 
 
 class Evaluator(ABC):

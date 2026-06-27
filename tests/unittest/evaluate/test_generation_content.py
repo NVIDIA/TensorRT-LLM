@@ -13,10 +13,11 @@ def _request_output(text: str, token_ids: list[int] | None = None):
     return SimpleNamespace(outputs=[completion])
 
 
-def test_extract_final_content_returns_raw_plain_text_by_default():
-    output = _request_output('{"answer": "plain"}')
+def test_extract_final_content_does_not_guess_reasoning_parser():
+    text = '<think>scratch</think>{"answer": "final"}'
+    output = _request_output(text)
 
-    assert extract_final_content_from_generation(output) == '{"answer": "plain"}'
+    assert extract_final_content_from_generation(output) == text
 
 
 def test_extract_final_content_uses_explicit_reasoning_parser():
@@ -26,12 +27,6 @@ def test_extract_final_content_uses_explicit_reasoning_parser():
         extract_final_content_from_generation(output, reasoning_parser="qwen3")
         == '{"answer": "final"}'
     )
-
-
-def test_extract_final_content_detects_visible_reasoning_tags():
-    output = _request_output('<think>scratch</think>{"answer": "final"}')
-
-    assert extract_final_content_from_generation(output) == '{"answer": "final"}'
 
 
 def test_extract_final_content_does_not_guess_harmony_from_tokens(monkeypatch):

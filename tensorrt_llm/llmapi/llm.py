@@ -1264,20 +1264,6 @@ class BaseLLM:
                 os.environ[key] = str_value
                 logger.info(f"Setting {key}='{str_value}'")
 
-    def _prepare_guided_decoding_params(
-            self, sampling_params: SamplingParams) -> None:
-        """Normalize a caller-owned guide for the model's reasoning format."""
-        if sampling_params.guided_decoding is None:
-            # Preserve the ordinary generation path without constructing or
-            # replacing any request parameters.
-            return
-
-        sampling_params.guided_decoding = (
-            adapt_guided_decoding_params_for_reasoning_parser(
-                sampling_params.guided_decoding,
-                self._guided_decoding_reasoning_parser,
-            ))
-
     def _prepare_sampling_params(
             self,
             sampling_params: Optional[SamplingParams] = None) -> SamplingParams:
@@ -1292,7 +1278,14 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
-            self._prepare_guided_decoding_params(sampling_params)
+            if sampling_params.guided_decoding is not None:
+                # Raw LLM requests need the same final-content scoping that the
+                # serving path applies while constructing SamplingParams.
+                sampling_params.guided_decoding = (
+                    adapt_guided_decoding_params_for_reasoning_parser(
+                        sampling_params.guided_decoding,
+                        self._guided_decoding_reasoning_parser,
+                    ))
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,
