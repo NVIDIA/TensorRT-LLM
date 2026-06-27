@@ -16,7 +16,7 @@ verl_config:
     # Create nvshmem symlink (needed before DeepEP build)
     - >-
       (cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib &&
-      ln -s libnvshmem_host.so.3 libnvshmem_host.so)
+      ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
     # Install DeepEP
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
@@ -27,7 +27,11 @@ verl_config:
     # Install Python dependencies
     - "pip3 install --no-cache-dir --no-deps trl==0.27.0"
     - "pip3 install --no-cache-dir nvtx matplotlib liger_kernel cachetools"
-    - "pip3 install --no-cache-dir cupy-cuda12x==14.0.1"
+    # cupy 13.6.0 is the last cuda13x wheel with numpy<2 ABI; fastrlock and
+    # pyzmq are runtime deps of verl/checkpoint_engine/nccl_checkpoint_engine.py.
+    - "pip3 install --no-cache-dir fastrlock"
+    - "pip3 install --no-cache-dir --no-deps cupy-cuda13x==13.6.0"
+    - "pip3 install --no-cache-dir pyzmq"
     - "pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git@641a5a0"
     - "pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0"
     - "pip3 install pytest-asyncio"
@@ -50,3 +54,4 @@ verl_config:
     - "Qwen/Qwen2.5-0.5B-Instruct"
     - "Qwen/Qwen2.5-1.5B-Instruct"
     - "Qwen/Qwen2.5-VL-7B-Instruct"
+    - "Qwen/Qwen2.5-7B-Instruct"
