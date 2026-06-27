@@ -51,6 +51,9 @@ tk::Masked_multihead_attention_params<T> makeBaselineParams()
     p.attention_sinks = nullptr;
     p.int8_kv_cache = false;
     p.fp8_kv_cache = false;
+    p.cyclic_attention_window_size = 256;
+    p.max_attention_window_size = 256;
+    p.timestep = 79;
     // Pretend host-side input arrays exist; eligibility check only inspects
     // the pointer.
     static int dummy[1024];
