@@ -9,8 +9,8 @@ set in the environment.
 
 | File | Role |
 |---|---|
-| `sitecustomize.py` | Starts coverage in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, `ninja`, … — which opt out themselves and their spawned subtree). Long-lived non-pytest processes (e.g. `trtllm-serve`) poll a marker file to switch the test-context; `mpi4py.futures` pool workers run no background daemons and use the inherited `CBTS_TEST_ID` context plus the atexit save. |
-| `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per-test `cov.switch_context()`, and patches `mpi_session._start_mpi_pool` so workers inherit the coverage env. |
+| `sitecustomize.py` | Starts coverage in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, `ninja`, … — which opt out themselves and their spawned subtree). Each test runs in a fresh coverage session (own data file, tagged once with the nodeid) so the sysmon core records every line the test ran; the sysmon core does not honor a mid-run `switch_context`. Long-lived non-pytest processes (e.g. `trtllm-serve`) poll a marker file and open a new session per test via `switch_test_context()`; `mpi4py.futures` pool workers run no background daemons and use the inherited `CBTS_TEST_ID` context plus the atexit save. |
+| `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per-test, opens a fresh coverage session via `sitecustomize.switch_test_context()`, and patches `mpi_session._start_mpi_pool` so workers inherit the coverage env. |
 | `coveragerc.template` | Template for the runtime `.coveragerc`. |
 | `make_coveragerc.sh` | Substitutes `@...@` placeholders in the template; writes `$JOB_WORKSPACE/.coveragerc`. |
 | `coverage_summary.py` | Prints `covered/ran test cases` to the stage log after pytest (stdlib-only, read-only). |

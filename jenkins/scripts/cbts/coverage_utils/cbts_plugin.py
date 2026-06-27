@@ -16,7 +16,6 @@
 import inspect
 import os
 
-import coverage
 import pytest
 
 MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
@@ -70,6 +69,18 @@ def install_mpi_pool_patch(*, raise_on_refactor=True):
     return True
 
 
+def _switch_test_context(nodeid):
+    """Open a fresh per-test coverage session via the sitecustomize bootstrap, if active."""
+    try:
+        import sitecustomize
+
+        switch = getattr(sitecustomize, "switch_test_context", None)
+    except ImportError:
+        switch = None
+    if switch is not None:
+        switch(nodeid)
+
+
 def pytest_configure(config):  # noqa: D401 - pytest hook
     """Apply ``mpi_session`` monkeypatch with a compatibility guard."""
     del config
@@ -78,7 +89,7 @@ def pytest_configure(config):  # noqa: D401 - pytest hook
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):  # noqa: D401 - pytest hook
-    """Per-test marker write + main-process context switch."""
+    """Per-test marker write + fresh coverage session for the current test."""
     del nextitem
     nodeid = item.nodeid
 
@@ -92,8 +103,6 @@ def pytest_runtest_protocol(item, nextitem):  # noqa: D401 - pytest hook
     # Propagate nodeid via env so subprocesses pick it up in sitecustomize.py.
     os.environ["CBTS_TEST_ID"] = nodeid
 
-    cov = coverage.Coverage.current()
-    if cov is not None:
-        cov.switch_context(nodeid)
+    _switch_test_context(nodeid)
 
     yield

@@ -66,28 +66,72 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
 
     import coverage
 
-    _suffix = f"{_socket.gethostname()}.pid{os.getpid()}.X{_secrets.token_urlsafe(6)}"
-    cov = coverage.Coverage(
-        config_file=os.getenv("CBTS_COVERAGE_CONFIG"),
-        auto_data=True,
-        data_suffix=_suffix,
-    )
-    cov.start()
-
-    # sys.orig_argv preserves the launching cmdline; sys.argv has not yet gained "pytest" when sitecustomize runs.
-    _orig_argv = getattr(sys, "orig_argv", sys.argv)
-    _is_pytest_main = any("pytest" in a for a in _orig_argv[:4])
-    _is_nested_pytest = _parent_is_pytest() and _is_pytest_main
-    # MpiPoolSession spawns each executor worker via `python -m mpi4py.futures.server`.
-    # A worker serves a single test, so it relies on the inherited CBTS_TEST_ID context
-    # and the atexit save and runs no background daemons during the test.
-    _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
-    _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
+    _CONFIG = os.getenv("CBTS_COVERAGE_CONFIG")
+    # Per-process prefix; a per-session counter is appended so each test writes its own file.
+    _suffix_prefix = f"{_socket.gethostname()}.pid{os.getpid()}.X{_secrets.token_urlsafe(6)}"
 
     _PERIODIC_SAVE_SECONDS = 5
     _stop_event = threading.Event()
-    # Serialize switch_context/save/stop across the daemon threads and atexit.
+    # Serialize session open/close/save across the daemon threads, the pytest plugin, and atexit.
     _cov_lock = threading.Lock()
+
+    # The coverage.py sysmon core records each product line once and does not honor a
+    # mid-run switch_context, so a single long session attributes every shared line to
+    # whichever test ran first. Instead each test gets a fresh session: a new Coverage
+    # started into its own data file, tagged once with the test's nodeid. A fresh start
+    # re-arms line tracing, so every test's file captures the lines it actually ran.
+    _active_cov = None
+    _session_seq = 0
+
+    def _close_session_locked():
+        global _active_cov
+        if _active_cov is None:
+            return
+        cov, _active_cov = _active_cov, None
+        try:
+            cov.stop()
+            cov.save()
+        except Exception as e:
+            print(f"[cbts] session save failed in pid {os.getpid()}: {e!r}", file=sys.stderr)
+
+    def _open_session_locked(nodeid):
+        global _active_cov, _session_seq
+        _close_session_locked()
+        _session_seq += 1
+        cov = coverage.Coverage(
+            config_file=_CONFIG,
+            auto_data=False,
+            data_suffix=f"{_suffix_prefix}.s{_session_seq}",
+        )
+        cov.start()
+        if nodeid:
+            cov.switch_context(nodeid)
+        _active_cov = cov
+
+    def switch_test_context(nodeid):
+        """Open a fresh coverage session tagged with nodeid; each test's data file is self-contained."""
+        with _cov_lock:
+            if _stop_event.is_set():
+                return
+            _open_session_locked(nodeid or "")
+
+    def _save_active():
+        with _cov_lock:
+            if _active_cov is not None:
+                try:
+                    _active_cov.save()
+                except Exception as e:
+                    print(
+                        f"[cbts] periodic save failed in pid {os.getpid()}: {e!r}", file=sys.stderr
+                    )
+
+    def _final_save():
+        # Quiesce the daemon threads, then take the lock for the final stop+save.
+        _stop_event.set()
+        with _cov_lock:
+            _close_session_locked()
+
+    atexit.register(_final_save)
 
     # Fork safety: an instrumented product process may fork (e.g. a test using
     # multiprocessing). Hold the coverage lock across the fork so a background save
@@ -102,47 +146,20 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     except (AttributeError, ValueError):
         pass
 
-    def _periodic_save():
-        while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
-            try:
-                with _cov_lock:
-                    cov.save()
-            except Exception as e:
-                print(
-                    f"[cbts] periodic save failed in pid {os.getpid()}: "
-                    f"{e!r}; periodic save thread exiting, atexit will "
-                    f"still attempt one final save",
-                    file=sys.stderr,
-                )
-                return
+    # sys.orig_argv preserves the launching cmdline; sys.argv has not yet gained "pytest" when sitecustomize runs.
+    _orig_argv = getattr(sys, "orig_argv", sys.argv)
+    _is_pytest_main = any("pytest" in a for a in _orig_argv[:4])
+    _is_nested_pytest = _parent_is_pytest() and _is_pytest_main
+    # MpiPoolSession spawns each executor worker via `python -m mpi4py.futures.server`.
+    # A worker serves a single test, so it relies on the inherited CBTS_TEST_ID context
+    # and the atexit save and runs no background daemons during the test.
+    _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
+    _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
 
-    def _final_save():
-        # Quiesce the daemon threads, then take the lock for the final stop+save.
-        _stop_event.set()
-        try:
-            with _cov_lock:
-                cov.stop()
-                cov.save()
-        except Exception as e:
-            print(
-                f"[cbts] final save failed in pid {os.getpid()}: {e!r}",
-                file=sys.stderr,
-            )
-
-    atexit.register(_final_save)
-
-    if not _skip_daemons:
-        threading.Thread(
-            target=_periodic_save,
-            daemon=True,
-            name="cbts-periodic-save",
-        ).start()
-
-    # In worker processes and nested inner pytests, attribute coverage to the current test via the CBTS_TEST_ID env var.
+    # Open the initial session. Inner pytests and worker processes carry the current
+    # nodeid via CBTS_TEST_ID; the inner pytest then re-opens per test via the plugin.
     _initial_nodeid = os.environ.get("CBTS_TEST_ID", "").strip()
-    if _initial_nodeid and (not _is_pytest_main or _is_nested_pytest):
-        with _cov_lock:
-            cov.switch_context(_initial_nodeid)
+    switch_test_context(_initial_nodeid)
 
     if _is_nested_pytest:
         # Inner pytest: apply the mpi_session env-whitelist patch synchronously instead of via the watcher thread.
@@ -185,6 +202,16 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             name="cbts-mpi-patcher",
         ).start()
 
+        def _periodic_save():
+            while not _stop_event.wait(_PERIODIC_SAVE_SECONDS):
+                _save_active()
+
+        threading.Thread(
+            target=_periodic_save,
+            daemon=True,
+            name="cbts-periodic-save",
+        ).start()
+
         _MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
 
         def _poll_marker():
@@ -194,18 +221,9 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                     with open(_MARKER_FILE) as f:
                         nodeid = f.read().strip()
                     if nodeid and nodeid != last_seen:
-                        with _cov_lock:
-                            if _stop_event.is_set():
-                                break
-                            cov.switch_context(nodeid)
-                            try:
-                                # Save now so short-lived workers persist context before the periodic save.
-                                cov.save()
-                            except Exception as e:
-                                print(
-                                    f"[cbts] immediate save failed in pid {os.getpid()}: {e!r}",
-                                    file=sys.stderr,
-                                )
+                        # Long-lived non-pytest processes (e.g. trtllm-serve) switch
+                        # test by opening a fresh session for the new nodeid.
+                        switch_test_context(nodeid)
                         last_seen = nodeid
                 except (FileNotFoundError, OSError):
                     pass
