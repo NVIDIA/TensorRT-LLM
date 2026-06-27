@@ -39,7 +39,6 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "topk_indices",  # DSA-only
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
-        "multi_item_part_lens",  # rejected by TrtllmAttention.forward; FlashInfer-only path
     }
 )
 
