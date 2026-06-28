@@ -403,6 +403,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
+        requires_global_quant_config_fallback = False
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -423,9 +424,20 @@ class ModelLoader:
                     )
             except FileNotFoundError:
                 pass
-            self._apply_modelopt_quant_config(normalized,
-                                              explicit_kv_cache_quant_algo)
-            return True
+            if normalized.get("quant_algo") is None:
+                if normalized.get("quantized_layers") is not None:
+                    requires_global_quant_config_fallback = True
+                    logger.info(
+                        "hf_quant_config.json does not set a global quant_algo; "
+                        "falling back to config.json or model_kwargs for global "
+                        "quantization.")
+                else:
+                    raise ValueError(
+                        "Pre-quantized checkpoint must have quant_algo.")
+            else:
+                self._apply_modelopt_quant_config(normalized,
+                                                  explicit_kv_cache_quant_algo)
+                return True
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
@@ -447,6 +459,11 @@ class ModelLoader:
                 f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
             )
 
+        if requires_global_quant_config_fallback and hf_quant_config is None:
+            raise ValueError(
+                "hf_quant_config.json does not set a global quant_algo and no "
+                "quantization_config fallback was found.")
+
         if hf_quant_config is not None:
             if is_modelopt_quant_config(hf_quant_config):
                 self._apply_modelopt_quant_config(
@@ -458,6 +475,8 @@ class ModelLoader:
             if hf_quant_config.get("quant_method") == "fp8":
                 if hf_quant_config.get("weight_block_size") is not None:
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    quant_config.group_size = hf_quant_config[
+                        "weight_block_size"][0]
                     quant_config.exclude_modules = ["*eh_proj"]
                 else:
                     # Ministral 3 static quant

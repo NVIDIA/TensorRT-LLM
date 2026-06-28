@@ -718,6 +718,57 @@ def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
+    """Recompute slot mappings without re-running full Indexer.prepare()."""
+    head_dim = 128
+    block_size = 64
+    request_ids = [0, 1]
+    cached_tokens = [64, 128]
+    seq_lens = torch.tensor([32, 4], dtype=torch.int32)
+    kv_lens = torch.tensor([96, 132], dtype=torch.int32)
+    num_ctx_tokens = seq_lens[0].item()
+    num_tokens = seq_lens.sum().item()
+
+    cache_manager, _ = create_dsa_cache_manager(
+        batch_size=len(request_ids),
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=256,
+        num_layers=1,
+    )
+    cache_manager.add_dummy_requests(
+        request_ids, kv_lens.tolist(), is_gen=False, prepare_resource=True
+    )
+    metadata = _create_mock_metadata(
+        request_ids,
+        len(request_ids),
+        num_contexts=1,
+        num_generations=1,
+        seq_lens=seq_lens,
+        kv_lens=kv_lens,
+        num_cached_tokens=cached_tokens,
+        cache_manager=cache_manager,
+        num_ctx_tokens=num_ctx_tokens,
+        num_tokens=num_tokens,
+        indexer_head_dim=head_dim,
+    )
+
+    Indexer.prepare(metadata)
+    expected_fp8 = metadata.slot_mapping_fp8[:num_tokens].clone()
+    expected_scale = metadata.slot_mapping_scale[:num_tokens].clone()
+
+    metadata.host_slot_mapping_fp8.zero_()
+    metadata.host_slot_mapping_scale.zero_()
+    metadata.slot_mapping_fp8.zero_()
+    metadata.slot_mapping_scale.zero_()
+    Indexer.recompute_slot_mappings(metadata)
+
+    torch.testing.assert_close(metadata.slot_mapping_fp8[:num_tokens], expected_fp8)
+    torch.testing.assert_close(metadata.slot_mapping_scale[:num_tokens], expected_scale)
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
 def test_indexer_k_cache_scatter_custom_op():
     """
     Direct comparison: CUDA kernel vs Python reference for k_cache scatter.

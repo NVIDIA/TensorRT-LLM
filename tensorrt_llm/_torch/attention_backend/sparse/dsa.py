@@ -1885,20 +1885,53 @@ class Indexer(nn.Module):
         )
 
     @staticmethod
-    def prepare_for_update_k_cache(metadata: DSAtrtllmAttentionMetadata,
-                                   indexer_params: IndexerParams):
-        """
-        Prepare indexer for the update_k_cache stage.
+    def build_indexer_params(
+            metadata: DSAtrtllmAttentionMetadata) -> Optional[IndexerParams]:
+        kv_cache_manager = metadata.kv_cache_manager
+        if kv_cache_manager is None or not hasattr(kv_cache_manager,
+                                                   'index_head_dim'):
+            return None
 
-        Compute slot_mapping for all requests (both context and generation)
-        This maps each token to its flat cache position for vectorized KV cache updates
+        head_dim = metadata.indexer_head_dim
+        data_bytes_per_token = head_dim // 2 if getattr(
+            kv_cache_manager, 'use_fp4', False) else head_dim
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios))
+        return IndexerParams(
+            num_contexts=metadata.num_contexts,
+            num_generations=metadata.num_generations,
+            num_ctx_tokens=metadata.num_ctx_tokens,
+            head_dim=head_dim,
+            quant_block_size=metadata.indexer_quant_block_size,
+            tokens_per_block=metadata._tokens_per_block,
+            compress_ratio=compress_ratio,
+            request_ids=metadata.request_ids,
+            num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
+            seq_lens=metadata.seq_lens,
+            data_bytes_per_token=data_bytes_per_token,
+        )
+
+    @staticmethod
+    def recompute_slot_mappings(metadata: DSAtrtllmAttentionMetadata,
+                                indexer_params: Optional[IndexerParams] = None):
+        """Recompute slot_mapping_fp8/scale from current block offsets.
+
+        This is the subset of prepare_for_update_k_cache() that maps each new
+        compressed KV token to its flat cache position. It is safe to call in
+        isolation after a caller has swapped the active KV cache manager and
+        block-offset buffers, such as during draft KV-cache replay.
         """
+        if indexer_params is None:
+            indexer_params = Indexer.build_indexer_params(metadata)
+            if indexer_params is None:
+                return
+
         batch_size = indexer_params.batch_size
         tokens_per_block = indexer_params.tokens_per_block
         head_dim = indexer_params.head_dim
         new_kv_tokens = indexer_params.new_kv_tokens
         total_new_kv_tokens = new_kv_tokens.sum().item()
-        data_bytes_per_token = head_dim // 2 if metadata.kv_cache_manager.use_fp4 else head_dim
+        data_bytes_per_token = indexer_params.data_bytes_per_token
 
         # Compute global positions for all kv tokens in the batch (fully vectorized)
         req_indices = torch.repeat_interleave(
@@ -1940,6 +1973,17 @@ class Indexer(nn.Module):
         metadata.slot_mapping_scale[:total_new_kv_tokens].copy_(
             metadata.host_slot_mapping_scale[:total_new_kv_tokens],
             non_blocking=True)
+
+    @staticmethod
+    def prepare_for_update_k_cache(metadata: DSAtrtllmAttentionMetadata,
+                                   indexer_params: IndexerParams):
+        """
+        Prepare indexer for the update_k_cache stage.
+
+        Compute slot_mapping for all requests (both context and generation)
+        This maps each token to its flat cache position for vectorized KV cache updates
+        """
+        Indexer.recompute_slot_mappings(metadata, indexer_params)
 
     @staticmethod
     def prepare_for_chunked_prefill(metadata: DSAtrtllmAttentionMetadata,
@@ -2088,39 +2132,16 @@ class Indexer(nn.Module):
         # This can happen when the metadata is being used with a draft KV cache manager
         # during MTP speculative decoding, which uses a regular KVCacheManager instead
         # of DSACacheManager.
-        kv_cache_manager = metadata.kv_cache_manager
-        if kv_cache_manager is None or not hasattr(kv_cache_manager,
-                                                   'index_head_dim'):
+        indexer_params = Indexer.build_indexer_params(metadata)
+        if indexer_params is None:
             return
 
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
-        request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
-        head_dim = metadata.indexer_head_dim
-        quant_block_size = metadata.indexer_quant_block_size
-        num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         compress_ratio = _effective_compress_ratio_divisor(
             _select_indexer_compress_ratio(metadata.compress_ratios))
-        # MXFP4 indexer K cache packs two E2M1 codes per byte so the data
-        # footprint is half head_dim; FP8 keeps one byte per element.
-        use_fp4 = getattr(kv_cache_manager, 'use_fp4', False)
-        data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
-
-        indexer_params = IndexerParams(
-            num_contexts=num_contexts,
-            num_generations=num_generations,
-            num_ctx_tokens=num_ctx_tokens,
-            head_dim=head_dim,
-            quant_block_size=quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
-            compress_ratio=compress_ratio,
-            request_ids=request_ids,
-            num_past_tokens=num_past_tokens,
-            seq_lens=seq_lens,
-            data_bytes_per_token=data_bytes_per_token,
-        )
         # Store compressed KV token count for context requests
         metadata.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:
                                                                   num_contexts].sum(

@@ -1103,7 +1103,7 @@ private:
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
-        llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
+        llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
@@ -1112,11 +1112,11 @@ private:
         {
             // Reuse the error state for the cancelled request.
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-            llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
             return;
         }
         receiveSync(session);
-        llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+        llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
