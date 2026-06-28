@@ -126,6 +126,7 @@ class MoERunner(TunableRunner):
         use_fused_finalize: bool,
         activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
+        use_mxfp8_weight_scaling: bool = False,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -143,6 +144,7 @@ class MoERunner(TunableRunner):
         self.use_w4_group_scaling = use_w4_group_scaling
         self.use_int8_woq_per_channel = use_int8_woq_per_channel
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
+        self.use_mxfp8_weight_scaling = use_mxfp8_weight_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
@@ -150,7 +152,8 @@ class MoERunner(TunableRunner):
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                        use_int8_woq_per_channel, use_mxfp8_act_scaling)
+                        use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                        use_mxfp8_weight_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
@@ -158,7 +161,7 @@ class MoERunner(TunableRunner):
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
                     use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                    use_fused_finalize)
+                    use_mxfp8_weight_scaling, use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -183,6 +186,7 @@ class MoERunner(TunableRunner):
             self.use_fused_finalize,
             self.activation_type,
             self.unpadded_hidden_size,
+            self.use_mxfp8_weight_scaling,
         )
 
     def forward(
@@ -252,6 +256,7 @@ def fused_moe(
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
     use_dynamic_fc2_scale: bool = False,
+    use_mxfp8_weight_scaling: bool = False,
     # Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
     # Each *_ranks   : CPU int32  [num_seqs]
     # Each *_weights : CPU int64  [num_seqs, 3], holding (A_ptr, B_ptr, DoRA_ptr); DoRA unused.
@@ -308,6 +313,7 @@ def fused_moe(
         use_fused_finalize=use_fused_finalize,
         activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
+        use_mxfp8_weight_scaling=use_mxfp8_weight_scaling,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
@@ -429,6 +435,7 @@ def _(input: torch.Tensor,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None,
       use_dynamic_fc2_scale: bool = False,
+      use_mxfp8_weight_scaling: bool = False,
       fc1_lora_ranks: Optional[torch.Tensor] = None,
       fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
       fc2_lora_ranks: Optional[torch.Tensor] = None,

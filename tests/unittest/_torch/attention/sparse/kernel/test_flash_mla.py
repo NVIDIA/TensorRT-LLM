@@ -13,6 +13,7 @@ def has_flash_mla():
     """Check if FlashMLA module is available."""
     try:
         from tensorrt_llm.flash_mla import flash_mla_sparse_fwd  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -20,15 +21,16 @@ def has_flash_mla():
 
 @pytest.mark.skipif(not has_flash_mla(), reason="FlashMLA not available")
 @pytest.mark.skipif(
-    getSMVersion() < 90,
-    reason="FlashMLA requires SM90 (Hopper) or SM100 (Blackwell)")
+    getSMVersion() < 90, reason="FlashMLA requires SM90 (Hopper) or SM100 (Blackwell)"
+)
 @pytest.mark.parametrize(
     "seq_len_q,seq_len_kv,topk",
     [
         (62, 128, 128),  # Small test case
         (128, 256, 128),  # Medium
         (128, 512, 256),  # Larger topk
-    ])
+    ],
+)
 def test_flash_mla_sparse_fwd(seq_len_q, seq_len_kv, topk):
     """
     Test FlashMLA sparse attention forward kernel.
@@ -53,29 +55,27 @@ def test_flash_mla_sparse_fwd(seq_len_q, seq_len_kv, topk):
 
     # Generate test inputs
     # Q: [b, s_q, h_q, d_qk]
-    q = torch.randn(batch_size,
-                    seq_len_q,
-                    num_heads_q,
-                    head_dim_qk,
-                    dtype=torch.bfloat16,
-                    device='cuda') / 10.0
+    q = (
+        torch.randn(
+            batch_size, seq_len_q, num_heads_q, head_dim_qk, dtype=torch.bfloat16, device="cuda"
+        )
+        / 10.0
+    )
     q.clamp_(-10, 10)
 
     # KV: [b, s_kv, h_kv, d_qk]
-    kv = torch.randn(batch_size,
-                     seq_len_kv,
-                     num_heads_kv,
-                     head_dim_qk,
-                     dtype=torch.bfloat16,
-                     device='cuda') / 10.0
+    kv = (
+        torch.randn(
+            batch_size, seq_len_kv, num_heads_kv, head_dim_qk, dtype=torch.bfloat16, device="cuda"
+        )
+        / 10.0
+    )
     kv.clamp_(-10, 10)
 
     # Indices: [b, s_q, h_kv, topk] - which KV tokens each Q attends to
-    indices = torch.randint(0,
-                            seq_len_kv,
-                            (batch_size, seq_len_q, num_heads_kv, topk),
-                            dtype=torch.int32,
-                            device='cuda')
+    indices = torch.randint(
+        0, seq_len_kv, (batch_size, seq_len_q, num_heads_kv, topk), dtype=torch.int32, device="cuda"
+    )
 
     softmax_scale = 1.0 / math.sqrt(head_dim_qk)
 
@@ -84,23 +84,24 @@ def test_flash_mla_sparse_fwd(seq_len_q, seq_len_kv, topk):
         q.squeeze(0),  # [s_q, h_q, d_qk]
         kv.squeeze(0),  # [s_kv, h_kv, d_qk]
         indices.squeeze(0),  # [s_q, h_kv, topk]
-        sm_scale=softmax_scale)
+        sm_scale=softmax_scale,
+    )
 
     # Validate outputs
-    assert output.shape == (seq_len_q, num_heads_q, head_dim_v), \
+    assert output.shape == (seq_len_q, num_heads_q, head_dim_v), (
         f"Output shape mismatch: expected [{seq_len_q}, {num_heads_q}, {head_dim_v}], got {output.shape}"
-    assert output.dtype == torch.bfloat16, \
+    )
+    assert output.dtype == torch.bfloat16, (
         f"Output dtype mismatch: expected torch.bfloat16, got {output.dtype}"
+    )
 
-    assert max_logits.shape == (seq_len_q, num_heads_q), \
+    assert max_logits.shape == (seq_len_q, num_heads_q), (
         f"Max logits shape mismatch: got {max_logits.shape}"
-    assert max_logits.dtype == torch.float32, \
-        f"Max logits dtype mismatch: got {max_logits.dtype}"
+    )
+    assert max_logits.dtype == torch.float32, f"Max logits dtype mismatch: got {max_logits.dtype}"
 
-    assert lse.shape == (seq_len_q, num_heads_q), \
-        f"LSE shape mismatch: got {lse.shape}"
-    assert lse.dtype == torch.float32, \
-        f"LSE dtype mismatch: got {lse.dtype}"
+    assert lse.shape == (seq_len_q, num_heads_q), f"LSE shape mismatch: got {lse.shape}"
+    assert lse.dtype == torch.float32, f"LSE dtype mismatch: got {lse.dtype}"
 
     # Numerical validity checks
     assert not torch.isnan(output).any(), "Output contains NaN"

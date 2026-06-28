@@ -1,0 +1,425 @@
+metadata:
+  model_name: qwen3.5_397b_a17b_fp4
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  # 1k1k - TEP8 with TRTLLM, no MTP
+  - name: "qwen3_5_397b_fp4_tep8_1k1k"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    max_batch_size: 512
+    max_num_tokens: 16384
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.9
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 384
+      - 512
+    moe_config:
+      backend: 'TRTLLM'
+      use_low_precision_moe_combine: true
+    batch_wait_timeout_iters: 50
+    batch_wait_max_tokens_ratio: 0.0625
+    client_configs:
+      - name: "con4_iter5_1k1k"
+        concurrency: 4
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 1k1k - DEP4 with CUTEDSL, no MTP
+  - name: "qwen3_5_397b_fp4_dep4_1k1k"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    max_batch_size: 256
+    max_num_tokens: 16384
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.9
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+    moe_config:
+      backend: 'CUTEDSL'
+      use_low_precision_moe_combine: true
+    enable_attention_dp: true
+    attention_dp_config:
+      enable_balance: true
+      batching_wait_iters: 10
+      timeout_iters: 500
+    client_configs:
+      - name: "con1024_iter5_1k1k"
+        concurrency: 1024
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 1k1k - TP2 with TRTLLM, MTP3
+  - name: "qwen3_5_397b_fp4_tp2_mtp3_1k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 16384
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.6
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    moe_config:
+      backend: 'TRTLLM'
+      use_low_precision_moe_combine: true
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 3
+    batch_wait_timeout_iters: 50
+    batch_wait_max_tokens_ratio: 0.0625
+    client_configs:
+      - name: "con8_iter5_1k1k"
+        concurrency: 8
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 1k1k - DEP8 with CUTEDSL, MTP3
+  - name: "qwen3_5_397b_fp4_dep8_mtp3_1k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    max_batch_size: 16
+    max_num_tokens: 16384
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.9
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    moe_config:
+      backend: 'CUTEDSL'
+      use_low_precision_moe_combine: true
+    enable_attention_dp: true
+    attention_dp_config:
+      enable_balance: true
+      batching_wait_iters: 10
+      timeout_iters: 500
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 3
+    client_configs:
+      - name: "con128_iter5_1k1k"
+        concurrency: 128
+        iterations: 5
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 8k1k - TP4 with TRTLLM, no MTP
+  - name: "qwen3_5_397b_fp4_tp4_8k1k"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 32768
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.9
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 384
+      - 512
+    moe_config:
+      backend: 'TRTLLM'
+      use_low_precision_moe_combine: true
+    batch_wait_timeout_iters: 50
+    batch_wait_max_tokens_ratio: 0.45
+    client_configs:
+      - name: "con4_iter5_8k1k"
+        concurrency: 4
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 8k1k - DEP8 with CUTEDSL, no MTP
+  - name: "qwen3_5_397b_fp4_dep8_8k1k"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    max_batch_size: 128
+    max_num_tokens: 32768
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.9
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    moe_config:
+      backend: 'CUTEDSL'
+      use_low_precision_moe_combine: true
+    enable_attention_dp: true
+    attention_dp_config:
+      enable_balance: true
+      batching_wait_iters: 10
+      timeout_iters: 500
+    client_configs:
+      - name: "con1024_iter5_8k1k"
+        concurrency: 1024
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 8k1k - TEP4 with TRTLLM, MTP3
+  - name: "qwen3_5_397b_fp4_tep4_mtp3_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    max_batch_size: 4
+    max_num_tokens: 32768
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.75
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    moe_config:
+      backend: 'TRTLLM'
+      use_low_precision_moe_combine: true
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 3
+    batch_wait_timeout_iters: 50
+    batch_wait_max_tokens_ratio: 0.45
+    client_configs:
+      - name: "con4_iter5_8k1k"
+        concurrency: 4
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>
+
+  # 8k1k - DEP8 with CUTEDSL, MTP3
+  - name: "qwen3_5_397b_fp4_dep8_mtp3_8k1k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
+    model_name: "qwen3.5_397b_a17b_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    max_batch_size: 32
+    max_num_tokens: 32768
+    trust_remote_code: true
+    num_postprocess_workers: 4
+    print_iter_log: true
+    enable_layerwise_nvtx_marker: false
+    disable_overlap_scheduler: false
+    enable_iter_perf_stats: true
+    enable_chunked_prefill: false
+    stream_interval: 20
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+      context_chunking_policy: FIRST_COME_FIRST_SERVED
+    kv_cache_config:
+      free_gpu_memory_fraction: 0.9
+      enable_block_reuse: false
+      dtype: 'fp8'
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+    moe_config:
+      backend: 'CUTEDSL'
+      use_low_precision_moe_combine: true
+    enable_attention_dp: true
+    attention_dp_config:
+      enable_balance: true
+      batching_wait_iters: 10
+      timeout_iters: 500
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 3
+    client_configs:
+      - name: "con256_iter5_8k1k"
+        concurrency: 256
+        iterations: 5
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>

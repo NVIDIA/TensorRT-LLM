@@ -1,0 +1,19 @@
+# Modularized perf test list — owner: ruodil (QA). Design: trtllm-perf-modulized-test-{notes,PLATFORM}.md
+# Format:  <pytest-nodeid>  <discrete|continuous>   # Cat# — what it guards
+#   discrete   = zero-threshold == assert, pre-merge gate, runs anywhere.
+#   continuous = gpu_time vs baseline, clock-locked, post-merge detector (runs independently).
+# One pytest node id per line + a discrete|continuous tag. '#' and blank lines are ignored.
+# QA registration list for the modularized perf tests (run by the QA perf pipeline, not pre-merge L0).
+
+# --- MoE (pilot, verified) ---
+tests/microbenchmarks/bench_moe/test_discrete_metrics.py::test_moe_backend_selection      discrete    # Cat3.4 — AUTO backend routing (pure CPU)
+tests/microbenchmarks/bench_moe/test_discrete_metrics.py::test_moe_forward_launch_count   discrete    # Cat11/2 — fused-MoE kernel count (golden: sm120=9,sm90=10,sm103=10)
+
+# --- Attention (context / decode; harness: attention_perf/attention_perf_harness.py) ---
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_ctx_dispatch     discrete      # Cat2/3 — context use_paged_context_fmha (verified sm120=false)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_decode_dispatch  discrete      # Cat2/4 — decode XQA launch_count (verified sm120=49)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_ctx_fmha_time    continuous    # context FMHA gpu_time (backstops ctx discrete blind spot)
+tests/microbenchmarks/attention_perf/test_attention_perf_module.py::test_attn_decode_xqa_time  continuous    # decode XQA gpu_time — the green-discrete + red-continuous blind-spot case
+
+# Backlog (PLATFORM §4, not yet implemented): fmha_cubin_present, fmha_no_jit_recompile,
+#   moe_quant_kernel_select, moe_smallM_gemm_time, cudagraph_batch_bucketing, host_ws1_no_broadcast
