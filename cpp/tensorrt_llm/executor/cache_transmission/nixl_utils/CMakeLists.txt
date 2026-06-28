@@ -42,6 +42,38 @@ if(NIXL_ROOT)
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
 
+  # ------------------------------------------------------------------------
+  # Bounce v2 transport (control plane = zmq) — compiled into the wrapper when
+  # zmq is available (fetched under ENABLE_UCX). Activates the TLLM_BOUNCE_V2
+  # code paths in transferAgent.cpp; runtime use is still opt-in via
+  # TRTLLM_NIXL_BOUNCE_ENABLE.
+  # ------------------------------------------------------------------------
+  if(ENABLE_UCX)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ZMQ REQUIRED libzmq)
+    target_sources(
+      ${NIXL_WRAPPER_TARGET}
+      PRIVATE bounce/BounceTransferPlan.cpp
+              bounce/BuddyAllocator.cpp
+              bounce/CreditScheduler.cpp
+              bounce/BounceMessage.cpp
+              bounce/BounceArena.cpp
+              bounce/ExecPool.cpp
+              bounce/GatherScatterKernel.cu
+              bounce/ZmqControlChannel.cpp
+              bounce/NixlTransferEngine.cpp
+              bounce/BounceTransport.cpp)
+    target_include_directories(
+      ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
+                                     ${ZMQ_INCLUDE_DIRS})
+    target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES}
+                                                         ${NIXL_BUILD_LIBRARY})
+    target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
+    # The .cu device symbols must resolve into this shared lib.
+    set_target_properties(${NIXL_WRAPPER_TARGET}
+                          PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
+
   set(NIXL_ENABLED TRUE)
 else()
   set(NIXL_ENABLED FALSE)
