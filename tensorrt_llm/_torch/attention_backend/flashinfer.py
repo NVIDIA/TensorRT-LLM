@@ -959,10 +959,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # representative layer so the initial block-count computation has a
         # valid window_size.  Per-pool indices are rebuilt in the VSWA block
         # below (lines ~944+) so this initial call is only used for num_blocks.
+        # For VSWA (V2) _vswa_layer_to_pool maps any layer to its pool; for
+        # VSWA (V1) that dict is None but kv_cache_manager.is_vswa is still
+        # True.  In both cases we need any valid layer_idx to resolve the
+        # window_size.  Use the first key in layer_offsets (guaranteed
+        # non-empty for any model with attention layers).
         _vswa_init_layer: Optional[int] = None
         if self._vswa_layer_to_pool is not None:
+            # V2 VSWA: use primary pool representative layer.
             _primary_pool = self._vswa_layer_to_pool.get(0, 0)
             _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool, 0)
+        elif getattr(self.kv_cache_manager, 'is_vswa', False):
+            # V1 VSWA: no per-pool mapping; any layer index resolves
+            # window_size via layer_offsets → max_attention_window_vec.
+            _layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
+            if _layer_offsets:
+                _vswa_init_layer = next(iter(_layer_offsets))
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids, layer_idx=_vswa_init_layer)
 
