@@ -62,10 +62,20 @@ class VanillaAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
-        # indices of used cache blocks for each sequence
+        # indices of used cache blocks for each sequence.
+        # For VSWA models the correct pool depends on layer_idx, which is
+        # unknown at prepare() time (metadata is shared across all layers).
+        # Defer the lookup to VanillaAttention.forward() in that case.
+        if self.kv_cache_manager is None:
+            self.block_ids_per_seq = None
+            return
         assert self.request_ids is not None
-        self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids) if self.kv_cache_manager is not None else None
+        if getattr(self.kv_cache_manager, 'is_vswa', False):
+            # Signal to forward() that it must fetch per-layer block IDs.
+            self.block_ids_per_seq = None
+        else:
+            self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
+                self.request_ids)
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
@@ -503,8 +513,15 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 attention_mask=forward_args.attention_mask)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+        # For VSWA models block_ids_per_seq is None (set by prepare()); fetch
+        # the correct pool's block IDs using this layer's index.
+        block_ids_per_seq = metadata.block_ids_per_seq
+        if block_ids_per_seq is None:
+            assert metadata.request_ids is not None
+            block_ids_per_seq = metadata.kv_cache_manager.get_batch_cache_indices(
+                metadata.request_ids, layer_idx=self.layer_idx)
         cache_indices = [
-            block_ids[0] for block_ids in metadata.block_ids_per_seq
+            block_ids[0] for block_ids in block_ids_per_seq
         ]
         kv_cache_tensor = metadata.kv_cache_manager.get_buffers(self.layer_idx)
 

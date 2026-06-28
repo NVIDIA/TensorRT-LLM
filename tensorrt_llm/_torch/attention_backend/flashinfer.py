@@ -890,8 +890,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
+        # For VSWA models the KV cache manager has multiple pools with
+        # independent page numbering; calling get_batch_cache_indices without
+        # a layer_idx would raise ValueError.  Use the primary pool's
+        # representative layer so the initial block-count computation has a
+        # valid window_size.  Per-pool indices are rebuilt in the VSWA block
+        # below (lines ~944+) so this initial call is only used for num_blocks.
+        _vswa_init_layer: Optional[int] = None
+        if self._vswa_layer_to_pool is not None:
+            _primary_pool = self._vswa_layer_to_pool.get(0, 0)
+            _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool, 0)
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+            self.request_ids, layer_idx=_vswa_init_layer)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
