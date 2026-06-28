@@ -969,9 +969,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # V2 VSWA: use primary pool representative layer.
             _primary_pool = self._vswa_layer_to_pool.get(0, 0)
             _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool, 0)
-        elif getattr(self.kv_cache_manager, 'is_vswa', False):
-            # V1 VSWA: no per-pool mapping; any layer index resolves
-            # window_size via layer_offsets → max_attention_window_vec.
+        elif len(getattr(self.kv_cache_manager, 'max_attention_window_vec', [])) > 1:
+            # V1 manager (or any manager without per-pool dict) with multiple
+            # window sizes: get_batch_cache_indices requires layer_idx to
+            # resolve the window_size.  Use any valid layer index.
             _layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
             if _layer_offsets:
                 _vswa_init_layer = next(iter(_layer_offsets))
