@@ -148,6 +148,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_req, server=ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
+            ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+            if ctx_response_disagg_params.disagg_request_id is not None:
+                disagg_request_id = ctx_response_disagg_params.disagg_request_id
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         else:
             # Clear synthetic disaggregated_params that may have been
