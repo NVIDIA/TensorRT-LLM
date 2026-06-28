@@ -407,6 +407,58 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             sm_scale=plan_params.sm_scale,
         )
 
+    def _plan_mtp_gen_prefill(self, plan_params: PlanParams,
+                              o_dtype: Optional[torch.dtype]) -> None:
+        """Plan a prefill-style wrapper for MTP generation tokens.
+
+        Called when generation requests carry more than 1 token per sequence
+        (i.e. speculative decoding / MTP is active).
+        BatchDecodeWithPagedKVCacheWrapper assumes q_len=1 per sequence; for
+        MTP we route the generation sub-batch through a paged-prefill wrapper
+        instead.  This path is NOT compatible with CUDA-graph capture (gated
+        on not self.is_cuda_graph at the call site).
+        """
+        num_gen = self.num_generations
+        num_ctx = self.num_contexts
+
+        # Rebase generation qo_indptr to start from 0.
+        gen_qo_indptr = (
+            self._qo_indptr[num_ctx:num_ctx + num_gen + 1] -
+            self._qo_indptr[num_ctx])
+
+        gen_paged_kv_indptr = self.paged_kv_indptr_decode[:num_gen + 1]
+        gen_paged_kv_indices = self._paged_kv_indices[
+            self.num_context_blocks:self.num_context_blocks +
+            self.num_generation_blocks]
+        gen_paged_kv_last_page = self._paged_kv_last_page_len[
+            num_ctx:num_ctx + num_gen]
+
+        # Allocate or reuse the MTP gen prefill wrapper and its indptr buffers.
+        # We allocate fresh each time rather than caching because batch shape
+        # can change run-to-run (and CUDA graph is disabled on this path).
+        self._mtp_gen_prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer,
+            self.kv_layout,
+            backend="fa2",
+            use_cuda_graph=False,
+        )
+        self._mtp_gen_prefill_wrapper.plan(
+            gen_qo_indptr,
+            gen_paged_kv_indptr,
+            gen_paged_kv_indices,
+            gen_paged_kv_last_page,
+            plan_params.num_heads,
+            plan_params.num_kv_heads,
+            plan_params.head_dim,
+            self.page_size,
+            causal=True,
+            sm_scale=plan_params.sm_scale,
+            window_left=plan_params.window_left,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            o_data_type=o_dtype,
+        )
+
     @property
     def paged_kv_indices(self) -> torch.Tensor:
         return self._paged_kv_indices[:self.num_generation_blocks +
@@ -612,6 +664,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             cache_name="_mla_kv_len_arr_buf",
             capture_graph=capture_graph,
         )
+        # Buffers for MTP (speculative decoding) generation path.  When
+        # generation requests carry more than 1 token per sequence the standard
+        # BatchDecodeWithPagedKVCacheWrapper cannot be used (it assumes q_len=1
+        # per request).  We instead route those through a separate prefill
+        # wrapper.  Buffers are allocated here (not inside forward()) so their
+        # addresses are stable across calls; CUDA-graph capture is NOT supported
+        # on this path (gated on not is_cuda_graph in forward).
+        self._mtp_gen_qo_indptr_buf: Optional[torch.Tensor] = None
+        self._mtp_gen_paged_kv_indptr_buf: Optional[torch.Tensor] = None
+        self._mtp_gen_prefill_wrapper: Optional[
+            flashinfer.BatchPrefillWithPagedKVCacheWrapper] = None
         # Rebind the wrapper to the freshly allocated buffers.
         self._ragged_prefill_wrapper = None
         self._mla_decode_wrapper = None
@@ -1893,13 +1956,42 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_mask_data=effective_mask_data,
                 flashinfer_backend=self.flashinfer_backend)
 
+            # Detect MTP: generation requests with >1 token per sequence.
+            # BatchDecodeWithPagedKVCacheWrapper assumes q_len=1; when MTP is
+            # active the generation sub-batch must use the prefill wrapper
+            # instead.  Not compatible with CUDA-graph capture (variable
+            # q_len per request), so this path is gated on non-graph mode.
+            gen_seq_lens = metadata.seq_lens_cuda[
+                num_contexts:num_contexts + num_generations]
+            is_mtp_gen = (num_generations > 0
+                          and not metadata.is_cuda_graph
+                          and gen_seq_lens.max().item() > 1)
+
+            def mtp_gen_forward(out: torch.Tensor):
+                """Run generation sub-batch through the paged prefill wrapper."""
+                o_dtype = (torch.bfloat16 if plan_params.q_dtype in (
+                    torch.float8_e4m3fn, torch.float8_e5m2) else None)
+                metadata._plan_mtp_gen_prefill(plan_params, o_dtype)
+                assert metadata._mtp_gen_prefill_wrapper is not None
+                metadata._mtp_gen_prefill_wrapper.run(
+                    q[num_ctx_tokens:].view(-1, self.num_heads, self.head_dim),
+                    kv_cache,
+                    out=out.view(-1, self.num_heads, self.head_dim),
+                )
+
             if num_contexts == 0:
-                decode_forward(plan_params, output)
+                if is_mtp_gen:
+                    mtp_gen_forward(output)
+                else:
+                    decode_forward(plan_params, output)
             elif num_generations == 0:
                 prefill_forward(plan_params, output)
             else:
                 prefill_forward(plan_params, output[:num_ctx_tokens, :])
-                decode_forward(plan_params, output[num_ctx_tokens:, :])
+                if is_mtp_gen:
+                    mtp_gen_forward(output[num_ctx_tokens:, :])
+                else:
+                    decode_forward(plan_params, output[num_ctx_tokens:, :])
 
     def forward(self,
                 q: torch.Tensor,
