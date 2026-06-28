@@ -49,7 +49,18 @@ from .ltx2_core.transformer_args import (
     TransformerArgs,
     TransformerArgsPreprocessor,
 )
-from .ltx2_core.utils_ltx2 import rms_norm
+from .ltx2_core.utils_ltx2 import (
+    apply_fused_gate_resid,
+    apply_fused_gate_resid_rmsnorm,
+    apply_fused_gate_resid_rmsnorm_shift_scale,
+    apply_fused_resid_rmsnorm_shift_scale_dual,
+    apply_fused_rmsnorm_shift_scale,
+    apply_shift_scale,
+    get_nvfp4_input_scale,
+    get_nvfp4_self_attn_input_scale,
+    is_fused_adaln_supported_dim,
+    rms_norm,
+)
 from .text_cache import TextCache
 
 if TYPE_CHECKING:
@@ -560,6 +571,14 @@ class BasicAVTransformerBlock(nn.Module):
         self._sharder = SequenceSharder.from_vgm(vgm)
         self._audio_is_sharded = False
 
+        # Whether to dispatch AdaLN modulation to the fused CUDA kernels. Resolved
+        # once at construction; call sites just consult the flag. The kernels are
+        # bf16 + hidden_dim in {2048, 4096}; non-matching cases raise at the C++
+        # boundary -- this flag is the only Python-side guard.
+        video_supports_fused_adaln = video is None or is_fused_adaln_supported_dim(video.dim)
+        audio_supports_fused_adaln = audio is None or is_fused_adaln_supported_dim(audio.dim)
+        self._fuse_adaln = video_supports_fused_adaln and audio_supports_fused_adaln
+
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
 
@@ -701,15 +720,41 @@ class BasicAVTransformerBlock(nn.Module):
         timestep: torch.Tensor,
         indices: slice,
     ) -> tuple[torch.Tensor, ...]:
+        """Combined-form AdaLN values for the slots in ``indices``. Returns one bf16
+        ``[batch_size, T, D]`` tensor per slot (broadcast-add of ``scale_shift_table``
+        cast to bf16 + ``timestep`` reshaped to per-slot views, then unbound on the
+        slot axis).
+        """
         num_ada_params = scale_shift_table.shape[0]
-        ada_values = (
+        return (
             scale_shift_table[indices]
             .unsqueeze(0)
             .unsqueeze(0)
             .to(device=timestep.device, dtype=timestep.dtype)
             + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
         ).unbind(dim=2)
-        return ada_values
+
+    @staticmethod
+    def _get_ada_table_ts_pairs(
+        scale_shift_table: torch.Tensor,
+        batch_size: int,
+        timestep: torch.Tensor,
+        indices: slice,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Pair-form companion to ``_get_ada_values``: returns one ``(table_slice, ts_slice)``
+        pair per slot in ``indices`` without materializing the broadcast-add. Consumers that
+        fuse the add into a downstream kernel (Phase 0b of the fused C++ ops) accept the pair
+        directly; the broadcast-add then becomes dead code and is DCE'd by Inductor when no
+        combined-form slot from the same range is consumed elsewhere.
+
+        Returns a tuple of (table_slice fp32 [D], ts_slice bf16 [B, T, D]) per slot.
+        """
+        num_ada_params = scale_shift_table.shape[0]
+        ts_reshaped = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)
+        return tuple(
+            (scale_shift_table[i], ts_reshaped[:, :, i, :])
+            for i in range(*indices.indices(num_ada_params))
+        )
 
     @staticmethod
     def _get_av_ca_ada_values(
@@ -744,6 +789,38 @@ class BasicAVTransformerBlock(nn.Module):
         ss_chunks = [t.squeeze(2) for t in ss_vals]
         gate_chunks = [t.squeeze(2) for t in gate_vals]
         return (*ss_chunks, *gate_chunks)
+
+    @staticmethod
+    def _get_av_ca_ada_table_ts_pairs(
+        scale_shift_table: torch.Tensor,
+        batch_size: int,
+        scale_shift_timestep: torch.Tensor,
+        gate_timestep: torch.Tensor,
+        num_scale_shift_values: int = 4,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Pair-form companion to ``_get_av_ca_ada_values``: returns one
+        ``(table_slice fp32 [D], ts_slice bf16 [B, T, D])`` pair per slot. The first
+        ``num_scale_shift_values`` slots use ``scale_shift_timestep``; the remaining
+        slots use ``gate_timestep``. Consumers that fuse the broadcast-add into a
+        downstream kernel accept the pair directly.
+        """
+        num_ada_params = scale_shift_table.shape[0]
+        num_gate_values = num_ada_params - num_scale_shift_values
+        ss_table = scale_shift_table[:num_scale_shift_values, :]
+        gate_table = scale_shift_table[num_scale_shift_values:, :]
+        ss_ts_reshaped = scale_shift_timestep.reshape(
+            batch_size, scale_shift_timestep.shape[1], num_scale_shift_values, -1
+        )
+        gate_ts_reshaped = gate_timestep.reshape(
+            batch_size, gate_timestep.shape[1], num_gate_values, -1
+        )
+        ss_pairs = tuple(
+            (ss_table[i], ss_ts_reshaped[:, :, i, :]) for i in range(num_scale_shift_values)
+        )
+        gate_pairs = tuple(
+            (gate_table[i], gate_ts_reshaped[:, :, i, :]) for i in range(num_gate_values)
+        )
+        return (*ss_pairs, *gate_pairs)
 
     # -- Sequence-parallel helpers for AV cross-attention ----------------------
 
@@ -788,72 +865,127 @@ class BasicAVTransformerBlock(nn.Module):
             perturbations, BatchedPerturbationConfig
         )
 
+        # Cross-block attention outputs are always parked in ``*_attn_raw`` slots so
+        # that the next block's fused kernel can absorb the residual add into its own
+        # first stage. Consumers bifurcate on ``... is not None``; producers always
+        # defer (the only fast-path that wins is the one where the next fused kernel
+        # exists). The AV-CA-skipped cleanup below handles single-modality models
+        # where the consumer block doesn't run at all.
+        av_ca_runs = run_a2v or run_v2a
+        text_v_attn_raw = None
+        text_a_attn_raw = None
+        a2v_attn_raw = None
+        v2a_attn_raw = None
+
         # --- Video self-attention + text cross-attention ---
         if run_vx:
             skip_v_self = has_perturbations and perturbations.all_in_batch(
                 PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
             )
-            vshift_msa, vscale_msa, vgate_msa = self._get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
-            )
             if not skip_v_self:
-                norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
-                v_self_out = (
-                    self.attn1(
-                        norm_vx,
-                        pe=video.positional_embeddings,
-                        timestep=video.timesteps,
-                    )
-                    * vgate_msa
+                # MSA modulators in pair form: slot 0 = shift_msa, 1 = scale_msa, 2 = gate_msa.
+                (
+                    (vshift_msa_table, vshift_msa_ts),
+                    (vscale_msa_table, vscale_msa_ts),
+                    (vgate_msa_table, vgate_msa_ts),
+                ) = self._get_ada_table_ts_pairs(
+                    self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
+                )
+                norm_vx = apply_fused_rmsnorm_shift_scale(
+                    vx,
+                    vscale_msa_table,
+                    vscale_msa_ts,
+                    vshift_msa_table,
+                    vshift_msa_ts,
+                    self.norm_eps,
+                    self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_self_attn_input_scale(self.attn1),
+                )
+                v_attn_raw = self.attn1(
+                    norm_vx, pe=video.positional_embeddings, timestep=video.timesteps
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
                 ):
-                    v_self_out = v_self_out * perturbations.mask_like(
-                        PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, v_self_out
+                    # Mask commutes with the gate mul: (attn * mask) * gate == attn * (gate * mask).
+                    v_attn_raw = v_attn_raw * perturbations.mask_like(
+                        PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, v_attn_raw
                     )
-                vx = vx + v_self_out
-            vx = vx + self.attn2(
-                rms_norm(vx, eps=self.norm_eps),
+                # Fused gate-residual + RMSNorm (+ optional FP4 quant):
+                # vx <- vx + v_attn_raw * gate_msa; rms_norm; optional FP4 quant.
+                vx, attn2_q_input = apply_fused_gate_resid_rmsnorm(
+                    vx,
+                    v_attn_raw,
+                    vgate_msa_table,
+                    vgate_msa_ts,
+                    self.norm_eps,
+                    self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_input_scale(self.attn2.to_q),
+                )
+            else:
+                attn2_q_input = rms_norm(vx, eps=self.norm_eps)
+            text_v_attn_raw = self.attn2(
+                attn2_q_input,
                 context=video.context,
                 pre_projected_kv=text_kv_video,
                 timestep=video.timesteps,
             )
-            del vshift_msa, vscale_msa, vgate_msa
 
         # --- Audio self-attention + text cross-attention ---
         if run_ax:
             skip_a_self = has_perturbations and perturbations.all_in_batch(
                 PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
             )
-            ashift_msa, ascale_msa, agate_msa = self._get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
-            )
             if not skip_a_self:
-                norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-                a_self_out = (
-                    self.audio_attn1(
-                        norm_ax,
-                        pe=audio.positional_embeddings,
-                        key_padding_mask=audio.audio_padding_mask,
-                        timestep=audio.timesteps,
-                    )
-                    * agate_msa
+                # MSA modulators in pair form: slot 0 = shift_msa, 1 = scale_msa, 2 = gate_msa.
+                (
+                    (ashift_msa_table, ashift_msa_ts),
+                    (ascale_msa_table, ascale_msa_ts),
+                    (agate_msa_table, agate_msa_ts),
+                ) = self._get_ada_table_ts_pairs(
+                    self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
+                )
+                norm_ax = apply_fused_rmsnorm_shift_scale(
+                    ax,
+                    ascale_msa_table,
+                    ascale_msa_ts,
+                    ashift_msa_table,
+                    ashift_msa_ts,
+                    self.norm_eps,
+                    self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_self_attn_input_scale(self.audio_attn1),
+                )
+                a_attn_raw = self.audio_attn1(
+                    norm_ax,
+                    pe=audio.positional_embeddings,
+                    key_padding_mask=audio.audio_padding_mask,
+                    timestep=audio.timesteps,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
                 ):
-                    a_self_out = a_self_out * perturbations.mask_like(
-                        PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, a_self_out
+                    a_attn_raw = a_attn_raw * perturbations.mask_like(
+                        PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, a_attn_raw
                     )
-                ax = ax + a_self_out
-            ax = ax + self.audio_attn2(
-                rms_norm(ax, eps=self.norm_eps),
+                # Fused gate-residual + RMSNorm (+ optional FP4 quant):
+                # ax <- ax + a_attn_raw * gate_msa; rms_norm; optional FP4 quant.
+                ax, audio_attn2_q_input = apply_fused_gate_resid_rmsnorm(
+                    ax,
+                    a_attn_raw,
+                    agate_msa_table,
+                    agate_msa_ts,
+                    self.norm_eps,
+                    self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_input_scale(self.audio_attn2.to_q),
+                )
+            else:
+                audio_attn2_q_input = rms_norm(ax, eps=self.norm_eps)
+            text_a_attn_raw = self.audio_attn2(
+                audio_attn2_q_input,
                 context=audio.context,
                 pre_projected_kv=text_kv_audio,
                 timestep=audio.timesteps,
             )
-            del ashift_msa, ascale_msa, agate_msa
 
         # --- Bidirectional audio ↔ video cross-attention ---
         if run_a2v or run_v2a:
@@ -864,39 +996,120 @@ class BasicAVTransformerBlock(nn.Module):
                 PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx
             )
 
-            vx_norm3 = rms_norm(vx, eps=self.norm_eps)
-            ax_norm3 = rms_norm(ax, eps=self.norm_eps)
+            # Fused residual + RMSNorm + dual shift_scale (per modality) consumes
+            # the deferred text-attn residual. Fallback when text_*_attn_raw is None
+            # (residual already added in place): do RMSNorm + two individual shift_scale calls.
+            if text_v_attn_raw is not None:
+                # Pass NVFP4 input_scales to also emit packed FP4 + 128x4 SWIZZLED SF
+                # for the downstream cross-attn Q/K projections (the wrapper handles
+                # None vs not-None uniformly and falls back gracefully when fuse=False).
+                # Pair-form for the AV CA video table: 4 ss pairs (cross_scale_shift_timestep)
+                # plus 1 gate pair (cross_gate_timestep). The fused kernel consumes the 4 ss
+                # pairs; the gate pair is unused here (the a2v cross-attn output is not gated).
+                (
+                    (v_scale_a2v_table, v_scale_a2v_ts),
+                    (v_shift_a2v_table, v_shift_a2v_ts),
+                    (v_scale_v2a_table, v_scale_v2a_ts),
+                    (v_shift_v2a_table, v_shift_v2a_ts),
+                    _,
+                ) = self._get_av_ca_ada_table_ts_pairs(
+                    self.scale_shift_table_a2v_ca_video,
+                    vx.shape[0],
+                    video.cross_scale_shift_timestep,
+                    video.cross_gate_timestep,
+                )
+                vx, vx_scaled_a2v, vx_scaled_v2a = apply_fused_resid_rmsnorm_shift_scale_dual(
+                    vx,
+                    text_v_attn_raw,
+                    v_scale_a2v_table,
+                    v_scale_a2v_ts,
+                    v_shift_a2v_table,
+                    v_shift_a2v_ts,
+                    v_scale_v2a_table,
+                    v_scale_v2a_ts,
+                    v_shift_v2a_table,
+                    v_shift_v2a_ts,
+                    self.norm_eps,
+                    fuse=self._fuse_adaln,
+                    fp4_input_scale1=get_nvfp4_input_scale(self.audio_to_video_attn.to_q),
+                    fp4_input_scale2=get_nvfp4_input_scale(self.video_to_audio_attn.to_k),
+                )
+            else:
+                # Combined-form modulators only needed on the eager fallback; the gate
+                # output is unused (the gated residual is folded into the next fused kernel).
+                (
+                    scale_ca_video_a2v,
+                    shift_ca_video_a2v,
+                    scale_ca_video_v2a,
+                    shift_ca_video_v2a,
+                    _,
+                ) = self._get_av_ca_ada_values(
+                    self.scale_shift_table_a2v_ca_video,
+                    vx.shape[0],
+                    video.cross_scale_shift_timestep,
+                    video.cross_gate_timestep,
+                )
+                vx_norm3 = rms_norm(vx, eps=self.norm_eps)
+                vx_scaled_a2v = apply_shift_scale(vx_norm3, scale_ca_video_a2v, shift_ca_video_a2v)
+                vx_scaled_v2a = apply_shift_scale(vx_norm3, scale_ca_video_v2a, shift_ca_video_v2a)
 
-            (
-                scale_ca_audio_a2v,
-                shift_ca_audio_a2v,
-                scale_ca_audio_v2a,
-                shift_ca_audio_v2a,
-                gate_out_v2a,
-            ) = self._get_av_ca_ada_values(
-                self.scale_shift_table_a2v_ca_audio,
-                ax.shape[0],
-                audio.cross_scale_shift_timestep,
-                audio.cross_gate_timestep,
-            )
+            if text_a_attn_raw is not None:
+                # Dual-shift_scale for the audio side (a2v consumes ax K side, v2a consumes ax Q side).
+                # Pair-form for the AV CA audio table: 4 ss pairs (cross_scale_shift_timestep)
+                # plus 1 gate pair (cross_gate_timestep). The fused kernel consumes the 4 ss
+                # pairs; the gate pair is unused here (the v2a cross-attn output is not gated).
+                (
+                    (a_scale_a2v_table, a_scale_a2v_ts),
+                    (a_shift_a2v_table, a_shift_a2v_ts),
+                    (a_scale_v2a_table, a_scale_v2a_ts),
+                    (a_shift_v2a_table, a_shift_v2a_ts),
+                    _,
+                ) = self._get_av_ca_ada_table_ts_pairs(
+                    self.scale_shift_table_a2v_ca_audio,
+                    ax.shape[0],
+                    audio.cross_scale_shift_timestep,
+                    audio.cross_gate_timestep,
+                )
+                ax, ax_scaled_a2v, ax_scaled_v2a = apply_fused_resid_rmsnorm_shift_scale_dual(
+                    ax,
+                    text_a_attn_raw,
+                    a_scale_a2v_table,
+                    a_scale_a2v_ts,
+                    a_shift_a2v_table,
+                    a_shift_a2v_ts,
+                    a_scale_v2a_table,
+                    a_scale_v2a_ts,
+                    a_shift_v2a_table,
+                    a_shift_v2a_ts,
+                    self.norm_eps,
+                    fuse=self._fuse_adaln,
+                    fp4_input_scale1=get_nvfp4_input_scale(self.audio_to_video_attn.to_k),
+                    fp4_input_scale2=get_nvfp4_input_scale(self.video_to_audio_attn.to_q),
+                )
+            else:
+                # Combined-form modulators only needed on the eager fallback; the gate
+                # output is unused (the gated residual is folded into the next fused kernel).
+                (
+                    scale_ca_audio_a2v,
+                    shift_ca_audio_a2v,
+                    scale_ca_audio_v2a,
+                    shift_ca_audio_v2a,
+                    _,
+                ) = self._get_av_ca_ada_values(
+                    self.scale_shift_table_a2v_ca_audio,
+                    ax.shape[0],
+                    audio.cross_scale_shift_timestep,
+                    audio.cross_gate_timestep,
+                )
+                ax_norm3 = rms_norm(ax, eps=self.norm_eps)
+                ax_scaled_a2v = apply_shift_scale(ax_norm3, scale_ca_audio_a2v, shift_ca_audio_a2v)
+                ax_scaled_v2a = apply_shift_scale(ax_norm3, scale_ca_audio_v2a, shift_ca_audio_v2a)
 
-            (
-                scale_ca_video_a2v,
-                shift_ca_video_a2v,
-                scale_ca_video_v2a,
-                shift_ca_video_v2a,
-                gate_out_a2v,
-            ) = self._get_av_ca_ada_values(
-                self.scale_shift_table_a2v_ca_video,
-                vx.shape[0],
-                video.cross_scale_shift_timestep,
-                video.cross_gate_timestep,
-            )
-
+            # a2v / v2a outputs are parked in ``*_attn_raw`` (see above). Per-batch SKIP
+            # perturbation masks are pre-multiplied onto the attn output here, since the
+            # kernel takes no mask input. Math is preserved: (attn * mask) * gate ==
+            # (attn * gate) * mask because mask is per-batch and gate is per-feature.
             if run_a2v and not skip_a2v:
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
-
                 # Project-before-gather: K/V projections run on sharded data
                 # so they benefit from Ulysses scaling.  RoPE is applied to K
                 # inside project_kv on the sharded shard (RoPE commutes with
@@ -907,34 +1120,27 @@ class BasicAVTransformerBlock(nn.Module):
                 # key_padding_mask zeros attention on the audio pad slots that
                 # configure_audio_ulysses appended to make T_a divisible by U.
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
-                    ax_scaled, pe=audio.cross_positional_embeddings
+                    ax_scaled_a2v, pe=audio.cross_positional_embeddings
                 )
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
                     v_a2v = self._sp_all_gather(v_a2v)
 
-                a2v_out = (
-                    self.audio_to_video_attn(
-                        vx_scaled,
-                        pre_projected_kv=(k_a2v, v_a2v),
-                        pe=video.cross_positional_embeddings,
-                        key_padding_mask=audio.audio_padding_mask,
-                        timestep=video.timesteps,
-                    )
-                    * gate_out_a2v
+                a2v_attn_raw = self.audio_to_video_attn(
+                    vx_scaled_a2v,
+                    pre_projected_kv=(k_a2v, v_a2v),
+                    pe=video.cross_positional_embeddings,
+                    key_padding_mask=audio.audio_padding_mask,
+                    timestep=video.timesteps,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx
                 ):
-                    a2v_out = a2v_out * perturbations.mask_like(
-                        PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, a2v_out
+                    a2v_attn_raw = a2v_attn_raw * perturbations.mask_like(
+                        PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, a2v_attn_raw
                     )
-                vx = vx + a2v_out
 
             if run_v2a and not skip_v2a:
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
-
                 # v2a: when the Ulysses wrapper is active, K/V (video, large)
                 # stay seq-sharded and the wrapper handles Q + K|V + output
                 # a2a internally. RoPE is applied to K in project_kv on the
@@ -947,7 +1153,7 @@ class BasicAVTransformerBlock(nn.Module):
                 # is_ulysses_active() — _audio_is_sharded can be true under
                 # Attention2D where no wrapper was built.
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
-                    vx_scaled, pe=video.cross_positional_embeddings
+                    vx_scaled_v2a, pe=video.cross_positional_embeddings
                 )
                 if not self.video_to_audio_attn.is_ulysses_active() and self._sharder.is_active:
                     # Fallback: wrapper inactive → all-gather sharded video
@@ -955,38 +1161,120 @@ class BasicAVTransformerBlock(nn.Module):
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
 
-                v2a_out = (
-                    self.video_to_audio_attn(
-                        ax_scaled,
-                        pre_projected_kv=(k_v2a, v_v2a),
-                        pe=audio.cross_positional_embeddings,
-                        timestep=audio.timesteps,
-                    )
-                    * gate_out_v2a
+                v2a_attn_raw = self.video_to_audio_attn(
+                    ax_scaled_v2a,
+                    pre_projected_kv=(k_v2a, v_v2a),
+                    pe=audio.cross_positional_embeddings,
+                    timestep=audio.timesteps,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx
                 ):
-                    v2a_out = v2a_out * perturbations.mask_like(
-                        PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, v2a_out
+                    v2a_attn_raw = v2a_attn_raw * perturbations.mask_like(
+                        PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, v2a_attn_raw
                     )
-                ax = ax + v2a_out
+
+        # AV cross-attn was skipped entirely (single-modality model): the
+        # deferred text-attn residuals never got consumed. Apply them now so
+        # the FFN sees the correct vx / ax.
+        if not av_ca_runs:
+            if text_v_attn_raw is not None:
+                vx = vx + text_v_attn_raw
+            if text_a_attn_raw is not None:
+                ax = ax + text_a_attn_raw
 
         # --- Video FFN ---
         if run_vx:
-            vshift_mlp, vscale_mlp, vgate_mlp = self._get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None)
+            # MLP modulators: slot 3 (shift_mlp), 4 (scale_mlp) feed the fused kernel as
+            # pair form; slot 5 (gate_mlp) is also pair-form so the final gate-residual
+            # add `vx + ff(vx_scaled) * vgate_mlp` can run as a single fused kernel via
+            # apply_fused_gate_resid (kernel composes gate = table.to(bf16) + ts inline).
+            (
+                (vshift_mlp_table, vshift_mlp_ts),
+                (vscale_mlp_table, vscale_mlp_ts),
+                (vgate_mlp_table, vgate_mlp_ts),
+            ) = self._get_ada_table_ts_pairs(
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
-            vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            if a2v_attn_raw is not None:
+                # Fused gate-residual + RMSNorm + shift_scale consumes the
+                # deferred a2v residual: vx <- vx + a2v_attn_raw*gate; rms_norm;
+                # (1+scale)*normed+shift. Gate = AV CA table[4] + cross_gate_timestep.
+                v_gate_a2v_table = self.scale_shift_table_a2v_ca_video[4]
+                v_gate_a2v_ts = video.cross_gate_timestep
+                vx, vx_scaled = apply_fused_gate_resid_rmsnorm_shift_scale(
+                    vx,
+                    a2v_attn_raw,
+                    v_gate_a2v_table,
+                    v_gate_a2v_ts,
+                    vscale_mlp_table,
+                    vscale_mlp_ts,
+                    vshift_mlp_table,
+                    vshift_mlp_ts,
+                    self.norm_eps,
+                    fuse=self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_input_scale(self.ff.up_proj),
+                )
+            else:
+                # No media cross-attn residual to consume: pure RMSNorm + shift_scale.
+                vx_scaled = apply_fused_rmsnorm_shift_scale(
+                    vx,
+                    vscale_mlp_table,
+                    vscale_mlp_ts,
+                    vshift_mlp_table,
+                    vshift_mlp_ts,
+                    self.norm_eps,
+                    self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_input_scale(self.ff.up_proj),
+                )
+            vx = apply_fused_gate_resid(
+                vx, self.ff(vx_scaled), vgate_mlp_table, vgate_mlp_ts, self._fuse_adaln
+            )
 
         # --- Audio FFN ---
         if run_ax:
-            ashift_mlp, ascale_mlp, agate_mlp = self._get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None)
+            # MLP modulators: slot 5 (gate_mlp) shares the pair-form fetch so the final
+            # gate-residual add runs as a single fused kernel via apply_fused_gate_resid.
+            (
+                (ashift_mlp_table, ashift_mlp_ts),
+                (ascale_mlp_table, ascale_mlp_ts),
+                (agate_mlp_table, agate_mlp_ts),
+            ) = self._get_ada_table_ts_pairs(
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
-            ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            if v2a_attn_raw is not None:
+                # Fused gate-residual + RMSNorm + shift_scale consumes the
+                # deferred v2a residual: ax <- ax + v2a_attn_raw*gate; rms_norm;
+                # (1+scale)*normed+shift. Gate = AV CA audio table[4] + cross_gate_timestep.
+                a_gate_v2a_table = self.scale_shift_table_a2v_ca_audio[4]
+                a_gate_v2a_ts = audio.cross_gate_timestep
+                ax, ax_scaled = apply_fused_gate_resid_rmsnorm_shift_scale(
+                    ax,
+                    v2a_attn_raw,
+                    a_gate_v2a_table,
+                    a_gate_v2a_ts,
+                    ascale_mlp_table,
+                    ascale_mlp_ts,
+                    ashift_mlp_table,
+                    ashift_mlp_ts,
+                    self.norm_eps,
+                    fuse=self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_input_scale(self.audio_ff.up_proj),
+                )
+            else:
+                ax_scaled = apply_fused_rmsnorm_shift_scale(
+                    ax,
+                    ascale_mlp_table,
+                    ascale_mlp_ts,
+                    ashift_mlp_table,
+                    ashift_mlp_ts,
+                    self.norm_eps,
+                    self._fuse_adaln,
+                    fp4_input_scale=get_nvfp4_input_scale(self.audio_ff.up_proj),
+                )
+            ax = apply_fused_gate_resid(
+                ax, self.audio_ff(ax_scaled), agate_mlp_table, agate_mlp_ts, self._fuse_adaln
+            )
 
         return (
             replace(video, x=vx) if video is not None else None,
@@ -1128,6 +1416,16 @@ class LTXModel(BaseDiffusionModel):
             self.audio_num_attention_heads = audio_num_attention_heads
             self.audio_inner_dim = audio_num_attention_heads * audio_attention_head_dim
             self._init_audio(audio_in_channels, audio_out_channels, caption_channels, norm_eps)
+
+        # Fused AdaLN modulation flag: True iff every inner_dim in this model
+        # matches the kernel's supported set. Threaded into output-head paths.
+        video_supports_fused_adaln = (
+            not model_type.is_video_enabled()
+        ) or is_fused_adaln_supported_dim(self.inner_dim)
+        audio_supports_fused_adaln = (
+            not model_type.is_audio_enabled()
+        ) or is_fused_adaln_supported_dim(self.audio_inner_dim)
+        self._fuse_adaln = video_supports_fused_adaln and audio_supports_fused_adaln
 
         if model_type.is_video_enabled() and model_type.is_audio_enabled():
             cross_pe_max_pos = max(
@@ -1675,7 +1973,7 @@ class LTXModel(BaseDiffusionModel):
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
         x = norm_out(x)
-        x = x * (1 + scale) + shift
+        x = apply_shift_scale(x, scale, shift)
         return proj_out(x)
 
     # -- Forward -------------------------------------------------------------
