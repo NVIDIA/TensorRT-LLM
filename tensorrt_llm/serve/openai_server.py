@@ -23,7 +23,7 @@ import socket
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -360,6 +360,15 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
+        # CTX-side incremental tokenizer (opt-in via TLLM_CTX_INCR_TOKENIZE=1).
+        # Re-encodes only the suffix that extends the previous turn's prompt,
+        # avoiding a full re-tokenize of the (often tens-of-thousands-token)
+        # prompt on every turn. See _encode_with_prefix_cache.
+        self._tok_prefix_cache = (
+            OrderedDict()
+            if os.environ.get("TLLM_CTX_INCR_TOKENIZE") == "1" else None)
+        if self._tok_prefix_cache is not None:
+            logger.info("CTX incremental tokenization enabled")
         hf_tokenizer_path = self.generator._hf_model_dir
         if not hf_tokenizer_path:
             hf_tokenizer_path = getattr(
@@ -1090,6 +1099,37 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info("Iteration stats collector loop cancelled")
             raise
 
+    def _encode_with_prefix_cache(self, rendered: str, key: int) -> list[int]:
+        """Tokenize ``rendered`` reusing the prefix cached from the previous turn.
+
+        Only the suffix that extends the cached render is re-encoded; the rest of
+        the token ids are reused, avoiding a full re-tokenize of the (often very
+        long) conversation prompt on every turn. A prompt that does not extend
+        the cached one falls back to a full encode.
+
+        Mirrors ``KvCacheAwareRouter._encode_with_prefix_cache`` on the context
+        path: with conversation-sticky routing the router skips its own tokenize,
+        so the context worker would otherwise re-encode the whole prompt every
+        turn. The cache key is the hash of the first messages, which carries the
+        per-session cache-bust id so concurrent sessions do not clobber each
+        other; the delta encode is exact because chat renders end on a special
+        token (an atomic boundary that BPE never merges across).
+        """
+        hf = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        cache = self._tok_prefix_cache
+        entry = cache.get(key)
+        if (entry is not None and len(rendered) > len(entry[0])
+                and rendered.startswith(entry[0])):
+            ids = entry[1] + hf.encode(rendered[len(entry[0]):],
+                                       add_special_tokens=False)
+        else:
+            ids = hf.encode(rendered, add_special_tokens=False)
+        cache[key] = (rendered, ids)
+        cache.move_to_end(key)
+        while len(cache) > 1024:
+            cache.popitem(last=False)
+        return ids
+
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
 
@@ -1194,6 +1234,19 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                # Incremental tokenization (opt-in): turn the rendered text into
+                # token ids via the prefix cache so _preprocess skips a full
+                # re-encode of the whole prompt. Only reachable on the context
+                # path (the generation path takes prompt_token_ids). Keyed by the
+                # first messages, which carry the per-session cache-bust id.
+                if self._tok_prefix_cache is not None and isinstance(prompt, str):
+                    key = hash("".join(
+                        str(m.get("content", "") if isinstance(m, dict) else
+                            getattr(m, "content", ""))
+                        for m in request.messages[:2]))
+                    prompt = await asyncio.to_thread(
+                        self._encode_with_prefix_cache, prompt, key)
+                    request.prompt_token_ids = prompt
             prompt = prompt_inputs(prompt)
 
             mm_data, mm_embeddings = await mm_coroutines
