@@ -1960,8 +1960,18 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # No engram concern here because engram only fires at layer entry.
         # When enable_fused_hc=False, fall back to the unfused chain.
         # -------------------------------------------------------------------
-        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+        capture_this_layer = spec_metadata is not None and spec_metadata.is_layer_capture(
+            self.layer_idx
+        )
+        is_dspark_capture = capture_this_layer and spec_metadata.spec_dec_mode.is_dspark()
+        if capture_this_layer:
             self.fusion_config.POST_MOE_FUSION = False
+        if is_dspark_capture:
+            # DSpark captures the FULL post-mapped mHC residual stream (reference
+            # ``h.mean(dim=2)``), which is only materialized after
+            # hc_ffn.post_mapping -- so post_mapping must resolve in-layer rather
+            # than being deferred into the next layer's fused_hc.
+            self.defer_post_mapping = False
         if self.enable_fused_hc:
             residual, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc(
                 x_prev=x_attn,
@@ -2003,6 +2013,17 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             post_layer_mix=post_mix,
             comb_res_mix=comb_mix,
         )
+        if is_dspark_capture:
+            # Capture the full mHC residual stream [N, hc_mult*hidden]; the DSpark
+            # metadata means over the hc streams (reference ``h.mean(dim=2)``) to
+            # form the draft's captured context (``main_x``). This is the correct
+            # representation -- NOT the pre-post_mapping MoE delta that the generic
+            # capture in forward_MoE records for other spec modes.
+            spec_metadata.maybe_capture_hidden_states(
+                self.layer_idx,
+                resolved_residual.reshape(resolved_residual.shape[0], -1),
+                None,
+            )
         return HCState.resolved(resolved_residual)
 
     def _entry_boundary(self, hc_state, engram_embeddings, has_engram):
@@ -2131,7 +2152,14 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                     fc2_output, all_reduce_params=moe_all_reduce_params
                 )
         else:
-            if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            # DSpark captures the post-mapped mHC residual stream after this layer
+            # (done in the decoder-layer forward), not the pre-post_mapping MoE
+            # output recorded here for other spec modes.
+            if (
+                spec_metadata is not None
+                and spec_metadata.is_layer_capture(self.layer_idx)
+                and not spec_metadata.spec_dec_mode.is_dspark()
+            ):
                 spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
 
         return hidden_states
