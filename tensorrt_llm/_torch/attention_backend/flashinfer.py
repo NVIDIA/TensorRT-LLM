@@ -169,6 +169,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _multi_item_params: Optional[FlashInferMultiItemParams] = field(
         init=False, default=None)
 
+    # Speculative-decoding metadata. Declared on TrtllmAttentionMetadata
+    # (trtllm.py) and read/written by the spec-dec code paths
+    # (eagle3._prepare_attn_metadata_for_spec_dec / drafting_loops). Now that
+    # the FLASHINFER + spec_dec gate has been narrowed to one-engine + CUDA
+    # graph only, FlashInfer + MTP exercises this code path and would
+    # AttributeError without these fields. Schema-only parity here; actually
+    # plumbing the packed mask into BatchPrefillWithPagedKVCacheWrapper.plan
+    # (custom_mask=...) for correct numerics is a separate concern.
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
             return True
