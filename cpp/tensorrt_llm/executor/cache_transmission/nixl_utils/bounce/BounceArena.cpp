@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"
 
+#include "tensorrt_llm/batch_manager/cacheTransBuffer.h" // kv_cache_manager::FabricMemory (full def)
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -34,10 +35,10 @@ BounceArena::BounceArena(std::size_t bytes, int deviceId, bool allowFabric)
     // On MNNVL parts (GH200/GB200) the arena (RDMA src/dst, NIXL-registered) must be fabric memory
     // to be reachable over the NVLink fabric + GPUDirect-RDMA capable. Elsewhere (and CI, or when
     // fabric is force-disabled) fall back to cudaMalloc.
-    mIsFabric = allowFabric && tensorrt_llm::common::FabricMemory::supportFbaricMemory();
+    mIsFabric = allowFabric && tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory::supportFabricMemory();
     if (mIsFabric)
     {
-        mFabric = std::make_unique<tensorrt_llm::common::FabricMemory>(bytes);
+        mFabric = std::make_unique<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory>(bytes);
         mBase = mFabric->getPtr();
         TLLM_LOG_DEBUG("BounceArena: %zuB backed by fabric memory", bytes);
     }
