@@ -317,8 +317,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Project context tokens through fc + hidden_norm
         ctx_hs = captured_hs[:num_ctx_tokens]
-        ctx_proj = draft_model.fc(ctx_hs.to(draft_model.fc.weight.dtype))
-        ctx_proj = draft_model.hidden_norm(ctx_proj)
+        ctx_proj = draft_model.project_target_hidden(ctx_hs)
 
         # Split by request and store/append accumulated context.
         # Context requests may arrive in chunks (chunked prefill), so we
@@ -632,10 +631,7 @@ class DFlashWorker(SpecWorkerBase):
                 # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
-                projected_to_store = draft_model.fc(
-                    gen_hs_to_project.to(draft_model.fc.weight.dtype)
-                )
-                projected_to_store = draft_model.hidden_norm(projected_to_store)
+                projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
