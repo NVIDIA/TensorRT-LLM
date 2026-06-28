@@ -26,6 +26,8 @@ tensorrt~=10.15.1
 torch>=2.10.0,<=2.11.0a0
 torchvision
 nvidia-modelopt[torch]~=0.37.0
+# NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
+nccl4py>=0.3
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-02.html#rel-26-02 uses 2.29.2
 # torch 2.10.0+cu130 depends on nvidia-nccl-cu13==2.28.9
 nvidia-nccl-cu13>=2.28.9,<=2.29.2

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,7 @@ from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
+from .nccl_ep import NcclEP
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
@@ -67,6 +68,7 @@ class CommunicationFactory:
         2. Auto-selection (tries in order):
            - NVLinkOneSided (highest priority for throughput)
            - NVLinkTwoSided (high priority for latency)
+           - NcclEP (if nccl-ep is available)
            - DeepEP (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - DeepEPLowLatency (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - AllGather + ReduceScatter (fallback, always works)
@@ -129,7 +131,7 @@ class CommunicationFactory:
             )
 
         # Auto-selection: Try strategies in priority order using try-catch
-        # Priority: NVLinkOneSided > NVLinkTwoSided > DeepEP > DeepEPLowLatency > AllGather
+        # Priority: NVLinkOneSided > NVLinkTwoSided > NcclEP > DeepEP > DeepEPLowLatency > AllGather
 
         try:
             enable_eplb = model_config.moe_load_balancer is not None
@@ -180,6 +182,26 @@ class CommunicationFactory:
             return strategy
         except Exception as e:
             logger.info(f"NVLinkTwoSided not available: {e}")
+
+        # Try NCCL EP (rank-major LL). Falls through to DeepEP/AllGather if
+        # prerequisites are not met or libnccl_ep.so is not available.
+        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(act_dtype)
+        if nccl_ep_unavailable_reason is None:
+            try:
+                strategy = NcclEP(
+                    mapping,
+                    num_slots,
+                    hidden_size,
+                    max_num_tokens,
+                    moe_max_num_tokens,
+                    top_k=top_k,
+                )
+                logger.info("Selected communication strategy: NcclEP")
+                return strategy
+            except RuntimeError as e:
+                logger.debug(f"NcclEP not available: {e}")
+        else:
+            logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
@@ -318,7 +340,29 @@ class CommunicationFactory:
                 use_low_precision_combine,
                 moe_max_num_tokens,
             )
+        elif method == "NCCL_EP":
+            nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
+                act_dtype
+            )
+            if nccl_ep_unavailable_reason is not None:
+                raise ValueError(nccl_ep_unavailable_reason)
+            return NcclEP(
+                mapping,
+                num_slots,
+                hidden_size,
+                max_num_tokens,
+                moe_max_num_tokens,
+                top_k=top_k,
+            )
         elif method == "ALLGATHER":
             return AllGatherReduceScatter(mapping)
         else:
             raise ValueError(f"Unknown communication method: {method}")
+
+    @staticmethod
+    def _get_nccl_ep_unavailable_reason(
+        act_dtype: torch.dtype,
+    ) -> Optional[str]:
+        if act_dtype != torch.bfloat16:
+            return f"NcclEP requires act_dtype=torch.bfloat16, got {act_dtype}."
+        return None

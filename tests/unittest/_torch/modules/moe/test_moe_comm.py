@@ -67,12 +67,14 @@ from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashinfer import (
     NVLinkTwoSidedFlashinfer,
 )
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
+from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import is_nccl_ep_installed
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -93,6 +95,7 @@ COMM_DEEP_EP_LL = "DeepEPLowLatency"
 COMM_NVLINK_ONE_SIDED = "NVLinkOneSided"
 COMM_NVLINK_TWO_SIDED = "NVLinkTwoSided"
 COMM_NVLINK_TWO_SIDED_FLASHINFER = "NVLinkTwoSidedFlashinfer"
+COMM_NCCL_EP = "NcclEP"
 
 ALL_COMM_TYPES = [
     COMM_ALLGATHER_RS,
@@ -101,6 +104,7 @@ ALL_COMM_TYPES = [
     COMM_NVLINK_ONE_SIDED,
     COMM_NVLINK_TWO_SIDED,
     COMM_NVLINK_TWO_SIDED_FLASHINFER,
+    COMM_NCCL_EP,
 ]
 
 # Must be in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES
@@ -393,6 +397,16 @@ def create_comm_object(
             alltoall_result_do_sum=True,
         )
 
+    elif comm_type == COMM_NCCL_EP:
+        return NcclEP(
+            mapping=mapping,
+            num_slots=num_slots,
+            hidden_size=config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            moe_max_num_tokens=max_num_tokens,
+            top_k=config.top_k,
+        )
+
     else:
         raise ValueError(f"Unknown comm type: {comm_type}")
 
@@ -441,6 +455,11 @@ def check_platform_support(comm_type: str) -> Optional[str]:
 
     if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
         return _check_flashinfer_mnnvl_support()
+
+    if comm_type == COMM_NCCL_EP:
+        if not is_nccl_ep_installed():
+            return "NCCL EP not available (install the nccl4py wheel)"
+        return None
 
     return f"Unknown comm type: {comm_type}"
 
@@ -491,6 +510,10 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
     if comm_type == COMM_NVLINK_ONE_SIDED:
         if config.top_k > NVLinkOneSided.MAX_TOP_K:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
+
+    if comm_type == COMM_NCCL_EP:
+        if config.quant_mode != "none":
+            return f"NcclEP does not support quant_mode={config.quant_mode}"
 
     if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
         # FlashInfer alltoallv requires every 2D payload row to be 16-byte aligned.
@@ -1247,14 +1270,27 @@ def _build_combine_reference(
                     ref[token_idx] += nvfp4_out[i].float()
 
     elif config.comm_type == COMM_DEEP_EP_LL:
-        # Path 2: DeepEPLL weighted reduction.
-        # DeepEPLL's dispatch returns ones as recv_scales, so simple_moe
-        # produces unweighted output. The combine kernel (low_latency_combine)
-        # internally applies real topk_weights during weighted reduction.
-        # Reconstruct by weighting recv_hs_bf16 per local expert with the
-        # real weights from original_scales on the source rank.
+        # Path 2: DeepEPLL weighted reduction (expert-major output).
+        #
+        # Dispatch output is [num_local_experts * ep_size * max_tokens, hidden].
+        # `simple_moe` returns identity (recv_scales are ones), so each row
+        # passed to combine still holds the original source token's bytes.
+        # The combine kernel sends per-position slots (one per k in top_k) and
+        # applies weight[k] to the k-th slot -- duplicate experts are NOT deduped;
+        # each position contributes independently.
+        #
+        # Empirically confirmed on DeepEPLL (4-rank LL, k=2): for every
+        # token T on target_rank:
+        #     combined[T] = (sum over k in [0, top_k) of w[T, k]) * T_hidden
+        # regardless of whether all top_k experts are distinct or a subset
+        # coalesces onto the same expert.
+        #
+        # Find the source token's hidden_states by locating any received row
+        # whose source is (target_rank, T); all such rows carry identical bytes.
         target_original_scales = all_results[target_rank]["original_scales"]
 
+        # Locate a representative received row per (target_rank, token_idx).
+        token_hs: dict = {}  # token_idx -> bf16 row
         for proc_result in all_results:
             proc_rank = proc_result["rank"]
             recv_hs_bf16 = proc_result["recv_hs_bf16"]
@@ -1265,12 +1301,17 @@ def _build_combine_reference(
             )
 
             for i, (src_rank, token_idx) in enumerate(source_info):
-                if src_rank == target_rank and token_idx < num_tokens:
-                    for k in range(config.top_k):
-                        eid = recv_slots[i, k].item()
-                        if slot_start <= eid < slot_end:
-                            weight = target_original_scales[token_idx, k].float()
-                            ref[token_idx] += recv_hs_bf16[i].float() * weight
+                if src_rank != target_rank or token_idx >= num_tokens:
+                    continue
+                if not any(slot_start <= eid < slot_end for eid in recv_slots[i].tolist()):
+                    continue
+                if token_idx not in token_hs:
+                    token_hs[token_idx] = recv_hs_bf16[i]
+
+        # Sum of topk weights per token applied to that token's hidden_states.
+        for token_idx, hs in token_hs.items():
+            weight_sum = target_original_scales[token_idx].float().sum()
+            ref[token_idx] += hs.float() * weight_sum
 
     else:
         # Path 3: Default — float32 accumulation.
