@@ -809,11 +809,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         """
         weight_mode = module.weights_loading_config.weight_mode
         shard_key_to_index = weight_mode.shard_key_to_index
+        compute_device = module.weight.device
+        if compute_device.type == "cpu" and torch.cuda.is_available():
+            compute_device = torch.device("cuda")
 
         # Handle input_scale
         if hasattr(module, "has_static_input_scale"):
             # Compute max and replace input_scale with a new parameter
-            max_input_scale = module.tmp_input_scales.max()
+            max_input_scale = module.tmp_input_scales.to(compute_device).max()
             module.input_scale.data.copy_(max_input_scale)
             # Also update inv_input_scale for static quantization
             if hasattr(
@@ -827,13 +830,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 module.inv_input_scale = None
 
         # Compute max weight_scale
-        max_weight_scale = module.tmp_weight_scales.max()
+        max_weight_scale = module.tmp_weight_scales.to(compute_device).max()
         module.weight_scale.data.copy_(max_weight_scale)
 
         # Rescale each weight shard: (weight * original_scale) / max_scale
         for shard_key in weight_mode.shard_keys:
             idx = shard_key_to_index[shard_key]
-            original_scale = module.tmp_weight_scales[idx]
+            original_scale = module.tmp_weight_scales[idx].to(compute_device)
 
             # Get shard position from mapping
             shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
@@ -842,12 +845,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             # Rescale: FP8 -> BF16 -> multiply by original_scale -> divide by max_scale -> FP8
             weight_shard = module.weight.data[shard_offset:shard_offset +
                                               shard_size]
-            rescaled_weight = weight_shard.to(module.dtype).mul_(original_scale)
+            rescaled_weight = weight_shard.to(compute_device).to(
+                module.dtype).mul_(original_scale)
             rescaled_weight = rescaled_weight.div_(
                 max_weight_scale.to(rescaled_weight.device)).to(
                     torch.float8_e4m3fn)
             module.weight.data[shard_offset:shard_offset +
-                               shard_size] = rescaled_weight
+                               shard_size] = rescaled_weight.to(
+                                   module.weight.device)
 
         delattr(module, "tmp_input_scales")
         delattr(module, "tmp_weight_scales")

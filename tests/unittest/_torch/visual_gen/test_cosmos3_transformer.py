@@ -295,7 +295,7 @@ class TestCosmos3TransformerCheckpoint:
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=_SKIP_AUX)
         try:
-            assert pipeline.transformer.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
             transformer = pipeline.transformer
             c = transformer.latent_channel_size
             hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(

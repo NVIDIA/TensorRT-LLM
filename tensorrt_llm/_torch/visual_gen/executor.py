@@ -91,6 +91,21 @@ def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
     return None
 
 
+def _cuda_memory_logging_enabled() -> bool:
+    """Whether per-request CUDA peak-memory logging is enabled.
+
+    This is a development-only knob exposed as an environment variable
+    (rather than a public ``VisualGenArgs`` field) to keep the engine
+    config surface clean, mirroring the nsys trace knob
+    ``TLLM_PROFILE_VISUAL_GEN_START_STOP``.
+    """
+    return os.environ.get("TLLM_VISUAL_GEN_LOG_CUDA_MEMORY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 @dataclass
 class DiffusionRequest:
     """Request for diffusion inference.
@@ -279,6 +294,9 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
+        log_cuda_memory = _cuda_memory_logging_enabled()
+        if log_cuda_memory:
+            self._reset_cuda_peak_memory_stats()
         try:
             self._merge_defaults(req)
             cache_key = self.pipeline.warmup_cache_key(
@@ -297,7 +315,10 @@ class DiffusionExecutor:
             # that the per-phase CUDA-event timings on PipelineOutput do not.
             generation_start = time.perf_counter()
             output = self.pipeline.infer(req)
+            if log_cuda_memory:
+                self._log_cuda_peak_memory(req.request_id)
             generation = time.perf_counter() - generation_start  # seconds
+
             if self.rank == 0:
                 self.response_queue.put(
                     DiffusionResponse(
@@ -307,12 +328,44 @@ class DiffusionExecutor:
                     )
                 )
         except Exception as e:
+            if log_cuda_memory:
+                self._log_cuda_peak_memory(req.request_id)
             logger.error(f"Worker {self.device_id}: Error: {e}")
             logger.error(traceback.format_exc())
             if self.rank == 0:
                 self.response_queue.put(
                     DiffusionResponse(request_id=req.request_id, error_msg=str(e))
                 )
+
+    def _reset_cuda_peak_memory_stats(self) -> None:
+        """Reset CUDA peak memory stats for this worker if CUDA is available."""
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            torch.cuda.reset_peak_memory_stats(self.device_id)
+        except RuntimeError as e:
+            logger.warning(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Unable to reset CUDA peak memory stats: {e}"
+            )
+
+    def _log_cuda_peak_memory(self, request_id: int) -> None:
+        """Log peak CUDA memory observed for one request."""
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            peak_allocated = torch.cuda.max_memory_allocated(self.device_id)
+            logger.info(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Request {request_id} peak CUDA memory: {peak_allocated / 2**30:.2f} GiB"
+            )
+        except RuntimeError as e:
+            logger.warning(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Unable to log CUDA peak memory for request {request_id}: {e}"
+            )
 
 
 def run_diffusion_worker(

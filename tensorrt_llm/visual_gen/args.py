@@ -433,6 +433,57 @@ class CudaGraphConfig(StrictBaseModel):
     enable: bool = Field(False, status="prototype")
 
 
+class CpuOffloadConfig(StrictBaseModel):
+    """Configuration for offloading visual-generation model components to CPU.
+
+    A diffusion pipeline is a sequence of large *components* (text encoder,
+    denoising transformer, VAE, optional guardrails, ...) that run one after
+    another, so only one is needed on the GPU at any moment. Offloading
+    exploits this: weights are loaded and quantized normally, then held in
+    packed host (CPU) storage and brought onto the GPU one *stage* at a time,
+    rebinding each module's parameters/buffers to a reusable GPU arena while
+    that stage runs and evicting it back to CPU afterwards. This lowers peak
+    GPU memory to roughly the largest single stage rather than the whole
+    pipeline, letting larger models fit on limited VRAM, at the cost of
+    host<->device copies between stages (mitigated by ``pin_memory``).
+
+    Terminology (used consistently across these fields):
+
+    - **component**: a named, public sub-model of the pipeline, e.g.
+      ``text_encoder``, ``transformer``, ``vae``.
+    - **stage**: one step of the offload schedule — a single component, or a
+      group of components that are co-resident on the GPU and run together
+      before being evicted. For example, a stage ``["text_encoder", "transformer"]``
+      keeps both components on GPU until that stage completes. The ordered list
+      of stages is set by ``stages``.
+    """
+
+    enable: bool = Field(
+        False,
+        status="prototype",
+        description="Enable offloading of model components to CPU between pipeline stages.",
+    )
+    pin_memory: bool = Field(
+        True,
+        status="prototype",
+        description="Allocate pinned CPU storage for faster host-to-device copies.",
+    )
+    stages: Optional[List[Union[str, List[str]]]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Optional ordered list of stages, named with model-specific public component "
+            "names. Each entry is a single component, or a list of components that are "
+            "co-resident on the GPU and run together as one stage. For example, "
+            "[['text_encoder', 'transformer'], 'vae'] keeps text_encoder and "
+            "transformer co-resident before moving to vae. Example components: "
+            "['text_encoder', 'transformer', 'vae'] for Wan T2V, or "
+            "['reasoner', 'generator', 'text_guardrail', 'video_guardrail', 'vae'] for Cosmos3. "
+            "If omitted, the model chooses default stages."
+        ),
+    )
+
+
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -527,6 +578,10 @@ class VisualGenArgs(StrictBaseModel):
     )
     cuda_graph_config: CudaGraphConfig = Field(
         default_factory=CudaGraphConfig,
+        status="prototype",
+    )
+    cpu_offload_config: CpuOffloadConfig = Field(
+        default_factory=CpuOffloadConfig,
         status="prototype",
     )
     attention_config: AttentionConfig = Field(

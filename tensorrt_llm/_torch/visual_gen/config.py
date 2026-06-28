@@ -35,6 +35,7 @@ from tensorrt_llm.visual_gen.args import (
     CacheConfig,
     CacheDiTConfig,
     CompilationConfig,
+    CpuOffloadConfig,
     CudaGraphConfig,
     ParallelConfig,
     TeaCacheConfig,
@@ -108,6 +109,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
 
     # Unified parallelism mapping copied from the owning pipeline config.
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+    device: str = "cuda"
 
     dynamic_weight_quant: bool = False
 
@@ -118,6 +120,7 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
+    cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -173,6 +176,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+    device: str = "cuda"
 
     dynamic_weight_quant: bool = False
 
@@ -183,6 +187,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
+    cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -240,12 +245,14 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             extra_attrs=_model_config_value(self.extra_attrs),
             # Topology mappings carry distributed process-group handles.
             visual_gen_mapping=_model_config_value(self.visual_gen_mapping, deep_copy=False),
+            device=_model_config_value(self.device),
             dynamic_weight_quant=_model_config_value(self.dynamic_weight_quant),
             quant_config=_model_config_value(self.quant_config),
             quant_config_dict=_model_config_value(self.quant_config_dict),
             compilation=_model_config_value(self.compilation),
             torch_compile=_model_config_value(self.torch_compile),
             cuda_graph=_model_config_value(self.cuda_graph),
+            cpu_offload_config=_model_config_value(self.cpu_offload_config),
             attention=_model_config_value(self.attention),
             attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
@@ -460,8 +467,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         Args:
             checkpoint_dir: Path to checkpoint
             args: VisualGenArgs containing user config
-                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache,
-                   cache_backend, cache_dit)
+                - (compilation_config, torch_compile_config, cuda_graph_config,
+                   cpu_offload_config, pipeline_config, attention_config, parallel_config,
+                   cache_config)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
@@ -470,6 +478,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         compilation_cfg = args.compilation_config if args else CompilationConfig()
         torch_compile_cfg = args.torch_compile_config if args else TorchCompileConfig()
         cuda_graph_cfg = args.cuda_graph_config if args else CudaGraphConfig()
+        offload_cfg = args.cpu_offload_config if args else CpuOffloadConfig()
         attention_cfg = args.attention_config if args else AttentionConfig()
         parallel_cfg = args.parallel_config if args else ParallelConfig()
         cache_cfg = args.cache_config if args else None
@@ -612,6 +621,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
         )
 
+        device = kwargs.pop("device", "cuda")
+
         pipeline_config = cls(
             quant_config=quant_config,
             quant_config_dict=quant_config_dict,
@@ -621,10 +632,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             compilation=compilation_cfg,
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
+            cpu_offload_config=offload_cfg,
             attention=attention_cfg,
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            device=device,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
