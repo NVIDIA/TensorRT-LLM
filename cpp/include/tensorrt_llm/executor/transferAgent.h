@@ -254,9 +254,10 @@ public:
     {
     }
 
-    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions)
+    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions, std::string bounceEndpoint = {})
         : mBackendAgentDesc{std::move(backendAgentDesc)}
         , mVramRegions{std::move(vramRegions)}
+        , mBounceEndpoint{std::move(bounceEndpoint)}
     {
     }
 
@@ -270,6 +271,14 @@ public:
         return mVramRegions;
     }
 
+    /// Optional NIXL-bounce control-plane endpoint of this agent (empty if bounce is disabled).
+    /// Travels with the metadata so the peer can register the bounce control channel — this is the
+    /// path production disagg uses (get_local_agent_desc / loadRemoteAgent(AgentDesc)).
+    [[nodiscard]] std::string const& getBounceEndpoint() const noexcept
+    {
+        return mBounceEndpoint;
+    }
+
     /// Serialize the entire AgentDesc (backend blob + VMM regions) into an opaque string.
     [[nodiscard]] std::string serialize() const;
 
@@ -279,6 +288,7 @@ public:
 private:
     std::string mBackendAgentDesc;
     std::vector<VramRegionMeta> mVramRegions;
+    std::string mBounceEndpoint;
 };
 
 // `TransferOp` is an enumeration that represents the types of transfer operations.
