@@ -17,11 +17,17 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/fabricMemory.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+
+// Reuse the KV-cache transfer buffers' fabric allocator (batch_manager) rather than a private copy:
+// one MNNVL/GPUDirect-RDMA implementation, shared. Forward-declared here (the member is held by
+// unique_ptr with an out-of-line dtor); the full definition is included in the .cpp.
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class FabricMemory;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
 
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
@@ -90,7 +96,7 @@ private:
     std::size_t mBytes{0};
     void* mBase{nullptr}; // the registered RDMA src/dst buffer (offset 0)
     // Non-null (and mIsFabric=true) on MNNVL when fabric-backed; else null and mBase is cudaMalloc'd.
-    std::unique_ptr<tensorrt_llm::common::FabricMemory> mFabric;
+    std::unique_ptr<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory> mFabric;
     bool mIsFabric{false};
 };
 
