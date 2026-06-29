@@ -74,7 +74,7 @@ void checkNcclAsyncResult(ncclComm_t comm, ncclResult_t result)
     TLLM_NCCL_CHECK(result);
 }
 
-ncclComm_t initNcclCommWithTimeout(ncclUniqueId const& id, int worldSize, int rank, int timeoutSec)
+void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int rank, int timeoutSec)
 {
     ncclComm_t comm{nullptr};
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
@@ -83,7 +83,8 @@ ncclComm_t initNcclCommWithTimeout(ncclUniqueId const& id, int worldSize, int ra
     auto result = ncclCommInitRankConfig(&comm, worldSize, id, rank, &config);
     if (result == ncclSuccess)
     {
-        return comm;
+        TLLM_NCCL_CHECK(ncclCommDestroy(comm));
+        return;
     }
     if (result != ncclInProgress)
     {
@@ -105,28 +106,41 @@ ncclComm_t initNcclCommWithTimeout(ncclUniqueId const& id, int worldSize, int ra
         result = ncclCommGetAsyncError(comm, &asyncResult);
         if (result != ncclSuccess)
         {
-            TLLM_THROW("NCCL communicator initialization failed while polling rank %d of %d: %s.", rank, worldSize,
-                ncclGetErrorString(result));
+            TLLM_THROW("NCCL communicator probe initialization failed while polling rank %d of %d: %s.", rank,
+                worldSize, ncclGetErrorString(result));
         }
         if (asyncResult == ncclSuccess)
         {
-            return comm;
+            TLLM_NCCL_CHECK(ncclCommDestroy(comm));
+            return;
         }
         if (asyncResult != ncclInProgress)
         {
-            TLLM_THROW("NCCL communicator initialization failed asynchronously on rank %d of %d: %s.", rank, worldSize,
-                ncclGetErrorString(asyncResult));
+            TLLM_THROW("NCCL communicator probe initialization failed asynchronously on rank %d of %d: %s.", rank,
+                worldSize, ncclGetErrorString(asyncResult));
         }
         if (std::chrono::steady_clock::now() >= deadline)
         {
             TLLM_THROW(
-                "NCCL communicator initialization timed out after %d seconds on rank %d of %d in "
+                "NCCL communicator probe initialization timed out after %d seconds on rank %d of %d in "
                 "NcclCommunicator::createComm. This indicates NCCL init is hung. TensorRT-LLM will not retry "
                 "in-process. Set %s to adjust the timeout.",
                 timeoutSec, rank, worldSize, kNcclCommInitTimeoutEnv);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
     }
+}
+
+ncclComm_t initBlockingNcclComm(ncclUniqueId const& id, int worldSize, int rank)
+{
+    ncclComm_t comm{nullptr};
+    auto const result = ncclCommInitRank(&comm, worldSize, id, rank);
+    if (result != ncclSuccess)
+    {
+        TLLM_THROW("NCCL communicator initialization failed on rank %d of %d: %s.", rank, worldSize,
+            ncclGetErrorString(result));
+    }
+    return comm;
 }
 
 ncclDataType_t toNcclType(nvinfer1::DataType dataType)
@@ -187,10 +201,16 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
     ncclUniqueId id;
     if (rank == 0)
     {
-        ncclGetUniqueId(&id);
+        TLLM_NCCL_CHECK(ncclGetUniqueId(&id));
     }
     mpiComm.bcastValue(id, 0);
-    return initNcclCommWithTimeout(id, worldSize, rank, getNcclCommInitTimeoutSec());
+    initNcclCommProbeWithTimeout(id, worldSize, rank, getNcclCommInitTimeoutSec());
+    if (rank == 0)
+    {
+        TLLM_NCCL_CHECK(ncclGetUniqueId(&id));
+    }
+    mpiComm.bcastValue(id, 0);
+    return initBlockingNcclComm(id, worldSize, rank);
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
     // pipeline parallel code-path. To enable this, have an empty communicator with uninitialized state.
