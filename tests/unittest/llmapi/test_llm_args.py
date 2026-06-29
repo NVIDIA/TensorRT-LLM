@@ -1741,6 +1741,7 @@ class TestStrictBaseModelArbitraryArgs:
                                         max_tokens_in_buffer=1024)
         assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
+        assert config.kv_transfer_poll_interval_ms == 5000
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
