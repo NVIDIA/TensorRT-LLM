@@ -148,9 +148,10 @@ def get_kv_cache_manager_cls(
 # KVCacheManager.get_cache_size_per_token may return either an ``int``
 # (legacy proportional model ``bytes = slope * tokens``) or an affine
 # ``(slope, intercept)`` tuple (CppMambaHybridCacheManager, where mamba
-# state introduces a per-batch fixed cost).  CacheCost normalizes both
-# shapes so the rest of the file does plain attribute access and method
-# calls instead of branching on type.
+# state introduces a per-batch fixed cost).  KVCacheManagerV2 reports
+# sliding-window attention fixed cost in the tuple intercept.  CacheCost
+# normalizes the combined shape so the rest of the file does plain attribute
+# access and method calls instead of branching on type.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,6 +234,7 @@ class KvCacheCreator:
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
+        self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
@@ -250,6 +252,8 @@ class KvCacheCreator:
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine)
+        self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
+                                                  KVCacheManagerV2)
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -350,8 +354,10 @@ class KvCacheCreator:
                 model_config,
                 self._mapping,
                 tokens_per_block=self._tokens_per_block,
+                max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
                 kv_cache_config=kv_cache_config,
+                spec_config=self._speculative_config,
                 **extra_kwargs))
 
     def _get_kv_size_per_token(self,
@@ -605,7 +611,7 @@ class KvCacheCreator:
         # heterogeneous layer_types) uses MambaHybridCacheManager and would
         # have its max_tokens estimate inflated incorrectly otherwise.
         num_pool_groups = 1
-        if self._kv_cache_manager_cls == KVCacheManagerV2:
+        if self._is_kv_cache_manager_v2:
             model_cfg = self._model_engine.model.model_config.pretrained_config
             layer_types = getattr(model_cfg, "layer_types", None)
             if isinstance(layer_types, (list, tuple)):
@@ -618,18 +624,22 @@ class KvCacheCreator:
                     set(self._kv_cache_config.max_attention_window))
         num_cache_blocks *= num_pool_groups
 
-        free_mem, total_mem = torch.cuda.mem_get_info()
+        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
+        max_num_tokens_for_estimation = (
+            num_cache_blocks * self._tokens_per_block *
+            self._dummy_reqs[0].sampling_config.beam_width)
+        # V2 capacity is controlled by max_gpu_total_bytes; max_tokens only
+        # describes the dummy workload needed for estimation.
+        if self._is_kv_cache_manager_v2:
+            return max_num_tokens_for_estimation
+
+        free_mem, _ = torch.cuda.mem_get_info()
         max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
         kv_size_per_token = self._get_kv_size_per_token()
         max_num_tokens_in_memory = (
             kv_size_per_token.tokens_for_budget(max_memory) //
             self._tokens_per_block * self._tokens_per_block)
-
-        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
-        return min(
-            num_cache_blocks * self._tokens_per_block *
-            self._dummy_reqs[0].sampling_config.beam_width,
-            max_num_tokens_in_memory)
+        return min(max_num_tokens_for_estimation, max_num_tokens_in_memory)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.
@@ -643,9 +653,20 @@ class KvCacheCreator:
         if 'cp_type' not in self._mapping.cp_config:
             estimating_kv_cache = True
             estimate_max_tokens = self._get_token_num_for_estimation()
-            self._kv_cache_config.max_tokens = min(
-                estimate_max_tokens, self._kv_cache_config.max_tokens
-            ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
+            if self._is_kv_cache_manager_v2:
+                free_mem, _ = torch.cuda.mem_get_info()
+                max_gpu_total_bytes = int(
+                    self._kv_cache_config.free_gpu_memory_fraction * free_mem)
+                if (self._max_gpu_total_bytes_in is not None
+                        and self._max_gpu_total_bytes_in > 0):
+                    max_gpu_total_bytes = min(max_gpu_total_bytes,
+                                              self._max_gpu_total_bytes_in)
+                self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
+                self._kv_cache_config.max_tokens = self._max_kv_tokens_in
+            else:
+                self._kv_cache_config.max_tokens = min(
+                    estimate_max_tokens, self._kv_cache_config.max_tokens
+                ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             logger.info(
@@ -757,7 +778,7 @@ class KvCacheCreator:
         # This leaves max_tokens as a user-defined constraint.
 
         # ---------------------------handle max_tokens---------------------------------
-        if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+        if self._is_kv_cache_manager_v2:
             # KVCacheManagerV2 doesn't rely on max_tokens to control capacity, so restore user provided value
             self._kv_cache_config.max_tokens = self._max_kv_tokens_in
         else:
@@ -788,11 +809,12 @@ class KvCacheCreator:
 
         # ---------------------------handle max_gpu_total_bytes---------------------------------
         # if user provided max_gpu_total_bytes, set max memory from max_gpu_total_bytes
-        if self._kv_cache_config.max_gpu_total_bytes > 0:
+        if (self._max_gpu_total_bytes_in is not None
+                and self._max_gpu_total_bytes_in > 0):
             kv_cache_max_memory = min(kv_cache_max_memory,
-                                      self._kv_cache_config.max_gpu_total_bytes)
+                                      self._max_gpu_total_bytes_in)
             logger.info(
-                f"max_gpu_total_bytes={self._kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
+                f"max_gpu_total_bytes={self._max_gpu_total_bytes_in / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
         logger.info(
@@ -1354,7 +1376,7 @@ class KvCacheCreator:
         kv_cache_config: Optional[KvCacheConfig] = None,
     ) -> bool:
         """Whether max_gpu_total_bytes must be split per manager."""
-        if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+        if self._is_kv_cache_manager_v2:
             return self._should_create_separate_draft_kv_cache()
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -1394,8 +1416,7 @@ class KvCacheCreator:
                         "max_gpu_total_bytes", self_kv_cache_config,
                         draft_kv_cache_config))
             # KVCacheManagerV2 does not support two-model draft budget splitting.
-            v2_two_model = (issubclass(self._kv_cache_manager_cls,
-                                       KVCacheManagerV2)
+            v2_two_model = (self._is_kv_cache_manager_v2
                             and self._draft_model_engine is not None)
             if not v2_two_model:
                 # Each manager sizes its host pool from host_cache_size directly.
@@ -1421,7 +1442,7 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
-            if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+            if self._is_kv_cache_manager_v2:
                 assert draft_kv_cache_config is None, (
                     "KVCacheManagerV2 does not support two-model speculative "
                     "decoding with separate draft KV cache budget splitting.")

@@ -33,6 +33,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -55,6 +56,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
             index_head_dim=128,
             compress_ratios=[1, 4, 1, 128],
             indexer_k_dtype="fp8",
+            window_size=128,
         )
         pretrained_config = SimpleNamespace(
             kv_lora_rank=512,
@@ -68,10 +70,109 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
         FakeModelConfig(),
         Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        tokens_per_block=128,
         is_disagg=True,
     )
 
-    assert size_per_token > 0
+    cost = CacheCost.from_raw(size_per_token)
+    assert cost.slope > 0
+    assert cost.intercept == 0
+
+
+def test_quota_from_max_tokens_models_context_swa_scratch():
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0, 1]
+    manager._compress_ratios = [4, 4]
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager._swa_window_size = 128
+    manager._max_draft_len = 0
+    manager._max_num_tokens = 1024
+    manager.tokens_per_block = 128
+    manager.max_batch_size = 2
+
+    manager.enable_swa_scratch_reuse = True
+    small_quota = manager._get_quota_from_max_tokens(1)
+    large_quota = manager._get_quota_from_max_tokens(4096)
+    scratch_delta = large_quota - small_quota
+
+    assert small_quota < large_quota
+    assert small_quota > manager._get_extra_quota_padding()
+    assert manager._get_max_tokens_from_quota(small_quota) == 1
+    assert manager._get_max_tokens_from_quota(large_quota) == 4096
+
+    manager.enable_swa_scratch_reuse = False
+    no_scratch_small_quota = manager._get_quota_from_max_tokens(1)
+    no_scratch_large_quota = manager._get_quota_from_max_tokens(4096)
+    no_scratch_delta = no_scratch_large_quota - no_scratch_small_quota
+
+    assert no_scratch_small_quota < no_scratch_large_quota
+    assert no_scratch_delta > scratch_delta
+    assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
+
+
+def test_needed_resource_uses_context_swa_scratch_slope():
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0, 1]
+    manager._compress_ratios = [4, 4]
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager._swa_window_size = 128
+    manager.tokens_per_block = 128
+    manager.num_extra_kv_tokens = 0
+    manager.enable_swa_scratch_reuse = True
+
+    context_request = SimpleNamespace(
+        is_context_init_state=True,
+        is_generation_in_progress_state=False,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        prompt_len=10,
+        max_new_tokens=100,
+    )
+    longer_context_request = SimpleNamespace(
+        is_context_init_state=True,
+        is_generation_in_progress_state=False,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        prompt_len=11,
+        max_new_tokens=100,
+    )
+    generation_request = SimpleNamespace(
+        is_context_init_state=False,
+        is_generation_in_progress_state=True,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        prompt_len=10,
+        max_new_tokens=20,
+    )
+    longer_generation_request = SimpleNamespace(
+        is_context_init_state=False,
+        is_generation_in_progress_state=True,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        prompt_len=10,
+        max_new_tokens=21,
+    )
+
+    non_sliding_attn_size_per_token = manager.get_cache_bytes_per_token()
+    context_bytes = manager.get_needed_resource_to_completion(context_request)
+    longer_context_bytes = manager.get_needed_resource_to_completion(longer_context_request)
+    generation_bytes = manager.get_needed_resource_to_completion(generation_request)
+    longer_generation_bytes = manager.get_needed_resource_to_completion(longer_generation_request)
+
+    assert non_sliding_attn_size_per_token > 0
+    assert context_bytes > context_request.prompt_len * non_sliding_attn_size_per_token
+    assert longer_context_bytes - context_bytes > non_sliding_attn_size_per_token
+    assert longer_generation_bytes - generation_bytes == non_sliding_attn_size_per_token
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
