@@ -639,6 +639,39 @@ def test_trtllm_fused_moe_nvfp4(
         def round_up(x, y):
             return math.ceil(x / y) * y
 
+        def quantize_weight_for_fused_moe(weight, global_scale):
+            fp4_weight, _ = torch.ops.trtllm.fp4_quantize(
+                weight,
+                global_scale,
+                NVFP4_BLOCK_SIZE,
+                isSfSwizzledLayout=False,
+            )
+
+            m, n = weight.shape
+            n_blocks = n // NVFP4_BLOCK_SIZE
+            weight_blocks = weight.view(m, n_blocks, NVFP4_BLOCK_SIZE)
+            block_maxes = weight_blocks.abs().amax(dim=2)
+            block_scales_fp8 = (
+                (block_maxes * global_scale / FLOAT8_E4M3_MAX)
+                .clamp(max=FLOAT8_E4M3_MAX)
+                .to(torch.float8_e4m3fn)
+            )
+
+            padded_m = round_up(m, TRTLLM_NVFP4_ROW_SIZE)
+            padded_n_blocks = round_up(n_blocks, TRTLLM_NVFP4_COLUMN_SIZE)
+            block_scales_padded = torch.zeros(
+                (padded_m, padded_n_blocks),
+                device=weight.device,
+                dtype=torch.uint8,
+            )
+            block_scales_padded[:m, :n_blocks] = block_scales_fp8.view(torch.uint8)
+
+            block_scales_swizzled = torch.ops.trtllm.block_scale_interleave(
+                block_scales_padded.cpu().contiguous()
+            ).reshape(padded_m, padded_n_blocks)
+
+            return fp4_weight, block_scales_swizzled.to(weight.device).view(torch.float8_e4m3fn)
+
         fc1_weights_n = fc1_weights.shape[1]
         sf_fc1_weights_n = round_up(fc1_weights_n, TRTLLM_NVFP4_ROW_SIZE)
         sf_fc1_weights_k = round_up(hidden_size // NVFP4_BLOCK_SIZE, TRTLLM_NVFP4_COLUMN_SIZE)
@@ -671,27 +704,18 @@ def test_trtllm_fused_moe_nvfp4(
             fc1_weights_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / fc1_weights_amax
             fc2_weights_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / fc2_weights_amax
 
-            # Quantize the weights to NVFP4 and ask for swizzled block scale factors because the
-            # MoE operator expects pre-swizzled block scale factors. Swizzling also flattens the
-            # block scale factors to a 1D tensor.
-            # Note that swizzling might create padded block scales
-            # because the block-scales are required to be padded to the nearest multiple of 128x4.
-            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                fc1_weights[expert],
-                fc1_weights_gs[expert],
-                NVFP4_BLOCK_SIZE,
-                isSfSwizzledLayout=True,
+            # fp4_quantize's swizzled scale layout targets nvfp4_gemm. The fused MoE kernel
+            # expects row-major per-block scales padded to 128x4 and then block_scale_interleave'd.
+            nvfp4_vals, fp8_block_scales = quantize_weight_for_fused_moe(
+                fc1_weights[expert], fc1_weights_gs[expert]
             )
             fc1_weights_q[expert] = nvfp4_vals
             fc1_weights_blockscale[expert] = fp8_block_scales.reshape(
                 fc1_weights_blockscale[expert].shape
             )
 
-            nvfp4_vals, fp8_block_scales = torch.ops.trtllm.fp4_quantize(
-                fc2_weights[expert],
-                fc2_weights_gs[expert],
-                NVFP4_BLOCK_SIZE,
-                isSfSwizzledLayout=True,
+            nvfp4_vals, fp8_block_scales = quantize_weight_for_fused_moe(
+                fc2_weights[expert], fc2_weights_gs[expert]
             )
             fc2_weights_q[expert] = nvfp4_vals
             fc2_weights_blockscale[expert] = fp8_block_scales.reshape(
