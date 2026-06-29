@@ -405,10 +405,9 @@ class FuseGemms(BaseTransform):
                 if not check_same_children(parent_node, is_linear_op):
                     # Mixed children (e.g., quantized or non-linear) — skip fusion
                     continue
-                # linear nodes to fuse (zero-copy strided narrows, matching the
-                # dedicated dsv3 a-gemm transform's output structure)
+                # linear nodes to fuse (split+copy for contiguous outputs)
                 if _insert_fused_gemm(
-                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=True
+                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
                 ):
                     num_matches += 1
 
