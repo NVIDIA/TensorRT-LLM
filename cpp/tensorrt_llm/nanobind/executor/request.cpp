@@ -633,8 +633,17 @@ void initRequestBindings(nb::module_& m)
         }
         // input_token_ids is a raw int32 byte buffer (see requestGetstate).
         auto const inputTokenIdsBytes = nb::cast<nb::bytes>(state[0]);
-        VecTokens inputTokenIds(inputTokenIdsBytes.size() / sizeof(VecTokens::value_type));
-        std::memcpy(inputTokenIds.data(), inputTokenIdsBytes.c_str(), inputTokenIdsBytes.size());
+        auto constexpr kTokenByteSize = sizeof(VecTokens::value_type);
+        auto const inputTokenIdsByteSize = inputTokenIdsBytes.size();
+        if (inputTokenIdsByteSize % kTokenByteSize != 0)
+        {
+            throw std::runtime_error("Invalid Request state: input_token_ids byte buffer has invalid size!");
+        }
+        VecTokens inputTokenIds(inputTokenIdsByteSize / kTokenByteSize);
+        if (inputTokenIdsByteSize > 0)
+        {
+            std::memcpy(inputTokenIds.data(), inputTokenIdsBytes.c_str(), inputTokenIdsByteSize);
+        }
         new (&self) tle::Request(std::move(inputTokenIds), nb::cast<SizeType32>(state[1]), nb::cast<bool>(state[2]),
             nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
             nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
