@@ -4485,9 +4485,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 3, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         // Disable Verl stage due to https://nvbugs/6236818.
         // Please re-enable it after the bug is fixed.

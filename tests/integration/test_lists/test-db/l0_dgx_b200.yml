@@ -184,7 +184,28 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False] TIMEOUT (60)
   # ------------- VisualGen multi-GPU tests ---------------
-  - unittest/_torch/visual_gen/multi_gpu
+  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py
+  - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
+  - unittest/_torch/visual_gen/multi_gpu/test_flux_tp.py
+  - unittest/_torch/visual_gen/multi_gpu/test_flux_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ltx2_async_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ltx2_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_parallel_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_parallel_conv.py
+  - unittest/_torch/visual_gen/multi_gpu/test_parallel_group_norm.py
+  - unittest/_torch/visual_gen/multi_gpu/test_parallel_vae.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_tp_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
+  - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
+  - unittest/_torch/visual_gen/multi_gpu/test_wan_async_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py
+  - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py
+  - unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py
 - condition:
     ranges:
       system_gpu_count:

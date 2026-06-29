@@ -5650,7 +5650,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                            max_batch_size=32)
+                                            max_batch_size=256)
         moe_config = MoeConfig(backend=moe_backend)
 
         # H20 path produces a small but fluctuating gap relative to H100/H200 BF16 MoE config.
@@ -5664,7 +5664,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
-                 max_batch_size=32,
+                 max_batch_size=256,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
@@ -5821,14 +5821,14 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         enable_block_reuse=enable_block_reuse)
-        cuda_graph_config = CudaGraphConfig(max_batch_size=32,
+        cuda_graph_config = CudaGraphConfig(max_batch_size=256,
                                             enable_padding=True)
 
         with LLM(model_path,
                  trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  max_num_tokens=16384,
-                 max_batch_size=32,
+                 max_batch_size=256,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  moe_config=MoeConfig(backend=moe_backend),
