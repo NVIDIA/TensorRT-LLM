@@ -216,6 +216,45 @@ def test_quant_cfg_from_hf_quant_config():
         assert layer_quant_config["model.layers.0.mlp.up_proj"].group_size == 64
 
 
+def test_quant_cfg_qwen35_nvfp4_alias_and_prefix_normalization():
+    """Qwen3.5/3.6 MIXED_PRECISION NVFP4 layers use TRT-LLM module names."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model_dir = Path(tmp_dir)
+        hf_quant_config_file = model_dir / "hf_quant_config.json"
+        with open(hf_quant_config_file, 'w') as f:
+            json.dump(
+                {
+                    "producer": {
+                        "name": "modelopt"
+                    },
+                    "quantization": {
+                        "quant_algo": "MIXED_PRECISION",
+                        "kv_cache_quant_algo": "FP8",
+                        "quantized_layers": {
+                            "model.language_model.layers.0.mlp.experts": {
+                                "quant_algo": "W4A16_NVFP4",
+                                "group_size": 16,
+                            },
+                            "lm_head": {
+                                "quant_algo": "W4A16_NVFP4",
+                                "group_size": 16,
+                            },
+                        },
+                    },
+                }, f)
+
+        quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
+            hf_quant_config_file, model_dir, "CUTLASS")
+
+        assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+        assert quant_config.exclude_modules == ["lm_head"]
+        assert "lm_head" not in layer_quant_config
+        assert "model.language_model.layers.0.mlp.experts" not in layer_quant_config
+        experts_config = layer_quant_config["model.layers.0.mlp.experts"]
+        assert experts_config.quant_algo == QuantAlgo.NVFP4
+        assert experts_config.group_size == 16
+
+
 def _write_hf_quant_config(model_dir: Path, content: dict) -> Path:
     """Write a ``hf_quant_config.json`` under ``model_dir`` and return its path."""
     path = model_dir / "hf_quant_config.json"
