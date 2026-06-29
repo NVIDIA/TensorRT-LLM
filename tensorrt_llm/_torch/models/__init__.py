@@ -7,10 +7,13 @@ import tensorrt_llm._torch.configs  # noqa: F401
 
 from .modeling_afmoe import AfmoeForCausalLM
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_bart import (BartForConditionalGeneration,
+                            MBartForConditionalGeneration)
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
@@ -26,6 +29,8 @@ from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
+from .modeling_minimaxm3 import (MiniMaxM3ForCausalLM,
+                                 MiniMaxM3VLForConditionalGeneration)
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
@@ -43,12 +48,14 @@ from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
 from .modeling_qwen3vl_moe import Qwen3MoeVLModel
+from .modeling_qwen_image_bench import QwenImageBenchModel
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
 from .modeling_step3p7 import Step3p7ForCausalLM
 from .modeling_step3p7vl import Step3p7VLForConditionalGeneration
+from .modeling_t5 import T5ForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
@@ -56,6 +63,7 @@ from .modeling_vila import VilaModel
 __all__ = [
     "AfmoeForCausalLM",
     "AutoModelForCausalLM",
+    "BartForConditionalGeneration",
     "BertForSequenceClassification",
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
@@ -74,6 +82,7 @@ __all__ = [
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
+    "DeepseekV4ForCausalLM",
     "NemotronH_Nano_VL_V2",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
@@ -86,6 +95,8 @@ __all__ = [
     "Qwen2MoeForCausalLM",
     "SiglipVisionModel",
     "Starcoder2ForCausalLM",
+    "T5ForConditionalGeneration",
+    "MBartForConditionalGeneration",
     "get_model_architecture",
     "VilaModel",
     "Qwen2VLModel",
@@ -94,6 +105,7 @@ __all__ = [
     "Qwen3MoeForCausalLM",
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
+    "QwenImageBenchModel",
     "Qwen3NextForCausalLM",
     "Qwen3MoeVLModel",
     "GptOssForCausalLM",
@@ -101,6 +113,8 @@ __all__ = [
     "Glm4MoeForCausalLM",
     "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
+    "MiniMaxM3ForCausalLM",
+    "MiniMaxM3VLForConditionalGeneration",
     "Cohere2ForCausalLM",
     "Step3p7ForCausalLM",
     "Step3p7VLForConditionalGeneration",

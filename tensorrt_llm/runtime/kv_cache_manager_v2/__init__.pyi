@@ -63,6 +63,30 @@ MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 
+# From _stats.py
+@dataclass(slots=True)
+class KVCacheStatsDelta:
+    alloc_total_blocks: int = 0
+    alloc_new_blocks: int = 0
+    reused_blocks: int = 0
+    missed_blocks: int = 0
+
+@dataclass(slots=True)
+class KVCacheIterationStatsDelta:
+    iter_alloc_total_blocks: int = 0
+    iter_alloc_new_blocks: int = 0
+    iter_reused_blocks: int = 0
+    iter_full_reused_blocks: int = 0
+    iter_partial_reused_blocks: int = 0
+    iter_missed_blocks: int = 0
+    iter_gen_alloc_blocks: int = 0
+    iter_onboard_blocks: int = 0
+    iter_onboard_bytes: int = 0
+    iter_offload_blocks: int = 0
+    iter_offload_bytes: int = 0
+    iter_intra_device_copy_blocks: int = 0
+    iter_intra_device_copy_bytes: int = 0
+
 # From _config.py
 DataRole = NewType("DataRole", str)
 
@@ -150,9 +174,103 @@ class KVCacheManagerConfig:
     ssm_reuse_interval: int = 512
     mamba_save_last_snapshot: bool = False
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    enable_stats: bool = True
     helix_config: HelixConfig | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
+
+# From _event_manager.py
+EventBlockHash: TypeAlias = int | str
+BlockHashLike: TypeAlias = bytes | EventBlockHash
+BlockHashesLike: TypeAlias = BlockHashLike | Iterable[BlockHashLike]
+EventTokenId: TypeAlias = int | str
+MmKey: TypeAlias = tuple[bytes, int] | tuple[bytes, int, str | None]
+AttentionDpGatherFn: TypeAlias = Callable[[list["KVCacheEvent"]], list[list["KVCacheEvent"]]]
+
+@dataclass(slots=True, frozen=True)
+class UniqueToken:
+    token_id: EventTokenId
+    token_extra_id: int = ...
+
+@dataclass(slots=True, frozen=True)
+class KVCacheCreatedData:
+    num_blocks_per_cache_level: list[int]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheStoredBlockData:
+    block_hash: EventBlockHash
+    tokens: list[UniqueToken]
+    cache_level: int
+    priority: int
+    mm_keys: list[MmKey] = ...
+    cache_salt: str | None = ...
+
+@dataclass(slots=True, frozen=True)
+class KVCacheStoredData:
+    parent_hash: EventBlockHash | None
+    blocks: list[KVCacheStoredBlockData]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheRemovedData:
+    block_hashes: list[EventBlockHash]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheEventDiff:
+    old_value: int
+    new_value: int
+
+@dataclass(slots=True, frozen=True)
+class KVCacheUpdatedData:
+    block_hash: EventBlockHash
+    cache_level: KVCacheEventDiff | None
+    priority: KVCacheEventDiff | None
+
+@dataclass(slots=True, frozen=True)
+class KVCacheEvent:
+    event_id: int
+    data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData
+    window_size: int
+    hash_algo: str | None = None
+    attention_dp_rank: int | None = None
+    layer_group_id: int | None = None
+
+class KVCacheEventManager:
+    def __init__(
+        self,
+        max_kv_event_entries: int,
+        *,
+        window_size: int = ...,
+        attention_dp_rank: int | None = None,
+        attention_dp_gather: AttentionDpGatherFn | None = None,
+        hash_algo: str = ...,
+        window_size_by_layer_group: dict[int, int] | None = None,
+    ) -> None: ...
+    def add_created_event(
+        self,
+        num_blocks_per_cache_level: Sequence[int],
+        layer_group_ids: Sequence[int] | None = None,
+    ) -> None: ...
+    def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None: ...
+    def add_stored_event(
+        self,
+        parent_hash: EventBlockHash | None,
+        blocks: Sequence[KVCacheStoredBlockData],
+        layer_group_id: int | None = None,
+    ) -> None: ...
+    def add_stored_block_event_from_block(self, block: Any) -> None: ...
+    def add_stored_life_cycle_event_from_block(self, block: Any, life_cycle_id: int) -> None: ...
+    def add_removed_event(self, block_hashes: BlockHashesLike) -> None: ...
+    def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None: ...
+    def add_updated_event(
+        self,
+        block_hash: BlockHashLike,
+        *,
+        cache_level: KVCacheEventDiff | None = None,
+        priority: KVCacheEventDiff | None = None,
+        layer_group_id: int | None = None,
+    ) -> None: ...
+    def flush_iteration_events(self) -> None: ...
+    def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
 # From _block_radix_tree.py
 def gen_multimodal_cache_key_tokens(
@@ -194,6 +312,8 @@ class _KVCache:
     def finish_event(self) -> Any: ...
     @property
     def num_blocks(self) -> int: ...
+    def commit_pending_stats(self) -> KVCacheStatsDelta: ...
+    def discard_pending_stats(self) -> None: ...
     def close(self) -> None: ...
     @property
     def beam_width(self) -> BeamIndex: ...
@@ -296,7 +416,11 @@ class PageIndexConverter:
     ) -> list[int]: ...
 
 class KVCacheManager:
-    def __init__(self, config: KVCacheManagerConfig) -> None: ...
+    def __init__(
+        self,
+        config: KVCacheManagerConfig,
+        event_manager: KVCacheEventManager | None = None,
+    ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
@@ -315,6 +439,7 @@ class KVCacheManager:
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
+        expected_prompt_length: int | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,
@@ -323,10 +448,20 @@ class KVCacheManager:
     ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
+    def get_committed_stats(self) -> KVCacheStatsDelta: ...
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
     def tokens_per_block(self) -> int: ...
+    @property
+    def event_manager(self) -> Any | None: ...
     @property
     def allow_seq_rebasing(self) -> bool: ...
     @property
