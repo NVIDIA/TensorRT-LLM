@@ -54,17 +54,9 @@ BounceArena::~BounceArena()
     {
         // Select the owning device before freeing (multi-GPU: cudaFree otherwise targets the thread's
         // current device). Fabric-backed arena is freed by ~FabricMemory (mFabric). A dtor can't
-        // throw, so warn on failure rather than swallow.
-        if (cudaSetDevice(mDeviceId) != cudaSuccess)
-        {
-            (void) cudaGetLastError();
-            TLLM_LOG_WARNING("BounceArena::~BounceArena: cudaSetDevice(%d) failed; arena may leak", mDeviceId);
-        }
-        if (cudaFree(mBase) != cudaSuccess)
-        {
-            (void) cudaGetLastError();
-            TLLM_LOG_WARNING("BounceArena::~BounceArena: cudaFree failed");
-        }
+        // throw, so use the project's warn-only cleanup check rather than discarding the result.
+        TLLM_CUDA_CHECK_WARN(cudaSetDevice(mDeviceId));
+        TLLM_CUDA_CHECK_WARN(cudaFree(mBase));
     }
 }
 
