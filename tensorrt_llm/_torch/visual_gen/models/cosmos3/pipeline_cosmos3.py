@@ -586,7 +586,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             """
             noise_pred = self.transformer(
                 hidden_states=latent_input,
-                timestep=timestep / self.scheduler.config.num_train_timesteps,
+                timestep=timestep,
+                attention_timestep=timestep / self.scheduler.config.num_train_timesteps,
                 text_ids=extra_tensors["text_ids"],
                 text_mask=extra_tensors["text_mask"],
                 video_shape=video_shape,

@@ -236,6 +236,7 @@ class SerializableSchedulerOutput:
         int
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
+    wait_for_disagg_gen_transfer_progress: bool = False
 
     @classmethod
     def from_scheduler_result(
@@ -243,6 +244,7 @@ class SerializableSchedulerOutput:
         scheduled_requests: ScheduledRequests,
         fitting_disagg_gen_init_requests: RequestList,
         num_fitting_requests: int,
+        wait_for_disagg_gen_transfer_progress: bool = False,
     ) -> "SerializableSchedulerOutput":
         return cls(
             encoder_requests=[req.request_id for req in scheduled_requests.encoder_requests],
@@ -258,6 +260,7 @@ class SerializableSchedulerOutput:
                 req.request_id for req in fitting_disagg_gen_init_requests
             ],
             num_fitting_requests=num_fitting_requests,
+            wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
         )
 
     def to_scheduler_result(

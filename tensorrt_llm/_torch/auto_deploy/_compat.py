@@ -207,6 +207,7 @@ else:
         cross_kv_cache_fraction: Optional[float] = None
         secondary_offload_min_priority: Optional[int] = None
         event_buffer_max_size: int = 0
+        kv_cache_event_hash_algo: str = "auto"
         enable_partial_reuse: bool = True
         copy_on_partial_reuse: bool = True
         use_uvm: bool = False
