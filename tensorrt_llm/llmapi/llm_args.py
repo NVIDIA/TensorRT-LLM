@@ -4587,20 +4587,13 @@ class TorchLlmArgs(BaseLlmArgs):
     @field_validator('cuda_graph_config', mode='before')
     @classmethod
     def infer_cuda_graph_config_mode(cls, v):
-        if isinstance(v, dict) and ("encoder" in v or "decoder" in v):
-            raise ValueError(
-                "Composite encoder-decoder CUDA graph configs have been "
-                "removed. Use CudaGraphConfig or DecodeCudaGraphConfig for "
-                "decoder CUDA graphs.")
         if isinstance(v, dict) and "mode" not in v:
             encoder_keys = {
                 "num_tokens", "max_num_token", "seq_lens", "max_seq_len"
             }
             v = dict(v)
-            if any(k in v and v[k] not in (None, 0) for k in encoder_keys):
-                v["mode"] = "encode"
-            else:
-                v["mode"] = "decode"
+            v["mode"] = "encode" if any(k in v and v[k] not in (None, 0)
+                                        for k in encoder_keys) else "decode"
         return v
 
     multimodal_config: MultimodalConfig = Field(

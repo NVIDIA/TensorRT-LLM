@@ -4949,14 +4949,25 @@ class PyTorchModelEngine(ModelEngine):
 
         self._capture_encoder_cuda_graphs()
 
-    def _get_encoder_cuda_graph_warmup_configs(
-            self) -> List[Tuple[int, int, int]]:
-        """Return feasible (batch_size, num_tokens, max_seq_len) graph keys."""
+    def _capture_encoder_cuda_graphs(self) -> None:
+        """Capture whole-model encoder CUDA graphs for all feasible keys.
+
+        Feasibility filter (also used in source):
+          nt >= prev_sl + bs   (enough tokens for this sl bucket)
+          prev_nt < bs * sl    (not enough tokens for a smaller nt bucket)
+          nt <= bs * sl        (num tokens should not exceed total possible in batch)
+          sl <= nt             (seq len should not exceed num tokens)
+        """
+        runner = self.encoder_cuda_graph_runner
+        if not runner.enabled:
+            return
+
         batch_sizes = sorted(self._cuda_graph_batch_sizes, reverse=True)
         num_tokens_list = sorted(self._cuda_graph_num_tokens)
         seq_lens_list = sorted(self._cuda_graph_seq_lens)
 
-        warmup_configs: List[Tuple[int, int, int]] = []
+        num_captured = 0
+        logger.info("Capturing encoder CUDA graphs ...")
         for bs in batch_sizes:
             if bs > self.batch_size:
                 continue
@@ -4971,44 +4982,15 @@ class PyTorchModelEngine(ModelEngine):
                     if nt > bs * sl or sl > nt:
                         continue
 
-                    warmup_configs.append((bs, nt, sl))
+                    inputs = self._create_encoder_warmup_inputs(bs, nt, sl)
+                    if inputs is None:
+                        continue
 
-        if self._cuda_graph_padding_enabled:
-            for bs in batch_sizes:
-                if bs > self.batch_size:
-                    continue
-                for sl in reversed(seq_lens_list):
-                    nt = bs * sl
-                    if nt <= self._max_cuda_graph_num_tokens:
-                        warmup_configs.append((bs, nt, sl))
-
-        return list(dict.fromkeys(warmup_configs))
-
-    def _capture_encoder_cuda_graphs(self) -> None:
-        """Capture whole-model encoder CUDA graphs for all feasible keys.
-
-        Feasibility filter (also used in source):
-          nt >= prev_sl + bs   (enough tokens for this sl bucket)
-          prev_nt < bs * sl    (not enough tokens for a smaller nt bucket)
-          nt <= bs * sl        (num tokens should not exceed total possible in batch)
-          sl <= nt             (seq len should not exceed num tokens)
-        """
-        runner = self.encoder_cuda_graph_runner
-        if not runner.enabled:
-            return
-
-        num_captured = 0
-        logger.info("Capturing encoder CUDA graphs ...")
-        for bs, nt, sl in self._get_encoder_cuda_graph_warmup_configs():
-            inputs = self._create_encoder_warmup_inputs(bs, nt, sl)
-            if inputs is None:
-                continue
-
-            logger.info(f"Encoder CUDA graph capture: "
-                        f"bs={bs}, nt={nt}, sl={sl}")
-            self.encoder_forward(inputs)
-            torch.cuda.synchronize()
-            num_captured += 1
+                    logger.info(f"Encoder CUDA graph capture: "
+                                f"bs={bs}, nt={nt}, sl={sl}")
+                    self.encoder_forward(inputs)
+                    torch.cuda.synchronize()
+                    num_captured += 1
 
         logger.info(f"Captured {num_captured} encoder CUDA graph(s).")
 
