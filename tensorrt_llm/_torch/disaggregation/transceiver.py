@@ -302,7 +302,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     mamba_state_index=base_slice.mamba_state_index,
                     token_range=base_slice.token_range,
                     chunk_block_offset=block_offset,
-                    cuda_event=None, # TODO(athenac): revisit this for pipelined transfer implementation
                 )
             )
             # Use the max length across layer groups to advance the receiver
@@ -576,9 +575,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         assert rid is not None
 
-        cuda_event = torch.cuda.Event()
-        cuda_event.record()
-
         if rid not in self._send_sessions:
             self._send_sessions[rid] = self._get_or_create_send_session(req)
             self._ever_had_send_session = True
@@ -598,14 +594,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
             chunk_block_offset=chunk_block_offset,
-            cuda_event=cuda_event,
             token_range=base_slice.token_range, # TODO(athenac): is this correct? probably not. what is token range used for?
             mamba_state_index=base_slice.mamba_state_index, # TODO(athenac): is this correct?
             layer_range=base_slice.layer_range, # TODO(athenac): is this correct?
         )
 
         session.send(kv_slice)
-        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS # TODO(athenac): is this correct?
+
 
         num_blocks_this_chunk = max((len(ids) for ids in chunk_block_ids), default=0)
         self._pipelined_chunk_offsets[rid] = chunk_block_offset + num_blocks_this_chunk # TODO(athenac): this might be a faulty calculation
@@ -626,6 +621,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._send_reqs[rid] = req
             self._pipelined_chunk_offsets.pop(rid, None)
             self._finalize_send(req, session) # TODO(athenac): what is this for?
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS # TODO(athenac): is this correct?
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest) -> None: # TODO(athenac): there is some redundancy here with send_prefill_chunk, we could refactor this
