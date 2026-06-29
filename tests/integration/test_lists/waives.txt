@@ -261,6 +261,7 @@ full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_
 full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False] SKIP (https://nvbugs/6313076)
 full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash SKIP (https://nvbugs/6273850)
 full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8 SKIP (https://nvbugs/6273850)
+full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False] SKIP (https://nvbugs/6388239)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6313072)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-enable_chunked_prefill=False-v2_kv_cache=False] SKIP (https://nvbugs/6313072)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6313072)
