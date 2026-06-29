@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
@@ -1100,6 +1116,8 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
         throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
     }
 
+    // TODO: Add mounts for different cache directories like pip, triton, etc.
+
     return mounts
 }
 
@@ -1372,6 +1390,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
+                    "--no-container-mount-home",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
                 envVarsToExport.each { varName, varValue ->
@@ -4485,9 +4504,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 3, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         // Disable Verl stage due to https://nvbugs/6236818.
         // Please re-enable it after the bug is fixed.

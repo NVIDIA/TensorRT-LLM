@@ -909,6 +909,19 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # Visual-gen deployments use a separate iteration-stats producer
+        # (see ``DiffusionRemoteClient._iter_stats``).  The LLM PyExecutor
+        # stats queue is empty in visual-gen mode, so route /metrics to the
+        # visual-gen-shaped producer instead. Each snapshot mirrors LLM
+        # field names where it makes sense (numActiveRequests,
+        # numQueuedRequests) so downstream consumers that already parse the
+        # LLM /metrics shape work for visual-gen with minimal changes.
+        if self._is_visual_gen:
+            stats = []
+            async for stat in self.generator.get_stats_async(timeout=None):
+                stats.append(stat)
+            return JSONResponse(content=stats)
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
