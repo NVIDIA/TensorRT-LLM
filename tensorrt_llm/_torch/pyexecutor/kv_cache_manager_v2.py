@@ -2690,13 +2690,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
-    def try_commit_blocks_for_reuse(self, request: LlmRequest, kv_cache) -> None:
-        if (
-            self.enable_block_reuse
-            and not self.is_draft
-            and not request.is_dummy_request
-            and request.context_current_position > kv_cache.num_committed_tokens
-        ):
+    def try_commit_blocks(self, request: LlmRequest) -> None:
+        should_block_reuse = (
+            self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
+        )
+        if not should_block_reuse:
+            return
+
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return
+
+        if request.context_current_position > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 request.get_tokens(DEFAULT_BEAM_INDEX),
                 request,
@@ -2704,6 +2709,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 end=request.context_current_position,
             )
             kv_cache.commit(tokens)
+        if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
     def release_index_slot(self, request_id: int) -> None:
@@ -2729,7 +2735,6 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
-        self.try_commit_blocks_for_reuse(request, kv_cache)
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
@@ -2955,11 +2960,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
             should_resize = not should_block_reuse or not is_all_reusable
-            should_commit = (
-                should_block_reuse
-                and (is_all_reusable or req.context_remaining_length == 0)
-                and req.context_current_position > kv_cache.num_committed_tokens
-            )
+            should_commit = is_all_reusable or req.context_remaining_length == 0
 
             if should_resize:
                 success = kv_cache.resize(None, req.context_current_position)
@@ -2970,16 +2971,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         "at context update"
                     )
             if should_commit:
-                tokens = self._augment_tokens_for_block_reuse(
-                    req.get_tokens(DEFAULT_BEAM_INDEX),
-                    req,
-                    start=kv_cache.num_committed_tokens,
-                    end=req.context_current_position,
-                )
-                kv_cache.commit(tokens)
+                self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
-                if should_block_reuse:
-                    kv_cache.stop_committing()
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.

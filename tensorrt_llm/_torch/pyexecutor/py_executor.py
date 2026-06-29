@@ -552,14 +552,10 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        # V2 manager owns KV alloc + suspend during scheduling: it
-        # eagerly grows ctx/gen capacity in the schedule loop and calls
-        # suspend_request() when needed (offloads GPU pages while
-        # preserving the radix tree).  The executor therefore does not
-        # need to call _terminate_requests (GPU resources are already
-        # freed by suspend) or _pause_requests (V2's prepare_context
-        # handles resume internally, so resetting to CONTEXT_INIT is
-        # unnecessary).  Several revert/skip paths gate on this flag.
+        # V2 owns KV allocation, suspend, resume, and context finalization.
+        # The executor skips the V1 terminate/pause paths and finalizes V2
+        # context resources before transfer or response handling can terminate
+        # a request.
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
