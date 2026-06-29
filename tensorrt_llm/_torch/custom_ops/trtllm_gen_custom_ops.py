@@ -2693,12 +2693,26 @@ class FlashInferTrtllmGenMoERunner(TunableRunner):
         args = FlashInferMoEInputs(*inputs)
         selected_tactic = [-1, -1] if tactic == -1 else tactic
 
+        # The low-level flashinfer 0.6.12 moe_op declares topk_ids/expert_weights
+        # as non-optional TensorView even for FromLogits routing (the kernel
+        # writes the computed routing into them). When routing is computed from
+        # logits these arrive as None here, so -- mirroring flashinfer's own
+        # wrapper ops -- allocate the buffers instead of forwarding None.
+        num_tokens = args.hidden_states.shape[0]
+        device = args.hidden_states.device
+        routing_dtype = (args.routing_logits.dtype
+                         if args.routing_logits is not None else torch.bfloat16)
+
         if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
+            topk_ids = args.topk_ids if args.topk_ids is not None else \
+                torch.empty(0, dtype=torch.int32, device=device)
+            expert_weights = args.expert_weights if args.expert_weights is not None else \
+                torch.empty(0, dtype=torch.bfloat16, device=device)
             return moe_op.trtllm_bf16_moe(
                 args.routing_logits,
                 kwargs["routing_bias"],
-                args.topk_ids,
-                args.expert_weights,
+                topk_ids,
+                expert_weights,
                 args.hidden_states,
                 kwargs["gemm1_weights"],
                 kwargs["gemm2_weights"],
@@ -2737,10 +2751,14 @@ class FlashInferTrtllmGenMoERunner(TunableRunner):
                     device=args.hidden_states.device,
                 )
 
+            topk_ids = args.topk_ids if args.topk_ids is not None else \
+                torch.empty(0, dtype=torch.int32, device=device)
+            expert_weights = args.expert_weights if args.expert_weights is not None else \
+                torch.empty(0, dtype=routing_dtype, device=device)
             return moe_op.trtllm_fp8_block_scale_moe(
                 args.routing_logits,
-                args.topk_ids,
-                args.expert_weights,
+                topk_ids,
+                expert_weights,
                 kwargs["routing_bias"],
                 args.hidden_states,
                 hidden_states_scale,
@@ -2769,11 +2787,15 @@ class FlashInferTrtllmGenMoERunner(TunableRunner):
                 kwargs.get("routing_replay_out"),
             )
 
+        fp4_topk_ids = args.topk_ids if args.topk_ids is not None else \
+            torch.empty(num_tokens, self.top_k, dtype=torch.int32, device=device)
+        fp4_expert_weights = args.expert_weights if args.expert_weights is not None else \
+            torch.empty(num_tokens, self.top_k, dtype=routing_dtype, device=device)
         return moe_op.trtllm_fp4_block_scale_moe(
             kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
             args.routing_logits,
-            args.topk_ids,
-            args.expert_weights,
+            fp4_topk_ids,
+            fp4_expert_weights,
             kwargs["routing_bias"],
             args.hidden_states,
             args.hidden_states_scale,
@@ -3353,6 +3375,27 @@ def flashinfer_trtllm_fp4_block_scale_moe_runner(
         activation_type=activation_type,
         norm_topk_prob=norm_topk_prob,
     )
+    # FromLogits: the tuner inputs stay None (so prepare_dummy and tactic
+    # selection are byte-for-byte unchanged), but the low-level op requires real
+    # topk output buffers for the actual execution call -- mirror flashinfer's
+    # own fp4 wrapper and allocate them here. For do_finalize=False these carry
+    # the routing weights the kernel writes, which the caller consumes.
+    if topk_ids is None:
+        exec_routing_dtype = (routing_logits.dtype
+                              if routing_logits is not None else torch.bfloat16)
+        input_tensors[FlashInferTrtllmGenMoERunner.TOPK_IDS_IDX] = torch.empty(
+            hidden_states.shape[0],
+            top_k,
+            dtype=torch.int32,
+            device=hidden_states.device)
+        exec_topk_weights = torch.empty(hidden_states.shape[0],
+                                        top_k,
+                                        dtype=exec_routing_dtype,
+                                        device=hidden_states.device)
+        input_tensors[
+            FlashInferTrtllmGenMoERunner.EXPERT_WEIGHTS_IDX] = exec_topk_weights
+    else:
+        exec_topk_weights = topk_weights
     intermediate_output = kernel_runner.run_raw(
         input_tensors,
         tactic=tactic,
@@ -3385,8 +3428,11 @@ def flashinfer_trtllm_fp4_block_scale_moe_runner(
     result = _unpack_flashinfer_trtllm_moe_output(intermediate_output, output,
                                                   do_finalize, None,
                                                   output_was_provided)
-    if not do_finalize and routing_logits is None and topk_weights.numel() > 0:
-        result[1] = topk_weights
+    if not do_finalize:
+        # Mirror flashinfer's fp4 wrapper: result[1] is the topk_weights buffer
+        # the routing kernel populated (FromLogits) or the user-provided weights
+        # (UnpackedPrecomputed).
+        result[1] = exec_topk_weights
     return result
 
 
