@@ -400,6 +400,35 @@ class KvCacheCreator:
                     num_layers=self._get_num_draft_layers())
         return total
 
+    def _estimate_mla_context_workspace_bytes(self) -> int:
+        """Upper-bound the per-rank MLA context-FMHA workspace.
+
+        The estimator's warmup forward at ``max_num_tokens`` allocates this
+        workspace; on tight configs the allocation OOMs and the OOM is caught,
+        so ``peak_memory`` under-counts. Reserve it explicitly. See
+        ``getWorkspaceSizeForContext`` in ``cpp/tensorrt_llm/common/attentionOp.cpp``.
+        Returns 0 for non-MLA models or when required fields are missing.
+        """
+        config = self._model_engine.model.model_config.pretrained_config
+        if not is_mla(config):
+            return 0
+        num_heads = getattr(config, "num_attention_heads", None)
+        qk_rope = getattr(config, "qk_rope_head_dim", None)
+        qk_nope = getattr(config, "qk_nope_head_dim", None)
+        v_head = getattr(config, "v_head_dim", None)
+        kv_lora = getattr(config, "kv_lora_rank", None)
+        if None in (num_heads, qk_rope, qk_nope, v_head, kv_lora):
+            return 0
+        # Per-token: q_buf_2 (kv_lora+qk_rope) + fp8 q/k (qk_rope+qk_nope each)
+        # + fp8 v (v_head) + bf16 staging copy of q_buf_2 (2 bytes).
+        per_token_bytes = 3 * (kv_lora + qk_rope) + 2 * (qk_rope +
+                                                         qk_nope) + v_head
+        workspace_bytes = self._max_num_tokens * num_heads * per_token_bytes
+        # 4x slack covers autotuner intermediates (cuBLAS, fp8 GEMM tuning,
+        # fused_moe scratch) and NCCL symmetric buffers that share this
+        # headroom during the estimation warmup.
+        return int(workspace_bytes * 4)
+
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
         """
@@ -409,13 +438,16 @@ class KvCacheCreator:
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        available_kv_mem = (total_gpu_memory - peak_memory +
-                            allocated_bytes) * fraction
+        fmha_workspace_reserve = self._estimate_mla_context_workspace_bytes()
+        available_kv_mem = max(
+            (total_gpu_memory - peak_memory + allocated_bytes) * fraction -
+            fmha_workspace_reserve, 0)
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
+            f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB, "
+            f"MLA FMHA workspace reserve {fmha_workspace_reserve / (GB):.2f} GiB"
         )
         return int(available_kv_mem)
 
@@ -615,11 +647,31 @@ class KvCacheCreator:
         num_cache_blocks *= num_pool_groups
 
         free_mem, total_mem = torch.cuda.mem_get_info()
-        max_memory = self._kv_cache_config.free_gpu_memory_fraction * free_mem
+        fmha_workspace_reserve = self._estimate_mla_context_workspace_bytes()
+        max_memory = max(
+            self._kv_cache_config.free_gpu_memory_fraction * free_mem -
+            fmha_workspace_reserve, 0)
         kv_size_per_token = self._get_kv_size_per_token()
         max_num_tokens_in_memory = (
             kv_size_per_token.tokens_for_budget(max_memory) //
             self._tokens_per_block * self._tokens_per_block)
+
+        # For MLA models the cuda_graph_warmup_block reservation crowds out the
+        # FMHA workspace and other transient warmup allocations. Cap blocks
+        # against the reserved budget; configure_kv_cache_capacity computes the
+        # real final capacity after estimation succeeds.
+        if fmha_workspace_reserve > 0:
+            max_blocks_in_memory = (max_num_tokens_in_memory //
+                                    self._tokens_per_block)
+            estimation_min_blocks = ceil_div(
+                self._max_num_tokens,
+                self._tokens_per_block) + self._model_engine.batch_size
+            num_cache_blocks = min(
+                num_cache_blocks,
+                max(estimation_min_blocks, max_blocks_in_memory // 2))
+            logger.info(
+                f"MLA FMHA context workspace reserve: {fmha_workspace_reserve / (GB):.2f} GiB; "
+                f"num_cache_blocks (post-cap): {num_cache_blocks}")
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         return min(
