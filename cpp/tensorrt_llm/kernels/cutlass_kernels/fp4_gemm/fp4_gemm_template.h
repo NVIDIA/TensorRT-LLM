@@ -37,6 +37,7 @@
 
 #include "../include/fp4_gemm.h"
 #include "mxfp8_mxfp4_gemm_template_sm100.h"
+#include "mxfp8_mxfp8_gemm_template_sm100.h"
 #include "nvfp4_nvfp4_gemm_template_sm100.h"
 #include "nvfp4_nvfp4_gemm_template_sm120.h"
 
@@ -323,6 +324,94 @@ size_t dispatchMXFP8xMXFP4GemmCTAShapeSm100(T* D, void const* A, void const* B, 
     }
 }
 
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_>
+size_t dispatchMXFP8xMXFP8GemmClusterShapeSm100(T* D, void const* A, void const* B, void const* input_sf,
+    void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
+    tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
+    int* occupancy = nullptr)
+{
+
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
+    switch (gemmConfig.cluster_shape)
+    {
+    case tkc::ClusterShape::ClusterShape_2x1x1:
+        return genericMXFP8xMXFP8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<1>, cute::Int<1>,
+            __2SM>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+            stream, occupancy);
+        break;
+    case tkc::ClusterShape::ClusterShape_2x2x1:
+        return genericMXFP8xMXFP8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<2>, cute::Int<1>,
+            __2SM>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+            stream, occupancy);
+        break;
+    case tkc::ClusterShape::ClusterShape_4x2x1:
+        return genericMXFP8xMXFP8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<2>, cute::Int<1>,
+            __2SM>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+            stream, occupancy);
+        break;
+    case tkc::ClusterShape::ClusterShape_2x4x1:
+        return genericMXFP8xMXFP8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<4>, cute::Int<1>,
+            __2SM>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+            stream, occupancy);
+        break;
+    case tkc::ClusterShape::ClusterShape_4x4x1:
+        return genericMXFP8xMXFP8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<4>, cute::Int<1>,
+            __2SM>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+            stream, occupancy);
+        break;
+    default:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][MXFP8][dispatch_gemm_cluster_shape] Config is invalid for MXFP8xMXFP8 GEMM.");
+        break;
+    }
+}
+
+template <typename T>
+size_t dispatchMXFP8xMXFP8GemmCTAShapeSm100(T* D, void const* A, void const* B, void const* input_sf,
+    void const* weight_sf, float const* global_sf, int m, int n, int k, int batch_count,
+    tkc::CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
+    int* occupancy = nullptr)
+{
+
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    switch (gemmConfig.tile_config_sm100)
+    {
+    case tkc::CutlassTileConfigSM100::CtaShape128x64x128B:
+        return dispatchMXFP8xMXFP8GemmClusterShapeSm100<T, cute::Int<128>, cute::Int<64>, cute::Int<128>>(D, A, B,
+            input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
+            occupancy);
+        break;
+    case tkc::CutlassTileConfigSM100::CtaShape128x256x128B:
+        return dispatchMXFP8xMXFP8GemmClusterShapeSm100<T, cute::Int<128>, cute::Int<256>, cute::Int<128>>(D, A, B,
+            input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
+            occupancy);
+        break;
+    case tkc::CutlassTileConfigSM100::CtaShape128x128x256B:
+        return dispatchMXFP8xMXFP8GemmClusterShapeSm100<T, cute::Int<128>, cute::Int<128>, cute::Int<256>>(D, A, B,
+            input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
+            occupancy);
+        break;
+    case tkc::CutlassTileConfigSM100::CtaShape128x256x256B:
+        return dispatchMXFP8xMXFP8GemmClusterShapeSm100<T, cute::Int<128>, cute::Int<256>, cute::Int<256>>(D, A, B,
+            input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
+            occupancy);
+        break;
+    case tkc::CutlassTileConfigSM100::Undefined:
+        throw std::runtime_error("[TensorRT LLM Error][MXFP8][dispatch_gemm_cta_shape] Gemm config undefined.");
+        break;
+    case tkc::CutlassTileConfigSM100::ChooseWithHeuristic:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][MXFP8][dispatch_gemm_cta_shape] Gemm config should have already been set by "
+            "heuristic.");
+        break;
+    default:
+        throw std::runtime_error(
+            "[TensorRT LLM Error][MXFP8][dispatch_gemm_cta_shape] Config is invalid for MXFP8xMXFP8 GEMM.");
+        break;
+    }
+}
+
 template <typename T, FP4GemmType fp4GemmType>
 CutlassFp4GemmRunner<T, fp4GemmType>::CutlassFp4GemmRunner()
 {
@@ -356,6 +445,19 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(T* D, void const* A,
         {
             throw std::runtime_error(
                 "[TensorRT LLM Error][CutlassFp4GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS FP4 GEMM");
+        }
+    }
+    else if constexpr (fp4GemmType == FP4GemmType::W8A8_MXFP8_MXFP8)
+    {
+        if (mSm == 100 || mSm == 103)
+        {
+            return dispatchMXFP8xMXFP8GemmCTAShapeSm100<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
+                batch_count, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "[TensorRT LLM Error][CutlassFp4GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS MXFP8 GEMM");
         }
     }
     else if constexpr (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4)
@@ -437,9 +539,12 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
         {
             for (auto const& cluster_config : clusterShapes)
             {
-                if constexpr (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
+                if constexpr (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8
+                    || fp4GemmType == FP4GemmType::W8A8_MXFP8_MXFP8)
                 {
-                    // Skip for high smem usage.
+                    // Skip for high smem usage (MXFP8xMXFP8 has even higher
+                    // smem pressure than MXFP8xMXFP4 because the B operand is
+                    // 2x wider, so the same skips apply).
                     if (cluster_config == tkc::ClusterShape::ClusterShape_1x1x1
                         || cluster_config == tkc::ClusterShape::ClusterShape_1x2x1
                         || cluster_config == tkc::ClusterShape::ClusterShape_1x4x1)
