@@ -1085,6 +1085,7 @@ moe_model_arch_list = [
     'NemotronHForCausalLM',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
+    'Qwen3_5MoeForCausalLM',
 ]
 
 

@@ -302,6 +302,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.W4A16_MXFP4,
     QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
 ]

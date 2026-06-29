@@ -764,15 +764,20 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         description=
         "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
         "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
-        "threshold search iterations. Currently supported for index_topk=2048 "
-        "on Blackwell (SM100+) and falls back to the production insertion/radix "
-        "Top-K path when prerequisites are not met.")
+        "threshold search iterations. Currently supported for index_topk ∈ "
+        "{512, 1024, 2048} on Blackwell (SM100+), with compress_ratio ∈ {1, 4} "
+        "(DSv3.2 + DSv4 indexers). Falls back to the production insertion/"
+        "radix Top-K path when prerequisites are not met.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
-        "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
-        "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
-        "per-token footprint from 132 B to 68 B.")
+        "Data type used for the indexer K cache. `fp8` stores one FP8 E4M3 "
+        "byte per element with a per-128 float32 scale; `fp4` packs two FP4 "
+        "E2M1 codes per byte with a per-32 UE8M0 exponent, halving the "
+        "per-token indexer K footprint (132 B to 68 B at index_head_dim=128). "
+        "`fp4` requires Blackwell+ (SM>=100) at runtime and "
+        "index_head_dim=128.",
+    )
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -866,7 +871,6 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
 class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     """Configuration for DeepSeek-V4 Sparse Attention."""
-
     algorithm: Literal["deepseek_v4"] = "deepseek_v4"
     index_head_dim: Optional[int] = Field(
         default=128,
@@ -875,6 +879,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         default=False,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+
     compress_ratios: List[int] = Field(
         default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
         description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
@@ -909,6 +914,61 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         # DeepSeek-V4 does not support short/long CUDA graph separation.
         return False
+
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+            DeepSeekV4Params
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+
+        def _value(name: str, default=None):
+            value = getattr(self, name)
+            if value is not None:
+                return value
+            if pretrained_config is not None:
+                return getattr(pretrained_config, name, default)
+            return default
+
+        return DeepSeekV4Params(
+            index_n_heads=_value("index_n_heads"),
+            index_head_dim=_value("index_head_dim"),
+            index_topk=_value("index_topk"),
+            indexer_max_chunk_size=self.indexer_max_chunk_size,
+            skip_indexer_for_short_seqs=self.skip_indexer_for_short_seqs,
+            use_cute_dsl_topk=self.use_cute_dsl_topk,
+            use_cute_dsl_paged_mqa_logits=self.use_cute_dsl_paged_mqa_logits,
+            q_split_threshold=self.q_split_threshold,
+            indexer_rope_interleave=self.indexer_rope_interleave,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            indexer_k_dtype=self.indexer_k_dtype,
+            compress_ratios=self.compress_ratios,
+            window_size=self.window_size,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+            DeepSeekV4MetadataParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+
+        def _value(name: str, default=None):
+            value = getattr(self, name)
+            if value is not None:
+                return value
+            if pretrained_config is not None:
+                return getattr(pretrained_config, name, default)
+            return default
+
+        return DeepSeekV4MetadataParams(
+            indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
+            max_sparse_topk=_value("index_topk"),
+            enable_indexer_skip=self.skip_indexer_for_short_seqs,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
+            q_split_threshold=self.q_split_threshold,
+            compress_ratios=self.compress_ratios,
+            window_size=self.window_size,
+        )
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
@@ -1108,7 +1168,7 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1144,6 +1204,7 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 # Maps alias → full import path (module.ClassName).
 TOKENIZER_ALIASES = {
     'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'deepseek_v4': 'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
 }
 
 
@@ -1715,8 +1776,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = Field(
         default=None,
         description=
-        "The number of eagle layers. Will not be used in pytorch flow, just for compatibility with TRT flow."
-    )
+        "Deprecated TensorRT-only field with different semantics from draft model "
+        "layer count. Do not use on the PyTorch backend.")
+    _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
     eagle3_one_model: Optional[bool] = Field(
@@ -3430,13 +3492,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
     )
 
+    kv_transfer_poll_interval_ms: Optional[PositiveInt] = Field(
+        default=5000,
+        description=
+        "Bounded wait interval in milliseconds for polling KV transfer "
+        "progress when active transfers block disaggregated admission.")
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             kv_transfer_sender_future_timeout_ms=self.
-            kv_transfer_sender_future_timeout_ms)
+            kv_transfer_sender_future_timeout_ms,
+            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms)
 
 
 @dataclass
@@ -3538,18 +3607,6 @@ class BaseLlmArgs(StrictBaseModel):
         "(1) a built-in alias (e.g., 'deepseek_v32'), or "
         "(2) a Python import path (e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer'). "
         "The tokenizer class must implement 'from_pretrained(path, **kwargs)' and the TokenizerBase interface.",
-        status="prototype")
-
-    post_processor_hook: Optional[str] = Field(
-        default=None,
-        description=
-        "Python import path of a user post-processing hook applied after "
-        "detokenization and before the per-endpoint response formatter (e.g. "
-        "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable and "
-        "picklable, take no constructor arguments, and be callable as "
-        "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
-        "It runs once per output, per streaming chunk, and may rewrite, "
-        "suppress, or terminate the output; it owns its own per-request state.",
         status="prototype")
 
     skip_tokenizer_init: bool = Field(
@@ -3913,35 +3970,41 @@ class BaseLlmArgs(StrictBaseModel):
     def validate_and_init_tokenizer(self):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
-            # The post-processing hook is a text-based guardrail
-            # and needs detokenized text to inspect; without a tokenizer it could
-            # never run, so reject the combination rather than silently disabling
-            # the guardrail (mirrors the harmony fail-fast in OpenAIServer).
-            if self.post_processor_hook is not None:
-                raise ValueError(
-                    "post_processor_hook is not supported together with "
-                    "skip_tokenizer_init: the post-processing hook operates on "
-                    "detokenized text, which is unavailable when the tokenizer "
-                    "is skipped.")
             self.tokenizer = None
         elif self.custom_tokenizer:
-            # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
-            if isinstance(self.tokenizer,
-                          (TokenizerBase, PreTrainedTokenizerBase)):
+            # IPC workers receive the tokenizer object that was already loaded
+            # in the parent LLM process. Reuse TRT-LLM tokenizer wrappers as-is.
+            if isinstance(self.tokenizer, TokenizerBase):
+                return self
+            # A raw HF tokenizer object would bypass the requested custom
+            # wrapper, so keep rejecting that combination.
+            if isinstance(self.tokenizer, PreTrainedTokenizerBase):
                 raise ValueError(
                     "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
+            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
+                                                   self.custom_tokenizer)
 
-            # Use tokenizer path if specified, otherwise use model path
-            load_path = self.tokenizer if self.tokenizer else self.model
-            self.tokenizer = load_custom_tokenizer(
-                self.custom_tokenizer,
-                load_path,
-                trust_remote_code=self.trust_remote_code,
-                use_fast=self.tokenizer_mode != 'slow')
+            # Dynamically import and use custom tokenizer
+            from importlib import import_module
+            try:
+                module_path, class_name = tokenizer_path.rsplit('.', 1)
+                module = import_module(module_path)
+                tokenizer_class = getattr(module, class_name)
+                # Use tokenizer path if specified, otherwise use model path
+                load_path = self.tokenizer if self.tokenizer else self.model
+                self.tokenizer = tokenizer_class.from_pretrained(
+                    load_path,
+                    trust_remote_code=self.trust_remote_code,
+                    use_fast=self.tokenizer_mode != 'slow')
+            except (ValueError, ImportError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
+                    "Expected format: 'module.path.ClassName' or a recognized alias."
+                ) from e
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
