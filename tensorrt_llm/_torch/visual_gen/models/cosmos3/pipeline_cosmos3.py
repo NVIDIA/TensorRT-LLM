@@ -17,6 +17,7 @@ import json
 import math
 import os
 import time
+from collections.abc import Mapping
 from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
@@ -26,6 +27,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime.
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -34,6 +41,16 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
+from .transfer import (
+    Cosmos3TransferConfig,
+    load_or_compute_control_frames,
+    media_hw,
+    media_to_uint8_cthw,
+    pad_temporal_frames,
+    resize_center_crop_uint8_cthw,
+    resolve_transfer_config,
+    uint8_cthw_to_normalized_5d,
+)
 from .defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
@@ -41,6 +58,7 @@ from .defaults import (
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
     COSMOS3_T2I_PARAMS,
+    COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
@@ -288,6 +306,57 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def extra_param_specs(self):
         return dict(COSMOS3_EXTRA_SPECS)
 
+    def _transfer_bucket_size(
+        self,
+        transfer_config: Cosmos3TransferConfig,
+        source_hw: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        resolution = transfer_config.resolution if transfer_config.resolution is not None else 720
+        source_h, source_w = source_hw or (
+            COSMOS3_720P_PARAMS["height"],
+            COSMOS3_720P_PARAMS["width"],
+        )
+        target_w, target_h = find_closest_target_size(int(source_h), int(source_w), resolution)
+        return int(target_h), int(target_w)
+
+    @staticmethod
+    def _video_payload_value(video: Any, key: str) -> Any:
+        if isinstance(video, Mapping):
+            return video.get(key)
+        return getattr(video, key, None)
+
+    @classmethod
+    def _video_payload_fps(cls, video: Any) -> Optional[float]:
+        for key in ("fps", "frame_rate", "source_fps", "input_fps", "avg_fps", "average_fps"):
+            fps = cls.positive_float(cls._video_payload_value(video, key))
+            if fps is not None:
+                return fps
+        for key in ("metadata", "info"):
+            metadata = cls._video_payload_value(video, key)
+            if metadata is None or metadata is video:
+                continue
+            fps = cls._video_payload_fps(metadata)
+            if fps is not None:
+                return fps
+        if isinstance(video, Mapping):
+            for key in ("frames", "data", "video"):
+                nested = video.get(key)
+                if nested is None or nested is video:
+                    continue
+                fps = cls._video_payload_fps(nested)
+                if fps is not None:
+                    return fps
+        if isinstance(video, (str, os.PathLike)):
+            try:
+                import imageio.v3 as iio
+
+                metadata = iio.immeta(os.fspath(video))
+            except Exception:
+                return None
+            if metadata is not video:
+                return cls._video_payload_fps(metadata)
+        return None
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
             self.forward(
@@ -308,6 +377,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
+        transfer_config = resolve_transfer_config(extra_params, req.params, req.prompt)
 
         # The V2V reference rides in ``multi_modal_data["video"]`` as a
         # ``VideoData`` (framework convention); the worker crops + VAE-encodes its
@@ -347,6 +417,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
             flow_shift=extra_params.get("flow_shift"),
+            transfer_config=transfer_config
         )
 
     def _apply_metadata_templates(
@@ -476,7 +547,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         token_ids.append(self.tokenizer.convert_tokens_to_ids("<|vision_start|>"))  # 151652
         seq_len = len(token_ids)
 
-        # Pad to max_sequence_length
+        # Pad to max_sequence_length. TRT's shared denoiser concatenates CFG
+        # prompt tensors, so cond/uncond sequence lengths must match.
         pad_len = max_sequence_length - seq_len
         attention_mask = [1] * seq_len + [0] * pad_len
         token_ids = token_ids + [self.tokenizer.pad_token_id or 0] * pad_len
@@ -593,8 +665,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     # VAE decode
     # =========================================================================
 
-    @nvtx_range("_decode_latents", color="blue")
-    def _decode_latents(self, latents):
+    def _decode_latents_raw(self, latents):
         latents = latents.to(self.vae.dtype)
 
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
@@ -614,9 +685,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             scaling_factor = self.vae.config.get("scaling_factor", 1.0)
             latents = latents / scaling_factor
 
-        video = self.vae.decode(latents, return_dict=False)[0]
-        video = postprocess_video_tensor(video)
-        return video
+        return self.vae.decode(latents, return_dict=False)[0]
+
+    @nvtx_range("_decode_latents", color="blue")
+    def _decode_latents(self, latents):
+        return postprocess_video_tensor(self._decode_latents_raw(latents))
 
     # =========================================================================
     # Audio generation
@@ -752,6 +825,39 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return latents, velocity_mask, condition_latents
 
     # =========================================================================
+    # Transfer
+    # =========================================================================
+
+    def _prepare_transfer_latents(
+        self,
+        target_video: torch.Tensor,
+        current_conditional_frames: int,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        condition_latents = self._encode_video_tensor(target_video)
+        noise = randn_tensor(
+            condition_latents.shape,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        condition_mask = torch.zeros(
+            1,
+            1,
+            condition_latents.shape[2],
+            1,
+            1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if current_conditional_frames > 0:
+            latent_frames = (current_conditional_frames - 1) // self.vae_scale_factor_temporal + 1
+            condition_mask[:, :, :latent_frames] = 1.0
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
+        velocity_mask = 1.0 - condition_mask
+        return latents, velocity_mask, condition_mask * condition_latents
+
+    # =========================================================================
     # Forward (main generation entry point)
     # =========================================================================
 
@@ -780,6 +886,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         condition_video_latent_indexes: Any = None,
         condition_video_keep: Any = None,
         flow_shift: Optional[float] = None,
+        transfer_config: Optional[Cosmos3TransferConfig] = None
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -805,6 +912,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_system_prompt = is_v2v
         else:
             use_system_prompt = bool(use_system_prompt)
+        if transfer_config is not None:
+            if is_t2i:
+                raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
+            if do_action:
+                raise ValueError("Cosmos3 transfer inference cannot be combined with action generation.")
+            if enable_audio:
+                raise ValueError("Cosmos3 transfer inference cannot be combined with sound generation.")
         guidance_interval = None
         if is_t2i:
             if image is not None:
@@ -832,7 +946,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
             if is_v2v:
                 self._set_flow_shift(
-                    flow_shift if flow_shift is not None else 10.0,
+                    flow_shift if flow_shift is not None else COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
                     use_karras_sigmas=False,
                 )
             else:
@@ -891,6 +1005,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if text_blocked.item():
             timer.mark_end()
             return timer.fill(PipelineOutput())
+
+        if transfer_config is not None:
+            return self._forward_transfer(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                max_frames=transfer_config.max_frames,
+                num_inference_steps=num_inference_steps,
+                max_sequence_length=max_sequence_length,
+                use_system_prompt=use_system_prompt,
+                use_duration_template=False,
+                use_resolution_template=False,
+                seed=seed,
+                transfer_config=transfer_config,
+                video=video,
+            )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -1162,4 +1293,433 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 if waveform is not None
                 else None,
             )
+        )
+
+    @staticmethod
+    def _first_transfer_control_hw(transfer_config: Cosmos3TransferConfig) -> tuple[int, int] | None:
+        for hint in transfer_config.ordered_hints:
+            if hint.control is not None:
+                detected = media_hw(hint.control)
+                if detected is not None:
+                    return detected
+            if hint.control_path is not None:
+                detected = media_hw(hint.control_path)
+                if detected is not None:
+                    return detected
+        return None
+    
+    @staticmethod
+    def _get_transfer_num_chunks(
+        total_frames: int,
+        frames_per_chunk: int,
+        conditional_frames: int,
+    ) -> tuple[int, int]:
+        if frames_per_chunk <= 0:
+            raise ValueError("Cosmos3 transfer frames_per_chunk must be positive.")
+        if total_frames <= frames_per_chunk:
+            return 1, frames_per_chunk
+        stride = frames_per_chunk - conditional_frames
+        if stride <= 0:
+            raise ValueError("Cosmos3 transfer num_conditional_frames must be smaller than num_video_frames_per_chunk.")
+        remaining = total_frames - frames_per_chunk
+        extra_chunks = remaining // stride + (1 if remaining % stride else 0)
+        return 1 + extra_chunks, stride
+
+    @staticmethod
+    def positive_float(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    @staticmethod
+    def _transfer_active_at(
+        timestep: torch.Tensor,
+        interval: tuple[float, float] | None,
+    ) -> bool:
+        if interval is None:
+            return True
+        t_scalar = float(timestep.item()) if torch.is_tensor(timestep) else float(timestep)
+        lo, hi = interval
+        return float(lo) <= t_scalar <= float(hi)
+
+    @staticmethod
+    def _combine_transfer_predictions(
+        *,
+        cond_full: torch.Tensor,
+        cond_no_control: torch.Tensor | None,
+        uncond_full: torch.Tensor | None,
+        guidance_scale: float,
+        control_guidance: float,
+    ) -> torch.Tensor:
+        needs_control_cfg = cond_no_control is not None and control_guidance != 1.0
+        needs_text_cfg = uncond_full is not None and guidance_scale > 1.0
+
+        if needs_control_cfg and needs_text_cfg:
+            control_cond = cond_no_control + control_guidance * (cond_full - cond_no_control)
+            return uncond_full + guidance_scale * (control_cond - uncond_full)
+        if needs_control_cfg:
+            return cond_no_control + control_guidance * (cond_full - cond_no_control)
+        if needs_text_cfg:
+            return uncond_full + guidance_scale * (cond_full - uncond_full)
+        return cond_full
+
+    def diffuse_transfer(
+        self,
+        *,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond_ids: torch.Tensor,
+        cond_mask: torch.Tensor,
+        uncond_ids: torch.Tensor,
+        uncond_mask: torch.Tensor,
+        guidance_scale: float,
+        control_guidance: float,
+        control_guidance_interval: tuple[float, float] | None,
+        control_latents: list[torch.Tensor],
+        shared_kwargs: dict[str, Any],
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        guidance_interval: tuple[float, float] | None = None,
+    ) -> torch.Tensor:
+        """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
+
+        branch_caches: dict[str, tuple[Any, Any]] = {}
+
+        def run_branch(
+            cache_key: str,
+            *,
+            text_ids: torch.Tensor,
+            text_mask: torch.Tensor,
+            branch_control_latents: list[torch.Tensor] | None,
+            timestep: torch.Tensor,
+        ) -> torch.Tensor:
+            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
+                cache_key,
+                (None, None),
+            )
+            result = self.transformer(
+                hidden_states=latents,
+                timestep=timestep,
+                attention_timestep=timestep / self.scheduler.config.num_train_timesteps,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                control_latents=branch_control_latents,
+                **shared_kwargs,
+            )
+            branch_caches[cache_key] = (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+            )
+            if result.video is None:
+                raise ValueError("Cosmos3 transfer diffusion expects video predictions.")
+            return result.video
+
+        self.transformer.reset_cache()
+        try:
+            transfer_steps = tqdm(
+                timesteps,
+                total=len(timesteps),
+                desc="Transfer denoising",
+                disable=self.rank != 0,
+                dynamic_ncols=True,
+            )
+            for t in transfer_steps:
+                timestep = t.expand(latents.shape[0])
+                step_guidance = (
+                    float(guidance_scale)
+                    if self._transfer_active_at(t, guidance_interval)
+                    else 1.0
+                )
+                step_control = (
+                    float(control_guidance)
+                    if self._transfer_active_at(t, control_guidance_interval)
+                    else 1.0
+                )
+
+                cond_full = run_branch(
+                    "transfer_cond_full",
+                    text_ids=cond_ids,
+                    text_mask=cond_mask,
+                    branch_control_latents=control_latents,
+                    timestep=timestep,
+                )
+                cond_no_control = None
+                if step_control != 1.0:
+                    cond_no_control = run_branch(
+                        "transfer_cond_no_control",
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
+                        branch_control_latents=None,
+                        timestep=timestep,
+                    )
+
+                uncond_full = None
+                if step_guidance > 1.0:
+                    uncond_full = run_branch(
+                        "transfer_uncond_full",
+                        text_ids=uncond_ids,
+                        text_mask=uncond_mask,
+                        branch_control_latents=control_latents,
+                        timestep=timestep,
+                    )
+
+                noise_pred = self._combine_transfer_predictions(
+                    cond_full=cond_full,
+                    cond_no_control=cond_no_control,
+                    uncond_full=uncond_full,
+                    guidance_scale=step_guidance,
+                    control_guidance=step_control,
+                )
+                noise_pred = noise_pred * velocity_mask
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+        finally:
+            self.transformer.reset_cache()
+
+        return latents
+
+    def _forward_transfer(self,
+                          *,
+                          prompt: str,
+                          negative_prompt: str,
+                          height: int,
+                          width: int,
+                          max_frames: int,
+                          num_inference_steps: int,
+                          max_sequence_length,
+                          use_system_prompt,
+                          use_duration_template: str,
+                          use_resolution_template: str,
+                          seed,
+                          transfer_config: Cosmos3TransferConfig,
+                          video: Any
+    ) -> PipelineOutput:
+        input_frames = None
+        transfer_input_fps = self._video_payload_fps(video) if video is not None else None
+        source_hw = media_hw(video) if video is not None else self._first_transfer_control_hw(transfer_config)
+        height, width = self._transfer_bucket_size(transfer_config, source_hw)
+        if self.rank == 0:
+            logger.info(
+                "Cosmos3 transfer bucket: "
+                f"source_hw={source_hw}, resolution={transfer_config.resolution or 720}, "
+                f"target={width}x{height} (WxH), transfer_input_fps={transfer_input_fps}"
+            )
+        if video is not None:
+            input_frames = media_to_uint8_cthw(
+                video,
+                height=height,
+                width=width,
+                max_frames=max_frames,
+            )
+            input_frames = input_frames[:, : transfer_config.max_frames]
+
+        per_hint_frames: dict[str, torch.Tensor] = {}
+        for hint in transfer_config.ordered_hints:
+            frames = load_or_compute_control_frames(
+                hint,
+                height=height,
+                width=width,
+                max_frames=transfer_config.max_frames,
+                input_frames=input_frames,
+            )
+            if frames.shape[1] < 1:
+                raise ValueError(f"Cosmos3 transfer hint '{hint.key}' produced no frames.")
+            per_hint_frames[hint.key] = frames
+        if not per_hint_frames:
+            raise ValueError("Cosmos3 transfer requires at least one control hint.")
+        
+        total_frames = next(iter(per_hint_frames.values())).shape[1]
+        if transfer_config.num_frames is not None:
+            total_frames = min(total_frames, int(transfer_config.num_frames))
+        total_frames = max(1, total_frames)
+        per_hint_frames = {key: pad_temporal_frames(frames, total_frames) for key, frames in per_hint_frames.items()}
+        if input_frames is not None:
+            input_frames = pad_temporal_frames(input_frames, total_frames)
+
+        temporal_compression = self.vae_scale_factor_temporal
+        chunk_frames = 1 if total_frames == 1 else transfer_config.num_video_frames_per_chunk
+        chunk_frames = math.ceil((chunk_frames - 1) / temporal_compression) * temporal_compression + 1
+        num_chunks, stride = self._get_transfer_num_chunks(
+            total_frames,
+            chunk_frames,
+            transfer_config.num_conditional_frames,
+        )
+        padded_frames = max(total_frames, chunk_frames)
+        per_hint_frames = {key: pad_temporal_frames(frames, padded_frames) for key, frames in per_hint_frames.items()}
+        if input_frames is not None:
+            input_frames = pad_temporal_frames(input_frames, padded_frames)
+
+        configured_frame_rate = self.positive_float(transfer_config.fps)
+        input_frame_rate = self.positive_float(transfer_input_fps)
+        sampling_frame_rate = self.positive_float(transfer_config.fps)
+        is_wsm_only = len(transfer_config.hints) == 1 and "wsm" in transfer_config.hints
+        if is_wsm_only:
+            frame_rate = configured_frame_rate or input_frame_rate or sampling_frame_rate or 24.0
+        else:
+            frame_rate = input_frame_rate or configured_frame_rate or sampling_frame_rate or 24.0
+        num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
+        guidance_scale = (
+            float(transfer_config.guidance_scale)
+            if transfer_config.guidance_scale is not None
+            else COSMOS3_720P_PARAMS["guidance_scale"]
+        )
+        flow_shift_target = float(
+            transfer_config.flow_shift
+            if transfer_config.flow_shift is not None
+            else COSMOS3_V2V_DEFAULT_FLOW_SHIFT
+        )
+        max_sequence_length = (
+            max_sequence_length
+            or COSMOS3_720P_PARAMS["max_sequence_length"]
+        )
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_inference_steps
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False)
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        if negative_prompt is None:
+            negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
+
+        # Transfer prompts are already upsampled by the benchmark/config path.
+        # Keep them verbatim; duration/resolution templates would change parity.
+        prompt = [prompt] if isinstance(prompt, str) else list(prompt)
+        prompt = prompt[0]
+        logger.info(f"Transfer prompt: '{prompt}'")
+
+        # 1. Tokenize prompts (no separate text encoder — transformer embeds internally)
+        logger.info("Tokenizing prompts...")
+        system_prompt = COSMOS3_DEFAULT_SYSTEM_PROMPT
+        cond_ids, cond_mask = self._tokenize_prompt(
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
+        )
+        uncond_ids, uncond_mask = self._tokenize_prompt(
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
+        )
+
+        output_chunks: list[torch.Tensor] = []
+        control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
+        previous_output: torch.Tensor | None = None
+
+
+        for chunk_id in range(num_chunks):
+            start_frame = chunk_id * stride
+            end_frame = min(start_frame + chunk_frames, total_frames)
+            control_norms = {
+                key: uint8_cthw_to_normalized_5d(
+                    pad_temporal_frames(frames[:, start_frame:end_frame], chunk_frames),
+                    dtype=self.dtype,
+                )
+                for key, frames in per_hint_frames.items()
+            }
+            target_norm = torch.zeros_like(next(iter(control_norms.values())))
+            current_conditional_frames = 0
+
+            if chunk_id == 0 and transfer_config.num_first_chunk_conditional_frames > 0:
+                if input_frames is None:
+                    raise ValueError("Cosmos3 transfer num_first_chunk_conditional_frames > 0 requires a video input.")
+                current_conditional_frames = min(
+                    transfer_config.num_first_chunk_conditional_frames,
+                    input_frames.shape[1],
+                    chunk_frames,
+                )
+                if current_conditional_frames > 0:
+                    input_cond = uint8_cthw_to_normalized_5d(
+                        input_frames[:, :current_conditional_frames],
+                        dtype=self.dtype,
+                    )
+                    target_norm[:, :, :current_conditional_frames] = input_cond
+                    if current_conditional_frames < chunk_frames:
+                        fill = target_norm[:, :, current_conditional_frames - 1 : current_conditional_frames]
+                        target_norm[:, :, current_conditional_frames:] = fill.expand(
+                            -1,
+                            -1,
+                            chunk_frames - current_conditional_frames,
+                            -1,
+                            -1,
+                        )
+            elif chunk_id > 0 and previous_output is not None:
+                current_conditional_frames = min(
+                    transfer_config.num_conditional_frames,
+                    previous_output.shape[2],
+                    chunk_frames,
+                )
+                if current_conditional_frames > 0:
+                    target_norm[:, :, :current_conditional_frames] = previous_output[
+                        :, :, -current_conditional_frames:
+                    ].to(target_norm)
+                    if current_conditional_frames < chunk_frames:
+                        fill = target_norm[:, :, current_conditional_frames - 1 : current_conditional_frames]
+                        target_norm[:, :, current_conditional_frames:] = fill.expand(
+                            -1,
+                            -1,
+                            chunk_frames - current_conditional_frames,
+                            -1,
+                            -1,
+                        )
+
+            control_latents = [self._encode_video_tensor(video) for video in control_norms.values()]
+            latents, velocity_mask, condition_latents = self._prepare_transfer_latents(
+                target_norm,
+                current_conditional_frames,
+                generator,
+            )
+            video_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+            shared_kwargs = dict(
+                video_shape=video_shape,
+                fps=frame_rate,
+                noisy_frame_mask=velocity_mask,
+                transfer_share_vision_temporal_positions=transfer_config.share_vision_temporal_positions,
+            )
+
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            latents = self.diffuse_transfer(
+                latents=latents,
+                timesteps=self.scheduler.timesteps,
+                cond_ids=cond_ids,
+                cond_mask=cond_mask,
+                uncond_ids=uncond_ids,
+                uncond_mask=uncond_mask,
+                guidance_scale=guidance_scale,
+                control_guidance=transfer_config.control_guidance,
+                control_guidance_interval=transfer_config.control_guidance_interval,
+                control_latents=control_latents,
+                shared_kwargs=shared_kwargs,
+                velocity_mask=velocity_mask,
+                condition_latents=condition_latents,
+            )
+            output_video = self._decode_latents_raw(latents).clamp(-1, 1)
+            previous_output = output_video
+
+            if chunk_id == 0:
+                output_chunks.append(output_video)
+                for key, control in control_norms.items():
+                    control_chunks_per_hint[key].append(control)
+            else:
+                output_chunks.append(output_video[:, :, current_conditional_frames:])
+                for key, control in control_norms.items():
+                    control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+
+        full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
+        full_controls = {
+            key: torch.cat(chunks, dim=2)[:, :, :total_frames] for key, chunks in control_chunks_per_hint.items()
+        }
+
+        if transfer_config.show_control_condition:
+            all_controls = torch.cat([full_controls[key] for key in per_hint_frames], dim=-1)
+            all_controls = all_controls.to(full_output)
+            full_output = torch.cat([all_controls, full_output], dim=-1)
+        if transfer_config.show_input and input_frames is not None:
+            normalized_input = uint8_cthw_to_normalized_5d(input_frames[:, :total_frames], dtype=torch.float32)
+            full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
+        video = postprocess_video_tensor(full_output)
+        return PipelineOutput(
+            video=video,
+            frame_rate=frame_rate,
         )

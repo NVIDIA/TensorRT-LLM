@@ -101,6 +101,7 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
+    "bool_or_str_or_dict": (bool, str, dict),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
