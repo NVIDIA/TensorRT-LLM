@@ -2182,17 +2182,17 @@ class MXFP4FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # mxfp4_dequantize_unswizzled returns (out_features, in_features)
             # which matches F.linear weight layout (out, in). Do NOT transpose.
             w1_dequant = (
-                unpacker(w1.cpu(), s1.cpu(), scaling_group_size)
+                unpacker(w1, s1, scaling_group_size)
                 .to(dtype=self.dtype, device="cuda")
                 .contiguous()
             )
             w3_dequant = (
-                unpacker(w3.cpu(), s3.cpu(), scaling_group_size)
+                unpacker(w3, s3, scaling_group_size)
                 .to(dtype=self.dtype, device="cuda")
                 .contiguous()
             )
             w2_dequant = (
-                unpacker(w2.cpu(), s2.cpu(), scaling_group_size)
+                unpacker(w2, s2, scaling_group_size)
                 .to(dtype=self.dtype, device="cuda")
                 .contiguous()
             )
@@ -2439,17 +2439,17 @@ class WFP4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # Note: mxfp4_dequantize_unswizzled returns shape (out_features, in_features)
             # which matches F.linear weight layout (out, in). Do NOT transpose.
             w1_dequant = (
-                unpacker(w1.cpu(), s1.cpu(), scaling_group_size)
+                unpacker(w1, s1, scaling_group_size)
                 .to(dtype=self.dtype, device="cuda")
                 .contiguous()
             )
             w3_dequant = (
-                unpacker(w3.cpu(), s3.cpu(), scaling_group_size)
+                unpacker(w3, s3, scaling_group_size)
                 .to(dtype=self.dtype, device="cuda")
                 .contiguous()
             )
             w2_dequant = (
-                unpacker(w2.cpu(), s2.cpu(), scaling_group_size)
+                unpacker(w2, s2, scaling_group_size)
                 .to(dtype=self.dtype, device="cuda")
                 .contiguous()
             )
@@ -2770,10 +2770,10 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
         # ModelOpt W4A8 packs pairs of 4b weights in the output dimension into one 8b element.
         if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-            return unpacker(weight.cpu().T.contiguous()).cuda()
+            return unpacker(weight.T.contiguous()).cuda()
         # The custom W4A8 quantization script packs pairs of 4b weight in the input dimension.
         else:
-            return unpacker(weight.cpu()).T.contiguous().cuda()
+            return unpacker(weight.contiguous()).T.contiguous().cuda()
 
     def load_weights(self, weights: List[Dict]):
         """Store raw quantized weights for forward computation."""
