@@ -987,6 +987,37 @@ def test_generate_with_bad_words():
                                                     bad=["F E", "I J"]))
 
 
+@pytest.mark.part0
+def test_bad_words_prefix_space_variants():
+    tokenizer = TransformersTokenizer.from_pretrained(get_model_path('gpt2'))
+    bad_word = "London"
+    unprefixed_bad_word_ids = tokenizer.encode(bad_word, add_special_tokens=False)
+    prefixed_bad_word_ids = tokenizer.encode(f" {bad_word}", add_special_tokens=False)
+    assert unprefixed_bad_word_ids != prefixed_bad_word_ids
+
+    sampling_params = SamplingParams(bad=bad_word)
+    sampling_params._setup(
+        tokenizer,
+        hf_model_config=None,
+        generation_config=None,
+        add_special_tokens=False,
+    )
+
+    bad_words = sampling_params._get_bad_words()
+    assert unprefixed_bad_word_ids in bad_words
+    assert prefixed_bad_word_ids in bad_words
+
+    prefixed_sampling_params = SamplingParams(bad=f" {bad_word}")
+    prefixed_sampling_params._setup(
+        tokenizer,
+        hf_model_config=None,
+        generation_config=None,
+        add_special_tokens=False,
+    )
+
+    assert prefixed_sampling_params._get_bad_words() == [prefixed_bad_word_ids]
+
+
 @pytest.mark.skip(reason="https://nvbugs/5370718")
 @force_ampere
 @pytest.mark.part0

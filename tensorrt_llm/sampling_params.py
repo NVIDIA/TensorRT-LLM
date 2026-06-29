@@ -472,9 +472,22 @@ class SamplingParams:
                 # For tiktokenizer, the encode method does not have add_special_tokens argument
                 return tokenizer.encode(text)
 
+        def _encode_bad_word(tokenizer, text, add_special_tokens):
+            """Encode a bad word as original and prefix-space token variants."""
+            word_ids = []
+            for bad_word in [text, f" {text.lstrip()}"]:
+                token_ids = _encode(tokenizer, bad_word, add_special_tokens)
+                if token_ids not in word_ids:
+                    word_ids.append(token_ids)
+            return word_ids
+
         if self.bad is not None:
             strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+            self._bad_word_ids = [
+                token_ids
+                for s in strs
+                for token_ids in _encode_bad_word(tokenizer, s, add_special_tokens)
+            ]
 
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
