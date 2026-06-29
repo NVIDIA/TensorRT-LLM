@@ -800,6 +800,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         scratch_reuse_config = None
         if self.enable_swa_scratch_reuse:
+            # Context requests will allocate num_extra_kv_tokens tokens for spec decoding.
+            # Cache manager should not take them into account when calculating scratch range.
+            # Therefore set max_rewind_len to num_extra_kv_tokens.
             scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
 
         return KVCacheManagerConfigPy(

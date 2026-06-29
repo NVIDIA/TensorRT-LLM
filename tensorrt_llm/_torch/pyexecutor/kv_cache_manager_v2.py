@@ -563,6 +563,7 @@ class KVCacheManagerV2(BaseResourceManager):
         from ..speculative import get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = (
             spec_config.max_total_draft_tokens if spec_config is not None else 0
         )

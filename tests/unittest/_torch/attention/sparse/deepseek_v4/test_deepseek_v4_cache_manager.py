@@ -177,6 +177,7 @@ class TestDeepseekV4CacheManager:
         tp_size: int = 1,
         enable_attention_dp: bool = False,
         enable_swa_scratch_reuse: bool = False,
+        spec_config: object | None = None,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -224,6 +225,7 @@ class TestDeepseekV4CacheManager:
             max_num_tokens=max_batch_size * (max_input_len + 1),
             sparse_attn_config=sparse_attn_config,
             is_draft=is_draft,
+            spec_config=spec_config,
         )
 
         return cache_manager, sparse_attn_config
@@ -1451,6 +1453,7 @@ class TestDeepseekV4CacheManager:
         try:
             assert not cache_manager.enable_swa_scratch_reuse
             assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse is None
             assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
         finally:
             cache_manager.shutdown()
@@ -1469,7 +1472,39 @@ class TestDeepseekV4CacheManager:
         try:
             assert cache_manager.enable_swa_scratch_reuse
             assert cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse is not None
+            assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse.max_rewind_len == 0
             assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_swa_scratch_reuse_uses_extra_kv_tokens_for_rewind(self):
+        spec_config = SimpleNamespace(
+            max_draft_len=7,
+            max_total_draft_tokens=7,
+            spec_dec_mode=SimpleNamespace(
+                is_eagle3_one_model=lambda: False,
+                is_mtp_eagle_one_model=lambda: False,
+                is_mtp_one_model=lambda: False,
+                is_mtp_vanilla=lambda: False,
+                use_one_engine=lambda: True,
+            ),
+        )
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            spec_config=spec_config,
+            enable_swa_scratch_reuse=True,
+        )
+
+        try:
+            scratch_reuse = cache_manager.kv_cache_manager_py_config.swa_scratch_reuse
+            assert scratch_reuse is not None
+            assert scratch_reuse.max_rewind_len == spec_config.max_draft_len - 1
         finally:
             cache_manager.shutdown()
 
@@ -1488,6 +1523,7 @@ class TestDeepseekV4CacheManager:
         try:
             assert not cache_manager.enable_swa_scratch_reuse
             assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse is None
             assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
         finally:
             cache_manager.shutdown()
