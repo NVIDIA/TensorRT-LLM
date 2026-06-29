@@ -50,7 +50,8 @@ namespace fused_fma_kernels
 // the post-mapped residual (bf16 [M, HC_MULT, hidden]) into residual_out, using
 // the same disjoint h-slice it already owns.  When false the residual_out arg
 // may be a nullptr; the parameter stays in the signature for simplicity.
-template <int N_PER_BLOCK, int NUM_K_SPLITS, int BF16_VEC_OVERRIDE = 0, bool WRITE_RESIDUAL = false>
+template <int N_PER_BLOCK, int NUM_K_SPLITS, int BF16_VEC_OVERRIDE = 0, bool WRITE_RESIDUAL = false,
+    int X_NUM_SPLITS = 1>
 __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 const* __restrict__ residual_in,
     __nv_bfloat16 const* __restrict__ x_in, float const* __restrict__ post_mix, float const* __restrict__ comb_mix,
     float const* __restrict__ W_T, float* __restrict__ Yp, float* __restrict__ Rp, int hidden_size, int N, int K,
@@ -58,6 +59,7 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
 {
     static_assert(NUM_K_SPLITS == 1 || NUM_K_SPLITS == 2 || NUM_K_SPLITS == 4 || NUM_K_SPLITS == 8,
         "ksplit ∈ {1, 2, 4, 8} supported");
+    static_assert(X_NUM_SPLITS == 1 || X_NUM_SPLITS == 2 || X_NUM_SPLITS == 4, "x split ∈ {1, 2, 4} supported");
     constexpr int HC_MULT = 4;
     constexpr int BLOCK_SIZE = 256;
     constexpr int WARP_SIZE = 32;
@@ -111,45 +113,51 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
     float sqr = 0.0f;
 
     long long const tok_res = static_cast<long long>(token) * HC_MULT * hidden_size;
-    long long const tok_x = static_cast<long long>(token) * hidden_size;
-
     // Iterate h over this CTA's HIDDEN slice.  Each thread owns BF16_VEC
     // contiguous positions per step; stride BLOCK_SIZE*BF16_VEC.
     for (int h = h_start + tid * BF16_VEC; h < h_end; h += BLOCK_SIZE * BF16_VEC)
     {
-        // Load x[h..h+BF16_VEC).  Vector width depends on BF16_VEC.
-        float xf[BF16_VEC];
-        if constexpr (BF16_VEC == 8)
-        {
-            uint4 x_raw = *reinterpret_cast<uint4 const*>(&x_in[tok_x + h]);
-            __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
+        // Load split-major x[split, token, h:h+BF16_VEC) and reduce the O_b
+        // partials in FP32 before applying pmap. Vector width depends on
+        // BF16_VEC; X_NUM_SPLITS=1 compiles to the original single load.
+        float xf[BF16_VEC] = {};
 #pragma unroll
-            for (int v = 0; v < 4; v++)
-            {
-                float2 f = __bfloat1622float2(xp[v]);
-                xf[2 * v + 0] = f.x;
-                xf[2 * v + 1] = f.y;
-            }
-        }
-        else if constexpr (BF16_VEC == 4)
+        for (int xs = 0; xs < X_NUM_SPLITS; ++xs)
         {
-            uint2 x_raw = *reinterpret_cast<uint2 const*>(&x_in[tok_x + h]);
-            __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
-#pragma unroll
-            for (int v = 0; v < 2; v++)
+            long long const tok_x
+                = (static_cast<long long>(xs) * gridDim.x + static_cast<long long>(token)) * hidden_size;
+            if constexpr (BF16_VEC == 8)
             {
-                float2 f = __bfloat1622float2(xp[v]);
-                xf[2 * v + 0] = f.x;
-                xf[2 * v + 1] = f.y;
+                uint4 x_raw = *reinterpret_cast<uint4 const*>(&x_in[tok_x + h]);
+                __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
+#pragma unroll
+                for (int v = 0; v < 4; v++)
+                {
+                    float2 f = __bfloat1622float2(xp[v]);
+                    xf[2 * v + 0] += f.x;
+                    xf[2 * v + 1] += f.y;
+                }
             }
-        }
-        else
-        { // BF16_VEC == 2
-            unsigned x_raw = *reinterpret_cast<unsigned const*>(&x_in[tok_x + h]);
-            __nv_bfloat162 xp = *reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
-            float2 f = __bfloat1622float2(xp);
-            xf[0] = f.x;
-            xf[1] = f.y;
+            else if constexpr (BF16_VEC == 4)
+            {
+                uint2 x_raw = *reinterpret_cast<uint2 const*>(&x_in[tok_x + h]);
+                __nv_bfloat162 const* xp = reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
+#pragma unroll
+                for (int v = 0; v < 2; v++)
+                {
+                    float2 f = __bfloat1622float2(xp[v]);
+                    xf[2 * v + 0] += f.x;
+                    xf[2 * v + 1] += f.y;
+                }
+            }
+            else
+            { // BF16_VEC == 2
+                unsigned x_raw = *reinterpret_cast<unsigned const*>(&x_in[tok_x + h]);
+                __nv_bfloat162 xp = *reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
+                float2 f = __bfloat1622float2(xp);
+                xf[0] += f.x;
+                xf[1] += f.y;
+            }
         }
 
         // Seed new_r[j, v] = pm[j] * x[v] for all j

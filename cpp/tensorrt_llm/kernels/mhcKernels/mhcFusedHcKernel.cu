@@ -91,7 +91,66 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
         y_acc, y_elems, r_acc, r_elems, done_counter, done_elems);
 }
 
+// O_b split-K emits BF16 partials in split-major layout. Each thread reduces
+// one 16-byte vector, keeping all eight lanes in FP32 until the final store.
+__global__ void fhcReduceSplitXKernel(
+    uint4 const* __restrict__ partials, uint4* __restrict__ reduced, uint32_t vectors_per_split, int num_splits)
+{
+    uint32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t const stride = gridDim.x * blockDim.x;
+    for (uint32_t vector_idx = tid; vector_idx < vectors_per_split; vector_idx += stride)
+    {
+        float2 accum[4] = {
+            make_float2(0.0f, 0.0f),
+            make_float2(0.0f, 0.0f),
+            make_float2(0.0f, 0.0f),
+            make_float2(0.0f, 0.0f),
+        };
+        for (int split = 0; split < num_splits; ++split)
+        {
+            uint4 const raw = __ldg(&partials[static_cast<uint64_t>(split) * vectors_per_split + vector_idx]);
+            auto const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair)
+            {
+                float2 const value = __bfloat1622float2(pairs[pair]);
+                accum[pair].x += value.x;
+                accum[pair].y += value.y;
+            }
+        }
+
+        uint4 packed;
+        auto* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair)
+        {
+            pairs[pair] = __float22bfloat162_rn(accum[pair]);
+        }
+        reduced[vector_idx] = packed;
+    }
+}
+
 } // namespace
+
+void mhcReduceSplitXLaunch(
+    __nv_bfloat16 const* partials, __nv_bfloat16* reduced, int M, int hidden_size, int num_splits, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(partials != nullptr && reduced != nullptr, "split-x reduction received a null pointer");
+    TLLM_CHECK_WITH_INFO(M > 0 && hidden_size > 0, "split-x reduction requires positive M and hidden_size");
+    TLLM_CHECK_WITH_INFO(
+        num_splits > 1 && num_splits <= 16, "split-x reduction supports num_splits in [2, 16], got %d", num_splits);
+    TLLM_CHECK_WITH_INFO(
+        hidden_size % 8 == 0, "split-x reduction requires hidden_size divisible by 8, got %d", hidden_size);
+
+    uint64_t const elements = static_cast<uint64_t>(M) * static_cast<uint64_t>(hidden_size);
+    uint64_t const vectors64 = elements / 8;
+    TLLM_CHECK_WITH_INFO(vectors64 <= UINT32_MAX, "split-x reduction tensor is too large");
+    uint32_t const vectors = static_cast<uint32_t>(vectors64);
+    constexpr uint32_t kBlock = 256;
+    uint32_t const blocks = min(static_cast<uint32_t>((vectors + kBlock - 1) / kBlock), 148u * 8u);
+    fhcReduceSplitXKernel<<<blocks, kBlock, 0, stream>>>(
+        reinterpret_cast<uint4 const*>(partials), reinterpret_cast<uint4*>(reduced), vectors, num_splits);
+}
 
 // ---- mHC fused kernel shape constants (mirrors the Python module) ----
 // HC_MULT * (2 + HC_MULT) = 4 * 6 = 24.
@@ -293,14 +352,53 @@ static constexpr uint32_t fhcSmemSize()
 using FusedRoutFn = void (*)(
     uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, float*, float const*, float const*, float*);
 
-template <uint32_t Hidden, uint32_t KS>
+template <uint32_t Hidden, uint32_t KS, uint32_t XS = 1>
 static FusedRoutFn fhcInstance()
 {
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
     static_assert(isSupportedFhcMmaKS<Hidden, KS>(), "Unsupported fused-HC MMA kNumSplits for hidden size");
     return &fused_mhc::fused_tf32_pmap_gemm_rout_atomic_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M, FHC_BLOCK_N,
         FHC_BLOCK_K, FHC_SWIZZLE_CD, FHC_N_B_STAGES, FHC_N_INPUT_STG, FHC_NUM_MMA_TH, FHC_NUM_PMAP_TH, KS,
-        /*kEarlyRelease=*/false>;
+        /*kEarlyRelease=*/false, XS>;
+}
+
+template <uint32_t Hidden, uint32_t KS, uint32_t XS>
+static FusedRoutFn fhcXSplitInstanceIfSupported()
+{
+    if constexpr (isSupportedFhcMmaKS<Hidden, KS>())
+    {
+        return fhcInstance<Hidden, KS, XS>();
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported (kNumSplits=%u, hidden=%u)", KS, Hidden);
+        return nullptr;
+    }
+}
+
+template <uint32_t Hidden, uint32_t XS>
+static FusedRoutFn pickFhcXSplitKs(uint32_t ks)
+{
+    switch (ks)
+    {
+    case 1: return fhcInstance<Hidden, 1, XS>();
+    case 2: return fhcXSplitInstanceIfSupported<Hidden, 2, XS>();
+    case 4: return fhcXSplitInstanceIfSupported<Hidden, 4, XS>();
+    case 8: return fhcXSplitInstanceIfSupported<Hidden, 8, XS>();
+    case 16: return fhcXSplitInstanceIfSupported<Hidden, 16, XS>();
+    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u for split x", ks); return nullptr;
+    }
+}
+
+template <uint32_t Hidden>
+static FusedRoutFn pickFhcXSplit(uint32_t ks, uint32_t xs)
+{
+    switch (xs)
+    {
+    case 2: return pickFhcXSplitKs<Hidden, 2>(ks);
+    case 4: return pickFhcXSplitKs<Hidden, 4>(ks);
+    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported x split=%u", xs); return nullptr;
+    }
 }
 
 template <uint32_t Hidden, uint32_t KS>
@@ -375,7 +473,7 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult,
     int num_k_splits, int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
     float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream, int x_num_splits = 1)
 {
     if (M <= 0)
         return;
@@ -407,7 +505,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
     CUtensorMap desc_x = getCachedTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden,
-        m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
+        static_cast<uint32_t>(x_num_splits) * m_u, FHC_BLOCK_K, FHC_BLOCK_M,
+        static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
     CUtensorMap desc_b = getCachedTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K, FHC_SHAPE_N,
@@ -419,8 +518,12 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
     // ---- Step 1: fused post-mapping + TF32 GEMM + sqrsum + residual_out ----
-    constexpr uint32_t fused_smem = fhcSmemSize();
-    FusedRoutFn fa = pickFhc<Hidden>(ks);
+    // Split-x reuses the baseline x data buffers and only adds full/empty
+    // barriers for the partial ring.
+    uint32_t const extra_x_smem = (x_num_splits > 1) ? (2u * FHC_N_INPUT_STG * sizeof(uint64_t)) : 0u;
+    uint32_t const fused_smem = fhcSmemSize() + extra_x_smem;
+    FusedRoutFn fa
+        = (x_num_splits > 1) ? pickFhcXSplit<Hidden>(ks, static_cast<uint32_t>(x_num_splits)) : pickFhc<Hidden>(ks);
     TLLM_CUDA_CHECK(cudaFuncSetAttribute(
         reinterpret_cast<void const*>(fa), cudaFuncAttributeMaxDynamicSharedMemorySize, fused_smem));
 
@@ -443,7 +546,7 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream, int x_num_splits)
 {
     if (M <= 0)
         return;
@@ -457,13 +560,13 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
         mhcFusedHcLaunchImpl<FHC_HIDDEN_FLASH>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
             hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, x_num_splits);
         return;
     case static_cast<int>(FHC_HIDDEN_PRO):
         mhcFusedHcLaunchImpl<FHC_HIDDEN_PRO>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
             hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, x_num_splits);
         return;
     default: return;
     }
@@ -481,19 +584,21 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
 using FmaKsplitFn = void (*)(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float const*, float const*,
     float*, float*, int, int, int, __nv_bfloat16*);
 
-template <int TN, int KS>
+template <int TN, int KS, int XS = 1>
 static FmaKsplitFn fhcFmaInstance()
 {
-    return &fused_fma_kernels::fused_pmap_gemm_fma_ksplit<TN, KS, /*BF16_VEC_OVERRIDE=*/0, /*WRITE_RESIDUAL=*/true>;
+    return &fused_fma_kernels::fused_pmap_gemm_fma_ksplit<TN, KS, /*BF16_VEC_OVERRIDE=*/0,
+        /*WRITE_RESIDUAL=*/true, XS>;
 }
 
 // Valid (tile_n, num_k_splits) combinations the fused_hc FMA path supports.
 // Keep this limited to the small/mid-M sweet spots from profile_fair_report v4.
-static FmaKsplitFn pickFhcFma(int tile_n, int ks)
+template <int XS>
+static FmaKsplitFn pickFhcFmaXSplit(int tile_n, int ks)
 {
 #define FHCFMA_CASE(TN, KS)                                                                                            \
     if (tile_n == (TN) && ks == (KS))                                                                                  \
-    return fhcFmaInstance<TN, KS>()
+    return fhcFmaInstance<TN, KS, XS>()
 
     FHCFMA_CASE(1, 1);
     FHCFMA_CASE(1, 2);
@@ -513,8 +618,21 @@ static FmaKsplitFn pickFhcFma(int tile_n, int ks)
     FHCFMA_CASE(12, 1);
     FHCFMA_CASE(24, 1);
 #undef FHCFMA_CASE
-    TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaLaunch: unsupported (tile_n=%d, ks=%d)", tile_n, ks);
+    TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaLaunch: unsupported (tile_n=%d, ks=%d, x_splits=%d)", tile_n, ks, XS);
     return nullptr;
+}
+
+static FmaKsplitFn pickFhcFma(int tile_n, int ks, int x_num_splits)
+{
+    switch (x_num_splits)
+    {
+    case 1: return pickFhcFmaXSplit<1>(tile_n, ks);
+    case 2: return pickFhcFmaXSplit<2>(tile_n, ks);
+    case 4: return pickFhcFmaXSplit<4>(tile_n, ks);
+    default:
+        TLLM_CHECK_WITH_INFO(false, "mhcFusedHcFmaLaunch: unsupported x_num_splits=%d", x_num_splits);
+        return nullptr;
+    }
 }
 
 void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
@@ -522,7 +640,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream, int x_num_splits)
 {
     if (M <= 0)
         return;
@@ -538,7 +656,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     int const N = static_cast<int>(FHC_SHAPE_N);
 
     // ---- Step 1: fused pmap + GEMM + sqrsum + residual_cur (FMA ksplit) ----
-    FmaKsplitFn fn = pickFhcFma(tile_n, num_k_splits);
+    FmaKsplitFn fn = pickFhcFma(tile_n, num_k_splits, x_num_splits);
     dim3 const grid(static_cast<unsigned>(M), static_cast<unsigned>(N / tile_n), static_cast<unsigned>(num_k_splits));
     dim3 const block(256);
     tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_ksplit", fn, grid, block, 0, stream,

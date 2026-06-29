@@ -660,6 +660,7 @@ def _fused_hc_call(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    x_num_splits: int = 1,
 ):
     torch.ops.trtllm.mhc_fused_hc(
         x_prev,
@@ -691,6 +692,7 @@ def _fused_hc_call(
         tile_m,
         norm_weight,
         norm_eps,
+        x_num_splits,
     )
 
 
@@ -806,6 +808,19 @@ def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
     if hidden_size is not None:
         mma_ok = mma_ok and hidden_size in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES
     return _FUSED_HC_FALLBACK_TACTIC_MMA if mma_ok else _FUSED_HC_FALLBACK_TACTIC_FMA
+
+
+def _pick_hidden_splits_for_split_x(M: int) -> int:
+    """Mirror the half-MMA C++ heuristic used by the fused split-x path."""
+    if M <= 512:
+        return 16
+    if M <= 1024:
+        return 8
+    if M <= 2048:
+        return 4
+    if M <= 4096:
+        return 2
+    return 1
 
 
 class MhcFusedHcRunner(TunableRunner):
@@ -960,6 +975,17 @@ class MhcFusedHcRunner(TunableRunner):
             norm_weight = norm_weight.contiguous()
 
         B = residual_prev.shape[0]
+        if x_prev.ndim != 2 or x_prev.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"x_prev must have shape [SK * B, {self.hidden_size}], got {tuple(x_prev.shape)}"
+            )
+        if B <= 0 or x_prev.shape[0] % B != 0:
+            raise ValueError(
+                f"x_prev rows ({x_prev.shape[0]}) must be an integer multiple of residual rows ({B})"
+            )
+        x_num_splits = x_prev.shape[0] // B
+        if not 1 <= x_num_splits <= 16:
+            raise ValueError(f"unsupported x_prev split count: {x_num_splits}")
         (
             residual_cur,
             post_mix_cur,
@@ -1000,6 +1026,7 @@ class MhcFusedHcRunner(TunableRunner):
             self.sinkhorn_repeat,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            x_num_splits=x_num_splits,
         )
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
@@ -1063,6 +1090,12 @@ def mhc_fused_hc(
 ):
     """Fuse the previous block's post_mapping with the current block's pre_mapping.
 
+    ``x_prev`` may be either reduced ``[B, hidden]`` or split-major O-projection
+    partials ``[SK * B, hidden]``. For SK2/SK4 the half-MMA path streams and
+    sums partials in its pmap x-ring, while half-FMA sums them at its register
+    x-load. Both accumulate in FP32. All-in-one backends use the common
+    fused-HC entry reduction before consuming the reduced BF16.
+
     The autotuner chooses between four backends:
       * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM atomic + bigfuse.
       * "fused_half_fma" — 2-kernel pmap inline + FMA GEMM + sqrsum + bigfuse.
@@ -1094,15 +1127,51 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    tuner = AutoTuner.get()
-    _, best_tactic = tuner.choose_one(
-        "trtllm::mhc_fused_hc",
-        [runner],
-        MhcFusedHcRunner.tuning_config,
-        [x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t_cur, hc_scale_cur, hc_base_cur],
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
+    B = residual_prev.shape[0]
+    if x_prev.ndim != 2 or B <= 0 or x_prev.shape[0] % B != 0:
+        raise ValueError(
+            f"x_prev must have split-major shape [SK * B, hidden], got {tuple(x_prev.shape)} "
+            f"for B={B}"
+        )
+    x_num_splits = x_prev.shape[0] // B
+    if x_num_splits in (2, 4):
+        if B <= 32:
+            # At tiny M, CUDA-core FMA wins over an under-filled tcgen05
+            # pipeline. This tactic reduces split x in its register load.
+            best_tactic = ("fused_half_fma", 3, 2, 256, 1)
+        else:
+            # Decode/prefill split-x uses the half-MMA x-ring specialization.
+            # Its HIDDEN-axis split is orthogonal to the O_b K split and
+            # follows the same C++ occupancy heuristic as the launcher.
+            best_tactic = (
+                "fused_half_mma",
+                0,
+                _pick_hidden_splits_for_split_x(B),
+                0,
+                1,
+            )
+    else:
+        tuner = AutoTuner.get()
+        # The tuning config's dynamic M is x_prev.shape[0]. For uncommon split
+        # counts that use the common reduction fallback, tune with one logical
+        # M slice; the reduction cost is identical across candidate backends.
+        tuning_x_prev = x_prev if x_num_splits == 1 else x_prev[:B]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::mhc_fused_hc",
+            [runner],
+            MhcFusedHcRunner.tuning_config,
+            [
+                tuning_x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                w_t_cur,
+                hc_scale_cur,
+                hc_base_cur,
+            ],
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
 
     return runner(
         inputs=[

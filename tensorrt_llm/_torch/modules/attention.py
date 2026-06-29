@@ -43,6 +43,20 @@ except ImportError:
     flash_mla_sparse_fwd = None
 
 
+def _select_dsv4_ob_split_k(num_tokens: int,
+                            configured_split: Optional[int] = None) -> int:
+    if configured_split is None:
+        env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
+        split_k = env_split if env_split else (
+            2 if 64 <= num_tokens <= 128 else 1)
+    else:
+        split_k = configured_split
+    if split_k not in (1, 2, 4):
+        raise ValueError(
+            f"unsupported DeepSeek-V4 O_b split-K factor: {split_k}")
+    return split_k
+
+
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
     extra_attrs = get_model_extra_attrs()
@@ -1887,6 +1901,69 @@ class MLA(nn.Module):
         q = (q * attn_scale).to(q.dtype)
         return q
 
+    def _fused_ob_gemm(self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor,
+                       num_tokens: int) -> torch.Tensor:
+        """o_b GEMM over the fp8 o_lora emitted by o_a's fused epilogue (DSV4_FUSE_OPROJ).
+
+        With ``self.ob_split_k > 1`` (and K divisible), emit split-K partials
+        ``[SK*num_tokens, hidden]`` (partial p = rows ``[p*M,(p+1)*M)``) via ONE
+        TRT-LLM ``dsv4_fp8_splitk_gemm`` launch. The kernel reuses DeepGEMM's
+        SM100 MMA/TMA primitives but is built and dispatched by TRT-LLM. The split
+        layout writes consumer-ready BF16 partials, filling the SMs left idle at
+        decode M=32-128 without a separate cast launch. The downstream ``mHC.fused_hc``
+        half-MMA backend folds the FP32 partial sum into its pmap input ring;
+        half-FMA folds it into its register x-load. Other backends use the
+        common FP32-accumulating reduction fallback.
+        Pre-transformed
+        scales (o_a's packed sf_out + load-time col-major weight scale) -> the kernel skips
+        transpose_and_pack. The production policy uses SK2 for M=64..128 and
+        SK1 otherwise; ``self.ob_split_k`` or ``TRTLLM_DSV4_OB_SPLIT_K`` can
+        override it for testing."""
+        from tensorrt_llm import deep_gemm
+        M, N = num_tokens, self.hidden_size
+        K_ob = o_lora_fp8.shape[1]
+        w, wsf = self.o_b_proj.weight, self.o_b_proj.weight_scale
+        nkb4, wcols = sf_out.shape[1], wsf.shape[-1]
+        SK = _select_dsv4_ob_split_k(M, getattr(self, "ob_split_k", None))
+        # K-split boundary must align with the 1x128 quant's int32-packed scale columns
+        # (512 K-elems / packed col); the kernel needs K % (512*SK) == 0.
+        can_split = (SK > 1 and M <= 128 and N == 7168 and K_ob == 16384
+                     and K_ob % SK == 0 and (K_ob // SK) % 512 == 0
+                     and nkb4 % SK == 0 and wcols % SK == 0)
+        if not can_split:
+            hidden = torch.empty([M, N],
+                                 device=o_lora_fp8.device,
+                                 dtype=self.dtype)
+            deep_gemm.fp8_gemm_nt((o_lora_fp8, sf_out), (w, wsf),
+                                  hidden,
+                                  c=None,
+                                  disable_ue8m0_cast=False)
+            return hidden
+        logger.info_once(
+            f"[obsk-fused] o_b split-K ENGAGED (trtllm cpp): SK={SK} M={M} "
+            f"K={K_ob} N={N}",
+            key="obsk_fused_engaged")
+        # The TRT-LLM split-K kernel needs int-packed UE8M0 scales for both
+        # operands. sf_out is already int (o_a's epilogue); the o_b weight scale is the
+        # load-time transformed int form in production, but transform once if a caller
+        # passes a plain fp32 scale.
+        if wsf.dtype != torch.int32:
+            from tensorrt_llm.quantization.utils.fp8_utils import \
+                transform_sf_into_required_layout
+            wsf = self.o_b_proj.__dict__.setdefault(
+                "_ob_wsf_int",
+                transform_sf_into_required_layout(wsf,
+                                                  mn=N,
+                                                  k=K_ob,
+                                                  recipe=(1, 128, 128),
+                                                  is_sfa=False))
+        partials = torch.empty([SK, M, N],
+                               device=o_lora_fp8.device,
+                               dtype=self.dtype)
+        torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, w, wsf,
+                                              partials, SK)
+        return partials.reshape(SK * M, N)
+
     def _deepseek_v4_o_proj(self, attn_out_latent: torch.Tensor,
                             position_ids: torch.Tensor) -> torch.Tensor:
         num_tokens = attn_out_latent.shape[0]
@@ -1917,6 +1994,38 @@ class MLA(nn.Module):
                     128,
                     self.inverse_rotary_emb.is_neox,
                 ))
+            # Fused o_proj (opt-in via DSV4_FUSE_OPROJ): o_a emits o_lora as fp8 e4m3
+            # + packed-UE8M0 1x128 scales directly, fed to DeepGEMM without the
+            # separate fp8_quantize_1x128 kernel + bf16 o_lora round-trip; the fused
+            # hidden is bit-identical to the o_b_proj Linear path. GATE: tp_size==1
+            # only — o_b_proj is row-parallel, so bypassing the Linear skips its
+            # all-reduce, a no-op only when groups are unsharded
+            # (n_local_groups==num_groups).
+            if (os.environ.get("DSV4_FUSE_OPROJ", "0") == "1"
+                    and self.n_local_groups == self.num_groups
+                    and getattr(self.o_b_proj, "tp_size", 1) == 1
+                    and self.o_b_proj.has_fp8_block_scales and not getattr(
+                        self.o_b_proj, "use_cute_dsl_blockscaling_mm", False)):
+                _M, _L, _Ng = num_tokens, self.n_local_groups, self.o_lora_rank
+                _aligned_mn = ((_M + 3) // 4) * 4
+                _ntiles = (_Ng + 127) // 128
+                _nkb4 = (_L * _ntiles + 3) // 4
+                o_lora_fp8 = torch.empty([_M, _L, _Ng],
+                                         device=attn_out_latent.device,
+                                         dtype=torch.float8_e4m3fn)
+                _sf_storage = torch.zeros(_nkb4 * _aligned_mn,
+                                          device=attn_out_latent.device,
+                                          dtype=torch.int32)
+                sf_out = torch.as_strided(_sf_storage, (_M, _nkb4),
+                                          (1, _aligned_mn))
+                torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(
+                    attn_fp8, self.o_a_proj, attn_scale, self.o_a_proj_scale,
+                    o_lora_fp8.transpose(0, 1), sf_out)
+                o_lora_fp8 = o_lora_fp8.flatten(1)  # [M, L*Ng] contiguous
+                # ob_split_k==1: reduced hidden [M,N]; >1: split-K partials
+                # [SK*M,N] consumed downstream by mHC's x-ring.
+                return self._fused_ob_gemm(o_lora_fp8, sf_out, num_tokens)
+
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
                 device=attn_out_latent.device,
