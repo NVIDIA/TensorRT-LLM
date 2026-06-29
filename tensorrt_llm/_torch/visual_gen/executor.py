@@ -5,7 +5,9 @@ import socket
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -27,6 +29,139 @@ POLL_TIMEOUT = 0.01
 AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
+
+# Default cap on the size of the iteration-stats snapshot buffer used by the
+# /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
+_DEFAULT_ITER_STATS_MAX = 1000
+
+
+class _IterationStatsTracker:
+    """Visual-gen analog of the LLM iteration-stats producer.
+
+    Mirrors the LLM /metrics shape where it makes sense (``numActiveRequests``,
+    ``numQueuedRequests``) so any downstream consumer that already parses the
+    LLM /metrics shape can read VisualGen /metrics with minimal code changes.
+
+    Snapshots are produced on lifecycle events (request enqueued, request sent
+    to workers, response received) rather than on a fixed cadence, so a
+    consumer always sees the transitions between idle / queued / active states
+    even between rapid-fire calls to ``/metrics``.
+    """
+
+    def __init__(self, maxlen: int = _DEFAULT_ITER_STATS_MAX):
+        self._iter = 0
+        self._buffer: deque = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        # Set of request ids that have been pushed onto the worker queue but
+        # not yet completed (received their final response).  Tracking by id
+        # (instead of just a counter) makes ``record_request_completed``
+        # idempotent under duplicate completion events and keeps
+        # ``currentRequestId`` valid when responses arrive out of order with
+        # respect to dispatch order.
+        self._active_request_ids: Set[int] = set()
+        # Insertion order of active ids; we use the most-recently-added id as
+        # the "current" request when the previous current request completes
+        # while others remain in flight.  ``deque`` lets us pop from either
+        # end in O(1) and preserve ordering across out-of-order completions.
+        self._active_order: deque = deque()
+        # Most-recently-sent in-flight request id; ``None`` when idle.
+        self._current_request_id: Optional[int] = None
+        # Cumulative diffusion-step count since the current request started.
+        # Reset to 0 when a new request becomes the current one and frozen
+        # once that request completes (becomes a stable post-mortem value
+        # until the next request begins).
+        self._current_steps_processed = 0
+        # Per-request step index for the in-flight request; ``None`` when
+        # idle or when no step-progress signal is available from the
+        # underlying pipeline.
+        self._current_request_step_idx: Optional[int] = None
+
+    def _snapshot_locked(self, num_queued_requests: int) -> Dict:
+        """Build a snapshot dict (caller must hold ``self._lock``)."""
+        self._iter += 1
+        return {
+            "iter": self._iter,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "numQueuedRequests": int(num_queued_requests),
+            "numActiveRequests": len(self._active_request_ids),
+            "currentStepsProcessed": int(self._current_steps_processed),
+            "currentRequestId": self._current_request_id,
+            "currentRequestStepIdx": self._current_request_step_idx,
+        }
+
+    def record_enqueue(self, num_queued_requests: int) -> None:
+        """Append a snapshot reflecting an enqueue event."""
+        with self._lock:
+            self._buffer.append(self._snapshot_locked(num_queued_requests))
+
+    def record_request_started(self, request_id: int, num_queued_requests: int) -> None:
+        """Append a snapshot reflecting a request being dispatched to workers."""
+        with self._lock:
+            if request_id not in self._active_request_ids:
+                self._active_request_ids.add(request_id)
+                self._active_order.append(request_id)
+            # The most-recently-dispatched request becomes the "current" one
+            # for step-progress reporting; reset step state to match.
+            self._current_request_id = request_id
+            self._current_steps_processed = 0
+            self._current_request_step_idx = None
+            self._buffer.append(self._snapshot_locked(num_queued_requests))
+
+    def record_request_completed(self, request_id: int, num_queued_requests: int) -> None:
+        """Append a snapshot reflecting a request completion.
+
+        Idempotent: a duplicate completion event for the same ``request_id``
+        is a no-op for the active count and current-request state, so the
+        active count cannot underflow and an unrelated in-flight request's
+        state is never disturbed.
+        """
+        with self._lock:
+            if request_id in self._active_request_ids:
+                self._active_request_ids.discard(request_id)
+                # Lazy removal from the ordering deque -- we filter stale
+                # entries when picking a fallback "current" id below.
+                if self._current_request_id == request_id:
+                    # Drop the completed id; preserve currentStepsProcessed
+                    # as a post-mortem read for the next snapshot poller.
+                    self._current_request_id = None
+                    self._current_request_step_idx = None
+                    # Fall back to the most-recently-dispatched still-active
+                    # request, if any, so out-of-order completions don't
+                    # spuriously park ``currentRequestId`` at None while
+                    # other requests are still in flight.
+                    while self._active_order:
+                        candidate = self._active_order[-1]
+                        if candidate in self._active_request_ids:
+                            self._current_request_id = candidate
+                            break
+                        self._active_order.pop()
+            self._buffer.append(self._snapshot_locked(num_queued_requests))
+
+    def record_step(self, request_id: int, step_idx: int, num_queued_requests: int) -> None:
+        """Append a snapshot for a per-step diffusion progress event.
+
+        Currently no pipeline emits step callbacks, but the hook is kept for
+        forward-compatibility so a future pipeline integration can populate
+        ``currentRequestStepIdx`` and ``currentStepsProcessed`` accurately
+        without re-shaping the buffer protocol.
+        """
+        with self._lock:
+            if self._current_request_id == request_id:
+                self._current_request_step_idx = int(step_idx)
+                self._current_steps_processed = int(step_idx) + 1
+            self._buffer.append(self._snapshot_locked(num_queued_requests))
+
+    def drain(self) -> List[Dict]:
+        """Return all buffered snapshots and clear the buffer."""
+        with self._lock:
+            stats = list(self._buffer)
+            self._buffer.clear()
+            return stats
+
+    def current_snapshot(self, num_queued_requests: int) -> Dict:
+        """Return a single snapshot of the *current* state (no buffering)."""
+        with self._lock:
+            return self._snapshot_locked(num_queued_requests)
 
 
 def find_free_port() -> int:
@@ -460,6 +595,13 @@ class DiffusionRemoteClient:
         # the process lifetime.
         self._abandoned_request_ids: Set[int] = set()
 
+        # Iteration-stats tracker — populated on lifecycle events (enqueue,
+        # request started, response received) and drained by
+        # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
+        # the LLM iteration-stats producer but with a visual-gen-shaped
+        # payload.
+        self._iter_stats = _IterationStatsTracker()
+
         # We'll create asyncio primitives in the background thread's event loop
         self._event_loop = None
         self.response_event = None
@@ -541,6 +683,11 @@ class DiffusionRemoteClient:
         for req in requests:
             self.pending_requests.put(req)
             req_ids.append(req.request_id)
+        # Record one snapshot per enqueue so a /metrics consumer sees the
+        # queued-request transitions even if the dispatcher drains the queue
+        # before the next poll.
+        if req_ids:
+            self._iter_stats.record_enqueue(self.pending_requests.qsize())
         return req_ids
 
     async def await_responses(
@@ -639,6 +786,9 @@ class DiffusionRemoteClient:
 
             logger.info(f"DiffusionClient: Sending request {req.request_id}")
             self.requests_ipc.put(req)
+            # Once the request has been handed to the workers it becomes the
+            # in-flight ("active") request from the client's perspective.
+            self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
         except queue.Empty:
             pass
         except Exception as e:
@@ -671,9 +821,38 @@ class DiffusionRemoteClient:
         async with self.lock:
             if response.request_id in self._abandoned_request_ids:
                 self._abandoned_request_ids.discard(response.request_id)
+                # The request was abandoned — still mark it complete in the
+                # iteration-stats so ``numActiveRequests`` decrements.
+                if response.request_id != -1:
+                    self._iter_stats.record_request_completed(
+                        response.request_id, self.pending_requests.qsize()
+                    )
                 return
             self.completed_responses[response.request_id] = response
+        # Record completion outside the asyncio lock to avoid blocking the
+        # event loop on the (uncontended) tracker mutex.  The READY signal
+        # uses request_id == -1 and is not tracked as a real request.
+        if response.request_id != -1:
+            self._iter_stats.record_request_completed(
+                response.request_id, self.pending_requests.qsize()
+            )
         self.response_event.set()
+
+    def get_iteration_stats(self) -> List[Dict]:
+        """Return all buffered iteration-stats snapshots and clear the buffer.
+
+        Each dict matches the shape documented for visual-gen ``/metrics``:
+        ``iter``, ``timestamp``, ``numQueuedRequests``, ``numActiveRequests``,
+        ``currentStepsProcessed``, ``currentRequestId``, ``currentRequestStepIdx``.
+        Snapshots are appended on lifecycle events (enqueue, request started,
+        response received) so the buffer is non-empty even between calls
+        unless the executor has been completely idle.
+        """
+        return self._iter_stats.drain()
+
+    def get_current_iteration_snapshot(self) -> Dict:
+        """Return a single snapshot of the current state (no buffering)."""
+        return self._iter_stats.current_snapshot(self.pending_requests.qsize())
 
     async def abandon_request_id(self, request_id: int):
         """Mark a request id as abandoned and drop any cached response.
