@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #if ENABLE_MULTI_DEVICE
@@ -42,6 +43,35 @@ int getNcclCommInitTimeoutSec()
     auto const timeoutSec
         = tensorrt_llm::common::getIntEnv(kNcclCommInitTimeoutEnv).value_or(kDefaultNcclCommInitTimeoutSec);
     return timeoutSec > 0 ? timeoutSec : kDefaultNcclCommInitTimeoutSec;
+}
+
+void waitForNcclAsyncCompletion(ncclComm_t comm)
+{
+    while (true)
+    {
+        ncclResult_t asyncResult = ncclSuccess;
+        auto const result = ncclCommGetAsyncError(comm, &asyncResult);
+        TLLM_NCCL_CHECK(result);
+        if (asyncResult == ncclSuccess)
+        {
+            return;
+        }
+        if (asyncResult != ncclInProgress)
+        {
+            TLLM_NCCL_CHECK(asyncResult);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
+    }
+}
+
+void checkNcclAsyncResult(ncclComm_t comm, ncclResult_t result)
+{
+    if (result == ncclInProgress)
+    {
+        waitForNcclAsyncCompletion(comm);
+        return;
+    }
+    TLLM_NCCL_CHECK(result);
 }
 
 ncclComm_t initNcclCommWithTimeout(ncclUniqueId const& id, int worldSize, int rank, int timeoutSec)
@@ -123,7 +153,7 @@ void NcclCommunicator::send(
     void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
-    TLLM_NCCL_CHECK(ncclSend(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
+    checkNcclAsyncResult(mComm, ncclSend(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -133,7 +163,7 @@ void NcclCommunicator::receive(
     void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
-    TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
+    checkNcclAsyncResult(mComm, ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -143,19 +173,23 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
 {
 #if ENABLE_MULTI_DEVICE
 
-    ncclUniqueId id;
-    if (rank == 0)
-    {
-        ncclGetUniqueId(&id);
-    }
-    mpiComm.bcastValue(id, 0);
 // Need static connection initialization for accurate KV cache size estimation.
 #if defined(_WIN32)
     if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
         _putenv_s("NCCL_RUNTIME_CONNECT", "0");
 #else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+    if (getenv("NCCL_NVLS_ENABLE") == nullptr && !ipcNvlsSupported())
+    {
+        setenv("NCCL_NVLS_ENABLE", "0", 0);
+    }
 #endif // _WIN32
+    ncclUniqueId id;
+    if (rank == 0)
+    {
+        ncclGetUniqueId(&id);
+    }
+    mpiComm.bcastValue(id, 0);
     return initNcclCommWithTimeout(id, worldSize, rank, getNcclCommInitTimeoutSec());
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
