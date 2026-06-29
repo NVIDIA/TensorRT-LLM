@@ -170,16 +170,9 @@ class DynamicTreeSlotStorage:
             return self._verify_staging[:0]
         ids = slot_ids[:count]
         staging = self._verify_staging[:count]
-        # Avoid advanced-indexing temporaries on the verification path.
-        torch.index_select(self.retrieve_index, 0, ids, out=staging[:, :, 0])
-        torch.index_select(self.retrieve_next_token,
-                           0,
-                           ids,
-                           out=staging[:, :, 1])
-        torch.index_select(self.retrieve_next_sibling,
-                           0,
-                           ids,
-                           out=staging[:, :, 2])
+        staging[:, :, 0] = self.retrieve_index[ids]
+        staging[:, :, 1] = self.retrieve_next_token[ids]
+        staging[:, :, 2] = self.retrieve_next_sibling[ids]
         return staging
 
     def next_links_from_slots(self, slot_ids, count):
@@ -254,10 +247,7 @@ class SpecTreeManager:
     # shape: [max_draft_len + 1], device tensor.
     draft_tokens_indices_cumsum: torch.Tensor = None
 
-    ############################ Auxiliary buffers for the dynamic tree. ############################
-    # CUDA kernel outputs for dynamic tree verification.
-    # These are produced by build_dynamic_tree CUDA kernel and used by verify_dynamic_tree_greedy.
-    # shape: [num_trees, max_total_draft_tokens + 1], int32, device tensor.
+    # Work buffers for dynamic tree build kernel output
     retrieve_index: torch.Tensor = None
     retrieve_next_token: torch.Tensor = None
     retrieve_next_sibling: torch.Tensor = None
@@ -305,17 +295,14 @@ class SpecTreeManager:
                 device='cuda',
             ).unsqueeze(0).repeat(self.num_trees, 1, 1)
 
-        # CUDA kernel facing — rows = max_total_draft_tokens + 1,
-        # columns widened to match attn_metadata mask_width so that the
-        # Hopper flat copy in update_spec_dec_param needs no per-row padding.
+        n_dt = self.max_total_draft_tokens + 1
         self.spec_dec_packed_mask = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1,
-             math.ceil(self._internal_buf_dim / 32)),
+            (self.num_trees, n_dt, math.ceil(n_dt / 32)),
             dtype=torch.int32,
             device='cuda',
         )
         self.spec_dec_position_offsets = torch.zeros(
-            (self.num_trees, self.max_total_draft_tokens + 1),
+            (self.num_trees, n_dt),
             dtype=torch.int32,
             device='cuda',
         )
@@ -343,8 +330,16 @@ class SpecTreeManager:
             self.init_tree_info_for_static_tree()
 
     def init_tree_info_for_dynamic_tree(self):
-        # Allocate retrieve buffers for CUDA kernel outputs
         num_draft_with_root = self.max_total_draft_tokens + 1
+
+        self.top_k_list = [
+            torch.ones(self.dynamic_tree_max_topK,
+                       dtype=torch.int32,
+                       device='cpu',
+                       pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
+        ]
+
+        # Work buffers for build_dynamic_tree kernel output
         self.retrieve_index = torch.zeros((self.num_trees, num_draft_with_root),
                                           dtype=torch.int32,
                                           device='cuda')
@@ -359,19 +354,11 @@ class SpecTreeManager:
             dtype=torch.int32,
             device='cuda')
 
-        # For the dynamic tree
-        # To the internal layer, the number of nodes is the same as the dynamic_tree_max_topK.
-        self.top_k_list = [
-            torch.ones(self.dynamic_tree_max_topK,
-                       dtype=torch.int32,
-                       device='cpu',
-                       pin_memory=prefer_pinned()) * self.dynamic_tree_max_topK
-        ]
-
+        mask_width = math.ceil(num_draft_with_root / 32)
         self.slot_storage = DynamicTreeSlotStorage(
             num_slots=self.num_trees,
             n_dt=num_draft_with_root,
-            mask_width=self.spec_dec_packed_mask.shape[-1],
+            mask_width=mask_width,
             top_k=self.dynamic_tree_max_topK,
         )
 
@@ -546,13 +533,21 @@ class SpecTreeManager:
 
         # Use cached bit weights
         weights = self._pack_weights
+        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
+            torch.int32)
+
+        if num_blocks == 1 and num_tokens_attend <= 32:
+            result = self._pack_result_buf[:bs, :num_tokens, :1]
+            torch.sum(src * weights[:num_tokens_attend],
+                      dim=-1,
+                      out=result[:, :, 0])
+            packed_mask[:, :num_tokens, :1] = result
+            return packed_mask
 
         # Pad into pre-allocated buffer
         total_bits = num_blocks * 32
         padded_m = self._padded_mask_buf[:bs, :num_tokens, :total_bits]
         padded_m.zero_()
-        src = mask_matrix if mask_matrix.dtype == torch.int32 else mask_matrix.to(
-            torch.int32)
         padded_m[:, :, :num_tokens_attend].copy_(src)
 
         # Reshape last dim into [num_blocks, 32] for blocked packing
