@@ -66,6 +66,7 @@ FLUX_LPIPS_THRESHOLD = 0.05
 LTX2_LPIPS_NUM_FRAMES = 49
 LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_THRESHOLD = 0.05
+LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
 
 WAN21_LPIPS_PROMPT = "A cat sitting on a windowsill"
 WAN21_LPIPS_NEGATIVE_PROMPT = None
@@ -511,9 +512,9 @@ def _generate_flux_lpips_image(model_path, output_path):
     save_image(generated_image, output_path)
 
 
-def _generate_ltx2_lpips_video(output_path):
+def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
     checkpoint_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
@@ -533,6 +534,8 @@ def _generate_ltx2_lpips_video(output_path):
                 "spatial_upsampler_path": spatial_upsampler_path,
                 "distilled_lora_path": distilled_lora_path,
             },
+            torch_compile_config=TorchCompileConfig(enable=False),
+            cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
@@ -724,6 +727,24 @@ def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
         ltx2_two_stage_bf16_video_path,
     )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
+    eager_path = tmp_path / "ltx2_eager_generated.mp4"
+    cuda_graph_path = tmp_path / "ltx2_cuda_graph_generated.mp4"
+
+    _generate_ltx2_lpips_video(eager_path, enable_cuda_graph=False)
+    _generate_ltx2_lpips_video(cuda_graph_path, enable_cuda_graph=True)
+    score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_cuda_graph",
+        "video",
+        LTX2_T2V_PROMPT,
+        eager_path,
+        cuda_graph_path,
+    )
+    _assert_lpips_below_threshold(score, LTX2_CUDA_GRAPH_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
