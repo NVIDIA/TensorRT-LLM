@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional
 
 import torch
-from capability_matrix import BACKEND_CAPS, unsupported_reason
+from backend_capability import BACKEND_CAPS, unsupported_reason
 from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
 
 import tensorrt_llm
@@ -33,6 +33,7 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_binding
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -50,23 +51,17 @@ BF16_RTOL = 3e-3
 FP8_ATOL = 4e-1
 FP4_ATOL = 6e-1
 
-_STR_TO_DTYPE = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float8_e4m3fn": torch.float8_e4m3fn,
-    "nvfp4": "nvfp4",  # sentinel; not a torch dtype
-}
-
-_BINDINGS_DTYPE = {
-    torch.float16: tensorrt_llm.bindings.DataType.HALF,
-    torch.bfloat16: tensorrt_llm.bindings.DataType.BF16,
-    torch.float8_e4m3fn: tensorrt_llm.bindings.DataType.FP8,
-}
-
 # Backends compared against the VanillaAttention golden. FlashInfer is only
 # included when available, so callers can iterate this list unconditionally.
 BACKENDS_UNDER_TEST = ("TRTLLM",) + (("FLASHINFER",) if IS_FLASHINFER_AVAILABLE else ())
 DEFAULT_MAX_NUM_TOKENS = 8192
+
+
+def _dtype_to_torch(dtype: str):
+    """Convert harness dtype names to torch dtypes, preserving the NVFP4 sentinel."""
+    if dtype == "nvfp4":
+        return dtype
+    return str_dtype_to_torch(dtype)
 
 
 @dataclass(kw_only=True)
@@ -91,7 +86,7 @@ class BackendCase:
 
     dtype: str = "float16"
     # KV cache dtype. None mirrors the compute dtype (the realistic default);
-    # set explicitly only to quantize the cache ("float8_e4m3fn" / "nvfp4").
+    # set explicitly only to quantize the cache ("fp8" / "nvfp4").
     kv_dtype: Optional[str] = None
     causal: bool = True
     sliding_window: Optional[int] = None
@@ -170,13 +165,13 @@ class BackendCase:
 
     @property
     def compute_dtype(self) -> torch.dtype:
-        return _STR_TO_DTYPE[self.dtype]
+        return _dtype_to_torch(self.dtype)
 
     @property
     def kv_torch_dtype(self):
         if self.kv_dtype is None:
             return self.compute_dtype
-        return _STR_TO_DTYPE[self.kv_dtype]
+        return _dtype_to_torch(self.kv_dtype)
 
     @property
     def max_num_tokens(self) -> int:
@@ -246,7 +241,7 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
         bindings_dtype = tensorrt_llm.bindings.DataType.NVFP4
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block, dtype="nvfp4")
     else:
-        bindings_dtype = _BINDINGS_DTYPE[kv_dtype]
+        bindings_dtype = torch_dtype_to_binding(kv_dtype)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     cache_types = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -306,7 +301,7 @@ def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
         max_seq_len=pages_per_seq * tokens_per_block,
         max_batch_size=case.num_seqs,
         mapping=mapping,
-        dtype=_BINDINGS_DTYPE[case.compute_dtype],
+        dtype=torch_dtype_to_binding(case.compute_dtype),
     )
 
 

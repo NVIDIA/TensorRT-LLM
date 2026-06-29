@@ -89,7 +89,7 @@ def required_features(case) -> set:
     feats = set()
     # ``case.kv_dtype`` is a string (or None to mirror the compute dtype).
     kv_dtype = getattr(case, "kv_dtype", None)
-    if kv_dtype == "float8_e4m3fn":
+    if kv_dtype == "fp8":
         feats.add("fp8_kv")
     elif kv_dtype == "nvfp4":
         feats.add("fp4_kv")
@@ -115,7 +115,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     # The Vanilla golden runs in compute dtype so it is unaffected.
     sm = getSMVersion()
     kv_dtype = getattr(case, "kv_dtype", None)
-    if kv_dtype == "float8_e4m3fn" and sm < 89:
+    if kv_dtype == "fp8" and sm < 89:
         return f"FP8 KV cache requires sm>=89 (have sm{sm})"
     if kv_dtype == "nvfp4" and sm < 100:
         return f"NVFP4 KV cache requires sm>=100/Blackwell (have sm{sm})"
@@ -257,7 +257,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     # output scale lets the kernel run, but the MHA path then produces garbage
     # (~1e5 abs error) while only GQA happens to tolerate it. fp8 *context*
     # (pure prefill) is exercised; FlashInfer validates fp8 decode on every arch.
-    if backend == "TRTLLM" and getattr(case, "kv_dtype", None) == "float8_e4m3fn":
+    if backend == "TRTLLM" and getattr(case, "kv_dtype", None) == "fp8":
         has_generation = case.num_contexts < len(case.seq_lens)
         if has_generation:
             return (

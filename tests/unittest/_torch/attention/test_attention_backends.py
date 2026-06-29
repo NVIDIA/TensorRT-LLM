@@ -6,7 +6,7 @@ Every case runs the VanillaAttention golden plus each supported backend
 (TRTLLM, FlashInfer) through a real KVCacheManager and asserts they match.
 
 The breadth sweep is **model-derived**: it enumerates the distinct attention
-configurations actually used by the supported models (``model_configs.py``), so
+configurations actually used by the supported models (``model_attn_config.py``), so
 each case maps to a real workload. The orthogonal dimensions are bounded:
 
 * default cross on every cacheable config: phase {ctx, dec, mix} x
@@ -23,20 +23,14 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 
 import pytest
 import torch
-from attention_test_harness import (
-    BACKENDS_UNDER_TEST,
-    BackendCase,
-    generate_inputs,
-    run_backend,
-    run_case,
-)
-from model_configs import MODEL_CONFIGS, ModelAttnConfig
+from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
+from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
 
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
 _BF16 = ("bfloat16", None)
 _FP16 = ("float16", None)
-_FP8 = ("bfloat16", "float8_e4m3fn")
+_FP8 = ("bfloat16", "fp8")
 
 # Core dimensions crossed on EVERY config; non-default values (page=64, NHD,
 # fp16) are added only for the representative configs below.
@@ -228,7 +222,7 @@ MODEL_CASES = _model_cases()
 
 
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
-def test_attention_backend_model(name):
+def test_attention_backend(name):
     run_case(MODEL_CASES[name])
 
 
@@ -240,7 +234,7 @@ def test_attention_backend_model(name):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("backend", ["VANILLA", *BACKENDS_UNDER_TEST])
 def test_split_consistency(backend):
-    from capability_matrix import unsupported_reason
+    from backend_capability import unsupported_reason
 
     # Two context + two generation requests.
     ctx_lens = _PHASES["ctx"]["seq_lens"][:2]
