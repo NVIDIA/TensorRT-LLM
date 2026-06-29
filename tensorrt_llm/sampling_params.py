@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
@@ -26,6 +27,7 @@ from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
 MAX_TOP_LOGPROBS = 20
+MIN_SAMPLING_TEMPERATURE = 1e-2
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -214,7 +216,8 @@ class SamplingParams:
         top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
         top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
         seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
-        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values >= 0.f. Defaults to None.
+        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It must be finite and can have values >= 0.f. Defaults to None.
+            Positive values smaller than 1e-2 are normalized to 1e-2 for numerical stability, while 0 preserves greedy decoding.
             The value None is treated as "not specified" in the following.
             If neither temperature, top_p, nor top_k are specified, sampling is greedy.
             If top_p < 1 and/or top_k > 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.
@@ -370,8 +373,19 @@ class SamplingParams:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
-        if self.temperature is not None and self.temperature < 0:
-            raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
+        if self.temperature is not None:
+            if not math.isfinite(self.temperature):
+                raise ValueError(
+                    f"require temperature to be finite, got temperature={self.temperature}"
+                )
+            if self.temperature < 0:
+                raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
+            if 0 < self.temperature < MIN_SAMPLING_TEMPERATURE:
+                logger.debug(
+                    f"Clamping temperature from {self.temperature} to {MIN_SAMPLING_TEMPERATURE} "
+                    "to avoid numerical instability."
+                )
+                self.temperature = MIN_SAMPLING_TEMPERATURE
 
         if self.best_of is not None and self.best_of < self.n:
             raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
