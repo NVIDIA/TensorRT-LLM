@@ -361,6 +361,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_flux1_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
   - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
