@@ -102,11 +102,7 @@ init_ubuntu() {
   # PEP 668: Allow break system packages for ubuntu24.04,
   # and ubuntu22.04 (currently not used) shouldn't be affected.
   pip3 config set global.break-system-packages true
-  pip3 install pip wheel
-  # WAR: pin setuptools<80; setuptools>=80 breaks `python setup_library.py develop`
-  # used by cutlass. Use --ignore-installed to avoid failing on system setuptools
-  # that lack a RECORD file (installed via apt without pip metadata).
-  pip3 install --ignore-installed "setuptools<80"
+  pip3 install pip setuptools wheel
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   # Remove previous TRT installation
