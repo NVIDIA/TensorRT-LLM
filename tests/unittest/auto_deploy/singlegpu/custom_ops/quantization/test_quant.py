@@ -19,9 +19,11 @@ import torch
 import torch.nn.functional as F
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
+from tensorrt_llm._torch.auto_deploy.utils.fp8_dequant import (  # noqa: E402
+    dequant_fp8_weight_two_dim_block_grid,
+)
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (  # noqa: E402
     fp4_global_scale,
     pack_int4_in_uint8,
     unpack_uint8_to_int4_weight_2d,
@@ -396,6 +398,170 @@ def test_finegrained_fp8_linear(M, N, K, bias):
         output_fg_fp8.reshape(-1).float(), output_ref.reshape(-1).float(), dim=0
     )
     assert cos > 0.95, f"Cosine similarity too low: {cos}"
+
+
+def _finegrained_fp8_dense_dequant_ref(
+    input_tensor,
+    weight_fp8,
+    weight_scale_inv,
+    block_size,
+    input_scale_fmt="",
+):
+    block_n, block_k = block_size
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    x_blocks = input_tensor.contiguous().view(-1, input_tensor.shape[-1] // block_k, block_k)
+    input_amax = x_blocks.abs().float().amax(dim=-1)
+    if input_scale_fmt.lower() == "ue8m0":
+        input_scale = torch.clamp(input_amax, min=1e-4) / fp8_max
+        input_scale = torch.pow(2.0, torch.ceil(torch.log2(input_scale)))
+    else:
+        input_scale = torch.clamp(input_amax / fp8_max, min=1e-12)
+    qinput = (x_blocks.float() / input_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    input_dequant = (qinput.float() * input_scale.unsqueeze(-1)).view_as(input_tensor)
+
+    weight_scale = weight_scale_inv.repeat_interleave(block_n, dim=0).repeat_interleave(
+        block_k, dim=1
+    )
+    weight_dequant = weight_fp8.float() * weight_scale
+    return torch.nn.functional.linear(
+        input_dequant.to(input_tensor.dtype),
+        weight_dequant.to(input_tensor.dtype),
+    )
+
+
+def _grouped_finegrained_fp8_dense_dequant_ref(
+    input_tensor,
+    weight_fp8,
+    bias,
+    weight_scale_inv,
+    block_size,
+    input_scale_fmt="",
+):
+    block_n, block_k = block_size
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    num_groups = input_tensor.shape[-2]
+    rank = weight_fp8.shape[0] // num_groups
+
+    x_blocks = input_tensor.contiguous().view(*input_tensor.shape[:-1], -1, block_k)
+    input_amax = x_blocks.abs().float().amax(dim=-1)
+    if input_scale_fmt.lower() == "ue8m0":
+        input_scale = torch.clamp(input_amax, min=1e-4) / fp8_max
+        input_scale = torch.pow(2.0, torch.ceil(torch.log2(input_scale)))
+    else:
+        input_scale = torch.clamp(input_amax / fp8_max, min=1e-12)
+    qinput = (x_blocks.float() / input_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    input_dequant = (qinput.float() * input_scale.unsqueeze(-1)).view_as(input_tensor)
+
+    weight_scale = weight_scale_inv.repeat_interleave(block_n, dim=0).repeat_interleave(
+        block_k, dim=1
+    )
+    weight_scale = weight_scale[: weight_fp8.shape[0], : weight_fp8.shape[1]]
+    weight_dequant = (weight_fp8.float() * weight_scale).to(input_tensor.dtype)
+    weight_grouped = weight_dequant.view(num_groups, rank, input_tensor.shape[-1])
+    output = torch.matmul(
+        input_dequant.to(input_tensor.dtype).unsqueeze(-2),
+        weight_grouped.transpose(-1, -2),
+    ).squeeze(-2)
+    output = output.flatten(-2)
+    if bias is not None:
+        output = output + bias.reshape(weight_fp8.shape[0]).to(output.dtype)
+    return output
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_finegrained_fp8_linear_ue8m0_input_scale_quantizes_with_rounded_scale():
+    block_size = [128, 128]
+    N, K = 128, 128
+
+    base = torch.linspace(1.0, 97.0, K, device="cuda", dtype=torch.float32)
+    input_tensor = torch.stack(
+        [
+            base,
+            base * 0.75 + 3.0,
+            base * 0.5 + 7.0,
+            base * 0.25 + 11.0,
+        ]
+    ).to(torch.float16)
+    weight_fp8 = torch.ones(N, K, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
+    weight_scale_inv = torch.ones(1, 1, device="cuda", dtype=torch.float32)
+
+    output_raw = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+        input_tensor,
+        weight_fp8,
+        None,
+        [],
+        [weight_scale_inv],
+        [],
+        [],
+    )
+    output_ue8m0 = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
+        input_tensor,
+        weight_fp8,
+        None,
+        [],
+        [weight_scale_inv],
+        [],
+        [],
+        input_scale_fmt="ue8m0",
+    )
+
+    ref_raw = _finegrained_fp8_dense_dequant_ref(
+        input_tensor, weight_fp8, weight_scale_inv, block_size
+    )
+    ref_ue8m0 = _finegrained_fp8_dense_dequant_ref(
+        input_tensor, weight_fp8, weight_scale_inv, block_size, input_scale_fmt="ue8m0"
+    )
+
+    assert not torch.allclose(output_raw, output_ue8m0, rtol=1e-3, atol=1e-2)
+    torch.testing.assert_close(output_raw, ref_raw, rtol=0.02, atol=1.0)
+    torch.testing.assert_close(output_ue8m0, ref_ue8m0, rtol=0.02, atol=1.0)
+
+
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_grouped_finegrained_fp8_linear_matches_dense_dequant_ue8m0_reference(bias):
+    block_size = [128, 128]
+    batch_size, seq_len, num_groups, rank, group_width = 2, 3, 2, 128, 128
+    N = num_groups * rank
+    K = group_width
+
+    input_tensor = torch.randn(
+        batch_size, seq_len, num_groups, K, device="cuda", dtype=torch.float16
+    )
+    weight = torch.randn(N, K, device="cuda", dtype=torch.float16)
+    bias_tensor = torch.randn(N, device="cuda", dtype=torch.float16) if bias else None
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    weight_blocks = weight.float().view(num_groups, rank, K // block_size[1], block_size[1])
+    amax = weight_blocks.abs().amax(dim=(1, 3)).to(torch.float32)
+    weight_scale_inv = torch.clamp(amax / fp8_max, min=torch.finfo(torch.float32).tiny)
+    weight_scale = weight_scale_inv.repeat_interleave(rank, dim=0).repeat_interleave(
+        block_size[1], dim=1
+    )
+    weight_fp8 = (weight.float() / weight_scale).to(torch.float8_e4m3fn)
+
+    output = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear(
+        input_tensor,
+        weight_fp8,
+        bias_tensor,
+        [],
+        [weight_scale_inv],
+        [],
+        [],
+        input_scale_fmt="ue8m0",
+    )
+    ref = _grouped_finegrained_fp8_dense_dequant_ref(
+        input_tensor,
+        weight_fp8,
+        bias_tensor,
+        weight_scale_inv,
+        block_size,
+        input_scale_fmt="ue8m0",
+    )
+
+    assert output.shape == (batch_size, seq_len, N)
+    torch.testing.assert_close(output, ref, rtol=0.02, atol=1.0)
 
 
 def _fused_relu2_quantize_available():

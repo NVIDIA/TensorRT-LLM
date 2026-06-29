@@ -27,7 +27,7 @@ for background.
 import operator
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, Type
 
 import torch
 from pydantic import Field, field_validator
@@ -46,6 +46,7 @@ from ...utils.node_utils import (
     _get_op_schema,
     extract_op_args,
     extract_weight_nodes,
+    get_param_or_buffer,
     invalidate_weight_node_cache,
     is_any_lin_op,
     set_op_args,
@@ -177,6 +178,80 @@ def _replicate_rowwise_bias(bn: WeightNode, rank: int) -> None:
         partial(_rowwise_bias_load_hook, rank=rank, param_key=pname)
     )
     setattr(bn.submod, pname, torch.nn.Parameter(new_bias.detach().clone(), requires_grad=False))
+
+
+def _assert_divisible(value: int, divisor: int, msg: str) -> None:
+    assert value % divisor == 0, f"{msg}: {value} is not divisible by {divisor}"
+
+
+def _contiguous_partition(total: int, world_size: int, rank: int) -> Tuple[int, int]:
+    _assert_divisible(total, world_size, "contiguous partition")
+    part = total // world_size
+    return rank * part, (rank + 1) * part
+
+
+def _split_flattened_groups(
+    tensor: torch.Tensor,
+    *,
+    num_groups: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Split a row-major ``[num_groups * rows_per_group, ...]`` tensor by group."""
+    _assert_divisible(num_groups, world_size, "group count")
+    _assert_divisible(int(tensor.shape[0]), num_groups, "flattened grouped rows")
+    group_lo, group_hi = _contiguous_partition(num_groups, world_size, rank)
+    rows_per_group = int(tensor.shape[0]) // num_groups
+    grouped = tensor.reshape(num_groups, rows_per_group, *tensor.shape[1:])
+    return grouped[group_lo:group_hi].reshape(-1, *tensor.shape[1:]).contiguous()
+
+
+def _split_grouped_fp8_scale(
+    tensor: torch.Tensor,
+    *,
+    num_groups: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    if int(tensor.shape[0]) % num_groups == 0:
+        return _split_flattened_groups(
+            tensor,
+            num_groups=num_groups,
+            rank=rank,
+            world_size=world_size,
+        )
+    return _split_fp8_block_scale(tensor, dim=0, rank=rank, world_size=world_size)
+
+
+def _slice_group_range(tensor: torch.Tensor, group_lo: int, group_hi: int) -> torch.Tensor:
+    return tensor[group_lo:group_hi].contiguous()
+
+
+def _get_attr_tensor(gm: GraphModule, node: Node, arg_name: str) -> Tuple[str, torch.Tensor]:
+    assert isinstance(node, Node) and node.op == "get_attr" and isinstance(node.target, str), (
+        f"Expected {arg_name} to be a get_attr node, got {node!r}"
+    )
+    return node.target, get_param_or_buffer(node.target, gm)
+
+
+def _weight_node_from_attr(gm: GraphModule, node: Node, tensor: torch.Tensor) -> WeightNode:
+    node_key = str(node.target)
+    return WeightNode(
+        node=node,
+        node_key=node_key,
+        tensor=tensor,
+        submod=gm.get_submodule(node_key.rpartition(".")[0]),
+    )
+
+
+def _set_node_meta_shape(node: Node, new_shape: Tuple[int, ...]) -> None:
+    meta_val = node.meta.get("val")
+    if isinstance(meta_val, torch.Tensor):
+        node.meta["val"] = torch.empty(
+            new_shape,
+            dtype=meta_val.dtype,
+            device=meta_val.device,
+        )
 
 
 _SHARDING_HINT_NAMES = frozenset(
@@ -420,6 +495,133 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
             )
 
 
+@ShardableNode.register(torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear)
+class GroupedFineGrainedFP8LinearShardableNode(ShardableNode):
+    """Grouped FineGrained FP8 linear: shard by whole output group boundaries."""
+
+    @staticmethod
+    def _input_is_tp_scaled_group_view(input_node: Node, group_dim: int) -> bool:
+        if not (
+            isinstance(input_node, Node)
+            and input_node.op == "call_function"
+            and input_node.target == torch.ops.auto_deploy.view.default
+        ):
+            return False
+
+        [tp_scaled_dim, view_shape] = extract_op_args(input_node, "tp_scaled_dim", "shape")
+        if tp_scaled_dim == -1:
+            return False
+        if tp_scaled_dim < 0:
+            tp_scaled_dim = len(view_shape) + tp_scaled_dim
+        return tp_scaled_dim == group_dim
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+
+        [input_node, weight_node, bias_node, weight_scale, tp_min_local_shape] = extract_op_args(
+            self.node,
+            "input",
+            "weight_quantized",
+            "bias",
+            "weight_scale",
+            "tp_min_local_shape",
+        )
+        assert isinstance(weight_scale, (list, tuple)) and len(weight_scale) == 1, (
+            "Grouped FineGrained FP8 linear expects a single weight_scale_inv tensor."
+        )
+        scale_node = weight_scale[0]
+        weight_name, weight_tensor = _get_attr_tensor(gm, weight_node, "weight_quantized")
+        _, scale_tensor = _get_attr_tensor(gm, scale_node, "weight_scale")
+
+        rank = int(tp_min_local_shape) if tp_min_local_shape else 1
+        _assert_divisible(int(weight_tensor.shape[0]), rank, "grouped FP8 weight rows")
+        num_groups = int(weight_tensor.shape[0]) // rank
+        _assert_divisible(num_groups, dc.tp_size, "grouped FP8 output groups")
+        local_groups = num_groups // dc.tp_size
+        group_lo, group_hi = _contiguous_partition(num_groups, dc.tp_size, dc.tp_rank)
+
+        input_shape = shape(input_node)
+        assert input_shape is not None and len(input_shape) >= 2, (
+            f"Cannot determine grouped FP8 input shape for node {self.node.name}."
+        )
+        group_dim = len(input_shape) - 2
+        observed_groups = int(input_shape[group_dim])
+        assert observed_groups in (num_groups, local_groups), (
+            "Grouped FineGrained FP8 input group count must match either global groups "
+            f"({num_groups}) or TP-local groups ({local_groups}), got {observed_groups}."
+        )
+
+        split_groups = partial(
+            _split_flattened_groups,
+            num_groups=num_groups,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_tensor,
+            param_key=weight_name,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+            custom_shard_fn=split_groups,
+        )
+
+        if isinstance(bias_node, Node):
+            bias_name, bias_tensor = _get_attr_tensor(gm, bias_node, "bias")
+            bias_split = (
+                split_groups
+                if bias_tensor.ndim == 1
+                else partial(_slice_group_range, group_lo=group_lo, group_hi=group_hi)
+            )
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=bias_tensor,
+                param_key=bias_name,
+                dim=SplitDimension.COLUMN,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+                custom_shard_fn=bias_split,
+            )
+
+        scale_split = partial(
+            _split_grouped_fp8_scale,
+            num_groups=num_groups,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+        scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
+        _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
+
+        view_localizes_groups = self._input_is_tp_scaled_group_view(input_node, group_dim)
+        if view_localizes_groups:
+            local_input_shape = list(input_shape)
+            local_input_shape[group_dim] = local_groups
+            _set_node_meta_shape(input_node, tuple(local_input_shape))
+        elif observed_groups == num_groups:
+            with gm.graph.inserting_before(self.node):
+                local_input = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(input_node, group_dim, group_lo, group_hi, 1),
+                )
+            local_shape = list(input_shape)
+            local_shape[group_dim] = local_groups
+            _set_node_meta_shape(local_input, tuple(local_shape))
+            set_op_args(self.node, input=local_input)
+
+        output_shape = shape(self.node)
+        if output_shape is not None:
+            local_output_shape = list(output_shape)
+            local_output_shape[-1] = local_groups * rank
+            _set_node_meta_shape(self.node, tuple(local_output_shape))
+
+        ad_logger.debug(
+            f"  sharded grouped FP8 linear groups [{group_lo}:{group_hi}] / {num_groups}"
+        )
+        return 1
+
+
 @ShardableNode.register(
     torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
     torch.ops.auto_deploy.torch_quant_nvfp4_linear,
@@ -466,19 +668,58 @@ class ViewShardableNode(ShardableNode):
         return True
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        [tp_scaled_dim, view_shape] = extract_op_args(self.node, "tp_scaled_dim", "shape")
+        [tp_scaled_dim, view_shape, tp_min_local_shape] = extract_op_args(
+            self.node, "tp_scaled_dim", "shape", "tp_min_local_shape"
+        )
         if tp_scaled_dim == -1:
             return 0
 
         view_shape = list(view_shape)
         if tp_scaled_dim < 0:
             tp_scaled_dim = len(view_shape) + tp_scaled_dim
+        modified = self._shard_parameter_input(gm, dc, tp_scaled_dim, tp_min_local_shape)
         if tp_scaled_dim < len(view_shape) and isinstance(view_shape[tp_scaled_dim], int):
             view_shape[tp_scaled_dim] = -1
             set_op_args(self.node, shape=view_shape)
             ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim} to -1 (inferred)")
-            return 1
-        return 0
+            modified = 1
+        return modified
+
+    def _shard_parameter_input(
+        self,
+        gm: GraphModule,
+        dc: DistConfig,
+        tp_scaled_dim: int,
+        tp_min_local_shape: Optional[int],
+    ) -> int:
+        """Shard get_attr tensors that are reshaped by a sharding-aware view."""
+        view_input = self.node.args[0]
+        if not isinstance(view_input, Node) or view_input.op != "get_attr":
+            return 0
+        if tp_scaled_dim != 0:
+            raise RuntimeError(
+                "Parameter sharding through auto_deploy.view currently supports "
+                f"tp_scaled_dim=0, got {tp_scaled_dim} on {self.node.name}."
+            )
+
+        weight_nodes = extract_weight_nodes(view_input)
+        shardable = weight_nodes.weights + weight_nodes.biases
+        if not shardable:
+            return 0
+
+        min_shape = tp_min_local_shape if tp_min_local_shape else 1
+        for wn in shardable:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=wn.tensor,
+                param_key=wn.node_key,
+                dim=0,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+                min_local_shape=min_shape,
+            )
+        ad_logger.debug(f"  sharded {len(shardable)} parameter(s) feeding view {self.node.name}")
+        return 1
 
 
 @ShardableNode.register(torch.ops.auto_deploy.split_with_sizes)
@@ -529,7 +770,7 @@ class AllReduceShardableNode(ShardableNode):
         if dc.tp_size <= 1:
             return 0
 
-        _, all_reduce_op = _get_dist_ops("auto")
+        _, all_reduce_op = _get_dist_ops(dc.dist_backend)
         [x] = extract_op_args(self.node, "x")
         self.node.target = all_reduce_op
         self.node.args = (x, dc.allreduce_strategy)
@@ -631,7 +872,7 @@ class WeightedParamShardableNode(ShardableNode):
 
 
 @ShardableNode.register(torch.ops.auto_deploy.torch_attention)
-class AttentionSinksShardableNode(ShardableNode):
+class AttentionSinkShardableNode(ShardableNode):
     """``torch_attention`` with per-head ``sinks``: shard sinks along the head dim.
 
     Attention-sink models (e.g. GPT-OSS) add a learnable per-head sink scalar
@@ -647,8 +888,18 @@ class AttentionSinksShardableNode(ShardableNode):
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         if dc.tp_size <= 1:
             return 0
+
+        [enable_sharding] = extract_op_args(self.node, "enable_sharding")
+        if enable_sharding is False:
+            return 0
+
+        [sinks_node] = extract_op_args(self.node, "sinks")
+        if not isinstance(sinks_node, Node):
+            return 0
+
+        weight_nodes = extract_weight_nodes(sinks_node)
         count = 0
-        for wn in extract_weight_nodes(self.node).weights:
+        for wn in weight_nodes.weights:
             # Only the per-head ``sinks`` (1-D) follows the head split; never a 2-D weight.
             if wn.tensor.dim() != 1:
                 continue
@@ -670,6 +921,50 @@ class AttentionSinksShardableNode(ShardableNode):
         # Leave ``torch_attention`` untouched at strip time: its ``layer_type`` is a
         # benign op default that downstream backend selection reads as-is.
         return False
+
+
+class AttentionSinkArgShardableNode(ShardableNode):
+    """Attention op with an ``attn_sink`` argument: shard only the per-head sink tensor."""
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+
+        [enable_sharding] = extract_op_args(self.node, "enable_sharding")
+        if enable_sharding is False:
+            return 0
+
+        [attn_sink_node] = extract_op_args(self.node, "attn_sink")
+        if not isinstance(attn_sink_node, Node):
+            return 0
+
+        weight_nodes = extract_weight_nodes(attn_sink_node)
+        count = 0
+        for wn in weight_nodes.weights:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=wn.tensor,
+                param_key=wn.node_key,
+                dim=0,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+            )
+            count += 1
+
+        if count:
+            ad_logger.debug(f"  sharded {count} attention sink tensor(s)")
+        return 1 if count > 0 else 0
+
+
+for _sparse_attention_op_name in (
+    "torch_deepseek_v4_sparse_attention",
+    "torch_deepseek_v4_sparse_attention_with_cache",
+):
+    try:
+        _sparse_attention_op = getattr(torch.ops.auto_deploy, _sparse_attention_op_name)
+    except AttributeError:
+        continue
+    ShardableNode.register(_sparse_attention_op)(AttentionSinkArgShardableNode)
 
 
 @ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
@@ -953,6 +1248,31 @@ class MoEShardableNode(ShardableNode):
         )
 
 
+class _StackedMoESchema(NamedTuple):
+    """Argument layout for stacked-expert MoE custom ops."""
+
+    expert_arg_names: Tuple[str, ...]
+    optional_trailing_arg_names: Tuple[str, ...]
+
+
+_STACKED_MOE_EXPERT_ARGS = (
+    "gate_up_blocks",
+    "gate_up_bias",
+    "gate_up_scales",
+    "down_blocks",
+    "down_bias",
+    "down_scales",
+)
+_ROUTER_STACKED_MOE_SCHEMA = _StackedMoESchema(
+    expert_arg_names=_STACKED_MOE_EXPERT_ARGS,
+    optional_trailing_arg_names=("layer_type",),
+)
+_ROUTING_DRIVEN_STACKED_MOE_SCHEMA = _StackedMoESchema(
+    expert_arg_names=_STACKED_MOE_EXPERT_ARGS,
+    optional_trailing_arg_names=("gate_up_order", "swiglu_mode", "layer_type"),
+)
+
+
 class StackedMoEShardableNode(ShardableNode):
     """Stacked-tensor MoE EP sharding: slice along the expert dimension and rewrite.
 
@@ -961,18 +1281,176 @@ class StackedMoEShardableNode(ShardableNode):
     stacked into 3-D tensors (``Tensor[num_experts, ...]``).  Sharding slices
     along dim 0 to select the local expert partition.
 
-    Currently the only registered variant is ``triton_mxfp4_moe`` (MXFP4
-    quantized), but the approach generalises to any stacked-tensor MoE op.
-    The op is rewritten to ``triton_mxfp4_moe_ep`` with an explicit
+    Registered MXFP4 variants carry explicit argument schemas.  This covers both
+    router-style ops that compute top-k internally and routing-driven ops that
+    receive ``selected_experts``/``routing_weights`` from a separate router.
+    Each variant rewrites to its matching ``*_ep`` op with an explicit
     ``all_reduce`` after the node.
     """
 
-    _IDX_GATE_UP_BLOCKS = 4
-    _IDX_GATE_UP_BIAS = 5
-    _IDX_GATE_UP_SCALES = 6
-    _IDX_DOWN_BLOCKS = 9
-    _IDX_DOWN_BIAS = 10
-    _IDX_DOWN_SCALES = 11
+    _EP_TARGET_BY_BASE: Dict[Any, OpOverload] = {}
+    _SCHEMA_BY_BASE: Dict[Any, _StackedMoESchema] = {}
+
+    @classmethod
+    def register_variant(
+        cls,
+        base_target,
+        ep_target: OpOverload,
+        schema: Optional[_StackedMoESchema] = None,
+    ) -> None:
+        """Register one stacked MXFP4 MoE op and remember its matching EP op."""
+        schema = schema or cls._infer_schema(base_target)
+        ShardableNode.register(base_target)(cls)
+        cls._EP_TARGET_BY_BASE[base_target] = ep_target
+        cls._SCHEMA_BY_BASE[base_target] = schema
+        if isinstance(base_target, OpOverloadPacket):
+            for overload_name in base_target.overloads():
+                overload = getattr(base_target, overload_name)
+                cls._EP_TARGET_BY_BASE[overload] = ep_target
+                cls._SCHEMA_BY_BASE[overload] = schema
+
+    @classmethod
+    def _arg_positions(cls, target) -> Dict[str, int]:
+        overload = (
+            getattr(target, "default", target) if isinstance(target, OpOverloadPacket) else target
+        )
+        schema = getattr(overload, "_schema", None)
+        if schema is None:
+            return {}
+        return {arg.name: idx for idx, arg in enumerate(schema.arguments)}
+
+    @classmethod
+    def _infer_schema(cls, target) -> _StackedMoESchema:
+        arg_positions = cls._arg_positions(target)
+        if not arg_positions:
+            raise RuntimeError(f"Cannot infer stacked MoE schema for op {target}")
+
+        if not all(arg_name in arg_positions for arg_name in _STACKED_MOE_EXPERT_ARGS):
+            raise RuntimeError(f"Op {target} does not match the stacked MXFP4 MoE expert schema")
+
+        if {"selected_experts", "routing_weights"}.issubset(arg_positions):
+            return _ROUTING_DRIVEN_STACKED_MOE_SCHEMA
+        if {"router_weight", "router_bias", "top_k"}.issubset(arg_positions):
+            return _ROUTER_STACKED_MOE_SCHEMA
+        raise RuntimeError(f"Op {target} does not expose a supported stacked MXFP4 routing schema")
+
+    @classmethod
+    def _ep_target_for(cls, target) -> Optional[OpOverload]:
+        ep_target = cls._EP_TARGET_BY_BASE.get(target)
+        if ep_target is None and isinstance(target, OpOverloadPacket):
+            ep_target = cls._EP_TARGET_BY_BASE.get(getattr(target, "default", None))
+        return ep_target
+
+    @classmethod
+    def _schema_for(cls, target) -> Optional[_StackedMoESchema]:
+        schema = cls._SCHEMA_BY_BASE.get(target)
+        if schema is None and isinstance(target, OpOverloadPacket):
+            schema = cls._SCHEMA_BY_BASE.get(getattr(target, "default", None))
+        return schema
+
+    @classmethod
+    def _move_optional_args_to_kwargs(
+        cls,
+        args: List[Any],
+        kwargs: Dict[str, Any],
+        base_target,
+        ep_target,
+        arg_names: Tuple[str, ...],
+    ) -> Tuple[List[Any], Dict[str, Any]]:
+        base_positions = cls._arg_positions(base_target)
+        ep_positions = cls._arg_positions(ep_target)
+        ordered_names = sorted(
+            arg_names,
+            key=lambda name: base_positions.get(name, -1),
+            reverse=True,
+        )
+        for arg_name in ordered_names:
+            base_pos = base_positions.get(arg_name)
+            if base_pos is None:
+                continue
+            if arg_name not in ep_positions:
+                if arg_name in kwargs or base_pos < len(args):
+                    raise RuntimeError(
+                        f"Cannot preserve argument '{arg_name}' when rewriting "
+                        f"{base_target} to {ep_target}: EP op does not accept it."
+                    )
+                continue
+            if arg_name in kwargs:
+                continue
+            if base_pos < len(args):
+                kwargs[arg_name] = args.pop(base_pos)
+        return args, kwargs
+
+    @classmethod
+    def _ep_topology_args(
+        cls, ep_target: OpOverload, expert_start: int, ep_size: int, ep_rank: int
+    ) -> Dict[str, int]:
+        ep_positions = cls._arg_positions(ep_target)
+        topology_args: Dict[str, int] = {}
+        if "expert_start" in ep_positions:
+            topology_args["expert_start"] = int(expert_start)
+
+        has_ep_size = "ep_size" in ep_positions
+        has_ep_rank = "ep_rank" in ep_positions
+        if has_ep_size or has_ep_rank:
+            if not (has_ep_size and has_ep_rank):
+                raise RuntimeError(f"EP op {ep_target} must accept both ep_size and ep_rank")
+            topology_args["ep_size"] = int(ep_size)
+            topology_args["ep_rank"] = int(ep_rank)
+
+        if not topology_args:
+            raise RuntimeError(
+                f"EP op {ep_target} must accept expert_start or ep_size/ep_rank topology args"
+            )
+        return topology_args
+
+    @staticmethod
+    def _slice_experts(tensor: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+        return tensor[lo:hi]
+
+    @classmethod
+    def _shard_get_attr_expert_arg(cls, gm: GraphModule, arg: Node, lo: int, hi: int) -> Node:
+        mod_name, _, attr_name = arg.target.rpartition(".")
+        submod = gm.get_submodule(mod_name)
+        tensor = getattr(submod, attr_name)
+        local_tensor = cls._slice_experts(tensor, lo, hi).detach().clone()
+
+        if attr_name in submod._buffers:
+            persistent = attr_name not in submod._non_persistent_buffers_set
+            submod.register_buffer(attr_name, local_tensor, persistent=persistent)
+        elif attr_name in submod._parameters:
+            requires_grad = submod._parameters[attr_name].requires_grad
+            setattr(
+                submod,
+                attr_name,
+                torch.nn.Parameter(local_tensor, requires_grad=requires_grad),
+            )
+        else:
+            setattr(submod, attr_name, local_tensor)
+
+        arg.meta["val"] = local_tensor
+        f_split = partial(cls._slice_experts, lo=lo, hi=hi)
+        submod._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook,
+                f_split=f_split,
+                param_key=attr_name,
+                param_shape=local_tensor.shape,
+            )
+        )
+        invalidate_weight_node_cache(gm)
+        return arg
+
+    @classmethod
+    def _local_expert_arg(cls, gm: GraphModule, node: Node, arg: Any, lo: int, hi: int) -> Any:
+        if isinstance(arg, Node) and arg.op == "get_attr":
+            return cls._shard_get_attr_expert_arg(gm, arg, lo, hi)
+
+        with gm.graph.inserting_before(node):
+            return gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(arg, 0, lo, hi, 1),
+            )
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         ep_size = dc.moe_ep_size
@@ -980,10 +1458,19 @@ class StackedMoEShardableNode(ShardableNode):
 
         if ep_size <= 1:
             return 0
+        ep_target = self._ep_target_for(self.node.target)
+        if ep_target is None:
+            raise RuntimeError(f"No EP target registered for stacked MoE op {self.node.target}")
+        schema = self._schema_for(self.node.target)
+        if schema is None:
+            raise RuntimeError(f"No stacked MoE schema registered for op {self.node.target}")
 
-        expert_shape = shape(self.node.args[self._IDX_GATE_UP_BLOCKS])
+        expert_args = extract_op_args(self.node, *schema.expert_arg_names)
+        first_expert_name = schema.expert_arg_names[0]
+        first_expert_arg = expert_args[0]
+        expert_shape = shape(first_expert_arg)
         assert expert_shape is not None, (
-            f"Cannot determine num_experts: gate_up_blocks arg has no shape metadata "
+            f"Cannot determine num_experts: {first_expert_name} arg has no shape metadata "
             f"(node: {self.node.name})"
         )
         num_experts = expert_shape[0]
@@ -991,25 +1478,35 @@ class StackedMoEShardableNode(ShardableNode):
         lo = base * ep_rank
         hi = num_experts if ep_rank == ep_size - 1 else base * (ep_rank + 1)
 
+        sliced_expert_args = {}
+        for arg_name, arg in zip(schema.expert_arg_names, expert_args):
+            sliced_expert_args[arg_name] = self._local_expert_arg(gm, self.node, arg, lo, hi)
+        set_op_args(self.node, **sliced_expert_args)
+
         args = list(self.node.args)
-        for idx in (
-            self._IDX_GATE_UP_BLOCKS,
-            self._IDX_GATE_UP_BIAS,
-            self._IDX_GATE_UP_SCALES,
-            self._IDX_DOWN_BLOCKS,
-            self._IDX_DOWN_BIAS,
-            self._IDX_DOWN_SCALES,
-        ):
-            with gm.graph.inserting_after(args[idx]):
-                args[idx] = gm.graph.call_function(
-                    torch.ops.aten.slice.Tensor,
-                    args=(args[idx], 0, lo, hi, 1),
-                )
+        kwargs = dict(self.node.kwargs or {})
+        args, kwargs = self._move_optional_args_to_kwargs(
+            args,
+            kwargs,
+            self.node.target,
+            ep_target,
+            schema.optional_trailing_arg_names,
+        )
 
-        self.node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
-        self.node.args = tuple(args) + (int(ep_size), int(ep_rank))
+        self.node.target = ep_target
+        self.node.args = tuple(args)
+        self.node.kwargs = kwargs
+        set_op_args(
+            self.node,
+            **self._ep_topology_args(
+                ep_target=ep_target,
+                expert_start=lo,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+            ),
+        )
 
-        _, all_reduce_op = _get_dist_ops("auto")
+        _, all_reduce_op = _get_dist_ops(dc.dist_backend)
         with gm.graph.inserting_after(self.node):
             red = gm.graph.call_function(
                 all_reduce_op,
@@ -1024,13 +1521,25 @@ class StackedMoEShardableNode(ShardableNode):
         return 1
 
 
-# MXFP4 MoE ops depend on triton_kernels + TRT-LLM internals that aren't in the
-# standalone package, so the op may not be registered at import time. Register
-# only when the op is actually available.
-try:
-    ShardableNode.register(torch.ops.auto_deploy.triton_mxfp4_moe)(StackedMoEShardableNode)
-except AttributeError:
-    pass
+def _register_stacked_mxfp4_moe_variant(base_name: str, ep_name: str) -> None:
+    """Register an optional stacked MXFP4 MoE op pair when both schemas exist."""
+    try:
+        base_target = getattr(torch.ops.auto_deploy, base_name)
+    except AttributeError:
+        return
+    try:
+        ep_target = getattr(torch.ops.auto_deploy, ep_name).default
+    except AttributeError:
+        return
+    StackedMoEShardableNode.register_variant(base_target, ep_target)
+
+
+for _base_name, _ep_name in (
+    ("triton_mxfp4_moe", "triton_mxfp4_moe_ep"),
+    ("torch_mxfp4_moe", "torch_mxfp4_moe_ep"),
+    ("torch_mxfp4_moe_from_routing", "torch_mxfp4_moe_from_routing_ep"),
+):
+    _register_stacked_mxfp4_moe_variant(_base_name, _ep_name)
 
 
 # =============================================================================
@@ -1063,6 +1572,7 @@ class IRShardingConfig(TransformConfig):
         "lm_head vocab projection, which the hint-driven sharder would otherwise replicate.",
     )
     enable_attention_dp: bool = Field(default=False)
+    dist_backend: Literal["auto", "torch", "trtllm"] = Field(default="auto")
     dist_mapping: dict[str, int] = Field(default_factory=dict)
     dist_config: DistConfig = Field(default_factory=DistConfig)
 
@@ -1086,6 +1596,7 @@ class IRShardingConfig(TransformConfig):
             dist_mapping=self.dist_mapping,
             enable_attention_dp=self.enable_attention_dp,
             allreduce_strategy=self.allreduce_strategy.name,
+            dist_backend=self.dist_backend,
         )
 
 
@@ -1100,7 +1611,7 @@ def _log_sharding_prelude(dc: DistConfig) -> None:
     ad_logger.info(
         f"apply_sharding_hints{skip}: tp_size={dc.tp_size}, tp_rank={dc.tp_rank}, "
         f"moe grid: [ep x tp] = [{dc.moe_ep_size} x {dc.moe_tp_size}], "
-        f"strategy={dc.allreduce_strategy}"
+        f"strategy={dc.allreduce_strategy}, backend={dc.dist_backend}"
     )
 
 
@@ -1258,6 +1769,7 @@ class ApplyShardingHints(BaseTransform):
             self.config._init_dist_config(shared_config.local_rank, shared_config.world_size)
 
         dc = self.config.dist_config
+        dc.dist_backend = self.config.dist_backend
         _log_sharding_prelude(dc)
 
         if shared_config.world_size < 2:

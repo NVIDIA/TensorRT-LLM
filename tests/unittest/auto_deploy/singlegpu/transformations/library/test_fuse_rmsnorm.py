@@ -68,6 +68,30 @@ class TestModel(torch.nn.Module):
         return x
 
 
+class DirectRMSNormFP32Weight(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.ones(hidden_size, device="cuda", dtype=torch.float32)
+        )
+        self.eps = eps
+
+    def forward(self, hidden_states):
+        return torch.ops.auto_deploy.torch_rmsnorm(hidden_states, self.weight, self.eps)
+
+
+def _node_dtype(node):
+    val = node.meta.get("val")
+    if hasattr(val, "dtype"):
+        return val.dtype
+
+    tensor_meta = node.meta.get("tensor_meta")
+    if hasattr(tensor_meta, "dtype"):
+        return tensor_meta.dtype
+
+    return None
+
+
 def _run_test(model, op, variant):
     def checker(gm):
         return any(is_op(n, op) for n in gm.graph.nodes)
@@ -148,3 +172,34 @@ def test_fuse_rmsnorm_preserves_node_metadata():
     ]
     assert len(rms_nodes) >= 1
     assert all("val" in n.meta and hasattr(n.meta["val"], "dtype") for n in rms_nodes)
+
+
+def test_flashinfer_rmsnorm_casts_fp32_weight_to_input_dtype():
+    model = DirectRMSNormFP32Weight(1024)
+    x = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
+    dynamic_shapes = {0: Dim.DYNAMIC}
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_rmsnorm": {
+                "stage": "post_load_fusion",
+                "gated_rmsnorm_backend": "triton",
+                "rmsnorm_backend": "flashinfer",
+            },
+        },
+    )(None, gm)
+
+    rms_nodes = [
+        n for n in gm_transformed.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm)
+    ]
+    assert len(rms_nodes) == 1
+
+    rms_node = rms_nodes[0]
+    weight_arg = rms_node.args[1]
+    assert is_op(weight_arg, torch.ops.aten.to.dtype)
+    assert weight_arg.args[1] == torch.float16
+    assert _node_dtype(rms_node.args[0]) == torch.float16
+    assert _node_dtype(weight_arg) == torch.float16
+    assert _node_dtype(rms_node.args[0]) == _node_dtype(weight_arg)

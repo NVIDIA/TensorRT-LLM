@@ -35,6 +35,7 @@ _AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
 _EXCLUDED_FILES = {
     "models.yaml",  # model registry index, not an LlmArgs config
     "flux_transforms.yaml",  # for build_and_run_flux.py, different schema
+    "nemotron_fp8_ir_test.yaml",  # full ExperimentConfig with top-level model/args
 }
 
 # Dummy model name used during validation (model path is not resolved during construction)

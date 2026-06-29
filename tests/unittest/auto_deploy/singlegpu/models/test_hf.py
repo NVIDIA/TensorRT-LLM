@@ -41,45 +41,6 @@ def restore_custom_model_mapping():
     AutoModelForCausalLMFactory._custom_model_mapping = old_mapping
 
 
-def test_hf_load_state_dict_with_device():
-    """Test that hf_load_state_dict_with_device correctly patches modeling.load_state_dict."""
-    # Create mock for original load_state_dict
-    original_load_state_dict = MagicMock()
-
-    # Test with CPU device
-    with patch.object(modeling, "load_state_dict", original_load_state_dict):
-        with hf_load_state_dict_with_device(device="cpu"):
-            # Call the patched function
-            modeling.load_state_dict("dummy_checkpoint")
-
-            # Check that device was set correctly
-            original_load_state_dict.assert_called_once_with(
-                "dummy_checkpoint", device_map={"": "cpu"}
-            )
-
-            # Reset mock for next test
-            original_load_state_dict.reset_mock()
-
-        # Check that original behavior is restored
-        modeling.load_state_dict("dummy_checkpoint", device_map="original_device_map")
-        original_load_state_dict.assert_called_once_with(
-            "dummy_checkpoint", device_map="original_device_map"
-        )
-        original_load_state_dict.reset_mock()
-
-    # Test with CUDA device (if available)
-    if torch.cuda.is_available():
-        with patch.object(modeling, "load_state_dict", original_load_state_dict):
-            with hf_load_state_dict_with_device(device="cuda"):
-                # Call the patched function
-                modeling.load_state_dict("dummy_checkpoint")
-
-                # Check that device was set correctly
-                original_load_state_dict.assert_called_once_with(
-                    "dummy_checkpoint", device_map={"": "cuda"}
-                )
-
-
 @pytest.fixture
 def mock_factory():
     with (
@@ -91,6 +52,46 @@ def mock_factory():
         # Set model path directly to avoid prefetch
         factory._prefetched_model_path = "/dummy/path"
         yield factory
+
+
+def test_hf_load_state_dict_with_device():
+    original_load_state_dict = MagicMock()
+
+    with patch.object(modeling, "load_state_dict", original_load_state_dict):
+        with hf_load_state_dict_with_device(device="cpu"):
+            modeling.load_state_dict("dummy_checkpoint")
+            original_load_state_dict.assert_called_once_with(
+                "dummy_checkpoint", device_map={"": "cpu"}
+            )
+            original_load_state_dict.reset_mock()
+
+        modeling.load_state_dict("dummy_checkpoint", device_map="original_device_map")
+        original_load_state_dict.assert_called_once_with(
+            "dummy_checkpoint", device_map="original_device_map"
+        )
+        original_load_state_dict.reset_mock()
+
+    if torch.cuda.is_available():
+        with patch.object(modeling, "load_state_dict", original_load_state_dict):
+            with hf_load_state_dict_with_device(device="cuda"):
+                modeling.load_state_dict("dummy_checkpoint")
+                original_load_state_dict.assert_called_once_with(
+                    "dummy_checkpoint", device_map={"": "cuda"}
+                )
+
+
+def test_disable_preload_uses_accelerate_loader(mock_factory):
+    model = SimpleModel()
+    ckpt_file = "/dummy/path/model.safetensors.index.json"
+
+    with (
+        patch.object(mock_factory, "_get_checkpoint_file", return_value=ckpt_file) as get_mock,
+        patch("tensorrt_llm._torch.auto_deploy.models.hf.load_checkpoint_in_model") as load_mock,
+    ):
+        mock_factory._load_checkpoint(model, "cpu", disable_preload=True)
+
+    get_mock.assert_called_once_with(mock_factory.model)
+    load_mock.assert_called_once_with(model, checkpoint=ckpt_file, full_state_dict=False)
 
 
 def test_recursive_update_config(mock_factory):

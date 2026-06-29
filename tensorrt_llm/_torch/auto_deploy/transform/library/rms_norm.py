@@ -14,7 +14,7 @@
 # limitations under the License.
 """Graph transform to optimize RMSNorm execution using FlashInfer."""
 
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import torch
 from pydantic import Field
@@ -40,6 +40,30 @@ _BACKEND_OPS = {
     "triton": torch.ops.auto_deploy.triton_rms_norm,
     "torch": torch.ops.auto_deploy.torch_rmsnorm,
 }
+
+
+def _extract_dtype_from_meta(node: Node) -> Optional[torch.dtype]:
+    val = node.meta.get("val")
+    if hasattr(val, "dtype"):
+        return val.dtype
+
+    tensor_meta = node.meta.get("tensor_meta")
+    if hasattr(tensor_meta, "dtype"):
+        return tensor_meta.dtype
+
+    return None
+
+
+def _copy_meta_with_dtype(dst: Node, src: Node, dtype: torch.dtype) -> None:
+    dst.meta.update(src.meta)
+
+    val = dst.meta.get("val")
+    if hasattr(val, "to"):
+        dst.meta["val"] = val.to(dtype=dtype)
+
+    tensor_meta = dst.meta.get("tensor_meta")
+    if hasattr(tensor_meta, "_replace") and hasattr(tensor_meta, "dtype"):
+        dst.meta["tensor_meta"] = tensor_meta._replace(dtype=dtype)
 
 
 def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -375,11 +399,31 @@ class FuseRMSNorm(BaseTransform):
         # Replace torch_rmsnorm ops with the selected backend
         for node in list(graph.nodes):
             if is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+                args = node.args
+                if backend == "flashinfer":
+                    data, weight, eps = node.args
+                    if isinstance(data, Node) and isinstance(weight, Node):
+                        original_weight = weight
+                        data_dtype = _extract_dtype_from_meta(data)
+                        weight_dtype = _extract_dtype_from_meta(weight)
+                        if (
+                            data_dtype is not None
+                            and weight_dtype is not None
+                            and data_dtype != weight_dtype
+                        ):
+                            with graph.inserting_before(node):
+                                weight = graph.call_function(
+                                    torch.ops.aten.to.dtype,
+                                    args=(weight, data_dtype),
+                                )
+                                _copy_meta_with_dtype(weight, original_weight, data_dtype)
+                            args = (data, weight, eps)
+
                 # Replace with the selected backend op
                 with graph.inserting_after(node):
                     new_node: Node = graph.call_function(
                         target_op,
-                        args=node.args,
+                        args=args,
                         kwargs=node.kwargs,
                     )
                     # Preserve metadata (including val/tensor_meta) for downstream transforms.

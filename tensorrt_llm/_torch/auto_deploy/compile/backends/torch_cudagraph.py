@@ -558,9 +558,8 @@ class PiecewiseCapturedGraph(nn.Module):
         ):
             trailing_idx = static_indices.pop()
             ad_logger.info(
-                "PiecewiseCapturedGraph: excluding trailing static submod_%d "
-                "(lm_head) from capture — will run eagerly",
-                trailing_idx,
+                f"PiecewiseCapturedGraph: excluding trailing static submod_{trailing_idx} "
+                "(lm_head) from capture — will run eagerly"
             )
 
         runner_by_idx: Dict[int, ADPiecewiseRunner] = {}

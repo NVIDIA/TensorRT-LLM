@@ -2052,6 +2052,50 @@ class KVPagedResourceHandler(ResourceHandler):
             raise ValueError(f"Invalid kv_layout: {self.kv_layout}")
 
 
+class PagedResourceHandler(ResourceHandler):
+    """Handler for local per-token paged resources.
+
+    These resources have shape ``[num_blocks, tokens_per_block, *token_shape]``. They
+    participate in paged cache memory sizing, but are allocated locally instead of being
+    managed as a standard K/V pair by ``KVCacheManager.get_buffers()``.
+    """
+
+    @property
+    def is_paged(self) -> bool:
+        """Whether the resource is paged."""
+        return True
+
+    def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
+        """Initialize the PagedResourceHandler.
+
+        Args:
+            token_shape: The shape of the resource per token.
+            dtype: The dtype of the resource.
+        """
+        self.token_shape = token_shape
+        self.dtype = dtype
+
+    def __eq__(self, other: Optional[ResourceHandler]) -> bool:
+        """Check compatibility for locally allocated paged resources."""
+        if type(other) is not type(self):
+            return False
+        return self.token_shape == other.token_shape and self.dtype == other.dtype
+
+    def _get_bytes_per_token(self) -> int:
+        """The size of the resource per token in bytes."""
+        return math.prod(self.token_shape) * self.dtype.itemsize
+
+    def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
+        """Allocate a local paged resource for the given sequence info."""
+        return torch.empty(
+            sequence_info.num_blocks,
+            sequence_info.tokens_per_block,
+            *self.token_shape,
+            device=sequence_info.device,
+            dtype=self.dtype,
+        )
+
+
 class StateResourceHandler(ResourceHandler):
     """Handler for per-sequence state resources (e.g., Mamba SSM/conv states).
 

@@ -24,6 +24,7 @@ from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
 from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.evaluate import GSM8K as GSM8KEvaluator
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -35,6 +36,7 @@ _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
 _AD_MODEL_REGISTRY_DIR = Path(
     get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
+_ACCURACY_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 
 
 def _load_ad_config(config_name):
@@ -1587,6 +1589,60 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
+    WORLD_SIZE = 4
+    YAML_EXTRA = [
+        str(_AD_CONFIGS_DIR / "dashboard_default.yaml"),
+        str(_AD_CONFIGS_DIR / "world_size_4.yaml"),
+        str(_AD_CONFIGS_DIR / "deepseek_v4_flash.yaml"),
+        str(_ACCURACY_CONFIGS_DIR / "deepseek_v4_flash_4gpu_smoke.yaml"),
+    ]
+    GSM8K_NUM_SAMPLES = 15
+    GSM8K_NUM_FEWSHOT = 0
+    GSM8K_MAX_INPUT_LEN = 1024
+    GSM8K_MAX_OUTPUT_LEN = 128
+    GSM8K_MIN_ACCURACY = 40.0
+
+    def get_default_sampling_params(self):
+        return SamplingParams(end_id=None,
+                              pad_id=None,
+                              max_tokens=self.GSM8K_MAX_OUTPUT_LEN,
+                              n=1,
+                              use_beam_search=False)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_gsm8k_smoke(self):
+        if get_device_count() < self.WORLD_SIZE:
+            pytest.skip(
+                f"DeepSeek V4 Flash smoke requires {self.WORLD_SIZE} GPUs")
+
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           world_size=self.WORLD_SIZE,
+                           yaml_extra=self.YAML_EXTRA,
+                           max_seq_len=self.GSM8K_MAX_INPUT_LEN +
+                           self.GSM8K_MAX_OUTPUT_LEN,
+                           trust_remote_code=True) as llm:
+            task = GSM8KEvaluator(dataset_path=GSM8K.DATASET_DIR,
+                                  num_samples=self.GSM8K_NUM_SAMPLES,
+                                  random_seed=0)
+            for task_obj in task.task_dict.values():
+                task_obj.set_config("num_fewshot", self.GSM8K_NUM_FEWSHOT)
+            score = task.evaluate(
+                llm,
+                sampling_params=self.get_default_sampling_params(),
+                scores_filter="exact_match,flexible-extract",
+            )
+
+        assert score >= self.GSM8K_MIN_ACCURACY, (
+            f"DeepSeek V4 Flash GSM8K smoke accuracy {score:.2f} is below "
+            f"{self.GSM8K_MIN_ACCURACY:.2f} on {self.GSM8K_NUM_SAMPLES} samples"
+        )
 
 
 # =============================================================================

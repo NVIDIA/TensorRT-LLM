@@ -74,6 +74,7 @@ from ...utils.node_utils import (
     filtered_nodes,
     get_all_layer_subgraphs,
     get_all_weights_in_subgraph,
+    get_op_schema,
     is_any_conv_op,
     is_any_delta_op,
     is_any_lin_op,
@@ -984,7 +985,13 @@ class MXFP4EPShardingInfo(EPShardingInfo):
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
-        if not is_op(node, torch.ops.auto_deploy.triton_mxfp4_moe):
+        if not is_op(
+            node,
+            [
+                torch.ops.auto_deploy.torch_mxfp4_moe,
+                torch.ops.auto_deploy.triton_mxfp4_moe,
+            ],
+        ):
             ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
             return False
         return True
@@ -1062,6 +1069,7 @@ EP_SHARDING_RULES = [
         FineGrainedFP8EPShardingInfo,
     ),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_mxfp4_moe), MXFP4EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
 
@@ -1705,8 +1713,11 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
+    if custom_shard_fn is not None:
+        f_split = custom_shard_fn
+
     # Handle fused weights
-    if fused_weight_dims is not None:
+    elif fused_weight_dims is not None:
 
         def f_split(
             t: torch.Tensor,
@@ -2270,9 +2281,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     config: ShardingTransformConfig,
 ):
     """
-    Transform a call to auto_deploy::triton_mxfp4_moe into:
+    Transform a call to auto_deploy::torch_mxfp4_moe or auto_deploy::triton_mxfp4_moe into:
       - sharded expert parameters along dim 0 (this rank's slice),
-      - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
+      - call to the matching *_mxfp4_moe_ep op,
       - followed by torch_dist_all_reduce.
 
     Expects the original op signature:
@@ -2283,31 +2294,43 @@ def _insert_sharded_mxfp4_mlp_ep(
        down_blocks, down_bias, down_scales)
     """
 
-    IDX_GATE_UP_BLOCKS = 4
-    IDX_GATE_UP_BIAS = 5
-    IDX_GATE_UP_SCALES = 6
-    IDX_DOWN_BLOCKS = 9
-    IDX_DOWN_BIAS = 10
-    IDX_DOWN_SCALES = 11
-
-    gate_up_blocks_node = node.args[IDX_GATE_UP_BLOCKS]
+    expert_arg_names = (
+        "gate_up_blocks",
+        "gate_up_bias",
+        "gate_up_scales",
+        "down_blocks",
+        "down_bias",
+        "down_scales",
+    )
+    expert_args = extract_op_args(node, *expert_arg_names)
+    gate_up_blocks_node = expert_args[0]
     num_experts = shape(gate_up_blocks_node)[0]
 
     rank, world_size = config.rank, config.world_size
     local_lo, local_hi = _split_range_last_remainder(num_experts, world_size, rank)
 
-    # Prepare new args with slices for this rank
-    args = list(node.args)
-    args[IDX_GATE_UP_BLOCKS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BLOCKS], local_lo, local_hi)
-    args[IDX_GATE_UP_BIAS] = _slice_expert_dim(gm, args[IDX_GATE_UP_BIAS], local_lo, local_hi)
-    args[IDX_GATE_UP_SCALES] = _slice_expert_dim(gm, args[IDX_GATE_UP_SCALES], local_lo, local_hi)
-    args[IDX_DOWN_BLOCKS] = _slice_expert_dim(gm, args[IDX_DOWN_BLOCKS], local_lo, local_hi)
-    args[IDX_DOWN_BIAS] = _slice_expert_dim(gm, args[IDX_DOWN_BIAS], local_lo, local_hi)
-    args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
+    sliced_expert_args = {
+        name: _slice_expert_dim(gm, arg, local_lo, local_hi)
+        for name, arg in zip(expert_arg_names, expert_args)
+    }
+    set_op_args(node, **sliced_expert_args)
 
-    args_ep = tuple(args) + (int(world_size), int(rank))
-    node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
-    node.args = args_ep
+    args = list(node.args)
+    kwargs = dict(node.kwargs or {})
+    base_arg_names = [arg.name for arg in get_op_schema(node.target).arguments]
+    if "layer_type" in base_arg_names:
+        layer_type_pos = base_arg_names.index("layer_type")
+        if len(args) > layer_type_pos and "layer_type" not in kwargs:
+            kwargs["layer_type"] = args[layer_type_pos]
+        args = args[:layer_type_pos]
+    node.args = tuple(args)
+    node.kwargs = kwargs
+
+    if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe):
+        node.target = torch.ops.auto_deploy.torch_mxfp4_moe_ep.default
+    else:
+        node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
+    set_op_args(node, ep_size=int(world_size), ep_rank=int(rank))
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
     _, all_reduce_op = _get_dist_ops(config.dist_backend)

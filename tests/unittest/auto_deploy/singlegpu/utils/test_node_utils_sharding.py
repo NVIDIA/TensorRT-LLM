@@ -137,6 +137,31 @@ def test_enable_sharding_node_linear():
     assert ShardableNode.from_node(lin_nodes[0]) is not None
 
 
+def test_enable_sharding_node_grouped_finegrained_fp8_linear():
+    class Shell(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.empty(32, 16, dtype=torch.float8_e4m3fn))
+            self.register_buffer("weight_scale_inv", torch.ones(1, 1))
+
+    root = Shell()
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    w = graph.get_attr("w")
+    scale = graph.get_attr("weight_scale_inv")
+    out = graph.call_function(
+        torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default,
+        args=(x, w, None, [], [scale], [], []),
+        kwargs={"tp_mode": "colwise", "tp_min_local_shape": 8, "layer_type": "mla"},
+    )
+    graph.output(out)
+    gm = GraphModule(root, graph)
+
+    grouped_nodes = [n for n in _call_function_nodes(gm) if ShardableNode.from_node(n) is not None]
+    assert len(grouped_nodes) == 1
+    assert ShardableNode.from_node(grouped_nodes[0]) is not None
+
+
 def test_enable_sharding_node_view():
     graph = fx.Graph()
     x = graph.placeholder("x")

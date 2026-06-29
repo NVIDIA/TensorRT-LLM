@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
@@ -55,6 +56,18 @@ def _dequant_weight_fp8(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     return weight_fp8.to(dtype) * weight_scale
+
+
+def _dequant_block_fp8_weight(
+    weight_fp8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return dequant_fp8_weight_two_dim_block_grid(
+        weight_fp8, weight_scale, block_n, block_k, dtype=dtype
+    )
 
 
 # The NVFP4 helpers below are adapted from modelopt.torch.quantization.qtensor.nvfp4_tensor.NVFP4QTensor
@@ -478,7 +491,7 @@ def torch_fake_quant_int4_gptq_linear_fake(
 
 
 @triton.jit
-def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
+def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, ROUND_SCALE: tl.constexpr):
     """Block-wise FP8 activation quantization, safe for all-zero blocks.
 
     Identical to HuggingFace's act_quant_kernel except that the per-block scale
@@ -488,16 +501,22 @@ def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.0
-    # Clamp scale so that all-zero blocks produce 0/eps = 0 instead of 0/0 = NaN.
-    s = tl.maximum(s, 1e-12)
+    amax = tl.max(tl.abs(x))
+    if ROUND_SCALE:
+        amax = tl.maximum(amax, 1e-4)
+        s = amax / 448.0
+        s = tl.exp2(tl.ceil(tl.log2(s)))
+    else:
+        s = amax / 448.0
+        # Clamp scale so that all-zero blocks produce 0/eps = 0 instead of 0/0 = NaN.
+        s = tl.maximum(s, 1e-12)
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
     tl.store(s_ptr + pid, s)
 
 
-def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
+def _safe_act_quant(x: torch.Tensor, block_size: int = 128, input_scale_fmt: str = "") -> tuple:
     """Block-wise FP8 activation quantization (CUDA-graph safe).
 
     Drop-in replacement for ``transformers.integrations.finegrained_fp8.act_quant``
@@ -513,7 +532,8 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=x.dtype)
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
-    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+    round_scale = input_scale_fmt.lower() == "ue8m0"
+    _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size, ROUND_SCALE=round_scale)
     return y, s
 
 
@@ -675,6 +695,7 @@ def torch_fake_quant_finegrained_fp8_linear(
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
     layer_type: str = "unknown",
+    input_scale_fmt: str = "",
 ) -> torch.Tensor:
     """FineGrainedFP8 linear operation.
     - weight_scale[0] = weight_scale_inv (per-block weight scale)
@@ -691,7 +712,7 @@ def torch_fake_quant_finegrained_fp8_linear(
     block_k = triton.cdiv(K, scale_k)
     block_size = [block_n, block_k]
 
-    qinput, scale = _safe_act_quant(input, block_size[1])
+    qinput, scale = _safe_act_quant(input, block_size[1], input_scale_fmt)
     output = _w8a8_block_fp8_matmul_triton(
         qinput,
         weight_quantized,
@@ -720,7 +741,102 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
     layer_type: str = "unknown",
+    input_scale_fmt: str = "",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fake_quant_grouped_finegrained_fp8_linear",
+    mutates_args=(),
+)
+def torch_fake_quant_grouped_finegrained_fp8_linear(
+    input: torch.Tensor,  # [..., G, K]
+    weight_quantized: torch.Tensor,  # [G * R, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [G * R], [G, R], or None
+    input_scale: List[torch.Tensor],  # unused for FineGrained FP8 (input quantized on the fly)
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv]
+    input_zp: List[torch.Tensor],  # unused
+    weight_zp: List[torch.Tensor],  # unused
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+    input_scale_fmt: str = "",
+) -> torch.Tensor:
+    """Grouped FineGrainedFP8 projection for flattened checkpoint weights.
+
+    Consumes a flattened checkpoint weight layout ``[G * R, K]`` and matching
+    per-block ``weight_scale_inv`` buffers.
+    """
+    del input_scale, input_zp, weight_zp, tp_mode, output_sizes, tp_min_local_shape, layer_type
+    if input.dim() < 2:
+        raise ValueError(f"input must have at least grouped and K dimensions, got {input.shape}")
+    if weight_quantized.dim() != 2:
+        raise ValueError(f"weight must have shape [G * R, K], got {weight_quantized.shape}")
+    if weight_quantized.dtype != torch.float8_e4m3fn:
+        raise TypeError("Grouped FineGrained FP8 path requires float8_e4m3fn weight")
+
+    weight_scale_inv = _expect_single_scale(weight_scale, "weight_scale")
+    num_groups = input.shape[-2]
+    in_features = input.shape[-1]
+    out_rows, weight_in_features = weight_quantized.shape
+    if weight_in_features != in_features:
+        raise ValueError(f"weight K ({weight_in_features}) must match input K ({in_features})")
+    if out_rows % num_groups != 0:
+        raise ValueError(f"weight rows ({out_rows}) must be divisible by groups ({num_groups})")
+
+    scale_n, scale_k = weight_scale_inv.shape
+    if scale_n == 0 or scale_k == 0:
+        raise ValueError(f"weight_scale has zero dimension {tuple(weight_scale_inv.shape)}")
+    block_n = triton.cdiv(out_rows, scale_n)
+    block_k = triton.cdiv(in_features, scale_k)
+
+    input_contiguous = input.contiguous()
+    qinput, input_scales = _safe_act_quant(input_contiguous, block_k, input_scale_fmt)
+    qinput_blocks = qinput.reshape(*input_contiguous.shape[:-1], -1, block_k)
+    input_dequant = (qinput_blocks.to(input.dtype) * input_scales.unsqueeze(-1)).reshape_as(
+        input_contiguous
+    )
+
+    weight_dequant = _dequant_block_fp8_weight(
+        weight_quantized,
+        weight_scale_inv,
+        block_n,
+        block_k,
+        dtype=input.dtype,
+    )
+    rank = out_rows // num_groups
+    weight_grouped = weight_dequant.view(num_groups, rank, in_features)
+    output = torch.matmul(
+        input_dequant.unsqueeze(-2),
+        weight_grouped.transpose(-1, -2),
+    ).squeeze(-2)
+    output = output.flatten(-2)
+    if bias is not None:
+        output = output + bias.reshape(out_rows).to(output.dtype)
+    return output.to(dtype=input.dtype)
+
+
+@torch_fake_quant_grouped_finegrained_fp8_linear.register_fake
+def _torch_fake_quant_grouped_finegrained_fp8_linear_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+    input_scale_fmt: str = "",
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    del bias, input_scale, weight_scale, input_zp, weight_zp
+    del tp_mode, output_sizes, tp_min_local_shape, layer_type, input_scale_fmt
+    out_features = weight_quantized.shape[0]
+    return torch.empty((*input.shape[:-2], out_features), dtype=input.dtype, device=input.device)

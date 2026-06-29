@@ -384,6 +384,58 @@ def test_cudagraph_replays_with_rectangular_seq_len_input():
         assert model.forward_calls == calls_after_capture
 
 
+def test_monolithic_decode_capture_falls_back_to_eager_for_prefill_shape(monkeypatch):
+    """Monolithic CUDA graph captures decode buckets and leaves non-matching shapes eager."""
+
+    class CountingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids):
+            self.forward_calls += 1
+            return input_ids + 10
+
+    class ReplayGraph:
+        def __init__(self, compiled_model):
+            self.compiled_model = compiled_model
+            self.replay_calls = 0
+
+        def replay(self):
+            self.replay_calls += 1
+            self.compiled_model._out_buffer_flat[0].copy_(
+                self.compiled_model._input_buffers[0] + 10
+            )
+
+    model = CountingModel()
+    compiled_model = CapturedGraph(model, num_batched_inputs=1)
+    graphs = []
+
+    def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+        del args, kwargs, refresh_args_static
+        graph = ReplayGraph(self)
+        graphs.append(graph)
+        return graph, (2,)
+
+    monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+    def get_args_kwargs(batch_size):
+        return (torch.ones(batch_size, 1),), {}
+
+    compiled_model.capture_graph(get_args_kwargs, [2])
+    calls_after_capture = model.forward_calls
+
+    decode_output = compiled_model(torch.full((2, 1), 3.0))
+    assert model.forward_calls == calls_after_capture
+    assert graphs[0].replay_calls == 1
+    torch.testing.assert_close(decode_output, torch.full((2, 1), 13.0))
+
+    prefill_output = compiled_model(torch.full((1, 4), 5.0))
+    assert model.forward_calls == calls_after_capture + 1
+    assert graphs[0].replay_calls == 1
+    torch.testing.assert_close(prefill_output, torch.full((1, 4), 15.0))
+
+
 # ============================================================================
 # Tests for CapturedGraph capture-time truncation
 # ============================================================================
@@ -847,7 +899,6 @@ class TestDualModeCapturedGraphRouting:
 
         monolithic = MagicMock(spec=nn.Module)
         monolithic.return_value = torch.tensor([1.0])
-
         piecewise = MagicMock(spec=PiecewiseCapturedGraph)
         piecewise.piecewise_num_tokens = piecewise_num_tokens
         piecewise.original_model = MagicMock(return_value=torch.tensor([2.0]))
