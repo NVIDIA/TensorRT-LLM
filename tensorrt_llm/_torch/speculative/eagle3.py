@@ -540,9 +540,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     num_contexts:num_contexts + num_gens]
                 next_token, next_sibling = slot_storage.next_links_from_slots(
                     gen_slot_ids, num_gens)
-                slot_storage.apply_no_tree_linear_chain(next_token,
-                                                        next_sibling,
-                                                        gen_slot_ids, num_gens)
                 self.retrieve_next_token = next_token
                 self.retrieve_next_sibling = next_sibling
 
