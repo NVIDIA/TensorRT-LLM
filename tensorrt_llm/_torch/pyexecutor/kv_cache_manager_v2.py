@@ -819,10 +819,6 @@ class KVCacheManagerV2(BaseResourceManager):
             for layer_id in typed_range(LayerId(num_layers))
         }
 
-        (self.kv_cache_pool_pointers, self.kv_cache_pool_mapping) = (
-            self._build_pool_mapping_tensors()
-        )
-
         self.kv_cache_map: dict[int, _KVCache] = {}
 
         # Tracks the draft length allocated by try_allocate_generation per
@@ -885,6 +881,14 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
+        self._prepare_page_table_tensor(index_mapper_capacity)
+
+        self._log_kv_cache_pool_lifecycle_mapping()
+
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        (self.kv_cache_pool_pointers, self.kv_cache_pool_mapping) = (
+            self._build_pool_mapping_tensors()
+        )
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
@@ -906,7 +910,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Keep unused block offsets as safe block index 0.
         self.host_kv_cache_block_offsets = torch.zeros(
             self.num_pools,
-            index_mapper_capacity * max_beam_width,
+            index_mapper_capacity * self.max_beam_width,
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
@@ -915,8 +919,6 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if self.enable_swa_scratch_reuse:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
-
-        self._log_kv_cache_pool_lifecycle_mapping()
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())

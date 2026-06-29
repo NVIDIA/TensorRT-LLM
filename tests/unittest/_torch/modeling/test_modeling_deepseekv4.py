@@ -732,6 +732,7 @@ def test_deepseek_v4_sanity():
     assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
 
     context_sequence_length = [3, 2, 5]
+    num_contexts = len(context_sequence_length)
     sequence_length = context_sequence_length + [1, 1]
 
     # Total tokens = sum(sequence_length) = 3+2+5+1+1 = 12
@@ -741,7 +742,7 @@ def test_deepseek_v4_sanity():
     past_seen_tokens = [0, 0, 0, 62, 75]
     request_ids = list(range(len(sequence_length)))
     token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
-    prompt_lens = token_nums[:3] + past_seen_tokens[3:]
+    prompt_lens = token_nums[:num_contexts] + past_seen_tokens[num_contexts:]
     tokens_per_block = 128  # DeepSeek-V4 requirement
     max_new_tokens = 1024
     required_blocks = sum(
@@ -797,14 +798,20 @@ def test_deepseek_v4_sanity():
         )
         success = kv_cache_manager.prepare_context(req)
         assert success, f"Failed to prepare context for request {req_id}"
-        # Allocate enough capacity for context tokens plus generation headroom
-        success = kv_cache_manager.resize_context(req, token_nums[i] + max_new_tokens)
+        if i < num_contexts:
+            success = kv_cache_manager.resize_context(req, req.context_chunk_size)
+        else:
+            kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
+            kv_cache.enable_swa_scratch_reuse = False
+            success = kv_cache_manager.resize_context(
+                req, token_nums[i], history_length=past_seen_tokens[i]
+            )
         assert success, f"Failed to resize context for request {req_id}"
         reqs.append(req)
 
     attn_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
-        num_contexts=len(context_sequence_length),
+        num_contexts=num_contexts,
         max_num_requests=len(sequence_length),
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -832,7 +839,8 @@ def test_deepseek_v4_sanity():
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     with torch.inference_mode(), model_extra_attrs(extra_attrs):
         scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests_last_chunk = reqs
+        scheduled_batch.context_requests_last_chunk = reqs[:num_contexts]
+        scheduled_batch.generation_requests = reqs[num_contexts:]
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
 
@@ -840,9 +848,11 @@ def test_deepseek_v4_sanity():
             input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
         )
 
-        for req in reqs:
+        for req in reqs[:num_contexts]:
             req.context_current_position = seq_lens[req.py_request_id]
+        for req in reqs:
             req.add_new_token(seq_lens[req.py_request_id], 0)
+        kv_cache_manager.update_context_resources(scheduled_batch)
         kv_cache_manager.update_resources(scheduled_batch)
     assert len(past_seen_tokens) == logits.shape[0]
 
@@ -851,6 +861,8 @@ def test_deepseek_v4_sanity():
         seq_lens = [seq_len + 1 for seq_len in seq_lens]
         scheduled_batch = ScheduledRequests()
         scheduled_batch.generation_requests = reqs
+        for req in reqs:
+            assert kv_cache_manager.try_allocate_generation(req)
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
         logits = model.forward(

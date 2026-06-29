@@ -22,15 +22,25 @@ from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+    DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
+    compress_ratio_has_attention,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
@@ -69,6 +79,11 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
     if buffer.dtype == torch.float8_e4m3fn:
         return buffer.view(torch.uint8)
     return buffer
+
+
+@pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
+def scratch_reuse_enabled(request) -> bool:
+    return request.param
 
 
 @skip_pre_blackwell
@@ -137,9 +152,9 @@ class TestDeepseekV4CacheManager:
         if attn_type == DeepseekV4AttentionType.SWA:
             return self.window_size
         elif attn_type in [
-            DeepseekV4AttentionType.COMPRESSOR_STATE,
+            DeepseekV4AttentionType.COMPRESSOR_KV,
             DeepseekV4AttentionType.COMPRESSOR_SCORE,
-            DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
             DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             return state_factor * compress_ratio
@@ -158,6 +173,10 @@ class TestDeepseekV4CacheManager:
         dtype: DataType,
         compressor_dtype: DataType,
         max_input_len: Optional[int] = None,
+        is_draft: bool = False,
+        tp_size: int = 1,
+        enable_attention_dp: bool = False,
+        enable_swa_scratch_reuse: bool = False,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -175,10 +194,17 @@ class TestDeepseekV4CacheManager:
             enable_block_reuse=False,
             max_tokens=max_seq_len * max_batch_size,
             event_buffer_max_size=0,
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         )
 
         # Create mapping (single GPU, no parallelism)
-        mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+        mapping = Mapping(
+            world_size=tp_size,
+            rank=0,
+            tp_size=tp_size,
+            pp_size=1,
+            enable_attention_dp=enable_attention_dp,
+        )
 
         # Create cache manager
         cache_manager = DeepseekV4CacheManager(
@@ -197,6 +223,7 @@ class TestDeepseekV4CacheManager:
             vocab_size=self.vocab_size,
             max_num_tokens=max_batch_size * (max_input_len + 1),
             sparse_attn_config=sparse_attn_config,
+            is_draft=is_draft,
         )
 
         return cache_manager, sparse_attn_config
@@ -271,7 +298,7 @@ class TestDeepseekV4CacheManager:
                     self._rand_tensor((seq_len // ratio, head_dim), dtype, device),
                     None,
                 )
-                cache[layer, DeepseekV4AttentionType.COMPRESSOR_STATE] = (
+                cache[layer, DeepseekV4AttentionType.COMPRESSOR_KV] = (
                     self._rand_tensor((seq_len, compressor_dim), compressor_dtype, device),
                     None,
                 )
@@ -297,7 +324,7 @@ class TestDeepseekV4CacheManager:
                 )
 
                 indexer_compressor_dim = 2 * indexer_dim if is_overlap else indexer_dim
-                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE] = (
+                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV] = (
                     self._rand_tensor((seq_len, indexer_compressor_dim), compressor_dtype, device),
                     None,
                 )
@@ -433,6 +460,118 @@ class TestDeepseekV4CacheManager:
             values = values[-window_size:]
         return values
 
+    def _get_page_indices(
+        self,
+        req: LlmRequest,
+        cache_manager: DeepseekV4CacheManager,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        num_contexts: int = 1,
+    ) -> torch.Tensor:
+        if attn_type == DeepseekV4AttentionType.COMPRESS:
+            compress_block_tables = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            cache_manager.copy_batch_compress_block_tables(
+                compress_block_tables,
+                [req.py_request_id],
+                compress_ratio=cache_manager._compress_ratios[layer_idx],
+                beam_width=1,
+                num_contexts=num_contexts,
+                num_seqs=1,
+            )
+            return compress_block_tables[0]
+
+        if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+            host_block_table = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            cache_manager.copy_batch_indexer_compress_block_tables(
+                host_block_table,
+                [req.py_request_id],
+                beam_width=1,
+                num_contexts=num_contexts,
+                num_seqs=1,
+            )
+            return host_block_table[0]
+
+        sliding_block_tables = torch.empty_like(
+            cache_manager._host_per_layer_block_tables_staging,
+            device="cuda",
+        )
+        with torch.cuda.stream(cache_manager._stream):
+            cache_manager.copy_batch_sliding_block_tables(
+                sliding_block_tables,
+                [req.py_request_id],
+                num_contexts=num_contexts,
+                num_seqs=1,
+            )
+        cache_manager._stream.synchronize()
+        return sliding_block_tables.cpu()[
+            cache_manager.layer_offsets[layer_idx],
+            attn_type.value,
+            0,
+        ]
+
+    def _prepare_mixed_copy_batch(
+        self,
+        cache_manager: DeepseekV4CacheManager,
+        prompt_len: int,
+    ) -> tuple[list[LlmRequest], int]:
+        requests = [self._create_request(request_id, prompt_len) for request_id in range(3)]
+        for req in requests:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(req, req.context_chunk_size)
+
+        gen_req = requests[-1]
+        scheduled_batch = ScheduledRequests()
+        scheduled_batch.context_requests_last_chunk = [gen_req]
+        gen_req.context_current_position = prompt_len
+        gen_req.add_new_token(prompt_len, 0)
+        cache_manager.update_context_resources(scheduled_batch)
+        cache_manager.update_resources(scheduled_batch)
+        assert cache_manager.try_allocate_generation(gen_req)
+        return requests, len(requests) - 1
+
+    def _reference_copy_batch_page_indices(
+        self,
+        cache_manager: DeepseekV4CacheManager,
+        request_ids: list[int],
+        num_contexts: int,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        page_index_mode: PageIndexMode,
+    ) -> torch.Tensor:
+        layer_id = cache_manager._layer_attn_to_layer_id[layer_idx, attn_type]
+        pool_id = cache_manager.layer_to_pool_mapping_dict[layer_id]
+        converter = cache_manager.impl.get_page_index_converter(layer_id, attn_type.role)
+        copy_idx = cache_manager.index_mapper.get_copy_index(request_ids, num_contexts, 1)
+
+        expected = torch.full(
+            (len(request_ids), cache_manager.max_blocks_per_seq),
+            BAD_PAGE_INDEX,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        for row, request_id in enumerate(request_ids):
+            base_indices = cache_manager.host_kv_cache_block_offsets[
+                pool_id,
+                int(copy_idx[row]),
+                0,
+            ].tolist()
+            scratch = None
+            if row < num_contexts and page_index_mode == PageIndexMode.PER_LAYER:
+                scratch = cache_manager.kv_cache_map[request_id].get_scratch_desc(pool_id)
+            converted = converter(base_indices, page_index_mode, scratch)
+            expected[row, : len(converted)] = torch.tensor(converted, dtype=torch.int32)
+        return expected
+
     def _write_request_prefill(
         self,
         req: LlmRequest,
@@ -450,14 +589,12 @@ class TestDeepseekV4CacheManager:
         """
         compress_ratios = cache_manager._compress_ratios
         for (layer_idx, attn_type), (values, scales) in cache_values.items():
-            page_indices = cache_manager.get_batch_attn_offset(
-                [req.py_request_id],
-                beam_width=1,
-                num_contexts=1,
-                num_seqs=1,
-                attn_type=attn_type,
-                compress_ratio=compress_ratios[layer_idx],
-            ).squeeze(0)
+            page_indices = self._get_page_indices(
+                req,
+                cache_manager,
+                layer_idx,
+                attn_type,
+            )
 
             if attn_type in [
                 DeepseekV4AttentionType.COMPRESS,
@@ -505,14 +642,12 @@ class TestDeepseekV4CacheManager:
         """
         compress_ratios = cache_manager._compress_ratios
         for (layer_idx, attn_type), (values, scales) in cache_values.items():
-            block_indices = cache_manager.get_batch_attn_offset(
-                [req.py_request_id],
-                beam_width=1,
-                num_contexts=1,
-                num_seqs=1,
-                attn_type=attn_type,
-                compress_ratio=compress_ratios[layer_idx],
-            ).squeeze(0)
+            block_indices = self._get_page_indices(
+                req,
+                cache_manager,
+                layer_idx,
+                attn_type,
+            )
 
             compressed_token_idx = token_idx
             if attn_type in [
@@ -572,7 +707,7 @@ class TestDeepseekV4CacheManager:
                 attn_types.extend(
                     [
                         DeepseekV4AttentionType.COMPRESS,
-                        DeepseekV4AttentionType.COMPRESSOR_STATE,
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
                         DeepseekV4AttentionType.COMPRESSOR_SCORE,
                     ]
                 )
@@ -580,21 +715,19 @@ class TestDeepseekV4CacheManager:
                 attn_types.extend(
                     [
                         DeepseekV4AttentionType.INDEXER_COMPRESS,
-                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
                         DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
                     ]
                 )
 
             # read cache values for each attention type
             for attn_type in attn_types:
-                page_indices = cache_manager.get_batch_attn_offset(
-                    [req.py_request_id],
-                    beam_width=1,
-                    num_contexts=1,
-                    num_seqs=1,
-                    attn_type=attn_type,
-                    compress_ratio=ratio,
-                ).squeeze(0)
+                page_indices = self._get_page_indices(
+                    req,
+                    cache_manager,
+                    layer,
+                    attn_type,
+                )
                 if attn_type in [
                     DeepseekV4AttentionType.COMPRESS,
                     DeepseekV4AttentionType.INDEXER_COMPRESS,
@@ -732,6 +865,7 @@ class TestDeepseekV4CacheManager:
         num_generation_steps: int,
         dtype: DataType,
         compressor_dtype: DataType,
+        scratch_reuse_enabled: bool,
     ):
         max_batch_size = len(prompt_lens)
         max_seq_len = max(prompt_lens) + num_generation_steps + 1
@@ -745,7 +879,9 @@ class TestDeepseekV4CacheManager:
             dtype=dtype,
             compressor_dtype=compressor_dtype,
             max_input_len=max_input_len,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         # Create requests and their cache values
         requests = list[LlmRequest]()
@@ -784,6 +920,7 @@ class TestDeepseekV4CacheManager:
             for req in requests:
                 req.context_current_position = prompt_lens[req.py_request_id]
                 req.add_new_token(prompt_lens[req.py_request_id], 0)
+            cache_manager.update_context_resources(scheduled_batch)
             cache_manager.update_resources(scheduled_batch)
 
             # Read context from cache and verify
@@ -847,11 +984,10 @@ class TestDeepseekV4CacheManager:
     @pytest.mark.parametrize(
         "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]
     )
-    def test_kv_cache_pool_mapping(
+    def test_pool_mapping_tensors(
         self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
     ):
         # Create cache manager and sparse attention config
-        num_layers = len(compress_ratios)
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=4,
@@ -862,19 +998,599 @@ class TestDeepseekV4CacheManager:
         )
 
         try:
-            kv_cache_pool_mapping = cache_manager.kv_cache_pool_mapping
-            assert kv_cache_pool_mapping.shape == (num_layers, 2)
+            expected_mapping = torch.stack(
+                [
+                    torch.arange(cache_manager.num_local_layers, dtype=torch.int32),
+                    torch.zeros(cache_manager.num_local_layers, dtype=torch.int32),
+                ],
+                dim=1,
+            )
+            expected_pointers = torch.tensor(
+                [
+                    [
+                        cache_manager.impl.get_mem_pool_base_address(
+                            cache_manager._layer_attn_to_layer_id[
+                                pp_layer, DeepseekV4AttentionType.SWA
+                            ],
+                            DeepseekV4AttentionType.SWA.role,
+                            PageIndexMode.PER_LAYER,
+                        ),
+                        0,
+                    ]
+                    for pp_layer in cache_manager.pp_layers
+                ],
+                dtype=torch.int64,
+            )
 
-            assert torch.all(kv_cache_pool_mapping[:, 0] != -1), (
-                "all layers should have swa attention pool"
-            )
-            assert torch.all(kv_cache_pool_mapping[:, 1] >= 0), (
-                "buffer pointer offset should be non-negative"
-            )
-            assert torch.all(kv_cache_pool_mapping[:, 0] == kv_cache_pool_mapping[0, 0]), (
-                "all layers should have the same pool_id"
-            )
+            assert cache_manager.kv_cache_pool_mapping.shape == expected_mapping.shape
+            assert cache_manager.kv_cache_pool_mapping.dtype == expected_mapping.dtype
+            assert torch.equal(cache_manager.kv_cache_pool_mapping, expected_mapping)
+            assert cache_manager.kv_cache_pool_pointers.shape == expected_pointers.shape
+            assert cache_manager.kv_cache_pool_pointers.dtype == expected_pointers.dtype
+            assert torch.equal(cache_manager.kv_cache_pool_pointers, expected_pointers)
         finally:
+            cache_manager.shutdown()
+
+    def test_disagg_page_table_accepts_deepseek_v4_roles(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        try:
+            page_table = build_page_table_from_manager(cache_manager)
+            saw_pool_view = False
+            for layer_group in page_table.layer_groups:
+                for pool_view in layer_group.pool_views:
+                    saw_pool_view = True
+                    # All DSv4 pools publish per-layer buffer_entries (INDEXED);
+                    # the FLAT layout is reserved for the DSA (DeepSeek v3.2)
+                    # indexer K cache pool.
+                    assert pool_view.mapper_kind == MapperKind.INDEXED
+                    # pool_role carries the manager-native role-name strings,
+                    # which are all DSv4 attention-type names like
+                    # "deepseek_v4_swa", "deepseek_v4_compress", etc.
+                    assert pool_view.pool_role
+                    for role_name in pool_view.pool_role:
+                        assert role_name.startswith("deepseek_v4_"), role_name
+            assert saw_pool_view
+        finally:
+            cache_manager.shutdown()
+
+    def test_disagg_pool_mapping_prefers_exact_pool_view_layer_set(self):
+        ctx_cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.FP8,
+            compressor_dtype=DataType.FLOAT,
+            tp_size=2,
+        )
+        gen_cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=512,
+            compress_ratios=[1, 4, 128],
+            dtype=DataType.FP8,
+            compressor_dtype=DataType.FLOAT,
+            tp_size=2,
+            enable_attention_dp=True,
+        )
+
+        try:
+            ctx_rank_info = RankInfo.from_kv_cache_manager("ctx", ctx_cache_manager, 0)
+            gen_rank_info = RankInfo.from_kv_cache_manager("gen", gen_cache_manager, 0)
+            registrar = PeerRegistrar(gen_rank_info, KVRegionExtractorV1(gen_cache_manager))
+            registrar.register("ctx", 0, ctx_rank_info)
+
+            pool_mapping = registrar.get_pool_mapping(ctx_rank_info)
+            assert pool_mapping
+            for self_pool_key, peer_pool_key in pool_mapping.items():
+                registrar.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
+        finally:
+            ctx_cache_manager.shutdown()
+            gen_cache_manager.shutdown()
+
+    def test_dsv4_block_tables(self, scratch_reuse_enabled: bool):
+        prompt_len = self.tokens_per_block * 2
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=prompt_len,
+            compress_ratios=[4, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
+        )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
+
+        req = self._create_request(0, prompt_len)
+        allocated = False
+        try:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(req, req.context_chunk_size)
+            allocated = True
+
+            attention_types = {
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+                DeepseekV4AttentionType.COMPRESSOR_KV,
+            }
+            sliding_block_tables_cuda = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                device="cuda",
+            )
+            compress_block_table = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            host_indexer_compress_block_table = torch.empty(
+                1,
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            with torch.cuda.stream(cache_manager._stream):
+                cache_manager.copy_batch_sliding_block_tables(
+                    sliding_block_tables_cuda,
+                    [req.py_request_id],
+                    num_contexts=1,
+                    num_seqs=1,
+                )
+            cache_manager.copy_batch_compress_block_tables(
+                compress_block_table,
+                [req.py_request_id],
+                compress_ratio=4,
+                beam_width=1,
+                num_contexts=1,
+                num_seqs=1,
+            )
+            cache_manager.copy_batch_indexer_compress_block_tables(
+                host_indexer_compress_block_table,
+                [req.py_request_id],
+                beam_width=1,
+                num_contexts=1,
+                num_seqs=1,
+            )
+            cache_manager._stream.synchronize()
+            sliding_block_tables = sliding_block_tables_cuda.cpu()
+            for attn_type in attention_types:
+                layer0_buffer = _view_fp8_as_uint8(cache_manager.get_buffers(0, attn_type))
+                layer1_buffer = _view_fp8_as_uint8(cache_manager.get_buffers(1, attn_type))
+                attn_len = prompt_len
+                if attn_type in [
+                    DeepseekV4AttentionType.COMPRESS,
+                    DeepseekV4AttentionType.INDEXER_COMPRESS,
+                ]:
+                    attn_len //= 4
+                num_blocks = (attn_len + layer0_buffer.shape[1] - 1) // layer0_buffer.shape[1]
+                if attn_type == DeepseekV4AttentionType.COMPRESS:
+                    layer0_offsets = compress_block_table[0, :num_blocks].tolist()
+                    layer1_offsets = compress_block_table[0, :num_blocks].tolist()
+                elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+                    layer0_offsets = host_indexer_compress_block_table[0, :num_blocks].tolist()
+                    layer1_offsets = host_indexer_compress_block_table[0, :num_blocks].tolist()
+                else:
+                    layer0_offsets = sliding_block_tables[
+                        cache_manager.layer_offsets[0],
+                        attn_type.value,
+                        0,
+                        :num_blocks,
+                    ].tolist()
+                    layer1_offsets = sliding_block_tables[
+                        cache_manager.layer_offsets[1],
+                        attn_type.value,
+                        0,
+                        :num_blocks,
+                    ].tolist()
+                assert all(offset != BAD_PAGE_INDEX for offset in layer0_offsets)
+                assert all(offset != BAD_PAGE_INDEX for offset in layer1_offsets)
+
+                layer0_values = torch.full(
+                    (num_blocks, layer0_buffer.shape[1], layer0_buffer.shape[-1]),
+                    1,
+                    dtype=layer0_buffer.dtype,
+                    device=layer0_buffer.device,
+                )
+                layer1_values = torch.full_like(layer0_values, 2)
+
+                layer0_buffer[layer0_offsets] = layer0_values
+                layer1_buffer[layer1_offsets] = layer1_values
+
+                torch.testing.assert_close(layer0_buffer[layer0_offsets], layer0_values)
+                torch.testing.assert_close(layer1_buffer[layer1_offsets], layer1_values)
+        finally:
+            if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_block_offsets_matches_python_converter(self, scratch_reuse_enabled: bool):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
+        )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+            actual = torch.empty_like(
+                cache_manager._host_attention_op_block_offsets_staging,
+                device="cuda",
+            )
+
+            with torch.cuda.stream(cache_manager._stream):
+                cache_manager.copy_batch_block_offsets(
+                    actual,
+                    request_ids,
+                    beam_width=1,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+
+            expected = torch.full_like(
+                cache_manager._host_attention_op_block_offsets_staging[:, :, 0],
+                BAD_PAGE_INDEX,
+            )
+            for local_layer_idx, pp_layer in enumerate(cache_manager.pp_layers):
+                ref = self._reference_copy_batch_page_indices(
+                    cache_manager,
+                    request_ids,
+                    num_contexts,
+                    pp_layer,
+                    DeepseekV4AttentionType.SWA,
+                    PageIndexMode.PER_LAYER,
+                )
+                expected[local_layer_idx, : len(request_ids)] = ref
+
+            # DSV4 AttentionOp only consumes the key table.
+            cache_manager._stream.synchronize()
+            torch.testing.assert_close(actual.cpu()[:, :, 0], expected)
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_sliding_block_tables_matches_python_converter(
+        self, scratch_reuse_enabled: bool
+    ):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
+        )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+            actual = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                device="cuda",
+            )
+
+            with torch.cuda.stream(cache_manager._stream):
+                cache_manager.copy_batch_sliding_block_tables(
+                    actual,
+                    request_ids,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+
+            expected = torch.full_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                BAD_PAGE_INDEX,
+            )
+            for pp_layer in cache_manager.pp_layers:
+                compress_ratio = cache_manager._compress_ratios[pp_layer]
+                local_layer_idx = cache_manager.layer_offsets[pp_layer]
+                for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+                    if not compress_ratio_has_attention(compress_ratio, attn_type):
+                        continue
+                    expected[local_layer_idx, attn_type.value, : len(request_ids)] = (
+                        self._reference_copy_batch_page_indices(
+                            cache_manager,
+                            request_ids,
+                            num_contexts,
+                            pp_layer,
+                            attn_type,
+                            PageIndexMode.PER_LAYER,
+                        )
+                    )
+
+            cache_manager._stream.synchronize()
+            torch.testing.assert_close(actual.cpu(), expected)
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_compress_block_tables_matches_python_converter(
+        self, scratch_reuse_enabled: bool
+    ):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
+        )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+
+            for compress_ratio in (4, 128):
+                actual = torch.empty(
+                    len(request_ids),
+                    cache_manager.max_blocks_per_seq,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+
+                cache_manager.copy_batch_compress_block_tables(
+                    actual,
+                    request_ids,
+                    compress_ratio=compress_ratio,
+                    beam_width=1,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+
+                pp_layer = next(
+                    layer
+                    for layer in cache_manager.pp_layers
+                    if cache_manager._compress_ratios[layer] == compress_ratio
+                )
+                expected = self._reference_copy_batch_page_indices(
+                    cache_manager,
+                    request_ids,
+                    num_contexts,
+                    pp_layer,
+                    DeepseekV4AttentionType.COMPRESS,
+                    PageIndexMode.SHARED,
+                )
+                torch.testing.assert_close(actual, expected)
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_copy_batch_indexer_compress_block_tables_matches_python_converter(
+        self, scratch_reuse_enabled: bool
+    ):
+        prompt_len = self.tokens_per_block * 2 + 1
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=3,
+            max_seq_len=1024,
+            compress_ratios=[1, 4, 128, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=scratch_reuse_enabled,
+        )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
+
+        requests = []
+        try:
+            requests, num_contexts = self._prepare_mixed_copy_batch(cache_manager, prompt_len)
+            request_ids = [req.py_request_id for req in requests]
+            actual = torch.empty(
+                len(request_ids),
+                cache_manager.max_blocks_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+
+            cache_manager.copy_batch_indexer_compress_block_tables(
+                actual,
+                request_ids,
+                beam_width=1,
+                num_contexts=num_contexts,
+                num_seqs=len(request_ids),
+            )
+
+            pp_layer = next(
+                layer
+                for layer in cache_manager.pp_layers
+                if compress_ratio_has_attention(
+                    cache_manager._compress_ratios[layer],
+                    DeepseekV4AttentionType.INDEXER_COMPRESS,
+                )
+            )
+            expected = self._reference_copy_batch_page_indices(
+                cache_manager,
+                request_ids,
+                num_contexts,
+                pp_layer,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+                PageIndexMode.SHARED,
+            )
+            torch.testing.assert_close(actual, expected)
+            assert num_contexts == 2
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_swa_scratch_reuse_disabled_by_default_for_main_manager(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        try:
+            assert not cache_manager.enable_swa_scratch_reuse
+            assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_swa_scratch_reuse_enabled_by_config_for_main_manager(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=True,
+        )
+
+        try:
+            assert cache_manager.enable_swa_scratch_reuse
+            assert cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_draft_cache_manager_disables_swa_scratch_reuse(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            is_draft=True,
+            enable_swa_scratch_reuse=True,
+        )
+
+        try:
+            assert not cache_manager.enable_swa_scratch_reuse
+            assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_context_request_enable_scratch_reuse_until_generation(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=True,
+        )
+
+        req = self._create_request(request_id=0, prompt_len=self.tokens_per_block + 1)
+        allocated = False
+        try:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(req, req.context_chunk_size)
+            allocated = True
+
+            kv_cache = cache_manager.kv_cache_map[req.py_request_id]
+            assert kv_cache.enable_swa_scratch_reuse
+
+            scheduled_batch = ScheduledRequests()
+            scheduled_batch.context_requests_last_chunk = [req]
+            req.context_current_position = req.prompt_len
+            req.add_new_token(req.prompt_len, 0)
+            cache_manager.update_context_resources(scheduled_batch)
+            assert not kv_cache.enable_swa_scratch_reuse
+
+            assert cache_manager.try_allocate_generation(req)
+            assert not kv_cache.enable_swa_scratch_reuse
+        finally:
+            if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_disagg_generation_init_disables_swa_scratch_reuse(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=True,
+        )
+
+        req = self._create_request(request_id=0, prompt_len=self.tokens_per_block + 1)
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+        allocated = False
+        try:
+            assert cache_manager.prepare_context(req)
+            assert cache_manager.resize_context(
+                req,
+                req.context_remaining_length,
+                history_length=req.context_remaining_length,
+            )
+            allocated = True
+
+            kv_cache = cache_manager.kv_cache_map[req.py_request_id]
+            assert not kv_cache.enable_swa_scratch_reuse
+            assert kv_cache.history_length == req.context_remaining_length
+        finally:
+            if allocated:
+                cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_dummy_generation_requests_with_swa_scratch_reuse(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=True,
+        )
+
+        requests = []
+        token_nums = [1, self.tokens_per_block * 4 + 1]
+        try:
+            requests = cache_manager.add_dummy_requests(
+                request_ids=[0, 1],
+                token_nums=token_nums,
+                is_gen=True,
+            )
+            assert requests is not None
+            assert len(requests) == len(token_nums)
+
+            short_kv_cache = cache_manager.kv_cache_map[requests[0].py_request_id]
+            long_kv_cache = cache_manager.kv_cache_map[requests[1].py_request_id]
+            assert not short_kv_cache.enable_swa_scratch_reuse
+            assert not long_kv_cache.enable_swa_scratch_reuse
+            assert short_kv_cache.history_length == 0
+            assert short_kv_cache.capacity == token_nums[0] + 1
+            assert long_kv_cache.history_length == token_nums[1] - 1
+            assert long_kv_cache.capacity == token_nums[1] + 1
+        finally:
+            for req in requests:
+                cache_manager.free_resources(req)
             cache_manager.shutdown()
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
@@ -910,9 +1626,7 @@ class TestDeepseekV4CacheManager:
             if invalid:
                 # Inject invalid into a float buffer so NaN/Inf checks are supported.
                 layer_idx = next(i for i, ratio in enumerate(compress_ratios) if ratio > 1)
-                buffer = cache_manager.get_buffers(
-                    layer_idx, DeepseekV4AttentionType.COMPRESSOR_STATE
-                )
+                buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESSOR_KV)
                 buffer[0, 0, 0] = torch.nan
                 needs_invalid_cleanup = True
 
