@@ -17,6 +17,7 @@ from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
+from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -62,6 +63,12 @@ def get_moe_cls(
     if override_quant_config is not None:
         quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
+    if moe_backend.upper() == "MARLIN":
+        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Require nvfp4
+        # quantization explicitly so a misconfigured model fails fast.
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            raise ValueError("MarlinFusedMoE only supports NVFP4 quantization.")
+        return MarlinFusedMoE
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE
     elif moe_backend.upper() == "VANILLA":
@@ -247,6 +254,7 @@ def create_moe_backend(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_limit_scalar: Optional[float] = None,
     init_load_balancer: bool = True,
     without_comm: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
@@ -270,7 +278,8 @@ def create_moe_backend(
         layer_idx: Layer index
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
-        swiglu_limit: SwiGLU limit parameter
+        swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
+        swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
 
     Returns:
@@ -323,9 +332,16 @@ def create_moe_backend(
             "Both swiglu_alpha and swiglu_beta must be provided."
 
     if swiglu_limit is not None:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE,
-                           MegaMoECuteDsl], \
-            f"swiglu_limit is only supported in CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE and MegaMoECuteDsl, not in {moe_cls.__name__}."
+        assert moe_cls in [
+            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
+            DeepGemmFusedMoE, MegaMoECuteDsl
+        ], f"swiglu_limit is not supported in {moe_cls.__name__}."
+
+    if swiglu_limit_scalar is not None:
+        assert moe_cls in [
+            CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
+            MegaMoEDeepGemm
+        ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -345,11 +361,12 @@ def create_moe_backend(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls is CutlassFusedMoE:
+    elif moe_cls in (CutlassFusedMoE, MarlinFusedMoE):
         # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
         # also subclass CutlassFusedMoE but have narrower constructors, so
         # they take their own branches below.
@@ -369,6 +386,7 @@ def create_moe_backend(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,
@@ -386,6 +404,8 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             activation_type=activation_type)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
@@ -436,6 +456,8 @@ def create_moe_backend(
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             without_comm=without_comm,
         )
     elif moe_cls == TritonFusedMoE:
@@ -495,11 +517,10 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-        # Only MegaMoECuteDsl consumes the SwiGLU clamp; pass it explicitly
-        # so MegaMoEDeepGemm never receives a kwarg it does not model
-        # (the allowlist above already rejects non-None clamps for DG).
         if moe_cls is MegaMoECuteDsl:
             megamoe_kwargs["swiglu_limit"] = swiglu_limit
+        else:
+            megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
         return moe_cls(**megamoe_kwargs)
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
@@ -522,6 +543,7 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_limit_scalar: Optional[float] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """
@@ -543,7 +565,8 @@ def create_moe(
         layer_idx: Layer index
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
-        swiglu_limit: SwiGLU limit parameter
+        swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
+        swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
 
     Returns:
@@ -577,7 +600,7 @@ def create_moe(
                                               CuteDslB12xFusedMoE):
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
-                       MegaMoEDeepGemm, MegaMoECuteDsl):
+                       MegaMoEDeepGemm, MegaMoECuteDsl, MarlinFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,
@@ -595,6 +618,7 @@ def create_moe(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
+                swiglu_limit_scalar=swiglu_limit_scalar,
                 activation_type=activation_type,
             )
         else:
@@ -634,5 +658,6 @@ def create_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
     )

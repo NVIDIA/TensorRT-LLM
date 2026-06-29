@@ -1908,6 +1908,15 @@ public:
         return mPerfMetrics.kvCacheMetrics.numNewAllocatedBlocks;
     }
 
+    void updateKvCachePerfMetrics(
+        SizeType32 allocTotalBlocks, SizeType32 allocNewBlocks, SizeType32 reusedBlocks, SizeType32 missedBlocks)
+    {
+        updateAllocTotalBlocksPerRequest(allocTotalBlocks);
+        updateAllocNewBlocksPerRequest(allocNewBlocks);
+        updateReusedBlocksPerRequest(reusedBlocks);
+        updateMissedBlocksPerRequest(missedBlocks);
+    }
+
     void updateReusedBlocksPerRequest(SizeType32 reusedBlocksPerRequest)
     {
         mPerfMetrics.kvCacheMetrics.numReusedBlocks += reusedBlocksPerRequest;

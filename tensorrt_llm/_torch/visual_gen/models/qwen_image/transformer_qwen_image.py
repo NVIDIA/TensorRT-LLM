@@ -39,17 +39,17 @@ _WEIGHT_KEY_REMAPS = [
     (".net.2.", ".down_proj."),
 ]
 
-# Helper buffers that FP8/NVFP4 ``Linear.create_weights()`` registers but that
+# Helper parameters that FP8/NVFP4 ``Linear.create_weights()`` registers but that
 # are derived from the stored scales at load time (``alpha`` and
 # ``inv_input_scale``) or default to ones (the NVFP4 KV-cache scales). They are
 # never serialized in a ModelOpt checkpoint, so they must be excluded from the
 # strict key check when loading a statically pre-quantized checkpoint
 # (``dynamic_weight_quant=False``).
-_QUANT_DERIVED_PARAM_SUFFIXES = (
-    ".alpha",
-    ".inv_input_scale",
-    ".kv_scales",
-    ".inv_kv_scales",
+_QUANT_DERIVED_PARAM_NAMES = (
+    "alpha",
+    "inv_input_scale",
+    "kv_scales",
+    "inv_kv_scales",
 )
 
 # SVDQuant (NVFP4_SVD) checkpoints carry, per quantized Linear, three tensors on
@@ -114,8 +114,8 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
                 w["svdquant_lora_b"].to(device), requires_grad=False
             )
 
-    def post_load_weights(self, module) -> None:
-        super().post_load_weights(module)
+    def transform_weights(self, module) -> None:
+        super().transform_weights(module)
         lora_a = getattr(module, "svdquant_lora_a", None)
         lora_b = getattr(module, "svdquant_lora_b", None)
         pqs = getattr(module, "pre_quant_scale", None)
@@ -1216,6 +1216,11 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
     ):
         model_config = model_config or DiffusionModelConfig()
         super().__init__(model_config)
+        # Exclusion patterns can only be applied after the complete module
+        # names are known. Always defer Linear weight creation while building
+        # the module tree, then materialize eagerly below if the caller did
+        # not request deferred creation.
+        construction_config = model_config.model_copy(update={"skip_create_weights_in_init": True})
         self.attn_backend = attn_backend
 
         self.patch_size = patch_size
@@ -1237,9 +1242,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         )
         linear_kwargs = {
             "dtype": self.model_config.torch_dtype,
-            "quant_config": self.model_config.get_quant_config(),
-            "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
-            "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
+            "quant_config": construction_config.get_quant_config(),
+            "skip_create_weights_in_init": construction_config.skip_create_weights_in_init,
+            "force_dynamic_quantization": construction_config.force_dynamic_quantization,
         }
         self.img_in = Linear(in_channels, self.inner_dim, bias=True, **linear_kwargs)
         self.txt_in = Linear(joint_attention_dim, self.inner_dim, bias=True, **linear_kwargs)
@@ -1251,7 +1256,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     dtype=self.model_config.torch_dtype,
-                    config=self.model_config,
+                    config=construction_config,
                     layer_idx=layer_idx,
                 )
                 for layer_idx in range(num_layers)
@@ -1264,9 +1269,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             elementwise_affine=False,
             eps=1e-6,
             dtype=self.model_config.torch_dtype,
-            quant_config=self.model_config.get_quant_config(),
-            skip_create_weights=self.model_config.skip_create_weights_in_init,
-            force_dynamic_quant=self.model_config.force_dynamic_quantization,
+            quant_config=construction_config.get_quant_config(),
+            skip_create_weights=construction_config.skip_create_weights_in_init,
+            force_dynamic_quant=construction_config.force_dynamic_quantization,
         )
         self.proj_out = Linear(
             self.inner_dim,
@@ -1275,6 +1280,12 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             **linear_kwargs,
         )
         self._svdquant_qkv_aux_stream = None
+
+        self._clear_quant_config_on_excluded_layers()
+        if not self.model_config.skip_create_weights_in_init:
+            for _, module in self.named_modules():
+                if callable(getattr(module, "create_weights", None)):
+                    module.create_weights()
 
     @property
     def device(self) -> torch.device:
@@ -1346,6 +1357,20 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             ):
                 module.quant_config = None
 
+    def _quant_derived_parameter_names(self) -> set[str]:
+        """Return non-serialized helper parameters owned by quantized Linears."""
+        derived = set()
+        for module_name, module in self.named_modules():
+            if not isinstance(module, Linear) or module.quant_config is None:
+                continue
+            prefix = f"{module_name}." if module_name else ""
+            derived.update(
+                f"{prefix}{param_name}"
+                for param_name in _QUANT_DERIVED_PARAM_NAMES
+                if module._parameters.get(param_name) is not None
+            )
+        return derived
+
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
 
@@ -1365,12 +1390,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        # FP8/NVFP4 Linear.create_weights() registers helper buffers that are
+        # FP8/NVFP4 Linear.create_weights() registers helper parameters that are
         # derived at load time and never stored in a checkpoint; drop them so a
         # statically pre-quantized ModelOpt checkpoint passes the key check.
-        missing = sorted(
-            k for k in (expected - provided) if not k.endswith(_QUANT_DERIVED_PARAM_SUFFIXES)
-        )
+        missing = sorted((expected - provided) - self._quant_derived_parameter_names())
         # SVDQuant LoRA factors + pre_quant_scale are loaded by the quant method
         # (not module params at this point), so they are not "unexpected".
         unexpected = sorted(
