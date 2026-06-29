@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/GatherScatterKernel.h"
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
@@ -291,12 +292,9 @@ void BounceReceiver::forget(std::string const& peer)
 
 void BounceReceiver::scatterWorkerLoop()
 {
-    if (cudaSetDevice(mCtx.deviceId) != cudaSuccess)
-    {
-        (void) cudaGetLastError();
-        TLLM_LOG_WARNING(
-            "BounceTransport(%s): scatterWorker cudaSetDevice(%d) failed", mCtx.selfName.c_str(), mCtx.deviceId);
-    }
+    // Pin this worker to our device. Can't throw out of a thread fn -> warn-only (the loop's CUDA ops
+    // would then target the wrong device, so this is a real fault, just non-recoverable here).
+    TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
     std::vector<std::uint64_t> hsrcs;
     std::vector<std::uint64_t> hdsts;
     std::vector<std::uint32_t> hsizes;
@@ -688,6 +686,8 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
         }
         catch (...)
         {
+            // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
+            // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
         }
         mRequests.erase(it);
     }
@@ -818,6 +818,8 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req)
     }
     catch (...)
     {
+        // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
+        // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
     }
     mRequests.erase(rid);
 }
@@ -870,6 +872,8 @@ void BounceSender::failAll()
         }
         catch (...)
         {
+            // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
+            // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
         }
     }
     mRequests.clear();
@@ -922,21 +926,10 @@ void BounceTransport::shutdown()
     // streams referencing the arena. Drain the device BEFORE we release contexts and let the caller
     // tear down ExecPool/BounceArena — otherwise ~ExecPool's cudaStreamDestroy + ~BounceArena's
     // cudaFree could race a kernel still reading the arena. (Teardown-only; a full-device sync is
-    // acceptable here.) WARN on error (the user should see a GPU fault) and clear the sticky error.
-    // shutdown() may run on a thread whose current device isn't ours -> select it before syncing.
-    if (cudaSetDevice(mCtx.deviceId) != cudaSuccess)
-    {
-        (void) cudaGetLastError();
-        TLLM_LOG_WARNING(
-            "BounceTransport(%s): shutdown cudaSetDevice(%d) failed", mCtx.selfName.c_str(), mCtx.deviceId);
-    }
-    cudaError_t const de = cudaDeviceSynchronize();
-    if (de != cudaSuccess)
-    {
-        TLLM_LOG_WARNING(
-            "BounceTransport(%s): shutdown device sync error: %s", mCtx.selfName.c_str(), cudaGetErrorString(de));
-        (void) cudaGetLastError();
-    }
+    // acceptable here.) Warn-only (we're in teardown / a dtor path -> must not throw); the user
+    // should still see a GPU fault. shutdown() may run on a thread whose current device isn't ours.
+    TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
+    TLLM_CUDA_CHECK_WARN(cudaDeviceSynchronize());
     mSender.failAll();
 }
 
@@ -973,13 +966,9 @@ void BounceTransport::drainForgets()
 
 void BounceTransport::ioLoop()
 {
-    // Pin this thread to our device up front; if it fails, every CUDA op in the loop would target the
-    // wrong device, so warn loudly (the transport is effectively broken and requests will fail).
-    if (cudaSetDevice(mCtx.deviceId) != cudaSuccess)
-    {
-        (void) cudaGetLastError();
-        TLLM_LOG_WARNING("BounceTransport(%s): ioLoop cudaSetDevice(%d) failed", mCtx.selfName.c_str(), mCtx.deviceId);
-    }
+    // Pin this thread to our device up front; if it fails, every CUDA op in the loop targets the wrong
+    // device (the transport is effectively broken). Can't throw out of a thread fn -> warn-only.
+    TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
     std::string peer;
     std::string blob;
     while (!mCtx.stop.load(std::memory_order_acquire))
