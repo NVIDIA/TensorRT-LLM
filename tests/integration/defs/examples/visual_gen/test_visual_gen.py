@@ -404,26 +404,16 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
     previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     previous_cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
-    previous_piecewise_running = None
-
-    if fully_eager:
-        from tensorrt_llm._torch.utils import is_piecewise_running, set_piecewise_running
-
-        previous_piecewise_running = is_piecewise_running()
 
     try:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True)
-        if fully_eager:
-            set_piecewise_running(True)
         compiler_context = (
             torch.compiler.set_stance("force_eager") if fully_eager else contextlib.nullcontext()
         )
         with compiler_context:
             yield
     finally:
-        if fully_eager:
-            set_piecewise_running(previous_piecewise_running)
         torch.use_deterministic_algorithms(
             previous_deterministic,
             warn_only=previous_warn_only,

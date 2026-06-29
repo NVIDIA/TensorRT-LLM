@@ -14,7 +14,6 @@
   "attention_backend": "VANILLA",
   "torch_compile": false,
   "torch_compile_stance": "default",
-  "piecewise_running": false,
   "deterministic_algorithms": true,
   "lpips_net": "alex",
   "lpips_threshold": 0.05,

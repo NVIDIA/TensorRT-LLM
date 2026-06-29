@@ -14,7 +14,6 @@
   "attention_backend": "FA4",
   "torch_compile": false,
   "torch_compile_stance": "force_eager",
-  "piecewise_running": true,
   "deterministic_algorithms": true,
   "lpips_net": "alex",
   "lpips_threshold": 0.25,
