@@ -136,10 +136,17 @@ def test_redirect_is_disabled_by_default(generated_package: Path, env_value: str
     result = _run_generated(
         generated_package,
         """
+        import importlib
         import sys
         import llmc
 
         assert 'tensorrt_llm._torch.auto_deploy' not in sys.modules
+        try:
+            importlib.import_module('tensorrt_llm._torch.auto_deploy')
+        except RuntimeError as exc:
+            assert 'bundled AutoDeploy must not be imported' in str(exc)
+        else:
+            raise AssertionError('redirect unexpectedly enabled for falsey environment value')
         """,
         env_value=env_value,
     )
@@ -217,6 +224,7 @@ def test_redirect_bootstraps_during_child_unpickle(generated_package: Path) -> N
             capture_output=True,
             env=os.environ.copy(),
             text=True,
+            timeout=30,
         )
         assert child.returncode == 0, (child.stdout, child.stderr)
         """,
