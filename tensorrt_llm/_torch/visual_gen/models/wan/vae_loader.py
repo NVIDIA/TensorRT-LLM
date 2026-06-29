@@ -31,7 +31,7 @@ from .wan_vae import WanVAE, WanVAEConfig
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
 
 
-def _wan_vae_backend_fallback() -> bool:
+def _use_diffuser_vae_env() -> bool:
     """Whether the Diffusers Wan VAE is forced via the debug env var.
 
     Unset or ``0`` keeps the native Wan VAE default; any non-zero integer
@@ -64,13 +64,12 @@ def _use_native_wan_vae(visual_gen_mapping: Any | None) -> bool:
     native path does not support yet, or when forced via
     ``TRTLLM_USE_DIFFUSER_VAE``.
     """
-    if _wan_vae_backend_fallback():
+    if _use_diffuser_vae_env():
         logger.info(f"Loading Diffusers Wan VAE because {TRTLLM_USE_DIFFUSER_VAE_ENV} is non-zero.")
         return False
     if _vae_is_parallel(visual_gen_mapping):
         logger.info("Loading Diffusers Wan VAE because parallel VAE is not supported natively yet.")
         return False
-    logger.info("Loading native Wan VAE.")
     return True
 
 
@@ -93,6 +92,6 @@ def load_wan_vae(
         checkpoint_dir,
         Mapping(),
     )
-    wan_vae.load_diffusers_state_dict(state_dict, strict=True)
+    wan_vae.load_state_dict(state_dict, strict=True)
 
     return wan_vae.to(device=device, dtype=dtype).eval()
