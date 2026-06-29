@@ -515,7 +515,7 @@ class BaseLLM:
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
-            Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
+            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
         unbatched = self._is_unbatched_optional_inputs(inputs)
         if inputs is not None and not unbatched:
@@ -606,7 +606,7 @@ class BaseLLM:
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
-            tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
+            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
         if self._encode_only:
             raise RuntimeError(
