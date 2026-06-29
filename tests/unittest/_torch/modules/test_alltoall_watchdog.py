@@ -101,6 +101,28 @@ def test_watchdog_completes_when_all_active_flags_arrive() -> None:
     assert health.all_active() is True
 
 
+def test_watchdog_completes_when_flags_advance_past_expected_generation() -> None:
+    health = EPGroupHealth(4)
+    reader = FakeCompletionFlagReader(ep_size=4)
+    reader.set_flags("dispatch", [2, 1, 5, 3])
+    events: list[AlltoAllWatchdogTimeout] = []
+
+    with AlltoAllWatchdog(
+        ep_size=4,
+        ep_rank=0,
+        completion_reader=reader,
+        timeout_s=0.02,
+        poll_interval_s=0.005,
+        health=health,
+        on_timeout=events.append,
+    ) as watchdog:
+        watchdog.watch(phase="dispatch", expected_flag=1)
+        assert watchdog.wait_until_idle(timeout_s=1.0)
+
+    assert events == []
+    assert health.all_active() is True
+
+
 def test_watchdog_defaults_match_design_doc() -> None:
     reader = FakeCompletionFlagReader(ep_size=1)
     watchdog = AlltoAllWatchdog(ep_size=1, ep_rank=0, completion_reader=reader)
