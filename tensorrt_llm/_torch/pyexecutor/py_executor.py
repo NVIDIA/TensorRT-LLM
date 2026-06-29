@@ -563,15 +563,22 @@ class PyExecutor:
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse
             and not isinstance(self.kv_cache_manager, KVCacheManagerV2))
-        # Eager-store ctx blocks into the reuse trie at transfer start (and
-        # early-terminate via the same path) so a following request can reuse
-        # them immediately. Required for PP>1 disagg: lazy commit-on-terminate
-        # races behind the next request's reuse lookup, yielding a partial
-        # match. store_blocks_for_reuse is V1 KVCacheManager only;
+        # Store+pin ctx blocks into the reuse trie at transfer start so the next
+        # request reuses them immediately (PP>1 otherwise commits too late and
+        # only partially matches). No collective is required for the
+        # store-and-pin operation. store_blocks_for_reuse is V1-only;
         # KVCacheManagerV2 has no equivalent yet.
         self.enable_disagg_partial_reuse_store = (
             self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa)
+        # Early-terminating the ctx request in _handle_responses (at prefill
+        # done) is a PP=1-only latency win. Under PP>1, ctx termination is
+        # routed through the DisaggPPTerminationHandler cross-rank ring
+        # consensus, which is only validated against the transfer-complete
+        # trigger; driving it from the early path regressed to a hang in CI.
+        # So PP>1 keeps eager-store but terminates via the transfer-complete path.
+        self.force_terminate_ctx_for_partial_reuse = (
+            self.enable_disagg_partial_reuse_store and self.dist.pp_size == 1)
 
         self.max_input_len = max_input_len
         # _executor_loop private data
@@ -976,11 +983,9 @@ class PyExecutor:
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
-            # When should_store_blocks is True, _handle_responses already
-            # terminated this request via the early-termination path
-            # (enable_partial_reuse_for_disagg branch). Skip the redundant
-            # termination to avoid double free_resources calls.
-            if not self.async_transfer_manager.should_store_blocks:
+            # Skip if the PP=1 early path already terminated this request;
+            # under PP>1 that path is off, so terminate here on transfer-complete.
+            if not self.force_terminate_ctx_for_partial_reuse:
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
@@ -5723,11 +5728,10 @@ class PyExecutor:
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
                                 )
 
-                # Must stay consistent with should_store_blocks: when blocks
-                # are eager-stored, _end_transfer_and_maybe_terminate skips
-                # termination assuming this early-termination path ran.
+                # PP=1-only early termination; _end_transfer_and_maybe_terminate
+                # gates on the same flag so the request terminates exactly once.
                 force_terminate_for_partial_reuse = (
-                    self.async_transfer_manager.should_store_blocks)
+                    self.force_terminate_ctx_for_partial_reuse)
                 if request.is_disagg_context_complete_state:
                     # Already terminated by _check_disagg_ctx_cache_transfer_status;
                     # track for stats only to avoid double-free (nvbug/5961736).
