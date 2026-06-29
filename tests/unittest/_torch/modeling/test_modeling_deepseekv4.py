@@ -361,7 +361,7 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
 
 
 def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
-    from tensorrt_llm._torch.modules.attention import MLA
+    from tensorrt_llm._torch.modules.mla import MLA
 
     init_src = inspect.getsource(MLA.__init__)
     helper_src = inspect.getsource(MLA._deepseek_v4_q_b_layernorm)
