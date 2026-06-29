@@ -33,9 +33,11 @@ from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+from .utils import _merge_flash_attn_namespace
 
 _flash_attn_combine_import_error = None
 try:
+    _merge_flash_attn_namespace()
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
 except (ImportError, OSError) as e:
     _flash_attn_combine = None

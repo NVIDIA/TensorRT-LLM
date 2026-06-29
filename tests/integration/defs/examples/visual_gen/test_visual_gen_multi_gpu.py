@@ -15,6 +15,7 @@
 """Multi-GPU integration tests for VisualGen LPIPS quality checks."""
 
 import os
+import sys
 from typing import Callable
 
 import pytest
@@ -108,6 +109,11 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
     port = get_free_port()
+    # mp.spawn starts a fresh interpreter that does not inherit the parent's
+    # runtime sys.path mutations; without this, the child cannot import
+    # tensorrt_llm.bindings.internal.process_group (needed by the tp_size>1
+    # C++ allreduce path).
+    os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, sys.path))
     mp.spawn(
         _distributed_worker,
         args=(world_size, backend, test_fn, port, kwargs),
