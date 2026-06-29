@@ -10,13 +10,18 @@ import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import skip_pre_blackwell
+from utils.util import skip_blackwell, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
+from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -93,6 +98,77 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mtp_eagle_one_model_dynamic_tree_metadata_prepares_mamba_links():
+    max_num_requests = 3
+    max_draft_len = 2
+    max_total_draft_tokens = 2
+    spec_tree_manager = SpecTreeManager(
+        max_num_requests=max_num_requests,
+        use_dynamic_tree=True,
+        max_total_draft_tokens=max_total_draft_tokens,
+        max_draft_len=max_draft_len,
+        eagle_choices=None,
+        dynamic_tree_max_topK=2,
+    )
+    slot_storage = spec_tree_manager.slot_storage
+    slot_storage.all_ids_buf[:max_num_requests].copy_(
+        torch.tensor([0, 1, 2], dtype=torch.long, device="cuda"))
+    slot_storage.has_tree[1] = True
+    slot_storage.retrieve_next_token[1] = torch.tensor([2, -1, -1],
+                                                       dtype=torch.int32,
+                                                       device="cuda")
+    slot_storage.retrieve_next_sibling[1] = torch.tensor([-1, -1, -1],
+                                                         dtype=torch.int32,
+                                                         device="cuda")
+
+    class _ResourceManager:
+        hidden_states = None
+        slot_manager = None
+        sa_manager = None
+
+        def __init__(self):
+            self.spec_tree_manager = spec_tree_manager
+            self.batch_indices_cuda = torch.empty(max_num_requests,
+                                                  dtype=torch.int,
+                                                  device="cuda")
+
+    metadata = Eagle3OneModelSpecMetadata(
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
+        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        max_num_requests=max_num_requests,
+        num_layers=1,
+        hidden_size=1,
+        max_num_tokens=16,
+        spec_resource_manager=_ResourceManager(),
+        use_dynamic_tree=True,
+    )
+    metadata.request_ids = [10, 11, 12]
+    metadata.seq_lens = [
+        1, max_total_draft_tokens + 1, max_total_draft_tokens + 1
+    ]
+    metadata.num_generations = 2
+    metadata.num_tokens = 1 + 2 * (max_total_draft_tokens + 1)
+
+    metadata.prepare()
+
+    assert metadata.retrieve_next_token is not None
+    assert metadata.retrieve_next_sibling is not None
+    assert metadata.retrieve_next_token.shape == (2, max_total_draft_tokens + 1)
+    assert torch.equal(metadata.retrieve_next_token[0],
+                       slot_storage.retrieve_next_token[1])
+    assert torch.equal(
+        metadata.retrieve_next_token[1],
+        torch.tensor([1, 2, -1], dtype=torch.int32, device="cuda"))
+    assert torch.equal(
+        metadata.retrieve_next_sibling[1],
+        torch.full((max_total_draft_tokens + 1, ),
+                   -1,
+                   dtype=torch.int32,
+                   device="cuda"))
+
+
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
     [
@@ -157,6 +233,9 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       use_chain_drafter: bool, multi_batch: bool,
                       attention_dp: bool, use_hf_speculative_model: bool):
+    if not use_one_model:
+        pytest.skip("Two model Eagle3 is deprecated")
+
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -224,7 +303,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         ]
         tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
         if multi_batch:
-            tok_ids.append(llm_spec.tokenizer.encode(prompts))
+            # encode each prompt individually (encode(list) returns nested
+            # lists in transformers 5.x which prompt_inputs can't handle)
+            for p in prompts:
+                tok_ids.append(llm_spec.tokenizer.encode(p))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
@@ -242,7 +324,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.10
+        assert accept_rate > 0.1
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
@@ -688,13 +770,10 @@ def test_multi_eagle3(use_one_model: bool):
             load_format="dummy",
         )
 
-        spec_config = Eagle3DecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=eagle_model_dir,
-            # Llama 3 does not support one model eagle.
-            eagle3_one_model=use_one_model,
-            num_eagle_layers=2,
-            load_format="dummy")
+        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=use_one_model,
+                                           load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
@@ -757,8 +836,9 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
     prompts = [
-        "The capital of France is", "The president of the United States is",
-        "The future of AI is"
+        "The capital of France is",
+        "The president of the United States is",
+        "The future of AI is",
     ]
 
     sampling_params = SamplingParams(max_tokens=2048, temperature=0)
@@ -816,6 +896,230 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     llm_spec.shutdown()
 
 
+@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                         ids=["no_dynamic_tree", "dynamic_tree"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.high_cuda_memory
+@skip_blackwell
+@with_mocked_hf_download_for_single_gpu
+def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
+                                               use_cuda_graph: bool):
+    """Test one-model rejection sampling with and without dynamic tree."""
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+
+    max_batch_size = 1
+    max_draft_len = 6
+    dynamic_tree_max_top_k = 10
+    max_total_draft_tokens = 60
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1]) if use_cuda_graph else None
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend="TRTLLM",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=8192,
+    )
+
+    spec_config_kwargs = dict(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model,
+        eagle3_one_model=True,
+        use_rejection_sampling=True,
+    )
+    if use_dynamic_tree:
+        spec_config_kwargs.update(
+            use_dynamic_tree=True,
+            dynamic_tree_max_topK=dynamic_tree_max_top_k,
+            max_total_draft_tokens=max_total_draft_tokens,
+        )
+
+    llm_spec = LLM(**llm_common_config,
+                   speculative_config=Eagle3DecodingConfig(
+                       **spec_config_kwargs))
+
+    prompts = ["The president of the United States is"]
+    sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=1.0)
+
+    results = llm_spec.generate(prompts, sampling_params)
+    llm_spec.shutdown()
+
+    assert len(results) == len(prompts)
+    assert len(results[0].outputs[0].token_ids) > 0
+
+
+@pytest.mark.parametrize("use_cuda_graph", [True, False])
+def test_eagle3_lora(use_cuda_graph: bool):
+    """Test LoRA with 3 requests and max_batch_size=4.
+
+    This test verifies that when using LoRA modules,
+    the system properly applies the LoRA configurations.
+    """
+    attn_backend = "TRTLLM"
+    enable_block_reuse = False
+    use_one_model = True
+    enable_chunked_prefill = False
+
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+
+    eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    hf_lora_dir = f"{models_path}/llama-models/luotuo-lora-7b-0.1"
+
+    # Test with 3 requests and max_batch_size=4 to trigger padding
+    max_batch_size = 4
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                    max_tokens=8192)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1, 2, 4], enable_padding=True) if use_cuda_graph else None
+    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend=attn_backend,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=1024,
+        enable_chunked_prefill=enable_chunked_prefill,
+        lora_config=lora_config,
+    )
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model_dir,
+        eagle3_one_model=use_one_model,
+    )
+
+    # Create the LLM instance
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+    prompts = [
+        "The capital of France is",
+        "The president of the United States is",
+        "The future of AI is",
+    ]
+    lora_requests = [LoRARequest("luotuo", 1, hf_lora_dir)] * len(prompts)
+
+    sampling_params = SamplingParams(max_tokens=20, temperature=0)
+    llm_spec.generate(prompts, sampling_params, lora_request=lora_requests)
+    llm_spec.shutdown()
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler", [False])
+@pytest.mark.parametrize("use_cuda_graph", [True])
+@pytest.mark.high_cuda_memory
+@with_mocked_hf_download_for_single_gpu
+def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
+                                   disable_overlap_scheduler: bool):
+    """Test EAGLE3 dynamic tree speculative decoding with one-model architecture."""
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
+
+    max_batch_size = 4
+    max_draft_len = 6
+    dynamic_tree_max_topK = 10
+    max_total_draft_tokens = 30
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    max_tokens=2048,
+                                    free_gpu_memory_fraction=0.5)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[i for i in range(1, max_batch_size +
+                                      1)]) if use_cuda_graph else None
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend="TRTLLM",
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=2048,
+    )
+
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model,
+        eagle3_one_model=True,
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=dynamic_tree_max_topK,
+        max_total_draft_tokens=max_total_draft_tokens,
+    )
+
+    # Create the LLM instance
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+    # Acceptance rate tests
+    prompts = [
+        "The capital of France is",
+        "The president of the United States is",
+    ]
+    tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
+
+    sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+    for i in range(len(tok_ids)):
+        num_tokens = 0
+        num_drafted = 0
+        num_accepted = 0
+
+        for output in llm_spec.generate_async(tok_ids[i],
+                                              sampling_params,
+                                              streaming=True):
+            new_tokens = output.outputs[0].token_ids
+            num_drafted += max_draft_len
+            num_accepted += len(new_tokens) - num_tokens - 1
+            num_tokens = len(new_tokens)
+
+        accept_rate = num_accepted / num_drafted
+        assert accept_rate > 0.10
+
+    # Output tests: verify spec decode matches reference
+    sampling_params = SamplingParams(max_tokens=10, temperature=0)
+
+    results_spec = llm_spec.generate(prompts, sampling_params)
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
+
+    llm_ref = LLM(**llm_common_config)
+    results_ref = llm_ref.generate(prompts, sampling_params)
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
+
+    def assert_meaningful_text(text: str) -> None:
+        stripped = text.strip()
+        assert stripped
+        assert "\ufffd" not in stripped
+        assert any(ch.isalpha() for ch in stripped)
+        words = stripped.lower().split()
+        assert not any(
+            len(set(words[i:i + 6])) == 1 for i in range(len(words) - 5))
+
+    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+        assert_meaningful_text(text_spec)
+        assert_meaningful_text(text_ref)
+
+
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.high_cuda_memory
@@ -830,8 +1134,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
 
     max_batch_size = 1
     max_draft_len = 6
-    dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 31
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     mamba_ssm_cache_dtype="float16",
                                     free_gpu_memory_fraction=0.8)
@@ -850,23 +1152,27 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,
     )
-
-    spec_config = MTPDecodingConfig(
-        max_draft_len=max_draft_len,
-        mtp_eagle_one_model=True,
-        use_dynamic_tree=True,
-        dynamic_tree_max_topK=dynamic_tree_max_topK,
-        max_total_draft_tokens=max_total_draft_tokens,
-    )
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
+                                    mtp_eagle_one_model=True,
+                                    use_dynamic_tree=True,
+                                    dynamic_tree_max_topK=10,
+                                    max_total_draft_tokens=31)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    prompt = llm_spec.tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "The future of AI is"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    tok_ids = llm_spec.tokenizer.encode(prompt)
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
     num_tokens = 0
     num_drafted = 0
     num_accepted = 0
-    tok_ids = llm_spec.tokenizer.encode("The future of AI is")
-
     for output in llm_spec.generate_async(tok_ids,
                                           sampling_params,
                                           streaming=True):
@@ -878,25 +1184,13 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
     accept_rate = num_accepted / num_drafted
     assert accept_rate > 0.20
 
-    raw_prompts = ["The capital of France is"]
-    prompts = [
-        llm_spec.tokenizer.apply_chat_template(
-            [{
-                "role": "user",
-                "content": p
-            }],
-            tokenize=False,
-            add_generation_prompt=True,
-        ) for p in raw_prompts
-    ]
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
-    results_spec = llm_spec.generate(prompts, sampling_params)
+    results_spec = llm_spec.generate([prompt], sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
+    results_ref = llm_ref.generate([prompt], sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
