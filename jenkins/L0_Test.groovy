@@ -139,6 +139,17 @@ K8S_INFRA_RETRY_MAX = 1
 // to fail, we treat it as a timeout.
 SLURM_TIMEOUT_RETRY_FRACTION = 0.9
 
+// SLURM states in which the job is still alive (no terminal verdict yet). When a
+// monitor/agent exception surfaces while the job is in one of these, the failure
+// is a transient infra blip (lost SSH/agent) -- not a test result -- so the stage
+// should retry rather than defer an opaque exception to the classifier (which
+// could mistake it for a test failure and not retry). Mirrors the active-state
+// set the sbatch resubmit guard reuses an existing job on.
+SLURM_NON_TERMINAL_STATES = [
+    "RUNNING", "PENDING", "CONFIGURING", "COMPLETING",
+    "REQUEUED", "RESIZING", "SUSPENDED", "SIGNALING", "STOPPED",
+]
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -630,6 +641,10 @@ def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, S
     return state
 }
 
+boolean isNonTerminalSlurmState(String state) {
+    return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
+}
+
 def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -918,6 +933,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     "the SLURM controller was unreachable for an authoritative state; treating as a likely " +
                     "timeout, not retrying. Original failure: ${e.message}",
                     e)
+            }
+
+            if (isNonTerminalSlurmState(slurmState)) {
+                throw new InfraFailure(
+                    "SLURM job ${slurmJobID} for ${stageName} is still in non-terminal state ${slurmState} " +
+                    "(${elapsedMin}min of ${walltimeMin}min walltime); the monitor lost contact while the job was " +
+                    "alive (transient infra), so this is not a test failure. Original failure: ${e.message}",
+                    e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
             }
 
             echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
@@ -1680,6 +1703,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
                             "(hit partition walltime ${partition?.time}min); not retrying.",
                             null)
+                    }
+                    // Verdict unreadable but the job is still alive: a transport blip
+                    // dropped the monitor while the job kept running, so this is infra,
+                    // not a test failure.
+                    if (isNonTerminalSlurmState(slurmState)) {
+                        throw new InfraFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} is still in non-terminal state ${slurmState}; " +
+                            "the monitor lost contact while the job was alive (transient infra), so this is not a " +
+                            "test failure.",
+                            null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
                     }
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
                     throw new Exception("Pytest failed in SLURM job ${slurmJobId} for ${stageName}")
