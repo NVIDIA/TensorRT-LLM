@@ -2466,6 +2466,10 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
         self._combined_layer_mask = combined_layer_mask
         self.requests = []
         self._use_replay_state_update = use_replay_state_update
+        self.replay_step_width: Optional[int] = (
+            spec_config.tokens_per_gen_step
+            if spec_config is not None and use_replay_state_update else None)
+        self.replay_history_size: Optional[int] = self.replay_step_width
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0
@@ -2851,6 +2855,7 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
                                          device=device)
         self.old_x = torch.zeros(self.local_num_mamba_layers,
                                  cache_size,
+                                 2,
                                  T,
                                  nheads,
                                  head_dim,
@@ -3238,7 +3243,23 @@ class KVCacheManagerV2MambaHybridCacheManager(KVCacheManagerV2,
 
     @property
     def use_replay_state_update(self) -> bool:
-        return self._use_replay_state_update
+        return self.get_replay_state_update_metadata() is not None
+
+    def get_replay_state_update_metadata(
+            self) -> Optional[ReplayStateUpdateMetadata]:
+        prev_num_accepted_tokens = getattr(self, 'prev_num_accepted_tokens',
+                                           None)
+        cache_buf_idx = getattr(self, 'cache_buf_idx', None)
+        if (not self._use_replay_state_update
+                or prev_num_accepted_tokens is None or cache_buf_idx is None
+                or self.replay_step_width is None
+                or self.replay_history_size is None):
+            return None
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=prev_num_accepted_tokens,
+            cache_buf_idx=cache_buf_idx,
+            replay_step_width=self.replay_step_width,
+            replay_history_size=self.replay_history_size)
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype

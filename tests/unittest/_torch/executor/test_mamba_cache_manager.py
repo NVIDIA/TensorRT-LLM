@@ -581,14 +581,14 @@ def _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5):
     )
 
 
-def _assert_replay_layer_cache_uses_tokens_per_gen_step(layer_cache, tokens_per_gen_step):
+def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
     assert layer_cache.old_x is not None
     assert layer_cache.old_B is not None
     assert layer_cache.old_dt is not None
     assert layer_cache.old_dA_cumsum is not None
     assert layer_cache.cache_buf_idx is not None
     assert layer_cache.prev_num_accepted_tokens is not None
-    assert layer_cache.old_x.dim() == 4
+    assert layer_cache.old_x.dim() == 5
     cache_size = layer_cache.temporal.shape[0]
     assert layer_cache.old_x.shape[0] == cache_size
     assert layer_cache.old_B.shape[0] == cache_size
@@ -596,10 +596,14 @@ def _assert_replay_layer_cache_uses_tokens_per_gen_step(layer_cache, tokens_per_
     assert layer_cache.old_dA_cumsum.shape[0] == cache_size
     assert layer_cache.cache_buf_idx.shape[0] == cache_size
     assert layer_cache.prev_num_accepted_tokens.shape[0] == cache_size
-    assert layer_cache.old_x.shape[1] == tokens_per_gen_step
-    assert layer_cache.old_B.shape[2] == tokens_per_gen_step
-    assert layer_cache.old_dt.shape[-1] == tokens_per_gen_step
-    assert layer_cache.old_dA_cumsum.shape[-1] == tokens_per_gen_step
+    assert layer_cache.old_x.shape[1] == 2
+    assert layer_cache.old_B.shape[1] == 2
+    assert layer_cache.old_dt.shape[1] == 2
+    assert layer_cache.old_dA_cumsum.shape[1] == 2
+    assert layer_cache.old_x.shape[2] == history_size
+    assert layer_cache.old_B.shape[2] == history_size
+    assert layer_cache.old_dt.shape[-1] == history_size
+    assert layer_cache.old_dA_cumsum.shape[-1] == history_size
 
 
 @skip_no_cuda
@@ -676,9 +680,16 @@ def test_cpp_hybrid_replay_buffers_size_by_tokens_per_gen_step():
         use_replay_state_update=True,
     )
     try:
+        replay_metadata = mgr.get_replay_state_update_metadata()
+        assert mgr.use_replay_state_update is True
+        assert replay_metadata is not None
+        assert replay_metadata.replay_step_width == spec_config.tokens_per_gen_step
+        assert replay_metadata.replay_history_size == max(
+            MIN_REPLAY_HISTORY_SIZE, spec_config.tokens_per_gen_step
+        )
         layer_cache = mgr.mamba_layer_cache(0)
-        _assert_replay_layer_cache_uses_tokens_per_gen_step(
-            layer_cache, spec_config.tokens_per_gen_step
+        _assert_replay_layer_cache_uses_history_size(
+            layer_cache, replay_metadata.replay_history_size
         )
     finally:
         mgr.shutdown()
@@ -693,9 +704,14 @@ def test_v2_hybrid_replay_buffers_size_by_tokens_per_gen_step():
         use_replay_state_update=True,
     )
     try:
+        replay_metadata = mgr.get_replay_state_update_metadata()
+        assert mgr.use_replay_state_update is True
+        assert replay_metadata is not None
+        assert replay_metadata.replay_step_width == spec_config.tokens_per_gen_step
+        assert replay_metadata.replay_history_size == spec_config.tokens_per_gen_step
         layer_cache = mgr.mamba_layer_cache(0)
-        _assert_replay_layer_cache_uses_tokens_per_gen_step(
-            layer_cache, spec_config.tokens_per_gen_step
+        _assert_replay_layer_cache_uses_history_size(
+            layer_cache, replay_metadata.replay_history_size
         )
     finally:
         mgr.shutdown()
