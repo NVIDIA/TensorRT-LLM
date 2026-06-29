@@ -34,9 +34,12 @@ try:
 except RuntimeError:
     # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
     # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
-    capability = torch.cuda.get_device_capability()
-    arch_list = f"{capability[0]}.{capability[1]}"
-    os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+    # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
+    # capability query would force a CUDA context at import time.
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        arch_list = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
 
 from tensorrt_llm._utils import prefer_pinned
 
