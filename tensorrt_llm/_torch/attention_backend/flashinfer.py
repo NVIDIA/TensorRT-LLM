@@ -488,10 +488,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         crash append_paged_kv_cache with an illegal memory access.
         """
         mgr = self.kv_cache_manager
+        layer_offsets = getattr(mgr, 'layer_offsets', None)
+        if layer_offsets is not None and layer_idx in layer_offsets:
+            layer_offset = layer_offsets[layer_idx]
+            l2p = getattr(mgr, '_layer_to_pool_idx', None)
+            if l2p is not None:
+                pool_idx = l2p.get(layer_offset)
+                if pool_idx is not None:
+                    window = self._pool_window_for_pool_id(pool_idx)
+                    if window is not None:
+                        return window
         vec = getattr(mgr, 'max_attention_window_vec', None)
         if not vec:
             return None
-        layer_offsets = getattr(mgr, 'layer_offsets', None)
         if layer_offsets is None or layer_idx not in layer_offsets:
             return None
         off = layer_offsets[layer_idx]
@@ -510,6 +519,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 return w if w is not None else (1 << 31)
         return None
 
+    def _pool_window_for_pool_id(self, pool_id: int) -> Optional[int]:
+        """Return the configured window for a KV manager pool."""
+        mgr = self.kv_cache_manager
+        pool_configurations = getattr(mgr, 'pool_configurations', None)
+        if pool_configurations is not None and 0 <= pool_id < len(
+                pool_configurations):
+            window = pool_configurations[pool_id].window_size
+            return window if window is not None else (1 << 31)
+        vec = getattr(mgr, 'max_attention_window_vec', None)
+        if vec is not None and 0 <= pool_id < len(vec):
+            window = vec[pool_id]
+            return window if window is not None else (1 << 31)
+        return None
+
     def _pick_vswa_primary_pool_id(self) -> int:
         """Pick a non-linear pool as the FlashInfer 'primary' pool.
 
@@ -522,7 +545,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         assert self._vswa_layer_to_pool is not None
         default_pool = self._vswa_layer_to_pool.get(0, 0)
         for pool_id, rep_layer in self._vswa_pool_to_rep_layer.items():
-            w = self._pool_window_for_layer(rep_layer)
+            w = self._pool_window_for_pool_id(pool_id)
+            if w is None:
+                w = self._pool_window_for_layer(rep_layer)
             if w is not None and w > 0:
                 return pool_id
         return default_pool
@@ -722,7 +747,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                             if lbuf is not None:
                                 all_pool_pages = max(all_pool_pages,
                                                      lbuf.shape[0])
-                    for pool_id in set(self._vswa_layer_to_pool.values()):
+                    pool_ids = set(self._vswa_layer_to_pool.values())
+                    num_pools = getattr(self.kv_cache_manager, 'num_pools',
+                                        None)
+                    if num_pools is not None:
+                        pool_ids.update(range(num_pools))
+                    pool_ids.add(self._pick_vswa_primary_pool_id())
+                    for pool_id in pool_ids:
                         buf_key = f'_vswa_pool_buf_{pool_id}'
                         if getattr(self, buf_key, None) is None:
                             setattr(
