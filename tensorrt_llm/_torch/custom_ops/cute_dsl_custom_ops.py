@@ -7940,3 +7940,516 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            max_context_len,
                            dtype=output_dtype,
                            device=q.device)
+
+    # =========================================================================
+    # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
+    # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
+    # Used by the cute_dsl_mla FMHA library (see attention_backend/fmha/cute_dsl.py).
+    #
+    # One generic Runner ``CuteDSLNVMlaDecodeBlackwellRunner`` services both
+    # FP8 and FP16/BF16 paths - only the cutlass ``in_dtype`` is passed at
+    # construction; the kernel class is derived from it via
+    # ``CuteDSLNVMlaDecodeBlackwellRunner._KERNEL_CLASS_BY_DTYPE``. Each
+    # dtype still has its own ``@torch.library.custom_op`` (distinct op
+    # name + fake-tensor rule); the ops differ only in which ``in_dtype``
+    # they hand the generic Runner.
+    #
+    #   torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
+    #       -> CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float8E4M3FN)
+    #         (-> BlackwellMultiHeadLatentAttentionForwardFP8)
+    #
+    #   torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
+    #       -> CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float16)
+    #         or CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.BFloat16)
+    #         (-> BlackwellMultiHeadLatentAttentionForwardFP16)
+    # =========================================================================
+
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
+        BlackwellMultiHeadLatentAttentionForwardFP8
+    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
+        BlackwellMultiHeadLatentAttentionForwardFP16
+
+    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK = (2, 1, 1)
+
+    class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
+        """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
+
+        Works for FP8, FP16, and BF16 - pass the cutlass input dtype at
+        construction; the kernel class is derived from it:
+
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.Float8E4M3FN, ...)   # -> ...ForwardFP8
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.Float16, ...)        # -> ...ForwardFP16
+            CuteDSLNVMlaDecodeBlackwellRunner(
+                in_dtype=cutlass.BFloat16, ...)       # -> ...ForwardFP16
+
+        ``get_valid_tactics`` returns the tiler shapes as tactics
+        (``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples), filtered by the
+        kernel's static ``can_implement``. The current candidate list
+        carries only ``((128, 128), (128, 256))`` - the lone combination
+        both kernels accept today - but more can be added without
+        touching ``forward``. ``kernel_cache`` is class-level and keyed
+        by ``(in_dtype, ..., out_dtype, mma_qk_tiler_mn,
+        mma_pv_tiler_mn)``, so FP8/FP16/BF16 output variants and future
+        tilers coexist without collisions.
+        """
+        kernel_cache = dict()
+
+        # in_dtype -> kernel class. The kernels' own ``can_implement`` is
+        # what ultimately rejects unsupported dtypes, but this lookup
+        # picks which kernel we even try to compile.
+        _KERNEL_CLASS_BY_DTYPE = {
+            cutlass.Float8E4M3FN: BlackwellMultiHeadLatentAttentionForwardFP8,
+            cutlass.Float16: BlackwellMultiHeadLatentAttentionForwardFP16,
+            cutlass.BFloat16: BlackwellMultiHeadLatentAttentionForwardFP16,
+        }
+
+        def __init__(
+            self,
+            in_dtype,
+            num_heads: int,
+            seq_len_q: int,
+            page_size: int,
+            is_persistent: bool = True,
+            is_var_seq: bool = True,
+            is_var_split_kv: bool = False,
+            skip_correction_threshold: float = 0.0,
+        ):
+            super().__init__()
+            kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
+            if kernel_class is None:
+                raise ValueError(
+                    f"CuteDSLNVMlaDecodeBlackwellRunner: unsupported "
+                    f"in_dtype={in_dtype}. Supported: "
+                    f"{list(self.__class__._KERNEL_CLASS_BY_DTYPE.keys())}")
+            self.in_dtype = in_dtype
+            self.kernel_class = kernel_class
+            self.num_heads = num_heads
+            self.seq_len_q = seq_len_q
+            self.page_size = page_size
+            self.is_persistent = is_persistent
+            self.is_var_seq = is_var_seq
+            self.is_var_split_kv = is_var_split_kv
+            self.skip_correction_threshold = skip_correction_threshold
+
+        def unique_id(self):
+            # `kernel_class` is derived from `in_dtype`, so dropping it
+            # from the key keeps cache slots 1-to-1 with the in_dtype.
+            # The tilers are NOT here - they're part of the tactic and
+            # appended into the cache key inside ``forward``.
+            return (
+                self.in_dtype,
+                self.num_heads,
+                self.seq_len_q,
+                self.page_size,
+                self.is_persistent,
+                self.is_var_seq,
+                self.is_var_split_kv,
+                self.skip_correction_threshold,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+            """Filter the candidate tilers via the kernel's
+            ``can_implement``. Returns a list of
+            ``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples; AutoTuner picks
+            one and passes it to ``forward`` as ``tactic``.
+            """
+            if get_sm_version() not in (100, 103):
+                return []
+            q_latent, q_rope, _c_latent, _c_rope, _page_table, cache_seqs, \
+                _block_split_kvs, o, *_rest = inputs
+            h, latent_dim, seq_len_q, _ = q_latent.shape
+            rope_dim = q_rope.shape[1]
+            batch_size = cache_seqs.shape[0]
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
+
+            # Candidate tilers - widen this list to enable AutoTuner
+            # exploration over tile shapes. Each entry is
+            # ``(mma_qk_tiler_mn, mma_pv_tiler_mn)``.
+            candidate_tiler_tactics = [
+                ((128, 128), (128, 256)),
+            ]
+
+            valid = []
+            for mma_qk_tiler_mn, mma_pv_tiler_mn in candidate_tiler_tactics:
+                if self.kernel_class.can_implement(
+                        batch_size,
+                        seq_len_q,
+                        self.page_size,
+                        h,
+                        latent_dim,
+                        rope_dim,
+                        self.in_dtype,  # in_dtype
+                        out_dtype,
+                        cutlass.Float32,  # acc_dtype
+                        cutlass.Float32,  # lse_dtype
+                        mma_qk_tiler_mn,
+                        mma_pv_tiler_mn,
+                        1,
+                        self.is_persistent,
+                        self.is_var_seq,
+                        self.is_var_split_kv,
+                        self.page_size,
+                ):
+                    valid.append((mma_qk_tiler_mn, mma_pv_tiler_mn))
+                else:
+                    logger.debug(
+                        "CuteDSLNVMlaDecodeBlackwellRunner.can_implement "
+                        "rejected tactic: kernel=%s in_dtype=%s "
+                        "H=%d L=%d R=%d S=%d B=%d page_size=%d "
+                        "mma_qk=%s mma_pv=%s persistent=%s var_seq=%s "
+                        "var_split=%s", self.kernel_class.__name__,
+                        self.in_dtype, h, latent_dim, rope_dim, seq_len_q,
+                        batch_size, self.page_size, mma_qk_tiler_mn,
+                        mma_pv_tiler_mn, self.is_persistent, self.is_var_seq,
+                        self.is_var_split_kv)
+            return valid
+
+        def get_tuning_config(self) -> TuningConfig:
+            return TuningConfig()
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+            **kwargs,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
+             block_split_kvs, o, lse, workspace) = inputs
+            split_kv = int(kwargs.get("split_kv", 1))
+            softmax_scale = float(kwargs.get("softmax_scale", 1.0))
+            output_scale = float(kwargs.get("output_scale", 1.0))
+
+            # Unpack the tactic produced by ``get_valid_tactics``. When
+            # AutoTuner isn't engaged (e.g. the FMHA library calls the op
+            # without ``choose_one``), tactic may be ``None`` -
+            # fall back to the default (128,128)/(128,256) shape.
+            if isinstance(tactic, tuple) and len(tactic) == 2:
+                mma_qk_tiler_mn, mma_pv_tiler_mn = tactic
+            else:
+                mma_qk_tiler_mn, mma_pv_tiler_mn = (128, 128), (128, 256)
+            mma_qk_tiler_mn = tuple(mma_qk_tiler_mn)
+            mma_pv_tiler_mn = tuple(mma_pv_tiler_mn)
+
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
+
+            cache_key = self.unique_id() + (
+                out_dtype,
+                mma_qk_tiler_mn,
+                mma_pv_tiler_mn,
+            )
+            if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[0] *
+                    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[1] *
+                    _CUTE_DSL_MLA_CLUSTER_SHAPE_MNK[2])
+
+                # Fold seq_len_q into the head dimension when the head count
+                # alone does not fill the MMA M tile (num_heads < M) and there
+                # is more than one query token (MTP / spec-decode). The kernel
+                # derives the actual fold factor; this flag just enables the
+                # folding code path. For seq_len_q == 1 it is always False, so
+                # plain decode is unchanged.
+                fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
+                           and self.seq_len_q > 1)
+
+                mla = self.kernel_class(
+                    cutlass.Float32,  # acc_dtype
+                    cutlass.Float32,  # lse_dtype
+                    mma_qk_tiler_mn,
+                    mma_pv_tiler_mn,
+                    max_active_clusters,
+                    self.page_size,
+                    self.skip_correction_threshold,
+                    self.is_persistent,
+                    self.is_var_seq,
+                    self.is_var_split_kv,
+                    num_heads=self.num_heads,
+                    seq_len_q=self.seq_len_q,
+                    fold_sq=fold_sq,
+                )
+
+                q_latent_ct = cute.runtime.from_dlpack(
+                    q_latent,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                q_rope_ct = cute.runtime.from_dlpack(
+                    q_rope, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                c_latent_ct = cute.runtime.from_dlpack(
+                    c_latent,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                c_rope_ct = cute.runtime.from_dlpack(
+                    c_rope, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                page_table_ct = cute.runtime.from_dlpack(
+                    page_table,
+                    assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                o_ct = cute.runtime.from_dlpack(
+                    o, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                lse_ct = cute.runtime.from_dlpack(
+                    lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                # An empty workspace means split_kv == 1: the kernel's
+                # initialize_workspace builds the acc_o/acc_lse accumulators iff
+                # ``workspace is not None`` (regardless of split_kv), so a
+                # non-None but zero-sized workspace makes it write the partials
+                # into a 0-byte buffer (illegal global write). Pass None so the
+                # split_kv kernel writes the final result straight into ``o``.
+                workspace_ct = (cute.runtime.from_dlpack(
+                    workspace, assumed_align=16).mark_layout_dynamic()
+                                if workspace.numel() > 0 else None)
+                cache_seqs_ct = cute.runtime.from_dlpack(
+                    cache_seqs, assumed_align=16).mark_layout_dynamic()
+                block_split_kvs_ct = (cute.runtime.from_dlpack(
+                    block_split_kvs, assumed_align=16).mark_layout_dynamic()
+                                      if self.is_var_split_kv else None)
+
+                CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = \
+                    cute.compile(
+                        mla,
+                        q_latent_ct,
+                        q_rope_ct,
+                        c_latent_ct,
+                        c_rope_ct,
+                        page_table_ct,
+                        o_ct,
+                        lse_ct,
+                        workspace_ct,
+                        cutlass.Int32(split_kv),
+                        cache_seqs_ct,
+                        block_split_kvs_ct,
+                        cutlass.Float32(softmax_scale),
+                        cutlass.Float32(output_scale),
+                        stream,
+                        options="--opt-level 2",
+                    )
+
+            compiled_mla = CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[
+                cache_key]
+            compiled_mla(
+                q_latent,
+                q_rope,
+                c_latent,
+                c_rope,
+                page_table,
+                o,
+                lse,
+                workspace if workspace.numel() > 0 else None,
+                split_kv,
+                cache_seqs,
+                block_split_kvs if self.is_var_split_kv else None,
+                softmax_scale,
+                output_scale,
+                stream,
+            )
+            return o, lse
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_mla_decode_fp8_blackwell",
+        mutates_args=("o", "lse", "workspace"),
+        device_types="cuda",
+    )
+    def cute_dsl_mla_decode_fp8_blackwell(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        block_split_kvs: torch.Tensor,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        is_persistent: bool,
+        is_var_seq: bool,
+        is_var_split_kv: bool,
+        split_kv: int,
+        softmax_scale: float,
+        output_scale: float,
+    ) -> None:
+        """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
+
+        ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
+        see ``BlackwellMultiHeadLatentAttentionForwardFP8``.
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"trtllm::cute_dsl_mla_decode_fp8_blackwell requires SM 100 or "
+                f"SM 103, got SM {sm_version}")
+
+        runner = CuteDSLNVMlaDecodeBlackwellRunner(
+            in_dtype=cutlass.Float8E4M3FN,
+            num_heads=num_heads,
+            seq_len_q=seq_len_q,
+            page_size=page_size,
+            is_persistent=is_persistent,
+            is_var_seq=is_var_seq,
+            is_var_split_kv=is_var_split_kv,
+        )
+        inputs = [
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
+            block_split_kvs, o, lse, workspace
+        ]
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_mla_decode_fp8_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(
+            inputs,
+            tactic=best_tactic,
+            split_kv=split_kv,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp8_blackwell")
+    def _(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        block_split_kvs: torch.Tensor,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        is_persistent: bool,
+        is_var_seq: bool,
+        is_var_split_kv: bool,
+        split_kv: int,
+        softmax_scale: float,
+        output_scale: float,
+    ) -> None:
+        return None
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_mla_decode_fp16_blackwell",
+        mutates_args=("o", "lse", "workspace"),
+        device_types="cuda",
+    )
+    def cute_dsl_mla_decode_fp16_blackwell(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        block_split_kvs: torch.Tensor,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        is_persistent: bool,
+        is_var_seq: bool,
+        is_var_split_kv: bool,
+        split_kv: int,
+        softmax_scale: float,
+        output_scale: float,
+    ) -> None:
+        """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
+
+        ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
+        see ``BlackwellMultiHeadLatentAttentionForwardFP16``.
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"trtllm::cute_dsl_mla_decode_fp16_blackwell requires SM 100 "
+                f"or SM 103, got SM {sm_version}")
+
+        if q_latent.dtype == torch.float16:
+            in_dtype = cutlass.Float16
+        elif q_latent.dtype == torch.bfloat16:
+            in_dtype = cutlass.BFloat16
+        else:
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp16_blackwell supports "
+                "torch.float16 or torch.bfloat16 inputs, got "
+                f"{q_latent.dtype}")
+        if not (q_rope.dtype == c_latent.dtype == c_rope.dtype == o.dtype ==
+                q_latent.dtype):
+            raise ValueError(
+                "trtllm::cute_dsl_mla_decode_fp16_blackwell requires q, KV, "
+                f"and output dtypes to match; got q_latent={q_latent.dtype}, "
+                f"q_rope={q_rope.dtype}, c_latent={c_latent.dtype}, "
+                f"c_rope={c_rope.dtype}, o={o.dtype}")
+
+        runner = CuteDSLNVMlaDecodeBlackwellRunner(
+            in_dtype=in_dtype,
+            num_heads=num_heads,
+            seq_len_q=seq_len_q,
+            page_size=page_size,
+            is_persistent=is_persistent,
+            is_var_seq=is_var_seq,
+            is_var_split_kv=is_var_split_kv,
+        )
+        inputs = [
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs,
+            block_split_kvs, o, lse, workspace
+        ]
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_mla_decode_fp16_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
+        runner(
+            inputs,
+            tactic=best_tactic,
+            split_kv=split_kv,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        )
+
+    @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp16_blackwell")
+    def _(
+        q_latent: torch.Tensor,
+        q_rope: torch.Tensor,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqs: torch.Tensor,
+        block_split_kvs: torch.Tensor,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        workspace: torch.Tensor,
+        num_heads: int,
+        seq_len_q: int,
+        page_size: int,
+        is_persistent: bool,
+        is_var_seq: bool,
+        is_var_split_kv: bool,
+        split_kv: int,
+        softmax_scale: float,
+        output_scale: float,
+    ) -> None:
+        return None
