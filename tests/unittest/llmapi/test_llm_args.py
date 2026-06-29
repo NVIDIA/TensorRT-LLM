@@ -352,6 +352,8 @@ def test_KvCacheConfig_declaration():
                            enable_swa_scratch_reuse=True,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
+                           pool_ratio=[0.25, 0.75],
+                           avg_seq_len=2048,
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -368,6 +370,10 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert config.pool_ratio == [0.25, 0.75]
+    assert config.avg_seq_len == 2048
+    assert not hasattr(pybind_config, "pool_ratio")
+    assert not hasattr(pybind_config, "avg_seq_len")
     assert KvCacheConfig(
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
@@ -465,6 +471,25 @@ class TestMultimodalConfig:
         )
         encoder_graph = args.multimodal_config.encoder_cuda_graph
         assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {
+        "pool_ratio": []
+    },
+    {
+        "pool_ratio": [0.0, 1.0]
+    },
+    {
+        "pool_ratio": [0.25, 0.25]
+    },
+    {
+        "avg_seq_len": 0
+    },
+])
+def test_KvCacheConfig_pool_ratio_avg_seq_len_validation(kwargs):
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**kwargs)
 
 
 def test_CapacitySchedulerPolicy():

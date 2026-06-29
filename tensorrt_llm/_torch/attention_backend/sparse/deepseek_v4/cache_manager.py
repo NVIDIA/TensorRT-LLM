@@ -768,35 +768,55 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         max_seq_len = self.max_seq_len
         max_num_tokens = self._max_num_tokens
         max_draft_len = self._max_draft_len
-
-        # For aggregated serving in large batch size:
-        # Use 1 context request + (max_batch_size - 1) generation requests as
-        # the typical step. An all-generation typical_step over-provisions the
-        # compressed-cache pool at the expense of the SWA pool, starving the
-        # SWA pool and artificially capping the achievable batch size.
-        ctx_capacity = max_num_tokens if max_num_tokens is not None else max_seq_len
-        typical_step = BatchDesc(
-            kv_caches=[
-                KVCacheDesc(capacity=ctx_capacity, history_length=0),
-            ]
-            + [KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - max_draft_len - 1)]
-            * (max_batch_size - 1),
-        )
-
+        typical_step = None
         constraints = []
-        # Constraint 1: cuda graph generation warmup — one decode request that has
-        # accumulated to the tail of max_seq_len. Using history_length=max_seq_len-1
-        # (instead of 0) lets SWA / SSM pools collapse to their windowed working set,
-        # while full-cache pools still need max_seq_len/tokens_per_block blocks
-        # because they don't age.
-        constraints.append(
-            BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1)])
-        )
+        if kv_cache_config.pool_ratio is None:
+            typical_seq_len = (
+                kv_cache_config.avg_seq_len
+                if kv_cache_config.avg_seq_len is not None
+                else max_seq_len
+            )
+            if typical_seq_len > max_seq_len:
+                raise ValueError(
+                    f"kv_cache_config.avg_seq_len ({typical_seq_len}) must be less than or "
+                    f"equal to max_seq_len ({max_seq_len})"
+                )
 
-        # Constraint 2: general / chunked-prefill warmup — one fresh context request
-        # at max_num_tokens (the per-iteration token budget).
-        if max_num_tokens is not None:
-            constraints.append(BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)]))
+            # For aggregated serving in large batch size:
+            # Use 1 context request + (max_batch_size - 1) generation requests as
+            # the typical step. An all-generation typical_step over-provisions the
+            # compressed-cache pool at the expense of the SWA pool, starving the
+            # SWA pool and artificially capping the achievable batch size.
+            ctx_capacity = max_num_tokens if max_num_tokens is not None else typical_seq_len
+            generation_history_length = max(0, typical_seq_len - max_draft_len - 1)
+            typical_step = BatchDesc(
+                kv_caches=[
+                    KVCacheDesc(capacity=ctx_capacity, history_length=0),
+                ]
+                + [
+                    KVCacheDesc(
+                        capacity=typical_seq_len,
+                        history_length=generation_history_length,
+                    )
+                ]
+                * (max_batch_size - 1),
+            )
+
+            # Constraint 1: cuda graph generation warmup — one decode request that has
+            # accumulated to the tail of max_seq_len. Using history_length=max_seq_len-1
+            # (instead of 0) lets SWA / SSM pools collapse to their windowed working set,
+            # while full-cache pools still need max_seq_len/tokens_per_block blocks
+            # because they don't age.
+            constraints.append(
+                BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1)])
+            )
+
+            # Constraint 2: general / chunked-prefill warmup — one fresh context request
+            # at max_num_tokens (the per-iteration token budget).
+            if max_num_tokens is not None:
+                constraints.append(
+                    BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)])
+                )
 
         scratch_reuse_config = None
         if self.enable_swa_scratch_reuse:
@@ -815,6 +835,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             typical_step=typical_step,
             constraints=constraints,
             enable_stats=self.enable_stats,
+            initial_pool_ratio=kv_cache_config.pool_ratio,
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
