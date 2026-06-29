@@ -34,6 +34,7 @@ class GatedMLP(nn.Module):
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
+        swiglu_limit: Optional[float] = None,
     ):
 
         super().__init__()
@@ -42,8 +43,12 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        self.swiglu_limit = float(
+            swiglu_limit) if swiglu_limit is not None else None
 
         config = config or ModelConfig()
+        use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
+                                         False)
         self.mapping = config.mapping
         if overridden_tp_size is not None:
             assert config.mapping.tp_size % overridden_tp_size == 0
@@ -84,6 +89,7 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
@@ -114,6 +120,7 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
@@ -139,13 +146,14 @@ class GatedMLP(nn.Module):
                     logger.warning(
                         f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
                     )
-                    return swiglu(x)
+                    return swiglu(x, swiglu_limit=self.swiglu_limit)
                 else:
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
-                                  quant_type=torch.float8_e4m3fn)
+                                  quant_type=torch.float8_e4m3fn,
+                                  swiglu_limit=self.swiglu_limit)
             else:
-                return swiglu(x)
+                return swiglu(x, swiglu_limit=self.swiglu_limit)
         elif callable(self.activation):
             return self.activation(x)
         elif self.activation is None:
