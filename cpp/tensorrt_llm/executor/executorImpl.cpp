@@ -1932,20 +1932,16 @@ void Executor::Impl::appendCurrentIterStats(IterationStats&& currentIterStats)
 void Executor::Impl::appendMultipleIterStats(std::vector<IterationStats>&& currentIterStatsVec)
 {
     std::scoped_lock<std::mutex> lck(mIterStatsMtx);
+    mIterationStats.insert(mIterationStats.end(), std::make_move_iterator(currentIterStatsVec.begin()),
+        std::make_move_iterator(currentIterStatsVec.end()));
     if (statsBufferIsBounded(mIterStatsMaxIterations))
     {
         auto const maxIterStats = static_cast<std::size_t>(mIterStatsMaxIterations);
-        if (mIterationStats.size() + currentIterStatsVec.size() > maxIterStats)
+        while (mIterationStats.size() > maxIterStats)
         {
-            size_t const removeCount = mIterationStats.size() + currentIterStatsVec.size() - maxIterStats;
-            for (size_t i = 0; i < removeCount; i++)
-            {
-                mIterationStats.pop_front();
-            }
+            mIterationStats.pop_front();
         }
     }
-    mIterationStats.insert(mIterationStats.end(), std::make_move_iterator(currentIterStatsVec.begin()),
-        std::make_move_iterator(currentIterStatsVec.end()));
 }
 
 void Executor::Impl::updateIterationStats(RequestList const& activeRequests, double iterLatencyMS,
@@ -2004,20 +2000,16 @@ void Executor::Impl::appendCurrentRequestStats(RequestStatsPerIteration&& curren
 void Executor::Impl::appendMultipleRequestStats(std::vector<RequestStatsPerIteration>&& currentRequestStatsVec)
 {
     std::scoped_lock<std::mutex> lck(mRequestStatsMtx);
+    mRequestStats.insert(mRequestStats.end(), std::make_move_iterator(currentRequestStatsVec.begin()),
+        std::make_move_iterator(currentRequestStatsVec.end()));
     if (statsBufferIsBounded(mRequestStatsMaxIterations))
     {
         auto const maxRequestStats = static_cast<std::size_t>(mRequestStatsMaxIterations);
-        if (mRequestStats.size() + currentRequestStatsVec.size() > maxRequestStats)
+        while (mRequestStats.size() > maxRequestStats)
         {
-            size_t const removeCount = mRequestStats.size() + currentRequestStatsVec.size() - maxRequestStats;
-            for (size_t i = 0; i < removeCount; i++)
-            {
-                mRequestStats.pop_front();
-            }
+            mRequestStats.pop_front();
         }
     }
-    mRequestStats.insert(mRequestStats.end(), std::make_move_iterator(currentRequestStatsVec.begin()),
-        std::make_move_iterator(currentRequestStatsVec.end()));
 }
 
 void Executor::Impl::updateRequestStats(
