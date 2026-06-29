@@ -173,14 +173,12 @@ def _decide_do_sample_frames(
 
       1. If `mm_processor_kwargs.do_sample_frames` is explicitly set
          (True or False), honor it.
-      2. Otherwise, for each video compute the target frame count from the
+      2. If the caller supplies no frame target (`num_frames` / `fps`),
+         match HF's class default, which samples frames (returns True).
+      3. Otherwise, for each video compute the target frame count from the
          kwargs (`num_frames` directly, or `floor(duration * fps)` if
          `fps` is given) and compare to `len(vd.frames)`. If any video
          needs a different count, the batch is sampled (returns True).
-      3. When the caller is silent (no `num_frames` / `fps`) and the IO
-         loader decoded every source frame for a video, sample with HF's
-         class defaults so the request still gets a reasonable frame count
-         when the server is configured to load everything at IO.
 
     Per-video targets that match the IO-decoded count don't need HF
     sampling; the all-or-nothing reduction over the batch means a single
@@ -190,27 +188,30 @@ def _decide_do_sample_frames(
     if "do_sample_frames" in mm_processor_kwargs:
         return bool(mm_processor_kwargs["do_sample_frames"])
 
-    user_num_frames = mm_processor_kwargs.get("num_frames")
-    user_fps = mm_processor_kwargs.get("fps")
-
     if not video_datas:
         return False
 
+    user_num_frames = mm_processor_kwargs.get("num_frames")
+    user_fps = mm_processor_kwargs.get("fps")
+    has_num_frames = user_num_frames is not None and user_num_frames != -1
+    has_fps = user_fps is not None and user_fps != -1
+
+    # No explicit frame target from the caller: defer to HF's class-default
+    # sampling (the stock processor sets `do_sample_frames=True` when neither
+    # `num_frames` nor `fps` is given). Returning False here would hand the
+    # IO-decoded frames straight to HF unchanged and diverge from stock HF
+    # whenever the IO loader decoded a different number of frames than HF's
+    # default sampler would select.
+    if not has_num_frames and not has_fps:
+        return True
+
     for vd in video_datas:
         n_decoded = len(vd.frames)
-        if user_num_frames is not None and user_num_frames != -1:
+        if has_num_frames:
             n_target = user_num_frames
-        elif user_fps is not None and user_fps != -1:
+        else:  # has_fps
             duration = (vd.metadata or {}).get("duration") or 0
             n_target = math.floor(duration * user_fps)
-        else:
-            # If IO loaded every source frame (decoded count equals the source
-            # frame count), defer to HF's class-default sampling; otherwise
-            # leave the IO-decoded frames alone.
-            total = (vd.metadata or {}).get("total_num_frames")
-            if total is not None and n_decoded == total:
-                return True
-            n_target = n_decoded
         if n_target != n_decoded:
             return True
     return False
