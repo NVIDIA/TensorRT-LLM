@@ -25,7 +25,7 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
     get_size_in_bytes,
-    nvtx_range,
+    nvtx_range_debug,
     prefer_pinned,
 )
 from tensorrt_llm.bindings import DataType
@@ -1334,7 +1334,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._device_scratch_slots_staging,
         )
 
-    @nvtx_range("dsv4_compute_sliding_block_tables")
+    @nvtx_range_debug("dsv4_compute_sliding_block_tables")
     def compute_sliding_block_tables(
         self,
         request_ids: List[int],
@@ -1396,7 +1396,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 self._precomputed_sliding_block_tables,
             )
 
-    @nvtx_range("dsv4_copy_batch_block_offsets")
+    @nvtx_range_debug("dsv4_copy_batch_block_offsets")
     def copy_batch_block_offsets(
         self,
         dst_tensor: torch.Tensor,
@@ -1416,7 +1416,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             non_blocking=True,
         )
 
-    @nvtx_range("dsv4_copy_batch_sliding_block_tables")
+    @nvtx_range_debug("dsv4_copy_batch_sliding_block_tables")
     def copy_batch_sliding_block_tables(
         self,
         dst_tensor: torch.Tensor,
@@ -1434,7 +1434,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             non_blocking=True,
         )
 
-    @nvtx_range("dsv4_copy_batch_compress_block_tables")
+    @nvtx_range_debug("dsv4_copy_batch_compress_block_tables")
     def copy_batch_compress_block_tables(
         self,
         dst_tensor: torch.Tensor,
@@ -1466,7 +1466,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
         dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
 
-    @nvtx_range("dsv4_copy_batch_indexer_compress_block_tables")
+    @nvtx_range_debug("dsv4_copy_batch_indexer_compress_block_tables")
     def copy_batch_indexer_compress_block_tables(
         self,
         host_block_table: torch.Tensor,
