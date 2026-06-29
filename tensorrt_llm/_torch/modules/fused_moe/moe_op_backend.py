@@ -612,11 +612,11 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
-       if gemm1_clamp_limit is not None:
-           raise NotImplementedError(
-               "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
-               "forward gemm1_clamp_limit; use the trtllm op backend."
-           )
+        if gemm1_clamp_limit is not None:
+            raise NotImplementedError(
+                "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
+                "forward gemm1_clamp_limit; use the trtllm op backend."
+            )
         outputs = torch.ops.trtllm.flashinfer_trtllm_fp8_block_scale_moe_runner(
             router_logits,
             routing_bias,
@@ -787,9 +787,6 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
-        # Forward the activation (Swiglu/Relu2) to the FlashInfer BF16 kernels.
-        activation_type = self.cvt_activation_type(gated_act_type)
-
         outputs = torch.ops.trtllm.flashinfer_trtllm_bf16_moe_runner(
             router_logits,
             routing_bias,
