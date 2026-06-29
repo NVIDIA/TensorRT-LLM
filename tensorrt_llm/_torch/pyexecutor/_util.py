@@ -881,6 +881,28 @@ class KvCacheCreator:
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
             return False
+        # The separate draft KV cache manager is swapped onto attn_metadata
+        # during the draft forward via SpecConfig.draft_kv_cache_context (and
+        # prepare_attn_metadata_for_draft_replay).  Both helpers early-return
+        # for any attn_metadata that is not TrtllmAttentionMetadata, so non-
+        # TRTLLM attention backends (FlashInfer, FlashAttention, Vanilla)
+        # would keep using the target KV cache manager during the draft step
+        # — whose layer_offsets do not contain the draft layer index — and
+        # crash with KeyError in get_buffers().  Fall back to the combined
+        # cache layout (draft layers live in the target manager via the
+        # spec-layer extension in get_pp_layers / extract_mamba_kv_cache_params)
+        # for those backends.  TRTLLM-attn keeps the separate layout it
+        # already supports.
+        if self._model_engine is not None:
+            attn_backend = getattr(self._model_engine.model.model_config,
+                                   'attn_backend', None)
+            if attn_backend is not None and attn_backend != "TRTLLM":
+                logger.info(
+                    f"Separate draft KV cache is not supported with "
+                    f"attn_backend={attn_backend} (only TRTLLM supports the "
+                    f"draft-KV-cache swap on attn_metadata); falling back to "
+                    f"combined target+draft KV cache layout.")
+                return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
