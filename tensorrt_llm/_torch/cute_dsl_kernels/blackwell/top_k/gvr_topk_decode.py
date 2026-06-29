@@ -681,6 +681,7 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        do_cluster_sync,  # bool: False = skip DSMEM aggregation (cs=1 / short-row degrade)
         smem_input=None,  # optional SMEM-cached slice (smem_input[i] == input_row[slice_start+i])
     ):
         """Count input[i] >= threshold across this CTA's row slice, then
@@ -851,25 +852,30 @@ class GvrTopKKernel:
             cute.arch.barrier()
 
         # Cluster all-reduce of cand_count. Skipped at cluster_size==1.
+        # Also skipped at runtime when do_cluster_sync=False (short-row
+        # degrade): CTA 0 is the only live CTA in the cluster and its
+        # local count IS the total, so s_iscalars[0] already holds the
+        # correct value with no DSMEM read needed.
         if cutlass.const_expr(cluster_size > 1):
-            cute.arch.barrier()  # publish s_iscalars[0] to all threads of this CTA
-            if tidx == cutlass.Int32(0):
-                s_cluster_partial[0] = s_iscalars[0]
-            # Non-relaxed arrive: pairs with the peer cluster_wait acquire
-            # to release s_cluster_partial writes so the DSMEM ld below
-            # observes them. cluster_arrive_relaxed would skip the release
-            # fence and risk stale peer reads on hardware that doesn't
-            # eagerly publish shared writes.
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-            if tidx == cutlass.Int32(0):
-                total = cutlass.Int32(0)
-                local_ptr = s_cluster_partial.iterator + cutlass.Int32(0)
-                for peer in cutlass.range_constexpr(cluster_size):
-                    peer_addr = mapa_shared_cluster(local_ptr, cutlass.Int32(peer))
-                    total = total + ld_shared_cluster_i32(peer_addr)
-                s_iscalars[0] = total
-            cute.arch.barrier()  # broadcast cluster total within this CTA
+            if do_cluster_sync:
+                cute.arch.barrier()  # publish s_iscalars[0] to all threads of this CTA
+                if tidx == cutlass.Int32(0):
+                    s_cluster_partial[0] = s_iscalars[0]
+                # Non-relaxed arrive: pairs with the peer cluster_wait acquire
+                # to release s_cluster_partial writes so the DSMEM ld below
+                # observes them. cluster_arrive_relaxed would skip the release
+                # fence and risk stale peer reads on hardware that doesn't
+                # eagerly publish shared writes.
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                if tidx == cutlass.Int32(0):
+                    total = cutlass.Int32(0)
+                    local_ptr = s_cluster_partial.iterator + cutlass.Int32(0)
+                    for peer in cutlass.range_constexpr(cluster_size):
+                        peer_addr = mapa_shared_cluster(local_ptr, cutlass.Int32(peer))
+                        total = total + ld_shared_cluster_i32(peer_addr)
+                    s_iscalars[0] = total
+                cute.arch.barrier()  # broadcast cluster total within this CTA
 
     # ------------------------------------------------------------------
     # Phase 2: Secant-interpolation threshold search
@@ -892,6 +898,7 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        do_cluster_sync,  # bool: False = cs=1 / short-row degrade (skip cluster sync)
         smem_input=None,  # optional SMEM-cached slice
     ):
         """Refine s_thr[0] until cand_count lands in [kK, kCC].
@@ -921,6 +928,7 @@ class GvrTopKKernel:
             warp_id,
             lane,
             smem_input=smem_input,
+            do_cluster_sync=do_cluster_sync,
         )
 
         # tid==0 classifies the initial count.
@@ -996,6 +1004,7 @@ class GvrTopKKernel:
                     warp_id,
                     lane,
                     smem_input=smem_input,
+                    do_cluster_sync=do_cluster_sync,
                 )
                 # tid==0 classifies the new count.
                 if tidx == 0:
@@ -1046,6 +1055,7 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        do_cluster_sync,  # bool: False = cs=1 / short-row degrade (skip cluster sync)
         smem_input=None,  # optional SMEM-cached slice
     ):
         """Retry-shrink (when P2 didn't converge) + prefix sum + stream-write.
@@ -1080,6 +1090,7 @@ class GvrTopKKernel:
                 warp_id,
                 lane,
                 smem_input=smem_input,
+                do_cluster_sync=do_cluster_sync,
             )
             if tidx == 0:
                 if s_iscalars[0] > cutlass.Int32(kCC):
@@ -1112,6 +1123,7 @@ class GvrTopKKernel:
                     warp_id,
                     lane,
                     smem_input=smem_input,
+                    do_cluster_sync=do_cluster_sync,
                 )
                 if tidx == 0:
                     c_rs = s_iscalars[0]
@@ -1797,24 +1809,23 @@ class GvrTopKKernel:
         output_values: cute.Tensor,  # [numRows, top_k] dtype, optional
         output_indices: cute.Tensor,  # [numRows, top_k] int32
     ):
-        """Run the full GVR pipeline (Phase 1-4 + writeback) for one row.
+        """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
-        Caller resolves ``row_idx`` from any bidx→row mapping (static,
-        load-balanced, etc.) and dispatches in. ``cta_in_cluster`` is
-        derived internally from ``block_idx_in_cluster()`` so callers
-        don't need to thread it through.
+        ``run_one_row`` only handles row resolution, SMEM allocation, and
+        the per-row long-vs-short decision. Phase 1-4 are in
+        :meth:`_run_phases`.
 
-        ``cluster_size`` is a constexpr on ``self``; callers MUST launch
-        with cluster=(cluster_size, 1, 1) when cluster_size > 1, and the
-        ``cluster_size`` neighbouring CTAs sharing a row must agree on
-        ``row_idx`` (computed identically per cluster) so the per-CTA
-        ``block_idx_in_cluster()`` yields the expected 0..cluster_size-1
-        coverage of the row.
+        Short-row degrade: when the actual row workload fits within ONE
+        CTA's design slice (``ceil(max_seq_len / cluster_size)``), CTA 0
+        solo-scans the row (do_cluster_sync=False, no cluster sync) and
+        the other cluster CTAs fall through ``run_one_row`` without
+        calling ``_run_phases``. CuTe DSL doesn't support runtime
+        ``return``, so non-leader CTAs naturally reach
+        ``griddepcontrol_launch_dependents`` at the end.
         """
         tidx, _, _ = cute.arch.thread_idx()
 
         next_n = cutlass.const_expr(self.next_n)
-        top_k = cutlass.const_expr(self.top_k)
         num_threads = cutlass.const_expr(self.num_threads)
         num_warps = cutlass.const_expr(self.num_warps)
         kC = cutlass.const_expr(self.kC)
@@ -1828,7 +1839,6 @@ class GvrTopKKernel:
             cta_in_cluster = cute.arch.block_idx_in_cluster()
         else:
             cta_in_cluster = cutlass.Int32(0)
-        is_leader = cta_in_cluster == cutlass.Int32(0)
         pre_idx_row_idx = row_idx // next_n
         # Temporal-shift offset, mirroring heuristicTopKDecode.cu PR #14219:
         #   cr == 1 (V3.2): (row % next_n) + 1 maps prev-step indices into this
@@ -1842,8 +1852,6 @@ class GvrTopKKernel:
 
         # Per-row length. seq_lens is in uncompressed-token space; logits/preIdx
         # live in compressed-token-index space when cr > 1 → divide by cr.
-        # (For cr == 1, the divide is a no-op, but the explicit form mirrors
-        # the CUDA branch and keeps the IR straightforward to read.)
         seq_len = seq_lens[pre_idx_row_idx]
         actual_kv_len = (
             seq_len - cutlass.Int32(next_n) + cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
@@ -1852,28 +1860,6 @@ class GvrTopKKernel:
             N = actual_kv_len
         else:
             N = actual_kv_len // cutlass.Int32(self.compress_ratio)
-
-        # Cluster row-slice: CTA r owns row[slice_start : slice_end). All
-        # CTAs except the last get floor(N / cs) elements; the last CTA
-        # absorbs the N mod cs remainder.
-        #
-        # slice_base is rounded DOWN to a multiple of vec_w so each CTA's
-        # slice_start = cta_in_cluster * slice_base stays vec_w-aligned —
-        # otherwise peers' vec_w-wide LDG would hit misaligned addresses
-        # under varlen N. The last CTA's tail (everything past
-        # (cs-1)*slice_base) is handled by block_count_ge's vec/scalar
-        # tail loops, which already cope with non-vec_w-aligned ends.
-        if cutlass.const_expr(cluster_size > 1):
-            vec_w_const = cutlass.const_expr(self.vec_bits // self.dtype.width)
-            raw_base = N // cutlass.Int32(cluster_size)
-            slice_base = (raw_base // cutlass.Int32(vec_w_const)) * cutlass.Int32(vec_w_const)
-            slice_start = cta_in_cluster * slice_base
-            slice_end_normal = slice_start + slice_base
-            slice_is_last = cta_in_cluster == cutlass.Int32(cluster_size - 1)
-            slice_end = N if slice_is_last else slice_end_normal
-        else:
-            slice_start = cutlass.Int32(0)
-            slice_end = N
 
         # Slice per-row views.
         input_row = input_data[row_idx, None]
@@ -1990,135 +1976,326 @@ class GvrTopKKernel:
         else:
             smem_input = None
 
-        # ---- Degenerate path: N <= top_k → copy input as-is ----
+        # ---- Per-row dispatch ----
+        # Three branches:
+        #   1. Degenerate (N <= top_k): no GVR work, leader emits identity.
+        #   2. cs>1 long row:           all cluster CTAs cooperate.
+        #   3. cs>1 short row OR cs=1:  leader/single CTA runs solo.
+        # Non-leader CTAs in (1)/(3) fall through to the function end (CuTe
+        # DSL doesn't support runtime ``return``).
+        top_k = cutlass.const_expr(self.top_k)
         if N <= cutlass.Int32(top_k):
-            jd = tidx
-            while jd < N:
-                if cutlass.const_expr(self.return_output_values):
-                    output_values_row[jd] = input_row[jd]
-                output_indices_row[jd] = cutlass.Int32(jd)
-                jd = jd + cutlass.Int32(num_threads)
-            jp = N + cutlass.Int32(tidx)
-            while jp < cutlass.Int32(top_k):
-                if cutlass.const_expr(self.return_output_values):
-                    output_values_row[jp] = self.dtype(self.NEG_FLT_MAX)
-                output_indices_row[jp] = cutlass.Int32(-1)
-                jp = jp + cutlass.Int32(num_threads)
+            # Degenerate: no GVR, just emit [0..N-1] + (-1) padding.
+            # Leader-only write (was an idempotent race across cluster CTAs).
+            if cta_in_cluster == cutlass.Int32(0):
+                jd = tidx
+                while jd < N:
+                    if cutlass.const_expr(self.return_output_values):
+                        output_values_row[jd] = input_row[jd]
+                    output_indices_row[jd] = cutlass.Int32(jd)
+                    jd = jd + cutlass.Int32(num_threads)
+                jp = N + cutlass.Int32(tidx)
+                while jp < cutlass.Int32(top_k):
+                    if cutlass.const_expr(self.return_output_values):
+                        output_values_row[jp] = self.dtype(self.NEG_FLT_MAX)
+                    output_indices_row[jp] = cutlass.Int32(-1)
+                    jp = jp + cutlass.Int32(num_threads)
         else:
-            # =================================================================
-            # Phase 1 — preIdx Min/Max/Mean
-            # =================================================================
-            self.phase1_preidx_stats(
+            # Normal GVR. Long vs short row decision threshold =
+            # ceil(max_seq_len / cluster_size) = one CTA's design
+            # workload. When actual seq_len fits within that, cluster
+            # cooperation overhead exceeds the work saved → degrade to
+            # CTA 0 solo.
+            if cutlass.const_expr(cluster_size > 1):
+                max_seq_len_buf = input_data.shape[1]
+                per_cta_design = (
+                    max_seq_len_buf + cutlass.Int32(cluster_size - 1)
+                ) // cutlass.Int32(cluster_size)
+                if N > per_cta_design:
+                    # Long row: cluster cooperation, all cs CTAs scan
+                    # N/cs. slice_base rounded DOWN to vec_w so each
+                    # CTA's slice_start stays vec_w-aligned; the last
+                    # CTA absorbs the N mod cs remainder.
+                    vec_w_const = cutlass.const_expr(self.vec_bits // self.dtype.width)
+                    raw_base = N // cutlass.Int32(cluster_size)
+                    slice_base = (raw_base // cutlass.Int32(vec_w_const)) * cutlass.Int32(
+                        vec_w_const
+                    )
+                    slice_start = cta_in_cluster * slice_base
+                    slice_is_last = cta_in_cluster == cutlass.Int32(cluster_size - 1)
+                    slice_end = N if slice_is_last else (slice_start + slice_base)
+                    self._run_phases(
+                        input_row,
+                        pre_idx_row,
+                        output_values_row,
+                        output_indices_row,
+                        N,
+                        pre_idx_offset,
+                        pre_idx_count,
+                        slice_start,
+                        slice_end,
+                        cutlass.Boolean(True),
+                        cta_in_cluster,
+                        smem_keys,
+                        smem_vals,
+                        smem_hist,
+                        smem_ptcnt,
+                        smem_wcnt,
+                        smem_wmin,
+                        smem_wmax,
+                        smem_wsum,
+                        smem_wcnt_p1,
+                        s_thr,
+                        s_iscalars,
+                        s_cluster_partial,
+                        smem_input,
+                        tidx,
+                        warp_id,
+                        lane,
+                    )
+                else:
+                    # Short row: only CTA 0 scans the full row; the other
+                    # (cluster_size - 1) CTAs fall through without entering
+                    # _run_phases and naturally reach the function end.
+                    if cta_in_cluster == cutlass.Int32(0):
+                        self._run_phases(
+                            input_row,
+                            pre_idx_row,
+                            output_values_row,
+                            output_indices_row,
+                            N,
+                            pre_idx_offset,
+                            pre_idx_count,
+                            cutlass.Int32(0),
+                            N,
+                            cutlass.Boolean(False),
+                            cta_in_cluster,
+                            smem_keys,
+                            smem_vals,
+                            smem_hist,
+                            smem_ptcnt,
+                            smem_wcnt,
+                            smem_wmin,
+                            smem_wmax,
+                            smem_wsum,
+                            smem_wcnt_p1,
+                            s_thr,
+                            s_iscalars,
+                            s_cluster_partial,
+                            smem_input,
+                            tidx,
+                            warp_id,
+                            lane,
+                        )
+            else:
+                # cs=1: one CTA per row, no cluster sync.
+                self._run_phases(
+                    input_row,
+                    pre_idx_row,
+                    output_values_row,
+                    output_indices_row,
+                    N,
+                    pre_idx_offset,
+                    pre_idx_count,
+                    cutlass.Int32(0),
+                    N,
+                    cutlass.Boolean(False),
+                    cta_in_cluster,
+                    smem_keys,
+                    smem_vals,
+                    smem_hist,
+                    smem_ptcnt,
+                    smem_wcnt,
+                    smem_wmin,
+                    smem_wmax,
+                    smem_wsum,
+                    smem_wcnt_p1,
+                    s_thr,
+                    s_iscalars,
+                    s_cluster_partial,
+                    smem_input,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+
+        griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _run_phases(
+        self,
+        input_row,
+        pre_idx_row,
+        output_values_row,
+        output_indices_row,
+        N,
+        pre_idx_offset,
+        pre_idx_count,
+        slice_start,
+        slice_end,
+        do_cluster_sync,
+        cta_in_cluster,
+        smem_keys,
+        smem_vals,
+        smem_hist,
+        smem_ptcnt,
+        smem_wcnt,
+        smem_wmin,
+        smem_wmax,
+        smem_wsum,
+        smem_wcnt_p1,
+        s_thr,
+        s_iscalars,
+        s_cluster_partial,
+        smem_input,
+        tidx,
+        warp_id,
+        lane,
+    ):
+        """Run Phase 1-4 + final cluster barrier on a given row slice.
+
+        Caller (``run_one_row``) decides slice + do_cluster_sync per row:
+          - cs=1                 → slice=[0,N), do_cluster_sync=False
+          - cs>1, long row       → slice=N/cs per CTA, do_cluster_sync=True
+          - cs>1, short row      → slice=[0,N), do_cluster_sync=False, CTA 0 only
+
+        Non-leader CTAs in short-row mode never call this helper.
+        """
+        num_threads = cutlass.const_expr(self.num_threads)
+        cluster_size = cutlass.const_expr(self.cluster_size)
+        is_leader = cta_in_cluster == cutlass.Int32(0)
+
+        # ---- Phase 1: preIdx Min/Max/Mean ----
+        self.phase1_preidx_stats(
+            input_row,
+            N,
+            pre_idx_row,
+            pre_idx_count,
+            pre_idx_offset,
+            smem_wmin,
+            smem_wmax,
+            smem_wsum,
+            smem_wcnt_p1,
+            s_thr,
+            s_iscalars,
+            tidx,
+            warp_id,
+            lane,
+        )
+
+        # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
+        # When preIdx values produce an unusable bracket (e.g. all -inf or
+        # identical), skip Phase 2-4 and emit identity output instead.
+        v_lo = s_thr[1]
+        v_hi = s_thr[2]
+        if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
+            if tidx == 0:
+                top_k = cutlass.const_expr(self.top_k)
+                # Emit identity output (first min(top_k, N) indices)
+                emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
+                je = cutlass.Int32(0)
+                while je < emit_count:
+                    output_indices_row[je] = je
+                    if cutlass.const_expr(self.return_output_values):
+                        output_values_row[je] = input_row[je]
+                    je = je + cutlass.Int32(1)
+        else:
+            # Stage this CTA's slice into SMEM once before Phase 2's
+            # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
+            # scatter-loads OUTSIDE this slice, so it stays on GMEM.
+            if cutlass.const_expr(self.enable_smem_cache):
+                self.load_slice_to_smem(
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    smem_input,
+                    tidx,
+                )
+
+            # ---- Phase 2: secant threshold search ----
+            self.phase2_secant_search(
                 input_row,
                 N,
-                pre_idx_row,
-                pre_idx_count,
-                pre_idx_offset,
-                smem_wmin,
-                smem_wmax,
-                smem_wsum,
-                smem_wcnt_p1,
+                slice_start,
+                slice_end,
+                smem_ptcnt,
+                smem_wcnt,
                 s_thr,
                 s_iscalars,
+                s_cluster_partial,
                 tidx,
                 warp_id,
                 lane,
+                do_cluster_sync=do_cluster_sync,
+                smem_input=smem_input,
             )
 
-            # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi
-            v_lo = s_thr[1]
-            v_hi = s_thr[2]
-            if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
-                if tidx == 0:
-                    # Emit identity output (first min(top_k, N) indices)
-                    emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
-                    je = cutlass.Int32(0)
-                    while je < emit_count:
-                        output_indices_row[je] = je
-                        if cutlass.const_expr(self.return_output_values):
-                            output_values_row[je] = input_row[je]
-                        je = je + cutlass.Int32(1)
-            else:
-                # Stage this CTA's slice into SMEM once before Phase 2's
-                # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
-                # scatter-loads OUTSIDE this slice, so it stays on GMEM.
-                if cutlass.const_expr(self.enable_smem_cache):
-                    self.load_slice_to_smem(
-                        input_row,
-                        slice_start,
-                        slice_end,
-                        smem_input,
-                        tidx,
-                    )
-
-                # ---- Phase 2: secant threshold search ----
-                self.phase2_secant_search(
-                    input_row,
-                    N,
-                    slice_start,
-                    slice_end,
-                    smem_ptcnt,
-                    smem_wcnt,
-                    s_thr,
-                    s_iscalars,
-                    s_cluster_partial,
-                    tidx,
-                    warp_id,
-                    lane,
-                    smem_input=smem_input,
-                )
-
-                # Cluster handoff #1 (end of Phase 2): after Phase 2 every
-                # CTA agrees on s_iscalars[0] (cluster cand_count) and
-                # s_thr (deterministic secant), and each CTA's smem_ptcnt
-                # holds its slice-local per-thread counts — the basis for
-                # its own Phase 3 prefix sum.
-                if cutlass.const_expr(cluster_size > 1):
+            # Cluster handoff #1 (end of Phase 2). Skipped when
+            # do_cluster_sync is False (cs=1 or short-row degrade).
+            if cutlass.const_expr(cluster_size > 1):
+                if do_cluster_sync:
                     cute.arch.cluster_arrive_relaxed()
                     cute.arch.cluster_wait()
 
-                # ---- Phase 3: cluster-parallel candidate collect ----
-                # Every CTA runs Phase 3 on its OWN slice using the
-                # slice-local smem_ptcnt. After this, each CTA's
-                # smem_keys[0 .. local_cand_count) holds its slice
-                # candidates (local_cand_count = s_iscalars[5]).
-                self.phase3_collect_candidates(
-                    input_row,
-                    N,
-                    slice_start,
-                    slice_end,
-                    smem_keys,
-                    smem_vals,
-                    smem_ptcnt,
-                    smem_wcnt,
-                    s_thr,
-                    s_iscalars,
-                    s_cluster_partial,
-                    tidx,
-                    warp_id,
-                    lane,
-                    smem_input=smem_input,
-                )
+            # ---- Phase 3: cluster-parallel candidate collect ----
+            self.phase3_collect_candidates(
+                input_row,
+                N,
+                slice_start,
+                slice_end,
+                smem_keys,
+                smem_vals,
+                smem_ptcnt,
+                smem_wcnt,
+                s_thr,
+                s_iscalars,
+                s_cluster_partial,
+                tidx,
+                warp_id,
+                lane,
+                do_cluster_sync=do_cluster_sync,
+                smem_input=smem_input,
+            )
 
-                # Cluster handoff #2: leader's gather of peer smem_keys /
-                # smem_vals into its own buffer. Peers' Phase 3 must have
-                # finished AND their smem writes must be visible to the
-                # leader before this DSMEM read. Non-relaxed arrive pairs
-                # release with the wait acquire so the leader sees the
-                # final smem_keys/smem_vals each peer published.
-                if cutlass.const_expr(cluster_size > 1):
+            # Cluster handoff #2: leader's DSMEM gather of peer
+            # smem_keys/smem_vals. Skipped at do_cluster_sync=False.
+            if cutlass.const_expr(cluster_size > 1):
+                if do_cluster_sync:
                     cute.arch.cluster_arrive()
                     cute.arch.cluster_wait()
 
-                if cluster_size == 1 or is_leader:
-                    if cutlass.const_expr(cluster_size > 1):
+            # Phase 4 runs on the leader only. const_expr (compile-
+            # time eliminated) split from runtime so cs=1 gets a flat
+            # code path with no leader/sync checks.
+            # Pre-init cand_count_p4 so CuTe DSL sees a stable Int32 type
+            # across the runtime ``if is_leader:`` branch in cs>1 mode
+            # (DSL forbids first-assigning a variable inside a dynamic if).
+            cand_count_p4 = cutlass.Int32(0)
+            if cutlass.const_expr(cluster_size == 1):
+                # cs=1: the single CTA per row IS the leader.
+                cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
+                self.phase4_histogram_snap(
+                    smem_keys,
+                    smem_vals,
+                    smem_hist,
+                    smem_wcnt,
+                    s_thr,
+                    s_iscalars,
+                    output_values_row,
+                    output_indices_row,
+                    cand_count_p4,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+            else:
+                # cs>1: only the leader (CTA 0 in cluster) runs Phase 4.
+                if is_leader:
+                    if do_cluster_sync:
                         # DSMEM-gather peer candidates into the leader's
                         # smem_keys/smem_vals. Layout: leader's chunk goes
                         # to [0 .. leader_local_cnt); each peer r's chunk
-                        # appends the next peer_r_local_cnt entries. Peer
-                        # counts are DSMEM-read from their s_iscalars[5];
-                        # the chunk itself is read by all threads in
-                        # parallel (one ld.shared::cluster per entry).
+                        # appends the next peer_r_local_cnt entries.
                         local_cnt_self = s_iscalars[5]
                         local_iscalars_ptr = s_iscalars.iterator + cutlass.Int32(5)
                         smem_keys_iter = smem_keys.iterator
@@ -2129,19 +2306,9 @@ class GvrTopKKernel:
                                 local_iscalars_ptr, cutlass.Int32(peer)
                             )
                             peer_cnt = ld_shared_cluster_i32(peer_iscalars_addr)
-                            # Defense-in-depth: cap to kC (peer's allocation
-                            # upper bound). Phase 3's stream-write guards
-                            # writes at ``dst < kC`` so peer.smem_keys /
-                            # smem_vals are only valid in [0, kC), but
-                            # s_iscalars[5] is uncapped and could exceed
-                            # kC in the done==2 bracket-exhaustion path
-                            # (not reached in V4 production data, but a
-                            # cheap guard vs. an OOB DSMEM read). Mirrors
-                            # the single-CTA path's cand_count_p4 = min(
-                            # s_iscalars[0], kC) downstream.
+                            # Cap to kC (defense-in-depth vs. the
+                            # done==2 bracket-exhaustion path).
                             peer_cnt = min(peer_cnt, cutlass.Int32(self.kC))
-                            # Each thread copies one entry at a time, strided
-                            # by num_threads, until the peer's chunk is drained.
                             i_gather = tidx
                             while i_gather < peer_cnt:
                                 peer_key_addr = mapa_shared_cluster(
@@ -2158,18 +2325,16 @@ class GvrTopKKernel:
                                     smem_vals[dst] = v_val
                                 i_gather = i_gather + cutlass.Int32(num_threads)
                             base_offset = base_offset + peer_cnt
-                        # Reset s_iscalars[0] to the cluster-wide cand_count
-                        # (= base_offset after the gather loop). Phase 3's
-                        # block prefix sum had overwritten it with the
-                        # leader's slice-local count; Phase 4 operates on
-                        # the merged candidate buffer and needs the total.
+                        # Reset s_iscalars[0] to cluster-wide cand_count.
                         if tidx == cutlass.Int32(0):
                             s_iscalars[0] = base_offset
                         cute.arch.barrier()
+                    # else: short-row degrade — leader (CTA 0) already
+                    # holds the full row's candidates in its own
+                    # smem_keys/smem_vals (no peers to gather from).
 
-                    # ---- Phase 4: histogram snap + writeback (leader only) ----
+                    # ---- Phase 4: histogram snap + writeback ----
                     cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
-
                     self.phase4_histogram_snap(
                         smem_keys,
                         smem_vals,
@@ -2186,13 +2351,13 @@ class GvrTopKKernel:
                     )
 
         # Final cluster barrier: keep peer CTAs (and their SMEM) alive
-        # until the leader's gather + Phase 4 finish. Skipping this lets
-        # peers exit and free their SMEM mid-gather → unmapped DSMEM read.
-        if cutlass.const_expr(self.cluster_size > 1):
-            cute.arch.cluster_arrive_relaxed()
-            cute.arch.cluster_wait()
-
-        griddepcontrol_launch_dependents()
+        # until the leader's gather + Phase 4 finish. Skipped at
+        # do_cluster_sync=False (no peers; short-row degrade non-leaders
+        # already fell through ``run_one_row``).
+        if cutlass.const_expr(cluster_size > 1):
+            if do_cluster_sync:
+                cute.arch.cluster_arrive_relaxed()
+                cute.arch.cluster_wait()
 
     # ------------------------------------------------------------------
     # Host-side launcher
