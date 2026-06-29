@@ -39,13 +39,15 @@ _WEIGHT_KEY_REMAPS = [
     (".net.2.", ".down_proj."),
 ]
 
-# Helper parameters that FP8/NVFP4 ``Linear.create_weights()`` registers but that
-# are derived from the stored scales at load time (``alpha`` and
-# ``inv_input_scale``) or default to ones (the NVFP4 KV-cache scales). They are
-# never serialized in a ModelOpt checkpoint, so they must be excluded from the
-# strict key check when loading a statically pre-quantized checkpoint
-# (``dynamic_weight_quant=False``).
-_QUANT_DERIVED_PARAM_NAMES = (
+# Parameters created by the shared FP8/NVFP4 Linear methods that ModelOpt does
+# not serialize. ``alpha`` and ``inv_input_scale`` are derived from serialized
+# scales by the shared ``Linear.load_weights()`` path. ``kv_scales`` and
+# ``inv_kv_scales`` are placeholders for the LLM fused-QKV path; Qwen-Image
+# uses separate Q/K/V projections without a KV cache, so they remain at their
+# defaults and are never read. Keep the list scoped to parameters actually
+# registered on each Linear so other missing checkpoint weights still fail
+# strict validation.
+_NON_SERIALIZED_QUANT_PARAM_NAMES = (
     "alpha",
     "inv_input_scale",
     "kv_scales",
@@ -916,19 +918,19 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     module._buffers.clear()
                     module.create_weights()
 
-    def _quant_derived_parameter_names(self) -> set[str]:
-        """Return non-serialized helper parameters owned by quantized Linears."""
-        derived = set()
+    def _non_serialized_quant_parameter_names(self) -> set[str]:
+        """Return shared Linear parameters absent from ModelOpt checkpoints."""
+        non_serialized = set()
         for module_name, module in self.named_modules():
             if not isinstance(module, Linear) or module.quant_config is None:
                 continue
             prefix = f"{module_name}." if module_name else ""
-            derived.update(
+            non_serialized.update(
                 f"{prefix}{param_name}"
-                for param_name in _QUANT_DERIVED_PARAM_NAMES
+                for param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES
                 if module._parameters.get(param_name) is not None
             )
-        return derived
+        return non_serialized
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
@@ -946,10 +948,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        # FP8/NVFP4 Linear.create_weights() registers helper parameters that are
-        # derived at load time and never stored in a checkpoint; drop them so a
-        # statically pre-quantized ModelOpt checkpoint passes the key check.
-        missing = sorted((expected - provided) - self._quant_derived_parameter_names())
+        # WAN uses the same shared Linear methods but does not perform this
+        # model-vs-checkpoint key check. Exempt only their known non-serialized
+        # parameters while retaining strict validation for real Qwen weights.
+        missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
         unexpected = sorted(provided - expected)
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.
