@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
 import json
 from collections import deque
 from types import SimpleNamespace
@@ -26,8 +25,11 @@ class _FakeGenerator:
     def __init__(self, stat_batches: list[list[dict]]):
         self.args = SimpleNamespace(iter_stats_max_iterations=None)
         self._stat_batches = deque(stat_batches)
+        self.stats_timeouts = []
 
-    def get_stats_async(self, _timeout: float):
+    def get_stats_async(self, timeout: float | None):
+        self.stats_timeouts.append(timeout)
+
         async def _stats_iter():
             if self._stat_batches:
                 for stat in self._stat_batches.popleft():
@@ -44,14 +46,18 @@ class _FakeMetricsCollector:
         self.logged_stats.append(iteration_stats)
 
 
-def _make_server(stat_batches: list[list[dict]], *, with_stats_buffer: bool = True) -> OpenAIServer:
+def _make_server(
+    stat_batches: list[list[dict]],
+    *,
+    with_stats_buffer: bool = True,
+    is_visual_gen: bool = False,
+) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
     server.generator = _FakeGenerator(stat_batches)
     server.metrics_collector = _FakeMetricsCollector()
-    server._iteration_stats_lock = asyncio.Lock()
-    server._iteration_stats_buffer = (
-        deque(maxlen=server._get_iteration_stats_buffer_maxlen()) if with_stats_buffer else None
-    )
+    server._is_visual_gen = is_visual_gen
+    max_buffer_size = server.generator.args.iter_stats_max_iterations or 1000
+    server._iteration_stats_buffer = deque(maxlen=max_buffer_size) if with_stats_buffer else None
     return server
 
 
@@ -60,26 +66,15 @@ def _response_content(response):
 
 
 @pytest.mark.asyncio
-async def test_background_iteration_stats_drain_preserves_metrics_endpoint():
+async def test_metrics_endpoint_reads_background_buffer():
     stats = [{"iter": 1}, {"iter": 2}]
-    server = _make_server([stats, []])
-
-    await server._drain_iteration_stats_to_sinks(timeout=0.5)
-    response = await server.get_iteration_stats()
-
-    assert _response_content(response) == stats
-    assert server.metrics_collector.logged_stats == stats
-
-
-@pytest.mark.asyncio
-async def test_metrics_endpoint_drain_logs_prometheus_metrics():
-    stats = [{"iter": 3}, {"iter": 4}]
-    server = _make_server([stats])
+    server = _make_server([])
+    server._iteration_stats_buffer.extend(stats)
 
     response = await server.get_iteration_stats()
 
     assert _response_content(response) == stats
-    assert server.metrics_collector.logged_stats == stats
+    assert server.generator.stats_timeouts == []
 
     response = await server.get_iteration_stats()
     assert _response_content(response) == []
@@ -93,4 +88,23 @@ async def test_metrics_endpoint_reads_queue_without_background_buffer():
     response = await server.get_iteration_stats()
 
     assert _response_content(response) == stats
-    assert server.metrics_collector.logged_stats == stats
+    assert server.generator.stats_timeouts == [2]
+    assert server.metrics_collector.logged_stats == []
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_reads_visual_gen_stats():
+    stats = [
+        {
+            "iter": 7,
+            "numQueuedRequests": 2,
+            "numActiveRequests": 1,
+        }
+    ]
+    server = _make_server([stats], is_visual_gen=True)
+
+    response = await server.get_iteration_stats()
+
+    assert _response_content(response) == stats
+    assert server.generator.stats_timeouts == [None]
+    assert server.metrics_collector.logged_stats == []
