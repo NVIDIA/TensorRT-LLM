@@ -298,6 +298,19 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
+    TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
+    auto const backendType = mCacheTransceiverConfig.value().getBackendType();
+    TLLM_CHECK_WITH_INFO(
+        backendType.has_value() && (backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT),
+        " CacheTransceiverConfig::BackendType is not set.");
+    if (common::getEnvDisaggEnableInflightCancel())
+    {
+        TLLM_CHECK_WITH_INFO(backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
+                && common::getEnvNixlBackend() == "UCX",
+            "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 is experimental and currently supported only with the "
+            "NIXL cache transceiver and TRTLLM_NIXL_KVCACHE_BACKEND=UCX.");
+    }
+
     if (useMPI())
     {
         mGroupComm = std::make_shared<CacheTransceiverComm>(std::addressof(tensorrt_llm::mpi::MpiComm::session()));
@@ -348,12 +361,6 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
-    auto backendType = mCacheTransceiverConfig.value().getBackendType();
-    TLLM_CHECK_WITH_INFO(
-        backendType.has_value() && (backendType.value() != executor::CacheTransceiverConfig::BackendType::DEFAULT),
-        " CacheTransceiverConfig::BackendType is not set.");
-
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
 
     mCacheTransBufferManagers.push_back(
