@@ -234,6 +234,32 @@ class CUDAGraphRunner:
                    is_all_greedy_sample)
         return key
 
+    @staticmethod
+    def _get_mrope_position_delta(request: Any) -> Optional[Any]:
+        mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
+        if mrope_position_delta is not None:
+            return mrope_position_delta
+
+        multimodal_data = getattr(request, "py_multimodal_data", None)
+        if not multimodal_data:
+            return None
+
+        mrope_config = multimodal_data.get("mrope_config")
+        if mrope_config is None:
+            return None
+        return mrope_config.get("mrope_position_deltas")
+
+    @staticmethod
+    def _needs_mrope_delta_cache_update(request: Any) -> bool:
+        if request.py_seq_slot is None or request.is_dummy:
+            return False
+
+        if getattr(request, "py_mrope_delta_cache_slot",
+                   None) == request.py_seq_slot:
+            return False
+
+        return CUDAGraphRunner._get_mrope_position_delta(request) is not None
+
     def __del__(self):
         self.clear()
 
@@ -276,13 +302,12 @@ class CUDAGraphRunner:
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
         if self.config.use_mrope and any(
-                request.py_seq_slot is not None and not request.is_dummy
-                and getattr(request, "py_mrope_delta_cache_slot",
-                            None) != request.py_seq_slot
+                self._needs_mrope_delta_cache_update(request)
                 for request in batch.generation_requests):
-            # Requests whose current seq slot has not been seeded in the
-            # model-side MRoPE delta cache must run eagerly. Later decode steps
-            # can replay CUDA graphs using the cache.
+            # Some MRoPE paths have no per-request delta (for example,
+            # Qwen3.5 configs normalized to text-only decoding). Requests that
+            # do carry a delta must first populate the model-side cache for their
+            # current seq slot before graph replay.
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata)
@@ -828,6 +853,14 @@ class EncoderCUDAGraphRunner:
         # New key not yet captured. Only create metadata if capture is
         # allowed (warmup time); otherwise fall back to eager.
         if not self._capture_allowed:
+            return None, None
+
+        if "multi_item_part_lens" in inputs:
+            # See model_engine.py for more details
+            logger.warning_once(
+                "Encoder CUDA graph does not support multi-item scoring; "
+                "falling back to eager.",
+                key="encoder_cuda_graph_multi_item_scoring_warning")
             return None, None
 
         if attn_metadata.has_cross_sub_metadata:

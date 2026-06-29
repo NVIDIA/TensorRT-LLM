@@ -993,7 +993,6 @@ class ADEngine(ModelEngine):
             _ungathered_new_lens=new_tokens_lens,
             **extra_args,
         )
-        self.cache_seq_interface.prepare_replay_metadata()
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens

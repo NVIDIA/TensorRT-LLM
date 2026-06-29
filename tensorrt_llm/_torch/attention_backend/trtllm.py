@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -38,7 +38,7 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams, SparsePrediction,
+                        PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -184,16 +184,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Required max_seq_len for context-only attention cases like visual gen
         """
         return min(self.max_seq_len, self.max_num_tokens)
-
-    @property
-    def effective_beam_width(self) -> int:
-        """Beam width visible to the kernel.
-
-        Cross-attention metadata is already expanded to one row per decoder
-        beam, and all beams read the same encoder K/V cache. Keep kernel beam
-        indirection disabled for that path.
-        """
-        return 1 if self.is_cross else self.beam_width
 
     @property
     def max_seq_len(self) -> int:
@@ -1439,10 +1429,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        if forward_args.multi_item_part_lens is not None:
-            raise ValueError(
-                "TRT-LLM Attention does not support multi-item scoring")
-
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
         if get_sm_version() == 90:
@@ -1496,7 +1482,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
                                                       forward_args)
-            forward_args.sparse_prediction = SparsePrediction(
+            forward_args.sparse_prediction = replace(
+                forward_args.sparse_prediction,
                 sparse_kv_indices=kv_idx,
                 sparse_kv_offsets=kv_off,
                 sparse_attn_indices=at_idx,
