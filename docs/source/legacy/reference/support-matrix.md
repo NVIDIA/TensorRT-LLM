@@ -158,7 +158,7 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [26.04](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [26.05](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
   - [10.16](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision

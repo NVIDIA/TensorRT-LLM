@@ -438,8 +438,6 @@ unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linea
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingDSv3-swiglu-1024-1024-1] SKIP (https://nvbugs/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_qwen_next-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingRenormalize_topk_4-swiglu-1024-1024-150] SKIP (https://nvbugs/5908070)
-unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[fp8-2-1560] SKIP (https://nvbugs/6198760)
-unittest/_torch/visual_gen/test_attention_integration.py::test_sage_attention_self_attention[int8-2-1560] SKIP (https://nvbugs/6198760)
 unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py::TestCosmos3TransformerParallel::test_tp2_vs_single_gpu SKIP (https://nvbugs/6384633)
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py::test_capture_smoke SKIP (https://nvbugs/6385134)
 unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py::TestWanI2VTP::test_wan_i2v_tp_vs_single_gpu SKIP (https://nvbugs/6384633)
