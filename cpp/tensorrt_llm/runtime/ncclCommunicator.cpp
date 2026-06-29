@@ -45,35 +45,6 @@ int getNcclCommInitTimeoutSec()
     return timeoutSec > 0 ? timeoutSec : kDefaultNcclCommInitTimeoutSec;
 }
 
-void waitForNcclAsyncCompletion(ncclComm_t comm)
-{
-    while (true)
-    {
-        ncclResult_t asyncResult = ncclSuccess;
-        auto const result = ncclCommGetAsyncError(comm, &asyncResult);
-        TLLM_NCCL_CHECK(result);
-        if (asyncResult == ncclSuccess)
-        {
-            return;
-        }
-        if (asyncResult != ncclInProgress)
-        {
-            TLLM_NCCL_CHECK(asyncResult);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{kNcclCommInitPollIntervalMs});
-    }
-}
-
-void checkNcclAsyncResult(ncclComm_t comm, ncclResult_t result)
-{
-    if (result == ncclInProgress)
-    {
-        waitForNcclAsyncCompletion(comm);
-        return;
-    }
-    TLLM_NCCL_CHECK(result);
-}
-
 void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int rank, int timeoutSec)
 {
     ncclComm_t comm{nullptr};
@@ -131,18 +102,6 @@ void initNcclCommProbeWithTimeout(ncclUniqueId const& id, int worldSize, int ran
     }
 }
 
-ncclComm_t initBlockingNcclComm(ncclUniqueId const& id, int worldSize, int rank)
-{
-    ncclComm_t comm{nullptr};
-    auto const result = ncclCommInitRank(&comm, worldSize, id, rank);
-    if (result != ncclSuccess)
-    {
-        TLLM_THROW("NCCL communicator initialization failed on rank %d of %d: %s.", rank, worldSize,
-            ncclGetErrorString(result));
-    }
-    return comm;
-}
-
 ncclDataType_t toNcclType(nvinfer1::DataType dataType)
 {
     switch (dataType)
@@ -167,7 +126,7 @@ void NcclCommunicator::send(
     void const* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
-    checkNcclAsyncResult(mComm, ncclSend(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
+    TLLM_NCCL_CHECK(ncclSend(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -177,7 +136,7 @@ void NcclCommunicator::receive(
     void* sendbuff, size_t count, nvinfer1::DataType dataType, int peer, CudaStream const& stream) const
 {
 #if ENABLE_MULTI_DEVICE
-    checkNcclAsyncResult(mComm, ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
+    TLLM_NCCL_CHECK(ncclRecv(sendbuff, count, toNcclType(dataType), peer, mComm, stream.get()));
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -210,7 +169,9 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
         TLLM_NCCL_CHECK(ncclGetUniqueId(&id));
     }
     mpiComm.bcastValue(id, 0);
-    return initBlockingNcclComm(id, worldSize, rank);
+    ncclComm_t comm;
+    TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
+    return comm;
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
     // pipeline parallel code-path. To enable this, have an empty communicator with uninitialized state.
