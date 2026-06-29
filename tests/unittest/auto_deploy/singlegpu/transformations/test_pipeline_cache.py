@@ -128,6 +128,11 @@ class _ToyModule(nn.Module):
         return x + self.weight
 
 
+class _BatchInfoToyModule(nn.Module):
+    def forward(self, input_ids, position_ids, batch_info_host):
+        return input_ids, position_ids, batch_info_host
+
+
 class _PartialBoundHookOwner:
     def __init__(self, payload_value):
         self.payload_value = payload_value
@@ -214,6 +219,20 @@ class _BuildGraphForPipelineCache(BaseTransform):
         _COUNTERS["build"] += 1
         gm = symbolic_trace(_ToyModule().to("meta"))
         gm.meta["build_counter"] = _COUNTERS["build"]
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=1,
+            is_clean=True,
+            has_valid_shapes=True,
+        )
+
+
+@TransformRegistry.register("_unit_test_build_graph_with_batch_info_for_pipeline_cache")
+class _BuildGraphWithBatchInfoForPipelineCache(BaseTransform):
+    def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
+        _COUNTERS["build"] += 1
+        gm = symbolic_trace(_BatchInfoToyModule())
+        cm.info.activate_arg("batch_info_host")
         return gm, TransformInfo(
             skipped=False,
             num_matches=1,
@@ -532,6 +551,31 @@ def test_pipeline_cache_transform_restores_and_skips_prefix(monkeypatch, tmp_pat
     assert list(tmp_path.rglob(HOOKS_FILE_NAME))
     assert list(tmp_path.glob("*/rank_0"))
     assert not list(tmp_path.glob("*/pipeline_cache/rank_0"))
+
+
+def test_pipeline_cache_restore_preserves_graph_input_interface_state(monkeypatch, tmp_path):
+    """A cache hit restores interface state required by inputs in the cached graph."""
+    _reset_counters()
+    _patch_mem_stats(monkeypatch)
+    factory = _DummyFactory(model="dummy-model")
+    config = _optimizer_config(
+        tmp_path, "_unit_test_build_graph_with_batch_info_for_pipeline_cache"
+    )
+
+    cm_first = _cache_seq_interface()
+    model_first = InferenceOptimizer(factory=factory, config=config)(cm_first)
+    assert "batch_info_host" in cm_first.named_args
+    assert len(model_first(**cm_first.named_args)) == 3
+
+    cm_restored = _cache_seq_interface()
+    assert "batch_info_host" not in cm_restored.named_args
+    model_restored = InferenceOptimizer(factory=factory, config=config)(cm_restored)
+
+    batch_info_nodes = model_restored.graph.find_nodes(op="placeholder", target="batch_info_host")
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
+    assert len(batch_info_nodes) == 1
+    assert len(model_restored(**cm_restored.named_args)) == 3
+    assert "batch_info_host" in cm_restored.named_args
 
 
 def test_pipeline_cache_ignores_post_boundary_runtime_transform_config(monkeypatch, tmp_path):
