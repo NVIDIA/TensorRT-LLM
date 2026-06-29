@@ -49,6 +49,8 @@ except ImportError:
 
 # Keep it as 0.25 as the worst case scenario at NVL72 scale
 WAN_MULTI_GPU_LPIPS_THRESHOLD = 0.25
+WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
+WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
 WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("ulysses4", {"ulysses_size": 4}),
     ("cfg2_ulysses2", {"cfg_size": 2, "ulysses_size": 2}),
@@ -140,8 +142,9 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
         kwargs["num_inference_steps"],
         kwargs["guidance_scale"],
         kwargs["seed"],
-        attention_backend="FA4",
+        attention_backend=WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND,
         parallel=parallel,
+        fully_eager=True,
     )
 
     if rank == 0:
@@ -163,7 +166,9 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     parallel_cfg = ParallelConfig(**parallel)
     generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
     golden_path = _golden_media_path(
-        tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
+        tmp_path,
+        WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO,
+        "Wan 2.2 FA4 fully-eager LPIPS golden video",
     )
 
     run_test_in_distributed(
@@ -200,7 +205,9 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     WAN22_LPIPS_MULTI_GPU_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_MULTI_GPU_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parallel):
+def test_wan22_t2v_lpips_against_golden_multi_gpu(
+    _visual_gen_deps, tmp_path, variant_name, parallel
+):
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
 
 
@@ -209,5 +216,5 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
     WAN22_LPIPS_TP_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_tp(tmp_path, variant_name, parallel):
+def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_name, parallel):
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)

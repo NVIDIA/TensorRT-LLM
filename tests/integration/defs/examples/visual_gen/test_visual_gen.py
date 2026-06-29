@@ -229,16 +229,6 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 
 
 @pytest.fixture(scope="session")
-def _visual_gen_deps(llm_venv):
-    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
-    llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
-
-
-@pytest.fixture(scope="session")
 def vbench_repo_root(llm_venv):
     """Clone VBench repo into workspace and install; return repo root path."""
     workspace = llm_venv.get_working_directory()
@@ -410,14 +400,38 @@ def _cleanup_cuda():
 
 
 @contextlib.contextmanager
-def _lpips_deterministic_algorithms():
-    previous = torch.are_deterministic_algorithms_enabled()
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True)
+def _lpips_deterministic_algorithms(*, fully_eager=False):
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    previous_piecewise_running = None
+
+    if fully_eager:
+        from tensorrt_llm._torch.utils import is_piecewise_running, set_piecewise_running
+
+        previous_piecewise_running = is_piecewise_running()
+
     try:
-        yield
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        if fully_eager:
+            set_piecewise_running(True)
+        compiler_context = (
+            torch.compiler.set_stance("force_eager") if fully_eager else contextlib.nullcontext()
+        )
+        with compiler_context:
+            yield
     finally:
-        torch.use_deterministic_algorithms(previous)
+        if fully_eager:
+            set_piecewise_running(previous_piecewise_running)
+        torch.use_deterministic_algorithms(
+            previous_deterministic,
+            warn_only=previous_warn_only,
+        )
+        if previous_cublas_workspace_config is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous_cublas_workspace_config
 
 
 def _save_lpips_video_mp4(video, output_path, frame_rate):
@@ -605,6 +619,7 @@ def _run_wan_lpips_pipeline(
     seed,
     attention_backend="VANILLA",
     parallel=None,
+    fully_eager=False,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
@@ -618,7 +633,7 @@ def _run_wan_lpips_pipeline(
     )
     if parallel is not None:
         args_kwargs["parallel_config"] = parallel
-    with _lpips_deterministic_algorithms():
+    with _lpips_deterministic_algorithms(fully_eager=fully_eager):
         args = VisualGenArgs(**args_kwargs)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
@@ -653,7 +668,9 @@ def _generate_wan_lpips_video(
     guidance_scale,
     seed,
     frame_rate,
+    attention_backend="VANILLA",
     parallel=None,
+    fully_eager=False,
 ):
     generated_video = _run_wan_lpips_pipeline(
         model_path,
@@ -665,7 +682,9 @@ def _generate_wan_lpips_video(
         num_inference_steps,
         guidance_scale,
         seed,
+        attention_backend=attention_backend,
         parallel=parallel,
+        fully_eager=fully_eager,
     )
     assert generated_video is not None, "Single-GPU Wan LPIPS run produced no video"
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
