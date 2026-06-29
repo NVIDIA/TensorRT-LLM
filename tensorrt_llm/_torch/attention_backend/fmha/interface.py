@@ -29,20 +29,40 @@ if TYPE_CHECKING:
 
 
 class Fmha(ABC):
-    """Common runtime contract for TRT-LLM attention FMHA libraries."""
+    """Common runtime contract for TRT-LLM attention FMHA libraries.
 
-    def __init__(self, attn: "TrtllmAttention"):
-        self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
+    Most FMHA backends are owned by a :class:`TrtllmAttention` layer and
+    are driven by :meth:`TrtllmAttention.forward`. A small subset
+    (indexer-style proxy FMHA libraries used by sparse-attention
+    predictors) live in the same registry but have no owning attention
+    layer; they pass ``None`` for ``attn``. The :meth:`attn` property
+    raises only when callers actually dereference the owner, so the
+    no-owner subclasses never trip it as long as they do not call into
+    ``self.attn``.
+    """
+
+    def __init__(self, attn: Optional["TrtllmAttention"] = None):
+        self._attn_ref: Optional[weakref.ReferenceType["TrtllmAttention"]] = (
+            weakref.ref(attn) if attn is not None else None
+        )
 
     @property
     def attn(self) -> "TrtllmAttention":
+        if self._attn_ref is None:
+            raise RuntimeError(
+                f"{type(self).__name__} was constructed without an owning "
+                "TrtllmAttention instance. This typically means an "
+                "indexer-style FMHA backend was asked for a property "
+                "that only makes sense for main-attention FMHA "
+                "backends."
+            )
         attn = self._attn_ref()
         if attn is None:
             raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
         return attn
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
+    def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
         return True
 
     def is_supported(

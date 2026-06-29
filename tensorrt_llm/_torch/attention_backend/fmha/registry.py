@@ -19,12 +19,24 @@ from typing import TypeAlias
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
+from .msa_proxy_mqa import MsaProxyMqaFmha
+from .msa_sparse_gqa import MsaSparseGqaFmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
 FMHA_LIBS: dict[str, FmhaCls] = {
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
+    # Indexer-style proxy FMHA. Returns False from is_supported() so the
+    # main-attention dispatch loop ignores it; sparse-attention indexers
+    # locate it via get_enabled_fmha_lib_classes() filtered to
+    # subclasses of IndexerProxyFmha.
+    "msa_proxy_mqa": MsaProxyMqaFmha,
+    # Block-sparse main-attention FMHA. Consumes kv_block_indexes
+    # produced by an upstream proxy + top-k pass. Same opt-out pattern
+    # as the proxy: returns False from is_supported() and is invoked
+    # directly by sparse-attention backends via forward_block_sparse().
+    "msa_sparse_gqa": MsaSparseGqaFmha,
 }
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(FMHA_LIBS)
 

@@ -13,13 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .block_sparse import BlockSparseFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from .indexer_proxy import IndexerProxyFmha
 from .interface import Fmha
+from .msa_proxy_mqa import MsaProxyMqaFmha
+from .msa_sparse_gqa import MsaSparseGqaFmha
 from .phased import FmhaParams, PhasedFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
 
 __all__ = [
+    "BlockSparseFmha",
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FallbackFmha",
@@ -27,6 +32,9 @@ __all__ = [
     "Fmha",
     "FmhaCls",
     "FmhaParams",
+    "IndexerProxyFmha",
+    "MsaProxyMqaFmha",
+    "MsaSparseGqaFmha",
     "PhasedFmha",
     "get_enabled_fmha_lib_classes",
 ]

@@ -39,14 +39,29 @@ def get_sparse_attn_kv_cache_manager(
         )
 
 
+def _resolve_minimax_m3_backend_cls(
+        sparse_attention_config: "SparseAttentionConfig"):
+    """Pick the Triton or MSA-backed M3 backend class.
+
+    Honours ``sparse_use_msa`` on the user-facing
+    :class:`MiniMaxM3SparseAttentionConfig`. Falls back to the Triton
+    reference path when the flag is unset, preserving the legacy
+    behaviour for callers that have not opted in.
+    """
+    from .minimax_m3 import (get_minimax_m3_attention_backend_cls,
+                             get_minimax_m3_msa_attention_backend_cls)
+    if getattr(sparse_attention_config, "sparse_use_msa", False):
+        return get_minimax_m3_msa_attention_backend_cls()
+    return get_minimax_m3_attention_backend_cls()
+
+
 def get_vanilla_sparse_attn_attention_backend(
         sparse_attention_config: "SparseAttentionConfig"):
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
     from .rocket import RocketVanillaAttention
     if sparse_attention_config.algorithm == "rocket":
         return RocketVanillaAttention
     elif sparse_attention_config.algorithm == "minimax_m3":
-        return get_minimax_m3_attention_backend_cls()
+        return _resolve_minimax_m3_backend_cls(sparse_attention_config)
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in vanilla attention backend: {sparse_attention_config.algorithm}"
@@ -59,7 +74,6 @@ def get_trtllm_sparse_attn_attention_backend(
 
     from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
     from .rocket import RocketTrtllmAttention
     if sparse_attention_config.algorithm == "rocket":
         return RocketTrtllmAttention
@@ -75,7 +89,7 @@ def get_trtllm_sparse_attn_attention_backend(
         # `create_attention(...)` dispatch in `Attention.__init__`
         # returns an instantiable AttentionBackend under the trtllm
         # attention backend slot.
-        return get_minimax_m3_attention_backend_cls()
+        return _resolve_minimax_m3_backend_cls(sparse_attention_config)
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_attention_config.algorithm}"
@@ -84,9 +98,8 @@ def get_trtllm_sparse_attn_attention_backend(
 
 def get_flashinfer_sparse_attn_attention_backend(
         sparse_attention_config: "SparseAttentionConfig"):
-    from .minimax_m3 import get_minimax_m3_attention_backend_cls
     if sparse_attention_config.algorithm == "minimax_m3":
-        return get_minimax_m3_attention_backend_cls()
+        return _resolve_minimax_m3_backend_cls(sparse_attention_config)
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_attention_config.algorithm}"
     )
