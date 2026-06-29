@@ -64,6 +64,7 @@ union alignas(16) Bf16x8
     uint4 bits;
     __nv_bfloat162 elts[4];
 };
+
 static_assert(sizeof(Bf16x8) == 16);
 
 // trtllm's PadUpFn is a function-like macro (quantization.h); use a plain
@@ -153,9 +154,9 @@ __device__ __forceinline__ uint64_t quantizeSmoothed16(
 }
 
 template <int NumCols, int RowsPerCta>
-__global__ void __launch_bounds__(512, 4) smooth_quantize_fast_kernel(int numRows, Type const* __restrict__ in,
-    Type const* __restrict__ pqs, float const* __restrict__ SFScale, uint64_t* __restrict__ out,
-    uint8_t* __restrict__ SFout)
+__global__ void __launch_bounds__(512, 4)
+    smooth_quantize_fast_kernel(int numRows, Type const* __restrict__ in, Type const* __restrict__ pqs,
+        float const* __restrict__ SFScale, uint64_t* __restrict__ out, uint8_t* __restrict__ SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     static_assert(NumCols % (4 * SF_VEC_SIZE) == 0);
@@ -190,8 +191,7 @@ __global__ void __launch_bounds__(512, 4) smooth_quantize_fast_kernel(int numRow
             loadBf16x8(pqsPtr, pqsLo);
             loadBf16x8(pqsPtr + 8, pqsHi);
 
-            int64_t const sfOffset
-                = get_sf_out_offset_128x4(std::nullopt, row, sfCol, std::nullopt, NumSfCols);
+            int64_t const sfOffset = get_sf_out_offset_128x4(std::nullopt, row, sfCol, std::nullopt, NumSfCols);
             out[vecOffset] = quantizeSmoothed16(xLo, xHi, pqsLo, pqsHi, SFScaleVal, SFout + sfOffset);
         }
     }
@@ -311,15 +311,14 @@ void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void const* 
             : defaultThreads;
         int const requestedBlocksPerSm = getSmoothQuantBlocksPerSm();
         int const defaultBlocksPerSm = 8;
-        int const blocksPerSm
-            = requestedBlocksPerSm > 0 ? std::min(requestedBlocksPerSm, 32) : defaultBlocksPerSm;
+        int const blocksPerSm = requestedBlocksPerSm > 0 ? std::min(requestedBlocksPerSm, 32) : defaultBlocksPerSm;
 
         if (n == 3072)
-            launchSmoothQuantizeFast<3072, 2>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount, blockThreads,
-                blocksPerSm, enablePDL, stream);
+            launchSmoothQuantizeFast<3072, 2>(
+                out, sf_out, in, pqs, sf_scale, m, multiProcessorCount, blockThreads, blocksPerSm, enablePDL, stream);
         else
-            launchSmoothQuantizeFast<12288, 1>(out, sf_out, in, pqs, sf_scale, m, multiProcessorCount, blockThreads,
-                blocksPerSm, enablePDL, stream);
+            launchSmoothQuantizeFast<12288, 1>(
+                out, sf_out, in, pqs, sf_scale, m, multiProcessorCount, blockThreads, blocksPerSm, enablePDL, stream);
         return;
     }
 

@@ -31,15 +31,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (
-    AutoTuner,
-    ConstraintSpec,
-    DistributedTuningStrategy,
-    DynamicTensorSpec,
-    OptimizationProfile,
-    TunableRunner,
-    TuningConfig,
-)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -50,16 +44,14 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (
-    ActivationType,
-    deep_gemm_gen_tuning_buckets,
-    fp4_scale_infer_shape,
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
-)
+from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
+                     fp4_scale_infer_shape,
+                     get_last_power_of_2_num_tokens_buckets,
+                     last_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVFP4BlackwellRunner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4BlackwellRunner
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -652,8 +644,7 @@ class NVFP4SVDQuantGemmRunner(TunableRunner):
         self.output_dtype = output_dtype
         if output_dtype not in NVFP4SVDQuantGemmRunner.runner_dict:
             NVFP4SVDQuantGemmRunner.runner_dict[
-                output_dtype
-            ] = torch.classes.trtllm.NVFP4SVDQuantGemmRunner()
+                output_dtype] = torch.classes.trtllm.NVFP4SVDQuantGemmRunner()
         self.cpp_runner = NVFP4SVDQuantGemmRunner.runner_dict[output_dtype]
 
     def unique_id(self):
@@ -715,9 +706,10 @@ def nvfp4_svdquant_gemm_tuned(
         bias=bias,
         down_offset=down_offset,
     )
-    return runner(
-        inputs, tactic=best_tactic, bias=bias, down_offset=down_offset
-    )
+    return runner(inputs,
+                  tactic=best_tactic,
+                  bias=bias,
+                  down_offset=down_offset)
 
 
 @nvfp4_svdquant_gemm_tuned.register_fake
@@ -734,9 +726,8 @@ def _(
     down_offset: int = 0,
 ) -> torch.Tensor:
     del act_sf, weight_sf, alpha, down, lora_up, bias, down_offset
-    return act_fp4.new_empty(
-        (act_fp4.shape[0], weight.shape[0]), dtype=output_dtype
-    )
+    return act_fp4.new_empty((act_fp4.shape[0], weight.shape[0]),
+                             dtype=output_dtype)
 
 
 class CublasLtFP4GemmRunner(TunableRunner):
@@ -2660,9 +2651,8 @@ class QuantizeE4M3PerTensorRunner(TunableRunner):
         if cls._te_available is None:
             try:
                 import transformer_engine_torch as tex
-                from transformer_engine.pytorch.tensor.float8_tensor import (
-                    Float8CurrentScalingQuantizer,
-                )
+                from transformer_engine.pytorch.tensor.float8_tensor import \
+                    Float8CurrentScalingQuantizer
                 cls._te_available = True
                 # Initialize quantizer once
                 cls._te_quantizer = Float8CurrentScalingQuantizer(

@@ -115,6 +115,7 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
     static constexpr int LoRaK = 32; // SVDQuant rank r=32 = 2 bf16 16-wide K-atoms
     using LoRaMmaTileShape
         = decltype(make_shape(cute::size<0>(TileShape{}), cute::size<1>(TileShape{}), cute::Int<LoRaK>{}));
+
     static constexpr auto make_lora_mma()
     {
         static_assert(cute::size(AtomThrShapeMNK{}) == 1 || cute::size(AtomThrShapeMNK{}) == 2,
@@ -132,6 +133,7 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
                 cute::UMMA::Major::K>();
         }
     }
+
     using LoRaMma = decltype(make_lora_mma());
     static_assert(cute::size(typename LoRaMma::ThrLayoutVMNK{}) >= 1, "LoRaMma constructed");
     static_assert(cute::size(typename LoRaMma::AtomThrID{}) == cute::size(typename TiledMma::AtomThrID{}),
@@ -634,12 +636,12 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
             SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, cluster_layout_vmnk);
         typename Params::TMA_L1 tma_load_l1 = make_tma_atom_B_sm100<cutlass::bfloat16_t>(GmemTiledCopyB{}, tensor_l1,
             SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, cluster_layout_vmnk);
-        typename Params::TMA_D tma_load_d_fallback = make_tma_atom_A_sm100<cutlass::bfloat16_t>(GmemTiledCopyA{},
-            tensor_d, SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{},
-            cluster_layout_vmnk_fallback);
-        typename Params::TMA_L1 tma_load_l1_fallback = make_tma_atom_B_sm100<cutlass::bfloat16_t>(GmemTiledCopyB{},
-            tensor_l1, SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{},
-            cluster_layout_vmnk_fallback);
+        typename Params::TMA_D tma_load_d_fallback
+            = make_tma_atom_A_sm100<cutlass::bfloat16_t>(GmemTiledCopyA{}, tensor_d,
+                SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, cluster_layout_vmnk_fallback);
+        typename Params::TMA_L1 tma_load_l1_fallback
+            = make_tma_atom_B_sm100<cutlass::bfloat16_t>(GmemTiledCopyB{}, tensor_l1,
+                SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, cluster_layout_vmnk_fallback);
 
         return {tma_load_a, tma_load_b, tma_load_sfa, tma_load_sfb, tma_load_a_fallback, tma_load_b_fallback,
             tma_load_sfa_fallback, tma_load_sfb_fallback, tma_load_d, tma_load_l1, tma_load_d_fallback,
