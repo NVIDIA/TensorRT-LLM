@@ -164,68 +164,16 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
-def scpFromSlurmFrontendCmd(List<Map> remotes, String remotePath, String localPath) {
-    if (!remotes) {
-        throw new IllegalArgumentException("No SLURM frontend remotes configured")
-    }
-    if (remotes.size() == 1) {
-        return scpFromRemoteCmd(remotes[0], remotePath, localPath)
-    }
-
-    // Decide failover by error message, not exit code: scp/sshpass report
-    // connection failures inconsistently (1, 255, ...), so only the message
-    // reliably distinguishes a dead frontend from a real error. Non-connection
-    // failures fall to the default case and exit with the original rc.
-    def retryableConnectionCheck = '''
-        __slurm_frontend_message=$(printf '%s' "$__slurm_frontend_output" | tr '[:upper:]' '[:lower:]')
-        case "$__slurm_frontend_message" in
-            *"no route to host"*|\
-            *"connection timed out"*|\
-            *"connection timeout"*|\
-            *"operation timed out"*|\
-            *"connection refused"*|\
-            *"network is unreachable"*|\
-            *"could not resolve hostname"*|\
-            *"could not resolve host"*|\
-            *"name or service not known"*|\
-            *"temporary failure in name resolution"*|\
-            *"connection reset by peer"*|\
-            *"broken pipe"*|\
-            *"kex_exchange_identification"*|\
-            *"connection closed"*|\
-            *"closed by remote host"*)
-                ;;
-            *)
-                exit $__slurm_frontend_rc
-                ;;
-        esac
-    '''.stripIndent().trim()
-
-    def attempts = remotes.collect { remote -> """
-        echo '[SLURM-FRONTEND] trying ${remote.host}' >&2
-        __slurm_frontend_output=\$({ ${scpFromRemoteCmd(remote, remotePath, localPath)}; } 2>&1)
-        __slurm_frontend_rc=\$?
-        printf '%s\\n' "\$__slurm_frontend_output" >&2
-        if [ \$__slurm_frontend_rc -eq 0 ]; then
-            exit 0
-        fi
-        ${retryableConnectionCheck}
-    """.stripIndent().trim() }
-
-    return """
-        (
-            __slurm_frontend_rc=255
-            ${attempts.join("\n")}
-            exit \$__slurm_frontend_rc
-        )
-    """.stripIndent().replaceAll(/\s+$/, "")
-}
-
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
 def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
     CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
+        // Pin one reachable frontend for the whole collect: every download targets
+        // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
+        // so the find + scps must all hit the login node that holds those files.
+        // No whole-closure failover here -- uploadArtifacts/junit must not re-run.
+        def remote = CloudManager.selectReachableSlurmRemote(pipeline, remotes)
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
@@ -234,7 +182,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             sh "mkdir -p ${stageName}"
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
-            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromSlurmFrontendCmd(remotes, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
@@ -246,14 +194,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             }
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
-            downloadResultSucceed = Utils.exec(pipeline, script: scpFromSlurmFrontendCmd(remotes, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+            downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
 
             // Download perf test results
             def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
             def folderListOutput = Utils.exec(
                 pipeline,
-                script: CloudManager.sshUserCmdWithSlurmFrontendFailover(
-                    remotes,
+                script: Utils.sshUserCmd(
+                    remote,
                     "\"find '${perfResultsBasePath}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -printf '%f\\n' || true\""
                 ),
                 returnStdout: true,
@@ -265,7 +213,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 def scpSources = perfFolders.size() == 1
                     ? "${perfResultsBasePath}/${perfFolders[0]}"
                     : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
-                downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromSlurmFrontendCmd(remotes, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+                downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
@@ -1607,35 +1555,27 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
 
             stage("[${stageName}] Run Pytest") {
-                // Submit the Slurm job
-                CloudManager.withSlurmSshCredentialRemotes(pipeline, partition.clusterName, cluster) { remotes ->
-                    Utils.exec(
-                        pipeline,
-                        timeout: false,
-                        script: CloudManager.sshUserCmdWithSlurmFrontendFailover(
-                            remotes,
-                            scriptSubmitPathNode
-                        ),
-                        numRetries: 3
-                    )
-                }
+                // Submit the Slurm job. Submit/metadata/track all run on the one
+                // frontend the enclosing withSlurmFrontendFailover pinned, so they
+                // share the job workspace (slurm_job_id.txt, scripts) on that login
+                // node; a frontend disconnect fails the whole closure over to a fresh
+                // frontend as a unit (the submit script reuses an active job).
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(remote, scriptSubmitPathNode),
+                    numRetries: 3
+                )
 
-                def slurmMetadata = CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { metadataRemote ->
-                    captureSlurmWorkspaceMetadata(pipeline, metadataRemote, jobWorkspace, placementContext, stageName)
-                }
+                def slurmMetadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
                 def slurmJobId = slurmMetadata.slurmJobId
                 if (!slurmJobId) {
-                    slurmJobId = CloudManager.withSlurmSshCredentialRemotes(pipeline, partition.clusterName, cluster) { remotes ->
-                        Utils.exec(
-                            pipeline,
-                            script: CloudManager.sshUserCmdWithSlurmFrontendFailover(
-                                remotes,
-                                "\"cat ${jobWorkspace}/slurm_job_id.txt\""
-                            ),
-                            returnStdout: true,
-                            numRetries: 3
-                        ).trim()
-                    }
+                    slurmJobId = Utils.exec(
+                        pipeline,
+                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt\""),
+                        returnStdout: true,
+                        numRetries: 3
+                    ).trim()
                     recordSlurmPlacementContext(placementContext, slurmJobId, null, stageName)
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
@@ -1723,42 +1663,37 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job
-                CloudManager.withSlurmSshCredentialRemotes(pipeline, partition.clusterName, cluster) { remotes ->
-                    try {
-                        Utils.exec(
-                            pipeline,
-                            timeout: false,
-                            script: CloudManager.sshUserCmdWithSlurmFrontendFailover(
-                                remotes,
-                                scriptTrackPathNode
-                            ),
-                            numRetries: 3
-                        )
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        // The track script squashes the job's terminal SLURM state to
-                        // exit 0/1, so a walltime kill is indistinguishable here from a
-                        // real test failure. Re-query sacct for the allocation-level
-                        // state (SLURM already aggregates it across nodes; TIMEOUT if
-                        // any node hit the walltime) and, when it is TIMEOUT, raise a
-                        // typed UserFailure so neither the SLURM retry loop nor the
-                        // outer K8s pod retry re-runs a job that would just time out
-                        // again. srun --kill-on-bad-exit=1 means a genuine test failure
-                        // surfaces as FAILED, not TIMEOUT, so this stays unambiguous.
-                        def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
-                        if (slurmState == "TIMEOUT") {
-                            throw new UserFailure(
-                                "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
-                                "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
-                                "Original failure: ${e.message}",
-                                e)
-                        }
-                        echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
-                             "deferring to failure classifier."
-                        throw e
+                // Track the Slurm job on the same pinned frontend.
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptTrackPathNode),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    // The track script squashes the job's terminal SLURM state to
+                    // exit 0/1, so a walltime kill is indistinguishable here from a
+                    // real test failure. Re-query sacct for the allocation-level
+                    // state (SLURM already aggregates it across nodes; TIMEOUT if
+                    // any node hit the walltime) and, when it is TIMEOUT, raise a
+                    // typed UserFailure so neither the SLURM retry loop nor the
+                    // outer K8s pod retry re-runs a job that would just time out
+                    // again. srun --kill-on-bad-exit=1 means a genuine test failure
+                    // surfaces as FAILED, not TIMEOUT, so this stays unambiguous.
+                    def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                    if (slurmState == "TIMEOUT") {
+                        throw new UserFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
+                            "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
+                            "Original failure: ${e.message}",
+                            e)
                     }
+                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
+                         "deferring to failure classifier."
+                    throw e
                 }
             }
             echo "Finished test stage execution."
