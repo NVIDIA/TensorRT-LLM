@@ -5758,6 +5758,51 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+@skip_pre_blackwell
+class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.6-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.6-35B-A3B-NVFP4"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
+    def test_nvfp4(self, moe_backend, mocker):
+        # Qwen3.6-35B-A3B NVFP4 MoE checkpoint. The TRTLLM-Gen / CuteDSL NVFP4
+        # MoE backends only support the SM100 family (B200/B300); RTX 6000
+        # (SM120) uses a different MoE path, so restrict this test to SM100/103.
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
+
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=128)
+        moe_config = MoeConfig(backend=moe_backend)
+
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=128,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(183000)
 @pytest.mark.timeout(14400)

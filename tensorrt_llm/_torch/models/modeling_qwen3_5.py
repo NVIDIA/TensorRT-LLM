@@ -1,4 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import re
+
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.quantization import QuantAlgo
 
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_utils import register_auto_model
@@ -94,7 +112,84 @@ def _normalize_qwen35_exclude_modules(model_config):
     # but conv1d is not a proper linear module and should be excluded from quant
     normalized.add("*linear_attn.conv1d")
 
+    # TRT-LLM's LMHead always allocates an unquantized (bf16) weight, so a
+    # quantized lm_head (e.g. NVFP4 in some ModelOpt MIXED_PRECISION exports)
+    # must be excluded from quant; the weight mapper dequantizes it to bf16.
+    normalized.add("lm_head")
+
     qc.exclude_modules = sorted(normalized)
+
+
+def _normalize_qwen35_quant_config_dict(model_config):
+    """Normalize MIXED_PRECISION per-layer quant config keys from HF naming.
+
+    ModelOpt MIXED_PRECISION checkpoints key ``quant_config_dict`` by HF names
+    (``model.language_model.layers.N...``, ``mtp.layers.N...``), but
+    ``apply_layerwise_quant_config`` matches them against TRT-LLM module names
+    (``model.layers.N...``).  Without this translation the per-layer entries
+    never match, so quantized modules (MoE experts, shared_expert, attention,
+    linear_attn.out_proj) silently fall back to the MIXED_PRECISION global
+    config -> unquantized, and their quantized checkpoint weights fail to load.
+
+    On SM100/SM103, W4A16_NVFP4 routed experts AND dense MLP projections
+    (gate_proj/up_proj/down_proj) are promoted to NVFP4 so the CuteDSL/TRTLLM
+    GEMM path can consume the checkpoint's packed FP4 weights and static input
+    scales. Dense MLP keys are additionally re-pathed to the doubled
+    ``.mlp.mlp.`` form to match the ``_DenseMlpAdapter`` runtime module tree.
+    Other W4A16_NVFP4 modules retain their original algorithm.
+
+    Mutates ``quant_config_dict`` in place (model_config is frozen). Split
+    linear-attn in_proj entries are intentionally left untranslated: TRT-LLM
+    fuses them into in_proj_qkvz, which is dequantized to bf16 by the weight
+    mapper, so it must stay unquantized (no matching key).
+    """
+    qcd = getattr(model_config, "quant_config_dict", None)
+    if not qcd:
+        return
+
+    n_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
+    convert_to_nvfp4 = get_sm_version() in (100, 103)
+
+    normalized = {}
+    for name, cfg in qcd.items():
+        if name.startswith(_LANG_PREFIX):
+            name = "model." + name[len(_LANG_PREFIX) :]
+        if name.startswith("model.visual"):
+            continue
+        if name.startswith("mtp."):
+            if n_hidden_layers is None:
+                continue
+            translated = _translate_mtp_pattern(name, n_hidden_layers)
+            if translated is None:
+                continue
+            name = translated
+        if (
+            convert_to_nvfp4
+            and name.endswith(".mlp.experts")
+            and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        ):
+            cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+        else:
+            # Dense MLP (gate_proj/up_proj/down_proj directly under ``.mlp``) is
+            # wrapped by ``_DenseMlpAdapter``, so the runtime module path has a
+            # doubled ``.mlp.mlp.`` segment
+            # (layer.mlp[adapter].mlp[GatedMLP].{gate_up_proj,down_proj}).
+            # Translate the per-layer key to that path so
+            # ``apply_layerwise_quant_config`` matches it; otherwise the dense
+            # MLP silently falls back to the global MIXED_PRECISION config and
+            # its quantized checkpoint weights fail to load. On SM100/SM103 also
+            # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
+            # consume the checkpoint's packed FP4 weights and static input scales.
+            dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
+            if dense_mlp_match and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
+                if convert_to_nvfp4:
+                    cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                proj = dense_mlp_match.group(1)
+                name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
+        normalized[name] = cfg
+
+    qcd.clear()
+    qcd.update(normalized)
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")
@@ -121,6 +216,7 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
 
     def __init__(self, model_config):
         _normalize_qwen35_exclude_modules(model_config)
+        _normalize_qwen35_quant_config_dict(model_config)
         super().__init__(model_config)
 
 
@@ -136,4 +232,5 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
 
     def __init__(self, model_config):
         _normalize_qwen35_exclude_modules(model_config)
+        _normalize_qwen35_quant_config_dict(model_config)
         super().__init__(model_config)
