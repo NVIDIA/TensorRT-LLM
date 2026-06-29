@@ -382,12 +382,14 @@ def _select_cv2_stream_buffered_backend() -> Optional[int]:
     return None
 
 
-# TRT-LLM is Linux-only, so /dev/shm (tmpfs, RAM-backed) is normally available
-# and avoids the disk round-trip the system tempdir would incur. Resolved once
-# at import time. Falls back to `None` (system default tempdir, typically
-# /tmp) if /dev/shm is missing or not writable in this environment.
-_VIDEO_TEMPFILE_DIR: Optional[str] = (
-    "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+# Prefer /dev/shm (tmpfs, RAM-backed) over the system tempdir to avoid a disk
+# round-trip; falls back to `None` (system default) when unavailable. Only
+# consumed as the `dir=` argument to `tempfile.NamedTemporaryFile`, so the
+# B108 predictable-path concern does not apply.
+_VIDEO_TEMPFILE_DIR: Optional[str] = (  # nosec B108
+    "/dev/shm"  # nosec B108
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)  # nosec B108
+    else None
 )
 
 
