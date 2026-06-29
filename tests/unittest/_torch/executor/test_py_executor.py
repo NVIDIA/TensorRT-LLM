@@ -140,6 +140,41 @@ def test_handle_special_queue_items(mock_executor):
     assert 2 in mock_executor.canceled_req_ids
 
 
+def test_reset_prefix_cache_resets_when_idle():
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.waiting_queue = []
+    executor.kv_cache_manager = Mock()
+
+    executor.reset_prefix_cache()
+
+    executor.kv_cache_manager.reset_reuse_state.assert_called_once_with()
+
+
+def test_reset_prefix_cache_rejects_active_requests():
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [Mock()]
+    executor.waiting_queue = []
+    executor.kv_cache_manager = Mock()
+
+    with pytest.raises(RuntimeError, match="no active or queued requests"):
+        executor.reset_prefix_cache()
+
+    executor.kv_cache_manager.reset_reuse_state.assert_not_called()
+
+
+def test_reset_prefix_cache_rejects_queued_requests():
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.waiting_queue = [Mock()]
+    executor.kv_cache_manager = Mock()
+
+    with pytest.raises(RuntimeError, match="no active or queued requests"):
+        executor.reset_prefix_cache()
+
+    executor.kv_cache_manager.reset_reuse_state.assert_not_called()
+
+
 def test_clear_canceled_req_ids(mock_executor):
     """Test clearing canceled request IDs."""
     mock_executor.canceled_req_ids = [1, 2, 3]

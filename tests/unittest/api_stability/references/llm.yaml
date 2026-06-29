@@ -401,6 +401,10 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  reset_prefix_cache:
+    parameters: {}
+    return_annotation: None
+    status: beta
   get_stats:
     parameters:
       timeout:
