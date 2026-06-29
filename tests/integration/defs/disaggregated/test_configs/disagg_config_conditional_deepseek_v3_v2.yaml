@@ -7,10 +7,15 @@ conditional_disagg_config:
   max_local_prefill_length: 100
 disable_overlap_scheduler: true
 enable_autotuner: false
+# Enable per-request perf metrics so the disagg /perf_metrics endpoint (used by
+# the test's _check_bypass_signal) records routed requests; bypassed ones absent.
+perf_metrics_max_requests: 1000
 context_servers:
   num_instances: 1
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
+  return_perf_metrics: true
+  perf_metrics_max_requests: 1000
   kv_cache_config:
     enable_block_reuse: true
     enable_partial_reuse: true
@@ -26,6 +31,8 @@ generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
+  return_perf_metrics: true
+  perf_metrics_max_requests: 1000
   router:
     type: kv_cache_aware
     # disagg-gen path doesn't emit kv_cache_events; track router-side state from

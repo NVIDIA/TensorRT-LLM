@@ -1740,29 +1740,39 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
-    # Bypassed requests clear disaggregated_params and skip add_per_request_metrics,
-    # so /perf_metrics records strictly fewer entries than requests issued.
-    last_total = [0]
-
-    def _check_bypass_signal(server_url: str):
+    # Conditional disagg handles short-prefill requests locally on the gen
+    # server (bypassing the ctx handoff + add_per_request_metrics), while routed
+    # requests are recorded in the disagg /perf_metrics. Verify ONCE after all
+    # client iterations via post_client_test (not per-iteration): routed-request
+    # metrics are recorded asynchronously (add_per_request_metrics via
+    # create_task on response completion) and surface only after the client
+    # traffic settles, so a per-iteration read races that lag; /perf_metrics is
+    # also consume-on-read, so query it exactly once at the end.
+    def _check_routed_recorded(server_url: str):
         import requests as http_requests
-        resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
-        assert resp.status_code == 200, \
-            f"perf_metrics fetch failed: {resp.status_code}"
-        metrics = resp.json()
-        logger.info(
-            f"conditional_v2 perf_metrics len={len(metrics)} "
-            f"(bypassed requests absent — grows sub-linearly if bypass works)")
-        # At least one iteration's worth of requests should have been routed —
-        # i.e. perf_metrics is non-empty after the first client run.
-        assert metrics or last_total[0] > 0, \
-            "no per-request metrics recorded; bypass logic may be misconfigured"
-        last_total[0] = len(metrics)
+        metrics = []
+        deadline = time.time() + 60
+        while True:
+            resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
+            assert resp.status_code == 200, \
+                f"perf_metrics fetch failed: {resp.status_code}"
+            metrics = resp.json()
+            if metrics or time.time() >= deadline:
+                break
+            time.sleep(2)
+        logger.info(f"conditional_v2 perf_metrics len={len(metrics)} "
+                    f"(routed requests recorded; bypassed ones absent)")
+        # With short prompts every prompt's first occurrence routes through the
+        # context server (match=0 -> need_ctx), so at least one routed request
+        # must be recorded; an empty result means conditional routing never
+        # engaged.
+        assert metrics, \
+            "no per-request metrics recorded after client runs; conditional routing may be misconfigured"
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional_v2",
                            env=llm_venv._new_env,
-                           extra_endpoints_test=_check_bypass_signal,
+                           post_client_test=_check_routed_recorded,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 
