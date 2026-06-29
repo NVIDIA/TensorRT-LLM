@@ -220,7 +220,7 @@ class OpenAIServer(_VideoRoutesMixin):
             max_workers=media_load_workers,
             thread_name_prefix="trtllm_media_load",
         )
-        BaseMediaIO.configure_executor(self._media_load_executor)
+        BaseMediaIO.set_executor(self._media_load_executor)
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():

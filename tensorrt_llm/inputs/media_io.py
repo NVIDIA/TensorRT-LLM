@@ -498,8 +498,8 @@ def _load_video_by_cv2(
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
         elif format == "hwc_uint8":
-            # Return uint8 HWC frames as-is; the downstream HF processor
-            # handles rescale and permute via its `do_rescale=True` path.
+            # Return uint8 HWC frames as-is; let the downstream HF processor
+            # handle this internally.
             loaded_frames = [raw_frames[i] for i in valid_indices]
         else:  # "pil"
             loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
@@ -509,7 +509,6 @@ def _load_video_by_cv2(
             "fps": original_fps,
             "duration": duration,
             "frames_indices": valid_indices,
-            "io_loaded_all_frames": len(valid_indices) == frame_count,
         }
     finally:
         # Release the OpenCV handle before any downstream re-open (e.g. PyAV
@@ -560,12 +559,12 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 
     # Executor used by `async_load` to run blocking decode work off the
     # event loop. `None` selects the asyncio loop's default executor.
-    # Servers can publish a dedicated pool via `configure_executor` so
+    # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
 
     @classmethod
-    def configure_executor(cls, executor: Executor) -> None:
+    def set_executor(cls, executor: Executor) -> None:
         """Publish a shared executor for blocking decode work.
 
         Affects every existing and future subclass instance. Calling more
@@ -622,7 +621,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 
         Dispatches on scheme: http/https (remote fetch), data: (inline
         base64), or file:// / bare path (local file). Blocking decode work
-        runs on the executor published via `configure_executor`, falling
+        runs on the executor published via `set_executor`, falling
         back to the asyncio loop's default executor when none is set.
         """
         parsed = urlparse(url)
@@ -643,8 +642,8 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
-    @classmethod
-    async def _run_in_executor(cls, fn, *args, **kwargs):
+    @staticmethod
+    async def _run_in_executor(fn, *args, **kwargs):
         """Run a blocking decode callable on the configured executor."""
         if kwargs:
             fn = functools.partial(fn, **kwargs)

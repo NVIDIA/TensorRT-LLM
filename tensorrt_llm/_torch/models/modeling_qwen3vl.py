@@ -204,9 +204,11 @@ def _decide_do_sample_frames(
             duration = (vd.metadata or {}).get("duration") or 0
             n_target = math.floor(duration * user_fps)
         else:
-            # If IO loaded every source frame, defer to HF's class-default
-            # sampling; otherwise leave the IO-decoded frames alone.
-            if (vd.metadata or {}).get("io_loaded_all_frames", False):
+            # If IO loaded every source frame (decoded count equals the source
+            # frame count), defer to HF's class-default sampling; otherwise
+            # leave the IO-decoded frames alone.
+            total = (vd.metadata or {}).get("total_num_frames")
+            if total is not None and n_decoded == total:
                 return True
             n_target = n_decoded
         if n_target != n_decoded:
@@ -334,8 +336,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             for vd in video_datas:
                 m = dict(vd.metadata or {})
                 m["total_num_frames"] = len(vd.frames)
-                # Internal stash; not a field on HF's VideoMetadata dataclass.
-                m.pop("io_loaded_all_frames", None)
                 video_metadata.append(m)
 
         return self.processor(

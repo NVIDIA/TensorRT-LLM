@@ -83,15 +83,17 @@ class TestDecideDoSampleFrames:
         assert _decide_do_sample_frames([vd_diff], {"fps": 4.0}) is True
 
     def test_silent_caller_io_loaded_all_triggers_fallback_sampling(self):
-        # No num_frames/fps from caller, IO loaded every source frame:
-        # defer to HF's class-default sampling.
-        vd = _fake_video({"io_loaded_all_frames": True}, n_frames=240)
+        # No num_frames/fps from caller, IO loaded every source frame
+        # (decoded count == total_num_frames): defer to HF's class-default
+        # sampling.
+        vd = _fake_video({"total_num_frames": 240}, n_frames=240)
         assert _decide_do_sample_frames([vd], {}) is True
 
     def test_silent_caller_io_subsampled_no_sampling(self):
-        # No num_frames/fps from caller, IO already subsampled:
-        # leave the IO-decoded frames alone.
-        vd = _fake_video({"io_loaded_all_frames": False}, n_frames=8)
+        # No num_frames/fps from caller, IO already subsampled
+        # (decoded count < total_num_frames): leave the IO-decoded frames
+        # alone.
+        vd = _fake_video({"total_num_frames": 240}, n_frames=8)
         assert _decide_do_sample_frames([vd], {}) is False
 
     def test_batch_reduction_is_any_video_needs_sampling(self):
@@ -113,14 +115,6 @@ class TestPreprocessMetadataForwarding:
         m = processor.call_args.kwargs["video_metadata"][0]
         assert m["total_num_frames"] == 8
         assert m["fps"] == 24.0  # other fields unchanged
-
-    def test_io_loaded_all_frames_internal_stash_stripped(self):
-        # `io_loaded_all_frames` is consumed by `_decide_do_sample_frames` and
-        # must not leak into HF's VideoMetadata dataclass (which rejects it).
-        vd = _fake_video({"io_loaded_all_frames": True, "duration": 1.0}, n_frames=8)
-        processor = _call_preprocess({"video": [vd]}, {"num_frames": 8})
-        m = processor.call_args.kwargs["video_metadata"][0]
-        assert "io_loaded_all_frames" not in m
 
     def test_metadata_is_none_when_no_videos(self):
         processor = _call_preprocess({}, {"fps": 2.0})
