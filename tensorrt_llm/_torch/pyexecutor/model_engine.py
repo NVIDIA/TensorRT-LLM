@@ -1269,65 +1269,6 @@ class PyTorchModelEngine(ModelEngine):
         clear_memory_buffers()
         torch.cuda.empty_cache()
 
-    def _need_spec_dec_gen_autotuner_warmup(
-            self, resource_manager: ResourceManager) -> bool:
-        """Whether dynamic-tree spec-dec generation needs explicit autotuning."""
-        if not getattr(self.llm_args, "enable_autotuner", True):
-            return False
-        if not self.cuda_graph_runner.enabled:
-            return False
-        if self.spec_config is None or self.is_draft_model:
-            return False
-        if not self.spec_config.spec_dec_mode.use_one_engine():
-            return False
-        if not getattr(self.spec_config, "use_dynamic_tree", False):
-            return False
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.kv_cache_manager_key)
-        return isinstance(kv_cache_manager, MambaHybridCacheManager)
-
-    def _run_spec_dec_gen_autotuner_warmup(
-            self, resource_manager: ResourceManager) -> None:
-        """Profile the CUDA-graph generation MoE shape before capture."""
-        if not self._need_spec_dec_gen_autotuner_warmup(resource_manager):
-            return
-
-        draft_len = self.max_total_draft_tokens
-        effective_max_seq_len = self.max_seq_len
-        if self.mapping is not None and self.mapping.has_cp_helix():
-            effective_max_seq_len = self.max_seq_len // self.mapping.cp_size
-        effective_max_seq_len = min(effective_max_seq_len, self.max_num_tokens)
-
-        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
-        logger.info("Running spec-dec generation autotuner warmup...")
-        with self.no_cuda_graph(), autotune(cache_path=cache_path):
-            for bs in sorted(self._cuda_graph_batch_sizes, reverse=True):
-                if bs > self.batch_size:
-                    continue
-                warmup_request = self._create_cuda_graph_warmup_request(
-                    resource_manager, bs, draft_len, effective_max_seq_len)
-                with self._release_batch_context(warmup_request,
-                                                 resource_manager) as batch:
-                    if batch is None:
-                        continue
-                    logger.info(
-                        f"Run pre-capture autotuner warmup at generation shape "
-                        f"(bs={bs}, draft_len={draft_len}, "
-                        f"max_seq_len={effective_max_seq_len})")
-                    self.enable_spec_decode = True
-                    self.runtime_draft_len = draft_len
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
-
-        self.enable_spec_decode = self.is_spec_decode
-        self.runtime_draft_len = self.max_draft_len
-        logger.info(
-            f"[Autotuner] Cache size after spec-dec generation warmup is {len(AutoTuner.get().profiling_cache)}"
-        )
-
     def _compute_dynamic_draft_len_mapping(self) -> Optional[Dict[int, int]]:
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.
 
