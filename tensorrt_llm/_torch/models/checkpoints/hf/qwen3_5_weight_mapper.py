@@ -39,8 +39,7 @@ _SCALAR_SCALE_SUFFIXES = frozenset({"weight_scale", "input_scale"})
 # Bit layout: sign(1) | exponent(2) | mantissa(1).
 # Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6.
 _E2M1_VALUES = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=torch.float32,
 )
 
@@ -105,7 +104,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             if key.startswith("model.visual."):
                 continue
             if key.startswith("model.language_model."):
-                key = "model." + key[len("model.language_model."):]
+                key = "model." + key[len("model.language_model.") :]
             normalized_weights[key] = tensor
         return normalized_weights
 
@@ -282,10 +281,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         vals[:, 1::2] = lut[high.long()]
 
         # block_scale_fp8: (N, K/16) — each scale covers 16 K elements
-        scale = (
-            block_scale_fp8.to(torch.float32)
-            * global_scale_fp32.to(torch.float32)
-        ).unsqueeze(-1)  # (N, K/16, 1)
+        scale = (block_scale_fp8.to(torch.float32) * global_scale_fp32.to(torch.float32)).unsqueeze(
+            -1
+        )  # (N, K/16, 1)
 
         vals = vals.view(N, K // _NVFP4_BLOCK_SIZE, _NVFP4_BLOCK_SIZE) * scale
         target_dtype = getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16)
@@ -314,8 +312,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         # Collect all weight keys for excluded modules with uint8 dtype.
         # Key format after normalization: "<module_path>.weight"
         candidates = [
-            k for k, v in weights.items()
-            if k.endswith(".weight") and v.dtype == torch.uint8
+            k for k, v in weights.items() if k.endswith(".weight") and v.dtype == torch.uint8
         ]
         for weight_key in candidates:
             prefix = weight_key[: -len(".weight")]
@@ -338,7 +335,6 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 updated.pop(scale_key, None)
 
         return updated
-
 
     def _dequantize_fp8_pertensor_excluded_split_weights(self, weights: dict) -> dict:
         """Dequantize FP8 per-tensor-scale split linear-attention projections.
@@ -379,17 +375,16 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         except AttributeError:
             pass
 
-        target_dtype = getattr(
-            self.config.pretrained_config, "torch_dtype", torch.bfloat16
-        ) or torch.bfloat16
+        target_dtype = (
+            getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16) or torch.bfloat16
+        )
 
         updated = dict(weights)
         # Walk all FP8 weight keys and find split linear-attention projections
         # (matching the pattern <prefix>.linear_attn.in_proj_{qkv|q|k|v|z}.weight)
         # that carry a scalar per-tensor weight_scale.
         candidates = [
-            k for k, v in weights.items()
-            if k.endswith(".weight") and v.dtype in _FP8_DTYPES
+            k for k, v in weights.items() if k.endswith(".weight") and v.dtype in _FP8_DTYPES
         ]
         for weight_key in candidates:
             # Match the full weight_key, e.g.
@@ -406,7 +401,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             # Only dequantize projections that will be packed into in_proj_qkvz
             # or in_proj_ba (both receive BF16 buffers under MIXED_PRECISION).
             # Check for a scalar per-tensor weight_scale on this split tensor.
-            scale_key = weight_key[:-len(".weight")] + ".weight_scale"
+            scale_key = weight_key[: -len(".weight")] + ".weight_scale"
             if scale_key not in weights:
                 continue
             scale = weights[scale_key]
@@ -414,13 +409,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 continue  # 2D-block scale — handled by _dequantize_linear_attn_fp8_qkvz
             # Dequantize: bf16 = fp8.to(float32) * weight_scale
             updated[weight_key] = (
-                weights[weight_key].to(torch.float32) * scale.to(torch.float32)
-            ).to(target_dtype).contiguous()
+                (weights[weight_key].to(torch.float32) * scale.to(torch.float32))
+                .to(target_dtype)
+                .contiguous()
+            )
             # Remove scale tensors — the packed BF16 module has no parameter
             # slots for them, and _pack_split_projections must not emit a
             # now-stale fused scalar scale under the in_proj_qkvz key.
             for scale_suffix in ("weight_scale", "input_scale"):
-                scale_k = weight_key[:-len(".weight")] + f".{scale_suffix}"
+                scale_k = weight_key[: -len(".weight")] + f".{scale_suffix}"
                 updated.pop(scale_k, None)
 
         return updated
@@ -456,14 +453,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             # uniformly to the entire projection.  Forward the scalar from the
             # qkv sub-tensor directly as the fused qkvz/ba key and skip the
             # regular split/pack path entirely.
-            if suffix in _SCALAR_SCALE_SUFFIXES and all(
-                    t.ndim == 0 for t in tensors.values()):
+            if suffix in _SCALAR_SCALE_SUFFIXES and all(t.ndim == 0 for t in tensors.values()):
                 qkvz_candidates = {"qkv", "q", "k", "v", "z"} & tensors.keys()
                 if qkvz_candidates:
                     # Use the scalar from "qkv" if present, else fall back to
                     # any available candidate (q/k/v all hold the same value).
-                    representative = tensors["qkv"] if "qkv" in tensors else next(
-                        v for k, v in tensors.items() if k in {"q", "k", "v"}
+                    representative = (
+                        tensors["qkv"]
+                        if "qkv" in tensors
+                        else next(v for k, v in tensors.items() if k in {"q", "k", "v"})
                     )
                     assert representative.ndim == 0, (
                         f"Expected scalar (ndim=0) for {prefix}.in_proj_qkv.{suffix}, "

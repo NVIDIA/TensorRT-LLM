@@ -438,7 +438,8 @@ class ModelConfig(Generic[TConfig]):
             _LM_PREFIX = "model.language_model."
             _MODEL_PREFIX = "model."
             mixed_quant_configs = {
-                (_MODEL_PREFIX + k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k): v
+                (_MODEL_PREFIX + k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k):
+                v
                 for k, v in mixed_quant_configs.items()
             }
             # LMHead bypasses Linear.create_weights (manual Parameter),

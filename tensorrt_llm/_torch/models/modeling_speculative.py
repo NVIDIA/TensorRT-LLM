@@ -1513,7 +1513,9 @@ class MTPDraftModel(nn.Module):
                                      layer_idx,
                                      aux_stream_dict,
                                      is_separate_draft_engine=False)
-        elif model_type in ["qwen3_next", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"]:
+        elif model_type in [
+                "qwen3_next", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"
+        ]:
             from .modeling_qwen3_next import Qwen3NextMTP
             mtp_layer = Qwen3NextMTP(model_config, layer_idx, aux_stream_dict)
         else:

@@ -36,13 +36,13 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.quantization import QuantAlgo
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from tensorrt_llm.quantization import QuantAlgo
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
@@ -154,15 +154,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # to the default CutlassFusedMoE which cannot load NVFP4 weights.
         moe_override_quant_config = None
         if (model_config.quant_config_dict is not None
-                and model_config.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-                and layer_idx is not None):
+                and model_config.quant_config.quant_algo
+                == QuantAlgo.MIXED_PRECISION and layer_idx is not None):
             candidate_keys = [
                 f"model.language_model.layers.{layer_idx}.mlp.experts",
                 f"model.layers.{layer_idx}.mlp.experts",
             ]
             for key in candidate_keys:
                 if key in model_config.quant_config_dict:
-                    moe_override_quant_config = model_config.quant_config_dict[key]
+                    moe_override_quant_config = model_config.quant_config_dict[
+                        key]
                     break
         self.experts = create_moe(
             num_experts=self.num_experts,

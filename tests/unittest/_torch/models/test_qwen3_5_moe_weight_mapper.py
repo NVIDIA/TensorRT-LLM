@@ -19,9 +19,7 @@ import types
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import (
-    Qwen3_5MoeHfWeightMapper,
-)
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -57,11 +55,11 @@ def test_fp8_pertensor_linear_attn_weights_are_dequantized_before_pack():
         "model.layers.0.linear_attn.in_proj_qkv.weight": qkv_fp8,
         "model.layers.0.linear_attn.in_proj_qkv.weight_scale": scale,
         "model.layers.0.linear_attn.in_proj_qkv.input_scale": torch.tensor(
-            1.0, dtype=torch.float32),
+            1.0, dtype=torch.float32
+        ),
         "model.layers.0.linear_attn.in_proj_z.weight": z_fp8,
         "model.layers.0.linear_attn.in_proj_z.weight_scale": scale,
-        "model.layers.0.linear_attn.in_proj_z.input_scale": torch.tensor(
-            1.0, dtype=torch.float32),
+        "model.layers.0.linear_attn.in_proj_z.input_scale": torch.tensor(1.0, dtype=torch.float32),
     }
 
     packed = mapper.preprocess_weights(weights)
