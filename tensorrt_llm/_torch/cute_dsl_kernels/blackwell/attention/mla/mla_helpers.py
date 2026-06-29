@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -250,8 +250,16 @@ class MLAStaticTileScheduler:
 
             blk_coord = (cluster_idx, s_idx, b_idx, split_kv_idx)
         else:
-            s_idx, b_idx = divmod(self.blk_coord[1],
-                                  self.params.problem_shape_b_fdd)
+            # Non-persistent grid: blockIdx.y spans ``problem_shape_b *
+            # problem_shape_s`` with ``s`` as the fast-varying dim (matching the
+            # persistent ``persistent_blk_layout`` ordering (cluster, s, b,
+            # split)). Decode with ``problem_shape_s`` as the divisor so the
+            # (b, s) mapping is consistent with the persistent path. Using
+            # ``problem_shape_b`` here transposes b<->s and corrupts results for
+            # ``seq_len_q > 1`` (MTP / spec-decode) in non-persistent mode.
+            # Ported from flashinfer PR #3309.
+            b_idx, s_idx = divmod(self.blk_coord[1],
+                                  self.params.problem_shape_s_fdd)
             blk_coord = (self.blk_coord[0], s_idx, b_idx, self.blk_coord[2])
 
         return WorkTileInfo(blk_coord, is_valid)
