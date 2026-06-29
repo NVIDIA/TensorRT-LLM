@@ -48,23 +48,20 @@ ExecPool::~ExecPool()
 {
     // Select the device the resources live on before freeing — otherwise on a multi-GPU process the
     // cudaFree/cudaStreamDestroy/cudaEventDestroy target whatever device is current on this thread.
-    // A failure here means the frees below would leak on the wrong device, so warn (a dtor can't
-    // throw). The frees themselves stay best-effort: nothing to recover at teardown.
-    if (cudaSetDevice(mDeviceId) != cudaSuccess)
-    {
-        (void) cudaGetLastError();
-        TLLM_LOG_WARNING("ExecPool::~ExecPool: cudaSetDevice(%d) failed; contexts may leak", mDeviceId);
-    }
+    // Select the owning device before freeing (multi-GPU: otherwise these target the thread's current
+    // device). A dtor can't throw, so use the project's warn-only cleanup check on every teardown call
+    // rather than discarding the result (matches tllmBuffers / cudaMemPool).
+    TLLM_CUDA_CHECK_WARN(cudaSetDevice(mDeviceId));
     for (auto& c : mCtxs)
     {
         if (c.scratch != nullptr)
-            (void) cudaFree(c.scratch);
+            TLLM_CUDA_CHECK_WARN(cudaFree(c.scratch));
         if (c.hostPinned != nullptr)
-            (void) cudaFreeHost(c.hostPinned);
+            TLLM_CUDA_CHECK_WARN(cudaFreeHost(c.hostPinned));
         if (c.stream != nullptr)
-            (void) cudaStreamDestroy(c.stream);
+            TLLM_CUDA_CHECK_WARN(cudaStreamDestroy(c.stream));
         if (c.event != nullptr)
-            (void) cudaEventDestroy(c.event);
+            TLLM_CUDA_CHECK_WARN(cudaEventDestroy(c.event));
     }
 }
 
