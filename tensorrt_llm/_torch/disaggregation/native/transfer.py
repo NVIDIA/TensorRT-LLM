@@ -1195,7 +1195,11 @@ class TxSession(TxSessionBase):
 
     def has_failed(self) -> bool:
         """Non-blocking check: has the transfer failed or been cancelled?"""
-        return self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            return True
+        if any(task.status == TaskStatus.ERROR for task in self.kv_tasks):
+            return True
+        return self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR
 
     def cancel(self) -> None:
         """Cancel the session and notify the remote receiver.
@@ -1225,11 +1229,35 @@ class TxSession(TxSessionBase):
         """
         return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
 
-    def wait_complete(self) -> Optional[WaitResult]:
-        """Block until KV (and optionally aux) transfer finishes.
+    def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
+        """Poll or block until KV (and optionally aux) transfer finishes.
 
-        Returns WaitResult.COMPLETED, WaitResult.FAILED, or WaitResult.TIMEOUT.
+        With blocking=True (default): waits up to _timeout_s for each task.
+        With blocking=False: polls non-blockingly; returns None if any KV task
+        or aux is not yet done.
         """
+        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            return WaitResult.FAILED
+        if not self.kv_tasks:
+            return None
+        if not blocking:
+            has_pending = False
+            for task in self.kv_tasks:
+                if task.status == TaskStatus.ERROR:
+                    return WaitResult.FAILED
+                if task.status != TaskStatus.TRANSFERRED:
+                    has_pending = True
+            if has_pending:
+                return None
+            if self._need_aux:
+                if self.aux_task is None:
+                    return None
+                if self.aux_task.status == TaskStatus.ERROR:
+                    return WaitResult.FAILED
+                if self.aux_task.status != TaskStatus.TRANSFERRED:
+                    return None
+            return WaitResult.COMPLETED
+
         for task in self.kv_tasks:
             if not task.wait(timeout=self._timeout_s):
                 return WaitResult.TIMEOUT

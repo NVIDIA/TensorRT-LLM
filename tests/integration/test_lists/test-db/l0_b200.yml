@@ -33,9 +33,6 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=none-mtp_nextn=2-fp8kv=False-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_no_kv_cache_reuse[quant_dtype=nvfp4-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=none-kv_cache_reuse=True-fp8kv=False-overlap_scheduler=True]
@@ -106,6 +103,20 @@ l0_b200:
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_o_proj.py TIMEOUT (30)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py TIMEOUT (90)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_module.py TIMEOUT (90)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
+  - unittest/_torch/attention/sparse/test_sparse_mla_forward.py TIMEOUT (60)
+  - unittest/_torch/modeling/test_modeling_deepseekv4.py
+  - unittest/llmapi/test_deepseek_v4_tokenizer.py
+  - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/modules/test_engram.py
+  - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
@@ -122,19 +133,10 @@ l0_b200:
   - unittest/_torch/modules/test_moe_host_sharer.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
-  # ------------- legacy MoE tests ---------------
-  - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: test_single_gpu (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
@@ -363,6 +365,19 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
+  # ---- moved to post-merge (MoE CI optimization) ----
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and not MEGAMOE_CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DENSEGEMM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
+  # ---- non-quantized (quant=None) moved to post-merge ----
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

@@ -1051,3 +1051,79 @@ class TestSpecBoundsChecking:
             profiles = tuner._optimization_profiles(config, [x])
             # OOB spec skipped — profile generation still produces at least one profile.
             assert len(profiles) >= 1
+
+
+def test_single_pair_shortcut(monkeypatch):
+    """Single (runner, tactic) candidate must bypass the timed profile loop.
+
+    When ``_profile_runners`` sees exactly one (runner, tactic) pair, it
+    must (1) skip ``_profile_single_kernel`` entirely, (2) still fire the
+    ``do_preparation`` hook for runners that opt in, (3) fire exactly one
+    ``forward()`` to drive any JIT side effect, and (4) record the pair
+    in the profiling cache. Multi-tactic ops in the same fixture must
+    still use the timed path.
+    """
+
+    profile_calls: List[Any] = []
+
+    def _track(self, runner, inputs, tactic, tuning_config, **kwargs):
+        profile_calls.append(tactic)
+        return 1.0 + len(profile_calls) * 0.01
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", _track)
+
+    forward_calls: List[tuple] = []
+
+    class PrepRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False,
+                    **kwargs) -> torch.Tensor:
+            forward_calls.append((tactic, do_preparation))
+            if do_preparation:
+                return None
+            x, w = inputs
+            return x @ w
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+
+    # Single (runner, tactic): shortcut must fire.
+    op_single = "autotuner_test::single_pair_shortcut"
+    with autotune():
+        _, tactic = tuner.choose_one(op_single, [PrepRunner()], TuningConfig(),
+                                     [x, w])
+    assert tactic == 0
+    assert profile_calls == [], (
+        f"_profile_single_kernel must not be called for single-pair op; "
+        f"got {profile_calls}")
+    assert forward_calls == [
+        (-1, True), (0, False)
+    ], (f"Expected do_preparation then exactly one forward(tactic=0); "
+        f"got {forward_calls}")
+    assert len(tuner.profiling_cache.get_specific_custom_op(op_single)) == 1, (
+        "single-pair shortcut must still record the (runner, tactic) entry")
+
+    # Multi-tactic on the same fixture: timed profile path must still run.
+    forward_calls.clear()
+    op_multi = "autotuner_test::single_pair_shortcut_multi"
+    with autotune():
+        tuner.choose_one(op_multi, [GemmRunner()], TuningConfig(), [x, w])
+    # GemmRunner exposes 3 tactics -> 3 profile calls.
+    assert len(profile_calls) == 3, (
+        f"Multi-tactic op must hit _profile_single_kernel per tactic; "
+        f"got {len(profile_calls)} ({profile_calls})")
