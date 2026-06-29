@@ -550,6 +550,19 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 positive_pool_ids.append(pool_id)
         return positive_pool_ids
 
+    def _first_positive_window_layer_id(self) -> int:
+        """Return a layer id that uses a real attention KV window."""
+        mgr = self.kv_cache_manager
+        layer_offsets = getattr(mgr, 'layer_offsets', {})
+        vec = getattr(mgr, 'max_attention_window_vec', None)
+        if vec:
+            pattern_len = len(vec)
+            for layer_idx in layer_offsets:
+                window = vec[layer_idx % pattern_len]
+                if window is not None and window > 0:
+                    return layer_idx
+        return next(iter(layer_offsets), 0)
+
     def _pick_vswa_primary_pool_id(self) -> int:
         """Pick a non-linear pool as the FlashInfer 'primary' pool.
 
@@ -1114,9 +1127,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             _primary_pool = self._pick_vswa_primary_pool_id()
             _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool)
             if _vswa_init_layer is None:
-                _layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets',
-                                         {})
-                _vswa_init_layer = next(iter(_layer_offsets), 0)
+                _vswa_init_layer = self._first_positive_window_layer_id()
         elif len(getattr(self.kv_cache_manager, 'max_attention_window_vec', [])) > 1:
             # V1 manager (or any manager without per-pool dict) with multiple
             # window sizes: get_batch_cache_indices requires layer_idx to
