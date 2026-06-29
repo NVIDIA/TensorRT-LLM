@@ -550,13 +550,16 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | Fp4QuantizedTensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
+        # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
+        # fused norm+quant kernel; downstream Linear accepts either.
+        if not isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
         kv_seq_len = (
             encoder_hidden_states.shape[1] if encoder_hidden_states is not None else seq_len
@@ -639,7 +642,7 @@ class Attention(nn.Module):
                 "forward() for sync execution."
             )
 
-        B, S, _ = hidden_states.shape
+        B, S = hidden_states.shape[:2]
         H = self.num_attention_heads
         KV = self.num_key_value_heads
         D = self.head_dim
@@ -648,13 +651,16 @@ class Attention(nn.Module):
         # has no async analog here.
         use_fused = self.fuse_qk_norm_rope and freqs is not None and self.qk_norm
 
-        # SEPARATE_QKV self-attn 3x fp4_quantize dedup: pre-quantize hidden_states
-        # once and pass the shared Fp4QuantizedTensor to to_q/to_k/to_v via Linear's
-        # Fp4QuantizedTensor shortcut. Saves 2 of 3 fp4_quantize launches per layer.
-        # Eligibility is structural (set in __init__); runtime gate checks that the
-        # checkpoint loaded an input_scale (some attn Linears can be excluded from
-        # NVFP4 per checkpoint config — e.g. LTX-2 transformer_blocks.10.attn1).
-        if self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+        # SEPARATE_QKV self-attn shares ONE input quant across to_q/to_k/to_v (never 3):
+        #   * hidden_states already an Fp4QuantizedTensor -> an upstream fused norm+quant AdaLN
+        #     pre-quantized it once (with to_q.input_scale); reuse it directly -> 0 quant here.
+        #   * else eligible -> quantize once and share the Fp4QuantizedTensor -> 1 quant here.
+        #   * else -> bf16, each Linear quantizes its own (non-NVFP4 / NVFP4-excluded layers).
+        # Eligibility is structural (set in __init__); the runtime gate checks the checkpoint
+        # loaded an input_scale (some attn Linears are NVFP4-excluded -- e.g. LTX-2 blocks.10.attn1).
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            qkv_input = hidden_states
+        elif self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
             x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
             fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
                 x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False

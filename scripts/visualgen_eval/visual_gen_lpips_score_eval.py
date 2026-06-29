@@ -614,6 +614,9 @@ def _make_lpips_model(net: str, device: str) -> Any:
 
 
 def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+
     if args.config is not None:
         _load_yaml(args.config)
     loaded_dataset = _load_json(args.dataset)
