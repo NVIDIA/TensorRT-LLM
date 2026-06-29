@@ -245,6 +245,7 @@ l0_a10:
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
+  - unittest/others/test_builder.py
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
 - condition:
