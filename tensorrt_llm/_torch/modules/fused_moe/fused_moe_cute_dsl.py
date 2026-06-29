@@ -456,8 +456,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             without_comm=without_comm,
             activation_type=activation_type,
         )
-        self.swiglu_limit_scalar = float(
-            "inf") if swiglu_limit_scalar is None else swiglu_limit_scalar
+        self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
 
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}

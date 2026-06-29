@@ -334,14 +334,8 @@ def create_moe_backend(
     if swiglu_limit is not None:
         assert moe_cls in [
             CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
-            DeepGemmFusedMoE, MegaMoECuteDsl, MegaMoEDeepGemm, CuteDslFusedMoE
+            DeepGemmFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
-        if moe_cls in (MegaMoEDeepGemm,
-                       CuteDslFusedMoE) and swiglu_limit is not None:
-            raise NotImplementedError(
-                f"{moe_cls.__name__} supports swiglu_limit_scalar (uniform "
-                "clamp) only; per-expert swiglu_limit tensor is not "
-                "supported. Set swiglu_limit=None.")
 
     if swiglu_limit_scalar is not None:
         assert moe_cls in [

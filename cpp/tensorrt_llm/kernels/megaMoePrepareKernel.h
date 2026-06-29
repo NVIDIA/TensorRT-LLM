@@ -25,12 +25,14 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+//! Dtype of the token-selected expert index tensor consumed by invokeMegaMoePrepare.
 enum class MegaMoePrepareExpertType
 {
     INT32,
     INT64,
 };
 
+//! Dtype of the token-final scale tensor consumed by invokeMegaMoePrepare.
 enum class MegaMoePrepareScaleType
 {
     FP32,
@@ -38,6 +40,19 @@ enum class MegaMoePrepareScaleType
     BF16,
 };
 
+//! Prepare DeepGEMM MegaMoE inputs by quantizing activations and copying routing metadata.
+//!
+//! Expected tensor-like arguments:
+//! - input: [numTokens, hiddenSize] BF16 activations.
+//! - tokenSelectedExperts: [numTokens, topK] INT32 or INT64 expert/slot ids.
+//! - tokenFinalScales: [numTokens, topK] FP32, FP16, or BF16 routing scales.
+//! - xOut: [>=numTokens, hiddenSize] FP8 E4M3 output activations.
+//! - xSfOut: [>=numTokens, hiddenSize / 128] INT32 packed UE8M0 scales.
+//! - topkIdxOut: [>=numTokens, topK] INT64 expert/slot ids.
+//! - topkWeightsOut: [>=numTokens, topK] FP32 routing scales.
+//!
+//! hiddenSize must be divisible by 128. All pointers must refer to contiguous
+//! CUDA buffers on the same device, and the kernel requires SM100 or newer.
 void invokeMegaMoePrepare(void const* input, void const* tokenSelectedExperts, void const* tokenFinalScales, void* xOut,
     void* xSfOut, int64_t* topkIdxOut, float* topkWeightsOut, int numTokens, int hiddenSize, int topK,
     MegaMoePrepareExpertType expertType, MegaMoePrepareScaleType scaleType, int multiProcessorCount,

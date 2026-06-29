@@ -80,14 +80,6 @@ def _trtllm_mxfp8_quantize_available() -> bool:
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "mxfp8_quantize")
 
 
-def _trtllm_megamoe_prepare_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "megamoe_prepare")
-
-
-def _megamoe_fused_prepare_enabled() -> bool:
-    return os.environ.get("TRTLLM_MEGAMOE_FUSED_PREPARE", "1").lower() not in ("0", "false", "off")
-
-
 def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (x_fp8, x_sf) in DG mega_moe's expected layout (packed int32)."""
     m, n = x.shape
@@ -671,7 +663,7 @@ class MegaMoEDeepGemm(MoE):
 
     def supports_fused_prepare(self) -> bool:
         """Whether ``run_moe`` can prepare DG SymmBuffer directly from BF16 input."""
-        return _megamoe_fused_prepare_enabled() and _trtllm_megamoe_prepare_available()
+        return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "megamoe_prepare")
 
     def run_moe(
         self,

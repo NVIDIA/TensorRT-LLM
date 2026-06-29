@@ -268,6 +268,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
 
         self.vectorized_f32 = vectorized_f32
 
+        if swiglu_limit < 0:
+            swiglu_limit = float("inf")
         self.swiglu_limit = swiglu_limit
         self.has_swiglu_limit = swiglu_limit != float("inf")
 
