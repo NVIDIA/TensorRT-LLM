@@ -46,7 +46,7 @@ from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
-from ..memory_buffer_utils import with_shared_pool
+from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -58,7 +58,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
-                           update_spec_config_from_model_config)
+                           update_spec_config_from_loaded_model)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -498,9 +498,11 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args.attn_backend,
             sparse_attention_config=self.sparse_attention_config)
 
+        self.spec_metadata = None
         if self.is_spec_decode:
-            update_spec_config_from_model_config(self.spec_config,
-                                                 self.model.config)
+            if not self.is_draft_model:
+                update_spec_config_from_loaded_model(self.spec_config,
+                                                     self.model)
             max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
@@ -701,6 +703,8 @@ class PyTorchModelEngine(ModelEngine):
             self.cache_indirection_attention = None
 
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+
+        self._prepare_inputs_event: Optional[torch.cuda.Event] = None
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -1121,7 +1125,35 @@ class PyTorchModelEngine(ModelEngine):
                 logger.warning(
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
+                # If the OOM aborted the forward between dispatch() and
+                # combine(), the MoE A2A state machines are stuck in
+                # ``dispatched`` and the next warmup will hit
+                # ``dispatch called twice``. Reset them before retrying a
+                # smaller shape.
+                self._reset_moe_alltoall_state()
                 torch.cuda.empty_cache()
+
+    def _reset_moe_alltoall_state(self) -> None:
+        """Reset all MoE all-to-all state machines reachable from ``self.model``.
+
+        Each MoE backend keeps a small dispatch/combine phase state per layer
+        (``MoeAlltoAll`` or ``NVLinkOneSided``). A forward that calls
+        ``dispatch`` but raises before reaching ``combine`` (e.g., a warmup
+        OOM mid-MoE) leaves that state in ``dispatched``, which fails the
+        invariant on the next ``dispatch`` call. This helper walks the model
+        and resets any A2A state found, so subsequent forwards start clean.
+        """
+        for module in self.model.modules():
+            for attr_name in ("moe_a2a", "comm"):
+                obj = getattr(module, attr_name, None)
+                reset = getattr(obj, "reset_state", None)
+                if callable(reset):
+                    try:
+                        reset()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            f"Failed to reset MoE A2A state on {type(module).__name__}.{attr_name}: {e}"
+                        )
 
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
@@ -1224,6 +1256,14 @@ class PyTorchModelEngine(ModelEngine):
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+        # Clear workspace buffers allocated during the autotuner forward pass.
+        # The autotuner runs a context-only forward with max_num_tokens, which
+        # causes the global Buffers pool to cache large MoE/GEMM workspaces.
+        # If not cleared, these inflate the memory baseline seen by the KV cache
+        # profiler, reducing memory available for activations during inference.
+        clear_memory_buffers()
+        torch.cuda.empty_cache()
 
     def _compute_dynamic_draft_len_mapping(self) -> Optional[Dict[int, int]]:
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.
@@ -5036,6 +5076,8 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager, can_run_graph)
+            self._prepare_inputs_event = torch.cuda.Event()
+            self._prepare_inputs_event.record()
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
@@ -5508,3 +5550,11 @@ class PyTorchModelEngine(ModelEngine):
                 lp(request.py_request_id, logits_row, token_ids, None, None)
 
             logits_tensor[idx] = logits_row.view(-1)
+
+    def wait_for_input_copy(self):
+        """
+        Wait for input preparation and H2D copy of previous iteration before modifying host input,
+        otherwise the input of previous iteration will be overwritten.
+        """
+        if self._prepare_inputs_event is not None:
+            self._prepare_inputs_event.synchronize()
