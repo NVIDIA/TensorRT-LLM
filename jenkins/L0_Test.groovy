@@ -1372,6 +1372,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
+                    "--no-container-mount-home",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
                 envVarsToExport.each { varName, varValue ->
