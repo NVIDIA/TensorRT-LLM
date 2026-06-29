@@ -1865,8 +1865,19 @@ class Fp8QuantKernelRunner(TunableRunner):
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, deep_gemm_gen_tuning_buckets), ), )
+    # DeepGemm performs JIT compilation as a side effect of the tuning
+    # call. If we let the autotuner persist this op's tactic to disk, a
+    # subsequent process startup loads the cached tactic and skips the
+    # tuning path entirely — meaning the DeepGemm JIT warmup never runs
+    # and inference falls back to a slower uncompiled path.
+    # `exclude_from_cache=True` keeps the in-process cache working but
+    # ensures the tuning (and the JIT warmup it triggers) repeats on
+    # every process startup.
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_gen_tuning_buckets), ),
+        exclude_from_cache=True,
+    )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
                  quant_tactic: int):
