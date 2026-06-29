@@ -21,7 +21,9 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
+    DecodeCudaGraphConfig,
     EncodeCudaGraphConfig,
+    EncoderDecoderCudaGraphConfig,
     KvCacheConfig,
     RequestOutput,
     SamplingParams,
@@ -31,28 +33,67 @@ from tensorrt_llm.llmapi import (
 from ..conftest import llm_models_root
 
 _SOURCE_TEXT = (
-    "Summarize: NVIDIA builds fast inference software for large language models. "
-    "TensorRT-LLM supports encoder-decoder models such as BART and T5."
+    "Summarize: The engineering team released a faster inference service on Monday. "
+    "The update improves batching, lowers latency, and adds detailed monitoring for operators."
 )
 _MIXED_ENCODER_SOURCE_TEXTS = [
     _SOURCE_TEXT,
     (
-        "Summarize: The city opened a new public library on Monday. Residents said "
-        "the library has quiet rooms, computer access, and a large children section."
+        "Summarize: The company opened a training center on Monday. Managers said "
+        "the center adds classrooms, simulation labs, and career coaching for workers."
     ),
 ]
+_FIXED_SEQ_LENS_SOURCE_TEXTS = [
+    (
+        "Summarize: The engineering team released a faster inference service on Monday. "
+        "The update improves batching, lowers latency, and adds detailed monitoring for operators."
+    ),
+    (
+        "Summarize: The city opened a new public library on Monday. Residents said the library "
+        "has quiet rooms, computer access, and a large children section."
+    ),
+    (
+        "Summarize: The company opened a training center on Monday. Managers said the center "
+        "adds classrooms, simulation labs, and career coaching for local workers."
+    ),
+    (
+        "Summarize: The museum opened a science exhibit on Monday. Curators said the exhibit "
+        "has space models, interactive lessons, and workshops for local children."
+    ),
+]
+_FIXED_SEQ_LENS_EXPECTED_TOKEN_IDS_BY_REQUEST = [
+    # "The update improves batching, lowers latency"
+    [[0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2]],
+    # "Residents said the library has quiet rooms,"
+    [[0, 35129, 26, 5, 5560, 34, 5128, 5351, 6, 2]],
+    # "The company opened a training center on Monday"
+    [[0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 2]],
+    # "The museum opened a science exhibit on Monday"
+    [[0, 133, 5707, 1357, 10, 2866, 8483, 15, 302, 2]],
+]
 _MODEL_NAME = "bart-large-cnn"
-_MAX_NEW_TOKENS = 8
+_MAX_NEW_TOKENS = 10
 _MAX_SEQUENCE_LENGTH = 128
 _MAX_KV_TOKENS = 384
 _MIN_GPU_MEMORY_MB = 16_000
 _FREE_GPU_MEMORY_FRACTION = 0.2
 _CROSS_KV_CACHE_FRACTION = 0.5
-_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [0, 565, 35354, 13963, 12, 6006, 448, 2]
-_EXPECTED_TEXT_FRAGMENT = "TensorRT"
-_MIXED_ENCODER_EXPECTED_TEXT_FRAGMENTS = [
-    _EXPECTED_TEXT_FRAGMENT,
-    "library",
+# "The update improves batching, lowers latency"
+_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2]
+_FIXED_SEQ_LENS_MAX_NEW_TOKENS = 10
+_EXPECTED_BEAM_OUTPUT_TOKEN_IDS_BY_BEAMS = {
+    2: [
+        # "The update improves batching, lowers latency"
+        [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2],
+        # "The update improves batching, lowers"
+        [0, 0, 133, 2935, 15296, 14398, 154, 6, 32222, 2],
+    ],
+}
+_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST = [
+    # "The update improves batching, lowers latency"
+    [[0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2]],
+    # "The company opened a training center on Monday"
+    [[0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 2]],
 ]
 
 
@@ -67,8 +108,11 @@ def _test_case(
     cuda_graph_batch_sizes: list[int] | None = None,
     kv_cache_dtype: str = "auto",
 ):
-    expected_output_token_ids = [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS] if num_beams == 1 else None
-    assert not exact_match or expected_output_token_ids is not None
+    expected_output_token_ids = (
+        [_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS]
+        if num_beams == 1
+        else _EXPECTED_BEAM_OUTPUT_TOKEN_IDS_BY_BEAMS[num_beams]
+    )
 
     return pytest.param(
         expected_output_token_ids,
@@ -119,7 +163,7 @@ _TEST_CASES = [
         enable_cuda_graph=False,
         num_beams=2,
         num_return_sequences=2,
-        exact_match=False,
+        exact_match=True,
         feature_id="bf16-kv-v1-cuda-graph-off-beam2",
     ),
     _test_case(
@@ -128,7 +172,7 @@ _TEST_CASES = [
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
-        exact_match=False,
+        exact_match=True,
         feature_id="bf16-kv-v1-cuda-graph-on-beam2",
     ),
     _test_case(
@@ -168,20 +212,54 @@ def _mixed_batch_test_case(
     )
 
 
+def _fixed_seq_lens_shape_test_case(
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    batch_size: int,
+    feature_id: str,
+    kv_cache_dtype: str = "auto",
+):
+    return pytest.param(
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        1,
+        1,
+        batch_size,
+        kv_cache_dtype,
+        id=f"{feature_id}-{_MODEL_NAME}",
+    )
+
+
 _MIXED_BATCH_TEST_CASES = [
     _mixed_batch_test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
         num_beams=1,
         num_return_sequences=1,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2",
     ),
     _mixed_batch_test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
         num_beams=1,
         num_return_sequences=1,
-        feature_id="bf16-kv-v2-cuda-graph-off-greedy-batch2",
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2",
+    ),
+]
+
+
+_FIXED_SEQ_LENS_SHAPE_TEST_CASES = [
+    _fixed_seq_lens_shape_test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        batch_size=2,
+        feature_id="bf16-kv-v1-encoder-cuda-graph-fixed-shape-batch2",
+    ),
+    _fixed_seq_lens_shape_test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        batch_size=4,
+        feature_id="bf16-kv-v1-encoder-cuda-graph-fixed-shape-batch4",
     ),
 ]
 
@@ -223,14 +301,33 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
 
 def _cuda_graph_config(
     enabled: bool,
+    num_tokens: list[int],
+    seq_lens: list[int],
     batch_sizes: list[int] | None = None,
-) -> CudaGraphConfig | EncodeCudaGraphConfig | None:
+) -> EncoderDecoderCudaGraphConfig | None:
     if not enabled:
         return None
-    return EncodeCudaGraphConfig(
+    return EncoderDecoderCudaGraphConfig(
+        encoder=EncodeCudaGraphConfig(
+            num_tokens=num_tokens,
+            seq_lens=seq_lens,
+            enable_padding=True,
+        ),
+        decoder=DecodeCudaGraphConfig(
+            batch_sizes=batch_sizes or [1],
+            enable_padding=True,
+        ),
+    )
+
+
+def _decoder_cuda_graph_config(
+    batch_sizes: list[int] | None = None,
+) -> CudaGraphConfig:
+    # CudaGraphConfig is decode-only. It keeps encoder CUDA graphs disabled,
+    # which is what mixed encoder-length tests want while still covering
+    # decoder graph capture/replay.
+    return CudaGraphConfig(
         batch_sizes=batch_sizes or [1],
-        max_num_token=_MAX_SEQUENCE_LENGTH,
-        max_seq_len=_MAX_SEQUENCE_LENGTH,
         enable_padding=True,
     )
 
@@ -249,12 +346,27 @@ def _assert_encoder_decoder_cuda_graph_state(
         assert not model_engine.cuda_graph_runner.graphs
         return
 
+    _assert_encoder_decoder_cuda_graphs_captured(llm)
+    if batch_sizes is not None:
+        assert model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+def _assert_encoder_decoder_cuda_graphs_captured(llm: LLM) -> None:
+    model_engine = llm._executor.engine.model_engine
+
     assert model_engine.encoder_cuda_graph_runner.enabled
     assert model_engine.encoder_cuda_graph_runner.graphs
     assert model_engine.cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.graphs
-    if batch_sizes is not None:
-        assert model_engine.cuda_graph_runner.padding_dummy_requests
+
+
+def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
+    model_engine = llm._executor.engine.model_engine
+
+    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert not model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
 
 
 def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,6 +380,7 @@ def _enable_trtllm_gen_attention(monkeypatch: pytest.MonkeyPatch) -> None:
 def _assert_bart_response(
     response: RequestOutput,
     num_return_sequences: int,
+    max_tokens: int = _MAX_NEW_TOKENS,
 ) -> list[list[int]]:
     assert response.finished
 
@@ -275,7 +388,7 @@ def _assert_bart_response(
     token_ids_by_output = []
     for output in response.outputs:
         assert output.token_ids is not None
-        assert 0 < len(output.token_ids) <= _MAX_NEW_TOKENS
+        assert 0 < len(output.token_ids) <= max_tokens
         token_ids_by_output.append(output.token_ids)
     return token_ids_by_output
 
@@ -292,18 +405,13 @@ def _assert_expected_generation(
     tokenizer,
     token_ids_by_output: list[list[int]],
     exact_match: bool,
-    expected_token_ids_by_output: list[list[int]] | None,
-    expected_text_fragment: str | None = _EXPECTED_TEXT_FRAGMENT,
+    expected_token_ids_by_output: list[list[int]],
 ) -> None:
     decoded_text_by_output = [
         tokenizer.decode(token_ids, skip_special_tokens=True) for token_ids in token_ids_by_output
     ]
     assert all(decoded_text_by_output)
-    if expected_token_ids_by_output is None:
-        if expected_text_fragment is not None:
-            assert all(expected_text_fragment in text for text in decoded_text_by_output)
-    else:
-        assert token_ids_by_output[0] == expected_token_ids_by_output[0]
+    assert token_ids_by_output[0] == expected_token_ids_by_output[0]
     if len(token_ids_by_output) > 1:
         assert len({tuple(token_ids) for token_ids in token_ids_by_output}) == len(
             token_ids_by_output
@@ -311,13 +419,12 @@ def _assert_expected_generation(
     if not exact_match:
         return
 
-    assert expected_token_ids_by_output is not None
     assert token_ids_by_output == expected_token_ids_by_output
 
 
 def _run_bart_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
-    expected_output_token_ids_by_output: list[list[int]] | None,
+    expected_output_token_ids_by_output: list[list[int]],
     torch_dtype: str,
     use_kv_cache_manager_v2: bool,
     enable_cuda_graph: bool,
@@ -332,6 +439,8 @@ def _run_bart_pytorch_generate_encoder_decoder(
 
     model_path = _get_bart_model_path()
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    encoder_seq_len = len(tokenizer(_SOURCE_TEXT).input_ids)
+    encoder_num_tokens = encoder_seq_len
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
         f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}, "
@@ -343,7 +452,12 @@ def _run_bart_pytorch_generate_encoder_decoder(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(enable_cuda_graph, cuda_graph_batch_sizes),
+        cuda_graph_config=_cuda_graph_config(
+            enable_cuda_graph,
+            [encoder_num_tokens],
+            [encoder_seq_len],
+            cuda_graph_batch_sizes,
+        ),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -394,7 +508,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
 )
 def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
-    expected_output_token_ids_by_output: list[list[int]] | None,
+    expected_output_token_ids_by_output: list[list[int]],
     torch_dtype: str,
     use_kv_cache_manager_v2: bool,
     enable_cuda_graph: bool,
@@ -419,6 +533,117 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
 
 
 @pytest.mark.parametrize(
+    "torch_dtype,use_kv_cache_manager_v2,num_beams,num_return_sequences,batch_size,kv_cache_dtype",
+    _FIXED_SEQ_LENS_SHAPE_TEST_CASES,
+)
+def test_bart_pytorch_generate_encoder_decoder_fixed_encoder_lengths_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    batch_size: int,
+    kv_cache_dtype: str,
+) -> None:
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_path = _get_bart_model_path()
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    source_texts = _FIXED_SEQ_LENS_SOURCE_TEXTS[:batch_size]
+    assert len(source_texts) == batch_size
+    expected_token_ids_by_request = _FIXED_SEQ_LENS_EXPECTED_TOKEN_IDS_BY_REQUEST[:batch_size]
+    encoder_seq_lens_by_request = [
+        len(tokenizer(source_text).input_ids) for source_text in source_texts
+    ]
+    assert len(set(encoder_seq_lens_by_request)) == 1
+    encoder_seq_len = encoder_seq_lens_by_request[0]
+    encoder_num_tokens = sum(encoder_seq_lens_by_request)
+    graph_key = (batch_size, encoder_num_tokens, encoder_seq_len)
+    assert num_beams == 1
+    assert num_return_sequences == 1
+    sampling_params = SamplingParams(
+        max_tokens=_FIXED_SEQ_LENS_MAX_NEW_TOKENS,
+        temperature=0.0,
+    )
+    max_num_tokens = max(_MAX_SEQUENCE_LENGTH, encoder_num_tokens)
+    kv_cache_max_tokens = max(
+        _MAX_KV_TOKENS,
+        batch_size * _MAX_SEQUENCE_LENGTH * 2,
+    )
+    case_id = (
+        f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
+        f"encoder_cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
+        f"kv_dtype={kv_cache_dtype}, fixed_encoder_seq_lens=True, batch_size={batch_size}"
+    )
+    llm_kwargs = {
+        "backend": "pytorch",
+        "attn_backend": "TRTLLM",
+        "disable_overlap_scheduler": True,
+        "dtype": torch_dtype,
+        "enable_chunked_prefill": False,
+        "kv_cache_config": KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=kv_cache_max_tokens,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            dtype=kv_cache_dtype,
+        ),
+        "max_batch_size": batch_size,
+        "max_beam_width": num_beams,
+        "max_input_len": _MAX_SEQUENCE_LENGTH,
+        "max_num_tokens": max_num_tokens,
+        "max_seq_len": _MAX_SEQUENCE_LENGTH,
+        "model_kwargs": {"torch_dtype": torch_dtype},
+        "scheduler_config": SchedulerConfig(use_python_scheduler=True),
+    }
+
+    with LLM(
+        model_path,
+        cuda_graph_config=_cuda_graph_config(
+            True,
+            [encoder_num_tokens],
+            [encoder_seq_len],
+            [batch_size],
+        ),
+        **llm_kwargs,
+    ) as llm:
+        model_engine = llm._executor.engine.model_engine
+        assert graph_key in model_engine.encoder_cuda_graph_runner.graphs
+
+        responses = llm.generate(
+            source_texts,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        assert len(responses) == batch_size
+
+        token_ids_by_request = []
+        for request_idx, response in enumerate(responses):
+            token_ids = _assert_bart_response(
+                response,
+                num_return_sequences=num_return_sequences,
+                max_tokens=_FIXED_SEQ_LENS_MAX_NEW_TOKENS,
+            )
+            token_ids_by_request.append(token_ids)
+            _print_generated_text(
+                tokenizer,
+                f"{case_id}, request={request_idx}",
+                "output",
+                token_ids,
+            )
+            _assert_expected_generation(
+                tokenizer,
+                token_ids,
+                exact_match=True,
+                expected_token_ids_by_output=expected_token_ids_by_request[request_idx],
+            )
+
+        assert token_ids_by_request == expected_token_ids_by_request
+
+
+@pytest.mark.parametrize(
     "torch_dtype,use_kv_cache_manager_v2,num_beams,num_return_sequences",
     _MIXED_BATCH_TEST_CASES,
 )
@@ -437,14 +662,14 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph=False, beams={num_beams}, returns={num_return_sequences}, "
+        f"decoder_cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
         "mixed_encoder_lengths=True, batch_size=2"
     )
     with LLM(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=None,
+        cuda_graph_config=_decoder_cuda_graph_config([2]),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -485,7 +710,10 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
             _assert_expected_generation(
                 tokenizer,
                 token_ids,
-                exact_match=False,
-                expected_token_ids_by_output=None,
-                expected_text_fragment=_MIXED_ENCODER_EXPECTED_TEXT_FRAGMENTS[request_idx],
+                exact_match=True,
+                expected_token_ids_by_output=_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST[
+                    request_idx
+                ],
             )
+
+        _assert_decoder_cuda_graphs_captured(llm)

@@ -452,11 +452,30 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         return sizes
 
 
+class EncoderDecoderCudaGraphConfig(StrictBaseModel):
+    """CUDA graph configuration for encoder-decoder models.
+
+    Provides independent configs for the encoder and decoder passes, allowing
+    separate control of batch sizes, token buckets, and padding for each.
+    """
+
+    mode: Literal["encoder_decoder"] = Field(
+        default="encoder_decoder", description="CUDA graph configuration mode.")
+
+    encoder: EncodeCudaGraphConfig = Field(
+        description="CUDA graph configuration for the encoder pass.")
+
+    decoder: DecodeCudaGraphConfig = Field(
+        default_factory=DecodeCudaGraphConfig,
+        description="CUDA graph configuration for the decoder pass.")
+
+
 # For CudaGraphConfig's backward compatibility
 CudaGraphConfig = DecodeCudaGraphConfig
 
 CudaGraphConfigType: TypeAlias = Annotated[
-    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig,
+          EncoderDecoderCudaGraphConfig],
     Field(discriminator="mode"),
 ]
 
@@ -4507,8 +4526,12 @@ class TorchLlmArgs(BaseLlmArgs):
                 "num_tokens", "max_num_token", "seq_lens", "max_seq_len"
             }
             v = dict(v)
-            v["mode"] = "encode" if any(k in v and v[k] not in (None, 0)
-                                        for k in encoder_keys) else "decode"
+            if "encoder" in v or "decoder" in v:
+                v["mode"] = "encoder_decoder"
+            elif any(k in v and v[k] not in (None, 0) for k in encoder_keys):
+                v["mode"] = "encode"
+            else:
+                v["mode"] = "decode"
         return v
 
     multimodal_config: MultimodalConfig = Field(

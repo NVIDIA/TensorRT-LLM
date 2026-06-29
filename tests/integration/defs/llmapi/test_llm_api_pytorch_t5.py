@@ -22,7 +22,9 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
+    DecodeCudaGraphConfig,
     EncodeCudaGraphConfig,
+    EncoderDecoderCudaGraphConfig,
     KvCacheConfig,
     RequestOutput,
     SamplingParams,
@@ -35,6 +37,18 @@ _SOURCE_TEXT = "translate English to German: The house is wonderful."
 _MIXED_ENCODER_SOURCE_TEXTS = [
     _SOURCE_TEXT,
     "translate English to German: The book is on the table.",
+]
+_FIXED_SEQ_LENS_SOURCE_TEXTS = [
+    "translate English to German: The book is on table.",
+    "translate English to German: The school is very clean.",
+    "translate English to German: The car is very small.",
+    "translate English to German: The food is very good.",
+]
+_FIXED_SEQ_LENS_EXPECTED_TOKEN_IDS_BY_REQUEST = [
+    [644, 4675, 229, 219],
+    [316, 12853, 229, 1319],
+    [644, 2040, 229, 1319],
+    [644, 11722, 229, 1319],
 ]
 _MAX_NEW_TOKENS = 4
 _MAX_SEQUENCE_LENGTH = 64
@@ -98,6 +112,24 @@ _MIXED_ENCODER_EXPECTED_TEXT_FRAGMENTS_BY_MODEL = {
     "flan-t5-small": [_EXPECTED_TRANSLATION_FRAGMENT, "Buch"],
 }
 _MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS = 8
+
+
+def _fixed_seq_lens_shape_test_case(
+    model_name: str,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    batch_size: int,
+    feature_id: str,
+):
+    return pytest.param(
+        model_name,
+        torch_dtype,
+        use_kv_cache_manager_v2,
+        1,
+        1,
+        batch_size,
+        id=f"{feature_id}-{model_name}",
+    )
 
 
 def _test_case(
@@ -440,7 +472,7 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
-        feature_id="bf16-kv-v1-cuda-graph-off-beam2-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="flan-t5-small",
@@ -449,7 +481,7 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
-        feature_id="bf16-kv-v1-cuda-graph-off-beam2-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
@@ -458,7 +490,7 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy-batch2",
+        feature_id="bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2",
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
@@ -467,7 +499,25 @@ _MIXED_BATCH_TEST_CASES = [
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v2-cuda-graph-off-greedy-batch2",
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2",
+    ),
+]
+
+
+_FIXED_SEQ_LENS_SHAPE_TEST_CASES = [
+    _fixed_seq_lens_shape_test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        batch_size=2,
+        feature_id="bf16-kv-v1-encoder-cuda-graph-fixed-shape-batch2",
+    ),
+    _fixed_seq_lens_shape_test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=False,
+        batch_size=4,
+        feature_id="bf16-kv-v1-encoder-cuda-graph-fixed-shape-batch4",
     ),
 ]
 
@@ -509,14 +559,33 @@ def _sampling_params(num_beams: int, num_return_sequences: int) -> SamplingParam
 
 def _cuda_graph_config(
     enabled: bool,
+    num_tokens: list[int],
+    seq_lens: list[int],
     batch_sizes: list[int] | None = None,
-) -> CudaGraphConfig | EncodeCudaGraphConfig | None:
+) -> EncoderDecoderCudaGraphConfig | None:
     if not enabled:
         return None
-    return EncodeCudaGraphConfig(
+    return EncoderDecoderCudaGraphConfig(
+        encoder=EncodeCudaGraphConfig(
+            num_tokens=num_tokens,
+            seq_lens=seq_lens,
+            enable_padding=True,
+        ),
+        decoder=DecodeCudaGraphConfig(
+            batch_sizes=batch_sizes or [1],
+            enable_padding=True,
+        ),
+    )
+
+
+def _decoder_cuda_graph_config(
+    batch_sizes: list[int] | None = None,
+) -> CudaGraphConfig:
+    # CudaGraphConfig is decode-only. It keeps encoder CUDA graphs disabled,
+    # which is what mixed encoder-length tests want while still covering
+    # decoder graph capture/replay.
+    return CudaGraphConfig(
         batch_sizes=batch_sizes or [1],
-        max_num_token=_MAX_SEQUENCE_LENGTH,
-        max_seq_len=_MAX_SEQUENCE_LENGTH,
         enable_padding=True,
     )
 
@@ -535,22 +604,32 @@ def _assert_encoder_decoder_cuda_graph_state(
         assert not model_engine.cuda_graph_runner.graphs
         return
 
-    assert model_engine.encoder_cuda_graph_runner.enabled
-    assert model_engine.encoder_cuda_graph_runner.graphs
-    assert model_engine.cuda_graph_runner.enabled
-    assert model_engine.cuda_graph_runner.graphs
+    _assert_encoder_decoder_cuda_graphs_captured(llm)
     if batch_sizes is not None:
         assert model_engine.cuda_graph_runner.padding_dummy_requests
 
 
-def _assert_mixed_context_generation_cuda_graph_state(llm: LLM) -> None:
+def _assert_encoder_decoder_cuda_graphs_captured(llm: LLM) -> None:
     model_engine = llm._executor.engine.model_engine
 
-    assert model_engine.cuda_graph_runner.enabled
-    assert model_engine.cuda_graph_runner.graphs
     assert model_engine.encoder_cuda_graph_runner.enabled
     assert model_engine.encoder_cuda_graph_runner.graphs
-    assert model_engine.cuda_graph_runner.padding_dummy_requests
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
+
+
+def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
+    model_engine = llm._executor.engine.model_engine
+
+    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert not model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
+
+
+def _assert_mixed_context_generation_cuda_graph_state(llm: LLM) -> None:
+    _assert_encoder_decoder_cuda_graphs_captured(llm)
+    assert llm._executor.engine.model_engine.cuda_graph_runner.padding_dummy_requests
 
 
 class _SleepLogitsProcessor:
@@ -634,6 +713,8 @@ def _run_t5_pytorch_generate_encoder_decoder(
 
     model_path = _get_t5_model_path(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    encoder_seq_len = len(tokenizer(_SOURCE_TEXT).input_ids)
+    encoder_num_tokens = encoder_seq_len
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
         f"cuda_graph={enable_cuda_graph}, beams={num_beams}, returns={num_return_sequences}"
@@ -644,7 +725,12 @@ def _run_t5_pytorch_generate_encoder_decoder(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(enable_cuda_graph, cuda_graph_batch_sizes),
+        cuda_graph_config=_cuda_graph_config(
+            enable_cuda_graph,
+            [encoder_num_tokens],
+            [encoder_seq_len],
+            cuda_graph_batch_sizes,
+        ),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -718,6 +804,108 @@ def test_t5_pytorch_generate_encoder_decoder_end_to_end(
 
 
 @pytest.mark.parametrize(
+    "model_name,torch_dtype,use_kv_cache_manager_v2,num_beams,num_return_sequences,batch_size",
+    _FIXED_SEQ_LENS_SHAPE_TEST_CASES,
+)
+def test_t5_pytorch_generate_encoder_decoder_fixed_encoder_lengths_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    torch_dtype: str,
+    use_kv_cache_manager_v2: bool,
+    num_beams: int,
+    num_return_sequences: int,
+    batch_size: int,
+) -> None:
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_path = _get_t5_model_path(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    source_texts = _FIXED_SEQ_LENS_SOURCE_TEXTS[:batch_size]
+    assert len(source_texts) == batch_size
+    expected_token_ids_by_request = _FIXED_SEQ_LENS_EXPECTED_TOKEN_IDS_BY_REQUEST[:batch_size]
+    encoder_seq_lens_by_request = [
+        len(tokenizer(source_text).input_ids) for source_text in source_texts
+    ]
+    assert len(set(encoder_seq_lens_by_request)) == 1
+    encoder_seq_len = encoder_seq_lens_by_request[0]
+    encoder_num_tokens = sum(encoder_seq_lens_by_request)
+    sampling_params = _sampling_params(num_beams, num_return_sequences)
+    max_num_tokens = max(
+        _MAX_SEQUENCE_LENGTH,
+        encoder_num_tokens + batch_size * (_MAX_NEW_TOKENS + 1),
+    )
+    case_id = (
+        f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
+        f"encoder_cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
+        f"fixed_encoder_seq_lens=True, batch_size={batch_size}"
+    )
+    llm_kwargs = {
+        "backend": "pytorch",
+        "attn_backend": "TRTLLM",
+        "disable_overlap_scheduler": True,
+        "dtype": torch_dtype,
+        "enable_chunked_prefill": False,
+        "kv_cache_config": KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        ),
+        "max_batch_size": batch_size,
+        "max_beam_width": num_beams,
+        "max_input_len": _MAX_SEQUENCE_LENGTH,
+        "max_num_tokens": max_num_tokens,
+        "max_seq_len": _MAX_SEQUENCE_LENGTH,
+        "model_kwargs": {"torch_dtype": torch_dtype},
+        "scheduler_config": SchedulerConfig(use_python_scheduler=True),
+    }
+
+    with LLM(
+        model_path,
+        cuda_graph_config=_cuda_graph_config(
+            True,
+            [encoder_num_tokens],
+            [encoder_seq_len],
+            [batch_size],
+        ),
+        **llm_kwargs,
+    ) as llm:
+        responses = llm.generate(
+            source_texts,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        assert len(responses) == batch_size
+
+        token_ids_by_request = []
+        for request_idx, response in enumerate(responses):
+            token_ids = _assert_t5_response(
+                response,
+                num_return_sequences=num_return_sequences,
+            )
+            token_ids_by_request.append(token_ids)
+            _print_generated_text(
+                tokenizer,
+                f"{case_id}, request={request_idx}",
+                "output",
+                token_ids,
+            )
+            _assert_expected_generation(
+                tokenizer,
+                token_ids,
+                exact_match=True,
+                expected_token_ids_by_output=[expected_token_ids_by_request[request_idx]],
+            )
+
+        assert token_ids_by_request == [
+            [expected_token_ids] for expected_token_ids in expected_token_ids_by_request
+        ]
+        _assert_encoder_decoder_cuda_graphs_captured(llm)
+
+
+@pytest.mark.parametrize(
     "model_name,expected_output_token_ids_by_request,torch_dtype,use_kv_cache_manager_v2,"
     "num_beams,num_return_sequences,exact_match",
     _MIXED_BATCH_TEST_CASES,
@@ -740,14 +928,14 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (
         f"model={model_name}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
-        f"cuda_graph=False, beams={num_beams}, returns={num_return_sequences}, "
+        f"decoder_cuda_graph=True, beams={num_beams}, returns={num_return_sequences}, "
         "mixed_encoder_lengths=True, batch_size=2"
     )
     with LLM(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=None,
+        cuda_graph_config=_decoder_cuda_graph_config([2]),
         disable_overlap_scheduler=True,
         dtype=torch_dtype,
         enable_chunked_prefill=False,
@@ -802,6 +990,8 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
                 expected_text_fragment=expected_text_fragment,
             )
 
+        _assert_decoder_cuda_graphs_captured(llm)
+
 
 def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
     monkeypatch: pytest.MonkeyPatch,
@@ -811,6 +1001,13 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
 
     model_name = "t5-small"
     model_path = _get_t5_model_path(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    encoder_seq_lens_by_request = [
+        len(tokenizer(source_text).input_ids) for source_text in _MIXED_ENCODER_SOURCE_TEXTS
+    ]
+    encoder_num_tokens = sum(encoder_seq_lens_by_request)
+    encoder_num_tokens_list = sorted({*encoder_seq_lens_by_request, encoder_num_tokens})
+    encoder_seq_lens = sorted(set(encoder_seq_lens_by_request))
     first_sampling_params = SamplingParams(
         max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
         temperature=0.0,
@@ -826,7 +1023,12 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_cuda_graph_config(True, [2]),
+        cuda_graph_config=_cuda_graph_config(
+            True,
+            encoder_num_tokens_list,
+            encoder_seq_lens,
+            [2],
+        ),
         disable_overlap_scheduler=True,
         dtype="bfloat16",
         enable_chunked_prefill=False,

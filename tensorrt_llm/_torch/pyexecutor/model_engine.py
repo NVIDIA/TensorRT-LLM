@@ -28,6 +28,7 @@ from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
+                                          EncoderDecoderCudaGraphConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
@@ -368,37 +369,76 @@ class PyTorchModelEngine(ModelEngine):
         self._init_model_capacity()
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config
-        cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
+
+        # Split config into decoder and encoder parts.
+        # EncoderDecoderCudaGraphConfig: explicit sub-configs for each pass.
+        # EncodeCudaGraphConfig: encode-only models only; no decoder graphs.
+        # DecodeCudaGraphConfig / None: decoder only; no encoder graphs.
+        if isinstance(self.cuda_graph_config, EncoderDecoderCudaGraphConfig):
+            _decode_cfg = self.cuda_graph_config.decoder
+            _encode_cfg = self.cuda_graph_config.encoder
+        elif isinstance(self.cuda_graph_config, EncodeCudaGraphConfig):
+            if self._is_encoder_decoder_model():
+                logger.warning(
+                    "EncodeCudaGraphConfig is not supported for encoder-decoder "
+                    "models. Use EncoderDecoderCudaGraphConfig instead. "
+                    "Encoder and decoder CUDA graphs will be disabled.")
+                self.cuda_graph_config = None
+                _decode_cfg = None
+                _encode_cfg = None
+            else:
+                _decode_cfg = None
+                _encode_cfg = self.cuda_graph_config
+        else:
+            _decode_cfg = self.cuda_graph_config
+            _encode_cfg = None
+
+        # Decoder CUDA graph batch-size buckets.
+        cuda_graph_batch_sizes = _decode_cfg.batch_sizes if _decode_cfg else CudaGraphConfig.model_fields[
             'batch_sizes'].default
-        cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
+        cuda_graph_padding_enabled = _decode_cfg.enable_padding if _decode_cfg else CudaGraphConfig.model_fields[
             'enable_padding'].default
+
+        # Encoder CUDA graph batch-size buckets (may differ from decoder's).
+        encoder_cuda_graph_batch_sizes = _encode_cfg.batch_sizes if _encode_cfg else []
 
         # Encode-only CUDA graph detection. Decode configs do not define these
         # encoder-specific bucket fields.
         cuda_graph_num_tokens = []
         cuda_graph_seq_lens = []
-        if isinstance(self.cuda_graph_config, EncodeCudaGraphConfig):
-            cuda_graph_num_tokens = self.cuda_graph_config.num_tokens or []
-            cuda_graph_seq_lens = self.cuda_graph_config.seq_lens or []
+        if _encode_cfg is not None:
+            cuda_graph_num_tokens = _encode_cfg.num_tokens or []
+            cuda_graph_seq_lens = _encode_cfg.seq_lens or []
 
         self._is_encode_only = (self.llm_args.encode_only
                                 and not self.llm_args.mm_encoder_only)
 
         if ((self._is_encode_only or self._is_encoder_decoder_model())
-                and isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
+                and _encode_cfg is not None
                 and (not cuda_graph_num_tokens or not cuda_graph_seq_lens)):
             missing = []
             if not cuda_graph_num_tokens:
                 missing.append("num_tokens/max_num_token")
             if not cuda_graph_seq_lens:
                 missing.append("seq_lens/max_seq_len")
+            if self._is_encode_only:
+                example = (
+                    "EncodeCudaGraphConfig(max_batch_size=64, "
+                    "num_tokens=[128, 256, 512], "
+                    "max_seq_len=128, enable_padding=True) for encode-only models"
+                )
+            else:
+                example = (
+                    "EncoderDecoderCudaGraphConfig("
+                    "encoder=EncodeCudaGraphConfig("
+                    "max_batch_size=64, num_tokens=[128, 256, 512], "
+                    "max_seq_len=128, enable_padding=True)) for encoder-decoder models"
+                )
             logger.warning(
                 f"Encoder CUDA graph config is set, but "
                 f"{' and '.join(missing)} not set. Encoder CUDA graphs "
                 f"require both. Encoder CUDA graphs will be disabled. "
-                f"To enable them, specify e.g. "
-                f"EncodeCudaGraphConfig(max_batch_size=64, num_tokens=[128, 256, "
-                f"512], max_seq_len=128, enable_padding=True).")
+                f"To enable them, specify e.g. {example}.")
 
         self.torch_compile_config = self.llm_args.torch_compile_config
         torch_compile_enabled = bool(self.torch_compile_config is not None)
@@ -558,6 +598,10 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
+        # Encoder pass may have independent padding setting (EncoderDecoderCudaGraphConfig).
+        self._encoder_cuda_graph_padding_enabled = (
+            _encode_cfg.enable_padding
+            if _encode_cfg is not None else self._cuda_graph_padding_enabled)
 
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
@@ -567,25 +611,39 @@ class PyTorchModelEngine(ModelEngine):
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
 
+        # Encoder batch-size buckets are independent from the decoder's.
+        self._encoder_cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
+            encoder_cuda_graph_batch_sizes,
+            self.batch_size,
+            self.max_num_tokens,
+            0,  # no draft tokens on the encoder pass
+            self._encoder_cuda_graph_padding_enabled
+        ) if encoder_cuda_graph_batch_sizes else []
+
+        self._max_encoder_cuda_graph_batch_size = (
+            self._encoder_cuda_graph_batch_sizes[-1]
+            if self._encoder_cuda_graph_batch_sizes else 0)
+
         # Encoder CUDA graph bucket lists
         self._cuda_graph_num_tokens = _filter_cuda_graph_num_tokens(
             cuda_graph_num_tokens, self.max_num_tokens,
-            self._cuda_graph_padding_enabled) if cuda_graph_num_tokens else []
+            self._encoder_cuda_graph_padding_enabled
+        ) if cuda_graph_num_tokens else []
 
         self._max_cuda_graph_num_tokens = (self._cuda_graph_num_tokens[-1] if
                                            self._cuda_graph_num_tokens else 0)
         self._cuda_graph_seq_lens = _filter_cuda_graph_seq_lens(
-            cuda_graph_seq_lens, self.max_seq_len,
-            self._cuda_graph_padding_enabled) if cuda_graph_seq_lens else []
+            cuda_graph_seq_lens, self.max_seq_len, self.
+            _encoder_cuda_graph_padding_enabled) if cuda_graph_seq_lens else []
 
         self._max_cuda_graph_seq_len = (self._cuda_graph_seq_lens[-1]
                                         if self._cuda_graph_seq_lens else 0)
 
-        self._enable_encoder_cuda_graph = (
-            (self._is_encode_only or self._is_encoder_decoder_model())
-            and self.cuda_graph_config is not None
-            and bool(self._cuda_graph_num_tokens)
-            and bool(self._cuda_graph_seq_lens))
+        self._enable_encoder_cuda_graph = ((self._is_encode_only
+                                            or self._is_encoder_decoder_model())
+                                           and _encode_cfg is not None
+                                           and bool(self._cuda_graph_num_tokens)
+                                           and bool(self._cuda_graph_seq_lens))
 
         self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
         )
@@ -679,11 +737,11 @@ class PyTorchModelEngine(ModelEngine):
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
             use_cuda_graph=self._enable_encoder_cuda_graph,
-            cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
-            cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
+            cuda_graph_padding_enabled=self._encoder_cuda_graph_padding_enabled,
+            cuda_graph_batch_sizes=self._encoder_cuda_graph_batch_sizes,
             cuda_graph_num_tokens=self._cuda_graph_num_tokens,
             cuda_graph_seq_lens=self._cuda_graph_seq_lens,
-            max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
+            max_cuda_graph_batch_size=self._max_encoder_cuda_graph_batch_size,
             max_cuda_graph_num_tokens=self._max_cuda_graph_num_tokens,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
@@ -4939,7 +4997,7 @@ class PyTorchModelEngine(ModelEngine):
     def _get_encoder_cuda_graph_warmup_configs(
             self) -> List[Tuple[int, int, int]]:
         """Return feasible (batch_size, num_tokens, max_seq_len) graph keys."""
-        batch_sizes = sorted(self._cuda_graph_batch_sizes, reverse=True)
+        batch_sizes = sorted(self._encoder_cuda_graph_batch_sizes, reverse=True)
         num_tokens_list = sorted(self._cuda_graph_num_tokens)
         seq_lens_list = sorted(self._cuda_graph_seq_lens)
 
@@ -4960,7 +5018,16 @@ class PyTorchModelEngine(ModelEngine):
 
                     warmup_configs.append((bs, nt, sl))
 
-        return warmup_configs
+        if self._encoder_cuda_graph_padding_enabled:
+            for bs in batch_sizes:
+                if bs > self.batch_size:
+                    continue
+                for sl in reversed(seq_lens_list):
+                    nt = bs * sl
+                    if nt <= self._max_cuda_graph_num_tokens:
+                        warmup_configs.append((bs, nt, sl))
+
+        return list(dict.fromkeys(warmup_configs))
 
     def _capture_encoder_cuda_graphs(self) -> None:
         """Capture whole-model encoder CUDA graphs for all feasible keys.
@@ -5811,6 +5878,25 @@ class PyTorchModelEngine(ModelEngine):
         if callable(loader):
             loader(target_model)
 
+    @staticmethod
+    def _apply_logits_processors(request, logits_processors, logits_tensor,
+                                 beam_width, token_ids, logits_row_offset):
+        logits_rows = logits_tensor[logits_row_offset:logits_row_offset +
+                                    beam_width]
+        # Reshape to align w/ the shape used in the TRT backend,
+        # so the same logit processors can be used across both backends.
+        logits_rows = logits_rows.view(beam_width, 1, -1)
+        for lp in logits_processors:
+            lp_params = inspect.signature(lp).parameters
+
+            assert 4 <= len(lp_params) <= 5, (
+                "Logit post processor signature must match the `LogitsProcessor` interface "
+                "defined in `tensorrtllm.sampling_params`.")
+            lp(request.py_request_id, logits_rows, token_ids, None, None)
+
+        logits_tensor[logits_row_offset:logits_row_offset +
+                      beam_width] = logits_rows.view(beam_width, -1)
+
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
@@ -5823,32 +5909,37 @@ class PyTorchModelEngine(ModelEngine):
             # TODO: support models that don't return outputs as dict
             return
 
-        num_ctx_req = scheduled_requests.num_context_requests
         logits_tensor = outputs["logits"]
 
-        for idx, request in enumerate(scheduled_requests.all_requests()):
-            logits_processors = getattr(request, "py_logits_post_processors",
-                                        None)
-            if not logits_processors:
-                continue
+        logits_row_offset = 0
+        request_groups = (
+            (scheduled_requests.context_requests, True),
+            (scheduled_requests.generation_requests, False),
+        )
 
-            token_ids = request.get_tokens(0)
-            if idx < num_ctx_req and request.py_orig_prompt_len < len(
-                    token_ids):
-                # Skip as we only need to apply logit processor on the last context request
-                continue
+        for requests, is_context_request in request_groups:
+            for request in requests:
+                if is_context_request:
+                    beam_width = 1
+                else:
+                    beam_width = request.get_beam_width_by_iter(
+                        for_next_iteration=False)
 
-            logits_row = logits_tensor[idx]
-            # Reshape to align w/ the shape used in the TRT backend,
-            # so the same logit processors can be used across both backends.
-            logits_row = logits_row.view(1, 1, -1)
-            token_ids = [token_ids]
-            for lp in logits_processors:
-                lp_params = inspect.signature(lp).parameters
+                logits_processors = getattr(request,
+                                            "py_logits_post_processors", None)
+                if logits_processors:
+                    token_ids = ([request.get_tokens(0)]
+                                 if is_context_request else [
+                                     request.get_tokens(beam_idx)
+                                     for beam_idx in range(beam_width)
+                                 ])
+                    if (is_context_request
+                            and request.py_orig_prompt_len < len(token_ids[0])):
+                        # Skip as we only need to apply logit processor on the last context request
+                        logits_row_offset += beam_width
+                        continue
 
-                assert 4 <= len(lp_params) <= 5, (
-                    "Logit post processor signature must match the `LogitsProcessor` interface "
-                    "defined in `tensorrtllm.sampling_params`.")
-                lp(request.py_request_id, logits_row, token_ids, None, None)
-
-            logits_tensor[idx] = logits_row.view(-1)
+                    self._apply_logits_processors(request, logits_processors,
+                                                  logits_tensor, beam_width,
+                                                  token_ids, logits_row_offset)
+                logits_row_offset += beam_width
