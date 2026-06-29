@@ -774,7 +774,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
         stage('Check If Node Is Online') {
             CloudManager.withSlurmSshCredentialRemotes(pipeline, partition.clusterName, cluster) { remotes ->
-                def remote = CloudManager.selectReachableSlurmRemote(pipeline, remotes)
                 // Check the SLURM job once; if it is no longer active, raise a typed
                 // InfraFailure(SLURM) so the retry layer routes it via instanceof (scope=SLURM).
                 def checkSlurmJobActive = {
