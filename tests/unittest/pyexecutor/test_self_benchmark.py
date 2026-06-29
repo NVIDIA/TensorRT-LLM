@@ -8,6 +8,7 @@ import types
 
 import pytest
 
+import tensorrt_llm._torch.pyexecutor.self_benchmark as self_benchmark_module
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.self_benchmark import (
     BenchmarkPoint,
@@ -15,6 +16,34 @@ from tensorrt_llm._torch.pyexecutor.self_benchmark import (
     SelfBenchmark,
 )
 from tensorrt_llm.llmapi.llm_args import SelfBenchmarkConfig, TorchLlmArgs
+
+
+class _FakeLlmRequest:
+    """Stand-in for the LlmRequest produced by executor_request_to_llm_request.
+
+    The real conversion needs torch/bindings (unavailable on CPU-only CI), so
+    tests monkeypatch executor_request_to_llm_request with _fake_to_llm_request
+    below. The fake just carries the deterministic per-rank inputs we assert on.
+    """
+
+    def __init__(self, req_id, executor_request):
+        self.py_request_id = req_id
+        self.executor_request = executor_request
+        self.input_token_ids = list(executor_request.input_token_ids)
+        self.cache_salt = executor_request.cache_salt
+        self.is_self_benchmark_request = False
+        self.py_self_benchmark_point_id = None
+
+
+def _fake_to_llm_request(req_id, executor_request, child_req_ids,
+                         exclude_last_generation_logits, **kwargs):
+    return _FakeLlmRequest(req_id, executor_request)
+
+
+@pytest.fixture(autouse=True)
+def _patch_executor_request_to_llm_request(monkeypatch):
+    monkeypatch.setattr(self_benchmark_module, "executor_request_to_llm_request",
+                        _fake_to_llm_request)
 
 
 class _FakeRequest:
@@ -117,10 +146,27 @@ def test_torch_llm_args_self_benchmark_rejects_attention_dp():
                      self_benchmark_config=SelfBenchmarkConfig())
 
 
-def test_torch_llm_args_self_benchmark_rejects_multi_rank():
-    with pytest.raises(ValueError, match="world_size=1"):
+def test_torch_llm_args_self_benchmark_accepts_pure_tp():
+    # Per-rank deterministic replication makes pure tensor parallelism safe:
+    # every TP rank builds the same forward batch in lockstep.
+    args = TorchLlmArgs(model="dummy",
+                        tensor_parallel_size=2,
+                        self_benchmark_config=SelfBenchmarkConfig())
+    assert args.parallel_config.tp_size == 2
+    assert args.enable_iter_perf_stats is True
+
+
+def test_torch_llm_args_self_benchmark_rejects_pipeline_parallel():
+    with pytest.raises(ValueError, match="pipeline parallelism"):
         TorchLlmArgs(model="dummy",
-                     tensor_parallel_size=2,
+                     pipeline_parallel_size=2,
+                     self_benchmark_config=SelfBenchmarkConfig())
+
+
+def test_torch_llm_args_self_benchmark_rejects_context_parallel():
+    with pytest.raises(ValueError, match="context parallelism"):
+        TorchLlmArgs(model="dummy",
+                     context_parallel_size=2,
                      self_benchmark_config=SelfBenchmarkConfig())
 
 
@@ -196,18 +242,44 @@ def test_prefill_grid_omits_kv_read_axis_when_block_reuse_disabled():
             ]
 
 
-def test_prefill_queue_item_marks_executor_request():
+def test_prefill_request_built_per_rank_marks_llm_request():
     config = SelfBenchmarkConfig(mode="prefill",
                                  prefill_isl_granularity=1,
                                  warmup_iterations=0)
     benchmark = SelfBenchmark(_make_executor(config))
 
-    items = benchmark.make_prefill_queue_items([], [])
+    requests = benchmark.make_prefill_requests([], [])
 
-    assert len(items) == 1
-    assert items[0].id == 900_000_000
-    assert items[0].request.py_is_self_benchmark_request is True
-    assert items[0].request.py_self_benchmark_point_id == 0
+    # Built locally per-rank (no RequestQueueItem / broadcast). Deterministic
+    # request id and benchmark marking are set on the LlmRequest itself.
+    assert len(requests) == 1
+    assert requests[0].py_request_id == 900_000_000
+    assert requests[0].is_self_benchmark_request is True
+    assert requests[0].py_self_benchmark_point_id == 0
+
+
+def test_prefill_request_is_rank_independent():
+    """Per-rank lockstep: non-rank-0 builds the same prefill request as rank 0.
+
+    This guards the core TP invariant -- prefill injection must not depend on
+    being rank 0. Every input is a deterministic function of the grid point, so
+    a rank-1 executor produces a bit-identical request id / tokens / cache_salt.
+    """
+    config = SelfBenchmarkConfig(mode="prefill",
+                                 prefill_isl_granularity=1,
+                                 warmup_iterations=0)
+    rank0 = SelfBenchmark(_make_executor(config))
+    executor_rank1 = _make_executor(config)
+    executor_rank1.dist = types.SimpleNamespace(rank=1)
+    rank1 = SelfBenchmark(executor_rank1)
+
+    req0 = rank0.make_prefill_requests([], [])[0]
+    req1 = rank1.make_prefill_requests([], [])[0]
+
+    assert req0.py_request_id == req1.py_request_id
+    assert req0.input_token_ids == req1.input_token_ids
+    assert req0.cache_salt == req1.cache_salt
+    assert req0.py_self_benchmark_point_id == req1.py_self_benchmark_point_id
 
 
 def test_shutdown_finishes_benchmark_without_starting_next_point(tmp_path):
@@ -219,7 +291,7 @@ def test_shutdown_finishes_benchmark_without_starting_next_point(tmp_path):
     executor.is_shutdown = True
     benchmark = SelfBenchmark(executor)
 
-    assert benchmark.make_prefill_queue_items([], []) == []
+    assert benchmark.make_prefill_requests([], []) == []
     assert benchmark.active is False
     assert output_path.exists()
 
@@ -240,14 +312,14 @@ def test_prefill_seed_and_measure_requests_share_cache_salt():
                        cache_salt_id=123),
     ]
 
-    seed_items = benchmark.make_prefill_queue_items([], [])
+    seed_items = benchmark.make_prefill_requests([], [])
     benchmark._finish_current_point()
-    measure_items = benchmark.make_prefill_queue_items([], [])
+    measure_items = benchmark.make_prefill_requests([], [])
 
-    assert seed_items[0].request.input_token_ids == [1, 1, 1, 1]
-    assert seed_items[0].request.cache_salt == "123"
-    assert measure_items[0].request.input_token_ids == [1] * 8
-    assert measure_items[0].request.cache_salt == "123"
+    assert seed_items[0].input_token_ids == [1, 1, 1, 1]
+    assert seed_items[0].cache_salt == "123"
+    assert measure_items[0].input_token_ids == [1] * 8
+    assert measure_items[0].cache_salt == "123"
 
 
 def test_decode_injection_uses_dummy_kv_path():
@@ -397,7 +469,8 @@ def test_write_output(tmp_path):
     with open(output_path) as f:
         data = json.load(f)
     assert data["config"]["mode"] == "prefill"
-    assert data["timed_out"] is False
+    assert data["status"] == "complete"
+    assert data["valid"] is True
     assert data["limits"]["max_num_scheduled_tokens"] == 8
     assert data["limits"]["tokens_per_block"] == 32
     assert data["results"][0]["point"]["isl"] == 8

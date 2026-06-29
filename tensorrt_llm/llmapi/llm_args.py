@@ -2388,13 +2388,6 @@ class SelfBenchmarkConfig(StrictBaseModel):
         description="Path to write self-benchmark results JSON.",
         status="prototype")
 
-    timeout_s: PositiveInt = Field(
-        default=300,
-        description=
-        "Maximum number of seconds external callers should wait for "
-        "self-benchmark output.",
-        status="prototype")
-
 
 class RayPlacementConfig(StrictBaseModel):
     """Configuration for Ray GPU workers placement.
@@ -4942,11 +4935,41 @@ class TorchLlmArgs(BaseLlmArgs):
                 "self_benchmark_config is not supported with attention data "
                 "parallelism yet. Disable enable_attention_dp to use startup "
                 "self-benchmarking.")
-        if self.parallel_config.world_size != 1:
+        # Self-benchmark injection is per-rank deterministic and relies on every
+        # rank building an identical forward batch each iteration. Pure tensor
+        # parallelism preserves that invariant (active_requests / waiting_queue
+        # are mirrored across TP ranks and per-rank KV budgets are equal), so
+        # tensor_parallel_size > 1 is allowed. Pipeline/context/expert/data
+        # parallelism break the per-rank lockstep (uneven pipeline stages,
+        # partitioned context, asymmetric expert/DP routing) and are rejected
+        # until those paths are validated.
+        parallel = self.parallel_config
+        if parallel.pp_size > 1:
             raise ValueError(
-                "self_benchmark_config is only supported with world_size=1 "
-                "until benchmark request injection is synchronized across "
-                "distributed ranks.")
+                "self_benchmark_config is not supported with pipeline "
+                "parallelism yet (pipeline_parallel_size > 1). Only pure tensor "
+                "parallelism is supported.")
+        if parallel.cp_size > 1:
+            raise ValueError(
+                "self_benchmark_config is not supported with context "
+                "parallelism yet (cp_size > 1). Only pure tensor parallelism is "
+                "supported.")
+        if parallel.enable_attention_dp:
+            raise ValueError(
+                "self_benchmark_config is not supported with data/attention "
+                "parallelism yet. Only pure tensor parallelism is supported.")
+        if parallel.moe_ep_size > 1 or parallel.moe_cluster_size > 1:
+            raise ValueError(
+                "self_benchmark_config is not supported with expert "
+                "parallelism yet (moe_ep_size/moe_cluster_size > 1). Only pure "
+                "tensor parallelism is supported.")
+        # Any remaining world_size > 1 must be pure TP (tp_size == world_size).
+        if parallel.world_size != parallel.tp_size:
+            raise ValueError(
+                "self_benchmark_config only supports pure tensor parallelism; "
+                f"got world_size={parallel.world_size} with "
+                f"tp_size={parallel.tp_size}. Disable other forms of "
+                "parallelism to use startup self-benchmarking.")
         self.enable_iter_perf_stats = True
         return self
 

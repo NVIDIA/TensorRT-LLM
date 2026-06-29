@@ -69,8 +69,6 @@ _SELF_BENCHMARK_WARMUP_ITERATIONS = SelfBenchmarkConfig.model_fields[
     "warmup_iterations"].default
 _SELF_BENCHMARK_OUTPUT_PATH = SelfBenchmarkConfig.model_fields[
     "output_path"].default
-_SELF_BENCHMARK_TIMEOUT = SelfBenchmarkConfig.model_fields[
-    "timeout_s"].default
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -235,7 +233,6 @@ def get_llm_args(
             _SELF_BENCHMARK_DECODE_BATCH_GRANULARITY),
         self_benchmark_warmup_iterations: int = _SELF_BENCHMARK_WARMUP_ITERATIONS,
         self_benchmark_output_path: str = _SELF_BENCHMARK_OUTPUT_PATH,
-        self_benchmark_timeout: int = _SELF_BENCHMARK_TIMEOUT,
         explicit_cli_keys: Optional[Set[str]] = None,
         **llm_args_extra_dict: Any):
 
@@ -339,7 +336,6 @@ def get_llm_args(
             decode_batch_granularity=self_benchmark_decode_batch_granularity,
             warmup_iterations=self_benchmark_warmup_iterations,
             output_path=self_benchmark_output_path,
-            timeout_s=self_benchmark_timeout,
         ) if self_benchmark_mode is not None else None,
     }
 
@@ -945,13 +941,6 @@ class ChoiceWithAlias(click.Choice):
     default=_SELF_BENCHMARK_OUTPUT_PATH,
     help=help_info_with_stability_tag(
         "Path to write startup self-benchmark results JSON.", "prototype"))
-@click.option(
-    "--self_benchmark_timeout",
-    type=int,
-    default=_SELF_BENCHMARK_TIMEOUT,
-    help=help_info_with_stability_tag(
-        "Maximum seconds external launchers should wait for startup "
-        "self-benchmark output.", "prototype"))
 @click.option("--chat_template",
               type=str,
               default=None,
@@ -1028,7 +1017,6 @@ def serve(
         self_benchmark_decode_batch_granularity: int,
         self_benchmark_warmup_iterations: int,
         self_benchmark_output_path: str,
-        self_benchmark_timeout: int,
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
@@ -1098,7 +1086,6 @@ def serve(
         "self_benchmark_decode_batch_granularity",
         "self_benchmark_warmup_iterations",
         "self_benchmark_output_path",
-        "self_benchmark_timeout",
     }
     if (self_benchmark_mode is None
             and explicit_cli_keys.intersection(self_benchmark_cli_keys)):
@@ -1147,7 +1134,6 @@ def serve(
             self_benchmark_decode_batch_granularity=self_benchmark_decode_batch_granularity,
             self_benchmark_warmup_iterations=self_benchmark_warmup_iterations,
             self_benchmark_output_path=self_benchmark_output_path,
-            self_benchmark_timeout=self_benchmark_timeout,
             explicit_cli_keys=explicit_cli_keys)
 
         llm_args_extra_dict = {}

@@ -3770,15 +3770,19 @@ class PyExecutor:
                             timeout))
 
             if benchmark_active:
+                # During self-benchmarking, defer real user requests
+                # (accumulate them) and forward only control/special items.
+                # Synthetic benchmark PREFILL requests are NOT injected here:
+                # they are built per-rank in _fetch_and_activate_new_requests so
+                # every TP rank deterministically produces the same forward
+                # batch. Injecting them into rank 0's broadcast queue would
+                # double-inject on non-rank-0 ranks (once via broadcast, once
+                # locally) and desync the per-rank state machine.
                 for req_item in queued_requests:
                     if req_item.is_normal_request:
                         self.request_accumulated.append(req_item)
                     else:
                         new_requests.append(req_item)
-                if len(new_requests) == 0:
-                    new_requests.extend(
-                        self.self_benchmark.make_prefill_queue_items(
-                            self.active_requests, waiting_queue))
             else:
                 new_requests.extend(queued_requests)
 
@@ -3972,8 +3976,19 @@ class PyExecutor:
 
         self.active_requests.extend(validated_requests)
         if self.self_benchmark is not None and self.self_benchmark.active:
-            benchmark_requests = self.self_benchmark.make_decode_requests(
+            # Self-benchmark injection runs identically on EVERY TP rank here
+            # (this method is invoked per-rank by the main loops). Both prefill
+            # and decode requests are constructed locally and deterministically
+            # from the grid point index, so each rank advances the same state
+            # machine and produces the same forward batch in lockstep -- no
+            # per-iteration broadcast/collective is needed. Prefill is attempted
+            # first; make_prefill_requests returns [] when the next point is a
+            # decode point (and vice versa), so at most one path injects.
+            benchmark_requests = self.self_benchmark.make_prefill_requests(
                 self.active_requests, self.waiting_queue)
+            benchmark_requests.extend(
+                self.self_benchmark.make_decode_requests(
+                    self.active_requests, self.waiting_queue))
             self.active_requests.extend(benchmark_requests)
             validated_requests.extend(benchmark_requests)
         return validated_requests
