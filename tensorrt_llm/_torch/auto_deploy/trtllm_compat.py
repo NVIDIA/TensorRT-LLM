@@ -28,6 +28,12 @@ from types import ModuleType
 
 REDIRECT_ENV_VAR = "TRTLLM_REDIRECT_AD_TO_LLMC"
 
+__all__ = [
+    "REDIRECT_ENV_VAR",
+    "install_autodeploy_redirect",
+    "install_autodeploy_redirect_from_env",
+]
+
 _LEGACY_PACKAGE = "tensorrt_llm._torch.auto_deploy"
 _TARGET_PACKAGE = "llmc"
 _FALSE_VALUES = frozenset({"", "0", "false", "no", "off"})
