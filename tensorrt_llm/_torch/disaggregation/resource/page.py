@@ -105,9 +105,9 @@ class PoolView:
 
     Fields:
         pool_idx: Index of the physical pool within its pool group.
-        buffer_entries: Per-(layer, role) byte layout. ``role`` is a
-            manager-private uint32 used only for byte-level addressing within
-            this side; it is not compared across peers.
+        buffer_entries: Structured array using ``BUFFER_ENTRY_DTYPE``. Each
+            entry records a buffer's ``local_layer_id`` and its byte ``offset``
+            and ``size`` within the pool slot. FLAT pools have no entries.
         pool_role: Set of native role-name strings (whatever the cache manager
             uses, e.g. ``"key"`` / ``"value"`` / ``"deepseek_v4_swa"``) that
             live in this pool. Used as the *equivalence label* for peer-to-peer

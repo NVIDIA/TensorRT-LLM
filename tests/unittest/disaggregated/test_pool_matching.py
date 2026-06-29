@@ -17,6 +17,7 @@ called out in the refactor commit message.
 """
 
 import numpy as np
+import pytest
 
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
@@ -317,3 +318,33 @@ def test_same_role_pools_disambiguated_by_layer_overlap():
 
     mapping = reg.get_pool_mapping(peer_ri)
     assert mapping == {(0, 0): (0, 1)}
+
+
+@pytest.mark.parametrize(
+    ("self_mapper_kind", "peer_mapper_kind"),
+    [
+        (MapperKind.FLAT, MapperKind.INDEXED),
+        (MapperKind.INDEXED, MapperKind.FLAT),
+    ],
+)
+def test_mixed_mapper_kinds_are_rejected(self_mapper_kind, peer_mapper_kind):
+    """Pool layouts must use the same mapper kind on both peers."""
+
+    def _indexer_view(mapper_kind):
+        if mapper_kind == MapperKind.FLAT:
+            return _empty_pool_view(0)
+        return _pool_view(
+            0,
+            [(0, "indexer_k"), (1, "indexer_k")],
+            pool_role=frozenset({"indexer_k"}),
+        )
+
+    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_indexer_view(self_mapper_kind)])
+    peer_lg = _attn_lg(0, [(0, 10), (1, 11)], [_indexer_view(peer_mapper_kind)])
+    reg = _registrar(_page_table([self_lg]))
+    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
+
+    with pytest.raises(ValueError, match="incompatible mapper kinds"):
+        reg.get_pool_mapping(peer_ri)
+    with pytest.raises(ValueError, match="incompatible mapper kinds"):
+        reg.get_kv_map(peer_ri, (0, 0), (0, 0))

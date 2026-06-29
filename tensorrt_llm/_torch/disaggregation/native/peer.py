@@ -111,9 +111,9 @@ class PeerRegistrar:
 
         Two-step matching:
         1. Find peer layer_group via layer_to_layer_group (global_layer_id -> lg_idx).
-        2. Within the matched peer layer_group, find the peer pool whose
-           ``PoolView.pool_role`` equals self's, breaking ties by largest
-           global_layer_id overlap.
+        2. Within the matched peer layer_group, find the unique peer pool whose
+           ``PoolView.pool_role`` equals self's and whose global_layer_ids
+           overlap.
 
         Layer-overlap is required: a peer pool with the same pool_role but
         zero layer overlap with self is *not* a match — the two pools cover
@@ -186,9 +186,17 @@ class PeerRegistrar:
                         if peer_pv.mapper_kind == MapperKind.FLAT
                         else get_pool_view_global_layer_ids(peer_pv, peer_lg)
                     )
-                    if set(peer_global_ids) & self_layer_set:
-                        matched_peer_pi = peer_pi
-                        break
+                    if not set(peer_global_ids) & self_layer_set:
+                        continue
+                    if peer_pv.mapper_kind != self_pv.mapper_kind:
+                        raise ValueError(
+                            "PeerRegistrar.get_pool_mapping: incompatible mapper "
+                            f"kinds for pool role {sorted(self_pv.pool_role)} "
+                            f"(local={self_pv.mapper_kind.name}, "
+                            f"peer={peer_pv.mapper_kind.name}, peer_pool={peer_pi})"
+                        )
+                    matched_peer_pi = peer_pi
+                    break
 
                 if matched_peer_pi is not None:
                     mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)
@@ -226,6 +234,11 @@ class PeerRegistrar:
         peer_pv = peer_lg.pool_views[peer_pi]
 
         assert self._ri.attention is not None
+        if self_pv.mapper_kind != peer_pv.mapper_kind:
+            raise ValueError(
+                "PeerRegistrar.get_kv_map: incompatible mapper kinds "
+                f"(local={self_pv.mapper_kind.name}, peer={peer_pv.mapper_kind.name})"
+            )
 
         # FLAT pools carry no per-buffer layer info, so layer ids and
         # layer count come from the layer_group itself.

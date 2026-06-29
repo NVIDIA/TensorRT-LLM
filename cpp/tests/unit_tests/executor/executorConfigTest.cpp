@@ -27,6 +27,17 @@ using ::testing::Invoke;
 using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::common;
 
+TEST(CacheTransceiverConfigTest, validatesKvTransferPollInterval)
+{
+    auto makeConfig = [](std::optional<int> pollIntervalMs)
+    { return CacheTransceiverConfig(std::nullopt, std::nullopt, std::nullopt, std::nullopt, pollIntervalMs); };
+
+    EXPECT_EQ(makeConfig(std::nullopt).getKvTransferPollIntervalMs(), std::nullopt);
+    EXPECT_EQ(makeConfig(1).getKvTransferPollIntervalMs(), 1);
+    EXPECT_THROW(makeConfig(0), TllmException);
+    EXPECT_THROW(makeConfig(-1), TllmException);
+}
+
 TEST(ExecutorConfigTest, ctorValidInputs)
 {
     SchedulerConfig schedulerConfig;
