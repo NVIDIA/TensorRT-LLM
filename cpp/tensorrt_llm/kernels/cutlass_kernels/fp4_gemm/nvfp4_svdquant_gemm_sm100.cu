@@ -84,10 +84,10 @@ struct SvdquantGemmConfig
     using MainloopSchedule = MainloopSchedule_;
     using ClusterShape = Shape<int, int, _1>;
 
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<Arch,
-        cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementC, LayoutC, AlignC, OutElementType, LayoutC, AlignC, EpilogueSchedule,
-        FusionOperation>::CollectiveOp;
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<Arch, cutlass::arch::OpClassTensorOp, MmaTileShape,
+            ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC, LayoutC, AlignC,
+            OutElementType, LayoutC, AlignC, EpilogueSchedule, FusionOperation>::CollectiveOp;
 
     // Build the standard block-scaled mainloop, then re-instantiate CollectiveMmaLoRA with the
     // builder's extracted template arguments. D/L1 overlay the residual A/B stage buffers, so no
@@ -95,8 +95,8 @@ struct SvdquantGemmConfig
     using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveBuilder<Arch,
         cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementType, SFType>, LayoutA, AlignA,
         cute::tuple<ElementType, SFType>, LayoutB, AlignB, ElementAccumulator, MmaTileShape, ClusterShape,
-        cutlass::gemm::collective::StageCountAutoCarveout<
-            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
         MainloopSchedule>::CollectiveOp;
 
     using CollectiveMainloop
@@ -104,29 +104,24 @@ struct SvdquantGemmConfig
             typename CollectiveMainloopBase::TileShape, typename CollectiveMainloopBase::ElementPairA,
             typename CollectiveMainloopBase::StridePairA, typename CollectiveMainloopBase::ElementPairB,
             typename CollectiveMainloopBase::StridePairB, typename CollectiveMainloopBase::TiledMma,
-            typename CollectiveMainloopBase::GmemTiledCopyPairA,
-            typename CollectiveMainloopBase::SmemLayoutAtomPairA, typename CollectiveMainloopBase::SmemCopyAtomA,
-            typename CollectiveMainloopBase::TransformA, typename CollectiveMainloopBase::GmemTiledCopyPairB,
-            typename CollectiveMainloopBase::SmemLayoutAtomPairB, typename CollectiveMainloopBase::SmemCopyAtomB,
-            typename CollectiveMainloopBase::TransformB>;
+            typename CollectiveMainloopBase::GmemTiledCopyPairA, typename CollectiveMainloopBase::SmemLayoutAtomPairA,
+            typename CollectiveMainloopBase::SmemCopyAtomA, typename CollectiveMainloopBase::TransformA,
+            typename CollectiveMainloopBase::GmemTiledCopyPairB, typename CollectiveMainloopBase::SmemLayoutAtomPairB,
+            typename CollectiveMainloopBase::SmemCopyAtomB, typename CollectiveMainloopBase::TransformB>;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
         CollectiveEpilogue, cutlass::gemm::PersistentScheduler>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-using Tactic1Sm128x256x128Config
-    = SvdquantGemmConfig<Shape<_128, _256, _128>, cutlass::epilogue::TmaWarpSpecialized1Sm,
-        cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
-using Tactic2Sm256x256x128Config
-    = SvdquantGemmConfig<Shape<_256, _256, _128>, cutlass::epilogue::TmaWarpSpecialized2Sm,
-        cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
-using Tactic1Sm128x128x128Config
-    = SvdquantGemmConfig<Shape<_128, _128, _128>, cutlass::epilogue::TmaWarpSpecialized1Sm,
-        cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
-using Tactic2Sm256x192x128Config
-    = SvdquantGemmConfig<Shape<_256, _192, _128>, cutlass::epilogue::TmaWarpSpecialized2Sm,
-        cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
+using Tactic1Sm128x256x128Config = SvdquantGemmConfig<Shape<_128, _256, _128>, cutlass::epilogue::TmaWarpSpecialized1Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
+using Tactic2Sm256x256x128Config = SvdquantGemmConfig<Shape<_256, _256, _128>, cutlass::epilogue::TmaWarpSpecialized2Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
+using Tactic1Sm128x128x128Config = SvdquantGemmConfig<Shape<_128, _128, _128>, cutlass::epilogue::TmaWarpSpecialized1Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
+using Tactic2Sm256x192x128Config = SvdquantGemmConfig<Shape<_256, _192, _128>, cutlass::epilogue::TmaWarpSpecialized2Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
 
 enum class KernelShape
 {
@@ -149,10 +144,8 @@ RuntimeTactic resolve_tactic(int tactic)
     // group, so every 2SM cluster uses 2x1 as its fallback.
     switch (static_cast<Nvfp4SvdquantGemmTactic>(tactic))
     {
-    case Nvfp4SvdquantGemmTactic::k1Sm128x256x128:
-        return {KernelShape::k1Sm128x256x128, dim3(1, 1, 1), dim3(1, 1, 1)};
-    case Nvfp4SvdquantGemmTactic::k2Sm256x256x128:
-        return {KernelShape::k2Sm256x256x128, dim3(2, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x256x128: return {KernelShape::k1Sm128x256x128, dim3(1, 1, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x128: return {KernelShape::k2Sm256x256x128, dim3(2, 1, 1), dim3(2, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k1Sm128x256x128Cluster1x2:
         return {KernelShape::k1Sm128x256x128, dim3(1, 2, 1), dim3(1, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k1Sm128x256x128Cluster1x4:
@@ -167,12 +160,10 @@ RuntimeTactic resolve_tactic(int tactic)
         return {KernelShape::k2Sm256x256x128, dim3(4, 4, 1), dim3(2, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k2Sm256x256x128Cluster4x1:
         return {KernelShape::k2Sm256x256x128, dim3(4, 1, 1), dim3(2, 1, 1)};
-    case Nvfp4SvdquantGemmTactic::k1Sm128x128x128:
-        return {KernelShape::k1Sm128x128x128, dim3(1, 1, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x128x128: return {KernelShape::k1Sm128x128x128, dim3(1, 1, 1), dim3(1, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k1Sm128x128x128Cluster1x2:
         return {KernelShape::k1Sm128x128x128, dim3(1, 2, 1), dim3(1, 1, 1)};
-    case Nvfp4SvdquantGemmTactic::k2Sm256x192x128:
-        return {KernelShape::k2Sm256x192x128, dim3(2, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x128: return {KernelShape::k2Sm256x192x128, dim3(2, 1, 1), dim3(2, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k2Sm256x192x128Cluster2x2:
         return {KernelShape::k2Sm256x192x128, dim3(2, 2, 1), dim3(2, 1, 1)};
     default: throw std::invalid_argument("nvfp4_svdquant_gemm: invalid tactic");
@@ -275,8 +266,8 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic)
 // Fused residual NVFP4 GEMM + rank-r LoRA-up: D @ L1ᵀ via the 2nd bf16 tcgen05 MMA in the custom
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
 void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const* sfa, void const* sfb,
-    float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, char* ws,
-    size_t wsBytes, cudaStream_t stream, int tactic, int64_t dStride)
+    float const* alpha, void const* D, void const* L1, void const* bias, int m, int n, int k, char* ws, size_t wsBytes,
+    cudaStream_t stream, int tactic, int64_t dStride)
 {
     RuntimeTactic const runtime_tactic = resolve_tactic(tactic);
     switch (runtime_tactic.kernel_shape)

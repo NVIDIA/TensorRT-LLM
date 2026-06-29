@@ -105,8 +105,7 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
     TORCH_CHECK(D.size(0) == m, "D must have m rows");
     TORCH_CHECK(D.stride(1) == 1, "D must be contiguous in its inner dimension");
     TORCH_CHECK(down_offset >= 0, "down_offset must be non-negative");
-    TORCH_CHECK(D.size(1) >= 32 && down_offset <= D.size(1) - 32,
-        "down_offset + 32 must not exceed D.size(1)");
+    TORCH_CHECK(D.size(1) >= 32 && down_offset <= D.size(1) - 32, "down_offset + 32 must not exceed D.size(1)");
     auto const downAddress = reinterpret_cast<std::uintptr_t>(D.const_data_ptr<at::BFloat16>() + down_offset);
     TORCH_CHECK(downAddress % 16 == 0, "D + down_offset must be 16-byte aligned for TMA");
     TORCH_CHECK(D.stride(0) % 8 == 0, "D row stride must be a multiple of 8 bf16 elements for TMA");
@@ -142,8 +141,8 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
     auto const* downPtr = D.const_data_ptr<at::BFloat16>() + down_offset;
     int64_t const downStride = D.stride(0);
     tensorrt_llm::kernels::cutlass_kernels::nvfp4_svdquant_gemm_run(out.data_ptr(), a_.const_data_ptr(),
-        wq_.const_data_ptr(), aSf_.const_data_ptr(), wSf_.const_data_ptr(), alpha_.const_data_ptr<float>(),
-        downPtr, L1_.const_data_ptr(), biasPtr, m, n, k, reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, stream,
+        wq_.const_data_ptr(), aSf_.const_data_ptr(), wSf_.const_data_ptr(), alpha_.const_data_ptr<float>(), downPtr,
+        L1_.const_data_ptr(), biasPtr, m, n, k, reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, stream,
         tacticId, downStride);
     return out;
 }
@@ -151,10 +150,9 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
 class NVFP4SVDQuantGemmRunner : public torch::CustomClassHolder
 {
 public:
-    at::Tensor runGemm(at::Tensor const& a, at::Tensor const& wq, at::Tensor const& a_sf,
-        at::Tensor const& w_sf, at::Tensor const& alpha, at::Tensor const& D, at::Tensor const& L1,
-        std::optional<c10::ScalarType> out_dtype, std::optional<at::Tensor> const& bias, int64_t tactic,
-        int64_t down_offset) const
+    at::Tensor runGemm(at::Tensor const& a, at::Tensor const& wq, at::Tensor const& a_sf, at::Tensor const& w_sf,
+        at::Tensor const& alpha, at::Tensor const& D, at::Tensor const& L1, std::optional<c10::ScalarType> out_dtype,
+        std::optional<at::Tensor> const& bias, int64_t tactic, int64_t down_offset) const
     {
         return nvfp4_svdquant_gemm(a, wq, a_sf, w_sf, alpha, D, L1, out_dtype, bias, tactic, down_offset);
     }

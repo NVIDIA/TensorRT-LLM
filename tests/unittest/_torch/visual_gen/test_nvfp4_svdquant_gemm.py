@@ -41,9 +41,7 @@ _GEMM_CASES = [
 ]
 # Exercise every dynamic cluster shape on one image-sized problem. The broader
 # shape/bias matrix above stays on the two base kernel shapes to keep SM100 CI bounded.
-_GEMM_CASES.extend(
-    (6912, 3072, 3072, True, tactic) for tactic in range(2, 9)
-)
+_GEMM_CASES.extend((6912, 3072, 3072, True, tactic) for tactic in range(2, 9))
 # Cover both runtime clusters of each new narrow tile. M=44 exercises the
 # token-tail regime where N=128 adds useful parallelism; M=6912 exercises the
 # N=192 scale-factor layout and odd/even N-tile addressing at image size.
@@ -146,16 +144,10 @@ def test_nvfp4_svdquant_gemm_packed_down(pack_width, down_offset, tactic):
     down_pack = torch.randn(m, pack_width, dtype=torch.bfloat16, device=dev)
     assert down_pack.is_contiguous() and down_pack.stride() == (pack_width, 1)
     down = down_pack[:, down_offset : down_offset + _RANK]
-    lora_up = torch.randn(n, _RANK, dtype=torch.bfloat16, device=dev) / (
-        _RANK**0.25
-    )
-    lora_up_scaled = (
-        lora_up.float() / alpha.reshape(-1)[:1]
-    ).to(torch.bfloat16).contiguous()
+    lora_up = torch.randn(n, _RANK, dtype=torch.bfloat16, device=dev) / (_RANK**0.25)
+    lora_up_scaled = (lora_up.float() / alpha.reshape(-1)[:1]).to(torch.bfloat16).contiguous()
 
-    ref = torch.ops.trtllm.fp4_gemm(
-        xq, wq, x_sf, w_sf, alpha, 0, torch.bfloat16
-    ).float()
+    ref = torch.ops.trtllm.fp4_gemm(xq, wq, x_sf, w_sf, alpha, 0, torch.bfloat16).float()
     ref = ref + down.float() @ lora_up.float().t()
     out = torch.ops.trtllm.nvfp4_svdquant_gemm(
         xq.view(torch.uint8),

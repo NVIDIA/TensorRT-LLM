@@ -1154,16 +1154,12 @@ class QwenImageTransformerBlock(nn.Module):
 
         def apply_img_mlp() -> torch.Tensor:
             img_hidden_states = hidden_states + img_gate1 * img_attn_output
-            img_modulated2, img_gate2 = self._modulate(
-                self.img_norm2(img_hidden_states), img_mod2
-            )
+            img_modulated2, img_gate2 = self._modulate(self.img_norm2(img_hidden_states), img_mod2)
             return img_hidden_states + img_gate2 * self.img_mlp(img_modulated2)
 
         def apply_txt_mlp() -> torch.Tensor:
             txt_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-            txt_modulated2, txt_gate2 = self._modulate(
-                self.txt_norm2(txt_hidden_states), txt_mod2
-            )
+            txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(txt_hidden_states), txt_mod2)
             return txt_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
 
         if self._svdquant_mlp_events is not None:
