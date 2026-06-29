@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import datetime
 import functools
@@ -4535,10 +4550,10 @@ class PyExecutor:
             logger.warning(
                 "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 was requested, but "
                 f"{type(transceiver).__name__} does not advertise in-flight "
-                "request cancellation support. This PR scopes cancellation "
-                "and transfer-buffer quarantine to the C++ cache transceiver; "
-                "using the existing timeout and cancellation behavior for this "
-                "transceiver.")
+                "request cancellation support. Cancellation and transfer-buffer "
+                "quarantine are currently scoped to the C++ NIXL transceiver "
+                "with the UCX plugin; using the existing timeout and "
+                "cancellation behavior for this transceiver.")
             self._disagg_inflight_cancel_unsupported_logged = True
         return False
 
@@ -5748,11 +5763,9 @@ class PyExecutor:
                     is_cancelled = self.kv_cache_transceiver.cancel_request(
                         request)
                     if is_cancelled:
-                        self._handle_errors(
-                            error_msg=
-                            f"Request {request.py_request_id} timed out",
-                            requests=[request],
-                            charge_budget=False)
+                        # _handle_errors enters response collectives under ADP.
+                        # Defer it until the rank-uniform vote below.
+                        timed_out_requests.append(request)
                     continue
 
                 new_active_requests.append(request)
