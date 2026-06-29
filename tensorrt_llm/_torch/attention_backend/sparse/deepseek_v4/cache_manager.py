@@ -138,11 +138,21 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         mapping: Mapping,
         dtype: DataType = DataType.BF16,
         compressor_dtype: DataType = DataType.FLOAT,
-        sparse_attn_config: DeepSeekV4SparseAttentionConfig,
+        sparse_attn_config: Optional[DeepSeekV4SparseAttentionConfig] = None,
         max_input_len: Optional[int] = None,
         max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> None:
+        if sparse_attn_config is None:
+            sparse_attn_config = kwargs.pop("sparse_attention_config", None)
+        if sparse_attn_config is None and kwargs.get("model_config") is not None:
+            sparse_attn_config = kwargs["model_config"].sparse_attention_config
+        if sparse_attn_config is None:
+            raise ValueError(
+                "sparse_attn_config or sparse_attention_config is required "
+                "for DeepseekV4CacheManager"
+            )
+
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
         assert num_kv_heads == 1, "DeepSeek-V4 only supports num_kv_heads == 1"

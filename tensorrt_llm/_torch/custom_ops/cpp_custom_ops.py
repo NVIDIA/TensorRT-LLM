@@ -387,6 +387,20 @@ def _register_fake():
         scale_fp8_sf = input.new_empty((sf_size, ), dtype=torch.uint8)
         return val_mxfp8, scale_fp8_sf
 
+    @torch.library.register_fake("trtllm::mxfp8_mxfp8_gemm")
+    def _(
+        act: torch.Tensor,
+        actScale: torch.Tensor,
+        weight: torch.Tensor,
+        weightScale: torch.Tensor,
+        globalScale: torch.Tensor,
+        out_dtype: Optional[torch.dtype] = None,
+    ):
+        m = act.shape[0]
+        n = weight.shape[0]
+        dtype = out_dtype if out_dtype is not None else torch.bfloat16
+        return act.new_empty((m, n), dtype=dtype)
+
     @torch.library.register_fake("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner")
     def _(
         routing_logits: Optional[torch.Tensor],
@@ -1283,6 +1297,52 @@ def _register_fake():
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
 
+    @torch.library.register_fake(
+        "trtllm::fused_dit_gate_resid_norm_shift_scale")
+    def _(x,
+          attn=None,
+          gate_table=None,
+          gate_ts=None,
+          scale_table=None,
+          scale_ts=None,
+          shift_table=None,
+          shift_ts=None,
+          sf_scale=None,
+          eps=1e-6,
+          num_out=1):
+        """Fake/meta for the unified fused DiT pre-block op (residual + gate +
+        RMSNorm + (dual) shift_scale + optional NVFP4 quant). Fully functional:
+        x is not mutated; for residual variants the new residual stream x_new is
+        returned as output[0] (callers rebind). All outputs are freshly allocated.
+        Optional list args default to None when the caller omits them.
+
+        Returns (x_new prepended iff residual; mirrors the CUDA op):
+          residual, num_out==0  -> [x_new]                                 (gate-residual only)
+          residual, bf16        -> [x_new, out_0, ..., out_{N-1}]
+          residual, quant       -> [x_new, fp4_0, sf_0, ..., fp4_{N-1}, sf_{N-1}]
+          no-residual, bf16     -> [out_0, ..., out_{N-1}]
+          no-residual, quant    -> [fp4_0, sf_0, ..., fp4_{N-1}, sf_{N-1}]   (128x4 SWIZZLED SF)
+        """
+        outs = []
+        if attn is not None:  # residual: x_new = output[0]
+            outs.append(torch.empty_like(x))
+        if num_out <= 0:
+            return outs
+        if not sf_scale:  # None (omitted) or empty -> bf16 outputs
+            outs.extend(torch.empty_like(x) for _ in range(num_out))
+            return outs
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        for _ in range(num_out):
+            outs.append(x.new_empty((M, D // 2), dtype=torch.uint8))
+            outs.append(x.new_empty((scale_shape, ), dtype=torch.uint8))
+        return outs
+
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
@@ -1319,64 +1379,3 @@ def _register_fake():
           top_p: Optional[torch.Tensor] = None,
           skip_temperature: bool = False) -> torch.Tensor:
         return logits.new_empty(list(logits.shape), dtype=torch.float32)
-
-    @torch.library.register_fake("trtllm::build_draft_prob_indices_out_op")
-    def _(topkScoreIndices: torch.Tensor, draftProbIndices: torch.Tensor,
-          topK: int, numDraftTokens: int) -> None:
-        return None
-
-    @torch.library.register_fake("trtllm::verify_dynamic_tree_rejection_out_op")
-    def _(candidates: torch.Tensor, draftProbs: torch.Tensor,
-          targetProbs: torch.Tensor, targetSupportIndices: torch.Tensor,
-          targetSupportLengths: torch.Tensor, draftProbIndices: torch.Tensor,
-          retrieveNextToken: torch.Tensor, retrieveNextSibling: torch.Tensor,
-          treeValid: torch.Tensor, acceptIndex: torch.Tensor,
-          acceptTokenNum: torch.Tensor, acceptToken: torch.Tensor,
-          numSpecStep: int, seed: torch.Tensor, offset: torch.Tensor) -> None:
-        return None
-
-    @torch.library.register_fake(
-        "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op")
-    def _(draftLogits: torch.Tensor,
-          temperatures: torch.Tensor,
-          numDraftProbRows: int,
-          targetVocabSize: int,
-          top_k: Optional[torch.Tensor] = None,
-          top_p: Optional[torch.Tensor] = None,
-          skip_temperature: bool = False,
-          d2t: Optional[torch.Tensor] = None,
-          top_k_max: int = 0,
-          skip_all_sampling_params: bool = False) -> torch.Tensor:
-        batch_size = temperatures.shape[0]
-        return draftLogits.new_empty(
-            (batch_size, numDraftProbRows, targetVocabSize),
-            dtype=torch.float32)
-
-    @torch.library.register_fake(
-        "trtllm::compute_target_probs_for_dynamic_tree_rejection_op")
-    def _(
-        targetLogits: torch.Tensor,
-        temperatures: torch.Tensor,
-        numDraftTokens: int,
-        top_k: Optional[torch.Tensor] = None,
-        top_p: Optional[torch.Tensor] = None,
-        skip_temperature: bool = False,
-        top_k_max: int = 0,
-        skip_all_sampling_params: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = temperatures.shape[0]
-        target_vocab_size = targetLogits.shape[-1]
-        target_probs = targetLogits.new_empty(
-            (batch_size, numDraftTokens, target_vocab_size),
-            dtype=torch.float32)
-        has_filtering = (top_k is not None) or (top_p is not None)
-        if skip_all_sampling_params or not has_filtering:
-            support_indices = targetLogits.new_empty((0, ), dtype=torch.int32)
-            support_lengths = targetLogits.new_empty((0, ), dtype=torch.int32)
-        else:
-            support_dim = top_k_max if top_k_max > 0 else target_vocab_size
-            support_indices = targetLogits.new_empty(
-                (batch_size, numDraftTokens, support_dim), dtype=torch.int32)
-            support_lengths = targetLogits.new_empty(
-                (batch_size, numDraftTokens), dtype=torch.int32)
-        return target_probs, support_indices, support_lengths

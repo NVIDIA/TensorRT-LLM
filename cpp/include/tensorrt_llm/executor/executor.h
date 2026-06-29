@@ -1501,20 +1501,25 @@ public:
         NIXL = 3,
         MOONCAKE = 4
     };
+    static constexpr int kDefaultKvTransferPollIntervalMs = 5000;
+
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
+    void setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferPollIntervalMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1526,6 +1531,9 @@ private:
     // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
     // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
+    // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
+    // disaggregated admission.
+    std::optional<int> mKvTransferPollIntervalMs;
 };
 
 /// @brief Configuration class for the model executor

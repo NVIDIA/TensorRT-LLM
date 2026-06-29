@@ -32,6 +32,7 @@ from tensorrt_llm._torch.modules.fused_moe import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -197,6 +198,11 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
             elif backend_name == "CUTLASS":
                 quant_kwargs["weight_alignment"] = 128
                 quant_kwargs["input_hidden_alignment"] = 128
+    elif quant_algo == QuantAlgo.MXFP8:
+        quantize_util_cls = MXFP8QuantizeUtil
+        # MXFP8 uses dynamic activation quantization in the kernel; group_size=32
+        # matches the UE8M0 1x32 block convention emitted by quant_bf16_to_mxfp8.
+        quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     elif quant_algo == QuantAlgo.W4A16_MXFP4:
         quantize_util_cls = WFP4A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
@@ -1227,6 +1233,72 @@ class FP8BlockScalesQuantizeUtil(BaseQuantizeUtil):
         FP8_BLOCK_SCALES requires special input values to avoid false positive failures.
         """
         return _create_fp8_block_scale_input(seq_len, self.hidden_size, self.dtype, "cuda")
+
+
+class MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
+    """Reference for MXFP8 (W8A8 e4m3+UE8M0 1x32) MoE.
+
+    Each expert is a GatedMLP wired with QuantConfig(MXFP8) so the per-expert
+    path uses the same MXFP8LinearMethod (CUTLASS or dequant ref) as the fused
+    MoE backend. Accuracy is checked between fused and per-expert paths.
+    """
+
+    scale_keys = ["weight_scale"]
+    expected_quant_algo = QuantAlgo.MXFP8
+
+    def check_accuracy(self, output, ref_output):
+        check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
+
+
+class MXFP8QuantizeUtil(BaseQuantizeUtil):
+    """Generate e4m3 weights + UE8M0 1x32 block scales for MXFP8 MoE tests."""
+
+    MXFP8_BLOCK_SIZE = 32
+
+    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+        assert self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.MXFP8, (
+            "expect quant_algo to be MXFP8"
+        )
+        # K (hidden / intermediate) must be a multiple of 32 for the per-block scales.
+        assert self.hidden_size % self.MXFP8_BLOCK_SIZE == 0
+        assert self.intermediate_size % self.MXFP8_BLOCK_SIZE == 0
+
+        weights = {}
+        for expert_id in range(self.num_experts):
+            w1_bf16 = torch.randn(
+                (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+            )
+            w2_bf16 = torch.randn(
+                (self.hidden_size, self.intermediate_size), dtype=self.dtype, device="cuda"
+            )
+            w3_bf16 = torch.randn(
+                (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+            )
+            w1_e4m3, w1_sf = quant_bf16_to_mxfp8(w1_bf16, self.MXFP8_BLOCK_SIZE)
+            w2_e4m3, w2_sf = quant_bf16_to_mxfp8(w2_bf16, self.MXFP8_BLOCK_SIZE)
+            w3_e4m3, w3_sf = quant_bf16_to_mxfp8(w3_bf16, self.MXFP8_BLOCK_SIZE)
+            weights[f"{expert_id}.w1.weight"] = w1_e4m3.cuda()
+            weights[f"{expert_id}.w2.weight"] = w2_e4m3.cuda()
+            weights[f"{expert_id}.w3.weight"] = w3_e4m3.cuda()
+            weights[f"{expert_id}.w1.weight_scale"] = w1_sf.cuda()
+            weights[f"{expert_id}.w2.weight_scale"] = w2_sf.cuda()
+            weights[f"{expert_id}.w3.weight_scale"] = w3_sf.cuda()
+            if self.bias:
+                weights[f"{expert_id}.w1.bias"] = torch.randn(
+                    (self.intermediate_size,), dtype=self.dtype, device="cuda"
+                )
+                weights[f"{expert_id}.w2.bias"] = torch.randn(
+                    (self.hidden_size,), dtype=self.dtype, device="cuda"
+                )
+                weights[f"{expert_id}.w3.bias"] = torch.randn(
+                    (self.intermediate_size,), dtype=self.dtype, device="cuda"
+                )
+        return weights
+
+    def create_ref_module(
+        self, routing_method, ref_cls=MXFP8RefGatedMLPFusedMoE
+    ) -> torch.nn.Module:
+        return super().create_ref_module(routing_method, ref_cls)
 
 
 class DeepGemmFP8BlockScalesRefFusedMoE(FP8BlockScalesRefGatedMLPFusedMoE):
