@@ -323,6 +323,13 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 proc_kwargs["num_frames"] = mm_processor_kwargs["num_frames"]
             if "fps" in mm_processor_kwargs:
                 proc_kwargs["fps"] = mm_processor_kwargs["fps"]
+            elif "num_frames" in mm_processor_kwargs:
+                # HF's `sample_frames` honors `num_frames` only when `fps` is
+                # not also set; the class-default `fps=2` would otherwise cap
+                # the returned count below the caller's requested
+                # `num_frames` for short clips. Null `fps` so `num_frames` is
+                # respected verbatim.
+                proc_kwargs["fps"] = None
 
         # Forward per-video metadata with `total_num_frames` rewritten to the
         # actual decoded frame count. HF's `sample_frames` computes indices
