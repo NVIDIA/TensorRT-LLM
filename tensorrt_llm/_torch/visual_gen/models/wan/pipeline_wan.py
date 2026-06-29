@@ -105,14 +105,12 @@ class WanPipeline(BasePipeline):
         # Fixed latent for reproducible benchmarking (e.g. MLPerf).
         # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
         # noise tensor; it will be used in place of freshly sampled random latents for
-        # all T2V requests.  Loaded once at server startup, reused across requests.
+        # all T2V requests. Lazy-loaded on first real inference call to avoid
+        # MetaInitException: __init__ runs inside TRT-LLM's MetaInitMode context
+        # where torch.load triggers aten.set_.source_Storage_storage_offset on a
+        # meta tensor and raises MetaInitException.
         self._fixed_latent: Optional[torch.Tensor] = None
-        _fixed_latent_path = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
-        if _fixed_latent_path:
-            self._fixed_latent = torch.load(_fixed_latent_path, weights_only=True)
-            logger.warning(
-                f"Loaded fixed latent from {_fixed_latent_path}, shape={self._fixed_latent.shape}"
-            )
+        self._fixed_latent_path: Optional[str] = os.environ.get("TRTLLM_VIDEO_FIXED_LATENT_PATH")
 
         super().__init__(pipeline_config)
 
@@ -503,7 +501,13 @@ class WanPipeline(BasePipeline):
             latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
                 batch_size, image, height, width, num_frames, generator
             )
-        elif self._fixed_latent is not None:
+        elif self._fixed_latent_path is not None:
+            if self._fixed_latent is None:
+                self._fixed_latent = torch.load(self._fixed_latent_path, weights_only=True)
+                logger.warning(
+                    f"Loaded fixed latent from {self._fixed_latent_path}, "
+                    f"shape={self._fixed_latent.shape}"
+                )
             latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
