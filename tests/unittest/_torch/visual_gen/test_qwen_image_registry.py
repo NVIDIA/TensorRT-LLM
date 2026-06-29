@@ -13,6 +13,8 @@ import json
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod, UnquantizedLinearMethod
+
 # Importing the models package side-effects the ``@register_pipeline``
 # decorator on ``QwenImagePipeline`` being applied, which is what we are
 # testing here.
@@ -24,16 +26,16 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
 def _tiny_static_nvfp4_model() -> QwenImageTransformer2DModel:
     """Build a CPU-sized static NVFP4 model with representative exclusions."""
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.quantization.mode import QuantAlgo
-
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.NVFP4,
+        kv_cache_quant_algo=QuantAlgo.FP8,
         group_size=16,
         exclude_modules=[
             "img_in",
@@ -107,16 +109,21 @@ def test_static_quant_excludes_high_precision_layers():
     BF16 with no scales, so they must fall back to the unquantized Linear
     method while the rest stay NVFP4.
     """
-    from tensorrt_llm.quantization.mode import QuantAlgo
-
     model = _tiny_static_nvfp4_model()
 
     # Excluded layers materialize directly in their unquantized layout.
-    assert model.img_in.quant_config is None
-    assert model.txt_in.quant_config is None
-    assert model.proj_out.quant_config is None
-    assert model.norm_out.linear.quant_config is None
-    assert model.transformer_blocks[0].attn.to_q.quant_config is None
+    excluded = (
+        model.img_in,
+        model.txt_in,
+        model.proj_out,
+        model.norm_out.linear,
+        model.transformer_blocks[0].attn.to_q,
+    )
+    for module in excluded:
+        assert module.quant_config is not None
+        assert module.quant_config.quant_algo is None
+        assert module.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        assert isinstance(module.quant_method, UnquantizedLinearMethod)
     assert model.img_in._weights_created
     assert model.img_in.weight.shape == (16, 16)
     assert not hasattr(model.img_in, "weight_scale")
@@ -124,10 +131,17 @@ def test_static_quant_excludes_high_precision_layers():
     # Included layers materialize in the NVFP4 layout.
     keep = model.transformer_blocks[1].attn.to_q.quant_config
     assert keep is not None and keep.quant_algo == QuantAlgo.NVFP4
+    assert keep.kv_cache_quant_algo == QuantAlgo.FP8
     quantized = model.transformer_blocks[1].attn.to_q
+    assert isinstance(quantized.quant_method, NVFP4LinearMethod)
     assert quantized._weights_created
     assert quantized.weight.shape == (16, 8)
     assert hasattr(quantized, "weight_scale")
+
+    # Applying module-local exclusions must not mutate the global config.
+    assert model.model_config.quant_config is not None
+    assert model.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert model.model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 def test_static_quant_load_allows_only_missing_derived_parameters(monkeypatch):

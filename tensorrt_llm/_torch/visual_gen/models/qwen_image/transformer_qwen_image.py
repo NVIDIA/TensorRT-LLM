@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -779,11 +780,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
     ):
         model_config = model_config or DiffusionModelConfig()
         super().__init__(model_config)
-        # Exclusion patterns can only be applied after the complete module
-        # names are known. Always defer Linear weight creation while building
-        # the module tree, then materialize eagerly below if the caller did
-        # not request deferred creation.
-        construction_config = model_config.model_copy(update={"skip_create_weights_in_init": True})
         self.attn_backend = attn_backend
 
         self.patch_size = patch_size
@@ -805,9 +801,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         )
         linear_kwargs = {
             "dtype": self.model_config.torch_dtype,
-            "quant_config": construction_config.get_quant_config(),
-            "skip_create_weights_in_init": construction_config.skip_create_weights_in_init,
-            "force_dynamic_quantization": construction_config.force_dynamic_quantization,
+            "quant_config": self.model_config.get_quant_config(),
+            "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
+            "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
         }
         self.img_in = Linear(in_channels, self.inner_dim, bias=True, **linear_kwargs)
         self.txt_in = Linear(joint_attention_dim, self.inner_dim, bias=True, **linear_kwargs)
@@ -819,7 +815,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     dtype=self.model_config.torch_dtype,
-                    config=construction_config,
+                    config=self.model_config,
                     layer_idx=layer_idx,
                 )
                 for layer_idx in range(num_layers)
@@ -832,9 +828,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             elementwise_affine=False,
             eps=1e-6,
             dtype=self.model_config.torch_dtype,
-            quant_config=construction_config.get_quant_config(),
-            skip_create_weights=construction_config.skip_create_weights_in_init,
-            force_dynamic_quant=construction_config.force_dynamic_quantization,
+            quant_config=self.model_config.get_quant_config(),
+            skip_create_weights=self.model_config.skip_create_weights_in_init,
+            force_dynamic_quant=self.model_config.force_dynamic_quantization,
         )
         self.proj_out = Linear(
             self.inner_dim,
@@ -843,11 +839,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             **linear_kwargs,
         )
 
-        self._clear_quant_config_on_excluded_layers()
-        if not self.model_config.skip_create_weights_in_init:
-            for _, module in self.named_modules():
-                if callable(getattr(module, "create_weights", None)):
-                    module.create_weights()
+        self.apply_quant_config_exclude_modules()
 
     @property
     def device(self) -> torch.device:
@@ -897,27 +889,32 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     buffer.data = buffer.data.to(target_dtype)
         return self
 
-    def _clear_quant_config_on_excluded_layers(self) -> None:
-        """Build the checkpoint's excluded layers as unquantized.
+    def apply_quant_config_exclude_modules(self) -> None:
+        """Disable weight quantization for excluded Linear modules.
 
-        ModelOpt keeps some layers in high precision (the ``ignore`` list in
-        the checkpoint's ``quantization_config`` -- e.g. img_in / txt_in /
-        proj_out / norm_out / time_text_embed and the first/last transformer
-        blocks), storing plain BF16 weights with no scales for them.
-        ``get_quant_method()`` selects the Linear method purely from
-        ``module.quant_config``, so clear it on the excluded Linear modules to
-        fall back to the unquantized method. Must run before any
-        ``create_weights()`` call, since parent modules (e.g. ``MLP``) may
-        materialize their child Linears eagerly.
+        Preserve the global KV-cache quantization policy, matching the shared
+        TensorRT-LLM and VisualGen convention. Direct construction may have
+        already materialized Linear weights, so rebuild those modules with the
+        effective no-weight-quant config.
         """
         quant_config = self.model_config.quant_config
-        if quant_config is None or quant_config.quant_algo is None:
+        if quant_config is None or quant_config.exclude_modules is None:
             return
+
+        no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+
         for name, module in self.named_modules():
-            if isinstance(module, Linear) and quant_config.is_module_excluded_from_quantization(
-                name
+            if (
+                isinstance(module, Linear)
+                and quant_config.is_module_excluded_from_quantization(name)
+                and getattr(module, "quant_config", None) is not None
             ):
-                module.quant_config = None
+                module.quant_config = no_quant_config
+                if getattr(module, "_weights_created", False):
+                    module._weights_created = False
+                    module._parameters.clear()
+                    module._buffers.clear()
+                    module.create_weights()
 
     def _quant_derived_parameter_names(self) -> set[str]:
         """Return non-serialized helper parameters owned by quantized Linears."""
@@ -942,9 +939,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         weights = _remap_checkpoint_keys(weights)
 
         device = self._weight_loading_device()
-        # Build excluded layers (the checkpoint's quantization ``ignore`` list)
-        # as unquantized, before any create_weights() call.
-        self._clear_quant_config_on_excluded_layers()
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
