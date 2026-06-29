@@ -1412,6 +1412,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         max_split_kv = 32
         return min(split_wave_aware, max_split_kv)
 
+    @staticmethod
+    def get_split_kv_simplified(B: int, S: int, max_active_blocks: int) -> int:
+        """Occupancy-only split_kv heuristic (flashinfer PR #2743).
+
+        Unlike ``get_split_kv`` this does NOT depend on the KV length: it picks
+        the split count purely from how many CTA slots are free per batch entry,
+        capped at 32. The kernel's per-sequence ``get_k_tile_count`` then divides
+        each request's actual K tiles by this uniform scalar, so short sequences
+        simply leave the higher split indices empty. CUDA-graph-safe by
+        construction (B, S and ``max_active_blocks`` are all host scalars).
+
+        ``S`` is the post-fold ``seq_len_q_eff`` (= seq_len_q // fold_sq_ratio).
+        """
+        blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+        max_split_kv = 32
+        return min(blocks_per_batch, max_split_kv)
+
     @cute.jit
     def get_k_tile_count(
         self,

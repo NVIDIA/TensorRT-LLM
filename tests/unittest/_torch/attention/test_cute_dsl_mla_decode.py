@@ -141,7 +141,7 @@ def cute_dsl_decode_counter(monkeypatch):
 @pytest.mark.parametrize(
     "context_sequence_lengths", _DECODE_CONTEXT_LENGTHS, ids=lambda x: f"ctx_lens={x}"
 )
-@pytest.mark.parametrize("generation_seq_len_q", [1, 4], ids=lambda x: f"gen_seq_len_q={x}")
+@pytest.mark.parametrize("generation_seq_len_q", [1, 4, 8], ids=lambda x: f"gen_seq_len_q={x}")
 @pytest.mark.parametrize("num_layers", _DECODE_NUM_LAYERS, ids=lambda x: f"num_layers={x}")
 def test_cute_dsl_mla_decode(
     kernel, context_sequence_lengths, generation_seq_len_q, num_layers, cute_dsl_decode_counter
@@ -176,6 +176,70 @@ def test_cute_dsl_mla_decode(
 
     # The decode path must have actually run the CuTe DSL kernel (1 dispatch
     # per layer per decode step), not silently fallen back to TRTLLM.
+    expected = scenario.num_layers * _DECODE_NUM_STEPS
+    assert cute_dsl_decode_counter["calls"] == expected, (
+        f"Expected {expected} CuTe DSL MLA decode dispatches, got "
+        f"{cute_dsl_decode_counter['calls']} (silent TRTLLM fallback?)"
+    )
+
+
+# Fold-path (H < M_tile) validation. The DeepSeek-V3 E2E run with TP=8 shards
+# the 128 attention heads to num_heads=16 per rank; the decode kernel then folds
+# F = compute_fold_sq_ratio(num_heads=16, seq_len_q, m_tile=128) query tokens
+# into the head dim so M_eff = 16*F. The default ``test_cute_dsl_mla_decode``
+# above uses num_heads=128 (>= m_tile) so F is always 1 (no fold) -- it validates
+# seq_len_q=8 *correctness* but NOT the H=16 fold code path that the real run
+# actually takes. This test pins num_heads=16 so each seq_len_q exercises a
+# distinct fold factor: sq=1->F=1, sq=2->F=2, sq=4->F=4, sq=8->F=8 (M_eff=128,
+# 100% M-tile fill). Confirms the fold path is numerically correct and that the
+# FMHA gate/can_implement actually engage CuteDSL at seq_len_q=8 / H=16 (the
+# geometry that silently fell back to TRTLLM in the draft_len=7 E2E bench).
+_FOLD_NUM_HEADS = 16
+
+
+@pytest.mark.parametrize("kernel", list(_KERNEL_DTYPES))
+@pytest.mark.parametrize(
+    "context_sequence_lengths", _DECODE_CONTEXT_LENGTHS, ids=lambda x: f"ctx_lens={x}"
+)
+@pytest.mark.parametrize("generation_seq_len_q", [1, 2, 4, 8], ids=lambda x: f"gen_seq_len_q={x}")
+@pytest.mark.parametrize("num_layers", _DECODE_NUM_LAYERS, ids=lambda x: f"num_layers={x}")
+def test_cute_dsl_mla_decode_fold_sq(
+    kernel, context_sequence_lengths, generation_seq_len_q, num_layers, cute_dsl_decode_counter
+):
+    """H=16 (TP=8 per-rank) fold-path decode validation for the CuTe DSL kernels."""
+    dtype, kv_cache_dtype = _KERNEL_DTYPES[kernel]
+
+    scenario = Scenario(
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        num_layers=num_layers,
+        num_heads=_FOLD_NUM_HEADS,
+        num_kv_heads=_FOLD_NUM_HEADS,
+    )
+    rope_config = _build_rope_config(scenario)
+
+    _run_test_for_backend(
+        "TRTLLM",
+        num_heads=scenario.num_heads,
+        num_kv_heads=scenario.num_kv_heads,
+        num_layers=scenario.num_layers,
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=scenario.kv_lora_rank,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        rope_config=rope_config,
+        kv_cache_tokens_per_block=scenario.kv_cache_tokens_per_block,
+        device=torch.device("cuda"),
+        dtype=scenario.dtype,
+        kv_cache_dtype=scenario.kv_cache_dtype,
+        context_sequence_lengths=context_sequence_lengths,
+        generation_seq_len_q=generation_seq_len_q,
+        num_generation_steps=_DECODE_NUM_STEPS,
+        v2_kv_cache=True,
+        skip_context_assert=True,
+    )
+
     expected = scenario.num_layers * _DECODE_NUM_STEPS
     assert cute_dsl_decode_counter["calls"] == expected, (
         f"Expected {expected} CuTe DSL MLA decode dispatches, got "

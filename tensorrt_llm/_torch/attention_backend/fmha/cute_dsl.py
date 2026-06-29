@@ -39,6 +39,15 @@ if TYPE_CHECKING:
 
 _LOG2_E = math.log2(math.e)
 
+# Diagnostic for "why didn't CuteDSL engage" (e.g. seq_len_q=8 / H=16 at MTP
+# draft_len=7 silently fell back). When TLLM_CUTE_DSL_GATE_LOG is set, the gate
+# logs -- once per (layer_idx, supported, reason) -- the is_supported verdict
+# plus the batch shape it saw (q rows, num_generations, num_contexts), so a
+# single run reveals exactly which check rejects a given geometry. Host metadata
+# only (no device sync) -> CUDA-graph-capture-safe.
+_DEBUG_GATE = bool(os.environ.get("TLLM_CUTE_DSL_GATE_LOG"))
+_GATE_LOG_SEEN = set()
+
 
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
@@ -57,10 +66,17 @@ class CuteDslMlaFmha(PhasedFmha):
         if not attn.is_mla_enable:
             logger.debug("CuTe DSL MLA FMHA is unavailable: only MLA is supported.")
             return False
-        if attn.predicted_tokens_per_seq is None or not (1 <= attn.predicted_tokens_per_seq <= 4):
+        # predicted_tokens_per_seq == seq_len_q (spec_config.tokens_per_gen_step,
+        # = max_draft_len + 1; 1 when no spec-decode). No hard upper bound here:
+        # the decode kernel folds up to F = min(seq_len_q, M_tile // num_heads)
+        # query tokens into the head dimension, and the per-request gate's
+        # can_implement check is the authority on what the kernel can serve. A
+        # [1, 4] cap here silently excluded CuteDSL from fmha_libs entirely for
+        # MTP draft_len > 3 (e.g. seq_len_q=8), so it was never even consulted.
+        if attn.predicted_tokens_per_seq is None or attn.predicted_tokens_per_seq < 1:
             logger.debug(
                 "CuTe DSL MLA FMHA is unavailable: predicted_tokens_per_seq "
-                f"must be in [1, 4], got {attn.predicted_tokens_per_seq}."
+                f"must be >= 1, got {attn.predicted_tokens_per_seq}."
             )
             return False
         if attn.kv_lora_rank is None or attn.kv_lora_rank <= 0:
@@ -194,6 +210,72 @@ class CuteDslMlaFmha(PhasedFmha):
             return block_offsets
         return None
 
+    # ---- variable split-KV (KV-dimension parallelism) --------------------
+    # The decode kernel's MMA grid is starved when batch_size is small: with
+    # split_kv=1 only ~batch*heads CTAs launch, so attention-DP (batch ≈
+    # concurrency/tp) leaves most SMs idle. Splitting the KV dimension lets
+    # multiple CTAs cooperate on one sequence (partials reduced via an fp32
+    # workspace). We mirror the kernel's own ``get_split_kv`` heuristic. The
+    # kernel's SUPPORTED split mode is the VARIABLE path (is_var_split_kv=True
+    # + per-sequence block_split_kvs); the fixed-split path is broken for
+    # split>1. CUDA-graph-safe by construction: the scalar split_kv (which
+    # bakes the launch grid) is derived from HOST-known sizes only, while the
+    # per-sequence block_split_kvs is computed on-device from cache_seqs with
+    # no host sync (no ``.item()``).
+    _CUTE_DSL_QK_TILE_K = 128  # mma_qk_tiler_mn[1] the op launches with
+    _CUTE_DSL_MAX_SPLIT_KV = 32  # kernel's get_split_kv hard cap
+
+    def _get_max_active_blocks(self) -> int:
+        """``max_active_clusters * cluster_shape[0]`` (cluster shape (2,1,1)),
+        matching the op's get_split_kv input. Queried once and cached before
+        CUDA-graph capture (the eager warmup populates it)."""
+        cached = getattr(self, "_cute_dsl_max_active_blocks", None)
+        if cached is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "CuTe DSL MLA FMHA: max_active_blocks was not cached "
+                    "before CUDA graph capture (run an eager warmup first)."
+                )
+            import cutlass
+            hw = cutlass.utils.HardwareInfo()
+            max_active_clusters = hw.get_max_active_clusters(2)  # cluster product
+            cached = int(max_active_clusters) * 2  # * cluster_shape_mnk[0]
+            self._cute_dsl_max_active_blocks = cached
+        return cached
+
+    @classmethod
+    def _split_kv_from_max_splits(
+        cls, max_splits: int, batch_size: int, seq_len_q: int, max_active_blocks: int
+    ) -> int:
+        """Host scalar form of the kernel's ``get_split_kv``."""
+        blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
+        split_heur = min(max_splits, blocks_per_batch)
+        k_waves = (max_splits + split_heur - 1) // split_heur
+        split_wave_aware = (max_splits + k_waves - 1) // k_waves
+        return min(split_wave_aware, cls._CUTE_DSL_MAX_SPLIT_KV)
+
+    def _compute_block_split_kvs(
+        self,
+        cache_seqs: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+        max_active_blocks: int,
+        split_kv_max: int,
+    ) -> torch.Tensor:
+        """Per-sequence split count, vectorized over the device ``cache_seqs``
+        tensor (capture-safe; no host sync). Mirrors ``get_split_kv`` with the
+        per-sequence KV length ``cache_seqs[b]`` and clamps to the host grid
+        max ``split_kv_max``."""
+        blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
+        k = cache_seqs.to(torch.int64)
+        tile_k = self._CUTE_DSL_QK_TILE_K
+        max_splits = torch.clamp((k + tile_k - 1) // tile_k, min=1)
+        split_heur = torch.clamp(max_splits, max=blocks_per_batch)
+        k_waves = (max_splits + split_heur - 1) // split_heur
+        split_wave_aware = (max_splits + k_waves - 1) // k_waves
+        cap = min(self._CUTE_DSL_MAX_SPLIT_KV, split_kv_max)
+        return torch.clamp(split_wave_aware, max=cap).to(torch.int32)
+
     def is_supported(
         self,
         q: torch.Tensor,
@@ -210,6 +292,20 @@ class CuteDslMlaFmha(PhasedFmha):
         )
         if not supported:
             logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
+        if _DEBUG_GATE:
+            key = (self.attn.layer_idx, supported, reason)
+            if key not in _GATE_LOG_SEEN:
+                _GATE_LOG_SEEN.add(key)
+                print(
+                    "[CUTEDSL_GATE] layer=%d supported=%s q_rows=%d "
+                    "num_generations=%d num_contexts=%d reason=%s"
+                    % (
+                        self.attn.layer_idx, supported, q.shape[0],
+                        metadata.num_generations, metadata.num_contexts,
+                        reason or "(ok)",
+                    ),
+                    flush=True,
+                )
         return supported
 
     def _is_supported_with_reason(
@@ -244,13 +340,22 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"num_generations ({meta.num_generations}).",
             )
         seq_len_q = q.shape[0] // meta.num_generations
-        if not (1 <= seq_len_q <= 4):
-            return False, f"Only query lengths in [1, 4] are supported, got {seq_len_q}."
+        # No hard upper bound on seq_len_q here: the kernel folds up to
+        # F = min(seq_len_q, M_tile // num_heads) query tokens into the head
+        # dimension and the can_implement check below is the authority on what
+        # the kernel can actually serve for this geometry.
+        if seq_len_q < 1:
+            return False, f"Query length must be >= 1, got {seq_len_q}."
         if meta.kv_cache_block_offsets is None:
             return False, "Paged KV block offsets are required."
+        # ``host_kv_cache_pool_mapping`` is indexed by the LOCAL (compacted)
+        # layer index, not the global ``attn.layer_idx`` -- they coincide for a
+        # full model but differ when the KV cache manager allocates a subset of
+        # layers (e.g. PP, or the layer-wise benchmark's ``layer_mask``).
+        local_layer_idx = attn.get_local_layer_idx(meta)
         page_table_layer = self._select_page_table_layer(
             meta.kv_cache_block_offsets,
-            attn.layer_idx,
+            local_layer_idx,
             meta.host_kv_cache_pool_mapping,
         )
         if page_table_layer is None:
@@ -400,9 +505,11 @@ class CuteDslMlaFmha(PhasedFmha):
             )
 
         block_offsets = meta.kv_cache_block_offsets
+        # See ``_is_supported_with_reason``: the pool mapping is local-indexed.
+        local_layer_idx = attn.get_local_layer_idx(meta)
         page_table_layer = self._select_page_table_layer(
             block_offsets,
-            attn.layer_idx,
+            local_layer_idx,
             meta.host_kv_cache_pool_mapping,
         )
         if page_table_layer is None:
@@ -427,7 +534,12 @@ class CuteDslMlaFmha(PhasedFmha):
                     kv_pool.is_contiguous(),
                     tuple(block_offsets.shape),
                     tuple(page_table.shape),
-                    page_table.t().tolist() if page_table.numel() < 64 else "(big)",
+                    # Full per-sequence rows when TLLM_CUTE_DSL_DUMP_FULL_PT=1
+                    # (page_table.t() -> [batch, pages_per_seq]); otherwise the
+                    # small-shape preview only (numel<64) to avoid log spam.
+                    page_table.t().tolist()
+                    if (os.environ.get("TLLM_CUTE_DSL_DUMP_FULL_PT")
+                        or page_table.numel() < 64) else "(big)",
                     cache_seqs_base[:8].tolist(),
                 ),
                 flush=True,
@@ -440,9 +552,34 @@ class CuteDslMlaFmha(PhasedFmha):
         c_pool_latent = kv_pages[..., :d_latent].permute(1, 2, 0)
         c_pool_rope = kv_pages[..., d_latent:].permute(1, 2, 0)
 
+        # Variable split-KV: parallelize the KV dimension when the batch is too
+        # small to fill the SMs (see the helper block above). Default ON; set
+        # TLLM_CUTE_DSL_VAR_SPLIT_KV=0 to force the legacy split_kv=1 path.
+        is_var_split_kv = False
         block_split_kvs = torch.empty(0, dtype=torch.int32, device=q.device)
         split_kv = 1
-        workspace = torch.empty(0, dtype=torch.float32, device=q.device)
+        workspace = torch.empty(0, dtype=torch.int8, device=q.device)
+        if os.environ.get("TLLM_CUTE_DSL_VAR_SPLIT_KV", "1") != "0":
+            max_active_blocks = self._get_max_active_blocks()
+            # Host upper bound on KV length: per-sequence page capacity * page
+            # size (page_table is [pages_per_seq, batch], a fixed shape under
+            # CUDA-graph capture). Yields the grid's split_kv max on the host.
+            k_max = page_table.shape[0] * page_size
+            max_splits = max(1, (k_max + self._CUTE_DSL_QK_TILE_K - 1) // self._CUTE_DSL_QK_TILE_K)
+            split_kv = self._split_kv_from_max_splits(
+                max_splits, batch_size, seq_len_q, max_active_blocks
+            )
+            if split_kv > 1:
+                is_var_split_kv = True
+                block_split_kvs = self._compute_block_split_kvs(
+                    cache_seqs_base, batch_size, seq_len_q, max_active_blocks, split_kv
+                )
+                # get_workspace_size = B*H*S*split_kv*(D+1)*acc_width//8; fold
+                # cancels (H_eff*S_eff == H*S), acc=fp32 (width 32 -> //8 = 4).
+                ws_bytes = batch_size * num_heads * seq_len_q * split_kv * (d_latent + 1) * 4
+                workspace = torch.empty(ws_bytes, dtype=torch.int8, device=q.device)
+            else:
+                split_kv = 1
 
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
@@ -496,11 +633,25 @@ class CuteDslMlaFmha(PhasedFmha):
         q_latent = q_view[..., :d_latent].permute(2, 3, 1, 0)
         q_rope = q_view[..., d_latent:].permute(2, 3, 1, 0)
 
-        o_storage = torch.empty(
-            (batch_size, seq_len_q, num_heads, d_latent),
-            dtype=out_kernel_dtype,
-            device=q.device,
-        )
+        # When the kernel output dtype matches the module output dtype (the
+        # common fp8-KV case: both bf16), have the kernel write straight into
+        # ``output`` instead of a temp buffer that is then D2D-copied back. That
+        # copy was ~1.7us/call and, at small batch where the decode win is only
+        # a few us, ate the win (MLA module went flat/slightly slower despite a
+        # faster decode kernel). ``output_view`` is a contiguous
+        # [B, S_q, H, d_latent] view, so its permute(2,3,1,0) is byte-identical
+        # in layout to a fresh contiguous o_storage's -- the op's compact-shape
+        # marking still holds. Only fall back to the temp+copy on a dtype
+        # mismatch (the kernel can only emit out_kernel_dtype).
+        write_output_direct = output.dtype == out_kernel_dtype
+        if write_output_direct:
+            o_storage = output_view
+        else:
+            o_storage = torch.empty(
+                (batch_size, seq_len_q, num_heads, d_latent),
+                dtype=out_kernel_dtype,
+                device=q.device,
+            )
         o_kernel = o_storage.permute(2, 3, 1, 0)
         lse_storage = torch.empty(
             (batch_size, seq_len_q, num_heads),
@@ -508,6 +659,48 @@ class CuteDslMlaFmha(PhasedFmha):
             device=q.device,
         )
         lse = lse_storage.permute(2, 1, 0)
+
+        # Capture-safe one-shot dump of the params entering the CuTe DSL kernel.
+        # Unlike TLLM_CUTE_DSL_DUMP (which .tolist()s device tensors and is thus
+        # illegal under CUDA-graph capture), this logs only host-side metadata
+        # (shapes/strides/dtypes + scalar config), so it is safe to leave on for
+        # perf runs. Logged once per (layer_idx, seq_len_q, batch_size,
+        # page_table shape) so each (batch x KV) combo is captured, eager only.
+        if os.environ.get("TLLM_CUTE_DSL_PARAM_LOG") and not torch.cuda.is_current_stream_capturing():
+            seen = getattr(self, "_cute_dsl_param_logged", None)
+            if seen is None:
+                seen = set()
+                self._cute_dsl_param_logged = seen
+            key = (attn.layer_idx, seq_len_q, batch_size, tuple(page_table.shape))
+            if key not in seen:
+                seen.add(key)
+                print(
+                    "[CUTEDSL_PARAM] layer=%d kernel_dtype=%s batch_size=%d "
+                    "seq_len_q=%d num_heads=%d d_latent=%d d_rope=%d page_size=%d "
+                    "layers_in_pool=%d split_kv=%d is_var_split_kv=%s "
+                    "softmax_scale=%.8f output_scale=%.8f | "
+                    "q_latent%s/%s q_rope%s/%s c_latent%s/%s c_rope%s/%s "
+                    "page_table%s cache_seqs%s out%s lse%s"
+                    % (
+                        attn.layer_idx, kernel_dtype, batch_size,
+                        seq_len_q, num_heads, d_latent, d_rope, page_size,
+                        layers_in_pool, split_kv, is_var_split_kv,
+                        softmax_scale, output_scale,
+                        tuple(q_latent.shape), tuple(q_latent.stride()),
+                        tuple(q_rope.shape), tuple(q_rope.stride()),
+                        tuple(c_pool_latent.shape), tuple(c_pool_latent.stride()),
+                        tuple(c_pool_rope.shape), tuple(c_pool_rope.stride()),
+                        tuple(page_table.shape), tuple(cache_seqs_base.shape),
+                        tuple(o_kernel.shape), tuple(lse.shape),
+                    ),
+                    flush=True,
+                )
+
+        # The decode path uses variable-seq mode by default (real serving has
+        # unequal per-request KV lengths). Experiment toggle: set
+        # TLLM_CUTE_DSL_VAR_SEQ=0 to force the fixed-length path -- only valid
+        # when every sequence shares one KV length (e.g. profiling/microbench).
+        is_var_seq = os.environ.get("TLLM_CUTE_DSL_VAR_SEQ", "1") != "0"
 
         op(
             q_latent,
@@ -524,17 +717,21 @@ class CuteDslMlaFmha(PhasedFmha):
             seq_len_q,
             page_size,
             True,  # is_persistent
-            True,  # is_var_seq
-            False,  # is_var_split_kv
+            is_var_seq,
+            is_var_split_kv,
             split_kv,
             softmax_scale,
             output_scale,
         )
 
-        # o_kernel is [num_heads, d_latent, seq_len_q, batch_size]; restore the
-        # [batch_size, seq_len_q, num_heads, d_latent] view to match output_view.
-        attn_out = o_kernel.permute(3, 2, 0, 1)
-        output_view.copy_(attn_out.to(output.dtype))
+        # If the kernel wrote into a temp (dtype mismatch), copy/convert back
+        # into ``output``. In the common matched-dtype case the kernel already
+        # wrote ``output`` directly (o_storage IS output_view), so skip the copy.
+        if not write_output_direct:
+            # o_kernel is [num_heads, d_latent, seq_len_q, batch_size]; restore
+            # the [batch_size, seq_len_q, num_heads, d_latent] view.
+            attn_out = o_kernel.permute(3, 2, 0, 1)
+            output_view.copy_(attn_out.to(output.dtype))
 
     def run_mla_generation(
         self,
