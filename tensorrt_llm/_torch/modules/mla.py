@@ -53,7 +53,6 @@ from .attention import (
     _helix_cp_output_projection,
     _helix_post_process,
     _helix_zero_kv_mask,
-    _lower_sparse_attention_params,
     extract_extra_attrs,
 )
 from .linear import Linear, TensorParallelMode
@@ -319,8 +318,7 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
-            _lower_sparse_attention_params(
-                sparse_attn_cfg,
+            sparse_attn_cfg.to_sparse_params(
                 pretrained_config=config.pretrained_config,
                 layer_idx=self.layer_idx,
             )
