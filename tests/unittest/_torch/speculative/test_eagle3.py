@@ -1150,6 +1150,99 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     assert len(results[0].outputs[0].token_ids) > 0
 
 
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
+        use_cuda_graph: bool, disable_overlap_scheduler: bool):
+    if torch.cuda.device_count() < 8:
+        pytest.skip("Nemotron Super dynamic-tree MTP test requires 8 GPUs")
+
+    models_path = llm_models_root()
+    model_path = f"{models_path}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+
+    max_batch_size = 1
+    max_draft_len = 6
+    dynamic_tree_max_topK = 10
+    max_total_draft_tokens = 31
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    mamba_ssm_cache_dtype="float16",
+                                    free_gpu_memory_fraction=0.8)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1]) if use_cuda_graph else None
+
+    llm_common_config = dict(
+        model=model_path,
+        tensor_parallel_size=8,
+        moe_expert_parallel_size=8,
+        pipeline_parallel_size=1,
+        moe_config=MoeConfig(backend="TRTLLM"),
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_seq_len=8192,
+    )
+
+    spec_config = MTPDecodingConfig(
+        max_draft_len=max_draft_len,
+        mtp_eagle_one_model=True,
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=dynamic_tree_max_topK,
+        max_total_draft_tokens=max_total_draft_tokens,
+    )
+
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+    sampling_params = SamplingParams(max_tokens=128, temperature=0)
+    num_tokens = 0
+    num_drafted = 0
+    num_accepted = 0
+    tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+
+    for output in llm_spec.generate_async(tok_ids,
+                                          sampling_params,
+                                          streaming=True):
+        new_tokens = output.outputs[0].token_ids
+        num_drafted += max_draft_len
+        num_accepted += len(new_tokens) - num_tokens - 1
+        num_tokens = len(new_tokens)
+
+    accept_rate = num_accepted / num_drafted
+    assert accept_rate > 0.20
+
+    raw_prompts = ["The capital of France is"]
+    prompts = [
+        llm_spec.tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": p
+            }],
+            tokenize=False,
+            add_generation_prompt=True,
+        ) for p in raw_prompts
+    ]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0)
+
+    results_spec = llm_spec.generate(prompts, sampling_params)
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
+
+    llm_ref = LLM(**llm_common_config)
+    results_ref = llm_ref.generate(prompts, sampling_params)
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
+
+    for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
+        assert text_spec == text_ref
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
 @pytest.mark.parametrize("use_cuda_graph", [True, False])
 def test_eagle3_lora(use_cuda_graph: bool):
     """Test LoRA with 3 requests and max_batch_size=4.
