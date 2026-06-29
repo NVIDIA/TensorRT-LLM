@@ -18,10 +18,12 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
@@ -2419,3 +2421,48 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+# ---------------------------------------------------------------------------
+# KVCacheManagerV2.trim_to_history (#14258): unbound on a fake self, all 5 branches.
+# ---------------------------------------------------------------------------
+class TestTrimToHistory:
+    @staticmethod
+    def _call(kv_cache, history_length, req_id=1):
+        kv_cache_map = {} if kv_cache is None else {req_id: kv_cache}
+        fake = SimpleNamespace(kv_cache_map=kv_cache_map)
+        req = SimpleNamespace(py_request_id=req_id)
+        return KVCacheManagerV2.trim_to_history(fake, req, history_length)
+
+    def test_missing_cache_is_noop_true(self):
+        assert self._call(None, 50) is True
+
+    def test_inactive_cache_is_noop_true(self):
+        kv = Mock(is_active=False)
+        assert self._call(kv, 50) is True
+        kv.resize.assert_not_called()
+
+    def test_history_not_increasing_is_noop_true(self):
+        kv = Mock(is_active=True, history_length=50, capacity=100)
+        assert self._call(kv, 50) is True  # 50 <= current 50
+        kv.resize.assert_not_called()
+
+    def test_resize_success_clamps_capacity_and_returns_true(self):
+        kv = Mock(is_active=True, history_length=10, capacity=8)
+        kv.resize.return_value = True
+        assert self._call(kv, 64) is True
+        # target_capacity = max(capacity=8, history=64) = 64
+        kv.resize.assert_called_once_with(64, history_length=64)
+
+    def test_resize_rejection_returns_false(self):
+        kv = Mock(is_active=True, history_length=10, capacity=100)
+        kv.resize.return_value = False
+        assert self._call(kv, 64) is False
+        kv.resize.assert_called_once_with(100, history_length=64)
+
+    def test_resize_exception_degrades_to_false(self):
+        # Broad except: a non-ValueError (e.g. internal state assert) must
+        # degrade to False rather than propagate (do-not-narrow contract).
+        kv = Mock(is_active=True, history_length=10, capacity=100)
+        kv.resize.side_effect = RuntimeError("internal state assert")
+        assert self._call(kv, 64) is False

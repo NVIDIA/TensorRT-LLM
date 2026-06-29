@@ -26,6 +26,7 @@ except ImportError:
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
@@ -244,6 +245,9 @@ class TransformersTokenizer(TokenizerBase):
 
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
+
+    def convert_tokens_to_ids(self, tokens, *args, **kwargs):
+        return self.tokenizer.convert_tokens_to_ids(tokens, *args, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
