@@ -53,6 +53,12 @@ _GEMM_CASES.extend(
         (6912, 3072, 3072, True, 12),
     ]
 )
+# N=64 closes the small-M tactic gap with the stock CUTLASS NVFP4 runner.
+# Exercise every retained 1SM runtime cluster without changing existing IDs.
+_GEMM_CASES.extend((44, 3072, 3072, True, tactic) for tactic in range(13, 16))
+# K=256 residual tiles use a BF16 K=64 storage/TMA box with logical rank 32;
+# cover every runtime cluster, including 2SM multicast, on a non-multiple M tail.
+_GEMM_CASES.extend((129, 3072, 3072, True, tactic) for tactic in range(16, 23))
 
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
@@ -128,6 +134,9 @@ def test_nvfp4_svdquant_gemm(m, n, k, use_bias, tactic):
         (96, 64, 1),
         (96, 64, 9),
         (96, 64, 11),
+        (96, 64, 16),
+        (96, 64, 18),
+        (96, 64, 19),
     ],
 )
 def test_nvfp4_svdquant_gemm_packed_down(pack_width, down_offset, tactic):

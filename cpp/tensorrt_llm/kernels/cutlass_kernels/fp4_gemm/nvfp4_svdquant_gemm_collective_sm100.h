@@ -112,9 +112,18 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
     // own SM100 helper (matches the residual cta_group; SS = both operands SMEM-sourced, as
     // the residual mainloop requires). The MMA tile is the full CTA-group tile, while the
     // SMEM layouts below are explicitly reduced to each CTA's partition. ===
-    static constexpr int LoRaK = 32; // SVDQuant rank r=32 = 2 bf16 16-wide K-atoms
+    static constexpr int LoRaK = 32; // Logical SVDQuant rank r=32 = 2 bf16 16-wide K-atoms.
+    using ResidualElementA = remove_cvref_t<decltype(get<0>(ElementPairA_{}))>;
+    static_assert(
+        (cute::size<2>(TileShape{}) * cute::sizeof_bits_v<ResidualElementA>) % cute::sizeof_bits_v<cutlass::bfloat16_t>
+        == 0);
+    // Match one residual A/B stage exactly: FP4 K128 -> BF16 K32, FP4 K256 -> BF16 K64.
+    // The global D/L1 tensors remain logical K32; TMA zero-fills the upper half of a K64 box.
+    static constexpr int LoRaStorageK
+        = cute::size<2>(TileShape{}) * cute::sizeof_bits_v<ResidualElementA> / cute::sizeof_bits_v<cutlass::bfloat16_t>;
+    static_assert(LoRaStorageK >= LoRaK);
     using LoRaMmaTileShape
-        = decltype(make_shape(cute::size<0>(TileShape{}), cute::size<1>(TileShape{}), cute::Int<LoRaK>{}));
+        = decltype(make_shape(cute::size<0>(TileShape{}), cute::size<1>(TileShape{}), cute::Int<LoRaStorageK>{}));
 
     static constexpr auto make_lora_mma()
     {
@@ -258,8 +267,8 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         cutlass::bfloat16_t, BlockTileL1_N, BlockTileL1_K>());
     // D/L1 smem layouts are MULTI-STAGE (Stages, == smem_A/smem_B) so D/L1 RIDE the
     // residual stage buffers (smem_A[ws]/smem_B[ws]) instead of dedicated sD/sL1 -> no carveout,
-    // residual regains its full stages. Byte-exact overlay: D-tile = M*LoRaK*bf16 == A-stage
-    // (M*K*fp4/2) and L1-tile = N*LoRaK*bf16 == B-stage; stage stride matches smem_A/B.
+    // residual regains its full stages. Byte-exact overlay: D-tile = M*LoRaStorageK*bf16 == A-stage
+    // (M*K*fp4) and L1-tile = N*LoRaStorageK*bf16 == B-stage; stage stride matches smem_A/B.
     using SmemLayoutD = decltype(UMMA::tile_to_mma_shape(
         SmemLayoutAtomD{}, append(MmaShapeD_MK{}, cute::Int<DispatchPolicy::Stages>{})));
     using SmemLayoutL1 = decltype(UMMA::tile_to_mma_shape(
@@ -355,6 +364,8 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
               size(AtomThrShapeMNK{}) * cosize(take<0, 3>(SmemLayoutA{})) * cute::sizeof_bits_v<ElementA>)
         + cutlass::bits_to_bytes(
             size(AtomThrShapeMNK{}) * cosize(take<0, 3>(SmemLayoutB{})) * cute::sizeof_bits_v<ElementB>);
+    static_assert(
+        LoRaTmaBytes == ABTmaTransactionBytes, "LoRA storage/TMA box must exactly replace the residual A/B stage");
     static constexpr uint32_t TmaTransactionBytes = ABTmaTransactionBytes + SFTransactionBytes;
 
     template <class AccTensor, class SfaTensor, class SfbTensor>
@@ -1136,10 +1147,13 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         // stage-moded since SmemLayoutD/L1 overlay the multi-stage smem_A/smem_B).
         auto lora_mma = LoRaMma{};
         lora_mma.accumulate_ = UMMA::ScaleOut::One;
+        static constexpr int LoRaAtomK = cute::size<2>(typename LoRaMma::AtomShape_MNK{});
+        static_assert(LoRaK % LoRaAtomK == 0);
+        static constexpr int LoRaMmaKBlocks = LoRaK / LoRaAtomK;
         auto apply_lora = [&](int rstage)
         {
             CUTLASS_PRAGMA_UNROLL
-            for (int kb = 0; kb < size<2>(tCrD); ++kb)
+            for (int kb = 0; kb < LoRaMmaKBlocks; ++kb)
             {
                 cute::gemm(lora_mma, tCrD(_, _, kb, rstage), tCrL1(_, _, kb, rstage), accumulators);
             }

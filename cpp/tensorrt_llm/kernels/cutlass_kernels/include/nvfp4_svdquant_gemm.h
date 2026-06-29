@@ -54,9 +54,19 @@ enum class Nvfp4SvdquantGemmTactic : int
     k1Sm128x128x128Cluster1x2 = 10,
     k2Sm256x192x128 = 11,
     k2Sm256x192x128Cluster2x2 = 12,
+    k1Sm128x64x128 = 13,
+    k1Sm128x64x128Cluster1x2 = 14,
+    k1Sm128x64x128Cluster1x4 = 15,
+    k1Sm128x128x256Cluster1x2 = 16,
+    k1Sm128x128x256Cluster1x4 = 17,
+    k2Sm256x128x256 = 18,
+    k2Sm256x256x256 = 19,
+    k2Sm256x256x256Cluster2x2 = 20,
+    k2Sm256x256x256Cluster4x4 = 21,
+    k2Sm256x256x256Cluster4x1 = 22,
 };
 
-inline constexpr int kNvfp4SvdquantGemmNumTactics = 13;
+inline constexpr int kNvfp4SvdquantGemmNumTactics = 23;
 
 // Tactic 0 preserves the original 1SM kernel and remains the source-compatible default.
 size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic = 0);

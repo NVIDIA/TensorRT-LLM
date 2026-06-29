@@ -649,7 +649,7 @@ class NVFP4SVDQuantGemmRunner(TunableRunner):
 
     def unique_id(self):
         # The version invalidates persisted tactic IDs if the native tactic order changes.
-        return ("nvfp4-svdquant-sm100-v6", self.output_dtype)
+        return ("nvfp4-svdquant-sm100-v9", self.output_dtype)
 
     def get_valid_tactics(
         self,
@@ -699,7 +699,7 @@ def nvfp4_svdquant_gemm_tuned(
     runner = NVFP4SVDQuantGemmRunner(output_dtype)
     inputs = [act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up]
     _, best_tactic = AutoTuner.get().choose_one(
-        "trtllm::nvfp4_svdquant_gemm::cutlass_v6",
+        "trtllm::nvfp4_svdquant_gemm::cutlass_v9",
         [runner],
         runner.tuning_config,
         inputs,
