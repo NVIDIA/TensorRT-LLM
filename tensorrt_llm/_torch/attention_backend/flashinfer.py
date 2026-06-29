@@ -533,6 +533,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return window if window is not None else (1 << 31)
         return None
 
+    def _positive_vswa_pool_ids(self) -> list[int]:
+        """Return KV cache pool ids that can back FlashInfer paged KV."""
+        mgr = self.kv_cache_manager
+        num_pools = getattr(mgr, 'num_pools', None)
+        if num_pools is None:
+            pool_configurations = getattr(mgr, 'pool_configurations', None)
+            if pool_configurations is not None:
+                num_pools = len(pool_configurations)
+            else:
+                num_pools = len(getattr(mgr, 'max_attention_window_vec', []))
+        positive_pool_ids: list[int] = []
+        for pool_id in range(num_pools):
+            window = self._pool_window_for_pool_id(pool_id)
+            if window is not None and window > 0:
+                positive_pool_ids.append(pool_id)
+        return positive_pool_ids
+
     def _pick_vswa_primary_pool_id(self) -> int:
         """Pick a non-linear pool as the FlashInfer 'primary' pool.
 
@@ -544,6 +561,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         """
         assert self._vswa_layer_to_pool is not None
         default_pool = self._vswa_layer_to_pool.get(0, 0)
+        positive_pool_ids = self._positive_vswa_pool_ids()
+        if positive_pool_ids:
+            return positive_pool_ids[0]
         for pool_id, rep_layer in self._vswa_pool_to_rep_layer.items():
             w = self._pool_window_for_pool_id(pool_id)
             if w is None:
@@ -580,7 +600,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return
         pool_id = self._vswa_layer_to_pool.get(layer_idx)
         if pool_id is None:
-            return  # Layer not in VSWA mapping
+            pool_id = self._pick_vswa_primary_pool_id()
         active = getattr(self, '_vswa_active_pool_id', None)
         if pool_id == active and not self.is_cuda_graph:
             return  # Buffer already has the right data
@@ -711,12 +731,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 if layer_to_pool_mapping is not None or layer_to_pool_idx is not None:
                     self._vswa_layer_to_pool = {}
                     self._vswa_pool_to_rep_layer: Dict[int, int] = {}
-                    positive_pool_ids = [
-                        pool_id for pool_id in range(
-                            getattr(mgr, 'num_pools', 0))
-                        if (self._pool_window_for_pool_id(pool_id) is not None
-                            and self._pool_window_for_pool_id(pool_id) > 0)
-                    ]
+                    positive_pool_ids = self._positive_vswa_pool_ids()
                     single_positive_pool_id = (positive_pool_ids[0] if len(
                         positive_pool_ids) == 1 else None)
                     for layer_idx in getattr(mgr, 'layer_offsets', {}):
@@ -1097,7 +1112,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # pool, whose block IDs are negative placeholders that would
             # poison _paged_kv_indices and crash append_paged_kv_cache.
             _primary_pool = self._pick_vswa_primary_pool_id()
-            _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool, 0)
+            _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool)
+            if _vswa_init_layer is None:
+                _layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets',
+                                         {})
+                _vswa_init_layer = next(iter(_layer_offsets), 0)
         elif len(getattr(self.kv_cache_manager, 'max_attention_window_vec', [])) > 1:
             # V1 manager (or any manager without per-pool dict) with multiple
             # window sizes: get_batch_cache_indices requires layer_idx to
