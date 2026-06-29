@@ -6353,6 +6353,47 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             layer_updates_per_iter=0)
         self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(90000)
+    @parametrize_with_ids("moe_backend", ["CUTLASS", "CUTEDSL"])
+    def test_nvfp4_1gpu(self, moe_backend):
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+        # SM120 b12x hybrid keeps both weight layouts → shrink workspaces.
+        b12x_hybrid = moe_backend == "CUTEDSL" and get_sm_version() == 120
+        if b12x_hybrid:
+            max_batch_size = 4
+            max_num_tokens = 2048
+            free_gpu_memory_fraction = 0.4
+            cuda_graph_cfg = None
+        else:
+            max_batch_size = 32
+            max_num_tokens = 4096
+            free_gpu_memory_fraction = 0.6
+            cuda_graph_cfg = CudaGraphConfig(max_batch_size=max_batch_size,
+                                             enable_padding=True)
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            mamba_ssm_cache_dtype="float16",
+            free_gpu_memory_fraction=free_gpu_memory_fraction,
+        )
+        with LLM(
+                model_path,
+                kv_cache_config=kv_cache_config,
+                max_batch_size=max_batch_size,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=4352,
+                tensor_parallel_size=1,
+                moe_expert_parallel_size=1,
+                pipeline_parallel_size=1,
+                enable_attention_dp=False,
+                cuda_graph_config=cuda_graph_cfg,
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend=moe_backend),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
     @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"])
