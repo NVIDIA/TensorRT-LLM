@@ -5,7 +5,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, Literal, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
