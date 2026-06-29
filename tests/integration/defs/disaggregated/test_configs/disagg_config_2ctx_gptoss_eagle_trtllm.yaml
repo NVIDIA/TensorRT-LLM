@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+model: gpt_oss/gpt-oss-120b
+hostname: localhost
+backend: pytorch
+cuda_graph_config: null
+speculative_config:
+  decoding_type: Eagle
+  max_draft_len: 3
+  eagle3_one_model: true
+  speculative_model: gpt_oss/gpt-oss-120b-Eagle3
+context_servers:
+  num_instances: 2
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 1
+  enable_attention_dp: false
+  max_num_tokens: 20000
+  max_seq_len: 131072
+  max_batch_size: 16
+  trust_remote_code: true
+  enable_chunked_prefill: true
+  disable_overlap_scheduler: true
+  router:
+    type: kv_cache_aware
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    event_buffer_max_size: 1024
+    free_gpu_memory_fraction: 0.8
+  moe_config:
+    backend: TRTLLM
+  print_iter_log: true
+  cache_transceiver_config:
+    backend: DEFAULT
+    max_tokens_in_buffer: 131072
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  moe_expert_parallel_size: 1
+  enable_attention_dp: false
+  max_num_tokens: 512
+  max_seq_len: 131072
+  max_batch_size: 16
+  trust_remote_code: true
+  enable_chunked_prefill: true
+  disable_overlap_scheduler: true
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    free_gpu_memory_fraction: 0.8
+  moe_config:
+    backend: TRTLLM
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+  print_iter_log: true
+  cache_transceiver_config:
+    backend: DEFAULT
+    max_tokens_in_buffer: 131072

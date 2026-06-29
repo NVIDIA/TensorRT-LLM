@@ -1794,6 +1794,11 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
                                 max_batch_size=32,
                                 tokens_per_block=32)
     tokenizer = _mock_tokenizer(token_ids=[11, 22, 33])
+    documents = [{
+        "title": "Weather policy",
+        "text": "Use Celsius for European weather."
+    }]
+    chat_template = "{{ messages[0]['content'] }}"
     req = ChatCompletionRequest(
         model="custom-chat-model",
         messages=[{
@@ -1801,6 +1806,8 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
             "content": "what's the weather in Paris?"
         }],
         tools=[_get_weather_tool()],
+        documents=documents,
+        chat_template=chat_template,
         chat_template_kwargs={"thinking": True},
     )
 
@@ -1809,12 +1816,14 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
 
     assert token_lists == [[11, 22, 33]]
     tokenizer.apply_chat_template.assert_called_once()
-    assert req.prompt_token_ids is None
+    assert req.prompt_token_ids == [11, 22, 33]
 
     kwargs = tokenizer.apply_chat_template.call_args.kwargs
     tool_dicts = kwargs["tools"]
     assert isinstance(tool_dicts, list)
     assert tool_dicts[0]["function"]["name"] == "get_current_weather"
+    assert kwargs["documents"] == documents
+    assert kwargs["chat_template"] == chat_template
     assert kwargs["thinking"] is True
 
 
@@ -1839,7 +1848,7 @@ def test_tokenize_handles_absent_and_empty_tools(
         router._tokenize(req)
 
     tokenizer.apply_chat_template.assert_called_once()
-    assert req.prompt_token_ids is None
+    assert req.prompt_token_ids == [11, 22, 33]
     kwargs = tokenizer.apply_chat_template.call_args.kwargs
     assert kwargs["tools"] == expected_tools
 
@@ -1980,6 +1989,7 @@ async def test_gpt_oss_router_and_server_create_same_tokenized_input(
     server = OpenAIServer.__new__(OpenAIServer)
     server.harmony_adapter = harmony
     server.await_disconnected = mock.AsyncMock()
+    server.allow_request_chat_template = False
     server.model_config = SimpleNamespace(vocab_size=1000)
     server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
         vocab_size=1000))
@@ -2077,7 +2087,33 @@ def test_gpt_oss_config_model_type_uses_harmony(tmp_path: Path) -> None:
     assert req.prompt_token_ids is None
 
 
-def test_tokenize_does_not_rewrite_completion_prompt() -> None:
+def test_disable_harmony_adapter_uses_tokenizer_for_gpt_oss(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISABLE_HARMONY_ADAPTER", "1")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[900, 901, 902, 903])
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter"
+                    ) as get_harmony_adapter, mock.patch.object(
+                        router, "_get_tokenizer", return_value=tokenizer):
+        req = ChatCompletionRequest(model="openai/gpt-oss-20b",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+        token_lists = router._tokenize(req)
+
+    get_harmony_adapter.assert_not_called()
+    tokenizer.apply_chat_template.assert_called_once()
+    assert token_lists == [[900, 901, 902, 903]]
+    assert req.prompt_token_ids == [900, 901, 902, 903]
+
+
+def test_tokenize_rewrites_completion_prompt_to_token_ids() -> None:
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["server1"],
                                 use_tokens=False,
@@ -2090,7 +2126,7 @@ def test_tokenize_does_not_rewrite_completion_prompt() -> None:
         token_lists = router._tokenize(req)
 
     assert token_lists == [[10, 20, 30]]
-    assert req.prompt == "hello"
+    assert req.prompt == [10, 20, 30]
 
 
 def test_tokenize_skipped_when_prompt_token_ids_already_set() -> None:
@@ -2207,20 +2243,24 @@ def _get_weather_tool() -> ChatCompletionToolsParam:
     ))
 
 
-def _mock_tokenizer(token_ids=None):
-    """Return a mock tokenizer with a recorded apply_chat_template.
+def _mock_tokenizer(token_ids: list[int] | None = None) -> mock.MagicMock:
+    """Return a mock tokenizer that emits the same token ids on each path.
 
-    ``apply_chat_template`` records its kwargs and returns the supplied
-    token id list.
+    ``apply_chat_template`` records its kwargs and ``encode`` / ``__call__``
+    cover completion prompt tokenization.
     """
+    if token_ids is None:
+        token_ids = [1, 2, 3, 4, 5]
     tok = mock.MagicMock()
-    tok.apply_chat_template.return_value = token_ids or [1, 2, 3, 4, 5]
+    tok.apply_chat_template.return_value = token_ids
+    tok.encode.return_value = token_ids
+    tok.return_value = {"input_ids": token_ids}
     return tok
 
 
 @pytest.mark.parametrize("router_class",
                          [KvCacheAwareRouter, ConversationRouter])
-def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
+def test_tokenize_forwards_tools_and_kwargs_for_router_classes(router_class):
     """Regression test for PR #13232.
 
     ``BlockHashMixin._tokenize`` must forward the request's ``tools`` (as a
@@ -2322,7 +2362,7 @@ def test_tokenize_preserves_empty_tools_list():
     assert kwargs["tools"] == []
 
 
-def test_tokenize_skipped_when_prompt_token_ids_already_set():
+def test_tokenize_skips_tools_kwargs_when_prompt_token_ids_already_set():
     """Skip tokenization when ``prompt_token_ids`` is already populated.
 
     When the caller pre-tokenizes (``prompt_token_ids`` set), the router

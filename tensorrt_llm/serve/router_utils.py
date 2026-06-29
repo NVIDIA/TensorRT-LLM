@@ -247,6 +247,8 @@ class BlockHashMixin:
         return self._model_types[model]
 
     def _uses_harmony_tokenization(self, request: ChatCompletionRequest) -> bool:
+        if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
+            return False
         if self._use_harmony is not None:
             return self._use_harmony
         return self._get_model_type(request.model) == "gpt_oss"
@@ -300,6 +302,9 @@ class BlockHashMixin:
             tokenizer = self._get_tokenizer(request.model)
             chat_template_kwargs = dict(request.chat_template_kwargs or {})
             chat_template_kwargs["tools"] = self._tool_dicts(request)
+            chat_template_kwargs["documents"] = request.documents
+            if request.chat_template is not None:
+                chat_template_kwargs["chat_template"] = request.chat_template
             rendered = tokenizer.apply_chat_template(
                 [msg if isinstance(msg, dict) else dict(msg) for msg in request.messages],
                 add_generation_prompt=request.add_generation_prompt,

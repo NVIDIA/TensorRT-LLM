@@ -339,6 +339,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "gpt_oss_120b_eagle_triton_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_triton.yaml",
+        "gpt_oss_120b_eagle_trtllm_2ctx":
+        f"{test_configs_root}/disagg_config_2ctx_gptoss_eagle_trtllm.yaml",
         "gpt_oss_120b_eagle_trtllm_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_eagle_trtllm.yaml",
         "gpt_oss_120b_triton_stress":
@@ -2722,6 +2724,23 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
                            env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])
+def test_disaggregated_gpt_oss_120b_eagle_2ctx(disaggregated_example_root: str,
+                                               llm_venv,
+                                               model_path: str) -> None:
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "gpt_oss_120b_eagle_trtllm_2ctx",
+                           num_iters=1,
+                           env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
 
