@@ -47,6 +47,20 @@ def _is_env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "on")
 
 
+def _select_dsv4_ob_split_k(num_tokens: int,
+                            configured_split: Optional[int] = None) -> int:
+    if configured_split is None:
+        env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
+        split_k = env_split if env_split else (
+            2 if 64 <= num_tokens <= 128 else 1)
+    else:
+        split_k = configured_split
+    if split_k not in (1, 2, 4):
+        raise ValueError(
+            f"unsupported DeepSeek-V4 O_b split-K factor: {split_k}")
+    return split_k
+
+
 def extract_extra_attrs(layer_idx: str, attn_type: str):
     assert attn_type in ["mla", "attn"], "Invalid attention type"
     extra_attrs = get_model_extra_attrs()
@@ -2008,6 +2022,76 @@ class MLA(nn.Module):
                 "Invalid DSv4 fused epilogue buffers for current token count.")
         return fp8_o, output_sf
 
+    def _should_use_fused_oproj(self) -> bool:
+        return (os.environ.get("DSV4_FUSE_OPROJ", "0") == "1"
+                and self.n_local_groups == self.num_groups
+                and getattr(self.o_b_proj, "tp_size", 1) == 1
+                and self.o_b_proj.has_fp8_block_scales and not getattr(
+                    self.o_b_proj, "use_cute_dsl_blockscaling_mm", False))
+
+    def _fused_oa_ob_proj(self, attn_fp8: torch.Tensor,
+                          attn_scale: torch.Tensor,
+                          num_tokens: int) -> torch.Tensor:
+        num_groups, o_lora_rank = self.n_local_groups, self.o_lora_rank
+        aligned_m = ((num_tokens + 3) // 4) * 4
+        n_tiles = (o_lora_rank + 127) // 128
+        packed_k = (num_groups * n_tiles + 3) // 4
+        o_lora_fp8 = torch.empty(
+            [num_tokens, num_groups, o_lora_rank],
+            device=attn_fp8.device,
+            dtype=torch.float8_e4m3fn)
+        sf_storage = torch.zeros(packed_k * aligned_m,
+                                 device=attn_fp8.device,
+                                 dtype=torch.int32)
+        sf_out = torch.as_strided(sf_storage, (num_tokens, packed_k),
+                                  (1, aligned_m))
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(
+            attn_fp8, self.o_a_proj, attn_scale, self.o_a_proj_scale,
+            o_lora_fp8.transpose(0, 1), sf_out)
+        return self._fused_ob_gemm(o_lora_fp8.flatten(1), sf_out, num_tokens)
+
+    def _fused_ob_gemm(self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor,
+                       num_tokens: int) -> torch.Tensor:
+        """Run the fused DSV4 O_b GEMM and emit mHC-ready partials."""
+        from tensorrt_llm import deep_gemm
+        M, N = num_tokens, self.hidden_size
+        K_ob = o_lora_fp8.shape[1]
+        w, wsf = self.o_b_proj.weight, self.o_b_proj.weight_scale
+        nkb4, wcols = sf_out.shape[1], wsf.shape[-1]
+        SK = _select_dsv4_ob_split_k(M, getattr(self, "ob_split_k", None))
+        can_split = (SK > 1 and M <= 128 and N == 7168 and K_ob == 16384
+                     and K_ob % SK == 0 and (K_ob // SK) % 512 == 0
+                     and nkb4 % SK == 0 and wcols % SK == 0)
+        if not can_split:
+            hidden = torch.empty([M, N],
+                                 device=o_lora_fp8.device,
+                                 dtype=self.dtype)
+            deep_gemm.fp8_gemm_nt((o_lora_fp8, sf_out), (w, wsf),
+                                  hidden,
+                                  c=None,
+                                  disable_ue8m0_cast=False)
+            return hidden
+        logger.info_once(
+            f"[obsk-fused] O_b split-K ENGAGED (TRT-LLM C++): SK={SK} "
+            f"M={M} K={K_ob} N={N}",
+            key="obsk_fused_engaged")
+        if wsf.dtype != torch.int32:
+            from tensorrt_llm.quantization.utils.fp8_utils import \
+                transform_sf_into_required_layout
+            wsf = self.o_b_proj.__dict__.setdefault(
+                "_ob_wsf_int",
+                transform_sf_into_required_layout(wsf,
+                                                  mn=N,
+                                                  k=K_ob,
+                                                  recipe=(1, 128, 128),
+                                                  is_sfa=False))
+        partials = torch.empty([SK, M, N],
+                               device=o_lora_fp8.device,
+                               dtype=self.dtype)
+        torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, w, wsf,
+                                              partials, SK)
+        return partials.reshape(SK * M, N)
+
     def _deepseek_v4_o_proj(
         self,
         attn_out_latent: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2016,6 +2100,9 @@ class MLA(nn.Module):
         if isinstance(attn_out_latent, (tuple, list)):
             attn_fp8, attn_scale = attn_out_latent
             num_tokens = attn_fp8.shape[1]
+
+            if self._should_use_fused_oproj():
+                return self._fused_oa_ob_proj(attn_fp8, attn_scale, num_tokens)
 
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
@@ -2055,6 +2142,9 @@ class MLA(nn.Module):
                     128,
                     self.inverse_rotary_emb.is_neox,
                 ))
+            if self._should_use_fused_oproj():
+                return self._fused_oa_ob_proj(attn_fp8, attn_scale, num_tokens)
+
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
                 device=attn_out_latent.device,

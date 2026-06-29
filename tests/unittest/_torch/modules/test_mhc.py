@@ -785,6 +785,63 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
 @pytest.mark.parametrize(
     "tactic",
     [
+        ("fused_half_mma", 0, 4, 512, 1),
+        ("fused_half_fma", 3, 2, 256, 1),
+        ("fused_all_mma", 0, 4, 0, 1),
+        ("fused_all_fma", 2, 2, 0, 1),
+    ],
+)
+def test_mhc_fused_hc_reduces_split_x_for_all_backends(tactic):
+    """Every fused-HC backend consumes split-major O_b partials correctly."""
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    n, hidden_size, hc_mult, x_splits = 32, 7168, 4, 4
+    pre_data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+    torch.random.manual_seed(23)
+
+    x_partials = (
+        torch.randn((x_splits, n, hidden_size), dtype=torch.float32, device="cuda") * 0.25
+    ).bfloat16()
+    x_reduced = x_partials.float().sum(dim=0).bfloat16()
+    residual_prev = torch.randn(
+        (n, hc_mult, hidden_size), dtype=torch.float32, device="cuda"
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult), dtype=torch.float32, device="cuda") * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device="cuda") * 0.1
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+
+    def inputs(x_prev):
+        return [
+            x_prev.contiguous(),
+            residual_prev,
+            post_mix_prev,
+            comb_mix_prev,
+            pre_data["fn"].contiguous(),
+            pre_data["hc_scale"].contiguous(),
+            pre_data["hc_base"].contiguous(),
+        ]
+
+    reference = tuple(output.clone() for output in runner(inputs(x_reduced), tactic=tactic))
+    split_output = runner(inputs(x_partials.reshape(x_splits * n, hidden_size)), tactic=tactic)
+
+    torch.testing.assert_close(split_output[0], reference[0], rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(split_output[1], reference[1], rtol=3e-3, atol=5e-3)
+    torch.testing.assert_close(split_output[2], reference[2], rtol=3e-3, atol=5e-3)
+    torch.testing.assert_close(split_output[3], reference[3], rtol=1e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "tactic",
+    [
         ("fused_half_mma", 0, 1, 256, 1),
         ("fused_half_fma", 2, 1, 256, 1),
         ("fused_all_mma", 0, 1, 0, 1),
