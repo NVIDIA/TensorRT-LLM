@@ -24,19 +24,19 @@ class DynamicTreeSlotStorage:
         S = num_slots + 1
         self.dummy_slot_id = num_slots
 
-        # Default no-tree rows to a valid linear chain; real trees overwrite
-        # these rows via scatter.
+        # Bootstrap/reused slots may not have a tree yet; keep their metadata
+        # as a valid linear chain so verification kernels can read it directly.
         no_tree_position_offsets, no_tree_packed_mask = self._make_no_tree_metadata(
             n_dt, mask_width)
         self.position_offsets = no_tree_position_offsets.unsqueeze(0).repeat(
             S, 1).contiguous()
         self.packed_mask = no_tree_packed_mask.unsqueeze(0).repeat(
             S, 1, 1).contiguous()
-        self._no_tree_position_offsets = self.position_offsets[0].clone()
-        self._no_tree_packed_mask = self.packed_mask[0].clone()
+        self._no_tree_position_offsets = no_tree_position_offsets
+        self._no_tree_packed_mask = no_tree_packed_mask
 
-        # CUDA-graph dummy rows use a bounded K-ary tree to match real warmup
-        # verify shapes.
+        # CUDA-graph dummies use a deterministic K-ary tree, matching real
+        # dynamic-tree mask/position shapes without depending on request state.
         dummy_position_offsets, dummy_packed_mask = self._make_dummy_tree_metadata(
             n_dt, mask_width, top_k)
         self.position_offsets[self.dummy_slot_id] = dummy_position_offsets
@@ -100,23 +100,31 @@ class DynamicTreeSlotStorage:
             cls, n_dt: int, mask_width: int,
             top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         top_k = max(int(top_k), 1)
-        position_offsets = [0] * n_dt
-        ancestor_mask = [[False] * n_dt for _ in range(n_dt)]
-        for token_idx in range(n_dt):
-            ancestor_mask[token_idx][token_idx] = True
-            if token_idx > 0:
-                parent_idx = (token_idx - 1) // top_k
-                position_offsets[token_idx] = position_offsets[parent_idx] + 1
-                ancestor_mask[token_idx][:token_idx] = ancestor_mask[
-                    parent_idx][:token_idx]
+        token_ids = torch.arange(n_dt, device='cuda')
+        parents = torch.where(token_ids > 0, (token_ids - 1) // top_k,
+                              token_ids)
+        ancestor_chain = torch.empty((n_dt, n_dt),
+                                     dtype=torch.long,
+                                     device='cuda')
+        current = token_ids
+        for depth in range(n_dt):
+            ancestor_chain[:, depth] = current
+            current = parents[current]
 
-        position_offsets = torch.tensor(position_offsets,
-                                        dtype=torch.int32,
-                                        device='cuda')
-        ancestor_mask = torch.tensor(ancestor_mask,
+        # Pack bits directly from the parent chain instead of materializing a
+        # dense bool mask and repacking it.
+        valid_ancestors = torch.ones((n_dt, n_dt),
                                      dtype=torch.bool,
                                      device='cuda')
-        return position_offsets, cls._pack_bool_mask(ancestor_mask, mask_width)
+        valid_ancestors[:, 1:] = ancestor_chain[:, 1:] != ancestor_chain[:, :-1]
+        bit_values = (1 << (ancestor_chain % 32)).to(torch.int32)
+        bit_values.masked_fill_(~valid_ancestors, 0)
+        packed_mask = torch.zeros((n_dt, mask_width),
+                                  dtype=torch.int32,
+                                  device='cuda')
+        packed_mask.scatter_add_(1, ancestor_chain // 32, bit_values)
+        position_offsets = valid_ancestors.sum(-1).to(torch.int32) - 1
+        return position_offsets, packed_mask
 
     @staticmethod
     def _make_no_tree_next_token(n_dt: int) -> torch.Tensor:
@@ -162,9 +170,16 @@ class DynamicTreeSlotStorage:
             return self._verify_staging[:0]
         ids = slot_ids[:count]
         staging = self._verify_staging[:count]
-        staging[:, :, 0] = self.retrieve_index[ids]
-        staging[:, :, 1] = self.retrieve_next_token[ids]
-        staging[:, :, 2] = self.retrieve_next_sibling[ids]
+        # Avoid advanced-indexing temporaries on the verification path.
+        torch.index_select(self.retrieve_index, 0, ids, out=staging[:, :, 0])
+        torch.index_select(self.retrieve_next_token,
+                           0,
+                           ids,
+                           out=staging[:, :, 1])
+        torch.index_select(self.retrieve_next_sibling,
+                           0,
+                           ids,
+                           out=staging[:, :, 2])
         return staging
 
     def next_links_from_slots(self, slot_ids, count):
