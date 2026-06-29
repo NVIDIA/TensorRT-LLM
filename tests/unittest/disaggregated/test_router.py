@@ -898,6 +898,11 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
                                 max_batch_size=32,
                                 tokens_per_block=32)
     tokenizer = _mock_tokenizer(token_ids=[11, 22, 33])
+    documents = [{
+        "title": "Weather policy",
+        "text": "Use Celsius for European weather."
+    }]
+    chat_template = "{{ messages[0]['content'] }}"
     req = ChatCompletionRequest(
         model="custom-chat-model",
         messages=[{
@@ -905,6 +910,8 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
             "content": "what's the weather in Paris?"
         }],
         tools=[_get_weather_tool()],
+        documents=documents,
+        chat_template=chat_template,
         chat_template_kwargs={"thinking": True},
     )
 
@@ -919,6 +926,8 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs() -> None:
     tool_dicts = kwargs["tools"]
     assert isinstance(tool_dicts, list)
     assert tool_dicts[0]["function"]["name"] == "get_current_weather"
+    assert kwargs["documents"] == documents
+    assert kwargs["chat_template"] == chat_template
     assert kwargs["thinking"] is True
 
 
@@ -1178,6 +1187,32 @@ def test_gpt_oss_config_model_type_uses_harmony(tmp_path: Path) -> None:
     tokenizer.apply_chat_template.assert_not_called()
     harmony.openai_to_harmony_tokens.assert_called_once()
     assert token_lists == [harmony_tokens]
+    assert req.prompt_token_ids is None
+
+
+def test_disable_harmony_adapter_uses_tokenizer_for_gpt_oss(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISABLE_HARMONY_ADAPTER", "1")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+    tokenizer = _mock_tokenizer(token_ids=[900, 901, 902, 903])
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter"
+                    ) as get_harmony_adapter, mock.patch.object(
+                        router, "_get_tokenizer", return_value=tokenizer):
+        req = ChatCompletionRequest(model="openai/gpt-oss-20b",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+        token_lists = router._tokenize(req)
+
+    get_harmony_adapter.assert_not_called()
+    tokenizer.apply_chat_template.assert_called_once()
+    assert token_lists == [[900, 901, 902, 903]]
     assert req.prompt_token_ids is None
 
 

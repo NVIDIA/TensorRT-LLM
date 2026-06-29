@@ -2708,7 +2708,7 @@ class PyExecutor:
         if self._is_kv_manager_v2:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
-    
+
     @staticmethod
     def _sync_disagg_generation_trans_complete_draft_tokens(
             requests: Iterable[LlmRequest]) -> None:
