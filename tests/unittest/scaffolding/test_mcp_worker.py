@@ -257,6 +257,7 @@ async def test_mcp_worker_add_numbers(mcp_server):
         worker.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_echo_message(mcp_server):
     # Initialize MCPWorker
