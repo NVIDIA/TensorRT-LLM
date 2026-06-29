@@ -377,8 +377,13 @@ class Block:
     def prev(self) -> "Block | RootBlock":
         return unwrap_rawref(self._prev)
 
-    def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
-        if self.storage[lc_idx] is None:
+    def unset_page(
+        self, lc_idx: LifeCycleId, lc: LifeCycle, expected_page: "CommittedPage | None" = None
+    ) -> None:
+        ref = self.storage[lc_idx]
+        if ref is None:
+            return
+        if expected_page is not None and ref() is not expected_page:
             return
         ordinal = self.ordinal
         self.storage[lc_idx] = None

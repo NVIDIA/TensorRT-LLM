@@ -241,6 +241,7 @@ class CommittedPage(Page):
             block.unset_page(
                 self.life_cycle,
                 self.manager._life_cycles.get_life_cycle(self.life_cycle),
+                self,
             )
         Page.__del__(self)
         self.__rawref__.invalidate()

@@ -890,17 +890,37 @@ class _KVCache:
         assert self.status == self.Status.ACTIVE
         if self._commit_state == self.CommitState.USER_STOP:
             raise LogicError("Cannot commit tokens after stop_committing()")
+        commit_min_snapshot = self.manager.commit_min_snapshot
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        if commit_min_snapshot:
+            new_num_committed_tokens = self.num_committed_tokens + len(accepted_input_tokens)
+            assert self.history_length in (
+                self.num_committed_tokens,
+                new_num_committed_tokens,
+            ), "commit_min_snapshot requires commit() to start or end at history_length"
+            assert new_num_committed_tokens % self.tokens_per_block == 0, (
+                "commit_min_snapshot requires commit() to end at a block boundary"
+            )
         self._committed_tokens.extend(accepted_input_tokens)
         if self._commit_state == self.CommitState.VIRTUAL_STOP:
             return
+        if self.history_length < self.num_committed_tokens:
+            self.history_length = self.num_committed_tokens
         num_committed_blocks = self._num_committed_blocks
         new_num_full_blocks = BlockOrdinal(self.num_committed_tokens // self.tokens_per_block)
         if new_num_full_blocks > num_committed_blocks:
+            ssm_snapshot_ordinal = BlockOrdinal(new_num_full_blocks - 1)
             with self._record_event():
                 for ordinal in typed_range(num_committed_blocks, new_num_full_blocks):
-                    self._commit_block(ordinal, False)
-        if self.history_length < self.num_committed_tokens:
-            self.history_length = self.num_committed_tokens
+                    self._commit_block(
+                        ordinal,
+                        False,
+                        commit_ssm=(
+                            commit_min_snapshot
+                            and ssm_lc_id is not None
+                            and ordinal == ssm_snapshot_ordinal
+                        ),
+                    )
 
     # Note that the tokens may not be ready yet, if the event passed to the past commit() calls are not yet signaled.
     @property
@@ -1242,22 +1262,25 @@ class _KVCache:
         )
 
     def _snapshot_ssm_to_tree_block(
-        self, tree_block: Block, ssm_lc_id: LifeCycleId, beam_idx: BeamIndex
+        self, tree_block: Block, ssm_lc_id: LifeCycleId, num_tokens: int
     ) -> None:
-        """Copy live SSM state to a new page and attach it to the radix tree block."""
+        """Copy live SSM state to a full radix-tree block for exactly num_tokens."""
+        assert num_tokens > 0
+        assert num_tokens == self.tokens_per_block * (tree_block.ordinal + 1)
+        existing_page = map_optional(tree_block.storage[ssm_lc_id], lambda p: p())
+        if existing_page is not None:
+            return
+
         storage = self.manager._storage
-        ssm_lock = expect_type(_SharedPageLock, self._ssm_blocks[beam_idx][ssm_lc_id])
+        ssm_lock = expect_type(_SharedPageLock, self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id])
         src_page = ssm_lock.page
         pg_idx = storage.get_pool_group_index(ssm_lc_id)
         # Try to find a slot in any cache level, starting from the source page's level
-        for i in range(storage.num_cache_levels):
-            lvl = CacheLevel(i + src_page.cache_level)
+        for lvl in typed_range(src_page.cache_level, storage.num_cache_levels):
             try:
                 new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
             except OutOfPagesError:
                 continue
-            except Exception:
-                raise
             cuda_stream = self.cuda_stream
             new_slot.ready_event.wait_in_stream(cuda_stream)
             slot_size = storage.slot_size(pg_idx)
@@ -1271,20 +1294,14 @@ class _KVCache:
                     [CopyTask(dst, src)],
                     cuda_stream,
                 )
-            ready_event = CachedCudaEvent(cuda_stream)
-            assert self.tokens_per_block * (tree_block.ordinal + 1) == self.num_committed_tokens
-            temp_page = UncommittedPage(
-                self, tree_block.ordinal, ssm_lc_id, lvl, new_slot, beam_idx
-            )
-            committed = temp_page.convert_to_committed(tree_block, ready_event)
-            # The tree only holds a weak rawref to the page. Schedule for eviction so the
-            # eviction controller keeps a strong reference, preventing the page from being GC'd.
+            new_slot.ready_event = CachedCudaEvent(cuda_stream)
+            priority = self._get_priority(tree_block.ordinal, self.manager._life_cycles[ssm_lc_id])
+            committed = CommittedPage(storage, tree_block, ssm_lc_id, lvl, new_slot, priority)
+            tree_block.storage[ssm_lc_id] = rawref.ref(committed)
             storage.schedule_for_eviction(committed)
-            break  # success
-        else:
-            return  # No pages available in any level, silently skip snapshot
+            return
 
-    def _commit_block(self, ordinal: BlockOrdinal, is_last: bool) -> None:
+    def _commit_block(self, ordinal: BlockOrdinal, is_last: bool, commit_ssm: bool = False) -> None:
         "Commit the block for reuse. Block must be full of tokens except for the last block."
         assert self._commit_state == self.CommitState.ALLOWED
         assert (
@@ -1316,6 +1333,7 @@ class _KVCache:
 
         assert tree_block.tokens_per_block == tokens_per_block
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        did_commit = False
         if is_new:
             # We are the only writer to padding. Other _KVCache reusing it should make copies.
             skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
@@ -1330,27 +1348,13 @@ class _KVCache:
                 beam_block[lc] = (
                     p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
                 )
-            # SSM snapshot: copy live SSM state at interval boundaries.
-            # The live SSM state corresponds to num_committed_tokens (updated
-            # before _commit_block is called), so snapshot only on the block
-            # whose end equals num_committed_tokens and that count is a
-            # non-zero multiple of the reuse interval.
-            if ssm_lc_id is not None:
-                num_committed = self.num_committed_tokens
-                block_end = (ordinal + 1) * tokens_per_block
-                if (
-                    block_end == num_committed
-                    and num_committed % self.manager.ssm_reuse_interval == 0
-                ):
-                    self._snapshot_ssm_to_tree_block(tree_block, ssm_lc_id, beam_idx)
-                else:
-                    tree_block.storage[ssm_lc_id] = None
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
             event_manager = self.manager.event_manager
             if event_manager is not None:
                 event_manager.add_stored_block_event_from_block(tree_block)
+            did_commit = True
         elif tree_block.is_full and self.manager.allow_seq_rebasing and is_full:
             # Happens when a concurrent request committed the same tokens before us.
             # Try to replace our pages with pages from the existing block to save memory.
@@ -1388,9 +1392,17 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
+            did_commit = True
         else:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP
+
+        if did_commit and commit_ssm:
+            assert ssm_lc_id is not None
+            assert is_full
+            self._snapshot_ssm_to_tree_block(
+                tree_block, ssm_lc_id, (ordinal + 1) * tokens_per_block
+            )
 
         if seq_block.is_committed:
             for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
@@ -1417,8 +1429,8 @@ class _KVCache:
                 assert not block.is_committed
                 for beam_block in block.pages:
                     if beam_block[lc_idx] is None:
-                        assert self.enable_swa_scratch_reuse
-                        continue  # Scratch block — already handled
+                        assert self.enable_swa_scratch_reuse or self.manager.commit_min_snapshot
+                        continue  # Scratch or commit_min_snapshot block — already handled
                     assert isinstance(beam_block[lc_idx], _PageHolder)
                     beam_block[lc_idx] = None
         assert NDEBUG or self._check_sanity()
@@ -1449,12 +1461,14 @@ class _KVCache:
                     block = self._blocks[ordinal]
                     is_committed = block.is_committed
                     hold_for_commit = (
-                        not is_committed and self._commit_state == self.CommitState.ALLOWED
+                        not self.manager.commit_min_snapshot
+                        and not is_committed
+                        and self._commit_state == self.CommitState.ALLOWED
                     )
                     for beam_idx, beam_block in typed_enumerate(block.pages):
                         if beam_block[lc_idx] is None:
-                            assert self.enable_swa_scratch_reuse
-                            continue  # Scratch block — no page to unlock
+                            assert self.enable_swa_scratch_reuse or self.manager.commit_min_snapshot
+                            continue  # Scratch or commit_min_snapshot block — no page to unlock
                         holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                         ret.append((ordinal, beam_idx, lc_idx, holder))
                         beam_block[lc_idx] = holder if hold_for_commit else None
@@ -1602,7 +1616,8 @@ class _KVCache:
                             # For the decoder-side disagg case, for the first step, we will skip the
                             # out-of-window blocks.
                             assert isinstance(holder, _PageHolder) or (
-                                holder is None and not self._committed_tokens
+                                holder is None
+                                and (not self._committed_tokens or self.manager.commit_min_snapshot)
                             )
                     else:
                         # Scratch blocks have None pages but valid base_page_indices

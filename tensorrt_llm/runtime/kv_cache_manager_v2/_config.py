@@ -213,12 +213,6 @@ class KVCacheManagerConfig:
     layer groups.
     """
 
-    ssm_reuse_interval: int = 512
-    """
-    Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
-    Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
-    """
-
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     """
     When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
@@ -231,6 +225,12 @@ class KVCacheManagerConfig:
 
     Most useful for disaggregated prefill servers handling long prompts or long prompt chunks,
     where the number of out-of-window blocks dominates memory usage.
+    """
+
+    commit_min_snapshot: bool = False
+    """
+    If True, commit only the minimum reusable snapshot for each commit() call.
+    Required when SSM layers are present.
     """
 
     enable_stats: bool = True
@@ -254,10 +254,8 @@ class KVCacheManagerConfig:
             for buffer in layer.buffers
         )
         if any(layer.type == LayerType.SSM for layer in self.layers):
-            assert self.ssm_reuse_interval > 0, "ssm_reuse_interval must be positive"
-            assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
-                f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
-                f"tokens_per_block ({self.tokens_per_block})"
+            assert self.commit_min_snapshot, (
+                "commit_min_snapshot must be True when SSM layers are present"
             )
             assert not self.enable_partial_reuse, (
                 "enable_partial_reuse must be False when SSM layers are present"
