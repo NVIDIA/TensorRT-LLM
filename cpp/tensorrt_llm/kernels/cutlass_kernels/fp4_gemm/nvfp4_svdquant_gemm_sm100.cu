@@ -76,18 +76,18 @@ using FusionOperation
 
 // Every kernel shape uses a dynamic cluster type so each tile can benchmark stock-compatible
 // runtime cluster shapes without multiplying the generated kernel variants.
-template <class MmaTileShape_, class EpilogueSchedule_, class MainloopSchedule_>
+template <class MmaTileShape_, class EpilogueSchedule_, class MainloopSchedule_, class EpilogueTile_ = EpilogueTileType>
 struct SvdquantGemmConfig
 {
     using MmaTileShape = MmaTileShape_;
+    using EpilogueTile = EpilogueTile_;
     using EpilogueSchedule = EpilogueSchedule_;
     using MainloopSchedule = MainloopSchedule_;
     using ClusterShape = Shape<int, int, _1>;
 
-    using CollectiveEpilogue =
-        typename cutlass::epilogue::collective::CollectiveBuilder<Arch, cutlass::arch::OpClassTensorOp, MmaTileShape,
-            ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC, LayoutC, AlignC,
-            OutElementType, LayoutC, AlignC, EpilogueSchedule, FusionOperation>::CollectiveOp;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<Arch,
+        cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape, EpilogueTile, ElementAccumulator, ElementCompute,
+        ElementC, LayoutC, AlignC, OutElementType, LayoutC, AlignC, EpilogueSchedule, FusionOperation>::CollectiveOp;
 
     // Build the standard block-scaled mainloop, then re-instantiate CollectiveMmaLoRA with the
     // builder's extracted template arguments. D/L1 overlay the residual A/B stage buffers, so no
@@ -122,6 +122,14 @@ using Tactic1Sm128x128x128Config = SvdquantGemmConfig<Shape<_128, _128, _128>, c
     cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
 using Tactic2Sm256x192x128Config = SvdquantGemmConfig<Shape<_256, _192, _128>, cutlass::epilogue::TmaWarpSpecialized2Sm,
     cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
+using Tactic1Sm128x64x128Config = SvdquantGemmConfig<Shape<_128, _64, _128>, cutlass::epilogue::TmaWarpSpecialized1Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
+using Tactic1Sm128x128x256Config = SvdquantGemmConfig<Shape<_128, _128, _256>, cutlass::epilogue::TmaWarpSpecialized1Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
+using Tactic2Sm256x128x256Config = SvdquantGemmConfig<Shape<_256, _128, _256>, cutlass::epilogue::TmaWarpSpecialized2Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
+using Tactic2Sm256x256x256Config = SvdquantGemmConfig<Shape<_256, _256, _256>, cutlass::epilogue::TmaWarpSpecialized2Sm,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, Shape<_128, _64>>;
 
 enum class KernelShape
 {
@@ -129,6 +137,10 @@ enum class KernelShape
     k2Sm256x256x128,
     k1Sm128x128x128,
     k2Sm256x192x128,
+    k1Sm128x64x128,
+    k1Sm128x128x256,
+    k2Sm256x128x256,
+    k2Sm256x256x256,
 };
 
 struct RuntimeTactic
@@ -166,6 +178,23 @@ RuntimeTactic resolve_tactic(int tactic)
     case Nvfp4SvdquantGemmTactic::k2Sm256x192x128: return {KernelShape::k2Sm256x192x128, dim3(2, 1, 1), dim3(2, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k2Sm256x192x128Cluster2x2:
         return {KernelShape::k2Sm256x192x128, dim3(2, 2, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x64x128: return {KernelShape::k1Sm128x64x128, dim3(1, 1, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x64x128Cluster1x2:
+        return {KernelShape::k1Sm128x64x128, dim3(1, 2, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x64x128Cluster1x4:
+        return {KernelShape::k1Sm128x64x128, dim3(1, 4, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x128x256Cluster1x2:
+        return {KernelShape::k1Sm128x128x256, dim3(1, 2, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k1Sm128x128x256Cluster1x4:
+        return {KernelShape::k1Sm128x128x256, dim3(1, 4, 1), dim3(1, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x128x256: return {KernelShape::k2Sm256x128x256, dim3(2, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x256: return {KernelShape::k2Sm256x256x256, dim3(2, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x256Cluster2x2:
+        return {KernelShape::k2Sm256x256x256, dim3(2, 2, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x256Cluster4x4:
+        return {KernelShape::k2Sm256x256x256, dim3(4, 4, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x256x256Cluster4x1:
+        return {KernelShape::k2Sm256x256x256, dim3(4, 1, 1), dim3(2, 1, 1)};
     default: throw std::invalid_argument("nvfp4_svdquant_gemm: invalid tactic");
     }
 }
@@ -259,6 +288,14 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic)
         return workspace_size_for_tactic<Tactic1Sm128x128x128Config>(m, n, k, runtime_tactic);
     case KernelShape::k2Sm256x192x128:
         return workspace_size_for_tactic<Tactic2Sm256x192x128Config>(m, n, k, runtime_tactic);
+    case KernelShape::k1Sm128x64x128:
+        return workspace_size_for_tactic<Tactic1Sm128x64x128Config>(m, n, k, runtime_tactic);
+    case KernelShape::k1Sm128x128x256:
+        return workspace_size_for_tactic<Tactic1Sm128x128x256Config>(m, n, k, runtime_tactic);
+    case KernelShape::k2Sm256x128x256:
+        return workspace_size_for_tactic<Tactic2Sm256x128x256Config>(m, n, k, runtime_tactic);
+    case KernelShape::k2Sm256x256x256:
+        return workspace_size_for_tactic<Tactic2Sm256x256x256Config>(m, n, k, runtime_tactic);
     }
     throw std::invalid_argument("nvfp4_svdquant_gemm_workspace_size: invalid kernel shape");
 }
@@ -283,6 +320,18 @@ void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const
             out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     case KernelShape::k2Sm256x192x128:
         return run_tactic<Tactic2Sm256x192x128Config>(
+            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+    case KernelShape::k1Sm128x64x128:
+        return run_tactic<Tactic1Sm128x64x128Config>(
+            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+    case KernelShape::k1Sm128x128x256:
+        return run_tactic<Tactic1Sm128x128x256Config>(
+            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+    case KernelShape::k2Sm256x128x256:
+        return run_tactic<Tactic2Sm256x128x256Config>(
+            out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
+    case KernelShape::k2Sm256x256x256:
+        return run_tactic<Tactic2Sm256x256x256Config>(
             out, A, B, sfa, sfb, alpha, D, dStride, L1, bias, m, n, k, ws, wsBytes, stream, runtime_tactic);
     }
     throw std::invalid_argument("nvfp4_svdquant_gemm_run: invalid kernel shape");
