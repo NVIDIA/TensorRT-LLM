@@ -146,8 +146,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
-            await self._verify_ctx_response(ctx_response)
-            gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            if not ctx_response or ctx_response.choices[0].finish_reason in (
+                "length",
+                "not_finished",
+            ):
+                await self._verify_ctx_response(ctx_response)
+                gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         else:
             # Clear synthetic disaggregated_params that may have been
             # injected by _extract_conversation_id (e.g. from the
