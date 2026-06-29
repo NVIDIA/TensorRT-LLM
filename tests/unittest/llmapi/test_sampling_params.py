@@ -32,6 +32,30 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.resource_governor import ResourceGovernor
 
 
+@pytest.mark.parametrize(
+    ("tokenizations", "expected_bad_words"),
+    [
+        ({"London": [1], " London": [2]}, [[1], [2]]),
+        ({"London": [1], " London": [1]}, [[1]]),
+        ({"London": [1], " London": [3, 1]}, [[1]]),
+    ],
+)
+def test_bad_words_prefix_space_variants(tokenizations, expected_bad_words):
+    class FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return tokenizations[text]
+
+    tokenizer = FakeTokenizer()
+    sampling_params = SamplingParams(bad="London")
+    sampling_params._setup(tokenizer, hf_model_config=None, generation_config=None)
+
+    assert sampling_params._get_bad_words() == expected_bad_words
+
+
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
 def test_check_logprobs_limit(field):
     check_logprobs_limit(field, None)
