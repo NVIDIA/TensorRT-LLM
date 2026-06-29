@@ -284,6 +284,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     # engine stats queue; /metrics reads from a tee buffer
                     # bounded by iter_stats_max_iterations to avoid racing
                     # the loop for the queue (nvbug 6102381).
+                    # One shared buffer is sufficient while this collector task
+                    # is the only consumer of the engine iteration-stats queue.
+                    # Other consumers can read it through get_iteration_stats(),
+                    # which clears the buffer. Adding another queue consumer
+                    # requires revisiting the buffering and clearing ownership.
                     max_buf = getattr(self.generator.args,
                                       "iter_stats_max_iterations", 1000) or 1000
                     self._iteration_stats_buffer = deque(maxlen=max_buf)
