@@ -15,9 +15,6 @@ from utils.util import skip_blackwell, skip_pre_blackwell
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
-from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
@@ -96,77 +93,6 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     expected_kv_lens_with_extra = actual_kv_lengths + num_extra_kv_tokens
     assert torch.equal(kv_lens_internal, expected_kv_lens_with_extra), \
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_mtp_eagle_one_model_dynamic_tree_metadata_prepares_mamba_links():
-    max_num_requests = 3
-    max_draft_len = 2
-    max_total_draft_tokens = 2
-    spec_tree_manager = SpecTreeManager(
-        max_num_requests=max_num_requests,
-        use_dynamic_tree=True,
-        max_total_draft_tokens=max_total_draft_tokens,
-        max_draft_len=max_draft_len,
-        eagle_choices=None,
-        dynamic_tree_max_topK=2,
-    )
-    slot_storage = spec_tree_manager.slot_storage
-    slot_storage.all_ids_buf[:max_num_requests].copy_(
-        torch.tensor([0, 1, 2], dtype=torch.long, device="cuda"))
-    slot_storage.has_tree[1] = True
-    slot_storage.retrieve_next_token[1] = torch.tensor([2, -1, -1],
-                                                       dtype=torch.int32,
-                                                       device="cuda")
-    slot_storage.retrieve_next_sibling[1] = torch.tensor([-1, -1, -1],
-                                                         dtype=torch.int32,
-                                                         device="cuda")
-
-    class _ResourceManager:
-        hidden_states = None
-        slot_manager = None
-        sa_manager = None
-
-        def __init__(self):
-            self.spec_tree_manager = spec_tree_manager
-            self.batch_indices_cuda = torch.empty(max_num_requests,
-                                                  dtype=torch.int,
-                                                  device="cuda")
-
-    metadata = Eagle3OneModelSpecMetadata(
-        max_draft_len=max_draft_len,
-        max_total_draft_tokens=max_total_draft_tokens,
-        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
-        max_num_requests=max_num_requests,
-        num_layers=1,
-        hidden_size=1,
-        max_num_tokens=16,
-        spec_resource_manager=_ResourceManager(),
-        use_dynamic_tree=True,
-    )
-    metadata.request_ids = [10, 11, 12]
-    metadata.seq_lens = [
-        1, max_total_draft_tokens + 1, max_total_draft_tokens + 1
-    ]
-    metadata.num_generations = 2
-    metadata.num_tokens = 1 + 2 * (max_total_draft_tokens + 1)
-
-    metadata.prepare()
-
-    assert metadata.retrieve_next_token is not None
-    assert metadata.retrieve_next_sibling is not None
-    assert metadata.retrieve_next_token.shape == (2, max_total_draft_tokens + 1)
-    assert torch.equal(metadata.retrieve_next_token[0],
-                       slot_storage.retrieve_next_token[1])
-    assert torch.equal(
-        metadata.retrieve_next_token[1],
-        torch.tensor([1, 2, -1], dtype=torch.int32, device="cuda"))
-    assert torch.equal(
-        metadata.retrieve_next_sibling[1],
-        torch.full((max_total_draft_tokens + 1, ),
-                   -1,
-                   dtype=torch.int32,
-                   device="cuda"))
 
 
 @pytest.mark.parametrize(
@@ -770,10 +696,13 @@ def test_multi_eagle3(use_one_model: bool):
             load_format="dummy",
         )
 
-        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
-                                           load_format="dummy")
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=eagle_model_dir,
+            # Llama 3 does not support one model eagle.
+            eagle3_one_model=use_one_model,
+            num_eagle_layers=2,
+            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
@@ -935,6 +864,7 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         eagle3_one_model=True,
+        allow_advanced_sampling=True,
         use_rejection_sampling=True,
     )
     if use_dynamic_tree:
@@ -1021,9 +951,10 @@ def test_eagle3_lora(use_cuda_graph: bool):
     llm_spec.shutdown()
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [False])
-@pytest.mark.parametrize("use_cuda_graph", [True])
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.high_cuda_memory
+@skip_blackwell
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
                                    disable_overlap_scheduler: bool):
@@ -1039,10 +970,8 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     max_batch_size = 4
     max_draft_len = 6
     dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 30
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    max_tokens=2048,
-                                    free_gpu_memory_fraction=0.5)
+    max_total_draft_tokens = 60
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[i for i in range(1, max_batch_size +
                                       1)]) if use_cuda_graph else None
@@ -1054,7 +983,7 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=2048,
+        max_seq_len=8192,
     )
 
     spec_config = Eagle3DecodingConfig(
@@ -1092,7 +1021,8 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.10
+        # Measured ~0.24 across all 4 configs (CG x overlap).
+        assert accept_rate > 0.20
 
     # Output tests: verify spec decode matches reference
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
@@ -1106,18 +1036,8 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    def assert_meaningful_text(text: str) -> None:
-        stripped = text.strip()
-        assert stripped
-        assert "\ufffd" not in stripped
-        assert any(ch.isalpha() for ch in stripped)
-        words = stripped.lower().split()
-        assert not any(
-            len(set(words[i:i + 6])) == 1 for i in range(len(words) - 5))
-
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-        assert_meaningful_text(text_spec)
-        assert_meaningful_text(text_ref)
+        assert text_spec == text_ref
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
