@@ -670,10 +670,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 capture_graph=capture_graph,
             )
 
-            # Detect VSWA: check if the manager has multiple pools.
-            # Guard on layer_to_pool_mapping_dict which is V2-specific — V1
-            # managers also expose is_vswa but lack the per-pool infrastructure.
-            if (getattr(self.kv_cache_manager, 'is_vswa', False) and hasattr(
+            # Detect multi-pool managers.  kv_cache_manager.is_vswa excludes
+            # hybrid Mamba managers because their recurrent-state pool uses a
+            # negative sentinel window, but FlashInfer still needs the V2 pool
+            # mapping to avoid feeding those placeholder block IDs to paged KV.
+            has_multiple_windows = len(
+                getattr(self.kv_cache_manager, 'max_attention_window_vec',
+                        [])) > 1
+            if (has_multiple_windows and hasattr(
                     self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
                 mgr = self.kv_cache_manager
                 self._vswa_layer_to_pool = {}
