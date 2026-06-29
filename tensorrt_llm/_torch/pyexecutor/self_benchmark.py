@@ -15,14 +15,16 @@
 
 import json
 import os
+import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional
 
 from tensorrt_llm.bindings.executor import OutputConfig, Request, SamplingConfig
 from tensorrt_llm.logger import logger
 
-from .executor_request_queue import RequestQueueItem
+from .llm_request import executor_request_to_llm_request
 from .resource_manager import ResourceManagerType
 from .scheduler import ScheduledRequests, WaitingQueue
 
@@ -61,23 +63,49 @@ class SelfBenchmark:
         self.config = executor.llm_args.self_benchmark_config
         self._grid = self._build_grid()
         self._grid_index = 0
+        # Per-point request-id stride must exceed the largest decode batch so
+        # point N's request ids never overflow into point N+1's id range.
+        self._id_stride = max(1024, self._max_decode_batch_size() + 1)
         self._current: Optional[BenchmarkPointResult] = None
         self._results: list[BenchmarkPointResult] = []
         self._done = self.config is None
-        self._timed_out = False
         self._started_at = time.monotonic()
+        self._run_id = uuid.uuid4().hex[:12]
+        self._output_path = (None if self.config is None else
+                             self._rank_output_path(self.config.output_path))
+        self._identity = self._build_identity()
         if not self._done:
             logger.info("Self-benchmark enabled: %s", self.config)
             logger.info("Self-benchmark grid: %d point(s)", len(self._grid))
+            # Invalidate any stale results from a previous run up front, so a
+            # crash mid-sweep can never leave a prior run's file looking valid.
+            self._invalidate_output()
 
     @property
     def active(self) -> bool:
         return not self._done
 
-    def make_prefill_queue_items(
-            self,
-            active_requests: list["LlmRequest"],
-            waiting_queue: WaitingQueue) -> list[RequestQueueItem]:
+    def make_prefill_requests(
+            self, active_requests: list["LlmRequest"],
+            waiting_queue: WaitingQueue) -> list["LlmRequest"]:
+        """Build the synthetic prefill request for the next grid point.
+
+        Per-rank lockstep rationale: this runs on EVERY TP rank (alongside
+        decode injection in ``_fetch_and_activate_new_requests``), not via the
+        rank-0 request-queue + broadcast path. For the TP forward collectives to
+        stay aligned, every rank must produce an identical request and advance
+        the state machine identically each iteration. Every input below is a
+        deterministic function of ``point.index`` (which is itself driven by the
+        grid + ``_grid_index``, advanced identically on all ranks), so the
+        constructed ``LlmRequest`` is bit-for-bit identical across ranks:
+          * request id  -> ``_request_id(point.index, 0)`` (pure arithmetic)
+          * prompt tokens -> ``[1] * isl`` (isl is a grid field)
+          * cache_salt  -> ``_cache_salt_id(point.index)`` (pure arithmetic)
+          * max_tokens / sampling / end_id / pad_id -> constants
+        Because the request is constructed locally on each rank, it must NOT be
+        injected into rank 0's broadcast queue as well (that would double-inject
+        on non-rank-0 ranks and diverge the state machine).
+        """
         if not self._can_start_next_point(active_requests, waiting_queue):
             return []
         point = self._peek_next_point()
@@ -89,12 +117,18 @@ class SelfBenchmark:
 
         self._start_point(point)
         request = self._make_prefill_request(point)
-        return [
-            RequestQueueItem(
-                id=self._request_id(point.index, 0),
-                request=request,
-                child_req_ids=None)
-        ]
+        # Construct the LlmRequest locally on this rank instead of going through
+        # the rank-0 fetch + RequestBroadcaster path. exclude_last_generation
+        # logits is a deterministic engine-wide flag (identical across TP ranks).
+        llm_request = executor_request_to_llm_request(
+            req_id=self._request_id(point.index, 0),
+            executor_request=request,
+            child_req_ids=None,
+            exclude_last_generation_logits=self._exclude_last_generation_logits(
+            ))
+        llm_request.is_self_benchmark_request = True
+        llm_request.py_self_benchmark_point_id = point.index
+        return [llm_request]
 
     def make_decode_requests(self, active_requests: list["LlmRequest"],
                              waiting_queue: WaitingQueue) -> list["LlmRequest"]:
@@ -120,17 +154,26 @@ class SelfBenchmark:
             self._request_id(point.index, offset)
             for offset in range(point.batch_size)
         ]
-        requests = kv_cache_manager.add_dummy_requests(
-            request_ids=request_ids,
-            token_nums=[token_num] * point.batch_size,
-            is_gen=True,
-            max_num_draft_tokens=self._executor.max_total_draft_tokens,
-            kv_reserve_draft_tokens=getattr(self._executor.model_engine,
-                                            "max_draft_loop_tokens",
-                                            self._executor.max_total_draft_tokens),
-            use_mrope=getattr(self._executor.model_engine, "use_mrope", False),
-            max_beam_width=self._executor.max_beam_width,
-            draft_kv_cache_manager=draft_kv_cache_manager)
+        try:
+            requests = kv_cache_manager.add_dummy_requests(
+                request_ids=request_ids,
+                token_nums=[token_num] * point.batch_size,
+                is_gen=True,
+                max_num_draft_tokens=self._executor.max_total_draft_tokens,
+                kv_reserve_draft_tokens=getattr(
+                    self._executor.model_engine, "max_draft_loop_tokens",
+                    self._executor.max_total_draft_tokens),
+                use_mrope=getattr(self._executor.model_engine, "use_mrope",
+                                  False),
+                max_beam_width=self._executor.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager)
+        except Exception as exc:
+            # add_dummy_requests only prechecks for >=1 free block, so a large
+            # batch can still fail mid-allocation when pages run out. Skip the
+            # point instead of crashing the engine.
+            self._skip_current_point(
+                f"synthetic decode KV allocation failed: {exc}")
+            return []
         if requests is None:
             self._skip_current_point("insufficient KV cache for synthetic decode")
             return []
@@ -171,13 +214,18 @@ class SelfBenchmark:
         return True
 
     def write_output(self) -> None:
-        if self.config is None:
+        if self.config is None or self._output_path is None:
             return
-        output_path = self._rank_output_path(self.config.output_path)
         output = {
+            "schema_version": 1,
+            "status": "complete",
+            "valid": True,
+            "run_id": self._run_id,
+            "completed_at_unix": time.time(),
+            "identity": self._identity,
+            "output_path": self._output_path,
             "config": self.config.model_dump(),
             "limits": self._limits(),
-            "timed_out": self._timed_out,
             "results": [
                 {
                     "point": asdict(result.point),
@@ -188,13 +236,79 @@ class SelfBenchmark:
                 } for result in self._results
             ],
         }
-        tmp_path = f"{output_path}.tmp"
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(tmp_path, "w") as f:
-            json.dump(output, f, indent=2)
-        os.replace(tmp_path, output_path)
+        self._atomic_write_json(self._output_path, output)
         logger.info("Self-benchmark results written to %s (%d point(s))",
-                    output_path, len(self._results))
+                    self._output_path, len(self._results))
+
+    def _invalidate_output(self) -> None:
+        """Replace any prior-run output with an invalid 'running' sentinel.
+
+        Readiness consumers must not treat the mere existence of the output
+        file as a completed result: a crash mid-sweep would otherwise leave a
+        previous run's file looking valid. Writing the sentinel at init (and
+        flipping it to status=complete only in write_output) makes existence
+        insufficient and the run_id/identity authoritative.
+        """
+        if self._output_path is None:
+            return
+        output = {
+            "schema_version": 1,
+            "status": "running",
+            "valid": False,
+            "run_id": self._run_id,
+            "started_at_unix": time.time(),
+            "identity": self._identity,
+            "output_path": self._output_path,
+            "message": "Self-benchmark is running; previous results are invalid.",
+        }
+        try:
+            os.unlink(self._output_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to remove stale self-benchmark output %s: %s",
+                           self._output_path, exc)
+        self._atomic_write_json(self._output_path, output)
+
+    def _atomic_write_json(self, output_path: str, output: dict) -> None:
+        output_dir = os.path.dirname(output_path) or "."
+        os.makedirs(output_dir, exist_ok=True)
+        basename = os.path.basename(output_path)
+        # Process-unique temp file so co-located writers never clobber a shared
+        # ".tmp"; os.replace then publishes atomically.
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{basename}.{os.getpid()}.",
+                                        suffix=".tmp",
+                                        dir=output_dir,
+                                        text=True)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(output, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, output_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _build_identity(self) -> dict:
+        executor = self._executor
+        llm_args = getattr(executor, "llm_args", None)
+        dist = getattr(executor, "dist", None)
+        parallel = getattr(llm_args, "parallel_config", None)
+        model = getattr(llm_args, "model", None)
+        if model is not None and not isinstance(model, (str, int, float, bool)):
+            model = str(model)
+        return {
+            "model": model,
+            "benchmark_mode": getattr(self.config, "mode", None),
+            "rank": getattr(dist, "rank", 0),
+            "world_size": getattr(parallel, "world_size", None),
+            "tp_size": getattr(parallel, "tp_size", None),
+            "pp_size": getattr(parallel, "pp_size", None),
+            "pid": os.getpid(),
+        }
 
     def _build_grid(self) -> list[BenchmarkPoint]:
         if self.config is None:
@@ -256,7 +370,12 @@ class SelfBenchmark:
             input_token_ids=[1] * max(1, point.isl),
             max_tokens=1,
             streaming=False,
-            sampling_config=SamplingConfig(),
+            # Match the engine's beam width so the synthetic prefill batch is
+            # shaped like real requests (the decode path already passes
+            # max_beam_width to add_dummy_requests). Using the default beam=1
+            # under a beam>1 engine would mis-shape the forward batch.
+            sampling_config=SamplingConfig(
+                beam_width=self._executor.max_beam_width),
             end_id=-1,
             pad_id=0,
             output_config=output_config,
@@ -265,6 +384,13 @@ class SelfBenchmark:
         request.py_is_self_benchmark_request = True
         request.py_self_benchmark_point_id = point.index
         return request
+
+    def _exclude_last_generation_logits(self) -> bool:
+        # Engine-wide flag derived from disable_overlap_scheduler and pp_size;
+        # identical across TP ranks, so it does not perturb per-rank lockstep.
+        return bool(
+            getattr(self._executor, "should_exclude_last_generation_logits",
+                    False))
 
     def _mark_benchmark_request(self, request: "LlmRequest",
                                 point: BenchmarkPoint) -> None:
@@ -279,14 +405,6 @@ class SelfBenchmark:
             logger.info(
                 "Self-benchmark stopping early because shutdown was requested."
             )
-            self._finish()
-            return False
-        if self.config is not None and (
-                time.monotonic() - self._started_at) >= self.config.timeout_s:
-            self._timed_out = True
-            logger.warning(
-                "Self-benchmark timed out after %ds; writing partial results.",
-                self.config.timeout_s)
             self._finish()
             return False
         return not active_requests and len(waiting_queue) == 0
@@ -489,9 +607,9 @@ class SelfBenchmark:
         stem, ext = os.path.splitext(base_path)
         return f"{stem}_rank{rank}{ext}"
 
-    @staticmethod
-    def _request_id(point_index: int, offset: int) -> int:
-        return _BENCHMARK_REQUEST_ID_BASE + point_index * 1024 + offset
+    def _request_id(self, point_index: int, offset: int) -> int:
+        return (_BENCHMARK_REQUEST_ID_BASE + point_index * self._id_stride +
+                offset)
 
     @staticmethod
     def _cache_salt_id(point_index: int) -> int:
