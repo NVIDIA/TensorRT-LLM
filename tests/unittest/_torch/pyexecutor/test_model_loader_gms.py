@@ -195,6 +195,8 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         # ``model=model`` is passed for symmetry with the LoadFormat.AUTO
         # path (see model_loader.py); HF ignores it, MX uses it for direct
         # P2P writes when MX+GMS composition eventually lands.
+        # ``source_identity`` is included so format-specific loaders can
+        # publish the same compatibility fingerprint the RO path validates.
         checkpoint_loader.load_weights.assert_called_once_with(
             "/ckpt",
             mapping=loader.mapping,

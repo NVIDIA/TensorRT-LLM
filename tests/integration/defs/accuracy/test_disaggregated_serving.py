@@ -1948,6 +1948,10 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
         }
+        cache_transceiver_config = {
+            "backend": "UCX",
+            "max_tokens_in_buffer": 8192,
+        }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 4,
@@ -1956,10 +1960,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
-            },
+            "cache_transceiver_config": cache_transceiver_config.copy(),
         }
         gen_server_config = {
             "tensor_parallel_size": gen_tp,
@@ -1976,10 +1977,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
-            "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
-            },
+            "cache_transceiver_config": cache_transceiver_config.copy(),
             "enable_attention_dp": enable_attention_dp,
         }
         disaggregated_server_config = {
