@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankState,
     _num_input_tokens,
 )
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 
@@ -56,6 +57,7 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
         mock_request.py_scheduling_params = mock_schedule_params
     else:
         mock_request.py_scheduling_params = None
+    mock_request.py_conversation_params = None
     mock_request.input_token_ids = [1, 2, 3]
     return mock_request
 
@@ -70,6 +72,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
     scheduling_params.attention_dp_relax = attention_dp_relax
     item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
+    item.request.py_conversation_params = None
     item.request.input_token_ids = list(range(num_tokens))
     return item
 
@@ -1010,7 +1013,7 @@ def _make_conv_request_item(
     attention_dp_relax=True,
     num_tokens=10,
 ):
-    """Mock RequestQueueItem carrying a conversation_id on disaggregated_params."""
+    """Mock RequestQueueItem carrying conversation params."""
     item = MagicMock()
     item.id = req_id
     item.child_req_ids = None
@@ -1019,14 +1022,12 @@ def _make_conv_request_item(
     scheduling_params.attention_dp_relax = attention_dp_relax
     item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
+    item.request.py_conversation_params = None
+    if conversation_id is not None:
+        item.request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
     item.request.input_token_ids = list(range(num_tokens))
     item.request.py_orig_prompt_len = num_tokens
-    if conversation_id is None:
-        item.request.py_disaggregated_params = None
-    else:
-        disagg = MagicMock()
-        disagg.conversation_id = conversation_id
-        item.request.py_disaggregated_params = disagg
+    item.request.py_disaggregated_params = None
     return item
 
 

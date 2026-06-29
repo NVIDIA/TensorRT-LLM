@@ -1,29 +1,28 @@
 from .._torch.async_llm import AsyncLLM
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
-
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DeepSeekSparseAttentionConfig,
-                       DeepSeekV4SparseAttentionConfig,
-                       DFlashDecodingConfig, DraftTargetDecodingConfig,
-                       DynamicBatchConfig, Eagle3DecodingConfig,
-                       EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, PARDDecodingConfig,
-                       PrometheusMetricsConfig, ReorderRequestPolicyConfig,
-                       RocketSparseAttentionConfig, SADecodingConfig,
-                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
-                       SchedulerConfig, SkipSoftmaxAttentionConfig,
-                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
-                       UserProvidedDecodingConfig)
+                       DeepSeekV4SparseAttentionConfig, DFlashDecodingConfig,
+                       DraftTargetDecodingConfig, DynamicBatchConfig,
+                       Eagle3DecodingConfig, EagleDecodingConfig,
+                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
+                       MTPDecodingConfig, NGramDecodingConfig,
+                       PARDDecodingConfig, PrometheusMetricsConfig,
+                       ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
+                       SADecodingConfig, SAEnhancerConfig,
+                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
+                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
+                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -38,6 +37,7 @@ __all__ = [
     'GuidedDecodingParams',
     'SamplingParams',
     'DisaggregatedParams',
+    'ConversationParams',
     'DisaggScheduleStyle',
     'KvCacheConfig',
     'KvCacheRetentionConfig',

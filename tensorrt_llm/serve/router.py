@@ -36,6 +36,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     ReuseScope
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     RootBlock as V2RootBlock
+from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
@@ -1317,7 +1318,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     """Router that provides session affinity for multi-turn conversations.
 
     Routing priority:
-    1. Explicit ``conversation_id`` in ``disaggregated_params`` — sticky
+    1. Explicit ``conversation_params.conversation_id`` — sticky
        routing to the previously assigned server.
     2. Implicit block-hash prefix matching — find the session whose
        stored block hashes share the longest prefix with the new request.
@@ -1565,9 +1566,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     # ── routing helpers ──
 
     def _get_conversation_id(self, request: OpenAIRequest) -> Optional[str]:
-        if request.disaggregated_params is not None:
-            return request.disaggregated_params.conversation_id
-        return None
+        return get_request_conversation_id(request)
 
     def _generate_implicit_id(self) -> str:
         self._implicit_id_counter += 1

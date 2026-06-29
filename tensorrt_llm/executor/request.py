@@ -8,6 +8,7 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
@@ -105,6 +106,7 @@ class GenerationRequest:
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt_id: Optional[int] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
@@ -134,6 +136,7 @@ class GenerationRequest:
         self.disaggregated_params = disaggregated_params
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
+        self.conversation_params = conversation_params
         self.cache_salt_id = cache_salt_id
         self.arrival_time = arrival_time
         if not (0.0 <= priority <= 1.0):
