@@ -22,8 +22,36 @@
 #include "nixl.h"
 #include "nixl_types.h"
 
+#include <exception>
+
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
+
+namespace
+{
+// Release a transfer-request handle, reacting to both a bad status and a throw rather than silently
+// swallowing — leaking a NIXL request would otherwise go unnoticed. Used on the dtor / error /
+// release paths (all best-effort: there is nothing to retry, but it must not be silent).
+void releaseXferLogged(nixlAgent* agent, nixlXferReqH* h)
+{
+    try
+    {
+        nixl_status_t const st = agent->releaseXferReq(h);
+        if (st != NIXL_SUCCESS)
+        {
+            TLLM_LOG_WARNING("NixlTransferEngine: releaseXferReq failed: %s", nixlEnumStrings::statusStr(st).c_str());
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlTransferEngine: releaseXferReq threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("NixlTransferEngine: releaseXferReq threw (unknown)");
+    }
+}
+} // namespace
 
 NixlTransferEngine::NixlTransferEngine(nixlAgent* agent, int deviceId)
     : mRawAgent(agent)
@@ -36,13 +64,7 @@ NixlTransferEngine::~NixlTransferEngine()
     std::lock_guard<std::mutex> lk(mMu);
     for (auto& [id, h] : mHandles)
     {
-        try
-        {
-            mRawAgent->releaseXferReq(static_cast<nixlXferReqH*>(h));
-        }
-        catch (...)
-        {
-        }
+        releaseXferLogged(mRawAgent, static_cast<nixlXferReqH*>(h));
     }
     // Deregister every region we registered, so we don't leave a stale registration on the borrowed
     // agent after the backing buffer is freed. The caller (NixlBounceState) destroys this engine
@@ -53,10 +75,20 @@ NixlTransferEngine::~NixlTransferEngine()
         {
             nixl_reg_dlist_t list{VRAM_SEG};
             list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(addr), bytes, static_cast<uint64_t>(mDeviceId)});
-            (void) mRawAgent->deregisterMem(list);
+            nixl_status_t const st = mRawAgent->deregisterMem(list);
+            if (st != NIXL_SUCCESS)
+            {
+                TLLM_LOG_WARNING(
+                    "NixlTransferEngine: deregisterMem failed: %s", nixlEnumStrings::statusStr(st).c_str());
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING("NixlTransferEngine: deregisterMem threw: %s", e.what());
         }
         catch (...)
         {
+            TLLM_LOG_WARNING("NixlTransferEngine: deregisterMem threw (unknown)");
         }
     }
 }
@@ -100,13 +132,7 @@ std::uint64_t NixlTransferEngine::postWrite(std::string const& peer, void const*
     {
         TLLM_LOG_WARNING(
             "NixlTransferEngine: postXferReq to %s failed: %s", peer.c_str(), nixlEnumStrings::statusStr(st).c_str());
-        try
-        {
-            mRawAgent->releaseXferReq(handle);
-        }
-        catch (...)
-        {
-        }
+        releaseXferLogged(mRawAgent, handle);
         return 0;
     }
     std::lock_guard<std::mutex> lk(mMu);
@@ -152,13 +178,7 @@ void NixlTransferEngine::release(std::uint64_t handle)
         h = static_cast<nixlXferReqH*>(it->second);
         mHandles.erase(it);
     }
-    try
-    {
-        mRawAgent->releaseXferReq(h);
-    }
-    catch (...)
-    {
-    }
+    releaseXferLogged(mRawAgent, h);
 }
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

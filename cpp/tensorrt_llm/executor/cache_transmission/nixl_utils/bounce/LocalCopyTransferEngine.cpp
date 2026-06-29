@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/LocalCopyTransferEngine.h"
 
+#include "tensorrt_llm/common/cudaUtils.h"
+
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
@@ -25,7 +27,7 @@ LocalCopyTransferEngine::~LocalCopyTransferEngine()
     std::lock_guard<std::mutex> lk(mMu);
     for (auto& [id, ev] : mEvents)
     {
-        (void) cudaEventDestroy(ev);
+        TLLM_CUDA_CHECK_WARN(cudaEventDestroy(ev)); // warn-only cleanup (dtor can't throw)
     }
 }
 
@@ -53,7 +55,7 @@ std::uint64_t LocalCopyTransferEngine::postWrite(std::string const& peer, void c
     if (cudaEventRecord(ev, stream) != cudaSuccess)
     {
         (void) cudaGetLastError();
-        (void) cudaEventDestroy(ev);
+        TLLM_CUDA_CHECK_WARN(cudaEventDestroy(ev));
         return 0;
     }
     std::lock_guard<std::mutex> lk(mMu);
@@ -93,7 +95,7 @@ void LocalCopyTransferEngine::release(std::uint64_t handle)
     auto it = mEvents.find(handle);
     if (it != mEvents.end())
     {
-        (void) cudaEventDestroy(it->second);
+        TLLM_CUDA_CHECK_WARN(cudaEventDestroy(it->second));
         mEvents.erase(it);
     }
 }
