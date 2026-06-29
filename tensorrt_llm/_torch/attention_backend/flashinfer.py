@@ -711,6 +711,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 if layer_to_pool_mapping is not None or layer_to_pool_idx is not None:
                     self._vswa_layer_to_pool = {}
                     self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                    positive_pool_ids = [
+                        pool_id for pool_id in range(
+                            getattr(mgr, 'num_pools', 0))
+                        if (self._pool_window_for_pool_id(pool_id) is not None
+                            and self._pool_window_for_pool_id(pool_id) > 0)
+                    ]
+                    single_positive_pool_id = (positive_pool_ids[0] if len(
+                        positive_pool_ids) == 1 else None)
                     for layer_idx in getattr(mgr, 'layer_offsets', {}):
                         layer_offset = mgr.layer_offsets[layer_idx]
                         if layer_to_pool_mapping is not None:
@@ -718,7 +726,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         else:
                             pool_id = layer_to_pool_idx.get(layer_offset)
                             if pool_id is None:
-                                continue
+                                if single_positive_pool_id is None:
+                                    continue
+                                pool_id = single_positive_pool_id
+                        pool_window = self._pool_window_for_pool_id(pool_id)
+                        if ((pool_window is None or pool_window <= 0)
+                                and single_positive_pool_id is not None):
+                            pool_id = single_positive_pool_id
                         self._vswa_layer_to_pool[layer_idx] = pool_id
                         if pool_id not in self._vswa_pool_to_rep_layer:
                             self._vswa_pool_to_rep_layer[pool_id] = layer_idx
