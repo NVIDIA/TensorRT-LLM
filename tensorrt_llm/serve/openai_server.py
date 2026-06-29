@@ -54,23 +54,14 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                ChatCompletionResponse,
-                                                ChatCompletionResponseChoice,
-                                                ChatMessage, CompletionRequest,
-                                                CompletionResponse,
-                                                CompletionResponseChoice,
-                                                ErrorResponse,
-                                                ImageGenerationRequest,
-                                                ImageGenerationResponse,
-                                                ImageObject,
-                                                MemoryUpdateRequest, ModelCard,
-                                                ModelList, PromptTokensDetails,
-                                                ResponseFormat,
-                                                ResponsesRequest,
-                                                ResponsesResponse,
-                                                UpdateWeightsRequest, UsageInfo,
-                                                to_llm_disaggregated_params)
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatMessage, CompletionRequest, CompletionResponse,
+    CompletionResponseChoice, ErrorResponse, ImageGenerationRequest,
+    ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
+    ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
+    ResponsesResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -197,13 +188,15 @@ class OpenAIServer(_VideoRoutesMixin):
             metadata_server_cfg: MetadataServerConfig,
             disagg_cluster_config: Optional[DisaggClusterConfig] = None,
             multimodal_server_config: Optional[MultimodalServerConfig] = None,
-            chat_template: Optional[str] = None):
+            chat_template: Optional[str] = None,
+            allow_request_chat_template: bool = False):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -403,10 +396,6 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
-        self._ensure_post_processor_hook_supported(
-            self.use_harmony,
-            getattr(self.generator.args, "post_processor_hook", None))
-
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
             # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
@@ -450,22 +439,6 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
-
-    @staticmethod
-    def _ensure_post_processor_hook_supported(
-            use_harmony: bool, post_processor_hook: Optional[str]) -> None:
-        """Reject ``--post_processor_hook`` combined with a harmony/gpt-oss model.
-
-        The harmony output path is rebuilt from raw token ids, not detokenized
-        text, so the text-based hook cannot act there.
-        """
-        if use_harmony and post_processor_hook:
-            raise ValueError(
-                "--post_processor_hook is not supported with harmony/gpt-oss models "
-                "in this version: the harmony output path is reconstructed from "
-                "raw token ids and would bypass the text-based hook. Disable the "
-                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
-                "not needed.")
 
     def _logit_bias_vocab_size(self) -> int:
         for config in (self.model_config,
@@ -694,6 +667,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 model_config=self.model_config,
                 processor=self.processor,
+                allow_request_chat_template=self.allow_request_chat_template,
                 harmony_adapter_factory=get_harmony_adapter
                 if self.use_harmony else None,
             )
@@ -915,6 +889,19 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # Visual-gen deployments use a separate iteration-stats producer
+        # (see ``DiffusionRemoteClient._iter_stats``).  The LLM PyExecutor
+        # stats queue is empty in visual-gen mode, so route /metrics to the
+        # visual-gen-shaped producer instead. Each snapshot mirrors LLM
+        # field names where it makes sense (numActiveRequests,
+        # numQueuedRequests) so downstream consumers that already parse the
+        # LLM /metrics shape work for visual-gen with minimal changes.
+        if self._is_visual_gen:
+            stats = []
+            async for stat in self.generator.get_stats_async(timeout=None):
+                stats.append(stat)
+            return JSONResponse(content=stats)
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
@@ -1203,6 +1190,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1343,6 +1332,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
@@ -1390,6 +1381,8 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1699,6 +1692,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             # Initialize HarmonyAdapter
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
@@ -1794,6 +1789,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())

@@ -13,11 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ctypes
 import enum
 import os
 import threading
-from ctypes.util import find_library
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -57,56 +55,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
-
-_NCCL_GB10_SYMMETRIC_FIXED_VERSION = 23004  # NCCL 2.30.4
-_NCCL_MNNVL_ENABLE = "NCCL_MNNVL_ENABLE"
-
-
-@lru_cache(maxsize=None)
-def _is_gb10() -> bool:
-    """Return True on GB10 (DGX Spark)."""
-    return "GB10" in torch.cuda.get_device_name()
-
-
-@lru_cache(maxsize=None)
-def _get_nccl_runtime_version_code() -> Optional[int]:
-    lib_names = ["libnccl.so.2", "libnccl.so"]
-    nccl_lib = find_library("nccl")
-    if nccl_lib is not None and nccl_lib not in lib_names:
-        lib_names.append(nccl_lib)
-
-    for lib_name in lib_names:
-        try:
-            nccl = ctypes.CDLL(lib_name)
-            nccl.ncclGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
-            nccl.ncclGetVersion.restype = ctypes.c_int
-        except (AttributeError, OSError):
-            continue
-
-        version = ctypes.c_int()
-        if nccl.ncclGetVersion(ctypes.byref(version)) == 0:
-            return version.value
-
-    return None
-
-
-@lru_cache(maxsize=None)
-def _needs_gb10_nccl_symmetric_workaround() -> bool:
-    if not _is_gb10():
-        return False
-
-    runtime_version = _get_nccl_runtime_version_code()
-    return (runtime_version is None
-            or runtime_version < _NCCL_GB10_SYMMETRIC_FIXED_VERSION)
-
-
-@lru_cache(maxsize=None)
-def _init_gb10_nccl_symmetric_workaround() -> bool:
-    if not _needs_gb10_nccl_symmetric_workaround():
-        return False
-
-    os.environ.setdefault(_NCCL_MNNVL_ENABLE, "0")
-    return True
 
 
 def _init_deep_gemm_pdl() -> None:
@@ -178,6 +126,7 @@ class MoERunner(TunableRunner):
         use_fused_finalize: bool,
         activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
+        use_mxfp8_weight_scaling: bool = False,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -195,6 +144,7 @@ class MoERunner(TunableRunner):
         self.use_w4_group_scaling = use_w4_group_scaling
         self.use_int8_woq_per_channel = use_int8_woq_per_channel
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
+        self.use_mxfp8_weight_scaling = use_mxfp8_weight_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
@@ -202,7 +152,8 @@ class MoERunner(TunableRunner):
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                        use_int8_woq_per_channel, use_mxfp8_act_scaling)
+                        use_int8_woq_per_channel, use_mxfp8_act_scaling,
+                        use_mxfp8_weight_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
@@ -210,7 +161,7 @@ class MoERunner(TunableRunner):
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
                     use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                    use_fused_finalize)
+                    use_mxfp8_weight_scaling, use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -235,6 +186,7 @@ class MoERunner(TunableRunner):
             self.use_fused_finalize,
             self.activation_type,
             self.unpadded_hidden_size,
+            self.use_mxfp8_weight_scaling,
         )
 
     def forward(
@@ -304,6 +256,7 @@ def fused_moe(
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
     use_dynamic_fc2_scale: bool = False,
+    use_mxfp8_weight_scaling: bool = False,
     # Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
     # Each *_ranks   : CPU int32  [num_seqs]
     # Each *_weights : CPU int64  [num_seqs, 3], holding (A_ptr, B_ptr, DoRA_ptr); DoRA unused.
@@ -360,6 +313,7 @@ def fused_moe(
         use_fused_finalize=use_fused_finalize,
         activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
+        use_mxfp8_weight_scaling=use_mxfp8_weight_scaling,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
@@ -481,6 +435,7 @@ def _(input: torch.Tensor,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None,
       use_dynamic_fc2_scale: bool = False,
+      use_mxfp8_weight_scaling: bool = False,
       fc1_lora_ranks: Optional[torch.Tensor] = None,
       fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
       fc2_lora_ranks: Optional[torch.Tensor] = None,
@@ -817,6 +772,119 @@ class CudaCoreNVFP4Runner(TunableRunner):
         return result
 
 
+class MarlinNVFP4Runner(TunableRunner):
+    """Marlin-based NVFP4 GEMM for SM90 (Hopper).
+
+    Weights are eagerly repacked to Marlin tiled format during
+    ``get_valid_tactics`` (before CUDA graph capture) so that ``forward()`` does
+    not allocate any memory.
+    """
+
+    tuning_config = TuningConfig()  # single tactic, no tuning
+
+    MIN_SM_VERSION = 90
+    MAX_SM_VERSION = 99  # SM90-series only (Hopper)
+    NVFP4_SCALE_VECTOR_SIZE = 16
+
+    def __init__(self, output_buffer_kind: int, output_dtype: torch.dtype):
+        super().__init__()
+        self.output_buffer_kind = int(output_buffer_kind)
+        self.output_dtype = output_dtype
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        if not torch.cuda.is_available():
+            return []
+        capability = torch.cuda.get_device_capability(torch.device('cuda:0'))
+        sm_version = capability[0] * 10 + capability[1]
+        if sm_version < self.MIN_SM_VERSION or sm_version > self.MAX_SM_VERSION:
+            return []
+
+        # Eagerly prepare Marlin weights so that forward() never allocates
+        # memory (safe for CUDA graph capture).
+        _, weight, _, weight_scale, _ = inputs
+        self._prepare_marlin_weights(weight, weight_scale)
+
+        return [0]
+
+    @classmethod
+    def _prepare_marlin_weights(
+        cls, weight: torch.Tensor, weight_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Convert raw NVFP4 weights + scales to Marlin format."""
+        from tensorrt_llm.math_utils import pad_up
+        from tensorrt_llm.quantization.utils import marlin_utils
+
+        assert torch.iinfo(weight.dtype).bits == 8
+        # weight: [N, K/2] FP4 packed as int8/uint8; view as int32 repacks to
+        # the int32-based Marlin tiled layout.
+        size_n = weight.shape[0]
+        size_k = weight.shape[1] * 2
+
+        qweight_int32 = weight.view(torch.int32)
+        qweight_int32 = qweight_int32.T.contiguous()
+        perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+        marlin_weight = torch.ops.trtllm.gptq_marlin_repack(
+            b_q_weight=qweight_int32,
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+            is_a_8bit=False,
+        )
+
+        num_groups = size_k // cls.NVFP4_SCALE_VECTOR_SIZE
+        n_padded = pad_up(size_n, 128)
+        scale_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_scale.view(n_padded, -1))
+        scale_2d = scale_unswizzled[:size_n, :num_groups].view(
+            torch.float8_e4m3fn).T.contiguous()
+        marlin_scale = marlin_utils.marlin_permute_scales(
+            scale_2d.to(torch.half),
+            size_k,
+            size_n,
+            group_size=cls.NVFP4_SCALE_VECTOR_SIZE)
+        marlin_scale = marlin_utils.nvfp4_marlin_process_scales(marlin_scale)
+
+        marlin_global_scale = marlin_utils.nvfp4_marlin_process_global_scale(
+            torch.tensor(1.0, dtype=torch.bfloat16, device=weight.device))
+
+        return marlin_weight, marlin_scale, marlin_global_scale, size_n, size_k
+
+    def forward(
+        self,
+        /,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_scale, alpha = inputs
+
+        (marlin_weight, marlin_scale, marlin_global_scale, size_n,
+         size_k) = self._prepare_marlin_weights(weight, weight_scale)
+
+        m = act_fp4.shape[0]
+        m_padded = (m + 128 - 1) // 128 * 128
+        act_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+            act_sf.view(m_padded, -1)).flatten()
+
+        result = torch.ops.trtllm.marlin_nvfp4_gemm(
+            act_fp4,
+            marlin_weight,
+            scale_a=act_sf_unswizzled,
+            scale_b=marlin_scale,
+            alpha=alpha,
+            weight_global_scale=marlin_global_scale,
+            bias=None,
+            out_dtype=self.output_dtype,
+            size_n=size_n,
+            size_k=size_k,
+            output_buffer_kind=self.output_buffer_kind,
+        )
+        return result
+
+
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
 def nvfp4_gemm_cublaslt(
     act_fp4: torch.Tensor,
@@ -977,6 +1045,22 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
+        # Add Marlin tactics (SM90 Hopper only) — users must opt-in explicitly
+        # by listing "marlin" in ``allowed_backends``.
+        if self._is_backend_allowed("marlin"):
+            marlin_runner = MarlinNVFP4Runner(self.output_buffer_kind,
+                                              self.output_dtype)
+            marlin_tactics = marlin_runner.get_valid_tactics(inputs, profile)
+            if marlin_tactics:
+                tactics.extend([("marlin", tactic)
+                                for tactic in marlin_tactics])
+            elif self._is_only_backend("marlin"):
+                sm_version = get_sm_version()
+                raise ValueError(
+                    f"Marlin backend requires SM 90-99 (Hopper), but got SM "
+                    f"{sm_version}. Please add other backends to "
+                    "allowed_backends.")
+
         # Add CUDA Core tactics if available
         if self._is_backend_allowed("cuda_core"):
             is_cuda_core_supported = False
@@ -1086,12 +1170,17 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Prefer cutlass as fallback if available, otherwise use first valid backend
+            # Prefer marlin on Hopper (SM90) when explicitly allowed, cutlass
+            # otherwise, falling back to whatever backend is available.
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
-            tactic = ("cutlass",
-                      -1) if "cutlass" in self.allowed_backends else (
-                          self.allowed_backends[0], -1)
+            sm_version = get_sm_version()
+            if "marlin" in self.allowed_backends and 90 <= sm_version <= 99:
+                tactic = ("marlin", -1)
+            elif "cutlass" in self.allowed_backends:
+                tactic = ("cutlass", -1)
+            else:
+                tactic = (self.allowed_backends[0], -1)
 
         backend, sub_tactic = tactic
         if backend == "cuda_core":
@@ -1119,6 +1208,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                self.group)(inputs,
                                                            tactic=sub_tactic,
                                                            bias=bias)
+        elif backend == "marlin":
+            return MarlinNVFP4Runner(self.output_buffer_kind,
+                                     self.output_dtype)(inputs,
+                                                        tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 
@@ -1143,6 +1236,7 @@ def nvfp4_gemm(
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
     - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
+    - Marlin: Hopper W4A16 NVFP4 implementation (requires SM 90-99)
 
     The AutoTuner profiles all available backends during the first run and caches
     the best choice for each input shape. Subsequent calls use the cached selection
@@ -1168,7 +1262,9 @@ def nvfp4_gemm(
         ValueError: If backend is invalid/unavailable
     """
 
-    valid_individual_backends = {'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'}
+    valid_individual_backends = {
+        'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'
+    }
 
     # Parse comma-separated string to list
     backends_list = [
@@ -1769,8 +1865,19 @@ class Fp8QuantKernelRunner(TunableRunner):
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, deep_gemm_gen_tuning_buckets), ), )
+    # DeepGemm performs JIT compilation as a side effect of the tuning
+    # call. If we let the autotuner persist this op's tactic to disk, a
+    # subsequent process startup loads the cached tactic and skips the
+    # tuning path entirely — meaning the DeepGemm JIT warmup never runs
+    # and inference falls back to a slower uncompiled path.
+    # `exclude_from_cache=True` keeps the in-process cache working but
+    # ensures the tuning (and the JIT warmup it triggers) repeats on
+    # every process startup.
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, deep_gemm_gen_tuning_buckets), ),
+        exclude_from_cache=True,
+    )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
                  quant_tactic: int):
@@ -2089,14 +2196,10 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        # NCCL_SYMMETRIC is unsupported on GB10 (DGX Spark) before NCCL 2.30.4.
-        if _needs_gb10_nccl_symmetric_workaround():
-            valid_strategies = [AllReduceStrategy.NCCL.value]
-        else:
-            valid_strategies = [
-                AllReduceStrategy.NCCL_SYMMETRIC.value,
-                AllReduceStrategy.NCCL.value,
-            ]
+        valid_strategies = [
+            AllReduceStrategy.NCCL_SYMMETRIC.value,
+            AllReduceStrategy.NCCL.value,
+        ]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2123,7 +2226,6 @@ class AllReduceRunner(TunableRunner):
         **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
-        gb10_nccl_workaround = _needs_gb10_nccl_symmetric_workaround()
         if do_preparation:
             valid_tactics = self.get_valid_tactics(inputs,
                                                    OptimizationProfile(),
@@ -2140,15 +2242,10 @@ class AllReduceRunner(TunableRunner):
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape.
-            # On GB10 (DGX Spark), NCCL_SYMMETRIC is unsupported before NCCL
-            # 2.30.4, so fall back to plain NCCL. On other platforms fall back
-            # to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
+            # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
-            if gb10_nccl_workaround:
-                tactic = AllReduceStrategy.NCCL.value
-            else:
-                tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
         return torch.ops.trtllm.allreduce(
             input,

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 from torch._guards import detect_fake_mode
-from torch._inductor.compile_fx import compile_fx
+from torch._inductor.compile_fx import compile_fx, compile_fx_inner
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Interpreter
 from torch.fx.passes.split_module import split_module
@@ -96,7 +96,8 @@ class PiecewiseInterpreter(Interpreter):
                 runtime_num_tokens_idx,
                 self.capture_num_tokens,
                 self.graph_pool_handle,
-                compile_fx(submod, args) if self.enable_inductor else submod,
+                compile_fx_inner(submod, args)
+                if self.enable_inductor else submod,
                 self.enable_inductor,
                 self.piecewise_runner_idx == 0,
                 self.piecewise_runner_idx == self.piecewise_runner_num - 1,

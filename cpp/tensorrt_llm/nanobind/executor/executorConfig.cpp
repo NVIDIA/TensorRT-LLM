@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -431,15 +431,24 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", guidedDecodingConfigSetstate);
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs()); };
+    {
+        return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs(),
+            self.getKvTransferSenderFutureTimeoutMs(), self.getKvTransferPollIntervalMs());
+    };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() < 3 || state.size() > 5)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        new (&self) tle::CacheTransceiverConfig(nb::cast<tle::CacheTransceiverConfig::BackendType>(state[0]),
-            nb::cast<std::optional<size_t>>(state[1]), nb::cast<std::optional<int>>(state[2]));
+        auto kvTransferSenderFutureTimeoutMs
+            = state.size() >= 4 ? nb::cast<std::optional<int>>(state[3]) : std::optional<int>{std::nullopt};
+        auto kvTransferPollIntervalMs = state.size() >= 5
+            ? nb::cast<std::optional<int>>(state[4])
+            : std::optional<int>{tle::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs};
+        auto backendType = nb::cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(state[0]);
+        new (&self) tle::CacheTransceiverConfig(backendType, nb::cast<std::optional<size_t>>(state[1]),
+            nb::cast<std::optional<int>>(state[2]), kvTransferSenderFutureTimeoutMs, kvTransferPollIntervalMs);
     };
 
     nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -466,10 +475,11 @@ void initConfigBindings(nb::module_& m)
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
-                 std::optional<int>, std::optional<int>>(),
+                 std::optional<int>, std::optional<int>, std::optional<int>>(),
             nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
             nb::arg("kv_transfer_timeout_ms") = std::nullopt,
-            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt)
+            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt,
+            nb::arg("kv_transfer_poll_interval_ms") = tle::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
@@ -479,6 +489,8 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("kv_transfer_sender_future_timeout_ms",
             &tle::CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs,
             &tle::CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs)
+        .def_prop_rw("kv_transfer_poll_interval_ms", &tle::CacheTransceiverConfig::getKvTransferPollIntervalMs,
+            &tle::CacheTransceiverConfig::setKvTransferPollIntervalMs)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 
