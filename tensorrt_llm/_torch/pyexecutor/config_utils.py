@@ -532,6 +532,17 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict,
                                           require_text_config=True))
+    elif model_type == "glm_moe_dsa":
+        # GLM-MoE-DSA configs tag every layer with
+        # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.
+        # TRT-LLM never reads it (get_layer_types is Gemma3-only; DSA layer
+        # routing is driven by index_topk_freq / index_skip_topk_offset), and
+        # transformers' validate_layer_type rejects the unknown entry. Drop the
+        # unused field and build from the dict via the registered config class,
+        # mirroring the exaone4 handling below.
+        config_dict.pop("layer_types", None)
+        model_config = _CONFIG_REGISTRY[model_type].from_dict(
+            config_dict, **kwargs)
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
