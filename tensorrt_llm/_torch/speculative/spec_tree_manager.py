@@ -26,8 +26,8 @@ class DynamicTreeSlotStorage:
 
         # Bootstrap/reused slots may not have a tree yet; keep their metadata
         # as a valid linear chain so verification kernels can read it directly.
-        no_tree_position_offsets, no_tree_packed_mask = self._make_no_tree_metadata(
-            n_dt, mask_width)
+        no_tree_position_offsets, no_tree_packed_mask = self._make_kary_tree_metadata(
+            n_dt, mask_width, top_k=1)
         self.position_offsets = no_tree_position_offsets.unsqueeze(0).repeat(
             S, 1).contiguous()
         self.packed_mask = no_tree_packed_mask.unsqueeze(0).repeat(
@@ -37,7 +37,7 @@ class DynamicTreeSlotStorage:
 
         # CUDA-graph dummies use a deterministic K-ary tree, matching real
         # dynamic-tree mask/position shapes without depending on request state.
-        dummy_position_offsets, dummy_packed_mask = self._make_dummy_tree_metadata(
+        dummy_position_offsets, dummy_packed_mask = self._make_kary_tree_metadata(
             n_dt, mask_width, top_k)
         self.position_offsets[self.dummy_slot_id] = dummy_position_offsets
         self.packed_mask[self.dummy_slot_id] = dummy_packed_mask
@@ -74,30 +74,8 @@ class DynamicTreeSlotStorage:
                                                  device='cuda')
 
     @staticmethod
-    def _pack_bool_mask(mask: torch.Tensor, mask_width: int) -> torch.Tensor:
-        """Pack a bool attention mask into int32 words."""
-        num_rows, num_bits = mask.shape
-        total_bits = mask_width * 32
-        padded_mask = torch.zeros((num_rows, total_bits),
-                                  dtype=torch.bool,
-                                  device=mask.device)
-        padded_mask[:, :num_bits] = mask
-        weights = 2**torch.arange(32, dtype=torch.int64, device=mask.device)
-        return (padded_mask.view(num_rows, mask_width, 32).to(torch.int64) *
-                weights).sum(-1).to(torch.int32)
-
-    @classmethod
-    def _make_no_tree_metadata(
-            cls, n_dt: int,
-            mask_width: int) -> tuple[torch.Tensor, torch.Tensor]:
-        token_ids = torch.arange(n_dt, device='cuda')
-        position_offsets = token_ids.to(torch.int32)
-        causal_mask = token_ids.unsqueeze(1) >= token_ids.unsqueeze(0)
-        return position_offsets, cls._pack_bool_mask(causal_mask, mask_width)
-
-    @classmethod
-    def _make_dummy_tree_metadata(
-            cls, n_dt: int, mask_width: int,
+    def _make_kary_tree_metadata(
+            n_dt: int, mask_width: int,
             top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         top_k = max(int(top_k), 1)
         token_ids = torch.arange(n_dt, device='cuda')
