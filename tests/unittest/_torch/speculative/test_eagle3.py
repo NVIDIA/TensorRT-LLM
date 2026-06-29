@@ -11,7 +11,8 @@ import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import skip_blackwell, skip_num_gpus_less_than
+from utils.util import (skip_blackwell, skip_num_gpus_less_than,
+                        skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
@@ -25,7 +26,7 @@ from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
-                                 KvCacheConfig)
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig)
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -1164,8 +1165,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
 
     max_batch_size = 1
     max_draft_len = 6
-    dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 31
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     mamba_ssm_cache_dtype="float16",
                                     free_gpu_memory_fraction=0.8)
@@ -1184,23 +1183,27 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,
     )
-
-    spec_config = MTPDecodingConfig(
-        max_draft_len=max_draft_len,
-        mtp_eagle_one_model=True,
-        use_dynamic_tree=True,
-        dynamic_tree_max_topK=dynamic_tree_max_topK,
-        max_total_draft_tokens=max_total_draft_tokens,
-    )
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
+                                    mtp_eagle_one_model=True,
+                                    use_dynamic_tree=True,
+                                    dynamic_tree_max_topK=10,
+                                    max_total_draft_tokens=31)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    prompt = llm_spec.tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "The future of AI is"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    tok_ids = llm_spec.tokenizer.encode(prompt)
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
     num_tokens = 0
     num_drafted = 0
     num_accepted = 0
-    tok_ids = llm_spec.tokenizer.encode("The future of AI is")
-
     for output in llm_spec.generate_async(tok_ids,
                                           sampling_params,
                                           streaming=True):
@@ -1212,25 +1215,13 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
     accept_rate = num_accepted / num_drafted
     assert accept_rate > 0.20
 
-    raw_prompts = ["The capital of France is"]
-    prompts = [
-        llm_spec.tokenizer.apply_chat_template(
-            [{
-                "role": "user",
-                "content": p
-            }],
-            tokenize=False,
-            add_generation_prompt=True,
-        ) for p in raw_prompts
-    ]
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
-
-    results_spec = llm_spec.generate(prompts, sampling_params)
+    results_spec = llm_spec.generate([prompt], sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
+    results_ref = llm_ref.generate([prompt], sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
