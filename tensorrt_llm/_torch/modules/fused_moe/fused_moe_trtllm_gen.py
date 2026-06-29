@@ -753,6 +753,8 @@ class TRTLLMGenFusedMoE(MoE):
                                             "use_shuffled_weight", False),
                 weight_layout=getattr(self.quant_method, "weight_layout", 0),
                 do_finalize=do_finalize,
+                tune_max_num_tokens=self.max_num_tokens,
+                use_dp=self.use_dp,
             )
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"

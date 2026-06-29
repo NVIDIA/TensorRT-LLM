@@ -68,6 +68,9 @@ def prepare_dummy_topk_and_hook(
     hidden_states_index: int = 2,
     local_expert_offset: int = 0,
     use_dp: bool = False,
+    routing_logits_index: int = 0,
+    topk_weights_index: int = -2,
+    topk_ids_index: int = -1,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, TuningConfig]:
     """
     Prepare dummy topk tensors and input pre-hook for AutoTuner profiling.
@@ -102,6 +105,10 @@ def prepare_dummy_topk_and_hook(
             all global experts (pure-EP regime). See the module-level
             distribution comment for the full framing and the
             corresponding profile-bucket math driven by `round_rule`.
+        routing_logits_index/topk_weights_index/topk_ids_index: Input-list
+            indices to rewrite inside the tuner pre-hook. Existing TRTLLM
+            runners keep the default layout; FlashInfer-backed runners pass
+            their MoERunnerInputs layout explicitly.
 
     Returns:
         Tuple of (routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook)
@@ -324,22 +331,24 @@ def prepare_dummy_topk_and_hook(
         # Only recreate if we originally created dummies
         if need_dummy_topk:
             # Check if shape changed
-            if inputs[-1] is not None and inputs[-1].shape[
-                    0] != current_num_tokens:
+            if inputs[topk_ids_index] is not None and inputs[
+                    topk_ids_index].shape[0] != current_num_tokens:
                 # Recreate with new shape
                 topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
                     current_num_tokens, inputs[hidden_states_index].device,
                     None)
-                inputs[-1] = topk_ids_for_tuner
-                inputs[-2] = topk_weights_for_tuner
+                inputs[topk_ids_index] = topk_ids_for_tuner
+                inputs[topk_weights_index] = topk_weights_for_tuner
             # Note: routing_logits is None in attention DP, no need to adjust
-            assert inputs[0] is None
+            assert inputs[routing_logits_index] is None
         # Recreate routing logits if token count changed
-        elif inputs[0] is None or inputs[0].shape[0] != current_num_tokens:
-            inputs[0] = torch.randn(current_num_tokens,
-                                    num_experts,
-                                    dtype=torch.bfloat16,
-                                    device=inputs[hidden_states_index].device)
+        elif (inputs[routing_logits_index] is None
+              or inputs[routing_logits_index].shape[0] != current_num_tokens):
+            inputs[routing_logits_index] = torch.randn(
+                current_num_tokens,
+                num_experts,
+                dtype=torch.bfloat16,
+                device=inputs[hidden_states_index].device)
 
         return inputs
 
@@ -2455,4 +2464,979 @@ def _(routing_logits,
                                 dtype=torch.bfloat16),
         hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
         hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
+    ]
+
+
+@dataclass(frozen=True)
+class FlashInferMoEInputs:
+    output: torch.Tensor
+    routing_logits: Optional[torch.Tensor]
+    topk_ids: Optional[torch.Tensor]
+    expert_weights: Optional[torch.Tensor]
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    gemm1_lora_delta: Optional[torch.Tensor]
+    per_token_scale: Optional[torch.Tensor]
+
+
+@lru_cache(maxsize=None)
+def _get_flashinfer_trtllm_moe_deps():
+    os.environ["FLASHINFER_EXTRA_LDFLAGS"] = "-Wl,-Bsymbolic-functions"
+
+    from flashinfer.fused_moe.core import RoutingInputMode
+    from flashinfer.jit import setup_cubin_loader
+    from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+    from flashinfer.tllm_enums import (DtypeTrtllmGen, Fp8QuantizationType,
+                                       WeightLayout,
+                                       deduce_trtllm_gen_tensor_dtype)
+    from flashinfer.utils import device_support_pdl
+
+    module = gen_trtllm_gen_fused_moe_sm100_module()
+    moe_op = module.build_and_load()
+    setup_cubin_loader(str(module.get_library_path()))
+    return (moe_op, DtypeTrtllmGen, Fp8QuantizationType, WeightLayout,
+            RoutingInputMode, deduce_trtllm_gen_tensor_dtype,
+            device_support_pdl)
+
+
+class FlashInferTrtllmGenMoERunner(TunableRunner):
+    valid_tactics_dict = dict()
+
+    OUTPUT_IDX = 0
+    ROUTING_LOGITS_IDX = 1
+    TOPK_IDS_IDX = 2
+    EXPERT_WEIGHTS_IDX = 3
+    HIDDEN_STATES_IDX = 4
+    HIDDEN_STATES_SCALE_IDX = 5
+    GEMM1_LORA_DELTA_IDX = 6
+    PER_TOKEN_SCALE_IDX = 7
+
+    def __init__(
+        self,
+        *,
+        top_k: int,
+        num_local_experts: int,
+        dtype_act,
+        dtype_weights,
+        fp8_quantization_type,
+        hidden_size: int,
+        intermediate_size: int,
+        activation_type: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        use_per_token_scaling: bool = False,
+        num_experts: Optional[int] = None,
+    ):
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.dtype_act = dtype_act
+        self.dtype_weights = dtype_weights
+        self.fp8_quantization_type = fp8_quantization_type
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.activation_type = activation_type
+        self.use_shuffled_weight = use_shuffled_weight
+        self.weight_layout = weight_layout
+        self.use_per_token_scaling = use_per_token_scaling
+        self.num_experts = num_experts if num_experts is not None else num_local_experts
+
+    def unique_id(self):
+        return (
+            int(self.dtype_act),
+            int(self.dtype_weights),
+            int(self.fp8_quantization_type),
+            self.top_k,
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_local_experts,
+            self.activation_type,
+            self.use_shuffled_weight,
+            self.weight_layout,
+            self.use_per_token_scaling,
+            self.num_experts,
+        )
+
+    @staticmethod
+    def get_tuning_config(
+        moe_inputs: FlashInferMoEInputs,
+        fp8_quantization_type,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+        ep_size: int = 1,
+    ) -> TuningConfig:
+        _, _, Fp8QuantizationType, _, _, _, _ = _get_flashinfer_trtllm_moe_deps(
+        )
+        MAX_PROFILE_BUCKET = 8192
+        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        if tune_max_num_tokens > MAX_PROFILE_BUCKET:
+            m_values = tuple(m_values) + (tune_max_num_tokens, )
+
+        def round_rule(x: int) -> int:
+            deflated = x // ep_size if use_dp else x
+            if (deflated > MAX_PROFILE_BUCKET
+                    and tune_max_num_tokens > MAX_PROFILE_BUCKET):
+                return tune_max_num_tokens
+            value = last_positive_power_of_2(deflated)
+            return min(max(1, value), MAX_PROFILE_BUCKET)
+
+        def constrain_to_num_tokens(shapes: Tuple[torch.Size]) -> int:
+            return shapes[FlashInferTrtllmGenMoERunner.HIDDEN_STATES_IDX][0]
+
+        constraint_specs = [
+            ConstraintSpec(FlashInferTrtllmGenMoERunner.OUTPUT_IDX, 0,
+                           constrain_to_num_tokens),
+        ]
+
+        if moe_inputs.routing_logits is not None:
+            constraint_specs.append(
+                ConstraintSpec(FlashInferTrtllmGenMoERunner.ROUTING_LOGITS_IDX,
+                               0, constrain_to_num_tokens))
+        if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0:
+            constraint_specs.append(
+                ConstraintSpec(FlashInferTrtllmGenMoERunner.TOPK_IDS_IDX, 0,
+                               constrain_to_num_tokens))
+        if (moe_inputs.expert_weights is not None
+                and moe_inputs.expert_weights.numel() > 0):
+            constraint_specs.append(
+                ConstraintSpec(FlashInferTrtllmGenMoERunner.EXPERT_WEIGHTS_IDX,
+                               0, constrain_to_num_tokens))
+        if moe_inputs.hidden_states_scale is not None:
+            if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+                constraint_specs.append(
+                    ConstraintSpec(
+                        FlashInferTrtllmGenMoERunner.HIDDEN_STATES_SCALE_IDX, 1,
+                        constrain_to_num_tokens))
+            else:
+                constraint_specs.append(
+                    ConstraintSpec(
+                        FlashInferTrtllmGenMoERunner.HIDDEN_STATES_SCALE_IDX, 0,
+                        constrain_to_num_tokens))
+        if moe_inputs.gemm1_lora_delta is not None:
+            constraint_specs.append(
+                ConstraintSpec(
+                    FlashInferTrtllmGenMoERunner.GEMM1_LORA_DELTA_IDX, 0,
+                    constrain_to_num_tokens))
+        if moe_inputs.per_token_scale is not None:
+            constraint_specs.append(
+                ConstraintSpec(FlashInferTrtllmGenMoERunner.PER_TOKEN_SCALE_IDX,
+                               0, constrain_to_num_tokens))
+
+        return TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                FlashInferTrtllmGenMoERunner.HIDDEN_STATES_IDX,
+                0,
+                m_values,
+                map_to_tuning_buckets=round_rule,
+            ), ),
+            constraint_specs=tuple(constraint_specs),
+            tune_max_num_tokens=max(8192, tune_max_num_tokens),
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile,
+                          **kwargs) -> List[List[int]]:
+        moe_op, _, _, _, _, _, _ = _get_flashinfer_trtllm_moe_deps()
+        args = FlashInferMoEInputs(*inputs)
+        num_tokens = args.hidden_states.shape[0]
+
+        # NOTE: aligned to flashinfer 0.6.12 trtllm_get_valid_moe_configs
+        # signature (12-tuple, no gemm1_lora_delta).
+        instance_key = (
+            self.dtype_act,
+            self.dtype_weights,
+            self.fp8_quantization_type,
+            self.top_k,
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_local_experts,
+            self.activation_type,
+            self.use_shuffled_weight,
+            self.weight_layout,
+            self.use_per_token_scaling,
+            num_tokens,
+        )
+        if instance_key not in FlashInferTrtllmGenMoERunner.valid_tactics_dict:
+            try:
+                valid_tactics = moe_op.trtllm_get_valid_moe_configs(
+                    *instance_key)
+            except Exception:
+                return []
+            FlashInferTrtllmGenMoERunner.valid_tactics_dict[
+                instance_key] = valid_tactics
+        return FlashInferTrtllmGenMoERunner.valid_tactics_dict[instance_key]
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: List[int] = [-1, -1],
+                do_preparation: bool = False,
+                **kwargs):
+        return self.run_raw(inputs, tactic=tactic, profile_mode=True, **kwargs)
+
+    def run_raw(self,
+                inputs: List[torch.Tensor],
+                tactic: List[int] = [-1, -1],
+                profile_mode: bool = False,
+                **kwargs):
+        moe_op, DtypeTrtllmGen, Fp8QuantizationType, _, RoutingInputMode, _, _ = \
+            _get_flashinfer_trtllm_moe_deps()
+        args = FlashInferMoEInputs(*inputs)
+        selected_tactic = [-1, -1] if tactic == -1 else tactic
+
+        if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
+            return moe_op.trtllm_bf16_moe(
+                args.routing_logits,
+                kwargs["routing_bias"],
+                args.topk_ids,
+                args.expert_weights,
+                args.hidden_states,
+                kwargs["gemm1_weights"],
+                kwargs["gemm2_weights"],
+                args.output,
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                self.use_shuffled_weight,
+                self.weight_layout,
+                kwargs["do_finalize"],
+                kwargs["enable_pdl"],
+                selected_tactic,
+                self.activation_type,
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+
+        if ((self.dtype_act == DtypeTrtllmGen.E4m3
+             and self.dtype_weights == DtypeTrtllmGen.E4m3)
+                or (self.dtype_act == DtypeTrtllmGen.MxE4m3
+                    and self.dtype_weights == DtypeTrtllmGen.MxE4m3)):
+            hidden_states_scale = args.hidden_states_scale
+            if (profile_mode and self.fp8_quantization_type
+                    == Fp8QuantizationType.DeepSeekFp8):
+                hidden_states_scale = torch.full(
+                    (args.hidden_states.shape[1] // 128,
+                     args.hidden_states.shape[0]),
+                    2.0,
+                    dtype=torch.float,
+                    device=args.hidden_states.device,
+                )
+
+            return moe_op.trtllm_fp8_block_scale_moe(
+                args.routing_logits,
+                args.topk_ids,
+                args.expert_weights,
+                kwargs["routing_bias"],
+                args.hidden_states,
+                hidden_states_scale,
+                kwargs["gemm1_weights"],
+                kwargs["gemm1_weights_scale"],
+                kwargs["gemm2_weights"],
+                kwargs["gemm2_weights_scale"],
+                args.output,
+                kwargs["num_experts"],
+                self.top_k,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                self.use_shuffled_weight,
+                self.weight_layout,
+                kwargs["do_finalize"],
+                kwargs["enable_pdl"],
+                selected_tactic,
+                self.fp8_quantization_type,
+                self.activation_type,
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
+            )
+
+        return moe_op.trtllm_fp4_block_scale_moe(
+            kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
+            args.routing_logits,
+            args.topk_ids,
+            args.expert_weights,
+            kwargs["routing_bias"],
+            args.hidden_states,
+            args.hidden_states_scale,
+            kwargs["gemm1_weights"],
+            kwargs["gemm1_weights_scale"],
+            kwargs["gemm1_bias"],
+            kwargs["gemm1_alpha"],
+            kwargs["gemm1_beta"],
+            kwargs["gemm1_clamp_limit"],
+            kwargs["gemm2_weights"],
+            kwargs["gemm2_weights_scale"],
+            kwargs["gemm2_bias"],
+            kwargs["output1_scale_scalar"],
+            kwargs["output1_scale_gate_scalar"],
+            kwargs["output2_scale_scalar"],
+            args.per_token_scale,
+            kwargs["num_experts"],
+            self.top_k,
+            kwargs["n_group"],
+            kwargs["topk_group"],
+            self.intermediate_size,
+            kwargs["local_expert_offset"],
+            self.num_local_experts,
+            kwargs["routed_scaling_factor"],
+            kwargs["routing_method_type"],
+            kwargs["do_finalize"],
+            kwargs["enable_pdl"],
+            self.activation_type,
+            args.output,
+            selected_tactic,
+            kwargs.get("norm_topk_prob", True),
+            kwargs.get("routing_replay_out"),
+        )
+
+
+def _unpack_flashinfer_trtllm_moe_output(
+    intermediate_output,
+    output: torch.Tensor,
+    do_finalize: bool,
+    gemm1_lora_delta: Optional[torch.Tensor],
+    output_was_provided: bool = False,
+) -> List[torch.Tensor]:
+    if do_finalize:
+        if output_was_provided:
+            return [torch.empty(0, device=output.device, dtype=output.dtype)]
+        return [output]
+    if gemm1_lora_delta is None:
+        return [
+            torch.from_dlpack(intermediate_output[0]),
+            torch.from_dlpack(intermediate_output[1]),
+            torch.from_dlpack(intermediate_output[2]),
+        ]
+    return [
+        torch.from_dlpack(intermediate_output[0]),
+        torch.from_dlpack(intermediate_output[1]),
+        torch.from_dlpack(intermediate_output[2]),
+        torch.from_dlpack(intermediate_output[3]),
+    ]
+
+
+def _choose_flashinfer_trtllm_moe_tactic(
+    custom_op_name: str,
+    runner: FlashInferTrtllmGenMoERunner,
+    moe_inputs: FlashInferMoEInputs,
+    base_tuning_config: TuningConfig,
+    *,
+    routing_method_type: int,
+    num_experts: int,
+    local_num_experts: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    routed_scaling_factor: Optional[float],
+    local_expert_offset: int,
+    use_dp: bool,
+    **kwargs,
+):
+    routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config = \
+        prepare_dummy_topk_and_hook(
+            routing_method_type=routing_method_type,
+            topk_weights=moe_inputs.expert_weights,
+            topk_ids=moe_inputs.topk_ids,
+            hidden_states=moe_inputs.hidden_states,
+            routing_logits=moe_inputs.routing_logits,
+            base_tuning_config=base_tuning_config,
+            top_k=runner.top_k,
+            num_experts=num_experts,
+            local_num_experts=local_num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            hidden_states_index=FlashInferTrtllmGenMoERunner.HIDDEN_STATES_IDX,
+            local_expert_offset=local_expert_offset,
+            use_dp=use_dp,
+            routing_logits_index=FlashInferTrtllmGenMoERunner.ROUTING_LOGITS_IDX,
+            topk_weights_index=FlashInferTrtllmGenMoERunner.EXPERT_WEIGHTS_IDX,
+            topk_ids_index=FlashInferTrtllmGenMoERunner.TOPK_IDS_IDX,
+        )
+
+    input_tensors_for_tuner = [
+        moe_inputs.output,
+        routing_logits_for_tuner,
+        topk_ids_for_tuner,
+        topk_weights_for_tuner,
+        moe_inputs.hidden_states,
+        moe_inputs.hidden_states_scale,
+        moe_inputs.gemm1_lora_delta,
+        moe_inputs.per_token_scale,
+    ]
+    runner_kwargs = dict(kwargs)
+    runner_kwargs.update(
+        num_experts=num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+    )
+    kernel_runner, best_tactic = AutoTuner.get().choose_one(
+        custom_op_name,
+        [runner],
+        tuning_config,
+        input_tensors_for_tuner,
+        **runner_kwargs,
+    )
+    input_tensors_for_tuner[FlashInferTrtllmGenMoERunner.ROUTING_LOGITS_IDX] = \
+        moe_inputs.routing_logits
+    input_tensors_for_tuner[FlashInferTrtllmGenMoERunner.TOPK_IDS_IDX] = \
+        moe_inputs.topk_ids
+    input_tensors_for_tuner[FlashInferTrtllmGenMoERunner.EXPERT_WEIGHTS_IDX] = \
+        moe_inputs.expert_weights
+    return kernel_runner, best_tactic, input_tensors_for_tuner
+
+
+@torch.library.custom_op("trtllm::flashinfer_trtllm_bf16_moe_runner",
+                         mutates_args=())
+def flashinfer_trtllm_bf16_moe_runner(
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    use_dp: bool = False,
+    activation_type: int = 3,
+) -> List[torch.Tensor]:
+    _, DtypeTrtllmGen, Fp8QuantizationType, _, _, _, device_support_pdl = \
+        _get_flashinfer_trtllm_moe_deps()
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(hidden_states.device)
+
+    output_was_provided = output is not None
+    if output is None:
+        output = torch.empty(hidden_states.shape,
+                             dtype=torch.bfloat16,
+                             device=hidden_states.device)
+
+    if routing_logits is not None:
+        topk_ids = None
+        topk_weights = None
+    else:
+        assert topk_ids is not None
+        topk_ids = topk_ids.to(torch.int32)
+        if topk_weights is None:
+            topk_weights = torch.empty(0,
+                                       dtype=torch.bfloat16,
+                                       device=hidden_states.device)
+        else:
+            topk_weights = topk_weights.to(torch.bfloat16)
+
+    runner = FlashInferTrtllmGenMoERunner(
+        top_k=top_k,
+        num_local_experts=local_num_experts,
+        dtype_act=DtypeTrtllmGen.Bfloat16,
+        dtype_weights=DtypeTrtllmGen.Bfloat16,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_states.shape[-1],
+        intermediate_size=intermediate_size,
+        activation_type=activation_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        num_experts=num_experts,
+    )
+    moe_inputs = FlashInferMoEInputs(output, routing_logits, topk_ids,
+                                     topk_weights, hidden_states, None, None,
+                                     None)
+    tuning_config = FlashInferTrtllmGenMoERunner.get_tuning_config(
+        moe_inputs, Fp8QuantizationType.NoneFp8, tune_max_num_tokens, use_dp,
+        max(1, num_experts // local_num_experts))
+    kernel_runner, tactic, input_tensors = _choose_flashinfer_trtllm_moe_tactic(
+        "trtllm::flashinfer_trtllm_bf16_moe_runner",
+        runner,
+        moe_inputs,
+        tuning_config,
+        routing_method_type=routing_method_type,
+        num_experts=num_experts,
+        local_num_experts=local_num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        local_expert_offset=local_expert_offset,
+        use_dp=use_dp,
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights,
+        gemm2_weights=gemm2_weights,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+    )
+    intermediate_output = kernel_runner.run_raw(
+        input_tensors,
+        tactic=tactic,
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights,
+        gemm2_weights=gemm2_weights,
+        num_experts=num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+    )
+    return _unpack_flashinfer_trtllm_moe_output(intermediate_output, output,
+                                                do_finalize, None,
+                                                output_was_provided)
+
+
+@flashinfer_trtllm_bf16_moe_runner.register_fake
+def _(routing_logits,
+      routing_bias,
+      hidden_states,
+      gemm1_weights,
+      gemm2_weights,
+      num_experts: int,
+      top_k: int,
+      n_group: Optional[int],
+      topk_group: Optional[int],
+      intermediate_size: int,
+      local_expert_offset: int,
+      local_num_experts: int,
+      routed_scaling_factor: Optional[float],
+      routing_method_type: int,
+      topk_weights: Optional[torch.Tensor] = None,
+      topk_ids: Optional[torch.Tensor] = None,
+      output: Optional[torch.Tensor] = None,
+      use_shuffled_weight: bool = False,
+      weight_layout: int = 0,
+      do_finalize: bool = True,
+      enable_pdl: Optional[bool] = None,
+      tune_max_num_tokens: int = 8192,
+      use_dp: bool = False,
+      activation_type: int = 3) -> List[torch.Tensor]:
+    if do_finalize:
+        return [
+            hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
+        ]
+
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1]
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                num_experts,
+                                                top_k,
+                                                max_tile_tokens_dim=128)
+    expanded_row_count = num_tokens * top_k
+    max_padding_required = (tile_tokens_dim - 1) * num_experts
+    max_num_padded_tokens = fp4_utils.pad_up(
+        expanded_row_count + max_padding_required, tile_tokens_dim)
+    return [
+        hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
+    ]
+
+
+@torch.library.custom_op("trtllm::flashinfer_trtllm_fp8_block_scale_moe_runner",
+                         mutates_args=())
+def flashinfer_trtllm_fp8_block_scale_moe_runner(
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    use_dp: bool = False,
+    fp8_quantization_type: int = 1,
+    activation_type: int = 3,
+    norm_topk_prob: bool = True,
+) -> List[torch.Tensor]:
+    _, DtypeTrtllmGen, Fp8QuantizationType, _, _, _, device_support_pdl = \
+        _get_flashinfer_trtllm_moe_deps()
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(hidden_states.device)
+    fp8_quantization_type = Fp8QuantizationType(fp8_quantization_type)
+
+    output_was_provided = output is not None
+    if output is None:
+        output = torch.empty(hidden_states.shape,
+                             dtype=torch.bfloat16,
+                             device=hidden_states.device)
+
+    if routing_logits is not None:
+        topk_ids = None
+        topk_weights = None
+    else:
+        assert topk_ids is not None
+        topk_ids = topk_ids.to(torch.int32)
+        if topk_weights is None:
+            topk_weights = torch.empty(0,
+                                       dtype=torch.bfloat16,
+                                       device=hidden_states.device)
+        else:
+            topk_weights = topk_weights.to(torch.bfloat16)
+
+    dtype_act = (DtypeTrtllmGen.E4m3 if fp8_quantization_type
+                 == Fp8QuantizationType.DeepSeekFp8 else DtypeTrtllmGen.MxE4m3)
+    dtype_weights = dtype_act
+    runner = FlashInferTrtllmGenMoERunner(
+        top_k=top_k,
+        num_local_experts=local_num_experts,
+        dtype_act=dtype_act,
+        dtype_weights=dtype_weights,
+        fp8_quantization_type=fp8_quantization_type,
+        hidden_size=hidden_states.shape[-1],
+        intermediate_size=intermediate_size,
+        activation_type=activation_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        num_experts=num_experts,
+    )
+    moe_inputs = FlashInferMoEInputs(output, routing_logits, topk_ids,
+                                     topk_weights, hidden_states,
+                                     hidden_states_scale, None, None)
+    tuning_config = FlashInferTrtllmGenMoERunner.get_tuning_config(
+        moe_inputs, fp8_quantization_type, tune_max_num_tokens, use_dp,
+        max(1, num_experts // local_num_experts))
+    kernel_runner, tactic, input_tensors = _choose_flashinfer_trtllm_moe_tactic(
+        "trtllm::flashinfer_trtllm_fp8_block_scale_moe_runner",
+        runner,
+        moe_inputs,
+        tuning_config,
+        routing_method_type=routing_method_type,
+        num_experts=num_experts,
+        local_num_experts=local_num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        local_expert_offset=local_expert_offset,
+        use_dp=use_dp,
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        norm_topk_prob=norm_topk_prob,
+    )
+    intermediate_output = kernel_runner.run_raw(
+        input_tensors,
+        tactic=tactic,
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        norm_topk_prob=norm_topk_prob,
+    )
+    result = _unpack_flashinfer_trtllm_moe_output(intermediate_output, output,
+                                                  True, None,
+                                                  output_was_provided)
+    return result
+
+
+@flashinfer_trtllm_fp8_block_scale_moe_runner.register_fake
+def _(routing_logits,
+      routing_bias,
+      hidden_states,
+      hidden_states_scale,
+      gemm1_weights,
+      gemm1_weights_scale,
+      gemm2_weights,
+      gemm2_weights_scale,
+      num_experts: int,
+      top_k: int,
+      n_group: Optional[int],
+      topk_group: Optional[int],
+      intermediate_size: int,
+      local_expert_offset: int,
+      local_num_experts: int,
+      routed_scaling_factor: Optional[float],
+      routing_method_type: int,
+      topk_weights: Optional[torch.Tensor] = None,
+      topk_ids: Optional[torch.Tensor] = None,
+      output: Optional[torch.Tensor] = None,
+      use_shuffled_weight: bool = False,
+      weight_layout: int = 0,
+      enable_pdl: Optional[bool] = None,
+      tune_max_num_tokens: int = 8192,
+      use_dp: bool = False,
+      fp8_quantization_type: int = 1,
+      activation_type: int = 3,
+      norm_topk_prob: bool = True) -> List[torch.Tensor]:
+    return [hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)]
+
+
+@torch.library.custom_op("trtllm::flashinfer_trtllm_fp4_block_scale_moe_runner",
+                         mutates_args=())
+def flashinfer_trtllm_fp4_block_scale_moe_runner(
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
+    output1_scale_scalar: Optional[torch.Tensor],
+    output1_scale_gate_scalar: Optional[torch.Tensor],
+    output2_scale_scalar: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    do_finalize: bool,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+    activation_type: int = 3,
+    per_token_scale: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 8192,
+    use_dp: bool = False,
+    norm_topk_prob: bool = True,
+) -> List[torch.Tensor]:
+    _, _, Fp8QuantizationType, WeightLayout, RoutingInputMode, deduce_dtype, device_support_pdl = \
+        _get_flashinfer_trtllm_moe_deps()
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(hidden_states.device)
+
+    hidden_size = hidden_states.shape[-1]
+    if hidden_states.dtype == torch.uint8:
+        hidden_size *= 2
+    output_was_provided = output is not None
+    if output is None:
+        output = torch.empty((hidden_states.shape[0], hidden_size),
+                             dtype=torch.bfloat16,
+                             device=hidden_states.device)
+
+    if routing_logits is not None:
+        routing_input_mode = RoutingInputMode.FromLogits
+        topk_ids = None
+        topk_weights = None
+    else:
+        assert topk_ids is not None
+        assert topk_weights is not None
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(torch.bfloat16)
+        routing_input_mode = RoutingInputMode.UnpackedPrecomputed
+
+    dtype_act = deduce_dtype(hidden_states, hidden_states_scale)
+    dtype_weights = deduce_dtype(gemm1_weights, gemm1_weights_scale)
+    runner = FlashInferTrtllmGenMoERunner(
+        top_k=top_k,
+        num_local_experts=local_num_experts,
+        dtype_act=dtype_act,
+        dtype_weights=dtype_weights,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=activation_type,
+        use_shuffled_weight=True,
+        weight_layout=int(WeightLayout.MajorK),
+        use_per_token_scaling=per_token_scale is not None,
+        num_experts=num_experts,
+    )
+    moe_inputs = FlashInferMoEInputs(output, routing_logits, topk_ids,
+                                     topk_weights, hidden_states,
+                                     hidden_states_scale, None, per_token_scale)
+    tuning_config = FlashInferTrtllmGenMoERunner.get_tuning_config(
+        moe_inputs, Fp8QuantizationType.NoneFp8, tune_max_num_tokens, use_dp,
+        max(1, num_experts // local_num_experts))
+    kernel_runner, tactic, input_tensors = _choose_flashinfer_trtllm_moe_tactic(
+        "trtllm::flashinfer_trtllm_fp4_block_scale_moe_runner",
+        runner,
+        moe_inputs,
+        tuning_config,
+        routing_method_type=routing_method_type,
+        num_experts=num_experts,
+        local_num_experts=local_num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        local_expert_offset=local_expert_offset,
+        use_dp=use_dp,
+        routing_input_mode=routing_input_mode,
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=gemm1_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=gemm2_bias,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+    )
+    intermediate_output = kernel_runner.run_raw(
+        input_tensors,
+        tactic=tactic,
+        routing_input_mode=routing_input_mode,
+        routing_bias=routing_bias,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=gemm1_bias,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=gemm2_bias,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        num_experts=num_experts,
+        n_group=n_group,
+        topk_group=topk_group,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+    )
+    result = _unpack_flashinfer_trtllm_moe_output(intermediate_output, output,
+                                                  do_finalize, None,
+                                                  output_was_provided)
+    if not do_finalize and routing_logits is None and topk_weights.numel() > 0:
+        result[1] = topk_weights
+    return result
+
+
+@flashinfer_trtllm_fp4_block_scale_moe_runner.register_fake
+def _(routing_logits,
+      routing_bias,
+      hidden_states,
+      hidden_states_scale,
+      gemm1_weights,
+      gemm1_weights_scale,
+      gemm1_bias,
+      gemm1_alpha,
+      gemm1_beta,
+      gemm1_clamp_limit,
+      gemm2_weights,
+      gemm2_weights_scale,
+      gemm2_bias,
+      output1_scale_scalar,
+      output1_scale_gate_scalar,
+      output2_scale_scalar,
+      num_experts: int,
+      top_k: int,
+      n_group: Optional[int],
+      topk_group: Optional[int],
+      intermediate_size: int,
+      local_expert_offset: int,
+      local_num_experts: int,
+      routed_scaling_factor: Optional[float],
+      routing_method_type: int,
+      do_finalize: bool,
+      topk_weights: Optional[torch.Tensor] = None,
+      topk_ids: Optional[torch.Tensor] = None,
+      output: Optional[torch.Tensor] = None,
+      enable_pdl: Optional[bool] = None,
+      activation_type: int = 3,
+      per_token_scale: Optional[torch.Tensor] = None,
+      tune_max_num_tokens: int = 8192,
+      use_dp: bool = False,
+      norm_topk_prob: bool = True) -> List[torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[1] * (2 if hidden_states.dtype
+                                            == torch.uint8 else 1)
+    if do_finalize:
+        return [
+            hidden_states.new_empty((num_tokens, hidden_size),
+                                    dtype=torch.bfloat16)
+        ]
+
+    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens,
+                                                num_experts,
+                                                top_k,
+                                                max_tile_tokens_dim=128)
+    expanded_row_count = num_tokens * top_k
+    max_padding_required = (tile_tokens_dim - 1) * num_experts
+    max_num_padded_tokens = fp4_utils.pad_up(
+        expanded_row_count + max_padding_required, tile_tokens_dim)
+    return [
+        hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
     ]
