@@ -532,8 +532,12 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 self.max_draft_len = spec_config.max_draft_len
             # Mutable per-iteration draft length (updated each iteration when
-            # dynamic draft length is enabled; otherwise stays fixed).
-            self.runtime_draft_len = self.max_draft_len
+            # dynamic draft length is enabled; otherwise stays fixed).  Tree
+            # modes verify all tree nodes per step, which can be wider than the
+            # tree depth used by the drafter loop.
+            self.runtime_draft_len = (self.max_total_draft_tokens
+                                      if not spec_config.is_linear_tree else
+                                      self.max_draft_len)
 
         else:
             self.without_logits = False

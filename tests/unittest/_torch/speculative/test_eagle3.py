@@ -15,6 +15,9 @@ from utils.util import skip_blackwell
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
@@ -93,6 +96,77 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     expected_kv_lens_with_extra = actual_kv_lengths + num_extra_kv_tokens
     assert torch.equal(kv_lens_internal, expected_kv_lens_with_extra), \
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mtp_eagle_one_model_dynamic_tree_metadata_prepares_mamba_links():
+    max_num_requests = 3
+    max_draft_len = 2
+    max_total_draft_tokens = 2
+    spec_tree_manager = SpecTreeManager(
+        max_num_requests=max_num_requests,
+        use_dynamic_tree=True,
+        max_total_draft_tokens=max_total_draft_tokens,
+        max_draft_len=max_draft_len,
+        eagle_choices=None,
+        dynamic_tree_max_topK=2,
+    )
+    slot_storage = spec_tree_manager.slot_storage
+    slot_storage.all_ids_buf[:max_num_requests].copy_(
+        torch.tensor([0, 1, 2], dtype=torch.long, device="cuda"))
+    slot_storage.has_tree[1] = True
+    slot_storage.retrieve_next_token[1] = torch.tensor([2, -1, -1],
+                                                       dtype=torch.int32,
+                                                       device="cuda")
+    slot_storage.retrieve_next_sibling[1] = torch.tensor([-1, -1, -1],
+                                                         dtype=torch.int32,
+                                                         device="cuda")
+
+    class _ResourceManager:
+        hidden_states = None
+        slot_manager = None
+        sa_manager = None
+
+        def __init__(self):
+            self.spec_tree_manager = spec_tree_manager
+            self.batch_indices_cuda = torch.empty(max_num_requests,
+                                                  dtype=torch.int,
+                                                  device="cuda")
+
+    metadata = Eagle3OneModelSpecMetadata(
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
+        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        max_num_requests=max_num_requests,
+        num_layers=1,
+        hidden_size=1,
+        max_num_tokens=16,
+        spec_resource_manager=_ResourceManager(),
+        use_dynamic_tree=True,
+    )
+    metadata.request_ids = [10, 11, 12]
+    metadata.seq_lens = [
+        1, max_total_draft_tokens + 1, max_total_draft_tokens + 1
+    ]
+    metadata.num_generations = 2
+    metadata.num_tokens = 1 + 2 * (max_total_draft_tokens + 1)
+
+    metadata.prepare()
+
+    assert metadata.retrieve_next_token is not None
+    assert metadata.retrieve_next_sibling is not None
+    assert metadata.retrieve_next_token.shape == (2, max_total_draft_tokens + 1)
+    assert torch.equal(metadata.retrieve_next_token[0],
+                       slot_storage.retrieve_next_token[1])
+    assert torch.equal(
+        metadata.retrieve_next_token[1],
+        torch.tensor([1, 2, -1], dtype=torch.int32, device="cuda"))
+    assert torch.equal(
+        metadata.retrieve_next_sibling[1],
+        torch.full((max_total_draft_tokens + 1, ),
+                   -1,
+                   dtype=torch.int32,
+                   device="cuda"))
 
 
 @pytest.mark.parametrize(

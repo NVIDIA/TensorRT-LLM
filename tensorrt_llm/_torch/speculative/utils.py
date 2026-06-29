@@ -484,7 +484,8 @@ def update_spec_config_from_model_config(spec_config, model_config):
             f"using max_draft_len={effective_draft_len} draft tokens.")
         spec_config.max_draft_len = effective_draft_len
 
-    spec_config.max_total_draft_tokens = spec_config.max_draft_len
+    if not spec_config.use_dynamic_tree:
+        spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:

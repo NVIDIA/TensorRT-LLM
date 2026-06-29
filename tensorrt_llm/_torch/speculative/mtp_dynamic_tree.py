@@ -195,6 +195,11 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         else:
             self._saved_generation_lengths = None
 
+    def prepare_position_ids_and_last_tokens(self, position_ids, seq_lens_cuda):
+        position_ids = position_ids.squeeze(0)
+        last_tokens_idx = torch.cumsum(seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        return position_ids, last_tokens_idx
+
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
 
@@ -1024,10 +1029,8 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
                     attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                         self._max_path_len
                     ) - num_accepted_tokens[num_contexts:batch_size]
-                if num_contexts > 0:
-                    attn_metadata.kv_lens_cuda[:num_contexts] += self.K
+                attn_metadata.kv_lens_cuda[:batch_size] += self.K
             attn_metadata.use_spec_decoding = True
-            attn_metadata.update_for_spec_dec()
             self._refresh_blackwell_tree_mask_metadata(attn_metadata)
         else:
             num_tokens_previous_layer = cur_draft_idx * self.K
@@ -1041,7 +1044,6 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
             attn_metadata.on_update()
             if hasattr(attn_metadata, "kv_lens_cuda"):
                 attn_metadata.kv_lens_cuda[:batch_size] += self.K
-            attn_metadata.update_for_spec_dec()
             self._refresh_blackwell_tree_mask_metadata(attn_metadata)
 
 

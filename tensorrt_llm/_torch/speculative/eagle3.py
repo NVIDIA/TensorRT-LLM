@@ -395,6 +395,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # for the first loop iteration and per-sequence token counts for
     # subsequent iterations.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # Per-generation tree links for Mamba verify in dynamic-tree one-model paths.
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+    retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -440,9 +444,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                  self.hidden_size * len(self.layers_to_capture)),
                 dtype=self.dtype,
                 device='cuda')
-        if (self.spec_resource_manager is not None
-                and self.spec_resource_manager.batch_indices_cuda is not None):
-            self.batch_indices_cuda = self.spec_resource_manager.batch_indices_cuda
+        batch_indices_cuda = getattr(self.spec_resource_manager,
+                                     "batch_indices_cuda", None)
+        if batch_indices_cuda is not None:
+            self.batch_indices_cuda = batch_indices_cuda
             assert self.batch_indices_cuda.shape[0] >= self.max_num_requests, (
                 f"batch_indices_cuda shape mismatch: "
                 f"{type(self.spec_resource_manager).__name__} has "
@@ -520,6 +525,26 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.max_draft_len)
+
+        self.retrieve_next_token = None
+        self.retrieve_next_sibling = None
+        self.retrieve_parent_token = None
+        spec_tree_manager = getattr(self.spec_resource_manager,
+                                    'spec_tree_manager', None)
+        if self.use_dynamic_tree and spec_tree_manager is not None:
+            num_gens = self.num_generations
+            if num_gens > 0:
+                num_contexts = num_seqs - num_gens
+                slot_storage = spec_tree_manager.slot_storage
+                gen_slot_ids = slot_storage.all_ids_buf[
+                    num_contexts:num_contexts + num_gens]
+                next_token, next_sibling = slot_storage.next_links_from_slots(
+                    gen_slot_ids, num_gens)
+                slot_storage.apply_no_tree_linear_chain(next_token,
+                                                        next_sibling,
+                                                        gen_slot_ids, num_gens)
+                self.retrieve_next_token = next_token
+                self.retrieve_next_sibling = next_sibling
 
     def maybe_capture_hidden_states(
             self,
