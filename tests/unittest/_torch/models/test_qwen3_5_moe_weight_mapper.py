@@ -30,6 +30,7 @@ def _make_mapper() -> Qwen3_5MoeHfWeightMapper:
         linear_value_head_dim=2,
         linear_num_key_heads=1,
         linear_num_value_heads=1,
+        num_hidden_layers=1,
         num_experts=1,
         torch_dtype=torch.bfloat16,
     )
@@ -39,7 +40,7 @@ def _make_mapper() -> Qwen3_5MoeHfWeightMapper:
         quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
     )
     mapper = object.__new__(Qwen3_5MoeHfWeightMapper)
-    mapper.config = model_config
+    mapper._config = model_config
     return mapper
 
 
@@ -47,10 +48,17 @@ def test_fp8_pertensor_linear_attn_weights_are_dequantized_before_pack():
     mapper = _make_mapper()
     scale = torch.tensor(0.25, dtype=torch.float32)
     qkv_fp8 = torch.tensor(
-        [[1.0, -2.0], [3.0, -4.0], [0.5, -0.5]],
+        [
+            [1.0, -2.0],
+            [3.0, -4.0],
+            [0.5, -0.5],
+            [1.5, -1.5],
+            [2.0, -1.0],
+            [4.0, -3.0],
+        ],
         dtype=torch.float8_e4m3fn,
     )
-    z_fp8 = torch.tensor([[2.0, -1.0]], dtype=torch.float8_e4m3fn)
+    z_fp8 = torch.tensor([[2.0, -1.0], [1.0, -0.5]], dtype=torch.float8_e4m3fn)
     weights = {
         "model.layers.0.linear_attn.in_proj_qkv.weight": qkv_fp8,
         "model.layers.0.linear_attn.in_proj_qkv.weight_scale": scale,
@@ -67,9 +75,9 @@ def test_fp8_pertensor_linear_attn_weights_are_dequantized_before_pack():
     packed_weight = packed["model.layers.0.linear_attn.in_proj_qkvz.weight"]
     expected = torch.cat(
         [
-            qkv_fp8[0:1].to(torch.float32) * scale,
-            qkv_fp8[1:2].to(torch.float32) * scale,
-            qkv_fp8[2:3].to(torch.float32) * scale,
+            qkv_fp8[0:2].to(torch.float32) * scale,
+            qkv_fp8[2:4].to(torch.float32) * scale,
+            qkv_fp8[4:6].to(torch.float32) * scale,
             z_fp8.to(torch.float32) * scale,
         ],
         dim=0,
