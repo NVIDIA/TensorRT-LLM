@@ -1497,6 +1497,28 @@ class Receiver(ReceiverBase):
             slice_id=task.slice_id,
         )
 
+    @staticmethod
+    def _fanin_bounce_safe(overlap, peer_ri) -> bool:
+        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
+        The split assumes every writer contributes the same size, which holds when:
+          * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
+            count in expected_transfers, so the live writers overflow their slots;
+          * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
+            for PP fan-in, every overlapping stage must hold the same number of layers
+            (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
+            list isn't available (shorter than the fan-in degree), be conservative and fall back.
+        Otherwise fall back to the per-fragment path (correct, just not coalesced).
+        NOTE: equal layer COUNT == equal BYTES only when per-layer KV is uniform; for mixed layer
+        groups (e.g. differing slot_bytes) reserve()'s `total % num_writers` divisibility guard is the
+        backstop, and a fully size-aware split (per-writer offsets) would be the general fix."""
+        if overlap.duplicate_head_factor != 1:
+            return False
+        if overlap.overlap_pp_size > 1:
+            lpp = getattr(peer_ri, "layer_num_per_pp", None)
+            if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
+                return False
+        return True
+
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
         logger.debug(
@@ -1534,8 +1556,16 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
-        # >1 = TP fan-in: bounce reserves one region for all writers, each given a sub-region base below.
-        bounced = self._bounce.reserve(receiver_req, task.expected_transfers)
+        # >1 = TP fan-in: bounce reserves ONE region split equally (per_writer = total // num_writers),
+        # valid only when every writer contributes the same size. _fanin_bounce_safe() permits the
+        # uniform cases (TP-by-head, and EVEN-PP layer split) and falls back to the per-fragment path
+        # for UNEVEN PP or duplicate_head_factor > 1 (MLA / duplicate TP heads, where some ranks don't
+        # send KV yet still count in expected_transfers). A single writer never splits -> always safe.
+        topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
+        allow_bounce = task.expected_transfers == 1 or self._fanin_bounce_safe(
+            topo_overlap, peer_infos
+        )
+        bounced = allow_bounce and self._bounce.reserve(receiver_req, task.expected_transfers)
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(

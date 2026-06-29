@@ -164,6 +164,39 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
+# fan-in safety gate — equal total//num_writers split only for uniform TP-by-head
+# --------------------------------------------------------------------------- #
+def test_fanin_bounce_safe_gate():
+    """Restrict multi-writer equal-split bounce to uniform TP-by-head.
+
+    PP (overlap_pp_size>1 -> unequal per-writer sizes) and duplicate_head_factor>1
+    (MLA / duplicate TP heads -> some ranks don't send KV yet count in
+    expected_transfers) must fall back to the per-fragment path.
+    """
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    safe = tfr.Receiver._fanin_bounce_safe
+
+    def ov(dup, pp):
+        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp)
+
+    def ri(lpp):
+        return SimpleNamespace(layer_num_per_pp=lpp)
+
+    # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
+    assert safe(ov(1, 1), ri([24])) is True
+    assert safe(ov(1, 0), ri([24])) is True
+    assert safe(ov(2, 1), ri([24])) is False  # duplicate heads / MLA -> some don't send
+    # EVEN PP fan-in (equal layers per overlapping stage) -> allowed (the case we now keep)
+    assert safe(ov(1, 4), ri([20, 20, 20, 20])) is True
+    # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
+    assert safe(ov(1, 4), ri([20, 20, 20, 19])) is False
+    # incomplete per-stage info (single element for a multi-stage fan-in) -> conservative fall back
+    assert safe(ov(1, 4), ri([20])) is False
+    # duplicate heads blocks even an otherwise-even PP split
+    assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+
+
+# --------------------------------------------------------------------------- #
 # NoBounce — disabled no-op fallback
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
