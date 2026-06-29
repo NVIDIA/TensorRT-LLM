@@ -148,7 +148,13 @@ void NixlTransferAgent::maybeInitBounce()
     try
     {
         int dev = 0;
-        (void) cudaGetDevice(&dev);
+        if (cudaGetDevice(&dev) != cudaSuccess)
+        {
+            // Don't silently bind the arena/exec to device 0 on a multi-GPU host — warn and clear the
+            // sticky error; the enclosing try still proceeds (best-effort) with dev=0.
+            (void) cudaGetLastError();
+            TLLM_LOG_WARNING("NixlTransferAgent(%s): cudaGetDevice failed; bounce assuming device 0", mName.c_str());
+        }
         auto st = std::make_unique<bounce::NixlBounceState>();
         st->cfg = cfg;
         // Bind the control channel to a ROUTABLE interface (not loopback) so peers on OTHER nodes can
