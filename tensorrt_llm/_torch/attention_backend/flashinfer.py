@@ -677,45 +677,55 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             has_multiple_windows = len(
                 getattr(self.kv_cache_manager, 'max_attention_window_vec',
                         [])) > 1
-            if (has_multiple_windows and hasattr(
-                    self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
+            if has_multiple_windows:
                 mgr = self.kv_cache_manager
-                self._vswa_layer_to_pool = {}
-                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
-                for layer_idx in getattr(mgr, 'layer_offsets', {}):
-                    layer_offset = mgr.layer_offsets[layer_idx]
-                    pool_id = mgr.layer_to_pool_mapping_dict[layer_offset]
-                    self._vswa_layer_to_pool[layer_idx] = pool_id
-                    if pool_id not in self._vswa_pool_to_rep_layer:
-                        self._vswa_pool_to_rep_layer[pool_id] = layer_idx
-                # Build head_dim → pool_id mapping using V2 per-layer head_dim
-                self._vswa_head_dim_to_pool: Dict[int, int] = {}
-                if hasattr(mgr, 'head_dim_per_layer'):
-                    for layer_idx, pool_id in self._vswa_layer_to_pool.items():
-                        hd = mgr.head_dim_per_layer[
-                            mgr.layer_offsets[layer_idx]]
-                        if hd not in self._vswa_head_dim_to_pool:
-                            self._vswa_head_dim_to_pool[hd] = pool_id
+                layer_to_pool_mapping = getattr(mgr,
+                                                'layer_to_pool_mapping_dict',
+                                                None)
+                layer_to_pool_idx = getattr(mgr, '_layer_to_pool_idx', None)
+                if layer_to_pool_mapping is not None or layer_to_pool_idx is not None:
+                    self._vswa_layer_to_pool = {}
+                    self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                    for layer_idx in getattr(mgr, 'layer_offsets', {}):
+                        layer_offset = mgr.layer_offsets[layer_idx]
+                        if layer_to_pool_mapping is not None:
+                            pool_id = layer_to_pool_mapping[layer_offset]
+                        else:
+                            pool_id = layer_to_pool_idx.get(layer_offset)
+                            if pool_id is None:
+                                continue
+                        self._vswa_layer_to_pool[layer_idx] = pool_id
+                        if pool_id not in self._vswa_pool_to_rep_layer:
+                            self._vswa_pool_to_rep_layer[pool_id] = layer_idx
+                    # Build head_dim → pool_id mapping using V2 per-layer head_dim
+                    self._vswa_head_dim_to_pool: Dict[int, int] = {}
+                    if hasattr(mgr, 'head_dim_per_layer'):
+                        for layer_idx, pool_id in self._vswa_layer_to_pool.items():
+                            hd = mgr.head_dim_per_layer[
+                                mgr.layer_offsets[layer_idx]]
+                            if hd not in self._vswa_head_dim_to_pool:
+                                self._vswa_head_dim_to_pool[hd] = pool_id
 
-                # Pre-allocate VSWA pool cache buffers.  These must be
-                # stable (never reallocated) so that CUDA-graph-recorded
-                # copies reference valid addresses across replays.
-                # Use the maximum page count across ALL pools (not just the
-                # primary) so that secondary pool buffers are large enough.
-                all_pool_pages = max_num_pages
-                if hasattr(self.kv_cache_manager, 'layer_offsets'):
-                    for lid in self.kv_cache_manager.layer_offsets:
-                        lbuf = self.kv_cache_manager.get_buffers(lid)
-                        if lbuf is not None:
-                            all_pool_pages = max(all_pool_pages, lbuf.shape[0])
-                for pool_id in set(self._vswa_layer_to_pool.values()):
-                    buf_key = f'_vswa_pool_buf_{pool_id}'
-                    if getattr(self, buf_key, None) is None:
-                        setattr(
-                            self, buf_key,
-                            torch.empty(all_pool_pages,
-                                        dtype=torch.int,
-                                        device='cuda'))
+                    # Pre-allocate VSWA pool cache buffers.  These must be
+                    # stable (never reallocated) so that CUDA-graph-recorded
+                    # copies reference valid addresses across replays.
+                    # Use the maximum page count across ALL pools (not just the
+                    # primary) so that secondary pool buffers are large enough.
+                    all_pool_pages = max_num_pages
+                    if hasattr(self.kv_cache_manager, 'layer_offsets'):
+                        for lid in self.kv_cache_manager.layer_offsets:
+                            lbuf = self.kv_cache_manager.get_buffers(lid)
+                            if lbuf is not None:
+                                all_pool_pages = max(all_pool_pages,
+                                                     lbuf.shape[0])
+                    for pool_id in set(self._vswa_layer_to_pool.values()):
+                        buf_key = f'_vswa_pool_buf_{pool_id}'
+                        if getattr(self, buf_key, None) is None:
+                            setattr(
+                                self, buf_key,
+                                torch.empty(all_pool_pages,
+                                            dtype=torch.int,
+                                            device='cuda'))
         # Stable buffers for FlashInfer MLA decode; required for CUDA graphs.
         self._mla_qo_indptr_buf = self.get_empty(
             buffers,
