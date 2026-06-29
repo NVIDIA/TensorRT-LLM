@@ -45,6 +45,11 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
+_MINIMAX_M3_ARCHITECTURES = {
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+}
+
 
 def _unified_kv_pool_includes_mamba(
         is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
@@ -675,6 +680,52 @@ class ModelConfig(Generic[TConfig]):
         return layer_quant_config
 
     @staticmethod
+    def _set_minimax_m3_moe_quant_config(pretrained_config, layer_quant_config):
+        """Inject per-MoE-layer NVFP4 quant config entries for Minimax M3.
+
+        The M3 NVFP4 checkpoint uses MIXED_PRECISION with per-linear entries
+        like ``language_model.model.layers.N.block_sparse_moe.experts.E.w1 ->
+        NVFP4`` in ``hf_quant_config.json``.  Those fine-grained keys cannot
+        be used directly by ``MiniMaxM3MoE._get_experts_quant_config``, which
+        needs a single coarse entry ``model.layers.N.block_sparse_moe.experts``
+        to select the NVFP4 backend.  This method detects the NVFP4 expert
+        entries and adds the coarse keys.
+
+        Does nothing when no NVFP4 expert entries are found (e.g. BF16
+        checkpoint).
+        """
+        from tensorrt_llm.models.modeling_utils import QuantAlgo
+        has_nvfp4_experts = layer_quant_config is not None and any(
+            "block_sparse_moe.experts" in k and isinstance(v, QuantConfig)
+            and v.quant_algo == QuantAlgo.NVFP4
+            for k, v in layer_quant_config.items())
+        if not has_nvfp4_experts:
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        experts_quant_config.quant_algo = QuantAlgo.NVFP4
+        experts_quant_config.group_size = 16
+
+        layer_quant_config = dict(layer_quant_config)
+
+        text_config = getattr(pretrained_config, "text_config",
+                              pretrained_config)
+        if isinstance(text_config, dict):
+            moe_layer_freq = text_config.get("moe_layer_freq", [])
+        else:
+            moe_layer_freq = getattr(text_config, "moe_layer_freq", [])
+
+        for layer_idx, freq in enumerate(moe_layer_freq):
+            if int(freq) != 0:
+                layer_quant_config[
+                    f"model.layers.{layer_idx}.block_sparse_moe.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected Minimax M3 NVFP4 routed MoE checkpoint; using NVFP4 "
+            "for routed experts.")
+        return layer_quant_config
+
+    @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -1059,6 +1110,10 @@ class ModelConfig(Generic[TConfig]):
                 layer_quant_config,
                 kwargs.get('spec_config', None),
                 require_layout=require_deepseek_v4_routed_moe_layout)
+
+        if architecture in _MINIMAX_M3_ARCHITECTURES:
+            layer_quant_config = cls._set_minimax_m3_moe_quant_config(
+                pretrained_config, layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
