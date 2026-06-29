@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
 from urllib.parse import urlparse
 
+import lazy_loader as lazy
 import numpy as np
 import soundfile
 import torch
 from PIL import Image
-from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
@@ -38,6 +38,7 @@ from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
+torchvision = lazy.load("torchvision")
 logger = logging.get_logger(__name__)
 
 
@@ -84,7 +85,7 @@ def load_image(image: Union[str, Image.Image],
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return torchvision.transforms.ToTensor()(image).to(device=device)
     else:
         return image
 
@@ -114,8 +115,8 @@ async def async_load_image(
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
-        return await asyncio.to_thread(lambda: ToTensor()
-                                       (image).to(device=device))
+        return await asyncio.to_thread(
+            lambda: torchvision.transforms.ToTensor()(image).to(device=device))
     else:
         return image
 

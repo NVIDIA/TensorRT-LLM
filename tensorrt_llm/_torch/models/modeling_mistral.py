@@ -2,8 +2,8 @@ import copy
 import dataclasses
 from typing import Any, Dict, List, Sequence, Tuple
 
+import lazy_loader as lazy
 import torch
-import torchvision
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from torch import nn
@@ -50,6 +50,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
+
+torchvision = lazy.load("torchvision")
 
 
 class MistralAttention(Attention):
