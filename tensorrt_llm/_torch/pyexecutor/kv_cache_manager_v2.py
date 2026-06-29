@@ -995,8 +995,114 @@ class KVCacheManagerV2(BaseResourceManager):
         self._log_kv_cache_pool_lifecycle_mapping()
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
-        (self.kv_cache_pool_pointers, self.kv_cache_pool_mapping) = (
-            self._build_pool_mapping_tensors()
+        kv_cache_pool_pointers_list = []
+        kv_cache_pool_mapping_list = []
+        block_scale_pool_pointers_list = []
+        if self.enable_swa_scratch_reuse:
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                kv_cache_pool_pointers_list.append(
+                    [
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.PER_LAYER
+                        ),
+                        0,
+                    ]
+                )
+                if self.dtype == DataType.NVFP4:
+                    block_scale_pool_pointers_list.append(
+                        [
+                            self.impl.get_mem_pool_base_address(
+                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.PER_LAYER
+                            ),
+                            0,
+                        ]
+                    )
+                kv_cache_pool_mapping_list.append([int(layer_id), 0])
+        else:
+            for pool_id in range(self.num_pools):
+                layer_id = self.impl.layer_grouping[pool_id][0]
+                kv_cache_pool_pointers_list.append(
+                    [
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        ),
+                        0,
+                    ]
+                )
+                if self.dtype == DataType.NVFP4:
+                    block_scale_pool_pointers_list.append(
+                        [
+                            self.impl.get_mem_pool_base_address(
+                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                            ),
+                            0,
+                        ]
+                    )
+
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                layer_group_id = self.impl.get_layer_group_id(layer_id)
+                if self.dtype != DataType.NVFP4:
+                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                    addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        )
+                        - key_base_addr
+                    )
+                else:
+                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                    block_scale_base_addr = block_scale_pool_pointers_list[layer_group_id][0]
+                    addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        )
+                        - key_base_addr
+                    )
+                    block_scale_addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                        )
+                        - block_scale_base_addr
+                    )
+                    block_scale_offset = exact_div(
+                        block_scale_addr_offset,
+                        self.get_layer_bytes_per_token(layer_id, Role.KEY_BLOCK_SCALE)
+                        * self.kv_factor
+                        * self.tokens_per_block,
+                    )
+                offset = exact_div(
+                    addr_offset,
+                    self.get_layer_bytes_per_token(layer_id, Role.KEY)
+                    * self.kv_factor
+                    * self.tokens_per_block,
+                )
+
+                if self.dtype == DataType.NVFP4:
+                    assert block_scale_offset == offset, (
+                        "Block scale offset and offset should be the same"
+                    )
+
+                kv_cache_pool_mapping_list.append([layer_group_id, offset])
+
+        if self.dtype == DataType.NVFP4:
+            for pool_id, block_scale_pool_pointers in enumerate(block_scale_pool_pointers_list):
+                pool_pointers = kv_cache_pool_pointers_list[pool_id]
+                kv_cache_pool_pointers_list[pool_id] = [
+                    [pool_pointers[0], block_scale_pool_pointers[0]],
+                    [pool_pointers[1], block_scale_pool_pointers[1]],
+                ]
+
+        self.kv_cache_pool_pointers = torch.tensor(
+            kv_cache_pool_pointers_list,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        self.kv_cache_pool_mapping = torch.tensor(
+            kv_cache_pool_mapping_list,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
@@ -1361,113 +1467,6 @@ class KVCacheManagerV2(BaseResourceManager):
             ],
             non_blocking=True,
         )
-
-    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        kv_cache_pool_pointers_list = []
-        kv_cache_pool_mapping_list = []
-        block_scale_pool_pointers_list = []
-        if self.enable_swa_scratch_reuse:
-            for layer_id in typed_range(LayerId(self.num_local_layers)):
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.PER_LAYER
-                        ),
-                        0,
-                    ]
-                )
-                if self.dtype == DataType.NVFP4:
-                    block_scale_pool_pointers_list.append(
-                        [
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.PER_LAYER
-                            ),
-                            0,
-                        ]
-                    )
-                kv_cache_pool_mapping_list.append([int(layer_id), 0])
-        else:
-            for pool_id in range(self.num_pools):
-                layer_id = self.impl.layer_grouping[pool_id][0]
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        ),
-                        0,
-                    ]
-                )
-                if self.dtype == DataType.NVFP4:
-                    block_scale_pool_pointers_list.append(
-                        [
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
-                            ),
-                            0,
-                        ]
-                    )
-
-            for layer_id in typed_range(LayerId(self.num_local_layers)):
-                layer_group_id = self.impl.get_layer_group_id(layer_id)
-                if self.dtype != DataType.NVFP4:
-                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        )
-                        - key_base_addr
-                    )
-                else:
-                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
-                    block_scale_base_addr = block_scale_pool_pointers_list[layer_group_id][0]
-                    addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        )
-                        - key_base_addr
-                    )
-                    block_scale_addr_offset = (
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
-                        )
-                        - block_scale_base_addr
-                    )
-                    block_scale_offset = exact_div(
-                        block_scale_addr_offset,
-                        self.get_layer_bytes_per_token(layer_id, Role.KEY_BLOCK_SCALE)
-                        * self.kv_factor
-                        * self.tokens_per_block,
-                    )
-                offset = exact_div(
-                    addr_offset,
-                    self.get_layer_bytes_per_token(layer_id, Role.KEY)
-                    * self.kv_factor
-                    * self.tokens_per_block,
-                )
-
-                if self.dtype == DataType.NVFP4:
-                    assert block_scale_offset == offset, (
-                        "Block scale offset and offset should be the same"
-                    )
-
-                kv_cache_pool_mapping_list.append([layer_group_id, offset])
-
-        if self.dtype == DataType.NVFP4:
-            for pool_id, block_scale_pool_pointers in enumerate(block_scale_pool_pointers_list):
-                pool_pointers = kv_cache_pool_pointers_list[pool_id]
-                kv_cache_pool_pointers_list[pool_id] = [
-                    [pool_pointers[0], block_scale_pool_pointers[0]],
-                    [pool_pointers[1], block_scale_pool_pointers[1]],
-                ]
-
-        kv_cache_pool_pointers = torch.tensor(
-            kv_cache_pool_pointers_list, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
-        )
-
-        kv_cache_pool_mapping = torch.tensor(
-            kv_cache_pool_mapping_list, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
-        )
-        return kv_cache_pool_pointers, kv_cache_pool_mapping
 
     def _build_cache_config(
         self,
