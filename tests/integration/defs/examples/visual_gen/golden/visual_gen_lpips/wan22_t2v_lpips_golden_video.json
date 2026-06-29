@@ -12,5 +12,6 @@
   "seed": 42,
   "frame_rate": 16.0,
   "lpips_net": "alex",
-  "lpips_threshold": 0.05
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.37.1"
 }

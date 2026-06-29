@@ -482,12 +482,12 @@ inline bool dispatchTierPairs(TierList<First, Rest...>*, Data const& data, Fn&& 
 // Only these pairs are compiled as kernel instantiations.
 // To add support for a new model config, add a Tier<E, K> to the appropriate TierList.
 //
-// THREAD-COUNT SAFETY: LAUNCH_ROUTING_FOR_POLICY automatically clamps the launch thread
-// count to at least min(MaxNumExperts, 1024) from the dispatched tier.  This prevents
+// THREAD-COUNT SAFETY: the default launch config clamps the launch thread count to at
+// least min(MaxNumExperts, 1024) from the dispatched tier.  This prevents
 // mismatches when a policy's smallest tier is larger than getMaxNumExperts() returns for
 // the same numExperts (e.g., 72 experts → getMaxNumExperts returns 128, but a policy
 // whose smallest tier is 256 would produce MaxNumExperts=256).  See the comment on
-// LAUNCH_ROUTING_FOR_POLICY for details.
+// DefaultRoutingLaunchConfig for details.
 //
 // ┌──────────────────────────────────────────────────────────────────────────────┐
 // │  Policy (PreProc + PostProc)           Supported pairs                      │
@@ -619,36 +619,61 @@ template <> struct PolicyTraits<FirstKExpertSelect, void>
 // (expert, topK) as compile-time integral_constants.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <int MaxNumExperts, int MaxNumTopExperts>
+struct DefaultRoutingLaunchConfig
+{
+    static constexpr int BlockDim = MaxNumExperts <= 1024 ? MaxNumExperts : 1024;
+
+    static int blockDim(Data const& /*data*/, int numThreads)
+    {
+        return std::max(numThreads, BlockDim);
+    }
+
+    static int gridDim(Data const& /*data*/, int numBlocks, int /*blockDim*/)
+    {
+        return numBlocks;
+    }
+};
+
 // Generic per-policy dispatch.  Iterates PolicyTraits<PreProc, PostProc>::Pairs,
 // picking the first (expert, topK) pair that covers the runtime values.
 //
-// IMPORTANT: numThreads is clamped to at least min(MaxNumExperts, 1024) from the dispatched tier.
+// IMPORTANT: DefaultRoutingLaunchConfig clamps numThreads to at least min(MaxNumExperts, 1024)
+// from the dispatched tier.
 // Many routing kernels derive their internal NumThreadsBlock from MaxNumExperts and use it for
 // grid-stride addressing, initArr strides, and cub::BlockScan.  If the caller's numThreads
 // (typically getMaxNumExperts(mNumExperts)) is smaller than the tier's MaxNumExperts, the kernel
-// would compute wrong indices, skip initialization, and corrupt memory.  The max() below
+// would compute wrong indices, skip initialization, and corrupt memory.  The default max()
 // guarantees the launch thread count always matches or exceeds the kernel's NumThreadsBlock:
 //   - "derive from tier" kernels: numThreadsHist < MaxNumExperts → bumped to MaxNumExperts  ✓
 //   - "fixed 1024" kernels (cluster): numThreads=1024 ≥ MaxNumExperts → unchanged            ✓
-#define LAUNCH_ROUTING_FOR_POLICY(                                                                                     \
-    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, PreProc, PostProc)                              \
+// Kernels with a different internal block size can pass a custom LaunchConfig through the
+// WITH_CONFIG variants and must keep their own launch bounds, blockDim, and gridDim consistent.
+#define LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(                                                                         \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, PreProc, PostProc, LaunchConfig)                \
     [&](auto pt_tag_)                                                                                                  \
     {                                                                                                                  \
         using Pairs_ = typename decltype(pt_tag_)::Pairs;                                                              \
         bool dispatched_ = dispatchTierPairs(static_cast<Pairs_*>(nullptr), data,                                      \
             [&](auto eTag_, auto kTag_)                                                                                \
             {                                                                                                          \
-                constexpr int tierMaxExp_ = decltype(eTag_)::value;                                                    \
-                constexpr int tierThreads_ = tierMaxExp_ <= 1024 ? tierMaxExp_ : 1024;                                 \
-                int const effectiveThreads_ = std::max(static_cast<int>(numThreads), tierThreads_);                    \
-                LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, effectiveThreads_, smemSize, stream, \
-                    PreProc, PostProc, decltype(eTag_)::value, decltype(kTag_)::value);                                \
+                using LaunchConfig_ = LaunchConfig<decltype(eTag_)::value, decltype(kTag_)::value>;                    \
+                int const effectiveThreads_ = LaunchConfig_::blockDim(data, static_cast<int>(numThreads));             \
+                int const effectiveBlocks_                                                                             \
+                    = LaunchConfig_::gridDim(data, static_cast<int>(numBlocks), effectiveThreads_);                    \
+                LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_, effectiveThreads_, smemSize,  \
+                    stream, PreProc, PostProc, decltype(eTag_)::value, decltype(kTag_)::value);                        \
             });                                                                                                        \
         if (!dispatched_)                                                                                              \
         {                                                                                                              \
             TLLM_LOG_ERROR("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);                      \
         }                                                                                                              \
     }(PolicyTraits<PreProc, PostProc>{})
+
+#define LAUNCH_ROUTING_FOR_POLICY(                                                                                     \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, PreProc, PostProc)                              \
+    LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, PreProc,  \
+        PostProc, DefaultRoutingLaunchConfig)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // CUSTOM EXPERT SELECT DISPATCH
@@ -782,13 +807,18 @@ inline int32_t queryDispatchedMaxExperts(Data const& data)
 
 // Top-level dispatch: maps runtime preprocess/postprocess enums to compile-time policy types,
 // then delegates to LAUNCH_ROUTING_FOR_POLICY which reads PolicyTraits for tier support.
-#define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                       \
+#define LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(                                                                             \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, LaunchConfig)                                   \
     dispatchRoutingPolicy(data,                                                                                        \
         [&](auto preProc_, auto postProc_)                                                                             \
         {                                                                                                              \
-            LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream,               \
-                decltype(preProc_), decltype(postProc_));                                                              \
+            LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream,   \
+                decltype(preProc_), decltype(postProc_), LaunchConfig);                                                \
         })
+
+#define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)                       \
+    LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(                                                                                 \
+        data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, DefaultRoutingLaunchConfig)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
