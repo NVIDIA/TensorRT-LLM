@@ -477,6 +477,56 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self._paged_kv_indices[:self.num_generation_blocks +
                                       self.num_context_blocks]
 
+    def _pool_window_for_layer(self, layer_idx: int) -> Optional[int]:
+        """Return the per-pool window size for *layer_idx*, or None if unknown.
+
+        Linear / recurrent (Mamba2) layers use a negative INT_MAX sentinel
+        for window; real SWA / full-attention layers have window > 0
+        (or None, which V2 represents as max_seq_len).  Callers use this
+        to avoid picking a linear-pool layer as the primary pool, since
+        those pools return negative placeholder block IDs that would
+        crash append_paged_kv_cache with an illegal memory access.
+        """
+        mgr = self.kv_cache_manager
+        vec = getattr(mgr, 'max_attention_window_vec', None)
+        if not vec:
+            return None
+        layer_offsets = getattr(mgr, 'layer_offsets', None)
+        if layer_offsets is None or layer_idx not in layer_offsets:
+            return None
+        off = layer_offsets[layer_idx]
+        # V2 manager: has layer_to_pool_mapping_dict; vec is indexed
+        # per-layer (length matches num_layers when user supplies
+        # per-layer max_attention_window, e.g. Qwen3-Next hybrid).
+        if hasattr(mgr, 'layer_to_pool_mapping_dict') and 0 <= off < len(vec):
+            w = vec[off]
+            return w if w is not None else (1 << 31)
+        # V1 manager: vec is per-pool; resolve pool via _layer_to_pool_idx.
+        l2p = getattr(mgr, '_layer_to_pool_idx', None)
+        if l2p is not None:
+            pool_idx = l2p.get(off)
+            if pool_idx is not None and 0 <= pool_idx < len(vec):
+                w = vec[pool_idx]
+                return w if w is not None else (1 << 31)
+        return None
+
+    def _pick_vswa_primary_pool_id(self) -> int:
+        """Pick a non-linear pool as the FlashInfer 'primary' pool.
+
+        On hybrid Mamba models (e.g. Qwen3-Next) layer 0 is a linear /
+        recurrent layer; its pool returns NEGATIVE placeholder block IDs
+        from BlockManager::getFreeBlock that crash append_paged_kv_cache.
+        Pick the first pool whose representative layer has window > 0.
+        Fall back to the layer-0 pool if no full-attention pool exists.
+        """
+        assert self._vswa_layer_to_pool is not None
+        default_pool = self._vswa_layer_to_pool.get(0, 0)
+        for pool_id, rep_layer in self._vswa_pool_to_rep_layer.items():
+            w = self._pool_window_for_layer(rep_layer)
+            if w is not None and w > 0:
+                return pool_id
+        return default_pool
+
     def get_paged_kv_indices_for_layer(self, layer_idx: int) -> torch.Tensor:
         """Return page indices for the pool that *layer_idx* belongs to.
 
@@ -979,16 +1029,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # non-empty for any model with attention layers).
         _vswa_init_layer: Optional[int] = None
         if self._vswa_layer_to_pool is not None:
-            # V2 VSWA: use primary pool representative layer.
-            _primary_pool = self._vswa_layer_to_pool.get(0, 0)
+            # V2 VSWA: prefer the rep layer of a non-linear (window > 0)
+            # pool.  On hybrid Mamba models layer 0 belongs to the linear
+            # pool, whose block IDs are negative placeholders that would
+            # poison _paged_kv_indices and crash append_paged_kv_cache.
+            _primary_pool = self._pick_vswa_primary_pool_id()
             _vswa_init_layer = self._vswa_pool_to_rep_layer.get(_primary_pool, 0)
         elif len(getattr(self.kv_cache_manager, 'max_attention_window_vec', [])) > 1:
             # V1 manager (or any manager without per-pool dict) with multiple
             # window sizes: get_batch_cache_indices requires layer_idx to
-            # resolve the window_size.  Use any valid layer index.
+            # resolve the window_size.  Prefer a layer whose pool window is
+            # positive (skip linear / recurrent pools whose window sentinel
+            # is negative); fall back to the first layer if none qualifies.
             _layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
             if _layer_offsets:
                 _vswa_init_layer = next(iter(_layer_offsets))
+                for _lid in _layer_offsets:
+                    _w = self._pool_window_for_layer(_lid)
+                    if _w is not None and _w > 0:
+                        _vswa_init_layer = _lid
+                        break
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids, layer_idx=_vswa_init_layer)
 
@@ -1042,7 +1102,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # capturable).
         if self._vswa_layer_to_pool is not None:
             unique_pools = set(self._vswa_layer_to_pool.values())
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            # Primary pool must be non-linear so _paged_kv_indices / the
+            # primary buffer hold positive page IDs (see _pick_vswa_primary_pool_id).
+            primary_pool_id = self._pick_vswa_primary_pool_id()
             # Use dedicated pre-allocated buffers for each pool's indices.
             # These buffers are created in __post_init__ so their addresses
             # stay stable across CUDA-graph replays.
@@ -1178,7 +1240,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # VSWA: restore primary pool indices as the default.
         if (self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None):
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._pick_vswa_primary_pool_id()
             total_blocks = self.num_generation_blocks + self.num_context_blocks
             src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
