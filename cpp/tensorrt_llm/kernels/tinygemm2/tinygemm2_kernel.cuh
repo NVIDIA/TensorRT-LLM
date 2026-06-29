@@ -421,10 +421,14 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
         __syncthreads();
 
-        if (threadIdx.x == 0) // one thread per block suffices according to official code examples
-        {
-            cudaTriggerProgrammaticLaunchCompletion();
-        }
+        // NOTE: Do NOT call cudaTriggerProgrammaticLaunchCompletion() here. This kernel writes its
+        // result (the `output[...]` global stores below) AFTER this point, so signaling programmatic
+        // launch completion now would let a PDL-dependent consumer proceed and read `output` before
+        // it is written -> stale gate logits / wrong MoE routing under CUDA-graph decode (the bug is
+        // severe when grid.y==1, i.e. small decode batch). With no explicit trigger, programmatic
+        // launch completion is signaled implicitly after all thread blocks exit (i.e. after the
+        // stores), which is correct. The kernel still benefits from PDL as a secondary (it overlaps
+        // weight loads / waits on the activation producer via cudaGridDependencySynchronize above).
 
         if (warp_id == 0)
         {
