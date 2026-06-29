@@ -801,11 +801,18 @@ def test_deepseek_v4_sanity():
         if i < num_contexts:
             success = kv_cache_manager.resize_context(req, req.context_chunk_size)
         else:
+            # Warm-cache setup for a generation request: simulate
+            # past_seen_tokens[i] worth of history without running forward.
+            # Reach into kv_cache.resize directly because resize_context no
+            # longer exposes a history_length override (production callers
+            # use prepare_disagg_gen_init or update_resources to advance it).
             kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
             kv_cache.enable_swa_scratch_reuse = False
-            success = kv_cache_manager.resize_context(
-                req, token_nums[i], history_length=past_seen_tokens[i]
+            target = (
+                req.context_current_position + token_nums[i] + kv_cache_manager.num_extra_kv_tokens
             )
+            capacity = max(kv_cache.capacity, target)
+            success = kv_cache.resize(capacity, past_seen_tokens[i])
         assert success, f"Failed to resize context for request {req_id}"
         reqs.append(req)
 

@@ -8,6 +8,7 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import os
 import threading
 import uuid
+from types import SimpleNamespace
 
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
@@ -53,6 +54,49 @@ MAX_SEQ_LEN = 256
 MAX_BATCH_SIZE = 4
 VOCAB_SIZE = 32000
 REQUEST_LENGTHS = [30, 60, 80]
+
+
+def test_assert_disagg_history_declared_passes_when_contract_met():
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: 17)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    # Should not raise — history_length matches prompt_len exactly.
+    transceiver._assert_disagg_history_declared(req)
+
+    # And also passes when history_length exceeds prompt_len (e.g., already advanced).
+    cache_manager.get_history_length = lambda r: 100
+    transceiver._assert_disagg_history_declared(req)
+
+
+def test_assert_disagg_history_declared_raises_on_contract_violation():
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: 0)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    with pytest.raises(RuntimeError, match="history_length=0 < prompt_len=17"):
+        transceiver._assert_disagg_history_declared(req)
+
+
+def test_assert_disagg_history_declared_noops_without_capability():
+    """V1 / non-V2 managers lack get_history_length; verify graceful skip."""
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = object()
+
+    # Should not raise — no get_history_length attribute.
+    transceiver._assert_disagg_history_declared(SimpleNamespace(prompt_len=17))
+
+
+def test_assert_disagg_history_declared_noops_when_cache_released():
+    """If the cache was released (e.g., cancelled mid-transfer), skip the check."""
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: None)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    transceiver._assert_disagg_history_declared(req)
 
 
 # ---------------------------------------------------------------------------
@@ -441,13 +485,23 @@ def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=10
 # ---------------------------------------------------------------------------
 # Add sequence to manager
 # ---------------------------------------------------------------------------
-def _add_sequence(mgr, request_id: int, prompt_len: int, use_v2: bool):
+def _add_sequence(
+    mgr, request_id: int, prompt_len: int, use_v2: bool, *, is_generation: bool = False
+):
     """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup)."""
     if use_v2:
         kv_cache = mgr._create_kv_cache(request_id, None, None)
+        if not mgr.enable_block_reuse:
+            kv_cache.stop_committing()
         success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
         assert success, f"Failed to resume kv_cache for request {request_id}"
-        kv_cache.resize(prompt_len)
+        if is_generation:
+            kv_cache.enable_swa_scratch_reuse = False
+            kv_cache.resize(prompt_len, history_length=prompt_len)
+        else:
+            kv_cache.resize(prompt_len)
+            kv_cache.resize(None, history_length=prompt_len)
+            kv_cache.enable_swa_scratch_reuse = False
         return kv_cache
     else:
         # V1: create a dummy LlmRequest for add_sequence_batch
@@ -874,7 +928,13 @@ def run_transfer_test(
         # 5. Add sequences and gen receive first
         for rank in range(gen_world):
             for req_idx, req in gen_handle_map[rank]:
-                kv = _add_sequence(gen_managers[rank], req.py_request_id, req.prompt_len, use_v2)
+                kv = _add_sequence(
+                    gen_managers[rank],
+                    req.py_request_id,
+                    req.prompt_len,
+                    use_v2,
+                    is_generation=True,
+                )
                 if kv is not None:
                     gen_kv_caches[rank].append(kv)
                 gen_tcs[rank].request_and_receive_async(req)

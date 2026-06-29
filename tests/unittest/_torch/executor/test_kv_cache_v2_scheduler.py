@@ -18,12 +18,10 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
@@ -159,13 +157,15 @@ def make_kv_cache_manager(
     tokens_per_block=64,
     prepare_context_fn=None,
     resize_context_fn=None,
+    prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
-    mgr.resize_context.side_effect = resize_context_fn or (lambda req, n, history_length=None: True)
+    mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
+    mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
@@ -1210,7 +1210,7 @@ class TestDisagg:
         assert ids(out.generation_requests) == [0, 1]
         assert ids(out.fitting_disagg_gen_init_requests) == [2]
 
-    def test_disagg_gated_by_prepare_context(self):
+    def test_disagg_gated_by_prepare_disagg_gen_init(self):
         """Disagg is limited by KV cache / IndexMapper, not batch budget."""
         call_count = [0]
 
@@ -1218,7 +1218,7 @@ class TestDisagg:
             call_count[0] += 1
             return call_count[0] <= 2  # first 2 succeed, rest fail
 
-        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [make_disagg_request(i) for i in range(4)]
         out = sched.schedule_request(reqs, set())
@@ -1243,51 +1243,45 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
 
-    def test_disagg_prepare_context_fails_skips(self):
-        """prepare_context failure skips the request, loop continues."""
+    def test_disagg_prepare_disagg_gen_init_fails_skips(self):
+        """prepare_disagg_gen_init failure skips the request, loop continues."""
         call_count = [0]
 
         def prepare_fn(req):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 
-        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [make_disagg_request(0), make_disagg_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
 
-    def test_disagg_resize_context_fails_skips(self):
-        """resize_context failure skips the request, loop continues."""
-        call_count = [0]
+    def test_disagg_uses_prepare_disagg_gen_init_api(self):
+        """Scheduler routes disagg through prepare_disagg_gen_init (not
+        prepare_context/resize_context).  The single-call API encapsulates
+        the SWA history pre-declaration internally."""
+        called = []
 
-        def resize_fn(req, n, history_length=None):
-            call_count[0] += 1
-            return call_count[0] > 1  # first fails, second succeeds
-
-        mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
-        sched = make_scheduler(mgr, max_num_tokens=100)
-        reqs = [make_disagg_request(0), make_disagg_request(1)]
-        out = sched.schedule_request(reqs, set())
-        assert ids(out.fitting_disagg_gen_init_requests) == [1]
-
-    def test_disagg_resize_context_passes_history_length(self):
-        """Disagg init forwards history_length=prompt_len to resize_context."""
-        captured = {}
-
-        def resize_fn(req, n, history_length=None):
-            captured[req.py_request_id] = history_length
+        def prepare_disagg_fn(req):
+            called.append(req.py_request_id)
             return True
 
-        mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
+        def resize_fn(req, n):
+            raise AssertionError("resize_context must not be called for disagg")
+
+        def prepare_ctx_fn(req):
+            raise AssertionError("prepare_context must not be called for disagg")
+
+        mgr = make_kv_cache_manager(
+            prepare_disagg_gen_init_fn=prepare_disagg_fn,
+            prepare_context_fn=prepare_ctx_fn,
+            resize_context_fn=resize_fn,
+        )
         sched = make_scheduler(mgr, max_num_tokens=100)
-        reqs = [
-            make_disagg_request(0, context_remaining_length=200, prompt_len=200),
-            make_disagg_request(1, context_remaining_length=512, prompt_len=512),
-        ]
+        reqs = [make_disagg_request(0), make_disagg_request(1)]
         sched.schedule_request(reqs, set())
-        assert captured[0] == 200
-        assert captured[1] == 512
+        assert called == [0, 1]
 
     def test_disagg_exceeds_max_batch_size(self):
         """Disagg count can exceed max_batch_size since it bypasses budget."""
@@ -1348,7 +1342,7 @@ class TestDisagg:
         assert ids(out.context_requests) == []
 
     def test_disagg_prepare_fail_continues_to_next_disagg(self):
-        """prepare_context failure for one disagg does not stop other disaggs."""
+        """prepare_disagg_gen_init failure for one disagg does not stop other disaggs."""
         call_count = [0]
 
         def selective_prepare(req):
@@ -1356,7 +1350,7 @@ class TestDisagg:
             # Fail for request 0 and 2, succeed for 1 and 3
             return req.request_id in (1, 3)
 
-        mgr = make_kv_cache_manager(prepare_context_fn=selective_prepare)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=selective_prepare)
         sched = make_scheduler(mgr, max_num_tokens=200)
         reqs = [make_disagg_request(i) for i in range(4)]
         out = sched.schedule_request(reqs, set())
@@ -1370,13 +1364,13 @@ class TestDisagg:
                   DISAGG_GENERATION_TRANS_IN_PROGRESS (value=9).
           Iter 2: TRANS_IN_PROGRESS (9) is invisible to both the disagg branch
                   (checks ==8) and state gating ([10,14)), so budget resets to
-                  0. New disagg_gen_init passes budget → prepare_context called
-                  again → IndexMapper would crash in production.
+                  0. New disagg_gen_init passes budget → prepare_disagg_gen_init
+                  called again → IndexMapper would crash in production.
 
-        This test counts prepare_context calls across two iterations. With
-        scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
-        correct implementation should cap total prepare_context calls to 2
-        (the IndexMapper capacity). The bug allows 4.
+        This test counts prepare_disagg_gen_init calls across two iterations.
+        With scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
+        correct implementation should cap total prepare_disagg_gen_init calls to
+        2 (the IndexMapper capacity). The bug allows 4.
         """
         prepare_count = [0]
 
@@ -1384,7 +1378,7 @@ class TestDisagg:
             prepare_count[0] += 1
             return True
 
-        mgr = make_kv_cache_manager(prepare_context_fn=counting_prepare)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=counting_prepare)
         sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
 
         # Iteration 1: two disagg_gen_init requests
@@ -1406,7 +1400,7 @@ class TestDisagg:
         out2 = sched.schedule_request(all_active, set())
 
         # BUG: budget resets to 0, TRANS_IN_PROGRESS not counted, so
-        # both new disagg pass → prepare_context called 4 times total.
+        # both new disagg pass → prepare_disagg_gen_init called 4 times total.
         # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
         assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
         assert prepare_count[0] == 4  # <-- proves the overflow
@@ -2444,48 +2438,3 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
-
-
-# ---------------------------------------------------------------------------
-# KVCacheManagerV2.trim_to_history (#14258): unbound on a fake self, all 5 branches.
-# ---------------------------------------------------------------------------
-class TestTrimToHistory:
-    @staticmethod
-    def _call(kv_cache, history_length, req_id=1):
-        kv_cache_map = {} if kv_cache is None else {req_id: kv_cache}
-        fake = SimpleNamespace(kv_cache_map=kv_cache_map)
-        req = SimpleNamespace(py_request_id=req_id)
-        return KVCacheManagerV2.trim_to_history(fake, req, history_length)
-
-    def test_missing_cache_is_noop_true(self):
-        assert self._call(None, 50) is True
-
-    def test_inactive_cache_is_noop_true(self):
-        kv = Mock(is_active=False)
-        assert self._call(kv, 50) is True
-        kv.resize.assert_not_called()
-
-    def test_history_not_increasing_is_noop_true(self):
-        kv = Mock(is_active=True, history_length=50, capacity=100)
-        assert self._call(kv, 50) is True  # 50 <= current 50
-        kv.resize.assert_not_called()
-
-    def test_resize_success_clamps_capacity_and_returns_true(self):
-        kv = Mock(is_active=True, history_length=10, capacity=8)
-        kv.resize.return_value = True
-        assert self._call(kv, 64) is True
-        # target_capacity = max(capacity=8, history=64) = 64
-        kv.resize.assert_called_once_with(64, history_length=64)
-
-    def test_resize_rejection_returns_false(self):
-        kv = Mock(is_active=True, history_length=10, capacity=100)
-        kv.resize.return_value = False
-        assert self._call(kv, 64) is False
-        kv.resize.assert_called_once_with(100, history_length=64)
-
-    def test_resize_exception_degrades_to_false(self):
-        # Broad except: a non-ValueError (e.g. internal state assert) must
-        # degrade to False rather than propagate (do-not-narrow contract).
-        kv = Mock(is_active=True, history_length=10, capacity=100)
-        kv.resize.side_effect = RuntimeError("internal state assert")
-        assert self._call(kv, 64) is False

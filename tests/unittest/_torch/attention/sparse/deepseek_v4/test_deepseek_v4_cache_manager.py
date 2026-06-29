@@ -1649,20 +1649,35 @@ class TestDeepseekV4CacheManager:
         req.state = LlmRequestState.DISAGG_GENERATION_INIT
         allocated = False
         try:
-            assert cache_manager.prepare_context(req)
-            assert cache_manager.resize_context(
-                req,
-                req.context_remaining_length,
-                history_length=req.context_remaining_length,
-            )
+            assert cache_manager.prepare_disagg_gen_init(req)
             allocated = True
 
             kv_cache = cache_manager.kv_cache_map[req.py_request_id]
             assert not kv_cache.enable_swa_scratch_reuse
-            assert kv_cache.history_length == req.context_remaining_length
+            assert kv_cache.history_length == req.prompt_len
         finally:
             if allocated:
                 cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_disagg_generation_init_rejects_context_apis(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=True,
+        )
+        req = self._create_request(request_id=0, prompt_len=self.tokens_per_block + 1)
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+        try:
+            with pytest.raises(AssertionError, match="prepare_disagg_gen_init"):
+                cache_manager.prepare_context(req)
+            with pytest.raises(AssertionError, match="prepare_disagg_gen_init"):
+                cache_manager.resize_context(req, req.context_remaining_length)
+        finally:
             cache_manager.shutdown()
 
     def test_dummy_generation_requests_with_swa_scratch_reuse(self):
