@@ -313,6 +313,10 @@ class BaseLLM:
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session
+        # Keep the live session on LLM only. LLM args are passed to model-build
+        # tasks and executor workers, and MpiSession objects are not pickleable.
+        self.args.mpi_session = None
+        self._owns_mpi_session = self.mpi_session is None
 
         # Build this LLM's post-processing hook for the in-proxy detok path (each
         # postproc worker builds its own). Resolving here fails fast on a bad
@@ -338,10 +342,12 @@ class BaseLLM:
                     logger_debug("LLM create MpiPoolSession\n", "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
+                    self._owns_mpi_session = True
                 else:
                     logger_debug("LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
+                    self._owns_mpi_session = True
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -364,7 +370,8 @@ class BaseLLM:
             self._build_model()
 
         except Exception:
-            if self.mpi_session is not None:
+            if (self.mpi_session is not None
+                    and getattr(self, "_owns_mpi_session", True)):
                 self.mpi_session.shutdown()
             raise
 
@@ -1472,7 +1479,8 @@ class BaseLLM:
             self._encoder_executor.shutdown()
             self._encoder_executor = None
 
-        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
+        if (hasattr(self, 'mpi_session') and self.mpi_session is not None
+                and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
 

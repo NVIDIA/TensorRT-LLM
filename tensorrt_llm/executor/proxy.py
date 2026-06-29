@@ -98,6 +98,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+        self._owns_mpi_session = mpi_session is None
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
@@ -527,7 +528,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._resource_governor_queue.close()
 
         self.workers_started = False
-        self.mpi_session.shutdown()
+        if self._owns_mpi_session:
+            self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()

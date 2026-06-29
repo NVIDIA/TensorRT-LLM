@@ -1337,6 +1337,178 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+    _NVFP4_4GPU_PREMERGE_CASES = (
+        dict(id="cutlass_mtp0_tp4_compile_off",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=4,
+             pp_size=1,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="cutlass_mtp0_tp4_compile_on",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=4,
+             pp_size=1,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=True),
+        dict(id="cutlass_mtp0_ep4_compile_on",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=4,
+             pp_size=1,
+             ep_size=4,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=True),
+        dict(id="cutlass_mtp0_tp2pp2_compile_off",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=2,
+             pp_size=2,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="cutlass_mtp0_tp2pp2_compile_on",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=2,
+             pp_size=2,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=True),
+        dict(id="cutlass_mtp2_tp4_compile_off",
+             moe_backend="CUTLASS",
+             mtp_nextn=2,
+             tp_size=4,
+             pp_size=1,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="trtllm_mtp2_ep4_compile_off",
+             moe_backend="TRTLLM",
+             mtp_nextn=2,
+             tp_size=4,
+             pp_size=1,
+             ep_size=4,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="cutlass_mtp2_pp4_compile_off",
+             moe_backend="CUTLASS",
+             mtp_nextn=2,
+             tp_size=1,
+             pp_size=4,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="cutlass_mtp0_pp4_compile_off",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=1,
+             pp_size=4,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="cutlass_mtp0_pp4_compile_on",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=1,
+             pp_size=4,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=True),
+        dict(id="trtllm_mtp0_tp4_compile_off",
+             moe_backend="TRTLLM",
+             mtp_nextn=0,
+             tp_size=4,
+             pp_size=1,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="trtllm_mtp0_ep4_compile_off",
+             moe_backend="TRTLLM",
+             mtp_nextn=0,
+             tp_size=4,
+             pp_size=1,
+             ep_size=4,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=False,
+             torch_compile=False),
+        dict(id="cutlass_mtp0_tp4_lpc_compile_off",
+             moe_backend="CUTLASS",
+             mtp_nextn=0,
+             tp_size=4,
+             pp_size=1,
+             ep_size=1,
+             fp8kv=True,
+             attention_dp=True,
+             cuda_graph=True,
+             overlap_scheduler=True,
+             low_precision_combine=True,
+             torch_compile=False),
+    )
+    _NVFP4_4GPU_PREMERGE_GROUPS = (
+        ("tp4_mtp0",
+         ("cutlass_mtp0_tp4_compile_off", "cutlass_mtp0_tp4_compile_on",
+          "trtllm_mtp0_tp4_compile_off", "cutlass_mtp0_tp4_lpc_compile_off")),
+        ("ep4_mtp0", ("cutlass_mtp0_ep4_compile_on",
+                      "trtllm_mtp0_ep4_compile_off")),
+        ("tp2pp2_mtp0", ("cutlass_mtp0_tp2pp2_compile_off",
+                         "cutlass_mtp0_tp2pp2_compile_on")),
+        ("tp4_mtp2", ("cutlass_mtp2_tp4_compile_off", )),
+        ("ep4_mtp2", ("trtllm_mtp2_ep4_compile_off", )),
+        ("pp4_mtp2", ("cutlass_mtp2_pp4_compile_off", )),
+        ("pp4_mtp0", ("cutlass_mtp0_pp4_compile_off",
+                      "cutlass_mtp0_pp4_compile_on")),
+    )
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
@@ -2207,6 +2379,80 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_backend):
+        self._run_nvfp4_4gpus_case(
+            fp8kv=fp8kv,
+            attention_dp=attention_dp,
+            cuda_graph=cuda_graph,
+            overlap_scheduler=overlap_scheduler,
+            low_precision_combine=low_precision_combine,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            torch_compile=torch_compile,
+            mtp_nextn=mtp_nextn,
+            moe_backend=moe_backend,
+        )
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    def test_nvfp4_4gpus_premerge_grouped(self):
+        from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+        cases_by_id = {
+            case["id"]: case
+            for case in self._NVFP4_4GPU_PREMERGE_CASES
+        }
+        grouped_case_ids = tuple(
+            case_id for _, case_ids in self._NVFP4_4GPU_PREMERGE_GROUPS
+            for case_id in case_ids)
+        assert len(grouped_case_ids) == len(set(grouped_case_ids))
+        assert set(grouped_case_ids) == set(cases_by_id)
+
+        previous_cache_env = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
+        os.environ["TRTLLM_HF_WEIGHT_CACHE"] = "1"
+        try:
+            for group_id, case_ids in self._NVFP4_4GPU_PREMERGE_GROUPS:
+                mpi_session = (MpiPoolSession(
+                    n_workers=4) if len(case_ids) > 1 else None)
+                try:
+                    for case_id in case_ids:
+                        case = cases_by_id[case_id]
+                        case_kwargs = {
+                            key: value
+                            for key, value in case.items() if key != "id"
+                        }
+                        try:
+                            self._run_nvfp4_4gpus_case(_mpi_session=mpi_session,
+                                                       **case_kwargs)
+                        except pytest.skip.Exception:
+                            raise
+                        except Exception as exc:
+                            raise AssertionError(
+                                "DeepSeek V3 Lite NVFP4 grouped case failed: "
+                                f"{group_id}/{case_id}") from exc
+                finally:
+                    if mpi_session is not None:
+                        mpi_session.shutdown()
+        finally:
+            if previous_cache_env is None:
+                os.environ.pop("TRTLLM_HF_WEIGHT_CACHE", None)
+            else:
+                os.environ["TRTLLM_HF_WEIGHT_CACHE"] = previous_cache_env
+
+    def _run_nvfp4_4gpus_case(self,
+                              *,
+                              fp8kv,
+                              attention_dp,
+                              cuda_graph,
+                              overlap_scheduler,
+                              low_precision_combine,
+                              tp_size,
+                              pp_size,
+                              ep_size,
+                              torch_compile,
+                              mtp_nextn,
+                              moe_backend,
+                              _mpi_session=None):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -2233,16 +2479,20 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        with LLM(
-                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=pp_size,
-                moe_expert_parallel_size=ep_size,
-                kv_cache_config=kv_cache_config,
-                **pytorch_config,
-                enable_attention_dp=attention_dp,
-                speculative_config=mtp_config,
-        ) as llm:
+        llm_kwargs = dict(
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            **pytorch_config,
+            enable_attention_dp=attention_dp,
+            speculative_config=mtp_config,
+        )
+        if _mpi_session is not None:
+            llm_kwargs["_mpi_session"] = _mpi_session
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 **llm_kwargs) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
             task = GSM8K(self.MODEL_NAME)

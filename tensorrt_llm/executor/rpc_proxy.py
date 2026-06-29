@@ -64,6 +64,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         )
 
         self.model_world_size = model_world_size
+        self._owns_mpi_session = mpi_session is None
         self._create_mpi_session(model_world_size, mpi_session)
 
         # Inject the generated HMAC key into worker_kwargs for workers
@@ -275,7 +276,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
-        if self.mpi_session is not None:
+        if self.mpi_session is not None and self._owns_mpi_session:
             logger_debug(f"Shutting down mpi session", color="yellow")
             self.mpi_session.shutdown()
             logger_debug(f"Mpi session shutdown", color="yellow")

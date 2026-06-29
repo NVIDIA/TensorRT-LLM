@@ -639,7 +639,7 @@ class GenerationExecutor(ABC):
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
-                mpi_session=None,  # use mpi4py
+                mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)

@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import pytest
 from utils.util import skip_ray
 
@@ -188,3 +190,88 @@ def test_llm_get_stats_async_tp2():
 @pytest.mark.gpu2
 def test_llm_get_stats_async_pp2():
     llm_get_stats_async_test_harness(pp_size=2, pytorch_backend=True)
+
+
+def _run_grouped_mpi_cases(
+        n_workers: int, cases: tuple[tuple[str, Callable[[object], None]],
+                                     ...]) -> None:
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    mpi_session = MpiPoolSession(n_workers=n_workers)
+    try:
+        for case_name, run_case in cases:
+            print(f"Running grouped multi-GPU PyTorch LLM case: {case_name}")
+            try:
+                run_case(mpi_session)
+            except pytest.skip.Exception:
+                raise
+            except Exception as exc:
+                raise AssertionError(
+                    f"Grouped multi-GPU PyTorch LLM case failed: {case_name}"
+                ) from exc
+    finally:
+        mpi_session.shutdown()
+
+
+def test_llm_multi_gpu_pytorch_grouped_mpi_reuse():
+    # Chunked stats cases are intentionally left as standalone tests because
+    # their microbatch-id checks depend on scheduler state.
+    gpu2_cases = (
+        ("test_llm_capture_request_error",
+         lambda mpi_session: _test_llm_capture_request_error(
+             pytorch_backend=True, tp_size=2, _mpi_session=mpi_session)),
+        ("test_tinyllama_logits_processor_2gpu[tp1pp2]", lambda mpi_session:
+         tinyllama_logits_processor_test_harness(backend="pytorch",
+                                                 tensor_parallel_size=1,
+                                                 pipeline_parallel_size=2,
+                                                 _mpi_session=mpi_session)),
+        ("test_tinyllama_logits_processor_2gpu[tp2pp1]", lambda mpi_session:
+         tinyllama_logits_processor_test_harness(backend="pytorch",
+                                                 tensor_parallel_size=2,
+                                                 pipeline_parallel_size=1,
+                                                 _mpi_session=mpi_session)),
+        ("test_llm_return_logprobs_streaming_tp2", lambda mpi_session:
+         llm_return_logprobs_test_harness(None,
+                                          1,
+                                          False,
+                                          False,
+                                          streaming=True,
+                                          backend="pytorch",
+                                          tp_size=2,
+                                          _mpi_session=mpi_session)),
+        ("test_llm_get_stats_pp2[no_chunked]", lambda mpi_session:
+         llm_get_stats_test_harness(tp_size=1,
+                                    pp_size=2,
+                                    return_context_logits=False,
+                                    pytorch_backend=True,
+                                    enable_chunked_prefill=False,
+                                    enable_iter_req_stats=True,
+                                    _mpi_session=mpi_session)),
+        ("test_llm_get_stats_tp2",
+         lambda mpi_session: llm_get_stats_test_harness(
+             tp_size=2, pytorch_backend=True, _mpi_session=mpi_session)),
+        ("test_llm_get_stats_async_tp2",
+         lambda mpi_session: llm_get_stats_async_test_harness(
+             tp_size=2, pytorch_backend=True, _mpi_session=mpi_session)),
+        ("test_llm_get_stats_async_pp2",
+         lambda mpi_session: llm_get_stats_async_test_harness(
+             pp_size=2, pytorch_backend=True, _mpi_session=mpi_session)),
+    )
+    gpu4_cases = (
+        ("test_tinyllama_logits_processor_tp2pp2", lambda mpi_session:
+         tinyllama_logits_processor_test_harness(backend="pytorch",
+                                                 tensor_parallel_size=2,
+                                                 pipeline_parallel_size=2,
+                                                 _mpi_session=mpi_session)),
+        ("test_llm_get_stats_pp4[no_chunked]", lambda mpi_session:
+         llm_get_stats_test_harness(tp_size=1,
+                                    pp_size=4,
+                                    return_context_logits=False,
+                                    pytorch_backend=True,
+                                    enable_chunked_prefill=False,
+                                    enable_iter_req_stats=True,
+                                    _mpi_session=mpi_session)),
+    )
+
+    _run_grouped_mpi_cases(2, gpu2_cases)
+    _run_grouped_mpi_cases(4, gpu4_cases)
