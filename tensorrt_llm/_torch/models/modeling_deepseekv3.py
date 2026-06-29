@@ -340,7 +340,7 @@ class DeepseekV3WeightLoader:
         # preserved as `_ckpt_num_nextn_predict_layers`.
         ckpt_num_nextn_predict_layers = (
             getattr(self.config, '_ckpt_num_nextn_predict_layers', None)
-            or self.config.num_nextn_predict_layers)
+            or getattr(self.config, 'num_nextn_predict_layers', None))
 
         def detect_shared_mtp_weights() -> bool:
             # Detect if MTP layers share checkpoint weights (model has more MTP
@@ -348,7 +348,8 @@ class DeepseekV3WeightLoader:
             # multiple model MTP layers map to the same checkpoint layer via
             # modulo, and mark_consumed must be skipped to avoid deleting
             # weights that later MTP layers still need.
-            model_nextn = self.config.num_nextn_predict_layers or 0
+            model_nextn = getattr(self.config, 'num_nextn_predict_layers',
+                                  None) or 0
             return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
@@ -1541,17 +1542,29 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
-            act_fp4, act_sf, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.mlp.gate_up_proj.input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ),
-            )
-            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            if self.mlp.gate_up_proj.has_nvfp4:
+                act_fp4, act_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        scale=self.mlp.gate_up_proj.input_scale,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
@@ -1920,7 +1933,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

@@ -11,7 +11,7 @@ import subprocess  # nosec B404
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Literal, Mapping, Optional, Sequence
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Set
 
 import click
 import torch
@@ -23,7 +23,8 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.commands.utils import get_is_diffusion_model
+from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
+                                         get_is_diffusion_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -33,7 +34,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
-                                              parse_metadata_server_config_file)
+                                              parse_metadata_server_config_file,
+                                              validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
@@ -55,6 +57,10 @@ _child_p_global: Optional[subprocess.Popen] = None
 
 # Bound gRPC messages while leaving room for multimodal image payloads.
 _GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
+
+
+def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
+    return validate_config_bool(config.pop(key, False), key)
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -119,13 +125,15 @@ def _signal_handler_cleanup_child(signum, frame):
     sys.exit(128 + signum)
 
 
-def is_non_default_or_required(param_name, value, backend):
+def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
     Returns True if parameter is either:
     1. Always required (core params that must be present), OR
-    2. Different from its default value in the backend's LlmArgs class
+    2. Set explicitly on the CLI (its name or one of its constructor
+       scalars is in `explicit_cli_keys`), OR
+    3. Different from its default value in the backend's LlmArgs class
     """
     always_include = {
         "model", "backend", "tokenizer", "custom_tokenizer",
@@ -137,6 +145,20 @@ def is_non_default_or_required(param_name, value, backend):
 
     if value is None:
         return False
+
+    if param_name in explicit_cli_keys:
+        return True
+
+    # LlmArgs fields built from CLI scalars whose names differ from the field
+    # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
+    cli_derived_fields = {
+        "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
+        "build_config":
+        ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
+    }
+    if any(s in explicit_cli_keys
+           for s in cli_derived_fields.get(param_name, ())):
+        return True
 
     if backend == "tensorrt":
         llm_args_class = TrtLlmArgs
@@ -192,7 +214,10 @@ def get_llm_args(
         telemetry: bool = True,
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
+        explicit_cli_keys: Optional[Set[str]] = None,
         **llm_args_extra_dict: Any):
+
+    explicit_cli_keys = explicit_cli_keys or set()
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -209,9 +234,6 @@ def get_llm_args(
             raise ValueError(f"Invalid cp_type: {cp_config['cp_type']}. " \
                              f"Must be one of: {', '.join([t.name for t in CpType])}")
 
-    kv_cache_default_fraction = KvCacheConfig.model_fields[
-        'free_gpu_memory_fraction'].default
-
     cli_maybe_overrides = {
         "model":
         model,
@@ -225,8 +247,7 @@ def get_llm_args(
         tokenizer or model,
         "kv_cache_config":
         KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
-                      dtype=kv_cache_dtype) if free_gpu_memory_fraction
-        != kv_cache_default_fraction or kv_cache_dtype != "auto" else None,
+                      dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
         "build_config":
@@ -291,10 +312,33 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend)
+        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
+
+
+def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
+    """Construct llm_args from a disaggregated server config's `other_args`.
+
+    `other_args` is a single source — there is no separate CLI / YAML
+    distinction here. Every key is user-set, so we pass all keys as
+    `explicit_cli_keys` to `get_llm_args` to bypass the value-based filter
+    that would otherwise drop fields equal to their LlmArgs class defaults
+    (e.g. `tensor_parallel_size: 1`).
+
+    Do NOT pass `explicit_cli_keys` to `update_llm_args_with_extra_dict`:
+    `llm_args_extra_dict` here is just the catch-all for kwargs that didn't
+    match `get_llm_args`'s named signature (e.g. `quant_config`,
+    `lora_config`, `pytorch_backend_config`) — it isn't a separate YAML
+    being overridden. Passing the explicit set would trigger the merge
+    function's "drop YAML keys claimed by explicit CLI" filter and
+    silently lose those kwargs.
+    """
+    disagg_explicit_keys = set(other_args)
+    llm_args, llm_args_extra_dict = get_llm_args(
+        **other_args, explicit_cli_keys=disagg_explicit_keys)
+    return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
 def launch_server(
@@ -308,7 +352,8 @@ def launch_server(
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
-        served_model_name: Optional[str] = None):
+        served_model_name: Optional[str] = None,
+        allow_request_chat_template: bool = False):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -343,14 +388,16 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
-        server = OpenAIServer(generator=llm,
-                              model=model,
-                              tool_parser=tool_parser,
-                              server_role=server_role,
-                              metadata_server_cfg=metadata_server_cfg,
-                              disagg_cluster_config=disagg_cluster_config,
-                              multimodal_server_config=multimodal_server_config,
-                              chat_template=chat_template)
+        server = OpenAIServer(
+            generator=llm,
+            model=model,
+            tool_parser=tool_parser,
+            server_role=server_role,
+            metadata_server_cfg=metadata_server_cfg,
+            disagg_cluster_config=disagg_cluster_config,
+            multimodal_server_config=multimodal_server_config,
+            chat_template=chat_template,
+            allow_request_chat_template=allow_request_chat_template)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
@@ -491,16 +538,19 @@ def launch_mm_encoder_server(
     port: int,
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    allow_request_chat_template: bool = False,
 ):
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
 
-    server = OpenAIServer(generator=mm_encoder,
-                          model=model,
-                          server_role=ServerRole.MM_ENCODER,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None)
+    server = OpenAIServer(
+        generator=mm_encoder,
+        model=model,
+        server_role=ServerRole.MM_ENCODER,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        allow_request_chat_template=allow_request_chat_template)
     asyncio.run(server(host, port))
 
 
@@ -521,23 +571,40 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
-    logger.info(f"Initializing VisualGen ({model})")
+    # Reserve the listening (host, port) by binding the socket *before*
+    # constructing the VisualGen pipeline, then hand the bound socket to
+    # uvicorn. VisualGen initialization can take many minutes; if we deferred
+    # the bind until uvicorn started, anything else on the host could grab the
+    # port in that window and trtllm-serve would die at bind() time.
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all(
+        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
 
-    visual_gen_model = VisualGen(model=model, args=visual_gen_args)
+        logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = visual_gen_model.args.parallel_config.n_workers
-    logger.info(f"World size: {n_workers}")
-    logger.info(f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
-    logger.info(
-        f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}")
+        visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-    server = OpenAIServer(generator=visual_gen_model,
-                          model=model,
-                          server_role=ServerRole.VISUAL_GEN,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None)
-    _apply_fastapi_middlewares(server.app, middleware)
-    asyncio.run(server(host, port))
+        n_workers = visual_gen_model.args.parallel_config.n_workers
+        logger.info(f"World size: {n_workers}")
+        logger.info(
+            f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
+        logger.info(
+            f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}"
+        )
+
+        server = OpenAIServer(generator=visual_gen_model,
+                              model=model,
+                              server_role=ServerRole.VISUAL_GEN,
+                              metadata_server_cfg=metadata_server_cfg,
+                              tool_parser=None)
+        _apply_fastapi_middlewares(server.app, middleware)
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 class ChoiceWithAlias(click.Choice):
@@ -717,9 +784,9 @@ class ChoiceWithAlias(click.Choice):
     type=str,
     default=None,
     help=help_info_with_stability_tag(
-        "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-        "Can be specified as either --config or --extra_llm_api_options.",
-        "prototype"))
+        "Path to a YAML configuration file. Explicit CLI flags take precedence "
+        "over values in this file. Can be specified as either --config or "
+        "--extra_llm_api_options.", "prototype"))
 @click.option(
     "--reasoning_parser",
     type=click.Choice(["auto"] + list(ReasoningParserFactory.keys())),
@@ -809,6 +876,12 @@ class ChoiceWithAlias(click.Choice):
                   "Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
                   "prototype"))
+@click.option("--allow_request_chat_template",
+              is_flag=True,
+              default=False,
+              help=help_info_with_stability_tag(
+                  "Allow clients to supply per-request chat_template values. "
+                  "Only enable this for trusted clients.", "prototype"))
 @click.option(
     "--middleware",
     multiple=True,
@@ -834,8 +907,6 @@ class ChoiceWithAlias(click.Choice):
         "when you want to expose a custom name to clients.", "prototype"))
 @click.option(
     "--visual_gen_args",
-    "--extra_visual_gen_options",
-    "visual_gen_args",
     type=str,
     default=None,
     help=help_info_with_stability_tag(
@@ -874,7 +945,8 @@ def serve(
         media_io_kwargs: Optional[str], agent_percentage: float,
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
+        chat_template: Optional[str], allow_request_chat_template: bool,
+        middleware: tuple[str, ...], grpc: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -915,7 +987,7 @@ def serve(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
                 f"Supported model types for auto-detection: qwen3, qwen3_moe, "
                 f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), nemotron_h, gemma4, "
+                f"deepseek_v32 (R1 only), deepseek_v4, nemotron_h, gemma4, "
                 f"kimi_k2, kimi_k25. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
@@ -933,8 +1005,11 @@ def serve(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_llm_api_options", "config"))
+
     def _serve_llm():
-        nonlocal server_role
+        nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
             tokenizer=tokenizer,
@@ -964,14 +1039,19 @@ def serve(
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
-            agent_types=agent_types)
+            agent_types=agent_types,
+            explicit_cli_keys=explicit_cli_keys)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+                llm_args_extra_dict = yaml.safe_load(f) or {}
+        extra_allow_request_chat_template = _pop_bool_config_option(
+            llm_args_extra_dict, "allow_request_chat_template")
+        allow_request_chat_template = (allow_request_chat_template
+                                       or extra_allow_request_chat_template)
+        llm_args = update_llm_args_with_extra_dict(
+            llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
         # CLI --no-telemetry always wins over YAML config
         if not telemetry:
@@ -1015,12 +1095,21 @@ def serve(
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
             unsupported_args = {
-                "tool_parser": tool_parser,
-                "middleware": middleware if middleware else None,
-                "chat_template": chat_template,
-                "metadata_server_config_file": metadata_server_config_file,
-                "server_role": server_role,
-                "disagg_cluster_config": disagg_cluster_config,
+                "tool_parser":
+                tool_parser,
+                "middleware":
+                middleware if middleware else None,
+                "chat_template":
+                chat_template,
+                "allow_request_chat_template":
+                allow_request_chat_template
+                if allow_request_chat_template else None,
+                "metadata_server_config_file":
+                metadata_server_config_file,
+                "server_role":
+                server_role,
+                "disagg_cluster_config":
+                disagg_cluster_config,
             }
             for name, value in unsupported_args.items():
                 if value is not None:
@@ -1034,17 +1123,19 @@ def serve(
                                served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
-            launch_server(host,
-                          port,
-                          llm_args,
-                          tool_parser,
-                          middleware,
-                          chat_template,
-                          metadata_server_cfg,
-                          server_role,
-                          disagg_cluster_config,
-                          multimodal_server_config,
-                          served_model_name=served_model_name)
+            launch_server(
+                host,
+                port,
+                llm_args,
+                tool_parser,
+                middleware,
+                chat_template,
+                metadata_server_cfg,
+                server_role,
+                disagg_cluster_config,
+                multimodal_server_config,
+                served_model_name=served_model_name,
+                allow_request_chat_template=allow_request_chat_template)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1100,9 +1191,8 @@ def serve(
     "extra_encoder_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
-    "Prefer --config over --extra_encoder_options.")
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Prefer --config over --extra_encoder_options.")
 @click.option("--hf_revision",
               "--revision",
               "revision",
@@ -1124,6 +1214,12 @@ def serve(
               type=str,
               default=None,
               help="Path to metadata server config file")
+@click.option("--allow_request_chat_template",
+              is_flag=True,
+              default=False,
+              help=help_info_with_stability_tag(
+                  "Allow clients to supply per-request chat_template values. "
+                  "Only enable this for trusted clients.", "prototype"))
 @click.option("--telemetry/--no-telemetry",
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
@@ -1132,7 +1228,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
                   gpus_per_node: Optional[int], trust_remote_code: bool,
                   extra_encoder_options: Optional[str], revision: Optional[str],
                   free_gpu_memory_fraction: float, tensor_parallel_size: int,
-                  metadata_server_config_file: Optional[str], telemetry: bool):
+                  metadata_server_config_file: Optional[str],
+                  allow_request_chat_template: bool, telemetry: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1143,6 +1240,9 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         logger.warning(
             "--extra_encoder_options is deprecated, use --config instead.")
 
+    explicit_cli_keys = collect_explicit_cli_keys(
+        exclude=("extra_encoder_options", "config"))
+
     llm_args, _ = get_llm_args(
         model=model,
         max_batch_size=max_batch_size,
@@ -1152,14 +1252,19 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         revision=revision,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         tensor_parallel_size=tensor_parallel_size,
-        telemetry=telemetry)
+        telemetry=telemetry,
+        explicit_cli_keys=explicit_cli_keys)
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f)
-    encoder_args = update_llm_args_with_extra_dict(llm_args,
-                                                   encoder_args_extra_dict)
+            encoder_args_extra_dict = yaml.safe_load(f) or {}
+    extra_allow_request_chat_template = _pop_bool_config_option(
+        encoder_args_extra_dict, "allow_request_chat_template")
+    allow_request_chat_template = (allow_request_chat_template
+                                   or extra_allow_request_chat_template)
+    encoder_args = update_llm_args_with_extra_dict(
+        llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
     # CLI --no-telemetry always wins over YAML config
     if not telemetry:
@@ -1169,7 +1274,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
+    launch_mm_encoder_server(
+        host,
+        port,
+        encoder_args,
+        metadata_server_cfg,
+        allow_request_chat_template=allow_request_chat_template)
 
 
 @click.command("disaggregated")
@@ -1324,9 +1434,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
@@ -1349,9 +1457,10 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        # NOTE: the resulting llm_args is currently unused; _launch_disaggregated_leader
+        # does not take it. Keeping the call symmetric with the client branch above
+        # so any future use of llm_args here behaves the same way.
+        _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)
@@ -1386,9 +1495,11 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
-    launch_server(host=server_cfg.hostname,
-                  port=server_cfg.port,
-                  llm_args=llm_args)
+    launch_server(
+        host=server_cfg.hostname,
+        port=server_cfg.port,
+        llm_args=llm_args,
+        allow_request_chat_template=disagg_config.allow_request_chat_template)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

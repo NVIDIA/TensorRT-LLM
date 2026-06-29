@@ -539,6 +539,9 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = dataset.select(range(calib_size))
     elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
             dataset_name_or_dir):
+        # Bare "cnn_dailymail" id is rejected by newer huggingface_hub; use the namespaced repo.
+        if dataset_name_or_dir == "cnn_dailymail":
+            dataset_name_or_dir = "abisee/cnn_dailymail"
         dataset = load_dataset(
             dataset_name_or_dir,
             name="3.0.0",
@@ -1154,6 +1157,9 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         text_column = "text"
     elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
             dataset_name_or_dir):
+        # Bare "cnn_dailymail" id is rejected by newer huggingface_hub; use the namespaced repo.
+        if dataset_name_or_dir == "cnn_dailymail":
+            dataset_name_or_dir = "abisee/cnn_dailymail"
         dataset = load_dataset(dataset_name_or_dir,
                                name="3.0.0",
                                split="train",

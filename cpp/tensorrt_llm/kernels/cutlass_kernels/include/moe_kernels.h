@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
 #include <cstdint>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -67,6 +68,14 @@ struct LoraParams
     void* workspace;
 
     cudaEvent_t* memcpy_event_ptr;
+
+    // Device-side capture-safe LoRA path scratch. When device_path.enabled is
+    // true, the kernel uses launchMoeLoraPointerExpand, launchMoeLoraProblemBuilder,
+    // and cudaGraph(SplitK)GroupedGemm instead of the legacy host-pointer
+    // LoraImpl::run path. The pointers refer to persistent allocations owned by
+    // the calling FusedMoeRunner, so their addresses are stable across
+    // CUDA-graph captures and replays.
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePath device_path;
 
     LoraParams() = default;
 
@@ -292,6 +301,22 @@ struct QuantParams
         GemmInputs fc2;
     } mxfp8_mxfp4;
 
+    // MXFP8 x MXFP8 quantization params (W8A8 with UE8M0 1x32 block scales on both
+    // sides). No per-tensor / global alpha (block scales determine output magnitude).
+    // Kept as a separate slot from mxfp8_mxfp4 so consumers can disambiguate
+    // B element bitwidth (4-bit vs 8-bit) without relying on naming aliases.
+    struct MXFP8MXFP8Inputs
+    {
+        struct GemmInputs
+        {
+            TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale
+                = nullptr; // (experts, n, k / 32)
+        };
+
+        GemmInputs fc1;
+        GemmInputs fc2;
+    } mxfp8_mxfp8;
+
     // FP4 quantization params
     struct FP4Inputs
     {
@@ -393,6 +418,36 @@ struct QuantParams
         qp.mxfp8_mxfp4.fc1 = {fc1_weight_block_scale, fc1_global_scale};
         qp.mxfp8_mxfp4.fc2 = {fc2_weight_block_scale, fc2_global_scale};
         return qp;
+    }
+
+    // MXFP8xMXFP8 grouped MoE: e4m3 acts + e4m3 weights, UE8M0 1x32 block
+    // scales on both sides. No per-tensor / global alpha is required (block
+    // scales determine output magnitude). Writes to its own dedicated slot
+    // so consumers can distinguish from MXFP8xMXFP4 (which has 4-bit B).
+    static QuantParams MXFP8MXFP8(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc1_weight_block_scale,
+        TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc2_weight_block_scale)
+    {
+        QuantParams qp;
+        qp.mxfp8_mxfp8.fc1 = {fc1_weight_block_scale};
+        qp.mxfp8_mxfp8.fc2 = {fc2_weight_block_scale};
+        return qp;
+    }
+
+    // Helpers: return the active MXFPX activation-side block-scale pointer
+    // regardless of whether B is fp4 (mxfp8_mxfp4) or fp8 (mxfp8_mxfp8).
+    // Used by consumers that only care "is the activation path block-scaled
+    // MXFPX" — they don't need to know B's bitwidth, that's already encoded
+    // in the kernel template instantiation.
+    TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* mxfpxActFc1WeightScale() const
+    {
+        return mxfp8_mxfp8.fc1.weight_block_scale ? mxfp8_mxfp8.fc1.weight_block_scale
+                                                  : mxfp8_mxfp4.fc1.weight_block_scale;
+    }
+
+    TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* mxfpxActFc2WeightScale() const
+    {
+        return mxfp8_mxfp8.fc2.weight_block_scale ? mxfp8_mxfp8.fc2.weight_block_scale
+                                                  : mxfp8_mxfp4.fc2.weight_block_scale;
     }
 
     static QuantParams FP4(float const* fc1_act_global_scale,
@@ -542,6 +597,12 @@ public:
 
     bool is_profiler = false;
     bool use_fused_finalize_ = true;
+    // When the activation/weight pair is <e4m3, e4m3>, this flag selects
+    // between the per-tensor FP8 path (false, default) and the MXFP8xMXFP8
+    // block-scaled path (true). It is read by getScalingType() in subclasses
+    // to choose the runtime FpXBlockScalingType. Ignored for other type
+    // combinations -- their scaling type is fully determined at compile time.
+    bool use_mxfp8_weight_scaling_ = false;
 };
 
 // Assumes inputs activations are row major. Weights need to be preprocessed by th_op/weight_quantize.cc .
@@ -624,7 +685,11 @@ public:
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override
     {
-        return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
+        // Pass `use_mxfp8_weight_scaling_` so MXFP8xMXFP8 enumerates only the
+        // Mxf8f6f4-valid tile shapes; otherwise autotuning would invoke FP8
+        // tile shapes that the runtime dispatcher rejects with TLLM_THROW.
+        return moe_gemm_runner_.getConfigs(
+            gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused(), use_mxfp8_weight_scaling_);
     }
 
     static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id)
@@ -732,7 +797,7 @@ public:
 
     virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override
     {
-        return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+        return moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, use_mxfp8_weight_scaling_);
     }
 
     std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -754,7 +819,7 @@ public:
             reinterpret_cast<ScaleBiasType const*>(bias1), reinterpret_cast<ScaleBiasType const*>(bias2),
             reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
             reinterpret_cast<UnfusedGemmOutputType*>(gemm2_output), router_scales, permuted_row_to_unpermuted_row,
-            stream);
+            Self::getScalingType(use_mxfp8_weight_scaling_), stream);
     }
 
     std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -797,7 +862,7 @@ private:
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
         ScaleBiasType const* bias1, ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
         UnfusedGemmOutputType* gemm2_output, float const* router_scales, int const* permuted_row_to_unpermuted_row,
-        cudaStream_t stream);
+        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type, cudaStream_t stream);
     static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
     computeStridesTmaWarpSpecializedLowLatency(TmaWarpSpecializedGroupedGemmInput layout_info1,
         TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens, int64_t gemm1_n, int64_t gemm1_k,
@@ -847,12 +912,29 @@ private:
         return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_wfp4a16;
     }
 
-    // TODO: This should eventually take the quant params to give more flexibility
-    static auto getScalingType()
+    // TODO: This should eventually take the full quant params to give more
+    // flexibility. For now the only runtime selector is the MXFP8 flag for
+    // the <e4m3, e4m3> instantiation (per-tensor FP8 vs MXFP8 block-scaled).
+    static auto getScalingType(bool use_mxfp8_weight_scaling)
     {
-        return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-            : use_fp4       ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        if constexpr (use_wfp4afp8)
+        {
+            return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+        }
+        else if constexpr (use_fp4)
+        {
+            return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+        }
+        else if constexpr (use_fp8 && std::is_same_v<T, WeightType>)
+        {
+            // <e4m3, e4m3>: per-tensor FP8 (NONE) or MXFP8 block-scaled (MXFPX).
+            return use_mxfp8_weight_scaling ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        }
+        else
+        {
+            return TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+        }
     }
 
     bool setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size, int64_t hidden_size,
@@ -953,7 +1035,7 @@ public:
         nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
         int64_t unpadded_hidden_size, int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias,
         bool use_lora, bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config,
-        bool const enable_alltoall)
+        bool const enable_alltoall, bool use_mxfp8_weight_scaling = false)
     {
         mInterface = &runner;
         mGemmToProfile = gemm_to_profile;
@@ -974,12 +1056,20 @@ public:
         mNeedWeights = need_weights;
         mParallelismConfig = parallelism_config;
         mEnableAlltoall = enable_alltoall;
+        mUseMxfp8WeightScaling = use_mxfp8_weight_scaling;
         mSM = common::getSMVersion();
 
         mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
         if (dtype == nvinfer1::DataType::kFP8
             && (wtype == nvinfer1::DataType::kFP4 || wtype == nvinfer1::DataType::kINT64))
         {
+            mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+        }
+        else if (dtype == nvinfer1::DataType::kFP8 && wtype == nvinfer1::DataType::kFP8 && use_mxfp8_weight_scaling)
+        {
+            // MXFP8 W8A8: e4m3 acts × e4m3 weights with UE8M0 1x32 block scales on both sides.
+            // Profiler must produce MXFPX block-scaled inputs (otherwise the per-expert SF
+            // pointer arrays stay uninitialized and the kernel reads garbage SF addresses).
             mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
         }
         else if ((dtype == nvinfer1::DataType::kFP4 || dtype == nvinfer1::DataType::kINT64)
@@ -1011,6 +1101,7 @@ public:
     ActivationType mActivationType{};
     MOEParallelismConfig mParallelismConfig{};
     bool mEnableAlltoall = false;
+    bool mUseMxfp8WeightScaling = false;
 
     int mSampleIndex = 0;
 

@@ -26,6 +26,7 @@ except ImportError:
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
@@ -175,6 +176,7 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
 
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
+
     This is the default tokenizer for LLM. '''
 
     def __init__(self, tokenizer):
@@ -243,6 +245,9 @@ class TransformersTokenizer(TokenizerBase):
 
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
+
+    def convert_tokens_to_ids(self, tokens, *args, **kwargs):
+        return self.tokenizer.convert_tokens_to_ids(tokens, *args, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
@@ -641,17 +646,38 @@ def load_hf_tokenizer(model_dir: str,
             trust_remote_code=trust_remote_code,
             use_fast=use_fast,
             **kwargs)
-
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
-
         return tokenizer
-
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning(
-            f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+            f"Failed to load hf tokenizer from hub for {model_dir}: {e}. "
+            f"The model may be gated and the token is unavailable in this "
+            f"environment. Retrying with local cache...")
+    except Exception:
+        raise
+
+    # Same code block as before but with the specific usage of local_files_only to check if the tokenizer is available locally.
+    # Can come in handy in cases like when the model is in a gated repo, was correctly downloaded locally but the environment has no HF Auth Key present.
+    # See https://github.com/NVIDIA/TensorRT-LLM/issues/12805 for more details.
+    try:
+        kwargs['local_files_only'] = True
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
+        if trust_remote_code:
+            maybe_register_transformers_modules_by_value()
+        return tokenizer
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Failed to load hf tokenizer from local cache for {model_dir}: {e}"
         )
-        return None
+    return None
 
 
 def load_custom_tokenizer(

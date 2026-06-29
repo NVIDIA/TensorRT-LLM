@@ -1,5 +1,7 @@
 import math
-from typing import Iterable, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import (TYPE_CHECKING, Iterable, List, Literal, Optional, Tuple,
+                    Union)
 
 import torch
 from torch import Tensor
@@ -24,6 +26,10 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              SparseAttentionConfig)
+
 from .kernel import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
                      triton_rocket_batch_to_flatten,
                      triton_rocket_paged_kt_cache_bmm, triton_rocket_qk_split,
@@ -31,20 +37,51 @@ from .kernel import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
                      triton_rocket_update_kt_cache_ctx,
                      triton_rocket_update_kt_cache_gen, triton_softmax,
                      triton_topk)
+from .params import SparseMetadataParams, SparseParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
+
+
+@dataclass(frozen=True)
+class RocketKVMetadataParams(SparseMetadataParams):
+    """RocketKV metadata settings derived from user config."""
+
+    prompt_budget: int
+    window_size: int
+    page_size: int
+    topk: int
+
+
+@dataclass(frozen=True)
+class RocketKVParams(SparseParams):
+    """RocketKV sparse attention backend parameters."""
+
+    algorithm: Literal["rocket"] = field(init=False, default="rocket")
+    window_size: int = 32
+    kernel_size: int = 63
+    topr: Union[int, float] = 128
+    topk: int = 64
+    prompt_budget: int = 2048
+    page_size: int = 4
+    kt_cache_dtype: str = "float8_e5m2"
+
+    @property
+    def indices_block_size(self) -> int:
+        return self.page_size
 
 
 class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.sparse_attention_config is None:
-            raise ValueError("Sparse attention config is not set")
-        self.prompt_budget = self.sparse_attention_config.prompt_budget
-        self.window_size = self.sparse_attention_config.window_size
-        self.page_size = self.sparse_attention_config.page_size
-        self.topk = self.sparse_attention_config.topk
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, RocketKVMetadataParams):
+            raise ValueError(
+                "RocketKV sparse attention metadata params are not set")
+        self.prompt_budget = sparse_metadata_params.prompt_budget
+        self.window_size = sparse_metadata_params.window_size
+        self.page_size = sparse_metadata_params.page_size
+        self.topk = sparse_metadata_params.topk
 
         assert self.page_size == next_power_of_2(
             self.page_size), "Page size must be a power of 2"
@@ -326,30 +363,32 @@ class RocketTrtllmAttention(TrtllmAttention):
         8: torch.int64
     }
 
-    def __init__(
-            self,
-            layer_idx: int,
-            num_heads: int,
-            head_dim: int,
-            num_kv_heads: Optional[int] = None,
-            quant_config: Optional[QuantConfig] = None,
-            q_scaling: Optional[float] = None,
-            sparse_attention_config: Optional["SparseAttentionConfig"] = None,
-            **kwargs):
+    def __init__(self,
+                 layer_idx: int,
+                 num_heads: int,
+                 head_dim: int,
+                 num_kv_heads: Optional[int] = None,
+                 quant_config: Optional[QuantConfig] = None,
+                 q_scaling: Optional[float] = None,
+                 sparse_params: Optional[RocketKVParams] = None,
+                 **kwargs):
+        if sparse_params is None:
+            raise ValueError(
+                "sparse_params is required for RocketTrtllmAttention")
         super().__init__(layer_idx,
                          num_heads,
                          head_dim,
-                         sparse_attention_config=sparse_attention_config,
+                         sparse_params=sparse_params,
                          num_kv_heads=num_kv_heads,
                          quant_config=quant_config,
                          q_scaling=q_scaling,
                          **kwargs)
-        self.topr = sparse_attention_config.topr
-        self.topk = sparse_attention_config.topk
-        self.prompt_budget = sparse_attention_config.prompt_budget
-        self.window_size = sparse_attention_config.window_size
-        self.kernel_size = sparse_attention_config.kernel_size
-        self.page_size = sparse_attention_config.page_size
+        self.topr = sparse_params.topr
+        self.topk = sparse_params.topk
+        self.prompt_budget = sparse_params.prompt_budget
+        self.window_size = sparse_params.window_size
+        self.kernel_size = sparse_params.kernel_size
+        self.page_size = sparse_params.page_size
 
     def sparse_kv_predict(
         self,
@@ -581,9 +620,11 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.sparse_attention_config is None:
-            raise ValueError("Sparse attention config is not set")
-        self.prompt_budget = self.sparse_attention_config.prompt_budget
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, RocketKVMetadataParams):
+            raise ValueError(
+                "RocketKV sparse attention metadata params are not set")
+        self.prompt_budget = sparse_metadata_params.prompt_budget
         self.kt_cache_block_offsets = torch.empty(
             [
                 self.max_num_sequences,
@@ -630,31 +671,33 @@ class RocketVanillaAttention(VanillaAttention):
 
     Metadata = RocketVanillaAttentionMetadata
 
-    def __init__(
-            self,
-            layer_idx: int,
-            num_heads: int,
-            head_dim: int,
-            num_kv_heads: Optional[int] = None,
-            quant_config: Optional[QuantConfig] = None,
-            q_scaling: Optional[float] = None,
-            sparse_attention_config: Optional["SparseAttentionConfig"] = None,
-            **kwargs):
+    def __init__(self,
+                 layer_idx: int,
+                 num_heads: int,
+                 head_dim: int,
+                 num_kv_heads: Optional[int] = None,
+                 quant_config: Optional[QuantConfig] = None,
+                 q_scaling: Optional[float] = None,
+                 sparse_params: Optional[RocketKVParams] = None,
+                 **kwargs):
+        if sparse_params is None:
+            raise ValueError(
+                "sparse_params is required for RocketVanillaAttention")
         super().__init__(layer_idx,
                          num_heads,
                          head_dim,
-                         sparse_attention_config=sparse_attention_config,
+                         sparse_params=sparse_params,
                          num_kv_heads=num_kv_heads,
                          quant_config=quant_config,
                          q_scaling=q_scaling,
                          **kwargs)
-        self.topr = sparse_attention_config.topr
-        self.topk = sparse_attention_config.topk
-        self.prompt_budget = sparse_attention_config.prompt_budget
-        self.window_size = sparse_attention_config.window_size
-        self.kernel_size = sparse_attention_config.kernel_size
-        self.page_size = sparse_attention_config.page_size
-        assert sparse_attention_config.kt_cache_dtype == 'bfloat16', "Only bfloat16 kt cache is supported for Vanilla RocketKV"
+        self.topr = sparse_params.topr
+        self.topk = sparse_params.topk
+        self.prompt_budget = sparse_params.prompt_budget
+        self.window_size = sparse_params.window_size
+        self.kernel_size = sparse_params.kernel_size
+        self.page_size = sparse_params.page_size
+        assert sparse_params.kt_cache_dtype == 'bfloat16', "Only bfloat16 kt cache is supported for Vanilla RocketKV"
 
     def _single_request_sparse_kv_predict(
             self, q: Optional[Tensor], k: Optional[Tensor], v: Optional[Tensor],
@@ -914,14 +957,23 @@ class RocketKVCacheManager(KVCacheManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
-        sparse_attn_config: Optional["SparseAttentionConfig"] = None,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+        pretrained_config=None,
         **kwargs,
     ) -> None:
 
+        if sparse_attention_config is None:
+            raise ValueError(
+                "sparse_attention_config is required for RocketKV cache")
+        sparse_params = sparse_attention_config.to_sparse_params(
+            pretrained_config=pretrained_config)
+        if not isinstance(sparse_params, RocketKVParams):
+            raise ValueError(
+                "RocketKV cache requires RocketKV sparse parameters")
         assert not kv_cache_config.enable_block_reuse, "RocketKV cache requires block reuse to be disabled in KV cache config"
         self.kt_tokens_per_block = next_power_of_2(
-            math.ceil(tokens_per_block / sparse_attn_config.page_size))
-        self.kt_cache_dtype = torch.bfloat16 if sparse_attn_config.kt_cache_dtype == 'bfloat16' else torch.float8_e5m2
+            math.ceil(tokens_per_block / sparse_params.page_size))
+        self.kt_cache_dtype = torch.bfloat16 if sparse_params.kt_cache_dtype == 'bfloat16' else torch.float8_e5m2
 
         super().__init__(
             kv_cache_config,
@@ -941,8 +993,8 @@ class RocketKVCacheManager(KVCacheManager):
             max_beam_width=max_beam_width,
             **kwargs,
         )
-        self.page_size = sparse_attn_config.page_size
-        self.prompt_budget = sparse_attn_config.prompt_budget
+        self.page_size = sparse_params.page_size
+        self.prompt_budget = sparse_params.prompt_budget
         self.max_batch_size = max_batch_size
 
         # Per layer KT cache pool
@@ -1073,11 +1125,19 @@ class RocketKVCacheManager(KVCacheManager):
         # K and V
         # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
         tokens_per_block = kwargs['tokens_per_block']
-        sparse_attn_config = model_config.sparse_attention_config
+        sparse_attention_config = model_config.sparse_attention_config
+        if sparse_attention_config is None:
+            raise ValueError(
+                "sparse_attention_config is required for RocketKV cache")
+        sparse_params = sparse_attention_config.to_sparse_params(
+            pretrained_config=model_config.pretrained_config)
+        if not isinstance(sparse_params, RocketKVParams):
+            raise ValueError(
+                "RocketKV cache requires RocketKV sparse parameters")
         kt_tokens_per_block = next_power_of_2(
-            math.ceil(tokens_per_block / sparse_attn_config.page_size))
+            math.ceil(tokens_per_block / sparse_params.page_size))
         kt_factor = 2
-        if sparse_attn_config.kt_cache_dtype == "float8_e5m2":
+        if sparse_params.kt_cache_dtype == "float8_e5m2":
             kt_factor = 1
         kv_factor = 2 + kt_factor * kt_tokens_per_block / tokens_per_block
         mem_per_token *= kv_factor

@@ -1,8 +1,12 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import os
 import random
 import time
 import uuid
+
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -25,8 +29,9 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -53,14 +58,18 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    disk_cache_size: Optional[int] = None
+    disk_cache_path: Optional[str] = None
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
 
     max_gpu_total_bytes: Optional[int] = None
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
+    disk_prefetch_num_reqs: int = 4
     # V2 specific field
     max_util_for_resume: float = 0.95
 

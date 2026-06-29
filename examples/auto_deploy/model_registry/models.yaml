@@ -13,18 +13,15 @@ models:
 - name: Qwen/Qwen3-0.6B
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-270M-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-1_1B-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-3B-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-270M-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-1_1B-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-3B-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
 # ImportError: cannot import name 'LossKwargs' from 'transformers.utils' (/usr/local/lib/python3.12/dist-packages/transformers/utils/__init__.py)
 # - name: microsoft/Phi-4-mini-instruct
 #   config_id: default_ws_1
@@ -168,10 +165,9 @@ models:
 - name: nvidia/Mistral-NeMo-Minitron-8B-Base
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# OOM during AutoDeploy run.
-# - name: openai/gpt-oss-20b
-#   config_id: gpt_oss_20b
-#   yaml_extra: ['gpt_oss_20b.yaml']
+- name: openai/gpt-oss-20b
+  config_id: gpt_oss
+  yaml_extra: ['gpt_oss.yaml', 'world_size_1.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
@@ -310,10 +306,9 @@ models:
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: deepseek_r1
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
-# OOM during AutoDeploy run.
-# - name: deepseek-ai/DeepSeek-R1-0528
-#   config_id: deepseek_r1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+- name: deepseek-ai/DeepSeek-R1-0528
+  config_id: deepseek_r1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
 #   config_id: deepseek_v2_ep
@@ -334,10 +329,9 @@ models:
 # - name: meta-llama/Llama-3.2-90B-Vision-Instruct
 #   config_id: multimodal
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
-# torch.distributed.DistStoreError: Timed out after 601 seconds waiting for clients. 1/4 clients joined.
-# - name: openai/gpt-oss-120b
-#   config_id: gpt_oss_120b
-#   yaml_extra: ['gpt_oss_120b.yaml']
+- name: openai/gpt-oss-120b
+  config_id: gpt_oss
+  yaml_extra: ['gpt_oss.yaml', 'world_size_2.yaml']
 # [RANK 3] Error querying confidential compute state: Function Not Found
 # - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
 #   config_id: multimodal__llama4_scout
@@ -374,14 +368,12 @@ models:
 #   config_id: default_ws_4
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3.5 MoE (Feb 2026) ---
-# tensorrt_llm.executor.utils.RequestError: Ran into a kwarg keyword mismatch.
-# - name: Qwen/Qwen3.5-35B-A3B
-#   config_id: qwen3_5_moe_35b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
-# OOM during AutoDeploy run.
-# - name: Qwen/Qwen3.5-397B-A17B
-#   config_id: qwen3_5_moe_400b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
+- name: Qwen/Qwen3.5-35B-A3B
+  config_id: qwen3_5_moe_35b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
+- name: Qwen/Qwen3.5-397B-A17B
+  config_id: qwen3_5_moe_400b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'qwen3.5_moe_400b.yaml', 'enable_sharder_ir.yaml']
 # --- GLM-5 (Feb 2026) ---
 - name: zai-org/GLM-5
   config_id: glm_5
@@ -404,6 +396,18 @@ models:
 # - name: XiaomiMiMo/MiMo-V2-Flash
 #   config_id: default_ws_8
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+# --- StepFun Step-3.7-Flash (Feb 2026) ---
+# Text decoder of the Step-3.7-Flash VLM (model_type step3p7 / step3p5). 45 layers,
+# 288 routed experts top-8 + shared expert, mixed full/sliding GQA, head-wise attn gate.
+- name: stepfun-ai/Step-3.7-Flash
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
+- name: stepfun-ai/Step-3.7-Flash-FP8
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
+- name: stepfun-ai/Step-3.7-Flash-NVFP4
+  config_id: step_3_7_flash
+  yaml_extra: ['step-3.7-flash.yaml']
 # --- Kimi-K2.5 (Jan 2026) ---
 # TypeError: 'NoneType' object is not subscriptable
 # - name: moonshotai/Kimi-K2.5
@@ -525,19 +529,23 @@ models:
 #   config_id: multimodal
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Gemma 4 (2026) - MoE with K=V attention ---
-# Error querying confidential compute state: Function Not Found
-# - name: google/gemma-4-E2B-it
-#   config_id: gemma4_e2b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_e2b.yaml']
+- name: google/gemma-4-E2B-it
+  config_id: gemma4_e2b
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_e2b.yaml']
 # AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
 # - name: google/gemma-4-26B-A4B
 #   config_id: gemma4_moe_base
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe_base.yaml']
-# AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
-# - name: google/gemma-4-26B-A4B-it
-#   config_id: gemma4_moe
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
+- name: google/gemma-4-26B-A4B-it
+  config_id: gemma4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
+- name: nvidia/Gemma-4-26B-A4B-NVFP4
+  config_id: gemma4_moe
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma4_moe.yaml']
 # --- Gemma 4 (2026) - Dense 31B ---
+- name: nvidia/Gemma-4-31B-IT-NVFP4
+  config_id: gemma4_dense
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'gemma4_dense.yaml']
 # AttributeError: 'GraphModule' object has no attribute 'get_per_layer_inputs'
 # - name: google/gemma-4-31B-it
 #   config_id: gemma4_dense
@@ -576,10 +584,9 @@ models:
 #   config_id: multimodal
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 # --- MiniMax M2 (2025) ---
-# RuntimeError: NVRTC compilation failed. See https://github.com/NVIDIA/TensorRT-LLM/issues/14676
-# - name: MiniMaxAI/MiniMax-M2
-#   config_id: minimax_m2
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
+- name: MiniMaxAI/MiniMax-M2
+  config_id: minimax_m2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- Tencent Hunyuan small (2025) ---
 - name: tencent/Hunyuan-1.8B-Instruct
   config_id: default_ws_1

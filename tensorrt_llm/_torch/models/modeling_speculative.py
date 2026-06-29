@@ -307,7 +307,8 @@ class Eagle3DraftModel(DecoderModel):
             self.hidden_size_in = config.hidden_size
 
         self._return_hidden_post_norm = eagle_config.get(
-            "return_hidden_post_norm", False)
+            "return_hidden_post_norm", False) or getattr(
+                config, "norm_output", False)
 
         # Create auxiliary CUDA stream for MLA operations (only needed for MLA)
         self.aux_stream = torch.cuda.Stream() if use_mla else None
@@ -329,6 +330,18 @@ class Eagle3DraftModel(DecoderModel):
             )
         else:
             self.input_norm = None
+
+        self._use_fc_norm = getattr(config, "fc_norm", False)
+        if self._use_fc_norm:
+            self.fc_norm = nn.ModuleList([
+                RMSNorm(
+                    hidden_size=self.hidden_size_in,
+                    eps=config.rms_norm_eps,
+                    dtype=config.torch_dtype,
+                ) for _ in range(self.spec_config.num_capture_layers)
+            ])
+        else:
+            self.fc_norm = None
 
         if self.num_layers > 1:
             self.midlayer = nn.ModuleList([
@@ -402,53 +415,65 @@ class Eagle3DraftModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        assert self.embed_tokens is not None
+        # When ``all_rank_num_tokens`` is supplied the caller wants this draft
+        # forward to run with a different attention-DP token distribution
+        # (e.g. the worker's per-step value); restore the original on exit so
+        # the next call sees the same attn_metadata it had on entry.
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+        try:
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
+            if inputs_embeds is None:
+                assert self.embed_tokens is not None
+                inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
-        assert hidden_states is not None
-        # NOTE: If hidden states from the target model have to be concatenated,
-        # ideally, we expect that to happen outside the model definition. This
-        # helps us avoid data-dependent control flow and gives us better CUDA
-        # graph coverage.
-        if self._eh_proj_before_attn:
-            input_embeds = self.enorm(inputs_embeds)
-            hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-            hidden_states = self.eh_proj(hidden_states)
+            assert hidden_states is not None
+            # NOTE: If hidden states from the target model have to be concatenated,
+            # ideally, we expect that to happen outside the model definition. This
+            # helps us avoid data-dependent control flow and gives us better CUDA
+            # graph coverage.
+            if self._eh_proj_before_attn:
+                input_embeds = self.enorm(inputs_embeds)
+                hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+                hidden_states = self.eh_proj(hidden_states)
 
-        residual = None
-        if self.num_layers > 1:
-            for layer in self.midlayer:
-                if residual is not None:
-                    hidden_states = hidden_states + residual
-                hidden_states, residual = layer(
+            residual = None
+            if self.num_layers > 1:
+                for layer in self.midlayer:
+                    if residual is not None:
+                        hidden_states = hidden_states + residual
+                    hidden_states, residual = layer(
+                        position_ids=position_ids,
+                        embeds=inputs_embeds,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        spec_metadata=spec_metadata,
+                    )
+            else:
+                hidden_states, residual = self.midlayer(
                     position_ids=position_ids,
                     embeds=inputs_embeds,
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
                 )
-        else:
-            hidden_states, residual = self.midlayer(
-                position_ids=position_ids,
-                embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-            )
 
-        hidden_states, hidden_states_to_save = self.norm(
-            hidden_states, residual)
-        if self._return_hidden_post_norm:
-            return hidden_states, hidden_states
-        return hidden_states, hidden_states_to_save
+            hidden_states, hidden_states_to_save = self.norm(
+                hidden_states, residual)
+            if self._return_hidden_post_norm:
+                return hidden_states, hidden_states
+            return hidden_states, hidden_states_to_save
+        finally:
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 # We use Llama3 as the base architecture for EAGLE3 draft layers
@@ -578,7 +603,14 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
 
         expected_hidden_size = self.model.hidden_size
         if hidden_states.shape[-1] != expected_hidden_size:
-            if self.model._norm_before_fc:
+            if self.model.fc_norm is not None:
+                chunks = hidden_states.chunk(len(self.model.fc_norm), dim=-1)
+                hidden_states = torch.cat([
+                    norm(chunk)
+                    for norm, chunk in zip(self.model.fc_norm, chunks)
+                ],
+                                          dim=-1)
+            elif self.model._norm_before_fc:
                 hidden_states = self.model.input_norm(hidden_states)
             hidden_states = self.model.fc(hidden_states)
 
@@ -632,14 +664,13 @@ class MistralLarge3DraftModel(DecoderModel):
         spec_metadata: SpecMetadata | None = None,
         hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert self.embed_tokens is not None
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
         if inputs_embeds is None:
+            assert self.embed_tokens is not None
             inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
         assert hidden_states is not None
@@ -1426,6 +1457,9 @@ class MTPForCausalLM(nn.Module):
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP
+            case "deepseek_v4":
+                from .modeling_deepseekv4 import DeepseekV4MTP
+                mtp_layer = DeepseekV4MTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -1485,6 +1519,12 @@ class MTPDraftModel(nn.Module):
         elif model_type == "qwen3_next":
             from .modeling_qwen3_next import Qwen3NextMTP
             mtp_layer = Qwen3NextMTP(model_config, layer_idx, aux_stream_dict)
+        elif model_type == "deepseek_v4":
+            from .modeling_deepseekv4 import DeepseekV4MTP
+            mtp_layer = DeepseekV4MTP(model_config,
+                                      layer_idx,
+                                      aux_stream_dict,
+                                      is_separate_draft_engine=True)
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")

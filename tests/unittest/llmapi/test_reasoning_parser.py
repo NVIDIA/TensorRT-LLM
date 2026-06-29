@@ -18,7 +18,8 @@ import os
 
 import pytest
 
-from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
+from tensorrt_llm.llmapi.reasoning_parser import (NemotronV3ReasoningParser,
+                                                  ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 
 R1_START, R1_END = "<think>", "</think>"
@@ -57,6 +58,34 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i]
         assert result.reasoning_content == reasoning_context[i]
+
+
+@pytest.mark.parametrize("chat_template_kwargs", [{
+    "thinking": True
+}, {
+    "enable_thinking": True
+}])
+def test_deepseek_v4_reasoning_parser_extracts_when_thinking(
+        chat_template_kwargs: dict):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek_v4", chat_template_kwargs)
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
+
+
+def test_deepseek_v4_reasoning_parser_streams_when_thinking():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek_v4", {"enable_thinking": True})
+
+    deltas = ["hid", f"den{R1_END}visible", " tail"]
+    results = [reasoning_parser.parse_delta(delta) for delta in deltas]
+
+    assert [result.content for result in results] == ["", "visible", " tail"]
+    assert [result.reasoning_content
+            for result in results] == ["hid", "den", ""]
 
 
 TOOL_START = "<|tool_calls_section_begin|>"
@@ -653,6 +682,25 @@ def test_auto_detect_laguna(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "laguna"
+
+
+@pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
+def test_auto_detect_nemotron_h(tmp_path, model_type):
+    """Nemotron-H models → 'nemotron-v3' parser (preferred over 'nano-v3')."""
+    model_dir = str(tmp_path / model_type)
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "nemotron-v3"
+
+
+def test_nemotron_v3_alias_same_parser():
+    """'nemotron-v3' and the legacy 'nano-v3' resolve to the same parser."""
+    nemotron = ReasoningParserFactory.create_reasoning_parser("nemotron-v3")
+    nano = ReasoningParserFactory.create_reasoning_parser("nano-v3")
+    assert isinstance(nemotron, NemotronV3ReasoningParser)
+    assert isinstance(nano, NemotronV3ReasoningParser)
 
 
 # ---------------------------------------------------------------------------

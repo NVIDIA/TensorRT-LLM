@@ -52,7 +52,10 @@ from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+from tensorrt_llm._torch.modules.fused_moe import (
+    DeepSeekV3MoeRoutingMethod,
+    RenormalizeMoeRoutingMethod,
+)
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
@@ -65,9 +68,20 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 logger = logging.getLogger(__name__)
 
 
+_MEGAMOE_BACKEND_TYPES = {
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
+}
+
+
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
-    """MegaMoE resolves an EP ProcessGroup at construction time."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """Every MegaMoE backend (DG + CuteDSL) resolves an EP ProcessGroup
+    at construction time via ``_resolve_ep_pg``. Single-process tests
+    must therefore initialise ``torch.distributed`` even when the test
+    only exercises ``ep_size == 1`` -- otherwise the constructor raises
+    ``MegaMoe*Unavailable``. Both MegaMoE backends need the same fixture
+    so the dist helper must accept the full set."""
+    if backend_type not in _MEGAMOE_BACKEND_TYPES:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
@@ -195,7 +209,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
             moe_tp_size=1,
             moe_ep_size=4,
         ),
-        moe_backend=MoeBackendType.MEGAMOE.value,
+        moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
     with pytest.raises(
@@ -250,7 +264,7 @@ def run_backend_moe(
     - TRTLLM: token_final_scales=bfloat16, optionally router_logits
     - CUTEDSL: token_final_scales=float32
     - DEEPGEMM: workspace, token_final_scales=float32
-    - MEGAMOE_DEEPGEMM: token_selected_experts=int64, output_dtype
+    - MegaMoE backends: token_selected_experts=int64, output_dtype
 
     Args:
         trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
@@ -281,7 +295,7 @@ def run_backend_moe(
 
         m_max = fp8_utils.align(x_quantized.shape[0], 128)
         args["workspace"] = backend.get_workspace(m_max, 128)
-    elif backend_type == MoeBackendType.MEGAMOE:
+    elif backend_type in _MEGAMOE_BACKEND_TYPES:
         args["token_selected_experts"] = token_selected_experts.to(torch.int64)
         args["output_dtype"] = dtype
 
@@ -302,6 +316,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.W4A16_MXFP4,
     QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
+    QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
 ]
@@ -313,8 +328,10 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
-    MoeBackendType.MEGAMOE,
+    MoeBackendType.MEGAMOE_DEEPGEMM,
+    MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
+    MoeBackendType.MARLIN,
 ]
 
 # Data types to test
@@ -567,6 +584,10 @@ def test_moe_backend(
     if backend_type == MoeBackendType.DENSEGEMM:
         monkeypatch.setenv("TRTLLM_MOE_FUSED_FC2_ALPHA", "0")
 
+    # MEGAMOE_CUTEDSL threads per-expert fc31_alpha / fc2_alpha /
+    # fc1_norm_const through the kernel ABI, so NVFP4QuantizeUtil's non-1
+    # weight_scale_2 values compute correctly without a test bypass.
+
     is_gated = is_gated_activation(activation_type)
     swiglu_gptoss_style = False
     if is_gated:
@@ -758,3 +779,131 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+# ============================================================================
+# BF16 (unquantized) TRTLLM-Gen MoE: DeepSeekV3 / Renormalize routing
+# ============================================================================
+# The main test_moe_backend skips TRTLLM + quant_algo=None, so cover the BF16
+# FlashInfer path here (Nemotron-H enablement): DeepSeekV3/Renormalize routing
+# x Relu2/Swiglu, via both fused and separated routing.
+
+# DeepSeekV3 trtllm-gen routing requires num_experts >= 22, multiple of 4.
+_BF16_UNQUANT_NUM_EXPERTS = 72
+_BF16_UNQUANT_TOP_K = 6
+_BF16_UNQUANT_HIDDEN = 1024
+_BF16_UNQUANT_INTERMEDIATE = 512
+
+
+def _make_bf16_routing_method(routing_kind: str, top_k: int, num_experts: int, device: str):
+    if routing_kind == "renormalize":
+        return RenormalizeMoeRoutingMethod(top_k=top_k)
+    # DeepSeekV3 (noaux_tc): sigmoid scores + correction bias, single group.
+    bias = torch.randn(num_experts, dtype=torch.float32, device=device)
+    return DeepSeekV3MoeRoutingMethod(
+        top_k=top_k,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+        callable_e_score_correction_bias=lambda: bias,
+    )
+
+
+@pytest.mark.parametrize(
+    "trtllm_use_router_logits", [True, False], ids=["fused_routing", "separated_routing"]
+)
+@pytest.mark.parametrize("seq_len", [8, 256])
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Relu2, ActivationType.Swiglu], ids=["relu2", "swiglu"]
+)
+@pytest.mark.parametrize("routing_kind", ["deepseekv3", "renormalize"])
+def test_trtllm_bf16_unquantized_moe(
+    routing_kind, activation_type, seq_len, trtllm_use_router_logits
+):
+    """TRTLLM-Gen BF16 (unquantized) MoE accuracy vs the reference impl."""
+    backend_type = MoeBackendType.TRTLLM
+    dtype = torch.bfloat16
+
+    can_impl, skip_reason = get_backend_class(backend_type).can_implement(
+        None, dtype_activation=dtype
+    )
+    if not can_impl:
+        pytest.skip(skip_reason)
+
+    num_experts = _BF16_UNQUANT_NUM_EXPERTS
+    top_k = _BF16_UNQUANT_TOP_K
+    hidden_size = _BF16_UNQUANT_HIDDEN
+    intermediate_size = _BF16_UNQUANT_INTERMEDIATE
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = _make_bf16_routing_method(routing_kind, top_k, num_experts, "cuda")
+
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        # Unquantized path: get_test_quant_params returns BaseQuantizeUtil.
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(None, x, backend_type)
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            activation_type=activation_type,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=activation_type,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+        AutoTuner.get().clear_cache()
+
+        def run_moe():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            return run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits=router_logits,
+                trtllm_use_router_logits=trtllm_use_router_logits,
+            )
+
+        # Autotune, then verify accuracy against the reference.
+        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+            _ = run_moe()
+        with torch.inference_mode():
+            output = run_moe()
+            ref_fused_moe.check_accuracy(output, ref_output)

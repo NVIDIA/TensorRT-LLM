@@ -82,7 +82,6 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 using MmKey = tensorrt_llm::executor::MmKey;
 using WindowSizeType = SizeType32;
 
@@ -487,6 +486,10 @@ public:
     [[nodiscard]] bool isShared() const;
 
     [[nodiscard]] bool isLeaf() const;
+
+    //! \brief Test if block is detached from radix search tree.
+    //! \return True if block is detached from search tree.
+    [[nodiscard]] bool isDetached() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -2196,6 +2199,31 @@ public:
     [[nodiscard]] virtual executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const
         = 0;
+
+    //! @brief Commit and return the chain of stored block hashes for \p llmRequest's currently-full blocks.
+    //! @details For each block index `b` in `[0, numFullBlocks)`:
+    //!   - if the block has already been marked full (`isFull() == true`), reuse its stored hash;
+    //!   - otherwise, build the BlockKey from `llmRequest`'s tokens for block `b`, then call
+    //!     `setBlockKey(blockKey, /*isFull=*/true)` and `setHash()` so the block holds the same
+    //!     hash that storeBlocks would later compute. Hashes chain through `mPrevBlockInSeq`,
+    //!     identical to `BlockKeyHasher::hash(blockKey, prevHash)`.
+    //!
+    //!   Beam-width-1 only. The connector enforces this at startup; this method
+    //!   asserts the invariant defensively.
+    //!
+    //!   Sliding-window attention with detached front blocks is not supported: once front
+    //!   blocks are evicted they remain in the cache block ID list but no longer align with
+    //!   token positions, so this method asserts `getNumFrontBlocksRemoved(windowSize) == 0`.
+    //!
+    //! @param llmRequest Request whose currently-allocated blocks should be hashed.
+    //! @param windowSize Attention window size identifying the per-window block manager.
+    //! @return Ordered hashes for full blocks at indices `[0, numFullBlocks)`, chained from
+    //!     `mPrevBlockInSeq`. Empty when the request has no full blocks yet.
+    [[nodiscard]] virtual std::vector<executor::IdType> commitAndGetBlockHashesForRequest(
+        LlmRequest const& llmRequest, SizeType32 windowSize)
+    {
+        TLLM_THROW("commitAndGetBlockHashesForRequest is not implemented for this KV cache manager.");
+    }
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -2514,6 +2542,9 @@ public:
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
+
+    [[nodiscard]] std::vector<executor::IdType> commitAndGetBlockHashesForRequest(
+        LlmRequest const& llmRequest, SizeType32 windowSize) override;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

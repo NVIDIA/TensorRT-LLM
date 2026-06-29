@@ -20,11 +20,10 @@ from .draft_target import (DraftTargetOneModelSampler,
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
-                     Eagle3SpecMetadata)
+                     Eagle3SpecMetadata, MTPEagleWorker)
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
-from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
-                  MTPSpecMetadata, MTPWorker)
+from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
@@ -43,7 +42,27 @@ def get_spec_metadata(spec_config,
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     vocab_size = getattr(model_config, "vocab_size", 0)
-    if spec_config.spec_dec_mode.is_mtp_one_model():
+    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        # MTP Eagle one-model reuses Eagle3 one-model metadata for the
+        # unified worker/sampler/slot_ids plumbing, but skips per-layer
+        # hidden-state capture: the worker feeds the target model's
+        # hidden_states directly into the MTP layer, so we leave
+        # layers_to_capture unset and let Eagle3OneModelSpecMetadata default
+        # it to an empty tuple. This also keeps post-MLP/MoE fusion enabled
+        # on models that gate it on is_layer_capture().
+        return Eagle3OneModelSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            use_rejection_sampling=use_rejection_sampling,
+            vocab_size=vocab_size,
+            spec_resource_manager=spec_resource_manager,
+        )
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -51,7 +70,6 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.max_draft_len,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
-            allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
@@ -97,7 +115,6 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
-            allow_advanced_sampling=spec_config.allow_advanced_sampling,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
@@ -110,7 +127,6 @@ def get_spec_metadata(spec_config,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
-            allow_advanced_sampling=spec_config.allow_advanced_sampling,
             spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_dflash():
@@ -120,7 +136,6 @@ def get_spec_metadata(spec_config,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
-            allow_advanced_sampling=spec_config.allow_advanced_sampling,
             layers_to_capture=target_layer_ids,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
@@ -133,7 +148,6 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
-            allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(
@@ -169,6 +183,16 @@ def get_spec_metadata(spec_config,
     return None
 
 
+def get_mtp_hidden_size(model_config) -> int:
+    pretrained_config = getattr(model_config, "pretrained_config", model_config)
+    hidden_size = getattr(pretrained_config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = getattr(model_config, "hidden_size")
+    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
+        return hidden_size * getattr(pretrained_config, "hc_mult", 1)
+    return hidden_size
+
+
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
@@ -185,16 +209,21 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
-            return MTPHiddenStatesManager(
+            # Unified resource manager: the unified worker reads
+            # ``relaxed_delta_pool`` from ``Eagle3ResourceManager`` (mirrors the
+            # pool ``MTPHiddenStatesManager`` used to provide).
+            return Eagle3ResourceManager(
                 spec_config,
                 model_config.torch_dtype,
-                model_config.hidden_size,
+                get_mtp_hidden_size(model_config),
                 max_num_requests,
+                max_seq_len,
+                max_num_tokens,
                 sa_manager=sa_manager,
             )
         else:
             return None
-    if spec_dec_mode.is_mtp_one_model():
+    if spec_dec_mode.is_mtp_vanilla():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
@@ -203,7 +232,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
-            model_config.hidden_size,
+            get_mtp_hidden_size(model_config),
             max_num_requests,
             sa_manager=sa_manager,
         )
@@ -263,7 +292,10 @@ def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
 ):
-    if spec_config.spec_dec_mode.is_mtp_one_model():
+    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
+        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
@@ -314,12 +346,31 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if spec_config.spec_dec_mode.is_mtp_one_model():
+    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        return 1
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
         return spec_config.num_nextn_predict_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
-        num_eagle_layers = spec_config.num_eagle_layers
-        return num_eagle_layers if num_eagle_layers is not None else 1
+        num_draft_hidden_layers = spec_config._num_draft_hidden_layers
+        return num_draft_hidden_layers if num_draft_hidden_layers is not None else 1
     return 0
+
+
+def update_spec_config_from_draft_model_config(spec_config,
+                                               draft_pretrained_config) -> None:
+    """Populate Eagle draft-layer fields from the loaded draft model config."""
+    from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
+
+    if not isinstance(spec_config, EagleDecodingConfig):
+        return
+
+    num_layers = getattr(draft_pretrained_config, "num_hidden_layers", None)
+    if num_layers is None:
+        logger.warning(
+            "Draft model pretrained config is missing num_hidden_layers; "
+            "defaulting _num_draft_hidden_layers to 1.")
+        num_layers = 1
+    spec_config._num_draft_hidden_layers = num_layers
 
 
 def get_spec_worker(spec_config,
@@ -336,8 +387,10 @@ def get_spec_worker(spec_config,
         if getattr(spec_config, 'use_dynamic_tree', False):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
                                                    use_separate_draft_kv_cache)
-        return Eagle3OneModelWorker(spec_config, mapping,
-                                    use_separate_draft_kv_cache)
+        return Eagle3OneModelWorker(
+            spec_config,
+            mapping=mapping,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
@@ -414,6 +467,15 @@ def update_spec_config_from_model_config(spec_config, model_config):
         spec_config.max_draft_len = effective_draft_len
 
     spec_config.max_total_draft_tokens = spec_config.max_draft_len
+
+
+def update_spec_config_from_loaded_model(spec_config, model) -> None:
+    """Populate spec config fields from loaded target and draft model configs."""
+    update_spec_config_from_model_config(spec_config, model.config)
+    draft_config = getattr(model, 'draft_config', None)
+    if draft_config is not None:
+        update_spec_config_from_draft_model_config(
+            spec_config, draft_config.pretrained_config)
 
 
 @dataclass

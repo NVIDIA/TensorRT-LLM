@@ -52,10 +52,15 @@ try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
+    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+        _flash_attn_combine as _fa_combine,
+    )
 
     _flash_attn4_available = _fa4_fwd is not None
+    _attn2d_available = _fa4_fwd is not None and _fa_combine is not None
 except (ImportError, OSError):
     _flash_attn4_available = False
+    _attn2d_available = False
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -401,6 +406,22 @@ class TestWanTransformerParallel:
             test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
             parallel_cfg_kwargs=dict(dit_attn2d_row_size=2, dit_attn2d_col_size=2),
             label="attn2d(2x2)-4gpu",
+        )
+
+    def test_parallel_attn2d_2x2_ulysses2_vs_single_gpu_8gpu(self):
+        """world=8, attn2d=2×2, ulysses=2 vs single-GPU FA4 reference."""
+        self._skip_if_unavailable()
+        if not _attn2d_available:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(
+            world_size=8,
+            test_fn=_logic_wan_transformer_parallel_vs_single_gpu,
+            parallel_cfg_kwargs=dict(
+                dit_attn2d_row_size=2,
+                dit_attn2d_col_size=2,
+                dit_ulysses_size=2,
+            ),
+            label="attn2d(2x2),ul=2-8gpu",
         )
 
     def test_parallel_ring4_vs_single_gpu_4gpu(self):

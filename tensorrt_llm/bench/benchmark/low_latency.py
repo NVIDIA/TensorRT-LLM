@@ -24,7 +24,8 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm.bench.benchmark import (generate_json_report,
+from tensorrt_llm.bench.benchmark import (collect_explicit_cli_keys,
+                                          generate_json_report,
                                           get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
@@ -65,9 +66,9 @@ from tensorrt_llm.sampling_params import SamplingParams
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
-    "Can be specified as either --config or --extra_llm_api_options.")
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Can be specified as either --config or "
+    "--extra_llm_api_options.")
 @optgroup.option(
     "--backend",
     type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -297,6 +298,7 @@ def latency_command(
     exec_settings["performance_options"]["multi_block_mode"] = True
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Decoding Options
     if medusa_choices is not None:
@@ -312,6 +314,11 @@ def latency_command(
     kwargs['backend'] = options.backend
     if bench_env.telemetry_config is not None:
         kwargs["telemetry_config"] = bench_env.telemetry_config
+
+    runtime_config.settings_config.max_batch_size = kwargs.get(
+        "max_batch_size", runtime_config.settings_config.max_batch_size)
+    runtime_config.settings_config.max_num_tokens = kwargs.get(
+        "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
     # Set environment variables for setting runtime options.
     default_env_overrides = {

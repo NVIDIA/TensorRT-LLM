@@ -1,0 +1,17 @@
+{
+  "video": "wan22_t2v_lpips_golden_video.mp4",
+  "model": "Wan2.2-T2V-A14B-Diffusers",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "A cat sitting on a sunny windowsill watching birds outside.",
+  "negative_prompt": "",
+  "height": 480,
+  "width": 832,
+  "num_frames": 9,
+  "num_inference_steps": 4,
+  "guidance_scale": 4.0,
+  "seed": 42,
+  "frame_rate": 16.0,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.37.1"
+}

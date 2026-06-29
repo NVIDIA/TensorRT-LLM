@@ -51,6 +51,7 @@ from ...utils.node_utils import (
     set_op_args,
     shape,
 )
+from ...utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -91,13 +92,91 @@ def _shard_scale_and_hook(
     sn: WeightNode,
     sharded_scale: torch.Tensor,
     f_split,
+    pipeline_cache_spec: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Register a sharded scale buffer and its corresponding load hook."""
     buf_name = sn.node_key.rsplit(".", 1)[-1]
     sn.submod.register_buffer(buf_name, sharded_scale)
-    gm._register_load_state_dict_pre_hook(
-        partial(_load_hook, f_split=f_split, param_key=sn.node_key, param_shape=sharded_scale.shape)
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=sn.node_key,
+        param_shape=sharded_scale.shape,
     )
+    if pipeline_cache_spec is not None:
+        hook = mark_pipeline_cache_hook(hook, pipeline_cache_spec)
+    gm._register_load_state_dict_pre_hook(hook)
+
+
+def _fp8_block_scale_pipeline_cache_spec(
+    sn: WeightNode,
+    sharded_scale: torch.Tensor,
+    dim: int,
+    rank: int,
+    world_size: int,
+) -> Dict[str, Any]:
+    return {
+        "type": "shard_fp8_block_scale",
+        "param_key": sn.node_key,
+        "param_shape": list(sharded_scale.shape),
+        "dim": int(dim),
+        "rank": rank,
+        "world_size": world_size,
+    }
+
+
+def _fp4_weight_scale_pipeline_cache_spec(
+    sn: WeightNode,
+    sharded_scale: torch.Tensor,
+    weight_shape: torch.Size,
+    dim: int,
+    rank: int,
+    world_size: int,
+    min_local_shape: int,
+    fused_weight_dims: Optional[Tuple[int, ...]] = None,
+) -> Dict[str, Any]:
+    return {
+        "type": "shard_fp4_weight_scale",
+        "param_key": sn.node_key,
+        "param_shape": list(sharded_scale.shape),
+        "original_uint8_weight_shape": list(weight_shape),
+        "dim": int(dim),
+        "rank": rank,
+        "world_size": world_size,
+        "min_local_shape": min_local_shape,
+        "fused_weight_dims": list(fused_weight_dims) if fused_weight_dims else None,
+    }
+
+
+def _rowwise_bias_load_hook(state_dict, prefix, *args, rank, param_key):
+    """Always-apply load hook for the rank0-only row-parallel bias: zero on rank != 0.
+
+    Unlike the shape-gated ``_load_hook`` (which only transforms when the loaded
+    shape differs from the sharded shape), the row-parallel bias keeps its full
+    shape -- only its *value* changes. Idempotent (zeroing zeros / keeping rank 0).
+    Takes plain ``rank``/``param_key`` (not a closure) so the pipeline cache can
+    serialize and rebuild it via the importable-hook path.
+    """
+    key = prefix + param_key
+    if key in state_dict and rank != 0:
+        state_dict[key] = torch.zeros_like(state_dict[key])
+
+
+def _replicate_rowwise_bias(bn: WeightNode, rank: int) -> None:
+    """Keep a row-parallel linear's bias on rank 0 only; zero it on the others.
+
+    The row-parallel output is summed across ranks by the trailing ``all_reduce``,
+    so a full bias present on every rank would be added ``world_size`` times. Zeroing
+    it on rank != 0 makes the all_reduce contribute the bias exactly once. The
+    parameter shape is unchanged (unlike the column-parallel bias, which is split),
+    so a dedicated always-apply load hook is used.
+    """
+    new_bias = bn.tensor if rank == 0 else torch.zeros_like(bn.tensor)
+    pname = bn.node_key.rsplit(".", 1)[-1]
+    bn.submod._register_load_state_dict_pre_hook(
+        partial(_rowwise_bias_load_hook, rank=rank, param_key=pname)
+    )
+    setattr(bn.submod, pname, torch.nn.Parameter(new_bias.detach().clone(), requires_grad=False))
 
 
 _SHARDING_HINT_NAMES = frozenset(
@@ -142,6 +221,8 @@ class ShardableNode(ABC):
 
         def decorator(subcls):
             for target in op_targets:
+                if target is None:
+                    continue
                 if isinstance(target, OpOverloadPacket):
                     for overload_name in target.overloads():
                         cls._REGISTRY[getattr(target, overload_name)] = subcls
@@ -303,6 +384,10 @@ class LinearShardableNode(ShardableNode):
                     world_size=dc.tp_size,
                     fused_weight_dims=fused,
                 )
+            else:
+                # Row-parallel: the trailing all_reduce would sum a full bias
+                # world_size times. Keep it on rank 0 only so it is added once.
+                _replicate_rowwise_bias(bn, dc.tp_rank)
 
         ad_logger.debug(f"  sharded linear tp_mode={tp_mode}")
         return 1
@@ -326,7 +411,13 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
                 _split_fp8_block_scale, dim=dim, rank=dc.tp_rank, world_size=dc.tp_size
             )
             sharded = f_split(sn.tensor)
-            _shard_scale_and_hook(gm, sn, sharded, f_split)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp8_block_scale_pipeline_cache_spec(sn, sharded, dim, dc.tp_rank, dc.tp_size),
+            )
 
 
 @ShardableNode.register(
@@ -351,7 +442,15 @@ class FP4LinearShardableNode(LinearShardableNode):
                 fused_weight_dims=fused,
             )
             sharded = f_split(sn.tensor)
-            _shard_scale_and_hook(gm, sn, sharded, f_split)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp4_weight_scale_pipeline_cache_spec(
+                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, min_shape, fused
+                ),
+            )
 
 
 @ShardableNode.register(torch.ops.auto_deploy.view)
@@ -531,6 +630,48 @@ class WeightedParamShardableNode(ShardableNode):
         return 1 if count > 0 else 0
 
 
+@ShardableNode.register(torch.ops.auto_deploy.torch_attention)
+class AttentionSinksShardableNode(ShardableNode):
+    """``torch_attention`` with per-head ``sinks``: shard sinks along the head dim.
+
+    Attention-sink models (e.g. GPT-OSS) add a learnable per-head sink scalar
+    (shape ``[num_heads]``). When the heads are TP-sharded (q/k/v colwise), the
+    ``sinks`` arg must follow the same head split, else the op sees full sinks
+    against the sharded head count. Standard attention (no ``sinks``) is a no-op.
+
+    Gating is handled by the apply loop: attention-DP skips all non-MoE nodes
+    (so attention stays replicated and sinks stays full), and ``shard_layers``
+    gates via the node's ``layer_type`` hint (default ``"mha"``).
+    """
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+        count = 0
+        for wn in extract_weight_nodes(self.node).weights:
+            # Only the per-head ``sinks`` (1-D) follows the head split; never a 2-D weight.
+            if wn.tensor.dim() != 1:
+                continue
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=wn.tensor,
+                param_key=wn.node_key,
+                dim=0,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+            )
+            count += 1
+        if count:
+            ad_logger.debug("  sharded attention sinks along head dim")
+        return 1 if count > 0 else 0
+
+    @classmethod
+    def _strip_node_hints(cls, node: Node) -> bool:
+        # Leave ``torch_attention`` untouched at strip time: its ``layer_type`` is a
+        # benign op default that downstream backend selection reads as-is.
+        return False
+
+
 @ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
 class NormShardableNode(ShardableNode):
     """Gated RMSNorm op: shard weight parameter."""
@@ -623,7 +764,14 @@ class FineGrainedFP8SwiGLUShardableNode(SwiGLUShardableNode):
             f_split = partial(
                 _split_fp8_block_scale, dim=dim, rank=dc.tp_rank, world_size=dc.tp_size
             )
-            _shard_scale_and_hook(gm, sn, f_split(sn.tensor), f_split)
+            sharded = f_split(sn.tensor)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp8_block_scale_pipeline_cache_spec(sn, sharded, dim, dc.tp_rank, dc.tp_size),
+            )
 
 
 @ShardableNode.register(torch.ops.auto_deploy.torch_nvfp4_swiglu_mlp)
@@ -645,7 +793,16 @@ class FP4SwiGLUShardableNode(SwiGLUShardableNode):
                 min_local_shape=1,
                 fused_weight_dims=None,
             )
-            _shard_scale_and_hook(gm, sn, f_split(sn.tensor), f_split)
+            sharded = f_split(sn.tensor)
+            _shard_scale_and_hook(
+                gm,
+                sn,
+                sharded,
+                f_split,
+                _fp4_weight_scale_pipeline_cache_spec(
+                    sn, sharded, weight_shape, dim, dc.tp_rank, dc.tp_size, 1
+                ),
+            )
 
 
 @ShardableNode.register(
@@ -732,9 +889,15 @@ class MoEShardableNode(ShardableNode):
         self.node.args = tuple(args)
 
         if enable_alltoall:
-            # mapping and max_num_tokens are needed downstream for MoE all-to-all dispatcher
             mapping_config = dc.serialize()
-            set_op_args(self.node, mapping_config=mapping_config, max_num_tokens=max_num_tokens)
+            batch_info_host_nodes = gm.graph.find_nodes(op="placeholder", target="batch_info_host")
+            batch_info_host_node = batch_info_host_nodes[0] if batch_info_host_nodes else None
+            set_op_args(
+                self.node,
+                mapping_config=mapping_config,
+                max_num_tokens=max_num_tokens,
+                batch_info_host=batch_info_host_node,
+            )
         else:
             # with pure EP/TP parallelism, global expert indices must be localized
             self._localize_expert_indices(
@@ -893,6 +1056,12 @@ class IRShardingConfig(TransformConfig):
         default=None,
         description="When set, only shard nodes whose layer_type hint is in this list.",
     )
+    simple_shard_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated weight-name keywords (e.g. 'lm_head'). Matching linears are "
+        "gather-sharded (column split + all_gather) regardless of shard_layers -- used for the "
+        "lm_head vocab projection, which the hint-driven sharder would otherwise replicate.",
+    )
     enable_attention_dp: bool = Field(default=False)
     dist_mapping: dict[str, int] = Field(default_factory=dict)
     dist_config: DistConfig = Field(default_factory=DistConfig)
@@ -961,44 +1130,52 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
     for node in list(gm.graph.nodes):
         if not is_any_lin_op(node):
             continue
-        weight_nodes = extract_weight_nodes(node)
-        if not weight_nodes.weights:
-            continue
-        for wn in weight_nodes.weights:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=wn.tensor,
-                param_key=wn.node_key,
-                dim=SplitDimension.COLUMN,
-                rank=dc.tp_rank,
-                world_size=dc.tp_size,
-            )
-        for bn in weight_nodes.biases:
-            shard_weight_tensor(
-                gm=gm,
-                weight_tensor=bn.tensor,
-                param_key=bn.node_key,
-                dim=SplitDimension.COLUMN,
-                rank=dc.tp_rank,
-                world_size=dc.tp_size,
-            )
-        enable_sharding = ShardableNode.from_node(node)
-        if isinstance(enable_sharding, LinearShardableNode):
-            enable_sharding._shard_scales(
-                gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
-            )
-        # torch_dist_all_gather is the demollm backend op; signature is
-        # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
-        # no strategy or symm_mem support (use the trtllm backend for those).
-        with gm.graph.inserting_after(node):
-            gather_node = gm.graph.call_function(
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
-                args=(node, -1),
-            )
-            node.replace_all_uses_with(gather_node)
-            gather_node.replace_input_with(gather_node, node)
-        num_updates += 1
+        num_updates += _simple_shard_node(gm, node, dc)
     return num_updates
+
+
+def _simple_shard_node(gm: GraphModule, node: Node, dc: DistConfig) -> int:
+    """Column-split one linear's weight/bias/scale, then all_gather (the "gather" mode).
+
+    Used as the simple-shard fallback for every linear (``simple_shard_only``) and,
+    via ``simple_shard_filter``, to gather-shard specific linears like ``lm_head``
+    (huge vocab projection) that the hint-driven sharder would otherwise replicate.
+    """
+    weight_nodes = extract_weight_nodes(node)
+    if not weight_nodes.weights:
+        return 0
+    for wn in weight_nodes.weights:
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=wn.tensor,
+            param_key=wn.node_key,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+    for bn in weight_nodes.biases:
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=bn.tensor,
+            param_key=bn.node_key,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+    sn = ShardableNode.from_node(node)
+    if isinstance(sn, LinearShardableNode):
+        sn._shard_scales(gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None)
+    # torch_dist_all_gather is the demollm backend op; signature is
+    # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
+    # no strategy or symm_mem support (use the trtllm backend for those).
+    with gm.graph.inserting_after(node):
+        gather_node = gm.graph.call_function(
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            args=(node, -1),
+        )
+        node.replace_all_uses_with(gather_node)
+        gather_node.replace_input_with(gather_node, node)
+    return 1
 
 
 # =============================================================================
@@ -1090,12 +1267,22 @@ class ApplyShardingHints(BaseTransform):
 
         max_num_tokens = cm.info.max_num_tokens if (cm and cm.info) else 0
 
+        # When attention-DP is active with EP, the MoE all-to-all ops need
+        # runtime token counts (batch_info_host slot 14, ``max_dp_num_tokens``)
+        # to avoid over-padding.
+        # Add the placeholder before the node loop so MoEShardableNode.apply()
+        # can find and wire it into each MoE node.
+        if dc.enable_attention_dp and dc.moe_ep_size > 1 and cm is not None:
+            self._add_or_retrieve_input(gm, cm, "batch_info_host", init_val=True)
+
         num_updates = 0
         if self.config.simple_shard_only:
             num_updates = _apply_simple_shard(gm, dc)
             _log_sharding_result(dc, num_updates)
         else:
             shard_layers = self.config.shard_layers
+            ssf = self.config.simple_shard_filter
+            simple_shard_filter = [k.strip() for k in ssf.split(",") if k.strip()] if ssf else None
             num_skipped = 0
             all_dead_nodes = []
 
@@ -1108,6 +1295,14 @@ class ApplyShardingHints(BaseTransform):
                         shardable_node, (MoEShardableNode, StackedMoEShardableNode)
                     ):
                         continue
+                    # Gather-shard simple_shard_filter matches (e.g. lm_head) regardless of
+                    # shard_layers: column split + all_gather of the huge vocab projection.
+                    if simple_shard_filter and is_any_lin_op(node):
+                        wnodes = extract_weight_nodes(node)
+                        key = wnodes.weights[0].node_key if wnodes.weights else ""
+                        if any(kw in key for kw in simple_shard_filter):
+                            num_updates += _simple_shard_node(gm, node, dc)
+                            continue
                     if shard_layers is not None:
                         [lt] = extract_op_args(node, "layer_type")
                         if lt is not None and lt not in shard_layers:

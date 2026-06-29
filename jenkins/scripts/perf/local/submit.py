@@ -368,7 +368,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmi2
+    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmix
     is_single_gpu_aggr = (
         is_aggr and hardware_config is not None and hardware_config.get("total_gpus") == 1
     )
@@ -376,7 +376,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
     if args.mpi_type:
         lines.append(f"--mpi={args.mpi_type}")
     elif is_aggr and not is_single_gpu_aggr:
-        lines.append("--mpi=pmi2")
+        lines.append("--mpi=pmix")
 
     return lines
 
@@ -412,6 +412,7 @@ def generate_pytest_command(
 
     pytest_command = (
         f"pytest -v "
+        f"perf/test_perf_sanity.py "
         f"--test-prefix={test_prefix} "
         f"--test-list={test_list_path} "
         f"--output-dir={work_dir} "
@@ -560,7 +561,7 @@ def main():
         "--mpi-type",
         default="",
         help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
-        " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
+        " --mpi=pmix; non-aggregated runs omit --mpi entirely.",
     )
     parser.add_argument(
         "--disagg-server-port",
@@ -632,6 +633,7 @@ def main():
     # Detect GPU type from config metadata
     supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
     is_b200 = "B200" in supported_gpus
+    is_gb300 = "GB300" in supported_gpus
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -816,10 +818,12 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_b200:
+        if is_gb300:
+            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
+        elif is_b200:
             ucx_tls_cmd = "export UCX_TLS=^ib &&"
         else:
-            ucx_tls_cmd = "unset UCX_TLS &&"
+            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',

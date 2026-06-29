@@ -62,6 +62,7 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
+from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .interface import MoESchedulerKind
 
@@ -97,6 +98,7 @@ class MoEScheduler(ABC):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         use_dp_padding: Optional[bool],
+        input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor: ...
 
@@ -137,6 +139,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         use_dp_padding: Optional[bool],
+        input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         moe = self.moe
@@ -184,6 +187,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 all_rank_num_tokens_padded,
                 use_dp_padding,
                 do_finalize,
+                input_ids,
                 lora_params=lora_params,
             )
         else:
@@ -195,6 +199,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 all_rank_num_tokens_padded,
                 use_dp_padding,
                 do_finalize,
+                input_ids,
                 lora_params=lora_params,
             )
 
@@ -299,6 +304,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         moe = self.moe
@@ -317,6 +323,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             is_last_call,
             do_finalize,
             workspace=workspace,
+            input_ids=input_ids,
             lora_params=lora_params,
         )
 
@@ -331,6 +338,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         is_last_call: bool,
         do_finalize: bool = True,
         workspace: Optional[dict] = None,
+        input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
@@ -354,7 +362,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
         if moe.backend._supports_load_balancer():
             # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = moe.routing_method.apply(router_logits)
+            token_selected_experts, token_final_scales = moe.routing_method.apply(
+                router_logits, input_ids
+            )
 
             token_selected_experts = token_selected_experts.to(torch.int32)
 
@@ -543,6 +553,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
         do_finalize: bool = True,
+        input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Multiple-chunk path with optional aux-stream overlap."""
@@ -572,6 +583,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         x_list = x.split(chunk_size_list)
         router_logits_list = router_logits.split(chunk_size_list)
+        input_ids_list = (
+            input_ids.split(chunk_size_list) if input_ids is not None else [None] * num_chunks
+        )
 
         use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
 
@@ -596,21 +610,26 @@ class ExternalCommMoEScheduler(MoEScheduler):
             assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
             x_list = list(x_list)
             router_logits_list = list(router_logits_list)
+            input_ids_list = list(input_ids_list)
             for idx_chunk in range(num_chunks):
                 _x = x_list[idx_chunk]
                 if _x.numel() == 0:
                     chunked_used[idx_chunk] = False
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
+                    input_ids_list[idx_chunk] = input_ids_list[0]
                     all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
                         all_rank_num_tokens_list[0][moe.mapping.tp_rank]
                     )
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
+            input_ids_list = tuple(input_ids_list)
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
-        for idx_chunk, (x_chunk, router_logits_chunk) in enumerate(zip(x_list, router_logits_list)):
+        for idx_chunk, (x_chunk, router_logits_chunk, input_ids_chunk) in enumerate(
+            zip(x_list, router_logits_list, input_ids_list)
+        ):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
 
@@ -629,6 +648,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             is_last_call,
                             do_finalize,
                             workspace=workspace_0,
+                            input_ids=input_ids_chunk,
                             lora_params=lora_params,
                         )
                 else:
@@ -642,6 +662,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         is_last_call,
                         do_finalize,
                         workspace=workspace_1,
+                        input_ids=input_ids_chunk,
                         lora_params=lora_params,
                     )
             else:
@@ -655,6 +676,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     do_finalize,
                     workspace=workspace_0,
+                    input_ids=input_ids_chunk,
                     lora_params=lora_params,
                 )
 
@@ -787,6 +809,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
 
+        elif moe.backend.__class__ == MarlinFusedMoE:
+            kwargs["router_logits"] = router_logits
+
         return kwargs
 
 
@@ -829,6 +854,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         use_dp_padding: Optional[bool],
+        input_ids: Optional[torch.Tensor],
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
@@ -856,15 +882,22 @@ class FusedCommMoEScheduler(MoEScheduler):
                 "quantization happens in backend.quantize_input."
             )
 
-        x_real, rl_real, real_all_rank_num_tokens, ep_rank, had_meta = self._strip_adp_padding(
-            x, router_logits, all_rank_num_tokens
+        x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta = (
+            self._strip_adp_padding(x, router_logits, input_ids, all_rank_num_tokens)
         )
         num_chunks, x_chunks, rl_chunks, all_rank_chunk_size_list = self._compute_chunk_layout(
             x_real, rl_real, real_all_rank_num_tokens, ep_rank
         )
+        input_ids_chunks = []
+        if input_ids_real is not None:
+            chunk_size_list = all_rank_chunk_size_list[ep_rank]
+            input_ids_chunks = (
+                list(input_ids_real.split(chunk_size_list)) if input_ids_real.numel() > 0 else []
+            )
         outputs = self._run_chunks(
             x_chunks,
             rl_chunks,
+            input_ids_chunks,
             num_chunks=num_chunks,
             x_real=x_real,
             rl_real=rl_real,
@@ -882,8 +915,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         all_rank_num_tokens: Optional[List[int]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int, bool]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], List[int], int, bool]:
         """Slice ADP padding off ``x`` / ``router_logits`` using moe_ep_rank.
 
         SymmBuffer exchange is EP-scoped, so we index the per-rank token count
@@ -912,7 +946,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # drift into chunk-0 or torch.split shape-errors.
         x_real = x[:real_local]
         rl_real = router_logits[:real_local]
-        return x_real, rl_real, real_all_rank_num_tokens, ep_rank, had_meta
+        input_ids_real = input_ids[:real_local] if input_ids is not None else None
+        return x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta
 
     def _compute_chunk_layout(
         self,
@@ -959,6 +994,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         self,
         x_chunks: List[torch.Tensor],
         rl_chunks: List[torch.Tensor],
+        input_ids_chunks: List[torch.Tensor],
         *,
         num_chunks: int,
         x_real: torch.Tensor,
@@ -986,12 +1022,14 @@ class FusedCommMoEScheduler(MoEScheduler):
             if idx_chunk < len(x_chunks):
                 x_chunk = x_chunks[idx_chunk]
                 rl_chunk = rl_chunks[idx_chunk]
+                input_ids_chunk = input_ids_chunks[idx_chunk] if input_ids_chunks else None
             else:
                 # Shape ``(0, hidden_size)`` keeps dtype/device/column-width
                 # intact so routing / quantize / run_moe execute as no-ops
                 # without shape errors before reaching the barrier.
                 x_chunk = x_real.new_empty((0, x_real.shape[1]))
                 rl_chunk = rl_real.new_empty((0, rl_real.shape[1]))
+                input_ids_chunk = None
 
             per_chunk_all_rank = (
                 [lst[idx_chunk] for lst in all_rank_chunk_size_list] if had_meta else None
@@ -1005,6 +1043,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 do_finalize=do_finalize,
                 is_first_call=is_first_call,
                 is_last_call=is_last_call,
+                input_ids=input_ids_chunk,
             )
             outputs.append(out_chunk)
         return outputs
@@ -1019,6 +1058,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         do_finalize: bool,
         is_first_call: bool = True,
         is_last_call: bool = True,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run a single chunk through the fused-comm backend.
 
@@ -1058,6 +1098,7 @@ class FusedCommMoEScheduler(MoEScheduler):
 
         x_chunk_real = x[:num_tokens]
         router_logits_chunk_real = router_logits[:num_tokens]
+        input_ids_chunk_real = input_ids[:num_tokens] if input_ids is not None else None
 
         # ----- EPLB: drain previous CPU rebalance -----
         # Static EPLB early-returns inside the helper; only the dynamic
@@ -1069,7 +1110,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         # path; the fused-comm backend casts to int64 internally.
         if num_tokens > 0:
             token_selected_experts, token_final_scales = moe.routing_method.apply(
-                router_logits_chunk_real
+                router_logits_chunk_real, input_ids_chunk_real
             )
             token_selected_experts = token_selected_experts.to(torch.int32)
             token_final_scales = token_final_scales.to(torch.float32)
@@ -1110,14 +1151,15 @@ class FusedCommMoEScheduler(MoEScheduler):
         )
 
         # ----- quantize -----
-        if num_tokens > 0:
-            x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
-        else:
-            device = x.device
-            x_fp8 = torch.empty((0, moe.hidden_size), dtype=torch.float8_e4m3fn, device=device)
-            # Packed-UE8M0 int32 SF: one int32 per 128 input elements per row,
-            # same stride contract as the non-empty runs for run_moe.
-            x_sf = torch.empty((0, moe.hidden_size // 128), dtype=torch.int32, device=device)
+        # Always delegate to ``backend.quantize_input`` so each fused-comm
+        # backend owns its own empty-tensor layout. Both ``MegaMoEDeepGemm``
+        # and ``MegaMoECuteDsl`` short-circuit ``x.shape[0] == 0`` inside
+        # their quantize_input contracts (DG returns FP8 + packed-UE8M0
+        # int32 SF; CuteDSL returns NVFP4 packed bytes + plain K-major FP8
+        # SF). Synthesizing the DG-specific empty layout here would lock
+        # the scheduler to a single backend; the unconditional delegation
+        # keeps it layout-agnostic.
+        x_fp8, x_sf = moe.backend.quantize_input(x_chunk_real)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's

@@ -88,20 +88,15 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     doc="Wan 2.1 & 2.2 image-to-video family.",
 )
 class WanImageToVideoPipeline(BasePipeline):
-    def __init__(self, model_config):
+    def __init__(self, pipeline_config):
         # Wan2.2 14B two-stage denoising parameters
         self.transformer_2 = None
-        self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
+        self.boundary_ratio = getattr(
+            pipeline_config.primary_pretrained_config, "boundary_ratio", None
+        )
         self.is_wan22_14b = self.boundary_ratio is not None
 
-        # Validate TeaCache compatibility before allocating GPU memory
-        if self.is_wan22_14b and model_config.cache_backend == "teacache":
-            raise ValueError(
-                "TeaCache is not supported for Wan 2.2 models. "
-                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
-            )
-
-        super().__init__(model_config)
+        super().__init__(pipeline_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for Wan I2V transformer.
@@ -110,7 +105,10 @@ class WanImageToVideoPipeline(BasePipeline):
         calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
-        t_freq = ce.timesteps_proj(timestep)
+        # The forward path receives normalized timesteps. TeaCache coefficients
+        # were calibrated against WAN's raw scheduler timestep scale.
+        timestep_for_embedding = timestep * self.scheduler.config.num_train_timesteps
+        t_freq = ce.timesteps_proj(timestep_for_embedding)
 
         # Cast to embedder's dtype (avoid int8 quantized layers)
         te_dtype = next(iter(ce.time_embedder.parameters())).dtype
@@ -119,7 +117,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         t_emb = ce.time_embedder(t_freq)
 
-        teacache = self.model_config.teacache
+        teacache = self.pipeline_config.teacache
         if teacache is not None and teacache.use_ret_steps:
             # ret_steps mode: use timestep_proj — what the ret_steps coefficients were calibrated for
             return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
@@ -128,7 +126,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def dtype(self):
-        return self.model_config.torch_dtype
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -166,12 +164,16 @@ class WanImageToVideoPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")
-        self.transformer = WanTransformer3DModel(model_config=self.model_config)
+        self.transformer = WanTransformer3DModel(
+            model_config=self.pipeline_config.model_configs["transformer"]
+        )
 
         # Wan2.2: Optionally create second transformer for two-stage denoising
         if self.boundary_ratio is not None:
             logger.info("Creating second transformer for Wan2.2 I2V two-stage denoising...")
-            self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
+            self.transformer_2 = WanTransformer3DModel(
+                model_config=self.pipeline_config.model_configs["transformer_2"]
+            )
 
     def load_standard_components(
         self,
@@ -217,7 +219,7 @@ class WanImageToVideoPipeline(BasePipeline):
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
-                torch_dtype=self.model_config.torch_dtype,
+                torch_dtype=self.pipeline_config.torch_dtype,
             ).to(device)
 
         if PipelineComponent.VAE not in skip_components:
@@ -306,7 +308,7 @@ class WanImageToVideoPipeline(BasePipeline):
             logger.info("Transformer_2 weights loaded successfully.")
 
         # Cache the target dtype from model config (default: bfloat16)
-        self._target_dtype = self.model_config.torch_dtype
+        self._target_dtype = self.pipeline_config.torch_dtype
 
         # Set model to eval mode
         if self.transformer is not None:
@@ -319,7 +321,7 @@ class WanImageToVideoPipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
-            if self.model_config.cache_backend == "teacache":
+            if self.pipeline_config.cache_backend == "teacache":
                 register_extractor_from_config(
                     ExtractorConfig(
                         model_class_name="WanTransformer3DModel",
@@ -329,18 +331,29 @@ class WanImageToVideoPipeline(BasePipeline):
                 )
 
             if not self.is_wan22_14b:
-                self._setup_cache_acceleration(
-                    self.transformer, coefficients=WAN_I2V_TEACACHE_COEFFICIENTS
-                )
-                self.transformer_cache_backend = self.cache_accelerator
+                self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
+                self._setup_cache_acceleration()
             else:
-                if self.model_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration(self.transformer, coefficients=None)
-                self.transformer_cache_backend = self.cache_accelerator
+                if self.pipeline_config.cache_backend == "cache_dit":
+                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
+
+        if (
+            self.transformer is not None
+            and self.transformer_2 is not None
+            and self.pipeline_config.cache_backend == "teacache"
+        ):
+            tc = self.pipeline_config.teacache
+            if tc.coefficients is None or tc.coefficients_2 is None:
+                raise ValueError(
+                    "Wan 2.2 TeaCache requires explicit teacache.coefficients and "
+                    "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
+                    "There is no built-in coefficient table for Wan 2.2."
+                )
+            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         dummy_image = PIL.Image.new("RGB", (width, height))
@@ -364,7 +377,6 @@ class WanImageToVideoPipeline(BasePipeline):
             is_wan22_14b=self.is_wan22_14b,
             name_or_path=getattr(self.config, "_name_or_path", ""),
             num_heads=getattr(self.config, "num_attention_heads", 40),
-            include_i2v=True,
         )
 
     @property
@@ -411,6 +423,7 @@ class WanImageToVideoPipeline(BasePipeline):
         self,
         image: Union[PIL.Image.Image, torch.Tensor, str],
         prompt: Union[str, List[str]],
+        seed: int,
         negative_prompt: Optional[str] = None,
         height: int = 480,
         width: int = 832,
@@ -419,7 +432,6 @@ class WanImageToVideoPipeline(BasePipeline):
         guidance_scale: Optional[float] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
-        seed: int = 42,
         max_sequence_length: int = 512,
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
@@ -545,7 +557,12 @@ class WanImageToVideoPipeline(BasePipeline):
         last_model_used = [None]
 
         def forward_fn(
-            latents_input, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            latents_input,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             """Forward function for WAN I2V transformer with two-stage support.
 
@@ -597,7 +614,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
             return current_model(
                 hidden_states=latent_model_input,
-                timestep=timestep_input,
+                timestep=timestep_input / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds_to_use,
             )

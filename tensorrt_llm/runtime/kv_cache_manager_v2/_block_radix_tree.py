@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import hashlib
+from array import array
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
@@ -22,6 +23,7 @@ from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCyc
 from ._utils import TypedIndexList, chunked, div_up, filled_list, find_index, unwrap_rawref
 
 if TYPE_CHECKING:
+    from ._event_manager import KVCacheEventManager
     from ._page import CommittedPage
 
 BlockKey = bytes
@@ -90,11 +92,21 @@ class Hasher:
         elif type(data) is bytes:
             self._hasher.update(data)
         else:
-            for item in data:  # type: ignore
-                assert (
-                    NDEBUG or (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
-                )
-                self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
+            # Hash the whole token block in one C call instead of one per token.
+            # array("Q", data).tobytes() packs each int as 8 native-endian bytes;
+            # all NVIDIA GPU host platforms (x86_64, aarch64/Grace) are little-endian
+            # so this is byte-identical to the per-token to_bytes(8, "little") loop.
+            # Falls back to that loop for multimodal blocks (which contain bytes items).
+            try:
+                self._hasher.update(array("Q", data).tobytes())  # type: ignore
+            except (TypeError, OverflowError):
+                for item in data:  # type: ignore
+                    assert (
+                        NDEBUG
+                        or (type(item) is int and (0 <= item < (1 << 64)))
+                        or type(item) is bytes
+                    )
+                    self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
         return self
 
     @property
@@ -119,23 +131,36 @@ Child = TypeVar("Child", bound="Block | RootBlock")
 Children = dict[BlockKey, Child]
 
 
-def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+def try_get_tree(block: "RootBlock | Block") -> "BlockRadixTree | None":
     node = block
     while not isinstance(node, BlockRadixTree):
-        node = node.prev
+        node = node._prev()
+        if node is None:
+            return None
     return node
+
+
+def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+    tree = try_get_tree(block)
+    if tree is None:
+        raise ValueError("Dereferencing a dangling rawref")
+    return tree
 
 
 def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
     ret: list[rawref.ref["CommittedPage"]] = []
+    removed_block_hashes: list[BlockKey] = []
+    tree = try_get_tree(root)
+    event_manager = tree.event_manager if tree is not None else None
     block: "RootBlock | Block" = root
     while True:
         if block.next:
             block = next(iter(block.next.values()))
         else:
             if isinstance(block, Block):
+                removed_block_hashes.append(block.key)
                 ret.extend(p for p in block.storage if p is not None)
                 block.storage = filled_list(None, block.num_life_cycles)
             assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
@@ -153,6 +178,8 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
                 break
             assert not isinstance(prev_block, BlockRadixTree)
             block = prev_block
+    if event_manager is not None:
+        event_manager.add_removed_event(removed_block_hashes)
     return ret
 
 
@@ -229,7 +256,7 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "reuse_scope", "__rawref__")
+    __slots__ = ("__rawref__", "_prev", "key", "next", "reuse_scope")
     key: BlockKey
     reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
@@ -274,7 +301,7 @@ class Block:
     A block of tokens. Manages data for all layers.
     """
 
-    __slots__ = ("key", "tokens", "ordinal", "_prev", "next", "storage", "__rawref__")
+    __slots__ = ("__rawref__", "_prev", "key", "next", "ordinal", "storage", "tokens")
     key: BlockKey
     tokens: Sequence[TokenIdExt]
     ordinal: BlockOrdinal
@@ -313,8 +340,11 @@ class Block:
             if len(b.tokens) < len(tokens) and tokens[: len(b.tokens)] == b.tokens:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
+        event_manager = get_tree(prev).event_manager if to_remove else None
         for k in to_remove:
             b = prev.next.pop(k)
+            if event_manager is not None:
+                event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
@@ -352,6 +382,8 @@ class Block:
             return
         ordinal = self.ordinal
         self.storage[lc_idx] = None
+        tree = try_get_tree(self)
+        event_manager = tree.event_manager if tree is not None else None
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
             pages = remove_subtree(self)
             for r in pages:
@@ -360,6 +392,8 @@ class Block:
                     assert page.status == PageStatus.DROPPABLE
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
+        elif event_manager is not None:
+            event_manager.add_removed_life_cycle_event(self.key, int(lc_idx))
         # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g.
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
@@ -371,6 +405,8 @@ class Block:
         ):
             if curr.key in curr.prev.next:
                 curr.prev.next.pop(curr.key)
+                if event_manager is not None:
+                    event_manager.add_removed_event(curr.key)
             curr = curr.prev
 
     @property
@@ -389,15 +425,28 @@ class Block:
 
 
 class BlockRadixTree:
-    __slots__ = ("_life_cycles", "_tokens_per_block", "next", "__rawref__")
+    __slots__ = (
+        "__rawref__",
+        "_event_manager",
+        "_life_cycles",
+        "_tokens_per_block",
+        "next",
+    )
     _life_cycles: LifeCycleRegistry
     _tokens_per_block: int
+    _event_manager: "KVCacheEventManager | None"
     next: Children[RootBlock]
     __rawref__: rawref.ref["BlockRadixTree"]
 
-    def __init__(self, life_cycles: LifeCycleRegistry, tokens_per_block: int) -> None:
+    def __init__(
+        self,
+        life_cycles: LifeCycleRegistry,
+        tokens_per_block: int,
+        event_manager: "KVCacheEventManager | None" = None,
+    ) -> None:
         self._life_cycles = life_cycles
         self._tokens_per_block = tokens_per_block
+        self._event_manager = event_manager
         self.next = {}
         self.__rawref__ = rawref.NULL
 
@@ -417,6 +466,10 @@ class BlockRadixTree:
     @property
     def life_cycles(self) -> LifeCycleRegistry:
         return self._life_cycles
+
+    @property
+    def event_manager(self) -> "KVCacheEventManager | None":
+        return self._event_manager
 
     @property
     def num_life_cycles(self) -> LifeCycleId:

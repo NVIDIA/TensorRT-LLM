@@ -124,6 +124,9 @@ class TuningConfig:
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
         distributed_tuning_strategy (DistributedTuningStrategy): Strategy for distributed tuning.
+        exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
+            Use for JIT-driven ops where caching the tactic across processes would skip
+            the JIT warmup. In-process cache still works.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -132,6 +135,7 @@ class TuningConfig:
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
+    exclude_from_cache: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -359,6 +363,32 @@ class AutoTunerStatistics:
         return stats_str
 
 
+@contextlib.contextmanager
+def _exclusive_cache_lock(lock_path: Path):
+    """Cross-node-correct exclusive lock used by save_cache/load_cache.
+
+    POSIX byte-range lock (`fcntl.lockf`) held on a SEPARATE lockfile
+    (not the data file), which avoids the truncate / rename complications
+    of locking the file you're also rewriting. The lockfile is persistent;
+    the kernel releases the lock when the holding fd is closed — including
+    on process death, so there is no stale-lock cleanup path to maintain.
+
+    Both readers and writers use LOCK_EX: read/write frequencies on the
+    autotuner cache are similar and the simpler "always exclusive" model
+    avoids reader/writer-priority pitfalls on networked filesystems.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 class AutoTunerProfilingCache:
     """AutoTunerCache for caching profiling results.
 
@@ -383,6 +413,11 @@ class AutoTunerProfilingCache:
         # Maps custom_op name -> DistributedTuningStrategy
         self.independent_op: Set[str] = set()
 
+        # Ops whose tuning results must NOT be persisted to disk (see the
+        # `exclude_from_cache` field on TuningConfig). Populated lazily
+        # from choose_one when an excluded op is first seen.
+        self.excluded_op: Set[str] = set()
+
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
         self.creation_timestamp = time.time()
@@ -402,6 +437,7 @@ class AutoTunerProfilingCache:
     def clear(self) -> None:
         self.cache.clear()
         self.independent_op.clear()
+        self.excluded_op.clear()
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -471,6 +507,19 @@ class AutoTunerProfilingCache:
         if strategy != DistributedTuningStrategy.INDEPENDENT:
             self.independent_op.add(custom_op)
 
+    def add_excluded_op(self, custom_op: str) -> None:
+        """Mark `custom_op` as excluded from disk persistence.
+
+        Entries for excluded ops still live in the in-memory cache (so
+        within one process the lookup-and-reuse path works normally),
+        but `_partition_cache_by_strategy` will drop them at `save_cache`
+        time so they are never written to disk. Combined with the
+        force-retune branch in `AutoTuner.choose_one`, this guarantees
+        the tuning process (and any JIT warmup it triggers as a side
+        effect) re-runs on every process startup.
+        """
+        self.excluded_op.add(custom_op)
+
     def _partition_cache_by_strategy(
             self) -> Tuple[Dict[Tuple, Tuple], Dict[Tuple, Tuple]]:
         """Partition cache entries into shared and rank-specific caches.
@@ -479,12 +528,16 @@ class AutoTunerProfilingCache:
             A tuple of (shared_cache, rank_cache) where:
             - shared_cache: entries for non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL)
             - rank_cache: entries for INDEPENDENT ops
+            Entries belonging to `self.excluded_op` are dropped from both
+            partitions so they never reach disk.
         """
         shared_cache = {}
         rank_cache = {}
 
         for key, value in self.cache.items():
             custom_op = key[0]  # First element of cache key is custom_op name
+            if custom_op in self.excluded_op:
+                continue
             if custom_op not in self.independent_op:
                 rank_cache[key] = value
             else:
@@ -498,6 +551,7 @@ class AutoTunerProfilingCache:
         Cache entries are organized based on distributed strategy:
         - INDEPENDENT ops are saved per-rank (rank_0, rank_1, ...)
         - Non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL) are saved in a shared dict
+        - Ops marked `exclude_from_cache=True` are dropped entirely.
 
         Args:
             file_path: Path where to save the cache
@@ -509,9 +563,28 @@ class AutoTunerProfilingCache:
         Note:
             The cache is saved in JSON format which provides human-readable output.
             Some type information may be lost for complex tactic objects.
+
+            Concurrency model:
+            * Cross-process mutual exclusion uses POSIX byte-range locks
+              (`fcntl.lockf`) on a SEPARATE lockfile next to the data
+              file. The lockfile is persistent (never unlinked); the
+              kernel auto-releases the lock when the holding fd is
+              closed, including on crash, so no stale-lock cleanup is
+              needed. Both readers and writers take LOCK_EX — read/write
+              frequencies are similar here and the simpler logic is
+              worth more than read parallelism.
+            * The data file itself is replaced atomically via
+              (write-to-tmp + fsync + rename). A writer killed at any
+              point leaves a discardable .tmp file; `file_path` is never
+              partially written, so concurrent readers always see a
+              fully-formed JSON document.
+            * The on-disk rank-specific dict is MERGED (not replaced)
+              with this writer's contribution so a concurrent writer
+              that loaded earlier does not get its entries clobbered.
         """
         file_path = Path(file_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._lock_path_for(file_path)
 
         try:
             # Partition cache into shared (non-INDEPENDENT) and rank-specific (INDEPENDENT)
@@ -520,18 +593,8 @@ class AutoTunerProfilingCache:
             serialized_shared_cache = self._serialize_cache_data(shared_cache)
             serialized_rank_cache = self._serialize_cache_data(rank_cache)
 
-            with open(file_path, 'a+') as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    current_cache = json.loads(content)
-                else:
-                    current_cache = {
-                        "metadata": self._serialize_metadata(),
-                    }
-                f.seek(0)
-                f.truncate()
+            with _exclusive_cache_lock(lock_path):
+                current_cache = self._read_existing_cache(file_path)
 
                 # Merge shared cache entries (non-INDEPENDENT ops)
                 if self.SHARED_CACHE_KEY not in current_cache:
@@ -539,16 +602,58 @@ class AutoTunerProfilingCache:
                 current_cache[self.SHARED_CACHE_KEY].update(
                     serialized_shared_cache)
 
-                # Save rank-specific cache entries (INDEPENDENT ops)
-                current_cache[f"rank_{rank}"] = serialized_rank_cache
+                # Merge rank-specific cache entries (INDEPENDENT ops).
+                # MUST be a merge (not assignment): a concurrent writer
+                # that committed its rank_{rank} contribution between
+                # this writer's load_cache and save_cache would otherwise
+                # be silently dropped by an `=` assignment that re-writes
+                # the slot with only this writer's in-memory cache.
+                rank_key = f"rank_{rank}"
+                if rank_key not in current_cache:
+                    current_cache[rank_key] = {}
+                current_cache[rank_key].update(serialized_rank_cache)
 
-                json.dump(current_cache, f, indent=2, default=str)
+                self._atomic_write_json(file_path, current_cache)
             logger.info(
                 f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
             )
         except Exception as e:
             logger.error(f"[AutoTuner] Failed to save cache with JSON: {e}")
             raise
+
+    @staticmethod
+    def _lock_path_for(file_path: Path) -> Path:
+        """Return the lockfile path that pairs with `file_path`."""
+        return file_path.with_name(file_path.name + ".lock")
+
+    def _read_existing_cache(self, file_path: Path) -> Dict[str, Any]:
+        """Read the data file (best-effort) under the caller's lock."""
+        if not file_path.exists():
+            return {"metadata": self._serialize_metadata()}
+        try:
+            with open(file_path, "r") as f:
+                content = f.read()
+            if not content.strip():
+                return {"metadata": self._serialize_metadata()}
+            return json.loads(content)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            # An earlier writer from a pre-fix version may have left a
+            # corrupted file behind. Don't fail the current save — start
+            # from a fresh dict and overwrite atomically.
+            logger.warning(f"[AutoTuner] Could not parse existing cache at "
+                           f"{file_path}: {e!r}; starting from a fresh dict.")
+            return {"metadata": self._serialize_metadata()}
+
+    @staticmethod
+    def _atomic_write_json(file_path: Path, payload: Dict[str, Any]) -> None:
+        """Write `payload` to `file_path` atomically (tmp + fsync + rename)."""
+        tmp_path = file_path.with_name(
+            f".{file_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, file_path)
 
     def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Load the profiling cache from disk in JSON format.
@@ -572,11 +677,13 @@ class AutoTunerProfilingCache:
         if not file_path.exists():
             raise FileNotFoundError(f"Cache file not found: {file_path}")
 
+        lock_path = self._lock_path_for(file_path)
         try:
-            with open(file_path, 'r') as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                current_cache_contents = json.load(f)
-                self._deserialize_metadata(current_cache_contents["metadata"])
+            with _exclusive_cache_lock(lock_path):
+                with open(file_path, "r") as f:
+                    current_cache_contents = json.load(f)
+            self._deserialize_metadata(
+                current_cache_contents.get("metadata", {}))
 
             # Start with empty cache and independent ops set
             self.cache = {}
@@ -708,6 +815,36 @@ class AutoTunerProfilingCache:
             cache[key] = (runner_id, tactic, min_time)
 
         return cache
+
+
+def _spec_in_bounds(spec, shapes_list) -> bool:
+    """Validate that spec.input_idx and spec.dim_idx are in range for shapes_list.
+
+    On out-of-bounds access, log a warning and return False. Otherwise return True.
+    Pass the SHAPE LIST (list-of-lists or equivalent indexable), not the wrapping
+    object. Both ``OptimizationProfile.shapes`` and the raw list-of-lists
+    ``base_profile`` used inside :meth:`AutoTuner._find_nearest_profile` are valid
+    inputs because the helper only uses ``len(...)`` and indexing.
+
+    Args:
+        spec: A ``DynamicTensorSpec`` or ``ConstraintSpec`` with ``input_idx`` and
+            ``dim_idx`` attributes. The spec's class name is used in the warning
+            message.
+        shapes_list: An indexable container of per-input shape lists.
+    """
+    spec_kind = type(spec).__name__
+    if spec.input_idx < 0 or spec.input_idx >= len(shapes_list):
+        logger.warning(
+            f"[Autotuner] Skipping {spec_kind} with input_idx={spec.input_idx}: "
+            f"only {len(shapes_list)} inputs available.")
+        return False
+    if spec.dim_idx < 0 or spec.dim_idx >= len(shapes_list[spec.input_idx]):
+        logger.warning(
+            f"[Autotuner] Skipping {spec_kind} with dim_idx={spec.dim_idx} for "
+            f"input {spec.input_idx}: shape has only "
+            f"{len(shapes_list[spec.input_idx])} dims.")
+        return False
+    return True
 
 
 class AutoTuner:
@@ -935,12 +1072,28 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
-        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-            custom_op,
-            runners,
-            input_shapes,
-            tuning_config,
-            apply_map_to_tuning_buckets=True)
+
+        # For ops opted out of the persistent cache (e.g. JIT-driven
+        # kernels whose "tuning" triggers compilation as a side effect),
+        # mark them in the cache so save_cache filters them out, and
+        # — in tuning mode — force the full profile path so the JIT
+        # warmup actually runs even if a stale on-disk entry was loaded.
+        # In inference mode we still consult the in-process cache, which
+        # was populated by this process's own warmup.
+        if tuning_config.exclude_from_cache:
+            self.profiling_cache.add_excluded_op(custom_op)
+        if tuning_config.exclude_from_cache and self.is_tuning_mode:
+            is_cache_hit = False
+            best_runner_id, best_tactic, min_time = (
+                self.profiling_cache.fallback_entry())
+        else:
+            is_cache_hit, best_runner_id, best_tactic, min_time = (
+                self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=True))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1047,6 +1200,15 @@ class AutoTuner:
         # If the inputs_pre_hook is provided, it will be called before profiling.
         if tuning_config.inputs_pre_hook is not None:
             input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+
+        # Pre-walk the runners so we know the total candidate (runner, tactic)
+        # pair count before deciding whether to short-circuit profiling. The
+        # count is taken BEFORE distributed-strategy splitting; the PARALLEL
+        # strategy can leave a rank with one tactic locally even though the
+        # full set has several, and that case must still go through the
+        # timed profile path so the merge picks a real winner.
+        candidates = []
+        total_pairs = 0
         for runner_id, runner in enumerate(runners):
             # TODO: use FakeTensor here.
             runner_arg_names = {
@@ -1055,61 +1217,103 @@ class AutoTuner:
             }
             all_valid_tactics = runner.get_valid_tactics(
                 input_tensors, profile, **kwargs)
+            total_pairs += len(all_valid_tactics)
+            candidates.append(
+                (runner_id, runner, runner_arg_names, all_valid_tactics))
 
-            valid_tactics = self._maybe_parallelize_tactics(
-                all_valid_tactics, tuning_config.distributed_tuning_strategy)
-            if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
-                runner(
-                    input_tensors,
-                    tactic=-1,
-                    do_preparation=True,
-                    **kwargs,
+        if total_pairs == 1:
+            # Single-pair shortcut. There is nothing to compare against, so
+            # the timed warmup + profile-repeat loop is pure overhead. We
+            # fire one forward call on every rank to drive any JIT side
+            # effects (e.g. DeepGEMM cubin compile for fp8_swap_ab_gemm),
+            # then record the pair in the cache directly. `do_preparation`
+            # still runs for runners that opt into it.
+            runner_id, runner, runner_arg_names, valid_tactics = next(
+                c for c in candidates if len(c[3]) == 1)
+            tac = valid_tactics[0]
+            if "do_preparation" in runner_arg_names:
+                runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
+            try:
+                with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
+                    runner(input_tensors, tactic=tac, **kwargs)
+                best_runner_id, best_tactic = runner_id, tac
+                # No comparable measurement exists; min_time stays 0.0 to
+                # distinguish "recorded without profiling" from a real
+                # timing.
+                min_time = 0.0
+            except Exception as e:
+                shapes = self._get_input_sizes(input_tensors)
+                logger.warning_once(
+                    f"[Autotuner] Single-pair run failed for custom_op={custom_op}, runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
+                    key=(custom_op, "warning_autotuning_single_pair_failure"),
                 )
-
-            for tac in valid_tactics:
-                try:
-                    with nvtx_range(f"r{runner_id}, tactic {tac}"):
-                        time_measured = self._profile_single_kernel(
-                            runner=runner,
-                            inputs=input_tensors,
-                            tactic=tac,
-                            tuning_config=tuning_config,
-                            use_cuda_graph=tuning_config.use_cuda_graph,
-                            **kwargs,
-                        )
-                except Exception as e:
-                    # Synchronize to clear any pending CUDA errors left by the
-                    # failed tactic.  Without this, the stale error propagates
-                    # to subsequent CUDA/cuBLAS calls in the forward pass
-                    # (observed as CUBLAS_STATUS_EXECUTION_FAILED on SM103).
-                    try:
-                        torch.cuda.synchronize()
-                    except Exception:
-                        pass
-
-                    # Handle None tensors for optional inputs
-                    shapes = self._get_input_sizes(input_tensors)
-                    logger.warning_once(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
-                        key=(custom_op, "warning_autotuning_profile_failure"),
+                self.stats.failed_profiling_count[custom_op].add(
+                    self.profiling_cache.get_cache_key(
+                        custom_op,
+                        runner,
+                        profile.get_opt_shapes(),
+                        tuning_config,
+                        apply_map_to_tuning_buckets=False))
+                has_tuning_failure_occurred = True
+        else:
+            for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
+                valid_tactics = self._maybe_parallelize_tactics(
+                    all_valid_tactics,
+                    tuning_config.distributed_tuning_strategy)
+                if "do_preparation" in runner_arg_names and len(
+                        valid_tactics) > 0:
+                    runner(
+                        input_tensors,
+                        tactic=-1,
+                        do_preparation=True,
+                        **kwargs,
                     )
 
-                    # Record the failed profiling combinations
-                    self.stats.failed_profiling_count[custom_op].add(
-                        self.profiling_cache.get_cache_key(
-                            custom_op,
-                            runner,
-                            profile.get_opt_shapes(),
-                            tuning_config,
-                            apply_map_to_tuning_buckets=False))
+                for tac in valid_tactics:
+                    try:
+                        with nvtx_range(f"r{runner_id}, tactic {tac}"):
+                            time_measured = self._profile_single_kernel(
+                                runner=runner,
+                                inputs=input_tensors,
+                                tactic=tac,
+                                tuning_config=tuning_config,
+                                use_cuda_graph=tuning_config.use_cuda_graph,
+                                **kwargs,
+                            )
+                    except Exception as e:
+                        # Synchronize to clear any pending CUDA errors left by the
+                        # failed tactic.  Without this, the stale error propagates
+                        # to subsequent CUDA/cuBLAS calls in the forward pass
+                        # (observed as CUBLAS_STATUS_EXECUTION_FAILED on SM103).
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
 
-                    # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
-                    # or some runtime error occurs during profiling.
-                    time_measured = float('inf')
-                    has_tuning_failure_occurred = True
-                if time_measured < min_time:
-                    min_time = time_measured
-                    best_runner_id, best_tactic = runner_id, tac
+                        # Handle None tensors for optional inputs
+                        shapes = self._get_input_sizes(input_tensors)
+                        logger.warning_once(
+                            f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
+                            key=(custom_op,
+                                 "warning_autotuning_profile_failure"),
+                        )
+
+                        # Record the failed profiling combinations
+                        self.stats.failed_profiling_count[custom_op].add(
+                            self.profiling_cache.get_cache_key(
+                                custom_op,
+                                runner,
+                                profile.get_opt_shapes(),
+                                tuning_config,
+                                apply_map_to_tuning_buckets=False))
+
+                        # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
+                        # or some runtime error occurs during profiling.
+                        time_measured = float('inf')
+                        has_tuning_failure_occurred = True
+                    if time_measured < min_time:
+                        min_time = time_measured
+                        best_runner_id, best_tactic = runner_id, tac
 
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
@@ -1310,6 +1514,8 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
+            if not _spec_in_bounds(spec, base_profile.shapes):
+                continue
             if self.skip_dynamic_tuning_buckets:
                 if spec.map_to_tuning_buckets is not None:
                     # Still include the bucketed value of the actual shape so the
@@ -1367,10 +1573,12 @@ class AutoTuner:
 
             # Adjust the profile to satisfy the constraints
             for spec in tuning_config.constraint_specs:
-                min_value = opt_value = max_value = spec.infer_shape(
-                    p.get_opt_shapes())
+                if not _spec_in_bounds(spec, p.shapes):
+                    continue
                 if p.shapes[spec.input_idx] == [StaticDim(0)]:
                     continue
+                min_value = opt_value = max_value = spec.infer_shape(
+                    p.get_opt_shapes())
                 p.shapes[spec.input_idx][spec.dim_idx] = DynamicDim(
                     min_value, opt_value, max_value)
             generated_profiles.append(p)
@@ -1404,6 +1612,12 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in dynamic_tensor_specs:
+            # Bounds check: skip specs that reference inputs or dimensions not present in the
+            # current shapes tuple. This can happen on hardware (e.g. SM121 / DGX Spark) where
+            # ops produce fewer or differently-shaped tensors than the specs were authored for.
+            if not _spec_in_bounds(spec, base_profile):
+                continue
+
             # During runtime: apply map_to_tuning_buckets to map input to bucket
             # During tuning: no mapper, use raw bucket value
             if apply_map_to_tuning_buckets:
@@ -1418,6 +1632,9 @@ class AutoTuner:
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for spec in constraint_specs:
+            # Bounds check: same defensive guard as above for constraint specs.
+            if not _spec_in_bounds(spec, base_profile):
+                continue
             if base_profile[spec.input_idx] == [0]:
                 continue
             base_profile[spec.input_idx][spec.dim_idx] = -1
@@ -1468,8 +1685,7 @@ class AutoTuner:
         if dtype == torch.float4_e2m1fn_x2:
             return (torch.rand(shapes, device=device) * 10 - 5).to(
                 torch.uint8).view(dtype)
-        else:
-            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+        return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,

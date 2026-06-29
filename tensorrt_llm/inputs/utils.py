@@ -27,8 +27,7 @@ from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
-from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
-                                            default_hasher)
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
@@ -36,6 +35,7 @@ from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
@@ -653,8 +653,8 @@ def apply_chat_template(
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
-    # Handle DeepSeek V32 tokenizer with custom chat template
-    if isinstance(tokenizer, DeepseekV32Tokenizer):
+    # Handle DeepSeek tokenizers with custom chat templates.
+    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,
@@ -894,14 +894,3 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
-
-
-def get_cache_salt_id(cache_salt: str) -> int:
-    b = cache_salt.encode("utf-8")
-    h = default_hasher(b).digest(length=8)
-    cache_salt_id = int.from_bytes(h, "little", signed=False)
-    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
-        raise ValueError(
-            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
-
-    return cache_salt_id
