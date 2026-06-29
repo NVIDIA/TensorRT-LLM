@@ -83,7 +83,8 @@ def is_diffusers_model_path(model_path: str) -> bool:
     return True
 
 
-def is_registered_trtllm_model_path(model_path: str) -> bool:
+def has_registered_llm_architecture(model_path: str) -> bool:
+    """Return whether the model declares a registered LLM/VLM runtime architecture."""
     config_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_path):
         return False
@@ -108,11 +109,11 @@ def get_is_diffusion_only_model(model_path: str):
     # Some checkpoints ship a diffusers layout (model_index.json) alongside a
     # regular language/vision-language model (e.g. Cosmos3-Nano). Prefer the
     # regular model path in that case and only treat the checkpoint as a pure
-    # diffusion model when no registered TRT-LLM architecture is present.
-    if is_registered_trtllm_model_path(model_path):
+    # diffusion model when no registered LLM/VLM architecture is present.
+    if has_registered_llm_architecture(model_path):
         logger.info(
             "Diffusers layout detected, but the checkpoint also advertises a "
-            "registered TRT-LLM architecture; treating it as a language model."
+            "registered LLM/VLM architecture; treating it as a language model."
         )
         return False
 

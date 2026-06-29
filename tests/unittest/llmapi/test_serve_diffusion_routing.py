@@ -26,7 +26,7 @@ import json
 from tensorrt_llm.commands.utils import get_is_diffusion_only_model
 
 # `is_diffusers_model_path` only checks for `_diffusers_version`, and
-# `is_registered_trtllm_model_path` only reads `architectures`, so the minimal
+# `has_registered_llm_architecture` only reads `architectures`, so the minimal
 # fixtures below carry just those single fields.
 _DIFFUSERS_MODEL_INDEX = {"_diffusers_version": "0.30.0"}
 _REGISTERED_ARCH_CONFIG = {"architectures": ["Cosmos3ForConditionalGeneration"]}
