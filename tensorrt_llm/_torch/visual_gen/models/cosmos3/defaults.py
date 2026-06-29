@@ -122,6 +122,7 @@ COSMOS3_PIPELINE_DEFAULTS = {
     "guidance_scale": None,
 }
 
+COSMOS3_V2V_DEFAULT_FLOW_SHIFT = 10.0
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
@@ -193,4 +194,26 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         ),
         validator=_validate_video_reference,
     ),
+    # Transfer
+    "edge": ExtraParamSchema(
+        type="bool_or_str_or_dict",
+        default=None,
+        description="Edge transfer control"
+    ),
+    "blur": ExtraParamSchema(type="bool_or_str_or_dict", default=None, description="Blur transfer control."),
+    "depth": ExtraParamSchema(type="bool_or_str_or_dict", default=None, description="Depth transfer control."),
+    "seg": ExtraParamSchema(type="bool_or_str_or_dict", default=None, description="Segmentation transfer control."),
+    "wsm": ExtraParamSchema(type="bool_or_str_or_dict", default=None, description="World scenario model transfer control."),
+
+    # TODO: 
+    "control_guidance": ExtraParamSchema(type="float", default=None),
+    "control_guidance_interval": ExtraParamSchema(type="list", default=None),
+    "resolution": ExtraParamSchema(type="str", default=None),
+    "num_video_frames_per_chunk": ExtraParamSchema(type="int", default=None),
+    "num_conditional_frames": ExtraParamSchema(type="int", default=None),
+    "num_first_chunk_conditional_frames": ExtraParamSchema(type="int", default=None),
+    "max_frames": ExtraParamSchema(type="int", default=None),
+    "show_control_condition": ExtraParamSchema(type="bool", default=False),
+    "show_input": ExtraParamSchema(type="bool", default=False),
+    "share_vision_temporal_positions": ExtraParamSchema(type="bool", default=None),
 }
