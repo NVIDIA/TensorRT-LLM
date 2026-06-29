@@ -665,6 +665,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
 
     def prepare(self):
+        assert self.kv_cache_manager is not None
+        assert self.request_ids is not None
+
+        self.kv_cache_manager.compute_sliding_block_tables(
+            self.request_ids,
+            self.num_contexts,
+        )
+
         TrtllmAttentionMetadata.prepare(self)
 
         num_requests = self.num_contexts + self.num_generations
