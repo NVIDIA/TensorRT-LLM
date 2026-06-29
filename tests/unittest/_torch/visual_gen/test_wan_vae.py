@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
@@ -35,34 +36,22 @@ def _wan22_ti2v_checkpoint() -> Path:
 def _require_wan22_ti2v_checkpoint() -> Path:
     checkpoint_dir = _wan22_ti2v_checkpoint()
     if not checkpoint_dir.exists():
-        pytest.skip(
+        raise FileNotFoundError(
             f"Wan2.2 TI2V checkpoint not found at {checkpoint_dir}. "
             "Set WAN22_TI2V_MODEL_PATH or LLM_MODELS_ROOT."
         )
     return checkpoint_dir
 
 
-def _require_cuda_memory(min_gb: int) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("Wan VAE checkpoint parity requires CUDA.")
-    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    if total_gb < min_gb:
-        pytest.skip(f"Wan VAE checkpoint parity requires at least {min_gb} GB GPU memory.")
-
-
 def _make_reference_and_wan_vae(
     checkpoint_dir: Path,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
-    wan_autoencoder = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_wan")
-
     vae_dir = checkpoint_dir / "vae"
     reference_vae = (
-        wan_autoencoder.AutoencoderKLWan.from_pretrained(str(vae_dir), torch_dtype=DTYPE)
-        .to(DEVICE)
-        .eval()
+        AutoencoderKLWan.from_pretrained(str(vae_dir), torch_dtype=DTYPE).to(DEVICE).eval()
     )
     wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
-    wan_vae.load_diffusers_state_dict(reference_vae.state_dict(), strict=True)
+    wan_vae.load_state_dict(reference_vae.state_dict(), strict=True)
     wan_vae = wan_vae.to(device=DEVICE, dtype=DTYPE).eval()
 
     return reference_vae, wan_vae
@@ -99,7 +88,6 @@ def _conv_weight_layout_counts(model: torch.nn.Module) -> dict[str, int]:
 
 
 def test_load_wan_vae_checkpoint_selection(monkeypatch):
-    wan_autoencoder = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_wan")
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     device = torch.device("cpu")
 
@@ -110,7 +98,7 @@ def test_load_wan_vae_checkpoint_selection(monkeypatch):
 
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "1")
     reference_vae = load_wan_vae(str(checkpoint_dir), device)
-    assert isinstance(reference_vae, wan_autoencoder.AutoencoderKLWan)
+    assert isinstance(reference_vae, AutoencoderKLWan)
 
 
 def test_use_native_wan_vae_selects_native_unless_parallel(monkeypatch):
@@ -126,14 +114,14 @@ def test_use_native_wan_vae_selects_native_unless_parallel(monkeypatch):
 
 
 @pytest.mark.parametrize("fallback_value", ["1", "2", "-1"])
-def test_wan_vae_backend_fallback_forces_diffusers(monkeypatch, fallback_value):
+def test_use_diffuser_vae_env_forces_diffusers(monkeypatch, fallback_value):
     single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
 
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, fallback_value)
     assert not _use_native_wan_vae(single_gpu_mapping)
 
 
-def test_wan_vae_zero_backend_fallback_keeps_native_vae(monkeypatch):
+def test_use_diffuser_vae_env_zero_keeps_native(monkeypatch):
     single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
 
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "0")
@@ -141,20 +129,18 @@ def test_wan_vae_zero_backend_fallback_keeps_native_vae(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("case_name", "height", "width", "min_gpu_memory_gb"),
+    ("case_name", "height", "width"),
     [
-        ("360p", 352, 640, 40),
-        ("720p", 704, 1280, 80),
+        ("360p", 352, 640),
+        ("720p", 704, 1280),
     ],
 )
 def test_wan_vae_matches_diffusers_decode_checkpoint(
     case_name: str,
     height: int,
     width: int,
-    min_gpu_memory_gb: int,
 ):
     del case_name
-    _require_cuda_memory(min_gpu_memory_gb)
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
 
@@ -191,20 +177,18 @@ def test_wan_vae_matches_diffusers_decode_checkpoint(
 
 
 @pytest.mark.parametrize(
-    ("case_name", "height", "width", "min_gpu_memory_gb"),
+    ("case_name", "height", "width"),
     [
-        ("360p", 352, 640, 40),
-        ("720p", 704, 1280, 80),
+        ("360p", 352, 640),
+        ("720p", 704, 1280),
     ],
 )
 def test_wan_vae_matches_diffusers_encode_checkpoint(
     case_name: str,
     height: int,
     width: int,
-    min_gpu_memory_gb: int,
 ):
     del case_name
-    _require_cuda_memory(min_gpu_memory_gb)
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     reference_vae, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
 
@@ -235,10 +219,3 @@ def test_wan_vae_matches_diffusers_encode_checkpoint(
         max_abs=2e-3,
         relative_mean=1e-3,
     )
-
-
-def test_wan_vae_tiling_fails_early():
-    wan_vae = WanVAE()
-
-    with pytest.raises(NotImplementedError, match="does not support tiled encode/decode"):
-        wan_vae.enable_tiling()

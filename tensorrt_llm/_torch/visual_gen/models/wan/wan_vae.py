@@ -992,9 +992,6 @@ class WanVAE(nn.Module):
             is_residual=config.is_residual,
         )
 
-        self.spatial_compression_ratio = config.scale_factor_spatial
-        self.use_slicing = False
-        self.use_tiling = False
         # Wan VAE always runs in channels-last: convert every conv weight's
         # memory format up front so weights and activations share one layout.
         for module in self.modules():
@@ -1014,16 +1011,6 @@ class WanVAE(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def load_diffusers_state_dict(
-        self,
-        state_dict: dict[str, torch.Tensor],
-        strict: bool = True,
-    ) -> Any:
-        return self.load_state_dict(state_dict, strict=strict)
-
-    def enable_tiling(self, *_args: Any, **_kwargs: Any) -> None:
-        raise NotImplementedError("WanVAE does not support tiled encode/decode yet")
-
     def clear_cache(self) -> None:
         self._conv_num = self._cached_conv_counts["decoder"]
         self._conv_idx = [0]
@@ -1034,9 +1021,6 @@ class WanVAE(nn.Module):
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         _, _, num_frame, _, _ = x.shape
-
-        if self.use_tiling:
-            raise NotImplementedError("WanVAE tiled encode is not implemented")
 
         self.clear_cache()
         if self.config.patch_size is not None:
@@ -1074,11 +1058,7 @@ class WanVAE(nn.Module):
         x: torch.Tensor,
         return_dict: bool = True,
     ) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
-        if self.use_slicing and x.shape[0] > 1:
-            encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
-            h = torch.cat(encoded_slices)
-        else:
-            h = self._encode(x)
+        h = self._encode(x)
         posterior = DiagonalGaussianDistribution(h)
         if not return_dict:
             return (posterior,)
@@ -1088,9 +1068,6 @@ class WanVAE(nn.Module):
         self, z: torch.Tensor, return_dict: bool = True
     ) -> DecoderOutput | tuple[torch.Tensor]:
         _, _, num_frame, _, _ = z.shape
-
-        if self.use_tiling:
-            raise NotImplementedError("WanVAE tiled decode is not implemented")
 
         self.clear_cache()
         z = _channels_last_3d_if_needed(z)
@@ -1124,11 +1101,7 @@ class WanVAE(nn.Module):
     def decode(
         self, z: torch.Tensor, return_dict: bool = True
     ) -> DecoderOutput | tuple[torch.Tensor]:
-        if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
-            decoded = torch.cat(decoded_slices)
-        else:
-            decoded = self._decode(z).sample
+        decoded = self._decode(z).sample
 
         if not return_dict:
             return (decoded,)
