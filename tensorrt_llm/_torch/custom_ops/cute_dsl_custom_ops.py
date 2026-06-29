@@ -7544,6 +7544,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 out_dtype,
                 mma_qk_tiler_mn,
                 mma_pv_tiler_mn,
+                # split_kv is baked into the kernel grid at ``cute.compile``
+                # time (``cutlass.Int32(split_kv)`` below). It is NOT in
+                # ``unique_id``, so it MUST be part of the cache key: reusing a
+                # kernel compiled for a different split_kv launches the wrong
+                # split-KV grid (out-of-bounds workspace writes).
+                split_kv,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -7590,8 +7596,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 page_table_ct = cute.runtime.from_dlpack(
                     page_table,
                     assumed_align=16).mark_layout_dynamic(leading_dim=0)
+                # Mark the (dense) output tensor as compact with a
+                # divisibility=16-byte stride hint. ``o`` is a permuted view of
+                # a freshly-allocated contiguous [B, S_q, H, d_latent] buffer
+                # ([H, d_latent, S_q, B] with d_latent innermost), so it IS
+                # compact -- unlike the rope-interleaved q/c KV views, which are
+                # not and must stay mark_layout_dynamic only. Without this the
+                # compiler emits conservative addressing for the whole kernel
+                # (~+7% SASS instrs, ~37% more long-scoreboard stalls) and the
+                # decode kernel runs ~1.7x slower (44us -> 26us at B64/H16/KV2k).
+                # stride_order (3,2,0,1) = B outer, S_q, H, d_latent innermost.
                 o_ct = cute.runtime.from_dlpack(
-                    o, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+                    o, assumed_align=16).mark_layout_dynamic(
+                        leading_dim=1).mark_compact_shape_dynamic(
+                            mode=1,
+                            stride_order=(3, 2, 0, 1),
+                            divisibility=(128 // out_dtype.width))
                 lse_ct = cute.runtime.from_dlpack(
                     lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
                 # An empty workspace means split_kv == 1: the kernel's

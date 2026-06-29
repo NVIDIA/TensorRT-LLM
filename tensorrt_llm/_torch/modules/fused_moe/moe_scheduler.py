@@ -584,22 +584,37 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Empty-chunk substitution (DP only) ==========
         chunked_used = torch.ones(num_chunks, dtype=torch.bool)
         if moe.use_dp:
-            # The split heuristic guarantees chunk 0 has >= 1 token, so it can
-            # stand in for any empty chunk on this rank. Without substitution,
-            # the per-chunk dispatch would launch with 0-token shape and the
-            # peers would see a barrier mismatch.
+            # When ranks carry different token counts (e.g. attention-DP with an
+            # imbalanced batch), split_chunk can leave a chunk empty on some
+            # ranks but not others. The split heuristic guarantees chunk 0 has
+            # >= 1 token, so it can stand in for any empty chunk on a rank.
+            # Without substitution, the per-chunk dispatch would launch with a
+            # 0-token shape and the peers would see a barrier mismatch.
+            #
+            # The dispatch is a variable-size all-gather, so its `sizes`
+            # (= all_rank_num_tokens_list[idx_chunk]) MUST be identical on every
+            # rank. Emptiness is deterministic from the cross-rank-consistent
+            # all_rank_num_tokens_list, so every rank applies the SAME
+            # substitution to ALL slots -- not just its own -- otherwise each
+            # rank would only fix its own slot and the `sizes` vectors would
+            # diverge across ranks (rank r reports its substituted count while
+            # the others still see 0), deadlocking the collective.
             assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
             x_list = list(x_list)
             router_logits_list = list(router_logits_list)
             for idx_chunk in range(num_chunks):
-                _x = x_list[idx_chunk]
-                if _x.numel() == 0:
+                # Keep the collective `sizes` consistent across ranks: substitute
+                # chunk 0's token count for EVERY rank whose chunk is empty.
+                num_tokens_list = all_rank_num_tokens_list[idx_chunk]
+                for r in range(len(num_tokens_list)):
+                    if num_tokens_list[r] == 0:
+                        num_tokens_list[r] = all_rank_num_tokens_list[0][r]
+                # Local-only tensor substitution: avoid a 0-row local dispatch
+                # and drop the (garbage) output of a locally-empty chunk.
+                if x_list[idx_chunk].numel() == 0:
                     chunked_used[idx_chunk] = False
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
-                    all_rank_num_tokens_list[idx_chunk][moe.mapping.tp_rank] = (
-                        all_rank_num_tokens_list[0][moe.mapping.tp_rank]
-                    )
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
 
