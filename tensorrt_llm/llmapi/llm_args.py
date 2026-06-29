@@ -452,30 +452,11 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         return sizes
 
 
-class EncoderDecoderCudaGraphConfig(StrictBaseModel):
-    """CUDA graph configuration for encoder-decoder models.
-
-    Provides independent configs for the encoder and decoder passes, allowing
-    separate control of batch sizes, token buckets, and padding for each.
-    """
-
-    mode: Literal["encoder_decoder"] = Field(
-        default="encoder_decoder", description="CUDA graph configuration mode.")
-
-    encoder: EncodeCudaGraphConfig = Field(
-        description="CUDA graph configuration for the encoder pass.")
-
-    decoder: DecodeCudaGraphConfig = Field(
-        default_factory=DecodeCudaGraphConfig,
-        description="CUDA graph configuration for the decoder pass.")
-
-
 # For CudaGraphConfig's backward compatibility
 CudaGraphConfig = DecodeCudaGraphConfig
 
 CudaGraphConfigType: TypeAlias = Annotated[
-    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig,
-          EncoderDecoderCudaGraphConfig],
+    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
     Field(discriminator="mode"),
 ]
 
@@ -4606,14 +4587,17 @@ class TorchLlmArgs(BaseLlmArgs):
     @field_validator('cuda_graph_config', mode='before')
     @classmethod
     def infer_cuda_graph_config_mode(cls, v):
+        if isinstance(v, dict) and ("encoder" in v or "decoder" in v):
+            raise ValueError(
+                "Composite encoder-decoder CUDA graph configs have been "
+                "removed. Use CudaGraphConfig or DecodeCudaGraphConfig for "
+                "decoder CUDA graphs.")
         if isinstance(v, dict) and "mode" not in v:
             encoder_keys = {
                 "num_tokens", "max_num_token", "seq_lens", "max_seq_len"
             }
             v = dict(v)
-            if "encoder" in v or "decoder" in v:
-                v["mode"] = "encoder_decoder"
-            elif any(k in v and v[k] not in (None, 0) for k in encoder_keys):
+            if any(k in v and v[k] not in (None, 0) for k in encoder_keys):
                 v["mode"] = "encode"
             else:
                 v["mode"] = "decode"
