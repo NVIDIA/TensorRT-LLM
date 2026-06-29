@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -144,6 +144,108 @@ public:
 private:
     MPI_Comm mGroupComm;
 };
+
+// Returns CU_MEM_HANDLE_TYPE_FABRIC when fabric-handle memory can actually be
+// allocated and exported on the current device (i.e. the fabric/IMEX plane is
+// provisioned), else CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR. Used both to pick
+// the NVLS allocation handle type and by ipcNvlsSupported() to gauge usability.
+static CUmemAllocationHandleType getMemHandleType()
+{
+    int device_id;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
+
+    // Check if fabric handle support is available.
+    int fabric_supported = 0;
+    CUCHECK(cuDeviceGetAttribute(&fabric_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device_id));
+    if (!fabric_supported)
+    {
+        TLLM_LOG_TRACE("checking fabric support... CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED not supported.");
+        return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    }
+
+    auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+    tensorrt_llm::common::NvmlManager nvmlManager;
+
+    nvmlDevice_t nvml_device;
+    NVMLCHECK(nvml->nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
+
+    nvmlGpuFabricState_t fabric_state;
+    nvmlReturn_t fabric_status;
+    if (nvml->hasGpuFabricInfoV())
+    {
+        nvmlGpuFabricInfoV_t fabric_info_v;
+        memset(&fabric_info_v, 0, sizeof(fabric_info_v));
+        fabric_info_v.version = nvmlGpuFabricInfo_v2;
+        NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info_v));
+        fabric_state = fabric_info_v.state;
+        fabric_status = fabric_info_v.status;
+    }
+    else if (nvml->hasGpuFabricInfo())
+    {
+        nvmlGpuFabricInfo_t fabric_info;
+        NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
+        fabric_state = fabric_info.state;
+        fabric_status = fabric_info.status;
+    }
+    else
+    {
+        TLLM_LOG_TRACE("checking fabric support... NVML fabric info APIs not available.");
+        return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    }
+
+    // Check if the fabric is fully initialized.
+    if (fabric_state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_status != NVML_SUCCESS)
+    {
+        TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state=%u status=%u.", fabric_state,
+            fabric_status);
+        return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    }
+
+    // Check that fabric handles can be created.
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(CUmemAllocationProp));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device_id;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    size_t alloc_size = 1024; // anything > 0
+    size_t min_gran = 0;
+    CUCHECK(cuMemGetAllocationGranularity(&min_gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    alloc_size = ROUND_UP(alloc_size, min_gran);
+
+    CUmemGenericAllocationHandle handle;
+    CUresult err = cuMemCreate(&handle, alloc_size, &prop, 0);
+    if (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED)
+    {
+        TLLM_LOG_TRACE("checking fabric support... cuMemCreate failed with not %s.",
+            err == CUDA_ERROR_NOT_PERMITTED ? "permitted" : "supported");
+        return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    }
+    else
+    {
+        CUCHECK(err);
+    }
+
+    // Check if fabric handles can be exported & imported by IMEX (Internode Memory Exchange).
+    CUmemFabricHandle fh;
+    CUmemGenericAllocationHandle imported_handle;
+    err = cuMemExportToShareableHandle(&fh, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
+    if (err != CUDA_SUCCESS
+        || (err = cuMemImportFromShareableHandle(&imported_handle, &fh, CU_MEM_HANDLE_TYPE_FABRIC)) != CUDA_SUCCESS)
+    {
+        TLLM_LOG_TRACE("checking fabric support... cuMemExport/cuMemImport failed.");
+        CUCHECK(cuMemRelease(handle));
+        return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    }
+
+    TLLM_LOG_TRACE("fabric status: device=%d, state=%u status=%u", device_id, fabric_state, fabric_status);
+
+    CUCHECK(cuMemRelease(imported_handle));
+    CUCHECK(cuMemRelease(handle));
+    // If we get here, fabric handles are supported.
+    return CU_MEM_HANDLE_TYPE_FABRIC;
+}
 
 class NVLSCudaAllocator
 {
@@ -313,104 +415,6 @@ public:
             CUCHECK(cuMemAddressFree(nvls_handle->ipc_uc_vas[i], nvls_handle->size));
         }
     }
-
-private:
-    static CUmemAllocationHandleType getMemHandleType()
-    {
-        int device_id;
-        TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-
-        // Check if fabric handle support is available.
-        int fabric_supported = 0;
-        CUCHECK(cuDeviceGetAttribute(&fabric_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device_id));
-        if (!fabric_supported)
-        {
-            TLLM_LOG_TRACE(
-                "checking fabric support... CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED not supported.");
-            return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        }
-
-        auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
-        tensorrt_llm::common::NvmlManager nvmlManager;
-
-        nvmlDevice_t nvml_device;
-        NVMLCHECK(nvml->nvmlDeviceGetHandleByIndex(device_id, &nvml_device));
-
-        nvmlGpuFabricState_t fabric_state;
-        nvmlReturn_t fabric_status;
-        if (nvml->hasGpuFabricInfoV())
-        {
-            nvmlGpuFabricInfoV_t fabric_info_v;
-            memset(&fabric_info_v, 0, sizeof(fabric_info_v));
-            fabric_info_v.version = nvmlGpuFabricInfo_v2;
-            NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfoV(nvml_device, &fabric_info_v));
-            fabric_state = fabric_info_v.state;
-            fabric_status = fabric_info_v.status;
-        }
-        else if (nvml->hasGpuFabricInfo())
-        {
-            nvmlGpuFabricInfo_t fabric_info;
-            NVMLCHECK(nvml->nvmlDeviceGetGpuFabricInfo(nvml_device, &fabric_info));
-            fabric_state = fabric_info.state;
-            fabric_status = fabric_info.status;
-        }
-        else
-        {
-            TLLM_LOG_TRACE("checking fabric support... NVML fabric info APIs not available.");
-            return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        }
-
-        // Check if the fabric is fully initialized.
-        if (fabric_state != NVML_GPU_FABRIC_STATE_COMPLETED || fabric_status != NVML_SUCCESS)
-        {
-            TLLM_LOG_TRACE("checking fabric support... fabric state is NOT COMPLETE: state=%u status=%u.", fabric_state,
-                fabric_status);
-            return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        }
-
-        // Check that fabric handles can be created.
-        CUmemAllocationProp prop;
-        memset(&prop, 0, sizeof(CUmemAllocationProp));
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id = device_id;
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-
-        size_t alloc_size = 1024; // anything > 0
-        size_t min_gran = 0;
-        CUCHECK(cuMemGetAllocationGranularity(&min_gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-        alloc_size = ROUND_UP(alloc_size, min_gran);
-
-        CUmemGenericAllocationHandle handle;
-        CUresult err = cuMemCreate(&handle, alloc_size, &prop, 0);
-        if (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED)
-        {
-            TLLM_LOG_TRACE("checking fabric support... cuMemCreate failed with not %s.",
-                err == CUDA_ERROR_NOT_PERMITTED ? "permitted" : "supported");
-            return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        }
-        else
-        {
-            CUCHECK(err);
-        }
-
-        // Check if fabric handles can be exported & imported by IMEX (Internode Memory Exchange)
-        CUmemFabricHandle fh;
-        err = cuMemExportToShareableHandle(&fh, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
-        if (err != CUDA_SUCCESS
-            || (err = cuMemImportFromShareableHandle(&handle, &fh, CU_MEM_HANDLE_TYPE_FABRIC)) != CUDA_SUCCESS)
-        {
-            TLLM_LOG_TRACE("checking fabric support... cuMemExport/cuMemImport failed.");
-            CUCHECK(cuMemRelease(handle));
-            return CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-        }
-
-        TLLM_LOG_TRACE("fabric status: state=%u status=%u", device_id, fabric_state, fabric_status);
-
-        CUCHECK(cuMemRelease(handle));
-        // If we get here, fabric handles are supported.
-        return CU_MEM_HANDLE_TYPE_FABRIC;
-    }
 };
 #endif
 
@@ -449,34 +453,73 @@ void MPI_group_barrier(std::set<int> group)
 bool ipcNvlsSupported()
 {
 #if ENABLE_MULTI_DEVICE
-    CUdevice current_dev;
-    int cuda_dev = -1;
-    int cuda_driver_version = -1;
-    int dev_count = 0;
-
-    TLLM_CUDA_CHECK(cudaDriverGetVersion(&cuda_driver_version));
-    if (cuda_driver_version < 12010)
+    // The result is static for the process and the fabric probe below is
+    // relatively heavy (it allocates and exports fabric-handle memory), so
+    // compute it once and cache it.
+    static bool const supported = []() -> bool
     {
-        TLLM_LOG_DEBUG("CUDA Driver version < 12010");
-        return false;
-    }
-
-    TLLM_CUDA_CHECK(cudaGetDeviceCount(&dev_count));
-    for (int i = 0; i < dev_count; ++i)
-    {
-        TLLM_CUDA_CHECK(cudaGetDevice(&cuda_dev));
-        CUCHECK(cuDeviceGet(&current_dev, cuda_dev));
-
-        int multicast_supported = 0;
-        CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, current_dev));
-        if (!multicast_supported)
+        // Cheap static capability check first (driver version + the multicast
+        // attribute on every device); short-circuits the fabric probe.
+        int cuda_driver_version = -1;
+        TLLM_CUDA_CHECK(cudaDriverGetVersion(&cuda_driver_version));
+        if (cuda_driver_version < 12010)
         {
-            TLLM_LOG_DEBUG("CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED not supported on GPU%d.", cuda_dev);
+            TLLM_LOG_DEBUG("CUDA Driver version < 12010");
             return false;
         }
-    }
-
-    return true;
+        int dev_count = 0;
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&dev_count));
+        for (int i = 0; i < dev_count; ++i)
+        {
+            int cuda_dev = -1;
+            CUdevice current_dev;
+            TLLM_CUDA_CHECK(cudaGetDevice(&cuda_dev));
+            CUCHECK(cuDeviceGet(&current_dev, cuda_dev));
+            int multicast_supported = 0;
+            CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, current_dev));
+            if (!multicast_supported)
+            {
+                TLLM_LOG_DEBUG("CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED not supported on GPU%d.", cuda_dev);
+                return false;
+            }
+        }
+#if !ENABLE_NVSHMEM
+        // The multicast attribute is a false positive when the fabric/IMEX plane
+        // is not provisioned (e.g. nvidia-imex not running): NVLS multicast
+        // cannot actually be bound there. getMemHandleType() does the real test
+        // -- it resolves to FABRIC only if fabric-handle memory can be allocated
+        // and exported. On any probe error, assume usable so an unrelated
+        // failure never disables a healthy NVLS setup.
+        try
+        {
+            if (getMemHandleType() != CU_MEM_HANDLE_TYPE_FABRIC)
+            {
+                TLLM_LOG_WARNING(
+                    "\n"
+                    "**************************************************************************\n"
+                    "* NVLS (NVLink SHARP) DISABLED -- falling back to NVLink P2P              *\n"
+                    "**************************************************************************\n"
+                    "* The GPU advertises multicast support, but the NVLink fabric/IMEX plane *\n"
+                    "* is NOT provisioned on this node, so NVLS multicast memory cannot be    *\n"
+                    "* bound. Collectives will still work over NVLink P2P, but NVLS-           *\n"
+                    "* accelerated paths (NCCL NVLS, fused GEMM-allreduce / MNNVL) are off    *\n"
+                    "* and performance may be reduced.                                        *\n"
+                    "*                                                                        *\n"
+                    "* To enable NVLS: start nvidia-imex and expose                           *\n"
+                    "* /dev/nvidia-caps-imex-channels to the container. Set                   *\n"
+                    "* NCCL_NVLS_ENABLE=1 explicitly to override this fallback.               *\n"
+                    "**************************************************************************");
+                return false;
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_DEBUG("NVLS fabric probe could not run, assuming usable: %s", e.what());
+        }
+#endif // !ENABLE_NVSHMEM
+        return true;
+    }();
+    return supported;
 #else
     return false;
 #endif

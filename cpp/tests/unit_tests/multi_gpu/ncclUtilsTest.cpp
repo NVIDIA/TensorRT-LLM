@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <gtest/gtest.h>
+#include <mutex>
 #include <nccl.h>
 #include <thread>
 #include <vector>
@@ -37,6 +38,36 @@ namespace tr = tensorrt_llm::runtime;
 namespace nccl_util = tensorrt_llm::common::nccl_util;
 
 using tensorrt_llm::getComm;
+
+namespace tensorrt_llm::common::nccl_util
+{
+class NCCLWindowAllocatorTestAccess
+{
+public:
+    static void recordSymmetricFailure(NCCLWindowAllocator& allocator, ncclComm_t comm, size_t size)
+    {
+        std::lock_guard<std::mutex> lock(allocator.mMutex);
+        allocator.recordSymmetricFailureLocked(comm, size);
+    }
+
+    static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
+        int localAllocOk, NCCLWindowAllocator::CudaGetLastErrorFunc getLastError = cudaGetLastError)
+    {
+        return NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(localAllocOk, getLastError);
+    }
+};
+} // namespace tensorrt_llm::common::nccl_util
+
+namespace
+{
+int gCudaGetLastErrorCallCount = 0;
+
+cudaError_t fakeCudaGetLastError()
+{
+    ++gCudaGetLastErrorCallCount;
+    return cudaErrorLaunchFailure;
+}
+} // namespace
 
 TEST(NCCLWindowSupportTest, RuntimeVersionAndGB10Gate)
 {
@@ -335,6 +366,87 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
     EXPECT_EQ(buffer768KB.size, 1024 * 1024); // Original size
 
     allocator.releaseBuffer(*mComm, buffer768KB.ptr);
+}
+
+TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
+
+    constexpr size_t failureSize = 1024 * 1024;
+    nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, failureSize);
+
+    auto smallBuffer = allocator.requestBuffer(*testComm, failureSize / 2);
+    ASSERT_TRUE(smallBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+
+    auto failedBuffer = allocator.requestBuffer(*testComm, failureSize);
+    EXPECT_FALSE(failedBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+
+    allocator.releaseBuffer(*testComm, smallBuffer.ptr);
+    testComm.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
+
+    auto buffer1MB = allocator.requestBuffer(*testComm, 1024 * 1024);
+    ASSERT_TRUE(buffer1MB.isValid());
+    void* ptr1MB = buffer1MB.ptr;
+    allocator.releaseBuffer(*testComm, ptr1MB);
+
+    nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 512 * 1024);
+
+    auto reusedBuffer = allocator.requestBuffer(*testComm, 768 * 1024);
+    ASSERT_TRUE(reusedBuffer.isValid());
+    EXPECT_EQ(reusedBuffer.ptr, ptr1MB);
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+    allocator.releaseBuffer(*testComm, reusedBuffer.ptr);
+
+    auto failedBuffer = allocator.requestBuffer(*testComm, 2 * 1024 * 1024);
+    EXPECT_FALSE(failedBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+
+    testComm.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, FailureCacheKeepsSmallestFailureSize)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto testComm = createSplitComm(*mComm, 0, mRank);
+
+    nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 2 * 1024 * 1024);
+    nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 1024 * 1024);
+
+    auto smallBuffer = allocator.requestBuffer(*testComm, 768 * 1024);
+    ASSERT_TRUE(smallBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+
+    auto failedBuffer = allocator.requestBuffer(*testComm, 1536 * 1024);
+    EXPECT_FALSE(failedBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+
+    allocator.releaseBuffer(*testComm, smallBuffer.ptr);
+    testComm.reset();
+}
+
+TEST_F(NCCLWindowAllocatorTest, ClearsCudaErrorAfterLocalAllocationFailure)
+{
+    auto const clearCudaErrorIfFailed = [](int localAllocOk)
+    {
+        return nccl_util::NCCLWindowAllocatorTestAccess::clearCudaErrorIfSymmetricAllocationFailed(
+            localAllocOk, fakeCudaGetLastError);
+    };
+
+    gCudaGetLastErrorCallCount = 0;
+    EXPECT_EQ(clearCudaErrorIfFailed(1), cudaSuccess);
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 0);
+
+    EXPECT_EQ(clearCudaErrorIfFailed(0), cudaErrorLaunchFailure);
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
 }
 
 TEST_F(NCCLWindowAllocatorTest, MultipleBuffers)
