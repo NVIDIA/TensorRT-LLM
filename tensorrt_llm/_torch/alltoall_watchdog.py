@@ -339,7 +339,7 @@ class AlltoAllWatchdog:
 
     def _phase_complete(self, watch: _CollectiveWatch, observed_flags: tuple[int, ...]) -> bool:
         return all(
-            observed_flags[rank] == watch.expected_flag
+            observed_flags[rank] >= watch.expected_flag
             for rank in self._active_ranks(watch.active_mask)
         )
 
@@ -349,7 +349,7 @@ class AlltoAllWatchdog:
         return tuple(
             rank
             for rank in self._active_ranks(watch.active_mask)
-            if observed_flags[rank] != watch.expected_flag
+            if observed_flags[rank] < watch.expected_flag
         )
 
     def _handle_timeout(
