@@ -74,6 +74,34 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+# The default FMHA registry order already prefers the FlashInfer TRTLLM-gen
+# backend on Blackwell. Keep explicit coverage for both that path and the
+# legacy fused ``thop.attention`` fallback.
+FMHA_ATTENTION_PATHS = [
+    pytest.param("flashinfer", marks=skip_pre_blackwell),
+    "fallback",
+]
+
+
+def set_fmha_attention_path(mocker, monkeypatch, attention_path: str):
+    """Pin the FMHA library backing ``TrtllmAttention`` for a single test.
+
+    ``"flashinfer"`` selects the FlashInfer TRTLLM-gen FMHA path with fallback
+    available for unsupported requests. ``"fallback"`` forces the legacy fused
+    ``thop.attention`` fallback via ``TLLM_FMHA_LIBS``.
+    """
+    if attention_path == "flashinfer":
+        fmha_libs = "flashinfer_trtllm_gen,fallback"
+    elif attention_path == "fallback":
+        fmha_libs = "fallback"
+    else:
+        raise ValueError(f"Unknown FMHA attention path: {attention_path}")
+
+    env_vars = {"TLLM_FMHA_LIBS": fmha_libs}
+    monkeypatch.setenv("TLLM_FMHA_LIBS", env_vars["TLLM_FMHA_LIBS"])
+    patch_mpi_pool_session_for_env(mocker, env_vars)
+
+
 def _get_default_torch_compile_config(torch_compile):
     return TorchCompileConfig(enable_fullgraph=True,
                               enable_piecewise_cuda_graph=True,
@@ -1349,9 +1377,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, True), (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn", [0, 2])
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill,
-                      v2_kv_cache):
+                      v2_kv_cache, attention_path, mocker, monkeypatch):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             use_kv_cache_manager_v2=v2_kv_cache,
@@ -4300,8 +4330,10 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                              ids=["latency", "ep2", "ep4"])
     @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
                              ids=["fp8", "mxfp8"])
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
     def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
-                        activation_dtype):
+                        activation_dtype, attention_path, mocker, monkeypatch):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
             pytest.skip(
                 "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
@@ -4692,8 +4724,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     ])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
-                     overlap_scheduler, mocker, v2_kv_cache):
+                     overlap_scheduler, mocker, v2_kv_cache, attention_path,
+                     monkeypatch):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4818,9 +4853,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         "v2_kv_cache,kv_cache_reuse", [(True, True), (False, True),
                                        (True, False)],
         ids=["v2_kv_cache", "v1_kv_cache", "v2_kv_cache_no_reuse"])
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
     def test_w4_4gpus(self, v2_kv_cache, kv_cache_reuse, kv_cache_dtype,
                       moe_backend, tp_size, pp_size, ep_size, attention_dp,
-                      cuda_graph, overlap_scheduler, mocker):
+                      cuda_graph, overlap_scheduler, mocker, attention_path,
+                      monkeypatch):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -4889,9 +4927,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (4, 1, 4, True, True, True),
         ],
         ids=["dp4"])
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
     def test_w4a16(self, kv_cache_dtype, tp_size, pp_size, ep_size,
                    attention_dp, cuda_graph, overlap_scheduler, monkeypatch,
-                   mocker):
+                   mocker, attention_path):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4932,9 +4972,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (2, 1, 2, True, True, True),
         ],
         ids=["tp2", "ep2", "dp2"])
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
     def test_w4_2gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      mocker):
+                      mocker, attention_path, monkeypatch):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
@@ -4971,7 +5013,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker):
+    @pytest.mark.parametrize("attention_path", FMHA_ATTENTION_PATHS)
+    def test_w4_chunked_prefill(self, kv_cache_dtype, moe_backend, mocker,
+                                attention_path, monkeypatch):
+        set_fmha_attention_path(mocker, monkeypatch, attention_path)
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
