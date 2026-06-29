@@ -714,8 +714,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     all_pool_pages = max_num_pages
                     if hasattr(self.kv_cache_manager, 'layer_offsets'):
                         for lid in self.kv_cache_manager.layer_offsets:
-                            window = self._pool_window_for_layer(lid)
-                            if window is not None and window <= 0:
+                            layer_offset = self.kv_cache_manager.layer_offsets[lid]
+                            if (self.kv_cache_manager.
+                                    num_kv_heads_per_layer[layer_offset] == 0):
                                 continue
                             lbuf = self.kv_cache_manager.get_buffers(lid)
                             if lbuf is not None:
