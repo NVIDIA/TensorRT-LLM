@@ -1,0 +1,10 @@
+Prometheus Metrics
+==================
+Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
+
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/c25c23f71786bad54d192893d696ce8043426eca/examples/serve/prometheus_metrics.py.
+
+.. literalinclude:: ../../../examples/serve/prometheus_metrics.py
+    :lines: 2-165
+    :language: python
+    :linenos:

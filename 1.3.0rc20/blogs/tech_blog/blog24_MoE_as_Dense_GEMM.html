@@ -1,0 +1,1374 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog24_MoE_as_Dense_GEMM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Joint Optimization of Agent Applications and TensorRT-LLM" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html" />
+    <link rel="prev" title="Sparse Attention Development Guide" href="../../developer-guide/sparse-attention-development-guide.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc20" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="moe-as-dense-gemm-optimizing-low-latency-moe-inference-on-nvidia-blackwell">
+<h1>MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell<a class="headerlink" href="#moe-as-dense-gemm-optimizing-low-latency-moe-inference-on-nvidia-blackwell" title="Link to this heading">#</a></h1>
+<p>by NVIDIA TensorRT LLM team</p>
+<section id="abstract">
+<h2>Abstract<a class="headerlink" href="#abstract" title="Link to this heading">#</a></h2>
+<p>Large-scale MoE models such as DeepSeek-V3/R1, Mixtral, and Qwen3-MoE often use tensor parallelism
+for latency-sensitive inference. In the low-latency range where tens to a few hundred tokens enter a
+routed MoE layer, the routed experts are still largely memory-bound, while grouped-GEMM execution pays
+overheads from small per-expert shapes, expert scheduling, input permutation, and routed-output
+accumulation.</p>
+<p>This post introduces <strong>DENSEGEMM</strong>, a TensorRT-LLM backend for NVFP4 MoE on NVIDIA Blackwell
+(SM100 / SM103). The target workflow is deliberately counterintuitive: express the MoE FFN as dense
+FC1/FC2 GEMMs over all experts, including the always-on shared expert, then use per-token alpha masks to
+keep only the selected routed experts. In the memory-bound low-latency regime, the extra arithmetic has
+limited latency impact, while the denser GEMM shapes improve hardware utilization.</p>
+<p>The implementation in TensorRT-LLM is staged. The current backend applies this dense formulation to the
+routed experts first, while shared experts and Router/TopK scheduling remain outside the dense backend.
+On a DeepSeek-V3-style B200 profile, this current routed-expert implementation is best in the
+<code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">64-208</span></code> range, reaching up to 1.12x speedup over the TRTLLM-Gen grouped-GEMM path in the
+measured TP8 MoE module benchmark.</p>
+<p align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog23_Picture1.png" alt="TP MoE critical path" width="700"/>
+</p>
+<p align="center"><em>Figure 1. Conventional TP routed-MoE path: routing and small grouped GEMMs
+dominate low-latency execution.</em></p>
+</section>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#background-moe-inference-latency-regimes">Background: MoE Inference Latency Regimes</a></p></li>
+<li><p><a class="reference internal" href="#scope-and-takeaways">Scope and Takeaways</a></p></li>
+<li><p><a class="reference internal" href="#densegemm-design">DENSEGEMM Design</a></p></li>
+<li><p><a class="reference internal" href="#advantages-over-the-grouped-gemm-flow">Advantages over the Grouped-GEMM Flow</a></p></li>
+<li><p><a class="reference internal" href="#roofline-analysis">Roofline Analysis</a></p></li>
+<li><p><a class="reference internal" href="#kernel-implementation-cute-dsl-on-blackwell">Kernel Implementation (CuTe DSL on Blackwell)</a></p></li>
+<li><p><a class="reference internal" href="#performance-evaluation">Performance Evaluation</a></p></li>
+<li><p><a class="reference internal" href="#current-limitations-and-future-work">Current Limitations and Future Work</a></p></li>
+<li><p><a class="reference internal" href="#references">References</a></p></li>
+</ul>
+</section>
+<section id="background-moe-inference-latency-regimes">
+<h2>Background: MoE Inference Latency Regimes<a class="headerlink" href="#background-moe-inference-latency-regimes" title="Link to this heading">#</a></h2>
+<p>Partitioning MoE inference workloads by <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> (the number of tokens entering the MoE module per
+forward pass) clarifies which optimization strategy applies in which regime. Using DeepSeek-V3
+(<code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">=</span> <span class="pre">256</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">8</span></code>) as a reference:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Regime</p></th>
+<th class="head"><p>num_tokens</p></th>
+<th class="head"><p>Physical characteristics</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Min-Latency</strong></p></td>
+<td><p>&lt;= 32</p></td>
+<td><p>Many routed experts receive no tokens; selected experts receive very few tokens. Fixed overheads dominate.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Low-Latency</strong></p></td>
+<td><p>32-320</p></td>
+<td><p>Most routed experts receive at least one assignment, but per-expert token counts remain small. Routed FC1/FC2 remain memory-bound.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Throughput at Latency</strong></p></td>
+<td><p>320-10k</p></td>
+<td><p>Average routed assignments per expert continue to grow; some experts cross into compute-bound execution while others stay memory-bound.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Max Throughput</strong></p></td>
+<td><p>&gt; 10k</p></td>
+<td><p>All experts are compute-bound; grouped GEMM approaches peak hardware utilization.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>DENSEGEMM primarily targets the <strong>Low-Latency</strong> regime and partially covers its boundaries. It is not a
+universal replacement for grouped GEMM: at very small batches, loading all routed experts is too
+expensive; at larger batches, the redundant dense arithmetic starts to appear on the critical path.</p>
+</section>
+<section id="scope-and-takeaways">
+<h2>Scope and Takeaways<a class="headerlink" href="#scope-and-takeaways" title="Link to this heading">#</a></h2>
+<p>This post separates the target DENSEGEMM workflow from the current TensorRT-LLM implementation. The
+main claims should be read with the following scope:</p>
+<ul class="simple">
+<li><p><strong>Target workflow</strong> describes the intended end state: routed experts and shared experts use one dense
+FC1/FC2 representation, Router/TopK/alpha generation are scheduled to overlap with FC1, and FC2
+consumes alpha to produce the weighted routed output.</p></li>
+<li><p><strong>Current implementation</strong> applies DENSEGEMM to routed experts first. The shared expert remains a
+standalone <code class="docutils literal notranslate"><span class="pre">shared_experts</span></code> FFN, Router GEMM and TopK are computed before the dense backend is invoked,
+and <code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA</span></code> is disabled by default.</p></li>
+<li><p><strong>Performance numbers</strong> refer to the current routed-expert implementation, not the full target
+workflow. The benchmark uses TP8 with <code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA=1</span></code> and reports per-rank MoE module
+compute latency. The two tensor-parallel AllReduces that flank the MoE module are excluded.</p></li>
+<li><p>The practical sweet spot in the measured B200 DeepSeek-V3-style profile is <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">64-208</span></code>.
+Below that range, TRTLLM-Gen is faster; above it, DENSEGEMM returns to parity and then falls behind
+once redundant compute and tactic changes start to cost latency.</p></li>
+</ul>
+<p>The core idea is therefore narrow but useful: when routed expert GEMMs are memory-bound, it can be
+faster to issue one dense, well-shaped GEMM over all routed experts than many small grouped GEMMs over
+only the selected experts. The target workflow extends that idea to the rest of the MoE FFN once the
+remaining scheduling, layout, and numerical-closure issues are resolved.</p>
+</section>
+<section id="densegemm-design">
+<h2>DENSEGEMM Design<a class="headerlink" href="#densegemm-design" title="Link to this heading">#</a></h2>
+<p>Conventional routed-MoE execution first determines the top-k experts for each token, then executes FC1
+and FC2 as grouped GEMMs over the selected expert/token pairs. That flow avoids redundant arithmetic,
+but it exposes the hardware to many small expert-local shapes in low-latency serving.</p>
+<p>DENSEGEMM keeps the same routing semantics, but changes how the MoE FFN compute is expressed. The
+design target is to represent expert selection as alpha masking inside dense FC1/FC2 GEMMs, rather than
+as many expert-local grouped GEMM problems.</p>
+<section id="target-workflow">
+<h3>Target Workflow<a class="headerlink" href="#target-workflow" title="Link to this heading">#</a></h3>
+<p>In the full target workflow, DENSEGEMM treats both routed experts and the shared expert as slices of the
+same dense FC1/FC2 representation:</p>
+<ul class="simple">
+<li><p><strong>FC1</strong>: W1 / W3 weights for all routed experts plus the shared expert are packed as one
+PyTorch-style weight matrix of shape <code class="docutils literal notranslate"><span class="pre">[(num_experts</span> <span class="pre">+</span> <span class="pre">1)</span> <span class="pre">x</span> <span class="pre">2</span> <span class="pre">x</span> <span class="pre">intermediate,</span> <span class="pre">hidden]</span></code>. All tokens
+execute one <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">&#64;</span> <span class="pre">W^T</span></code>, producing an output whose dense N dimension is
+<code class="docutils literal notranslate"><span class="pre">(num_experts</span> <span class="pre">+</span> <span class="pre">1)</span> <span class="pre">x</span> <span class="pre">2</span> <span class="pre">x</span> <span class="pre">intermediate</span></code>. W1 / W3 are interleaved in groups of 64 within N so SwiGLU can
+be fused in the epilogue.</p></li>
+<li><p><strong>FC2</strong>: W2 weights are concatenated along K and stored in hidden-major layout as
+<code class="docutils literal notranslate"><span class="pre">[hidden,</span> <span class="pre">(num_experts</span> <span class="pre">+</span> <span class="pre">1)</span> <span class="pre">x</span> <span class="pre">intermediate]</span></code>. FC2 computes <code class="docutils literal notranslate"><span class="pre">A</span> <span class="pre">&#64;</span> <span class="pre">W2^T</span></code>; each 256-element K block belongs
+to one expert and has its own alpha, fused as block-wise scaling along M and K in the mainloop.</p></li>
+<li><p><strong>Alpha mask</strong>: alpha has shape <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">num_experts</span> <span class="pre">+</span> <span class="pre">1]</span></code>. For routed experts, alpha is
+<code class="docutils literal notranslate"><span class="pre">topk_score</span></code> when the token selects the expert and 0 otherwise. For the shared expert, alpha is 1.0
+for every token, making it an always-on expert in the same dense GEMM.</p></li>
+<li><p><strong>Router-side overlap</strong>: Router GEMM, TopK, and alpha generation are scheduled on an auxiliary stream
+while FC1 runs on the main stream. FC1 depends only on <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> at launch time; alpha is needed
+at the fused scaling point. With the right synchronization, the router-side work can be hidden when
+FC1 is longer than Router/TopK/alpha generation.</p></li>
+</ul>
+<p>This is the intended end state: shared expert and routed experts share the same dense GEMM mainloops,
+expert selection is represented by alpha, and the intra-MoE critical path moves closer to
+<code class="docutils literal notranslate"><span class="pre">Quantize</span> <span class="pre">-&gt;</span> <span class="pre">FC1</span> <span class="pre">-&gt;</span> <span class="pre">FC2</span></code>.</p>
+</section>
+<section id="target-data-flow">
+<h3>Target Data Flow<a class="headerlink" href="#target-data-flow" title="Link to this heading">#</a></h3>
+<p>The figure below shows the target TP scenario. The two AllReduces flanking the MoE module are dictated
+by TP itself; DENSEGEMM does not change that communication. The target workflow densifies the whole MoE
+FFN, while the current implementation realizes the routed-expert dense FC1/FC2 portion first.</p>
+<p align="center">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog23_Picture2.png" alt="DENSEGEMM TP data flow" width="800"/>
+</p>
+<p align="center"><em>Figure 2. Target DENSEGEMM TP flow. The current implementation realizes the
+routed-expert dense FC1/FC2 portion and keeps shared experts plus Router/TopK scheduling staged.</em></p>
+</section>
+<section id="current-implementation-in-tensorrt-llm">
+<h3>Current Implementation in TensorRT-LLM<a class="headerlink" href="#current-implementation-in-tensorrt-llm" title="Link to this heading">#</a></h3>
+<p>The current TensorRT-LLM implementation is the first stage of that workflow. It implements dense GEMM
+for routed experts and keeps the remaining pieces conservative:</p>
+<ul class="simple">
+<li><p><strong>Routed experts only</strong>: FC1 packs W1 / W3 as <code class="docutils literal notranslate"><span class="pre">[num_experts</span> <span class="pre">x</span> <span class="pre">2</span> <span class="pre">x</span> <span class="pre">intermediate,</span> <span class="pre">hidden]</span></code>; FC2 stores W2
+as <code class="docutils literal notranslate"><span class="pre">[hidden,</span> <span class="pre">num_experts</span> <span class="pre">x</span> <span class="pre">intermediate]</span></code>; alpha has shape <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">num_experts]</span></code>.</p></li>
+<li><p><strong>Shared expert remains standalone</strong>: DeepSeek-style shared experts are still created and executed as
+<code class="docutils literal notranslate"><span class="pre">self.shared_experts</span></code>, then added to the routed output at the model layer.</p></li>
+<li><p><strong>Router/TopK remain serialized before the backend</strong>: the model computes <code class="docutils literal notranslate"><span class="pre">router_logits</span></code> before calling
+the MoE backend, and <code class="docutils literal notranslate"><span class="pre">ConfigurableMoE</span></code> applies routing before <code class="docutils literal notranslate"><span class="pre">backend.run_moe</span></code>.</p></li>
+<li><p><strong>FC2 alpha fusion is optional</strong>: by default, <code class="docutils literal notranslate"><span class="pre">gen_fc2_alpha_fused</span></code> builds the per-token-per-expert
+alpha consumed by the dense FC2 kernel. Setting <code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA=1</span></code> can pre-multiply FC2
+alpha into FC1’s <code class="docutils literal notranslate"><span class="pre">alpha_post</span></code>, but this is disabled by default because module-level numerical
+equivalence is not closed yet.</p></li>
+</ul>
+<p>The performance data in this post measures this current implementation, not the full target workflow.</p>
+</section>
+<section id="why-the-implementation-is-staged">
+<h3>Why the Implementation is Staged<a class="headerlink" href="#why-the-implementation-is-staged" title="Link to this heading">#</a></h3>
+<p>The staged implementation is a pragmatic way to land the core roofline trade-off first while containing
+performance and integration risk:</p>
+<ul class="simple">
+<li><p><strong>Shared-expert fusion is currently blocked by kernel performance.</strong> Folding the shared expert into
+the dense FC1/FC2 representation is the desired method-level direction, but the current fused kernel
+path regresses both GEMM latencies enough that the fusion is not yet worthwhile. This is a kernel
+optimization problem, not a limitation of the dense-MoE formulation itself.</p></li>
+<li><p><strong>Router/TopK overlap cuts across the software architecture.</strong> The current model layer computes
+<code class="docutils literal notranslate"><span class="pre">router_logits</span></code> before invoking the backend, and the wrapper applies routing before <code class="docutils literal notranslate"><span class="pre">run_moe</span></code>. Hiding
+Router/TopK behind FC1 would require moving scheduling responsibilities across the model/backend
+boundary, which is a significant software architecture change rather than only a kernel rewrite.</p></li>
+<li><p><strong>Fused FC2 alpha needs module-level numerical closure.</strong> The fused-alpha path is attractive for
+latency and has not shown an obvious end-to-end accuracy drop on GPQA Diamond, but it changes where
+quantization happens and therefore does not yet pass the module-level equivalence test.</p></li>
+<li><p><strong>The routed-expert path validates the main premise.</strong> It is enough to test the central claim that, in
+a memory-bound low-latency window, denser GEMM shapes can beat grouped GEMM despite redundant
+arithmetic.</p></li>
+</ul>
+</section>
+</section>
+<section id="advantages-over-the-grouped-gemm-flow">
+<h2>Advantages over the Grouped-GEMM Flow<a class="headerlink" href="#advantages-over-the-grouped-gemm-flow" title="Link to this heading">#</a></h2>
+<p>It is useful to separate the benefits that are available today from the benefits expected from the full
+target workflow.</p>
+<section id="available-today">
+<h3>Available Today<a class="headerlink" href="#available-today" title="Link to this heading">#</a></h3>
+<p>Against a conventional grouped-GEMM TP path, the current backend has four measured advantages:</p>
+<ol class="arabic simple">
+<li><p><strong>Routed FC1 and FC2 use larger, denser GEMM shapes.</strong> Grouped GEMM splits tokens across experts;
+FC1’s N is only <code class="docutils literal notranslate"><span class="pre">2</span> <span class="pre">x</span> <span class="pre">intermediate</span></code> per expert and FC2’s K is only <code class="docutils literal notranslate"><span class="pre">intermediate</span></code> per expert.
+DENSEGEMM concatenates all routed experts at once, growing FC1’s N to <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">x</span> <span class="pre">2</span> <span class="pre">x</span> <span class="pre">intermediate</span></code> and
+FC2’s K to <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">x</span> <span class="pre">intermediate</span></code>. In the low-latency range, those larger shapes better utilize the
+tcgen05 / TMA pipeline.</p></li>
+<li><p><strong>FC1 consumes the input without expert-order permutation.</strong> The dense routed FC1 operates directly on
+the token-major input, so the backend avoids the grouped-GEMM path’s FC1 input permutation / dispatch
+step that reorders tokens by selected experts.</p></li>
+<li><p><strong>Expert selection is represented as alpha math inside dense GEMM.</strong> Once alpha is scattered, selected
+and non-selected routed experts share the same dense mainloop. The backend trades redundant
+multiply-by-zero work for fewer small-shape scheduling decisions.</p></li>
+<li><p><strong>Routed-output weighting is fused into dense FC2.</strong> The top-k weights enter through alpha, so the
+selected experts’ contribution is applied during dense FC2, or through FC1’s optional <code class="docutils literal notranslate"><span class="pre">alpha_post</span></code>
+fusion, rather than as a separate post-processing pass for the dense backend.</p></li>
+</ol>
+</section>
+<section id="expected-from-the-full-target-workflow">
+<h3>Expected from the Full Target Workflow<a class="headerlink" href="#expected-from-the-full-target-workflow" title="Link to this heading">#</a></h3>
+<p>The full target workflow is expected to add three more benefits once the staged issues above are closed:</p>
+<ol class="arabic simple">
+<li><p><strong>The shared expert becomes an always-on dense slice.</strong> This removes the separate shared FFN scheduling
+path and lets routed and shared expert weights share the same FC1/FC2 mainloops.</p></li>
+<li><p><strong>Router-side work can move off the exposed critical path.</strong> Router GEMM, TopK, and alpha generation
+can be scheduled on an auxiliary stream and synchronized with FC1 at the point where alpha is first
+consumed.</p></li>
+<li><p><strong>The intra-MoE path gets closer to <code class="docutils literal notranslate"><span class="pre">Quantize</span> <span class="pre">-&gt;</span> <span class="pre">FC1</span> <span class="pre">-&gt;</span> <span class="pre">FC2</span></code>.</strong> In TP, the two flanking AllReduces
+remain unchanged. In EP-style deployments, the same alpha representation can also reduce explicit
+dispatch/combine work.</p></li>
+</ol>
+<p>The table below contrasts the conventional grouped-GEMM TP flow, the current DENSEGEMM implementation,
+and the full target workflow. Only the current implementation column is measured in the performance
+section.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Stage</p></th>
+<th class="head"><p>Grouped-GEMM TP Flow</p></th>
+<th class="head"><p>Current DENSEGEMM</p></th>
+<th class="head"><p>Target DENSEGEMM</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Before entering MoE</p></td>
+<td><p>AllReduce (from attention)</p></td>
+<td><p>AllReduce (from attention)</p></td>
+<td><p>AllReduce (from attention)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Router side</p></td>
+<td><p>Router GEMM -&gt; TopK before FC1</p></td>
+<td><p>Router GEMM -&gt; TopK before FC1</p></td>
+<td><p>Router GEMM / TopK / alpha generation overlapped with FC1</p></td>
+</tr>
+<tr class="row-even"><td><p>Routed-expert representation</p></td>
+<td><p>Expert-local grouped GEMM problems</p></td>
+<td><p>Token-major dense GEMM with <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">E]</span></code> alpha</p></td>
+<td><p>Token-major dense GEMM with <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">E</span> <span class="pre">+</span> <span class="pre">1]</span></code> alpha</p></td>
+</tr>
+<tr class="row-odd"><td><p>MoE compute</p></td>
+<td><p>grouped FC1 -&gt; activation -&gt; grouped FC2</p></td>
+<td><p>dense routed FC1 -&gt; dense routed FC2</p></td>
+<td><p>dense FC1/FC2 over routed + shared expert slices</p></td>
+</tr>
+<tr class="row-even"><td><p>Shared expert</p></td>
+<td><p>Standalone FFN at model layer</p></td>
+<td><p>Standalone FFN at model layer</p></td>
+<td><p>Always-on expert slice in dense FC1/FC2</p></td>
+</tr>
+<tr class="row-odd"><td><p>Leaving MoE</p></td>
+<td><p>AllReduce</p></td>
+<td><p>AllReduce</p></td>
+<td><p>AllReduce</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This is why the performance win appears only in a specific range. DENSEGEMM must load and multiply all
+routed expert weights, so it loses at very small <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code>. It wins when the grouped-GEMM path still
+has poor small-shape efficiency but dense GEMM remains memory-bound. Once the workload becomes
+compute-bound, the redundant arithmetic is no longer cheap.</p>
+</section>
+</section>
+<section id="roofline-analysis">
+<h2>Roofline Analysis<a class="headerlink" href="#roofline-analysis" title="Link to this heading">#</a></h2>
+<p>The analysis below models the current routed-expert implementation. The target workflow adds the shared
+expert as another dense slice, but the same memory-bound argument applies: only <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">8</span></code> routed
+experts are selected, yet the weights of all <code class="docutils literal notranslate"><span class="pre">E</span> <span class="pre">=</span> <span class="pre">256</span></code> routed experts are loaded and multiplied. The
+share of arithmetic not associated with selected routed experts is about 96.9%. A roofline analysis
+explains why this can still be a good latency trade-off in the memory-bound range.</p>
+<section id="step-1-notation">
+<h3>Step 1: Notation<a class="headerlink" href="#step-1-notation" title="Link to this heading">#</a></h3>
+<p>Below are the per-rank symbols (that is, dimensions after TP / EP partitioning):</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Symbol</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">M</span></code></p></td>
+<td><p>num_tokens (number of tokens entering the MoE module per forward)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">E</span></code></p></td>
+<td><p>per-rank number of routed experts</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">k</span></code></p></td>
+<td><p>top_k (experts activated per token, typically 4-8)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">H</span></code></p></td>
+<td><p>hidden size (per-rank, after TP)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">I</span></code></p></td>
+<td><p>intermediate size (per-rank)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">b</span></code></p></td>
+<td><p>packed payload bytes per weight element (NVFP4 payload is 0.5, before scale overhead)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BW</span></code></p></td>
+<td><p>HBM bandwidth (B200 is about 8 TB/s)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">P</span></code></p></td>
+<td><p>NVFP4 dense peak FLOPs (B200-class dense FP4 is roughly 9-10 PFLOPS)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Total weight bytes per routed expert (W1 + W2 + W3 in SwiGLU form):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">B_exp</span> <span class="o">=</span> <span class="p">(</span><span class="mi">2</span> <span class="n">x</span> <span class="n">H</span> <span class="n">x</span> <span class="n">I</span> <span class="o">+</span> <span class="n">H</span> <span class="n">x</span> <span class="n">I</span><span class="p">)</span> <span class="n">x</span> <span class="n">b</span> <span class="o">=</span> <span class="mi">3</span> <span class="n">x</span> <span class="n">H</span> <span class="n">x</span> <span class="n">I</span> <span class="n">x</span> <span class="n">b</span>
+</pre></div>
+</div>
+</section>
+<section id="step-2-the-low-latency-regime-is-memory-bound">
+<h3>Step 2: The Low-Latency Regime is Memory-Bound<a class="headerlink" href="#step-2-the-low-latency-regime-is-memory-bound" title="Link to this heading">#</a></h3>
+<p>The arithmetic-intensity ridge point at NVFP4 dense FLOPs and HBM bandwidth on Blackwell B200 is:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">AI_crit</span> <span class="o">=</span> <span class="n">P</span> <span class="o">/</span> <span class="n">BW</span> <span class="o">=</span> <span class="p">(</span><span class="mi">9</span><span class="o">-</span><span class="mi">10</span><span class="p">)</span><span class="n">e15</span> <span class="o">/</span> <span class="mf">8e12</span> <span class="o">~=</span> <span class="mi">1125</span><span class="o">-</span><span class="mi">1250</span> <span class="n">FLOPs</span> <span class="o">/</span> <span class="n">Byte</span>
+</pre></div>
+</div>
+<p>The arithmetic intensity of dense routed FC1 over <code class="docutils literal notranslate"><span class="pre">M</span></code> tokens and <code class="docutils literal notranslate"><span class="pre">E</span></code> experts (ignoring activation bytes
+because weight bytes dominate) is:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">FLOPs_FC1</span> <span class="o">=</span> <span class="mi">2</span> <span class="n">x</span> <span class="n">M</span> <span class="n">x</span> <span class="p">(</span><span class="n">E</span> <span class="n">x</span> <span class="mi">2</span><span class="n">I</span><span class="p">)</span> <span class="n">x</span> <span class="n">H</span>
+<span class="n">Bytes_FC1</span> <span class="o">=</span> <span class="n">E</span> <span class="n">x</span> <span class="p">(</span><span class="mi">2</span> <span class="n">x</span> <span class="n">H</span> <span class="n">x</span> <span class="n">I</span><span class="p">)</span> <span class="n">x</span> <span class="n">b</span>
+<span class="n">AI_FC1</span>   <span class="o">=</span> <span class="mi">2</span> <span class="n">x</span> <span class="n">M</span> <span class="n">x</span> <span class="n">E</span> <span class="n">x</span> <span class="mi">2</span><span class="n">I</span> <span class="n">x</span> <span class="n">H</span> <span class="o">/</span> <span class="p">(</span><span class="n">E</span> <span class="n">x</span> <span class="mi">2</span><span class="n">I</span> <span class="n">x</span> <span class="n">H</span> <span class="n">x</span> <span class="n">b</span><span class="p">)</span> <span class="o">=</span> <span class="mi">2</span><span class="n">M</span> <span class="o">/</span> <span class="n">b</span>
+</pre></div>
+</div>
+<p>Plugging in NVFP4’s <code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">=</span> <span class="pre">0.5</span></code> gives <code class="docutils literal notranslate"><span class="pre">AI_FC1</span></code> of about <code class="docutils literal notranslate"><span class="pre">4M</span></code>. Under this simplified model, whether FC1 is
+memory-bound depends primarily on <code class="docutils literal notranslate"><span class="pre">M</span></code>, not on <code class="docutils literal notranslate"><span class="pre">hidden</span></code>, <code class="docutils literal notranslate"><span class="pre">intermediate</span></code>, or <code class="docutils literal notranslate"><span class="pre">num_experts</span></code>.</p>
+<p>Memory-bound condition:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">AI_FC1</span> <span class="o">&lt;</span> <span class="n">AI_crit</span>  <span class="o">&lt;=&gt;</span>  <span class="mi">4</span><span class="n">M</span> <span class="o">&lt;</span> <span class="mi">1125</span><span class="o">-</span><span class="mi">1250</span>  <span class="o">&lt;=&gt;</span>  <span class="n">M</span> <span class="o">&lt;</span> <span class="o">~</span><span class="mi">281</span><span class="o">-</span><span class="mi">312</span>
+</pre></div>
+</div>
+<p>The same analysis gives <code class="docutils literal notranslate"><span class="pre">AI_FC2</span></code> of about <code class="docutils literal notranslate"><span class="pre">4M</span></code>, with the same ridge point of roughly 281-312 tokens.
+Hence, for <code class="docutils literal notranslate"><span class="pre">M</span></code> up to a few hundred tokens, FC1 and FC2 are roofline-predicted to be memory-bound, and
+DENSEGEMM’s redundant arithmetic should have limited latency impact:</p>
+<blockquote>
+<div><p><strong>Roofline estimate: M up to roughly 280-310 when counting packed FP4 weight payload bytes.</strong> Beyond
+this range, the redundant compute introduced by densification begins to translate into actual latency
+cost.</p>
+</div></blockquote>
+<p>The empirical FC1 memory-to-compute crossover is at about <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">=</span> <span class="pre">336</span></code> (see the roofline table in the
+performance section), close to this simplified estimate. The payload-only model intentionally ignores
+NVFP4 scale-factor loads, input/output activation traffic, epilogue work, and tactic changes; these
+effects make the boundary less sharp and can move the practical crossover into the low-to-mid 300-token
+range.</p>
+</section>
+</section>
+<section id="kernel-implementation-cute-dsl-on-blackwell">
+<h2>Kernel Implementation (CuTe DSL on Blackwell)<a class="headerlink" href="#kernel-implementation-cute-dsl-on-blackwell" title="Link to this heading">#</a></h2>
+<p>DENSEGEMM consists of two CuTe DSL kernels, both registered as <code class="docutils literal notranslate"><span class="pre">torch.library.custom_op</span></code>. The Python-side
+entry is <code class="docutils literal notranslate"><span class="pre">fused_moe_densegemm.py:run_moe_nvfp4</span></code>, with kernel bodies under
+<code class="docutils literal notranslate"><span class="pre">cute_dsl_kernels/blackwell/moe_as_dense_gemm/{fc1,fc2}.py</span></code>. Both share
+<code class="docutils literal notranslate"><span class="pre">Sm100BlockScaledPersistentDenseGemmKernel</span></code>, a dense GEMM template using persistent CTA, TMA load, and
+tcgen05 MMA, on top of which expert-aware alpha fusion is implemented separately.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>FC1</p></th>
+<th class="head"><p>FC2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Custom op</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cute_dsl_nvfp4_dense_gemm_swiglu_blackwell</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cute_dsl_nvfp4_dense_gemm_fc2_blackwell</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Math form</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">A</span> <span class="pre">=</span> <span class="pre">SwiGLU(alpha_fc31</span> <span class="pre">x</span> <span class="pre">X</span> <span class="pre">&#64;</span> <span class="pre">W^T)</span></code>, optional <code class="docutils literal notranslate"><span class="pre">A</span> <span class="pre">x</span> <span class="pre">alpha_post</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">C</span> <span class="pre">=</span> <span class="pre">(alpha_scale</span> <span class="pre">x</span> <span class="pre">A)</span> <span class="pre">&#64;</span> <span class="pre">B^T</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Expert concat dim</p></td>
+<td><p>N (per-expert tile = <code class="docutils literal notranslate"><span class="pre">2</span> <span class="pre">x</span> <span class="pre">intermediate</span></code>)</p></td>
+<td><p>K (per-expert tile = <code class="docutils literal notranslate"><span class="pre">intermediate</span></code>, 256-aligned)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Alpha fusion site</p></td>
+<td><p><strong>Epilogue</strong>, block-wise along N</p></td>
+<td><p><strong>Mainloop</strong>, block-wise along M and K</p></td>
+</tr>
+<tr class="row-even"><td><p>AutoTune space</p></td>
+<td><p>MMA <code class="docutils literal notranslate"><span class="pre">[(128,128),(128,256),(256,256)]</span></code>, cluster <code class="docutils literal notranslate"><span class="pre">[(1,1),(1,2),(1,4),(2,1)]</span></code></p></td>
+<td><p>MMA <code class="docutils literal notranslate"><span class="pre">[(128,64),(128,128),(128,256)]</span></code>, cluster <code class="docutils literal notranslate"><span class="pre">[(1,1),(1,2),(1,4)]</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Notes:</p>
+<ul class="simple">
+<li><p><strong>FC1 epilogue fusion</strong>: each N tile knows which expert it belongs to and can multiply in
+<code class="docutils literal notranslate"><span class="pre">alpha_post[:,</span> <span class="pre">expert_id]</span></code> after SwiGLU. Since W1 / W3 are interleaved within 64-groups along N,
+SwiGLU can fetch <code class="docutils literal notranslate"><span class="pre">(gate,</span> <span class="pre">up)</span></code> and compute the activation in the epilogue.</p></li>
+<li><p><strong>FC2 mainloop fusion</strong>: every 256 elements along K belong to one expert; before each MMA K-block
+enters the tensor cores, <code class="docutils literal notranslate"><span class="pre">alpha_scale[:,</span> <span class="pre">expert_id]</span></code> is multiplied in. Non-activated experts have
+alpha = 0, equivalent to multiply-by-zero masking. This requires <code class="docutils literal notranslate"><span class="pre">intermediate_size</span></code> to be a multiple
+of 256.</p></li>
+<li><p><strong>Weight layout</strong>: W2 is transposed from expert-major <code class="docutils literal notranslate"><span class="pre">(E,</span> <span class="pre">H,</span> <span class="pre">I)</span></code> to hidden-major <code class="docutils literal notranslate"><span class="pre">(H,</span> <span class="pre">E</span> <span class="pre">x</span> <span class="pre">I)</span></code>; the
+weight scale undergoes a <code class="docutils literal notranslate"><span class="pre">_transform_w2_weight_scale_for_min_latency</span></code> rearrangement so that the
+256-aligned K scales can be loaded into SMEM by TMA and fed to the mainloop alpha multiply.</p></li>
+<li><p><strong>Optional fusion <code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA</span></code></strong>: setting this environment variable to <code class="docutils literal notranslate"><span class="pre">1</span></code>
+pre-multiplies the per-token-per-expert FC2 alpha into FC1’s <code class="docutils literal notranslate"><span class="pre">alpha_post</span></code>, reducing FC2 to a regular
+NVFP4 GEMM with scalar alpha. This is disabled by default because the changed quantization point still
+needs module-level numerical closure, even though GPQA Diamond end-to-end accuracy does not show an
+obvious regression.</p></li>
+</ul>
+</section>
+<section id="performance-evaluation">
+<h2>Performance Evaluation<a class="headerlink" href="#performance-evaluation" title="Link to this heading">#</a></h2>
+<section id="setup">
+<h3>Setup<a class="headerlink" href="#setup" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>GPU</strong>: single NVIDIA B200 (SM100)</p></li>
+<li><p><strong>Workload profile</strong>: DeepSeek-V3-style routed MoE with <code class="docutils literal notranslate"><span class="pre">hidden</span> <span class="pre">=</span> <span class="pre">7168</span></code>, <code class="docutils literal notranslate"><span class="pre">num_experts</span> <span class="pre">=</span> <span class="pre">256</span></code>,
+<code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">8</span></code>, activation = SwiGLU, precision = NVFP4. <code class="docutils literal notranslate"><span class="pre">intermediate</span></code> may differ across comparison
+entries to reflect the per-rank shard size after TP partitioning.</p></li>
+<li><p><strong>Parallel strategy</strong>: TP8; measurements are reported for one tensor-parallel rank on one B200.</p></li>
+<li><p><strong>Environment</strong>: <code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA=1</span></code>.</p></li>
+<li><p><strong>Object under measurement</strong>: per-rank MoE module compute latency under the TP8 deployment, including
+Router GEMM, TopK, alpha generation, FC1, FC2, and necessary quantization. The two flanking AllReduces
+are excluded from this comparison.</p></li>
+<li><p><strong>Comparison points</strong>: DENSEGEMM (this work, dense routed-expert path) vs TRTLLM-Gen (per-expert
+grouped GEMM, TP) vs CUTLASS (reference).</p></li>
+</ul>
+</section>
+<section id="per-rank-moe-module-latency">
+<h3>Per-Rank MoE Module Latency<a class="headerlink" href="#per-rank-moe-module-latency" title="Link to this heading">#</a></h3>
+<p>The table below reports latency for representative <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> values with
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA=1</span></code>. Before reading the full table, the three main takeaways are:</p>
+<ul class="simple">
+<li><p>DENSEGEMM is not the min-latency winner at <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">&lt;=</span> <span class="pre">32</span></code>.</p></li>
+<li><p>DENSEGEMM is strongest in the <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">64-208</span></code> range, with the largest observed lead at
+<code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">128</span></code>.</p></li>
+<li><p>TRTLLM-Gen catches up around <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">224-256</span></code> and clearly overtakes from <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">272</span></code>.</p></li>
+</ul>
+<p>The speedup column is <code class="docutils literal notranslate"><span class="pre">t_TRTLLM-Gen</span> <span class="pre">/</span> <span class="pre">t_DENSEGEMM</span></code>; values greater than 1 indicate DENSEGEMM is faster.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-right"><p>num_tokens</p></th>
+<th class="head text-right"><p>DENSEGEMM (us)</p></th>
+<th class="head text-right"><p>TRTLLM-Gen (us)</p></th>
+<th class="head text-right"><p>CUTLASS (us)</p></th>
+<th class="head text-center"><p>DENSEGEMM vs TRTLLM-Gen</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-right"><p>1</p></td>
+<td class="text-right"><p>149.66</p></td>
+<td class="text-right"><p>26.78</p></td>
+<td class="text-right"><p>96.77</p></td>
+<td class="text-center"><p>0.18x</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>8</p></td>
+<td class="text-right"><p>142.15</p></td>
+<td class="text-right"><p>57.68</p></td>
+<td class="text-right"><p>150.55</p></td>
+<td class="text-center"><p>0.41x</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>16</p></td>
+<td class="text-right"><p>144.25</p></td>
+<td class="text-right"><p>86.55</p></td>
+<td class="text-right"><p>200.05</p></td>
+<td class="text-center"><p>0.60x</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>32</p></td>
+<td class="text-right"><p>144.15</p></td>
+<td class="text-right"><p>117.20</p></td>
+<td class="text-right"><p>262.73</p></td>
+<td class="text-center"><p>0.81x</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>48</p></td>
+<td class="text-right"><p>139.35</p></td>
+<td class="text-right"><p>133.54</p></td>
+<td class="text-right"><p>290.50</p></td>
+<td class="text-center"><p>0.96x</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p><strong>64</strong></p></td>
+<td class="text-right"><p><strong>140.59</strong></p></td>
+<td class="text-right"><p>141.68</p></td>
+<td class="text-right"><p>308.44</p></td>
+<td class="text-center"><p><strong>1.01x</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p><strong>128</strong></p></td>
+<td class="text-right"><p><strong>144.50</strong></p></td>
+<td class="text-right"><p>161.87</p></td>
+<td class="text-right"><p>335.65</p></td>
+<td class="text-center"><p><strong>1.12x</strong></p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p><strong>192</strong></p></td>
+<td class="text-right"><p><strong>166.61</strong></p></td>
+<td class="text-right"><p>168.23</p></td>
+<td class="text-right"><p>350.68</p></td>
+<td class="text-center"><p><strong>1.01x</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p><strong>208</strong></p></td>
+<td class="text-right"><p><strong>168.38</strong></p></td>
+<td class="text-right"><p>169.34</p></td>
+<td class="text-right"><p>354.73</p></td>
+<td class="text-center"><p><strong>1.01x</strong></p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>224</p></td>
+<td class="text-right"><p>169.61</p></td>
+<td class="text-right"><p>169.24</p></td>
+<td class="text-right"><p>354.01</p></td>
+<td class="text-center"><p>1.00x</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>256</p></td>
+<td class="text-right"><p>173.01</p></td>
+<td class="text-right"><p>172.17</p></td>
+<td class="text-right"><p>351.98</p></td>
+<td class="text-center"><p>1.00x</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>272</p></td>
+<td class="text-right"><p>241.80</p></td>
+<td class="text-right"><p>176.10</p></td>
+<td class="text-right"><p>357.90</p></td>
+<td class="text-center"><p>0.73x</p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>336</p></td>
+<td class="text-right"><p>251.33</p></td>
+<td class="text-right"><p>184.32</p></td>
+<td class="text-right"><p>363.58</p></td>
+<td class="text-center"><p>0.73x</p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>384</p></td>
+<td class="text-right"><p>257.37</p></td>
+<td class="text-right"><p>186.92</p></td>
+<td class="text-right"><p>368.12</p></td>
+<td class="text-center"><p>0.73x</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Observations:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">64-208</span></code> is DENSEGEMM’s measured sweet spot</strong>, reaching up to a 12% lead over TRTLLM-Gen
+and a 2.1x-2.3x lead over CUTLASS across that range.</p></li>
+<li><p><strong>DENSEGEMM is not advantageous at <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">&lt;=</span> <span class="pre">32</span></code>.</strong> The current implementation loads weights for
+all 256 routed experts; at small batch sizes, the weight-load time is roughly fixed at about 145 us,
+while TRTLLM-Gen only loads selected experts.</p></li>
+<li><p><strong>TRTLLM-Gen catches up around <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">224</span></code> and clearly overtakes at <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">&gt;=</span> <span class="pre">272</span></code></strong> because
+DENSEGEMM steps up to a slower FC1 tactic/configuration while the workload approaches the compute-bound
+crossover where redundant dense arithmetic starts to matter.</p></li>
+</ul>
+</section>
+<section id="roofline-sanity-check">
+<h3>Roofline Sanity Check<a class="headerlink" href="#roofline-sanity-check" title="Link to this heading">#</a></h3>
+<p>The measured FC1 behavior matches the roofline prediction. At <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">48</span></code> and <code class="docutils literal notranslate"><span class="pre">128</span></code>, FC1 reaches
+about 80% of B200 HBM bandwidth and stays close to the memory-bound lower bound. Around
+<code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">=</span> <span class="pre">336</span></code>, FC1 crosses into the compute-bound region: <code class="docutils literal notranslate"><span class="pre">xRoofline</span></code> rises above 2x and effective
+bandwidth drops below 50%. This matches the MoE module latency trend where DENSEGEMM wins in the
+<code class="docutils literal notranslate"><span class="pre">64-208</span></code> range, returns to parity around <code class="docutils literal notranslate"><span class="pre">224-256</span></code>, and loses again once the redundant dense arithmetic
+becomes visible.</p>
+</section>
+</section>
+<section id="current-limitations-and-future-work">
+<h2>Current Limitations and Future Work<a class="headerlink" href="#current-limitations-and-future-work" title="Link to this heading">#</a></h2>
+<p>The current backend intentionally optimizes a specific low-latency routed-MoE window as the first stage
+toward the target workflow. The remaining gaps are:</p>
+<ul class="simple">
+<li><p>It is not the best path for <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">&lt;=</span> <span class="pre">32</span></code>, where loading all routed experts overwhelms the benefit
+of denser GEMM shapes.</p></li>
+<li><p>Router GEMM and TopK are still serialized before the backend’s FC1/FC2 compute.</p></li>
+<li><p>DeepSeek-style shared experts are still executed separately as <code class="docutils literal notranslate"><span class="pre">shared_experts</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA</span></code> is disabled by default because changing the quantization point breaks the
+current module-level equivalence test, even though GPQA Diamond end-to-end accuracy does not show an
+obvious regression.</p></li>
+</ul>
+<p>Future directions include:</p>
+<ol class="arabic simple">
+<li><p><strong>Min-Latency: skip zero-load experts.</strong> For <code class="docutils literal notranslate"><span class="pre">num_tokens</span> <span class="pre">&lt;=</span> <span class="pre">32</span></code>, dynamically pick the subset of experts
+that are actually selected and only load / compute those weights. This addresses the current gap
+versus TRTLLM-Gen and is the key to extending DENSEGEMM into the Min-Latency regime.</p></li>
+<li><p><strong>Router-side overlap.</strong> Move Router GEMM, TopK, and alpha generation into a model-layer schedule that
+can run concurrently with FC1 and synchronize only when alpha is consumed.</p></li>
+<li><p><strong>Shared-expert fusion.</strong> Folding the shared expert into the dense FC1/FC2 representation would remove
+the separate shared FFN scheduling path for DeepSeek-style models.</p></li>
+<li><p><strong>Fused FC2 alpha numerical closure.</strong> Close the module-level numerical gap introduced by moving the
+quantization point so the latency-friendly <code class="docutils literal notranslate"><span class="pre">TRTLLM_MOE_FUSED_FC2_ALPHA=1</span></code> path can become a default
+path where it is beneficial.</p></li>
+<li><p><strong>Broader TP/EP coverage.</strong> The current implementation assumes a specific routed-expert deployment
+shape. Future work can adapt DENSEGEMM to broader TPxEPy combinations, supporting deployments from
+8xB200 to GB200 NVL72.</p></li>
+</ol>
+</section>
+<section id="references">
+<h2>References<a class="headerlink" href="#references" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Source code: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py</span></code></a></p></li>
+<li><p>Backend selection: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/create_moe.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/modules/fused_moe/create_moe.py</span></code></a></p></li>
+<li><p>FC1 kernel: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py</span></code></a></p></li>
+<li><p>FC2 kernel: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py</span></code></a></p></li>
+<li><p>Custom op registration: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py</span></code></a></p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/sparse-attention-development-guide.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Sparse Attention Development Guide</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Joint Optimization of Agent Applications and TensorRT-LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#abstract">Abstract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-moe-inference-latency-regimes">Background: MoE Inference Latency Regimes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scope-and-takeaways">Scope and Takeaways</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#densegemm-design">DENSEGEMM Design</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#target-workflow">Target Workflow</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#target-data-flow">Target Data Flow</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#current-implementation-in-tensorrt-llm">Current Implementation in TensorRT-LLM</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-the-implementation-is-staged">Why the Implementation is Staged</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advantages-over-the-grouped-gemm-flow">Advantages over the Grouped-GEMM Flow</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#available-today">Available Today</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expected-from-the-full-target-workflow">Expected from the Full Target Workflow</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#roofline-analysis">Roofline Analysis</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-notation">Step 1: Notation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-the-low-latency-regime-is-memory-bound">Step 2: The Low-Latency Regime is Memory-Bound</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-implementation-cute-dsl-on-blackwell">Kernel Implementation (CuTe DSL on Blackwell)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-evaluation">Performance Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#setup">Setup</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-rank-moe-module-latency">Per-Rank MoE Module Latency</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#roofline-sanity-check">Roofline Sanity Check</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-limitations-and-future-work">Current Limitations and Future Work</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#references">References</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on June 27, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
