@@ -348,16 +348,21 @@ class TestDeepseekV4CacheManager:
         is_draft: bool = False,
         tp_size: int = 1,
         enable_attention_dp: bool = False,
-        enable_swa_scratch_reuse: bool = False,
         spec_config: object | None = None,
+        indexer_k_dtype: str | None = None,
+        enable_swa_scratch_reuse: bool = True,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
         # Create sparse attention config
+        config_kwargs = {}
+        if indexer_k_dtype is not None:
+            config_kwargs["indexer_k_dtype"] = indexer_k_dtype
         sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=self.index_head_dim,
             window_size=self.window_size,
             compress_ratios=compress_ratios,
+            **config_kwargs,
         )
 
         # Create KV cache config
@@ -1654,7 +1659,7 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_swa_scratch_reuse_disabled_by_default_for_main_manager(self):
+    def test_swa_scratch_reuse_enabled_by_default_for_main_manager(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1662,25 +1667,6 @@ class TestDeepseekV4CacheManager:
             compress_ratios=[1],
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
-        )
-
-        try:
-            assert not cache_manager.enable_swa_scratch_reuse
-            assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
-            assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse is None
-            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
-        finally:
-            cache_manager.shutdown()
-
-    def test_swa_scratch_reuse_enabled_by_config_for_main_manager(self):
-        cache_manager, _ = self._create_deepseek_v4_cache_manager(
-            tokens_per_block=self.tokens_per_block,
-            max_batch_size=1,
-            max_seq_len=1024,
-            compress_ratios=[1],
-            dtype=DataType.BF16,
-            compressor_dtype=DataType.FLOAT,
-            enable_swa_scratch_reuse=True,
         )
 
         try:
@@ -1688,6 +1674,25 @@ class TestDeepseekV4CacheManager:
             assert cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
             assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse is not None
             assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse.max_rewind_len == 0
+            assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
+        finally:
+            cache_manager.shutdown()
+
+    def test_swa_scratch_reuse_disabled_by_config_for_main_manager(self):
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_swa_scratch_reuse=False,
+        )
+
+        try:
+            assert not cache_manager.enable_swa_scratch_reuse
+            assert not cache_manager.kv_cache_manager_py_config.enable_swa_scratch_reuse
+            assert cache_manager.kv_cache_manager_py_config.swa_scratch_reuse is None
             assert cache_manager.num_attention_op_pools == cache_manager.num_local_layers
         finally:
             cache_manager.shutdown()

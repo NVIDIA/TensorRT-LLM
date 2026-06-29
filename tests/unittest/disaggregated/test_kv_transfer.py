@@ -72,6 +72,8 @@ class KvCacheConfigV2:
     disk_prefetch_num_reqs: int = 4
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
 

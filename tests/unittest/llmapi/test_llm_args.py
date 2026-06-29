@@ -337,6 +337,8 @@ class TestModelDefaults:
 
 def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig().block_reuse_policy == "all_reusable"
+    assert KvCacheConfig().enable_swa_scratch_reuse is False
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
@@ -354,6 +356,7 @@ def test_KvCacheConfig_declaration():
                            copy_on_partial_reuse=True,
                            pool_ratio=[0.25, 0.75],
                            avg_seq_len=2048,
+                           block_reuse_policy="per_request",
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -372,8 +375,11 @@ def test_KvCacheConfig_declaration():
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
     assert config.pool_ratio == [0.25, 0.75]
     assert config.avg_seq_len == 2048
+    assert config.block_reuse_policy == "per_request"
     assert not hasattr(pybind_config, "pool_ratio")
     assert not hasattr(pybind_config, "avg_seq_len")
+    assert not hasattr(pybind_config, "block_reuse_policy")
+    assert not hasattr(pybind_config, "enable_swa_scratch_reuse")
     assert KvCacheConfig(
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
@@ -381,6 +387,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    with pytest.raises(ValidationError):
+        KvCacheConfig(block_reuse_policy="invalid")
 
 
 def test_KvCacheConfig_disk_cache_validation(tmp_path):

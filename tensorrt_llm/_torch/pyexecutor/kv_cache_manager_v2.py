@@ -20,6 +20,7 @@ from dataclasses import fields
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
+from strenum import StrEnum
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (
@@ -127,6 +128,11 @@ class Role:
     # reuse share the lifecycle of the main K/V buffers for the same layer.
     INDEX_KEY = DataRole("index_key")
     ALL = DataRole("all")
+
+
+class BlockReusePolicy(StrEnum):
+    ALL_REUSABLE = "all_reusable"
+    PER_REQUEST = "per_request"
 
 
 def _estimate_full_attn_size_per_token(
@@ -644,6 +650,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
+        self.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -2943,18 +2950,18 @@ class KVCacheManagerV2(BaseResourceManager):
             # iteration.
             if not kv_cache.is_active:
                 continue
-            if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
-                if req.context_current_position > kv_cache.num_committed_tokens:
-                    tokens = self._augment_tokens_for_block_reuse(
-                        req.get_tokens(DEFAULT_BEAM_INDEX),
-                        req,
-                        start=kv_cache.num_committed_tokens,
-                        end=req.context_current_position,
-                    )
-                    kv_cache.commit(tokens)
-                if req.context_remaining_length == 0:
-                    kv_cache.stop_committing()
-            else:
+            should_block_reuse = (
+                self.enable_block_reuse and not self.is_draft and not req.is_dummy_request
+            )
+            is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            should_resize = not should_block_reuse or not is_all_reusable
+            should_commit = (
+                should_block_reuse
+                and (is_all_reusable or req.context_remaining_length == 0)
+                and req.context_current_position > kv_cache.num_committed_tokens
+            )
+
+            if should_resize:
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:
                     raise ValueError(
@@ -2962,7 +2969,17 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id} to {req.context_current_position} tokens "
                         "at context update"
                     )
+            if should_commit:
+                tokens = self._augment_tokens_for_block_reuse(
+                    req.get_tokens(DEFAULT_BEAM_INDEX),
+                    req,
+                    start=kv_cache.num_committed_tokens,
+                    end=req.context_current_position,
+                )
+                kv_cache.commit(tokens)
             if req.context_remaining_length == 0:
+                if should_block_reuse:
+                    kv_cache.stop_committing()
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
