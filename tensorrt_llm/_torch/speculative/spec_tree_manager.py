@@ -1,6 +1,5 @@
 import logging
 import math
-from itertools import accumulate
 from typing import List
 
 import torch
@@ -203,11 +202,11 @@ class SpecTreeManager:
 
     # Auxiliary buffers
     # The top k  list for each draft layer.
-    top_k_list: list
+    top_k_list = []
     # The user input eagle choices, only available when using static tree.
-    eagle_choices: List[List[int]]
-    # If dynamic tree, each request has their own tree. If static tree, all requests share the same tree.
-    num_trees: int
+    eagle_choices: List[List[int]] = None
+    # If dynamice tree, each request has their own tree. If static tree, all requests share the same tree.
+    num_trees: int = None
 
     # Convert the choice to a path. Each path is an array of indices from the root to other nodes in the tree.
     # shape: [num_trees, max_total_draft_tokens + 1, max_draft_len + 1]
@@ -225,33 +224,37 @@ class SpecTreeManager:
     # shape: [num_trees, max_total_draft_tokens + 1], device tensor.
     spec_dec_position_offsets: torch.Tensor = None
 
-    ############################ Auxiliary buffers for the static tree. ############################
+    # TODO: Optimized together with the subsequent dynamic tree.
+    # Auxiliary buffers for the static tree.
     # Considering that the static tree does not modify the tree structure during inference, we can calculate some buffers in advance.
     # NOTE: Most of these buffers are introduced due to limitations of XQA:
     #       With tree attention, XQA cannot simply take the tokens to be processed in the next round as input. Instead, it needs to take ALL of their parent nodes as input.
     #       This incurs additional computation, but it is unavoidable.
 
     # NOTE: The reason why most of these auxiliary buffers are with `len == max_draft_len - 1` is that: we do not need to prepare specific input data for the first draft layer.
+
     # The top k value for each draft layer. Device tensor.
     top_k_list_cuda: list[torch.Tensor] = None
 
     # The max top k value for all draft layers. Which is used for torch.topk and cuda graph.
     max_top_k = -1
 
-    # Gather the required draft tokens among the 'max_total_draft_tokens + 1' tokens.
+    # Gather the required draft tokens from all currently generated draft tokens as the input of the next draft layer.
     # Only the nodes has child(s) this layer and all their parents nodes will be gathered.
+    # Device tensor. len(tokens_gather_idx) == max_draft_len - 1. Each element is a tensor with shape [num_tokens_for_next_layer].
     tokens_gather_idx_for_drafter_model: list[torch.Tensor] = None
 
+    # Gather the required logits from all currently generated logits.
+    # Device tensor. len(tokens_gather_idx) == max_draft_len - 1.
+    logits_gather_idx: list[torch.Tensor] = None
+
     # The packed mask for the drafter model's attention (i.e., xqa).
-    # shape: [1, max_total_draft_tokens + 1, math.ceil((max_total_draft_tokens + 1) / 32)], device tensor.
     spec_dec_packed_mask_for_drafter_model: torch.Tensor = None
 
     # The read indices offset for the drafter model.
-    # shape: [max_total_draft_tokens + 1], device tensor.
     hidden_states_read_indices_offset_for_drafter_model: torch.Tensor = None
 
     # The write back start indices for the drafter tokens between different draft layers.
-    # shape: [max_draft_len + 1], device tensor.
     draft_tokens_indices_cumsum: torch.Tensor = None
 
     # Work buffers for dynamic tree build kernel output
@@ -384,6 +387,7 @@ class SpecTreeManager:
             0, ids, self.retrieve_next_sibling[:num_gens])
         ss.mark_valid(ids, num_gens)
 
+    # For the static tree
     def init_tree_info_for_static_tree(self):
         self.index_mapping_set = {}
         self.nodes_list_per_layer = [[] for _ in range(self.max_draft_len + 1)]
@@ -432,7 +436,9 @@ class SpecTreeManager:
                              pin_memory=prefer_pinned()))
 
         # 6) Compute the spec decoding according to the eagle_paths for the target model
-        self.compute_spec_dec_mask_matrix(0)
+        for i, path in enumerate(self.eagle_paths[0]):
+            indices = path[path > -1]
+            self.spec_dec_mask_matrix[0][i, indices] = 1
         self.compute_spec_dec_packed_mask(self.spec_dec_mask_matrix,
                                           self.spec_dec_packed_mask)
 
@@ -471,6 +477,7 @@ class SpecTreeManager:
         num_nodes_per_layer = [0]
         num_nodes_per_layer.extend(
             [len(node_list) for node_list in self.nodes_list_per_layer[1:]])
+        from itertools import accumulate
         self.draft_tokens_indices_cumsum = torch.tensor(list(
             accumulate(num_nodes_per_layer)),
                                                         dtype=torch.int32,
@@ -520,15 +527,6 @@ class SpecTreeManager:
     def get_top_k_list(self, draft_layer_id):
         assert draft_layer_id >= 0
         return self.top_k_list[draft_layer_id]
-
-    def compute_spec_dec_mask_matrix(self, tree_idx=0):
-        if self.eagle_paths is None:
-            raise RuntimeError(
-                "compute_spec_dec_mask_matrix() is not supported in dynamic tree mode"
-            )
-        for i, path in enumerate(self.eagle_paths[0]):
-            indices = path[path > -1]
-            self.spec_dec_mask_matrix[0][i, indices] = 1
 
     def compute_spec_dec_packed_mask(self, mask_matrix, packed_mask):
         bs, num_tokens, num_tokens_attend = mask_matrix.shape
