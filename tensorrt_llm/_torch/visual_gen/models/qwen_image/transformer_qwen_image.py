@@ -27,6 +27,7 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.linear import Linear, NVFP4LinearMethod
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -66,8 +67,8 @@ def _svdquant_gemm_supported(device: torch.device) -> bool:
     """The fused NVFP4-SVDQuant GEMM kernel (residual + rank-r LoRA-up) is SM100 (Blackwell)-only."""
     if device.type != "cuda":
         return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major == 10 and hasattr(torch.ops.trtllm, "nvfp4_svdquant_gemm")
+    capability = torch.cuda.get_device_capability(device)
+    return capability == (10, 0) and hasattr(torch.ops.trtllm, "nvfp4_svdquant_gemm_tuned")
 
 
 class NVFP4SVDLinearMethod(NVFP4LinearMethod):
@@ -91,6 +92,9 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
         # Materialized lazily in load_weights_vanilla (rank comes from the ckpt).
         module.svdquant_lora_a = None
         module.svdquant_lora_b = None
+        module.register_buffer("_svdquant_l2t_smoothed", None, persistent=False)
+        module.register_buffer("_svdquant_l1_scaled", None, persistent=False)
+        module._svdquant_use_fused = False
 
     def load_weights_vanilla(self, module, weights, allow_partial_loading: bool = False) -> None:
         super().load_weights_vanilla(module, weights, allow_partial_loading)
@@ -110,6 +114,53 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
                 w["svdquant_lora_b"].to(device), requires_grad=False
             )
 
+    def post_load_weights(self, module) -> None:
+        super().post_load_weights(module)
+        lora_a = getattr(module, "svdquant_lora_a", None)
+        lora_b = getattr(module, "svdquant_lora_b", None)
+        pqs = getattr(module, "pre_quant_scale", None)
+
+        def set_derived_buffer(name: str, value: Optional[torch.Tensor]) -> None:
+            # Qwen swaps an already-created NVFP4 Linear to this method after construction, so
+            # create_weights() is not guaranteed to have registered these derived buffers.
+            if name in module._buffers:
+                setattr(module, name, value)
+            else:
+                module.register_buffer(name, value, persistent=False)
+
+        shapes_are_supported = (
+            lora_a is not None
+            and lora_b is not None
+            and pqs is not None
+            and lora_a.dim() == 2
+            and lora_b.dim() == 2
+            and lora_a.shape[0] == 32
+            and lora_b.shape[1] == 32
+            and module.weight.shape[0] == lora_b.shape[0]
+            and module.weight.shape[1] * 2 == lora_a.shape[1]
+            and pqs.numel() == lora_a.shape[1]
+        )
+        if not shapes_are_supported:
+            set_derived_buffer("_svdquant_l2t_smoothed", None)
+            set_derived_buffer("_svdquant_l1_scaled", None)
+            module._svdquant_use_fused = False
+            return
+
+        # These factors are invariant after checkpoint loading. Preparing them here avoids a
+        # device-to-host .item(), tensor allocation, and module mutation inside torch.compile or
+        # CUDA graph capture.
+        l2t_smoothed = (
+            pqs.to(torch.bfloat16).unsqueeze(1) * lora_a.t().to(torch.bfloat16)
+        ).contiguous()
+        l1_scaled = (
+            (lora_b.to(torch.float32) / module.alpha.reshape(-1)[:1])
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        set_derived_buffer("_svdquant_l2t_smoothed", l2t_smoothed)
+        set_derived_buffer("_svdquant_l1_scaled", l1_scaled)
+        module._svdquant_use_fused = _svdquant_gemm_supported(module.weight.device)
+
     def apply(self, module, input, bias):
         a = getattr(module, "svdquant_lora_a", None)
         b = getattr(module, "svdquant_lora_b", None)
@@ -117,8 +168,13 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
         # On SM100 the NVFP4 residual GEMM and the rank-r LoRA-up are fused into a single CUTLASS
         # kernel (with the pre_quant_scale smoothing folded into the quantize); other architectures
         # fall back to the eager BF16 LoRA path below.
-        if a is not None and b is not None and _svdquant_gemm_supported(input.device):
-            return self._apply_svdquant_gemm(module, input, bias, a, b, pqs)
+        if (
+            a is not None
+            and b is not None
+            and pqs is not None
+            and getattr(module, "_svdquant_use_fused", False)
+        ):
+            return self._apply_svdquant_gemm(module, input, bias, pqs)
         x_hat = input * pqs if pqs is not None else input
         # Residual NVFP4 GEMM on the already-smoothed activation; clear pre_quant_scale so the base
         # method does not smooth a second time.
@@ -133,28 +189,42 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
             out = out + lora.to(out.dtype)
         return out
 
-    def _apply_svdquant_gemm(self, module, input, bias, lora_a, lora_b, pqs):
-        # Cache the static fused LoRA factors once: L2t_smoothed = pqs ⊙ L2ᵀ [in, r] so the down-proj
-        # D = x @ L2t_smoothed reads the raw activation (no separate x̂ materialization), and
-        # L1_scaled = svdquant_lora_b / alpha [out, r] so the epilogue out = alpha·acc yields the
-        # unscaled D @ L1ᵀ correction on top of the alpha-scaled NVFP4 residual.
-        if getattr(module, "_svdquant_l2t_smoothed", None) is None:
-            alpha = float(module.alpha.reshape(-1)[0].item())
-            module._svdquant_l2t_smoothed = (
-                pqs.to(torch.bfloat16).unsqueeze(1) * lora_a.t().to(torch.bfloat16)
-            ).contiguous()
-            module._svdquant_l1_scaled = (
-                (lora_b.to(torch.float32) / alpha).to(torch.bfloat16).contiguous()
-            )
+    def _apply_svdquant_gemm(self, module, input, bias, pqs):
+        orig_shape, x2d, xq, x_sf = self._prepare_svdquant_input(module, input, pqs)
+        down = torch.mm(x2d, module._svdquant_l2t_smoothed)
+        return self._apply_svdquant_precomputed(
+            module,
+            orig_shape,
+            xq,
+            x_sf,
+            down,
+            bias,
+        )
+
+    def _prepare_svdquant_input(self, module, input, pqs):
         orig_shape = input.shape
         x2d = input.reshape(-1, orig_shape[-1]).to(torch.bfloat16).contiguous()
+        xq, x_sf = self._quantize_svdquant_input(module, x2d, pqs)
+        return orig_shape, x2d, xq, x_sf
+
+    @staticmethod
+    def _quantize_svdquant_input(module, x2d, pqs):
         global_scale = module.input_scale.to(torch.float32).reshape(1).contiguous()
-        # Fused smooth + NVFP4 quantize of the activation, and the eager rank-r down-projection D.
-        xq, x_sf = torch.ops.trtllm.nvfp4_quantize_smooth(
+        return torch.ops.trtllm.nvfp4_quantize_smooth(
             x2d, pqs.to(torch.bfloat16).contiguous(), global_scale
         )
-        down = (x2d @ module._svdquant_l2t_smoothed).contiguous()
-        out = torch.ops.trtllm.nvfp4_svdquant_gemm(
+
+    @staticmethod
+    def _apply_svdquant_precomputed(
+        module,
+        orig_shape,
+        xq,
+        x_sf,
+        down,
+        bias,
+        down_offset: int = 0,
+    ):
+        out = torch.ops.trtllm.nvfp4_svdquant_gemm_tuned(
             xq.view(torch.uint8),
             module.weight.view(torch.uint8),
             x_sf.view(torch.uint8),
@@ -163,11 +233,27 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
             down,
             module._svdquant_l1_scaled,
             torch.bfloat16,
+            bias,
+            down_offset=down_offset,
         )
         out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        if bias is not None:
-            out = out + bias
         return out
+
+
+def _is_tp1_fused_svdquant_linear(module: nn.Module) -> bool:
+    """Whether ``module`` can bypass Linear.forward in a packed SVDQuant frontend."""
+    return (
+        isinstance(module, Linear)
+        and isinstance(getattr(module, "quant_method", None), NVFP4SVDLinearMethod)
+        and getattr(module, "tp_size", 1) == 1
+        and getattr(module, "tp_mode", None) is None
+        and getattr(module, "lora", None) is None
+        and getattr(module, "_svdquant_use_fused", False)
+        and getattr(module, "input_scale", None) is not None
+        and getattr(module, "pre_quant_scale", None) is not None
+        and getattr(module, "_svdquant_l2t_smoothed", None) is not None
+        and getattr(module, "_svdquant_l1_scaled", None) is not None
+    )
 
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -649,6 +735,100 @@ class QwenJointAttention(Attention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
+        self.register_buffer("_svdquant_img_qkv_l2t_packed", None, persistent=False)
+        self.register_buffer("_svdquant_txt_qkv_l2t_packed", None, persistent=False)
+        self._svdquant_use_packed_img_qkv = False
+        self._svdquant_use_packed_txt_qkv = False
+        self._svdquant_qkv_aux_stream = None
+        self._svdquant_qkv_events = None
+
+    @staticmethod
+    def _can_pack_qkv(projections: Tuple[Linear, Linear, Linear]) -> bool:
+        if not all(_is_tp1_fused_svdquant_linear(proj) for proj in projections):
+            return False
+
+        first = projections[0]
+        first_l2t = first._svdquant_l2t_smoothed
+        factors_are_compatible = all(
+            proj._svdquant_l2t_smoothed.dim() == 2
+            and proj._svdquant_l2t_smoothed.shape == first_l2t.shape
+            and proj._svdquant_l2t_smoothed.shape[1] == 32
+            and proj._svdquant_l1_scaled.dim() == 2
+            and proj._svdquant_l1_scaled.shape[1] == 32
+            for proj in projections
+        )
+        scales_are_shared = all(
+            torch.equal(proj.input_scale, first.input_scale)
+            and torch.equal(proj.pre_quant_scale, first.pre_quant_scale)
+            for proj in projections[1:]
+        )
+        return factors_are_compatible and scales_are_shared
+
+    def prepare_svdquant_packed_frontends(
+        self, aux_stream: Optional[torch.cuda.Stream] = None
+    ) -> None:
+        """Build invariant QKV down-projection packs after all Linear post-load work."""
+        self._svdquant_img_qkv_l2t_packed = None
+        self._svdquant_txt_qkv_l2t_packed = None
+        self._svdquant_use_packed_img_qkv = False
+        self._svdquant_use_packed_txt_qkv = False
+        self._svdquant_qkv_aux_stream = None
+        self._svdquant_qkv_events = None
+
+        img_projections = (self.to_q, self.to_k, self.to_v)
+        if self._can_pack_qkv(img_projections):
+            self._svdquant_img_qkv_l2t_packed = torch.cat(
+                [proj._svdquant_l2t_smoothed for proj in img_projections], dim=1
+            ).contiguous()
+            self._svdquant_use_packed_img_qkv = True
+
+        txt_projections = (self.add_q_proj, self.add_k_proj, self.add_v_proj)
+        if self._can_pack_qkv(txt_projections):
+            self._svdquant_txt_qkv_l2t_packed = torch.cat(
+                [proj._svdquant_l2t_smoothed for proj in txt_projections], dim=1
+            ).contiguous()
+            self._svdquant_use_packed_txt_qkv = True
+
+        if (
+            aux_stream is not None
+            and self._svdquant_use_packed_img_qkv
+            and self._svdquant_use_packed_txt_qkv
+        ):
+            self._svdquant_qkv_aux_stream = aux_stream
+            self._svdquant_qkv_events = (torch.cuda.Event(), torch.cuda.Event())
+
+    @staticmethod
+    def _apply_packed_qkv(
+        input: torch.Tensor,
+        projections: Tuple[Linear, Linear, Linear],
+        l2t_packed: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_proj, k_proj, v_proj = projections
+        q_method = q_proj.quant_method
+        orig_shape, x2d, xq, x_sf = q_method._prepare_svdquant_input(
+            q_proj, input, q_proj.pre_quant_scale
+        )
+        down = torch.mm(x2d, l2t_packed)
+        q = q_method._apply_svdquant_precomputed(q_proj, orig_shape, xq, x_sf, down, q_proj.bias)
+        k = k_proj.quant_method._apply_svdquant_precomputed(
+            k_proj,
+            orig_shape,
+            xq,
+            x_sf,
+            down,
+            k_proj.bias,
+            down_offset=32,
+        )
+        v = v_proj.quant_method._apply_svdquant_precomputed(
+            v_proj,
+            orig_shape,
+            xq,
+            x_sf,
+            down,
+            v_proj.bias,
+            down_offset=64,
+        )
+        return q, k, v
 
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
@@ -664,12 +844,42 @@ class QwenJointAttention(Attention):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_txt = encoder_hidden_states.shape[1]
 
-        # Image QKV.
-        img_q, img_k, img_v = self.get_qkv(hidden_states)
-        # Text QKV.
-        txt_q = self.add_q_proj(encoder_hidden_states)
-        txt_k = self.add_k_proj(encoder_hidden_states)
-        txt_v = self.add_v_proj(encoder_hidden_states)
+        def apply_img_qkv() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if self._svdquant_use_packed_img_qkv:
+                return self._apply_packed_qkv(
+                    hidden_states,
+                    (self.to_q, self.to_k, self.to_v),
+                    self._svdquant_img_qkv_l2t_packed,
+                )
+            return self.get_qkv(hidden_states)
+
+        def apply_txt_qkv() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if self._svdquant_use_packed_txt_qkv:
+                return self._apply_packed_qkv(
+                    encoder_hidden_states,
+                    (self.add_q_proj, self.add_k_proj, self.add_v_proj),
+                    self._svdquant_txt_qkv_l2t_packed,
+                )
+            return (
+                self.add_q_proj(encoder_hidden_states),
+                self.add_k_proj(encoder_hidden_states),
+                self.add_v_proj(encoder_hidden_states),
+            )
+
+        if self._svdquant_qkv_events is not None:
+            img_outputs, txt_outputs = maybe_execute_in_parallel(
+                apply_img_qkv,
+                apply_txt_qkv,
+                self._svdquant_qkv_events[0],
+                self._svdquant_qkv_events[1],
+                self._svdquant_qkv_aux_stream,
+                disable_on_compile=True,
+            )
+            img_q, img_k, img_v = img_outputs
+            txt_q, txt_k, txt_v = txt_outputs
+        else:
+            img_q, img_k, img_v = apply_img_qkv()
+            txt_q, txt_k, txt_v = apply_txt_qkv()
 
         # Reshape to (B, S, H, D).
         img_q = img_q.unflatten(-1, (self.heads, -1))
@@ -754,6 +964,10 @@ class QwenImageTransformerBlock(nn.Module):
     ):
         super().__init__()
         config = config or DiffusionModelConfig()
+        # The modulation Linear children below currently use their default Mapping, so their
+        # local tp_size alone cannot prove that bypassing Linear.forward is safe. Preserve the
+        # model-level TP size explicitly for the packed-frontend guard.
+        self._svdquant_frontend_tp_size = config.mapping.tp_size
 
         # Image stream.
         self.img_mod = nn.Sequential(
@@ -812,6 +1026,92 @@ class QwenImageTransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
         )
+        self.register_buffer("_svdquant_mod_l2t_packed", None, persistent=False)
+        self._svdquant_use_packed_mod = False
+        self._svdquant_mlp_aux_stream = None
+        self._svdquant_mlp_events = None
+
+    def prepare_svdquant_packed_frontends(
+        self, aux_stream: Optional[torch.cuda.Stream] = None
+    ) -> None:
+        self.attn.prepare_svdquant_packed_frontends(aux_stream)
+        self._svdquant_mod_l2t_packed = None
+        self._svdquant_use_packed_mod = False
+        self._svdquant_mlp_aux_stream = None
+        self._svdquant_mlp_events = None
+
+        if self._svdquant_frontend_tp_size != 1:
+            return
+
+        img_linear = self.img_mod[1]
+        txt_linear = self.txt_mod[1]
+        if not (
+            _is_tp1_fused_svdquant_linear(img_linear) and _is_tp1_fused_svdquant_linear(txt_linear)
+        ):
+            return
+
+        img_l2t = img_linear._svdquant_l2t_smoothed
+        txt_l2t = txt_linear._svdquant_l2t_smoothed
+        factors_are_compatible = (
+            img_l2t.dim() == 2
+            and txt_l2t.dim() == 2
+            and img_l2t.shape == txt_l2t.shape
+            and img_l2t.shape[1] == 32
+            and img_linear._svdquant_l1_scaled.dim() == 2
+            and img_linear._svdquant_l1_scaled.shape[1] == 32
+            and txt_linear._svdquant_l1_scaled.dim() == 2
+            and txt_linear._svdquant_l1_scaled.shape[1] == 32
+        )
+        if factors_are_compatible:
+            self._svdquant_mod_l2t_packed = torch.cat([img_l2t, txt_l2t], dim=1).contiguous()
+            self._svdquant_use_packed_mod = True
+
+        mlp_projections = (
+            self.img_mlp.up_proj,
+            self.img_mlp.down_proj,
+            self.txt_mlp.up_proj,
+            self.txt_mlp.down_proj,
+        )
+        mlp_uses_fused_svdquant = all(
+            isinstance(getattr(projection, "quant_method", None), NVFP4SVDLinearMethod)
+            and getattr(projection, "_svdquant_use_fused", False)
+            for projection in mlp_projections
+        )
+        if aux_stream is not None and mlp_uses_fused_svdquant:
+            self._svdquant_mlp_aux_stream = aux_stream
+            self._svdquant_mlp_events = (torch.cuda.Event(), torch.cuda.Event())
+
+    def _apply_packed_modulations(self, temb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_linear = self.img_mod[1]
+        txt_linear = self.txt_mod[1]
+        mod_input = self.img_mod[0](temb)
+
+        img_method = img_linear.quant_method
+        orig_shape, x2d, img_xq, img_x_sf = img_method._prepare_svdquant_input(
+            img_linear, mod_input, img_linear.pre_quant_scale
+        )
+        txt_xq, txt_x_sf = txt_linear.quant_method._quantize_svdquant_input(
+            txt_linear, x2d, txt_linear.pre_quant_scale
+        )
+        down = torch.mm(x2d, self._svdquant_mod_l2t_packed)
+        img_mod_params = img_method._apply_svdquant_precomputed(
+            img_linear,
+            orig_shape,
+            img_xq,
+            img_x_sf,
+            down,
+            img_linear.bias,
+        )
+        txt_mod_params = txt_linear.quant_method._apply_svdquant_precomputed(
+            txt_linear,
+            orig_shape,
+            txt_xq,
+            txt_x_sf,
+            down,
+            txt_linear.bias,
+            down_offset=32,
+        )
+        return img_mod_params, txt_mod_params
 
     @staticmethod
     def _modulate(x: torch.Tensor, mod_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -830,8 +1130,11 @@ class QwenImageTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_mod_params = self.img_mod(temb)
-        txt_mod_params = self.txt_mod(temb)
+        if self._svdquant_use_packed_mod:
+            img_mod_params, txt_mod_params = self._apply_packed_modulations(temb)
+        else:
+            img_mod_params = self.img_mod(temb)
+            txt_mod_params = self.txt_mod(temb)
 
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
@@ -849,16 +1152,32 @@ class QwenImageTransformerBlock(nn.Module):
             timestep=timestep,
         )
 
-        # Residual.
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        def apply_img_mlp() -> torch.Tensor:
+            img_hidden_states = hidden_states + img_gate1 * img_attn_output
+            img_modulated2, img_gate2 = self._modulate(
+                self.img_norm2(img_hidden_states), img_mod2
+            )
+            return img_hidden_states + img_gate2 * self.img_mlp(img_modulated2)
 
-        # Norm2 + MLP + residual.
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
-        hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
+        def apply_txt_mlp() -> torch.Tensor:
+            txt_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+            txt_modulated2, txt_gate2 = self._modulate(
+                self.txt_norm2(txt_hidden_states), txt_mod2
+            )
+            return txt_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
 
-        txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
+        if self._svdquant_mlp_events is not None:
+            hidden_states, encoder_hidden_states = maybe_execute_in_parallel(
+                apply_img_mlp,
+                apply_txt_mlp,
+                self._svdquant_mlp_events[0],
+                self._svdquant_mlp_events[1],
+                self._svdquant_mlp_aux_stream,
+                disable_on_compile=True,
+            )
+        else:
+            hidden_states = apply_img_mlp()
+            encoder_hidden_states = apply_txt_mlp()
 
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
@@ -955,6 +1274,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             bias=True,
             **linear_kwargs,
         )
+        self._svdquant_qkv_aux_stream = None
 
     @property
     def device(self) -> torch.device:
@@ -1122,6 +1442,17 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         f"weight_scale_shape={scale_shape}, "
                         f"weight_scale_dtype={scale_dtype}"
                     ) from exc
+
+        has_svdquant = any(
+            isinstance(module, Linear)
+            and isinstance(getattr(module, "quant_method", None), NVFP4SVDLinearMethod)
+            for module in self.modules()
+        )
+        if has_svdquant and self.device.type == "cuda":
+            self._svdquant_qkv_aux_stream = torch.cuda.Stream(device=self.device)
+
+        for block in self.transformer_blocks:
+            block.prepare_svdquant_packed_frontends(self._svdquant_qkv_aux_stream)
 
     def forward(
         self,

@@ -30,6 +30,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -41,8 +42,12 @@ namespace torch_ext
 std::tuple<at::Tensor, at::Tensor> nvfp4_quantize_smooth(
     at::Tensor const& x, at::Tensor const& pqs, at::Tensor const& global_scale)
 {
+    TORCH_CHECK(x.is_cuda() && pqs.is_cuda() && global_scale.is_cuda(), "x, pqs, global_scale must be CUDA tensors");
+    TORCH_CHECK(pqs.device() == x.device() && global_scale.device() == x.device(),
+        "x, pqs, global_scale must reside on the same CUDA device");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && pqs.scalar_type() == at::kBFloat16, "x, pqs must be bf16");
     TORCH_CHECK(global_scale.scalar_type() == at::kFloat, "global_scale must be float32");
+    TORCH_CHECK(global_scale.numel() >= 1, "global_scale must contain at least one element");
     TORCH_CHECK(x.dim() == 2, "x must be [m, n]");
     int const m = static_cast<int>(x.size(0));
     int const n = static_cast<int>(x.size(1));
@@ -66,13 +71,25 @@ std::tuple<at::Tensor, at::Tensor> nvfp4_quantize_smooth(
 // and L1 [n,r]=svdquant_lora_b/alpha (1/alpha folded so the epilogue out=alpha*acc yields the LoRA).
 at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Tensor const& a_sf,
     at::Tensor const& w_sf, at::Tensor const& alpha, at::Tensor const& D, at::Tensor const& L1,
-    std::optional<c10::ScalarType> out_dtype)
+    std::optional<c10::ScalarType> out_dtype, std::optional<at::Tensor> const& bias = std::nullopt, int64_t tactic = -1,
+    int64_t down_offset = 0)
 {
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
+    TORCH_CHECK(wq.is_cuda() && a_sf.is_cuda() && w_sf.is_cuda() && alpha.is_cuda(),
+        "wq, a_sf, w_sf, alpha must be CUDA tensors");
+    TORCH_CHECK(wq.device() == a.device() && a_sf.device() == a.device() && w_sf.device() == a.device()
+            && alpha.device() == a.device(),
+        "a, wq, a_sf, w_sf, alpha must reside on the same CUDA device");
     TORCH_CHECK(a.scalar_type() == at::kByte && wq.scalar_type() == at::kByte, "a, wq must be uint8 (packed FP4)");
     TORCH_CHECK(a_sf.scalar_type() == at::kByte && w_sf.scalar_type() == at::kByte, "a_sf, w_sf must be uint8");
     TORCH_CHECK(alpha.scalar_type() == at::kFloat, "alpha must be float32");
-    TORCH_CHECK(D.scalar_type() == at::kBFloat16 && L1.scalar_type() == at::kBFloat16, "D, L1 must be bf16");
+    TORCH_CHECK(alpha.numel() >= 1, "alpha must contain at least one element");
+    TORCH_CHECK(D.is_cuda(), "D must be a CUDA tensor");
+    TORCH_CHECK(D.scalar_type() == at::kBFloat16, "D must be bf16");
+    TORCH_CHECK(D.dim() == 2, "D must be 2-D");
+    TORCH_CHECK(L1.is_cuda(), "L1 must be a CUDA tensor");
+    TORCH_CHECK(L1.scalar_type() == at::kBFloat16, "L1 must be bf16");
+    TORCH_CHECK(L1.dim() == 2, "L1 must be 2-D");
     TORCH_CHECK(a.dim() == 2 && wq.dim() == 2, "a, wq must be 2-D");
     int const m = static_cast<int>(a.size(0));
     int const kPacked = static_cast<int>(a.size(1));
@@ -80,6 +97,21 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
     int const n = static_cast<int>(wq.size(0));
     TORCH_CHECK(static_cast<int>(wq.size(1)) == kPacked, "a, wq inner dim mismatch");
     TORCH_CHECK(n % 32 == 0 && k % 32 == 0, "n and k must be divisible by 32");
+    int64_t const expectedActSfSize = tensorrt_llm::computeSwizzledLayoutSFSize(m, k / 16);
+    int64_t const expectedWeightSfSize = tensorrt_llm::computeSwizzledLayoutSFSize(n, k / 16);
+    TORCH_CHECK(a_sf.numel() >= expectedActSfSize, "a_sf is smaller than the required swizzled scale layout");
+    TORCH_CHECK(w_sf.numel() >= expectedWeightSfSize, "w_sf is smaller than the required swizzled scale layout");
+    TORCH_CHECK(D.device() == a.device(), "D must reside on the same CUDA device as a");
+    TORCH_CHECK(D.size(0) == m, "D must have m rows");
+    TORCH_CHECK(D.stride(1) == 1, "D must be contiguous in its inner dimension");
+    TORCH_CHECK(down_offset >= 0, "down_offset must be non-negative");
+    TORCH_CHECK(D.size(1) >= 32 && down_offset <= D.size(1) - 32,
+        "down_offset + 32 must not exceed D.size(1)");
+    auto const downAddress = reinterpret_cast<std::uintptr_t>(D.const_data_ptr<at::BFloat16>() + down_offset);
+    TORCH_CHECK(downAddress % 16 == 0, "D + down_offset must be 16-byte aligned for TMA");
+    TORCH_CHECK(D.stride(0) % 8 == 0, "D row stride must be a multiple of 8 bf16 elements for TMA");
+    TORCH_CHECK(L1.device() == a.device(), "L1 must reside on the same CUDA device as a");
+    TORCH_CHECK(L1.size(0) == n && L1.size(1) == 32, "L1 must have shape [n, 32]");
     auto const outType = out_dtype.value_or(at::kBFloat16);
     TORCH_CHECK(outType == at::kBFloat16, "nvfp4_svdquant_gemm currently supports bf16 output only");
     auto a_ = a.contiguous();
@@ -87,27 +119,65 @@ at::Tensor nvfp4_svdquant_gemm(at::Tensor const& a, at::Tensor const& wq, at::Te
     auto aSf_ = a_sf.contiguous();
     auto wSf_ = w_sf.contiguous();
     auto alpha_ = alpha.contiguous();
-    auto D_ = D.contiguous();
     auto L1_ = L1.contiguous();
     at::Tensor out = at::empty({m, n}, a.options().dtype(outType));
-    size_t const wsBytes = tensorrt_llm::kernels::cutlass_kernels::nvfp4_svdquant_gemm_workspace_size(m, n, k);
+    void const* biasPtr = nullptr;
+    if (bias.has_value() && bias->defined())
+    {
+        auto const& biasTensor = *bias;
+        TORCH_CHECK(biasTensor.is_cuda(), "bias must be a CUDA tensor");
+        TORCH_CHECK(biasTensor.device() == out.device(), "bias must reside on the same CUDA device as the output");
+        TORCH_CHECK(biasTensor.is_contiguous(), "bias must be contiguous");
+        TORCH_CHECK(biasTensor.dim() == 1 && biasTensor.size(0) == n, "bias must have shape [n]");
+        TORCH_CHECK(biasTensor.scalar_type() == outType, "bias dtype must match the output dtype");
+        biasPtr = biasTensor.const_data_ptr();
+    }
+    TORCH_CHECK(tactic >= -1 && tactic < tensorrt_llm::kernels::cutlass_kernels::kNvfp4SvdquantGemmNumTactics,
+        "invalid NVFP4 SVDQuant tactic: ", tactic);
+    int const tacticId = tactic < 0 ? 0 : static_cast<int>(tactic);
+    size_t const wsBytes
+        = tensorrt_llm::kernels::cutlass_kernels::nvfp4_svdquant_gemm_workspace_size(m, n, k, tacticId);
     at::Tensor workspace = at::empty({static_cast<int64_t>(wsBytes > 0 ? wsBytes : 1)}, a.options().dtype(at::kByte));
     auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+    auto const* downPtr = D.const_data_ptr<at::BFloat16>() + down_offset;
+    int64_t const downStride = D.stride(0);
     tensorrt_llm::kernels::cutlass_kernels::nvfp4_svdquant_gemm_run(out.data_ptr(), a_.const_data_ptr(),
         wq_.const_data_ptr(), aSf_.const_data_ptr(), wSf_.const_data_ptr(), alpha_.const_data_ptr<float>(),
-        D_.const_data_ptr(), L1_.const_data_ptr(), m, n, k, reinterpret_cast<char*>(workspace.data_ptr()), wsBytes,
-        stream);
+        downPtr, L1_.const_data_ptr(), biasPtr, m, n, k, reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, stream,
+        tacticId, downStride);
     return out;
 }
+
+class NVFP4SVDQuantGemmRunner : public torch::CustomClassHolder
+{
+public:
+    at::Tensor runGemm(at::Tensor const& a, at::Tensor const& wq, at::Tensor const& a_sf,
+        at::Tensor const& w_sf, at::Tensor const& alpha, at::Tensor const& D, at::Tensor const& L1,
+        std::optional<c10::ScalarType> out_dtype, std::optional<at::Tensor> const& bias, int64_t tactic,
+        int64_t down_offset) const
+    {
+        return nvfp4_svdquant_gemm(a, wq, a_sf, w_sf, alpha, D, L1, out_dtype, bias, tactic, down_offset);
+    }
+
+    int64_t getNumConfigs() const
+    {
+        return tensorrt_llm::kernels::cutlass_kernels::kNvfp4SvdquantGemmNumTactics;
+    }
+};
 
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.class_<torch_ext::NVFP4SVDQuantGemmRunner>("NVFP4SVDQuantGemmRunner")
+        .def(torch::init<>())
+        .def("run_gemm", &torch_ext::NVFP4SVDQuantGemmRunner::runGemm)
+        .def("get_num_configs", &torch_ext::NVFP4SVDQuantGemmRunner::getNumConfigs);
+
     m.def("nvfp4_quantize_smooth(Tensor x, Tensor pqs, Tensor global_scale) -> (Tensor, Tensor)");
     m.def(
         "nvfp4_svdquant_gemm(Tensor a, Tensor wq, Tensor a_sf, Tensor w_sf, Tensor alpha, "
-        "Tensor D, Tensor L1, ScalarType? out_dtype) -> Tensor");
+        "Tensor D, Tensor L1, ScalarType? out_dtype, Tensor? bias=None, int tactic=-1, int down_offset=0) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

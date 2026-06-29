@@ -7,6 +7,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..modules.multi_stream_utils import with_multi_stream
 from ..utils import make_weak_ref
 
 # One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
@@ -136,14 +137,18 @@ class CUDAGraphRunner:
         }
 
         graph = torch.cuda.CUDAGraph()
-        for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Match the LLM graph runner: model code may use persistent auxiliary
+        # streams only while warming/capturing a CUDA graph. Replay preserves
+        # the captured stream/event topology without host-side stream switches.
+        with with_multi_stream(True):
+            for _ in range(self.WARMUP_STEPS):
+                fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
-            output = fn(*static_args, **static_kwargs)
+            with torch.cuda.graph(graph, pool=self._get_pool()):
+                output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)

@@ -292,6 +292,37 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::nvfp4_quantize_smooth")
+    def _(
+        input: torch.Tensor,
+        pre_quant_scale: torch.Tensor,
+        global_scale: torch.Tensor,
+    ):
+        del pre_quant_scale, global_scale
+        output_shape, scale_size = fp4_utils.get_fp4_shape(input.shape, 16)
+        return (input.new_empty(output_shape, dtype=torch.uint8),
+                input.new_empty((scale_size, ), dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::nvfp4_svdquant_gemm")
+    def _(
+        a: torch.Tensor,
+        wq: torch.Tensor,
+        a_sf: torch.Tensor,
+        w_sf: torch.Tensor,
+        alpha: torch.Tensor,
+        down: torch.Tensor,
+        lora_up: torch.Tensor,
+        out_dtype: Optional[torch.dtype],
+        bias: Optional[torch.Tensor] = None,
+        tactic: int = -1,
+        down_offset: int = 0,
+    ):
+        del a_sf, w_sf, alpha, down, lora_up, bias, tactic, down_offset
+        return a.new_empty(
+            (a.shape[0], wq.shape[0]),
+            dtype=out_dtype if out_dtype is not None else torch.bfloat16,
+        )
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,

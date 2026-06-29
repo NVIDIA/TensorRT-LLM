@@ -17,10 +17,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstddef>
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 // Fused smooth + NVFP4 quantize: (out, sf_out) = NVFP4-quantize(in * pqs) in a single pass over in,
@@ -31,4 +35,6 @@ namespace tensorrt_llm::kernels
 void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void const* pqs, float const* sf_scale, int m,
     int n, int multiProcessorCount, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

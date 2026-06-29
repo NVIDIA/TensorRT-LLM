@@ -33,9 +33,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+from ..autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DistributedTuningStrategy,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -46,14 +52,16 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
-                     fp4_scale_infer_shape,
-                     get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2)
+from ..utils import (
+    ActivationType,
+    deep_gemm_gen_tuning_buckets,
+    fp4_scale_infer_shape,
+    get_last_power_of_2_num_tokens_buckets,
+    last_positive_power_of_2,
+)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellRunner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVFP4BlackwellRunner
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -653,6 +661,107 @@ class FP4GemmRunner(TunableRunner):
             bias,
         )
         return out
+
+
+class NVFP4SVDQuantGemmRunner(TunableRunner):
+    """Exact-shape tuner for the native residual-plus-rank-32 CUTLASS GEMM."""
+
+    runner_dict = dict()
+    # Image-token counts such as 6889 and 8192 must remain distinct. The regular NVFP4
+    # power-of-two M bucketing is intentionally not used for this composite kernel. Rotate
+    # cloned operands while profiling so cluster selection reflects the model's hundreds of
+    # distinct weights instead of repeatedly hitting one weight in L2.
+    tuning_config = TuningConfig(use_cold_l2_cache=True)
+
+    def __init__(self, output_dtype: torch.dtype):
+        self.output_dtype = output_dtype
+        if output_dtype not in NVFP4SVDQuantGemmRunner.runner_dict:
+            NVFP4SVDQuantGemmRunner.runner_dict[
+                output_dtype
+            ] = torch.classes.trtllm.NVFP4SVDQuantGemmRunner()
+        self.cpp_runner = NVFP4SVDQuantGemmRunner.runner_dict[output_dtype]
+
+    def unique_id(self):
+        # The version invalidates persisted tactic IDs if the native tactic order changes.
+        return ("nvfp4-svdquant-sm100-v6", self.output_dtype)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        del inputs, profile, kwargs
+        return list(range(self.cpp_runner.get_num_configs()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
+        down_offset: int = 0,
+    ) -> torch.Tensor:
+        act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up = inputs
+        return self.cpp_runner.run_gemm(
+            act_fp4,
+            weight,
+            act_sf,
+            weight_sf,
+            alpha,
+            down,
+            lora_up,
+            self.output_dtype,
+            bias,
+            tactic,
+            down_offset,
+        )
+
+
+@fast_custom_op("trtllm::nvfp4_svdquant_gemm_tuned", mutates_args=())
+def nvfp4_svdquant_gemm_tuned(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+    down_offset: int = 0,
+) -> torch.Tensor:
+    runner = NVFP4SVDQuantGemmRunner(output_dtype)
+    inputs = [act_fp4, weight, act_sf, weight_sf, alpha, down, lora_up]
+    _, best_tactic = AutoTuner.get().choose_one(
+        "trtllm::nvfp4_svdquant_gemm::cutlass_v6",
+        [runner],
+        runner.tuning_config,
+        inputs,
+        bias=bias,
+        down_offset=down_offset,
+    )
+    return runner(
+        inputs, tactic=best_tactic, bias=bias, down_offset=down_offset
+    )
+
+
+@nvfp4_svdquant_gemm_tuned.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    down: torch.Tensor,
+    lora_up: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+    down_offset: int = 0,
+) -> torch.Tensor:
+    del act_sf, weight_sf, alpha, down, lora_up, bias, down_offset
+    return act_fp4.new_empty(
+        (act_fp4.shape[0], weight.shape[0]), dtype=output_dtype
+    )
 
 
 class CublasLtFP4GemmRunner(TunableRunner):
@@ -2430,8 +2539,9 @@ class QuantizeE4M3PerTensorRunner(TunableRunner):
         if cls._te_available is None:
             try:
                 import transformer_engine_torch as tex
-                from transformer_engine.pytorch.tensor.float8_tensor import \
-                    Float8CurrentScalingQuantizer
+                from transformer_engine.pytorch.tensor.float8_tensor import (
+                    Float8CurrentScalingQuantizer,
+                )
                 cls._te_available = True
                 # Initialize quantizer once
                 cls._te_quantizer = Float8CurrentScalingQuantizer(

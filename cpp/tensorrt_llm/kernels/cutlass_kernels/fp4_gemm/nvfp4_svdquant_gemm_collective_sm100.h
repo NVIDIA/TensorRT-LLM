@@ -110,14 +110,32 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
     // === LoRA-up: a bf16 tcgen05 MMA of D@L1ᵀ (K=rank) accumulated into the
     // SAME f32 TMEM accumulator after the NVFP4 K-loop. Build the bf16 TiledMMA via CUTLASS's
     // own SM100 helper (matches the residual cta_group; SS = both operands SMEM-sourced, as
-    // the residual mainloop requires). This typedef + static_assert empirically prove the
-    // bf16 MMA constructs in-context before we wire smem/load/the 2nd gemm. ===
+    // the residual mainloop requires). The MMA tile is the full CTA-group tile, while the
+    // SMEM layouts below are explicitly reduced to each CTA's partition. ===
     static constexpr int LoRaK = 32; // SVDQuant rank r=32 = 2 bf16 16-wide K-atoms
-    using LoRaClusterTileShape
-        = decltype(make_shape(cute::size<0>(CtaShape_MNK{}), cute::size<1>(CtaShape_MNK{}), cute::Int<LoRaK>{}));
-    using LoRaMma = decltype(cutlass::gemm::collective::detail::sm100_make_1sm_trivial_tiled_mma<cutlass::bfloat16_t,
-        cutlass::bfloat16_t, float, LoRaClusterTileShape, ClusterShape, cute::UMMA::Major::K, cute::UMMA::Major::K>());
+    using LoRaMmaTileShape
+        = decltype(make_shape(cute::size<0>(TileShape{}), cute::size<1>(TileShape{}), cute::Int<LoRaK>{}));
+    static constexpr auto make_lora_mma()
+    {
+        static_assert(cute::size(AtomThrShapeMNK{}) == 1 || cute::size(AtomThrShapeMNK{}) == 2,
+            "LoRaMma only supports one- or two-CTA MMA groups");
+        if constexpr (cute::size(AtomThrShapeMNK{}) == 2)
+        {
+            return cutlass::gemm::collective::detail::sm100_make_2sm_trivial_tiled_mma<cutlass::bfloat16_t,
+                cutlass::bfloat16_t, float, LoRaMmaTileShape, ClusterShape, cute::UMMA::Major::K,
+                cute::UMMA::Major::K>();
+        }
+        else
+        {
+            return cutlass::gemm::collective::detail::sm100_make_1sm_trivial_tiled_mma<cutlass::bfloat16_t,
+                cutlass::bfloat16_t, float, LoRaMmaTileShape, ClusterShape, cute::UMMA::Major::K,
+                cute::UMMA::Major::K>();
+        }
+    }
+    using LoRaMma = decltype(make_lora_mma());
     static_assert(cute::size(typename LoRaMma::ThrLayoutVMNK{}) >= 1, "LoRaMma constructed");
+    static_assert(cute::size(typename LoRaMma::AtomThrID{}) == cute::size(typename TiledMma::AtomThrID{}),
+        "LoRA and residual MMA CTA groups must match");
     static_assert(shape<1>(CtaShape_MNK{}) == 192 or shape<1>(CtaShape_MNK{}) == 64 or shape<1>(CtaShape_MNK{}) == 128
             or shape<1>(CtaShape_MNK{}) == 256,
         "Cta N should be one of 64/128/192/256");
@@ -221,16 +239,21 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         = decltype(UMMA::tile_to_mma_shape(SmemLayoutAtomB{}, append(MmaShapeB_NK{}, Int<DispatchPolicy::Stages>{}),
             cute::conditional_t<cutlass::gemm::detail::is_mn_major<StrideB>(), Step<_2, _1, _3>, Step<_1, _2, _3>>{}));
 
-    // --- LoRA operand smem layouts: bf16 D[M,LoRaK] (A-side) + L1[N,LoRaK] (B-side), 1 stage
-    // (D/L1 are loaded ONCE per output tile, not per k_tile). Both K-major. Mirrors SmemLayoutA/B. ---
+    // --- LoRA operand smem layouts: bf16 D[M,LoRaK] (A-side) + L1[N,LoRaK] (B-side).
+    // D/L1 are loaded once per output tile, not per k_tile. Build the SMEM selector from the
+    // partitioned MMA shape so a 2SM 256x256 MMA stores only its 128x256 per-CTA partition. ---
     using MmaShapeD_MK = decltype(partition_shape_A(
-        LoRaMma{}, make_shape(cute::size<0>(LoRaClusterTileShape{}), cute::size<2>(LoRaClusterTileShape{}))));
+        LoRaMma{}, make_shape(cute::size<0>(LoRaMmaTileShape{}), cute::size<2>(LoRaMmaTileShape{}))));
     using MmaShapeL1_NK = decltype(partition_shape_B(
-        LoRaMma{}, make_shape(cute::size<1>(LoRaClusterTileShape{}), cute::size<2>(LoRaClusterTileShape{}))));
+        LoRaMma{}, make_shape(cute::size<1>(LoRaMmaTileShape{}), cute::size<2>(LoRaMmaTileShape{}))));
+    using BlockTileD_M = decltype(cute::size<0, 0>(MmaShapeD_MK{}) * cute::size<1>(MmaShapeD_MK{}));
+    using BlockTileD_K = decltype(cute::size<0, 1>(MmaShapeD_MK{}) * cute::size<2>(MmaShapeD_MK{}));
+    using BlockTileL1_N = decltype(cute::size<0, 0>(MmaShapeL1_NK{}) * cute::size<1>(MmaShapeL1_NK{}));
+    using BlockTileL1_K = decltype(cute::size<0, 1>(MmaShapeL1_NK{}) * cute::size<2>(MmaShapeL1_NK{}));
     using SmemLayoutAtomD = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<cute::UMMA::Major::K,
-        cutlass::bfloat16_t, decltype(cute::size<0>(LoRaClusterTileShape{})), cute::Int<LoRaK>>());
+        cutlass::bfloat16_t, BlockTileD_M, BlockTileD_K>());
     using SmemLayoutAtomL1 = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<cute::UMMA::Major::K,
-        cutlass::bfloat16_t, decltype(cute::size<1>(LoRaClusterTileShape{})), cute::Int<LoRaK>>());
+        cutlass::bfloat16_t, BlockTileL1_N, BlockTileL1_K>());
     // D/L1 smem layouts are MULTI-STAGE (Stages, == smem_A/smem_B) so D/L1 RIDE the
     // residual stage buffers (smem_A[ws]/smem_B[ws]) instead of dedicated sD/sL1 -> no carveout,
     // residual regains its full stages. Byte-exact overlay: D-tile = M*LoRaK*bf16 == A-stage
@@ -240,14 +263,22 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
     using SmemLayoutL1 = decltype(UMMA::tile_to_mma_shape(
         SmemLayoutAtomL1{}, append(MmaShapeL1_NK{}, cute::Int<DispatchPolicy::Stages>{})));
     static_assert(cute::cosize(SmemLayoutD{}) > 0 && cute::cosize(SmemLayoutL1{}) > 0, "LoRA smem layouts constructed");
+    static_assert(cute::cosize(take<0, 3>(SmemLayoutD{})) * cute::sizeof_bits_v<cutlass::bfloat16_t>
+            == cute::cosize(take<0, 3>(SmemLayoutA{})) * cute::sizeof_bits_v<ElementA>,
+        "Each CTA's LoRA D tile must exactly overlay one residual A stage");
+    static_assert(cute::cosize(take<0, 3>(SmemLayoutL1{})) * cute::sizeof_bits_v<cutlass::bfloat16_t>
+            == cute::cosize(take<0, 3>(SmemLayoutB{})) * cute::sizeof_bits_v<ElementB>,
+        "Each CTA's LoRA L1 tile must exactly overlay one residual B stage");
     using StrideD = cute::Stride<int64_t, cute::_1, int64_t>;  // D  [M, LoRaK, L] (K-contig)
     using StrideL1 = cute::Stride<int64_t, cute::_1, int64_t>; // L1 [N, LoRaK, L] (K-contig)
-    // Single-tile (one stage) bytes -- the post-loop TMA loads ONE D/L1 tile per output tile.
+    // CTA-group bytes for one stage -- the post-loop TMA loads one D/L1 tile per output tile.
     // (Unused in the post-loop, which relies on D/L1 arriving the armed A/B byte budget, but
     // kept correct in case of an expect_transaction path.)
-    static constexpr uint32_t LoRaTmaBytes = cutlass::bits_to_bytes(
-        (cute::cosize(SmemLayoutD{}) / DispatchPolicy::Stages) * cute::sizeof_bits_v<cutlass::bfloat16_t>
-        + (cute::cosize(SmemLayoutL1{}) / DispatchPolicy::Stages) * cute::sizeof_bits_v<cutlass::bfloat16_t>);
+    static constexpr uint32_t LoRaTmaBytes
+        = cutlass::bits_to_bytes(cute::size(AtomThrShapeMNK{}) * cute::cosize(take<0, 3>(SmemLayoutD{}))
+              * cute::sizeof_bits_v<cutlass::bfloat16_t>)
+        + cutlass::bits_to_bytes(cute::size(AtomThrShapeMNK{}) * cute::cosize(take<0, 3>(SmemLayoutL1{}))
+            * cute::sizeof_bits_v<cutlass::bfloat16_t>);
 
     // SmemLayoutAtomSFA and SmemLayoutAtomSFB are for whole CTA tiles. We add the number of pipeline stages here.
     // The number of pipeline stages is the same as the number of pipeline stages from AB Load <-> MainLoop
@@ -485,11 +516,11 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         using TMA_D = decltype(make_tma_atom_A_sm100<cutlass::bfloat16_t>(GmemTiledCopyA{},
             make_tensor(
                 static_cast<cutlass::bfloat16_t const*>(nullptr), repeat_like(StrideD{}, int32_t(0)), StrideD{}),
-            SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaClusterTileShape{}, LoRaMma{}, ClusterLayout_VMNK{}));
+            SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, ClusterLayout_VMNK{}));
         using TMA_L1 = decltype(make_tma_atom_B_sm100<cutlass::bfloat16_t>(GmemTiledCopyB{},
             make_tensor(
                 static_cast<cutlass::bfloat16_t const*>(nullptr), repeat_like(StrideL1{}, int32_t(0)), StrideL1{}),
-            SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaClusterTileShape{}, LoRaMma{}, ClusterLayout_VMNK{}));
+            SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, ClusterLayout_VMNK{}));
 
         TMA_A tma_load_a;
         TMA_B tma_load_b;
@@ -600,14 +631,14 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         Tensor tensor_d = make_tensor(args.ptr_D, make_layout(make_shape(M, cute::Int<LoRaK>{}, L), args.dD));
         Tensor tensor_l1 = make_tensor(args.ptr_L1, make_layout(make_shape(N, cute::Int<LoRaK>{}, L), args.dL1));
         typename Params::TMA_D tma_load_d = make_tma_atom_A_sm100<cutlass::bfloat16_t>(GmemTiledCopyA{}, tensor_d,
-            SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaClusterTileShape{}, LoRaMma{}, cluster_layout_vmnk);
+            SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, cluster_layout_vmnk);
         typename Params::TMA_L1 tma_load_l1 = make_tma_atom_B_sm100<cutlass::bfloat16_t>(GmemTiledCopyB{}, tensor_l1,
-            SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaClusterTileShape{}, LoRaMma{}, cluster_layout_vmnk);
+            SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{}, cluster_layout_vmnk);
         typename Params::TMA_D tma_load_d_fallback = make_tma_atom_A_sm100<cutlass::bfloat16_t>(GmemTiledCopyA{},
-            tensor_d, SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaClusterTileShape{}, LoRaMma{},
+            tensor_d, SmemLayoutD{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{},
             cluster_layout_vmnk_fallback);
         typename Params::TMA_L1 tma_load_l1_fallback = make_tma_atom_B_sm100<cutlass::bfloat16_t>(GmemTiledCopyB{},
-            tensor_l1, SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaClusterTileShape{}, LoRaMma{},
+            tensor_l1, SmemLayoutL1{}(_, _, _, cute::Int<0>{}), LoRaMmaTileShape{}, LoRaMma{},
             cluster_layout_vmnk_fallback);
 
         return {tma_load_a, tma_load_b, tma_load_sfa, tma_load_sfb, tma_load_a_fallback, tma_load_b_fallback,
@@ -664,6 +695,8 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         cute::prefetch_tma_descriptor(observed_tma_load_b_->get_tma_descriptor());
         cute::prefetch_tma_descriptor(observed_tma_load_sfa_->get_tma_descriptor());
         cute::prefetch_tma_descriptor(observed_tma_load_sfb_->get_tma_descriptor());
+        cute::prefetch_tma_descriptor(observed_tma_load_d_->get_tma_descriptor());
+        cute::prefetch_tma_descriptor(observed_tma_load_l1_->get_tma_descriptor());
     }
 
     /// Construct A Single Stage's Accumulator Shape
@@ -832,8 +865,8 @@ struct CollectiveMmaLoRA<MainloopSm100TmaUmmaWarpSpecializedBlockScaled<Stages, 
         // LoRA D[M,LoRaK]/L1[N,LoRaK]: partition like A/B (D along M, L1 along N), single k-tile.
         Tensor mD_mkl = observed_tma_load_d_->get_tma_tensor(make_shape(M, cute::Int<LoRaK>{}, L));
         Tensor mL1_nkl = observed_tma_load_l1_->get_tma_tensor(make_shape(N, cute::Int<LoRaK>{}, L));
-        Tensor gD_mkl = local_tile(mD_mkl, LoRaClusterTileShape{}, make_coord(_, _, _), Step<_1, X, _1>{});
-        Tensor gL1_nkl = local_tile(mL1_nkl, LoRaClusterTileShape{}, make_coord(_, _, _), Step<X, _1, _1>{});
+        Tensor gD_mkl = local_tile(mD_mkl, LoRaMmaTileShape{}, make_coord(_, _, _), Step<_1, X, _1>{});
+        Tensor gL1_nkl = local_tile(mL1_nkl, LoRaMmaTileShape{}, make_coord(_, _, _), Step<X, _1, _1>{});
         ThrMMA cta_mma_lora = LoRaMma{}.get_slice(blockIdx.x % size(typename LoRaMma::AtomThrID{}));
         Tensor tCgD_mkl = cta_mma_lora.partition_A(gD_mkl);
         Tensor tCgL1_nkl = cta_mma_lora.partition_B(gL1_nkl);
