@@ -9,7 +9,6 @@ with proper workspace management and synchronization.
 
 import os
 import sys
-import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -19,7 +18,7 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, AlltoAllWatchdog,
-    AlltoAllWatchdogTimeout)
+    AlltoAllWatchdogCoordinator, AlltoAllWatchdogTimeout, EPGroupHealthLike)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -132,13 +131,13 @@ class MoeAlltoAll:
         num_slots: int,
         workspace_size_per_rank: int,
         num_experts: Optional[int] = None,
-        ep_group_health=None,
+        ep_group_health: Optional[EPGroupHealthLike] = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s:
         float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[
             [AlltoAllWatchdogTimeout], None]] = None,
-    ):
+    ) -> None:
         """
         Initialize MoeAlltoAll with workspace allocation.
 
@@ -213,8 +212,6 @@ class MoeAlltoAll:
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
-                "watchdog_flag_generation": 0,
-                "watchdog_flag_generation_lock": threading.Lock(),
             }
         else:
             assert self._WORKSPACE[
@@ -232,29 +229,31 @@ class MoeAlltoAll:
         self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
-        if "watchdog_flag_generation_lock" not in self._WORKSPACE:
-            self._WORKSPACE["watchdog_flag_generation_lock"] = threading.Lock()
-            self._WORKSPACE[
-                "watchdog_flag_generation"] = self._read_current_flag_val()
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
+        workspace_state = self._WORKSPACE
+        assert workspace_state is not None
+        metainfo_index = self._METAINFO_INDEX
+        assert metainfo_index is not None
+        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
+            workspace_state=workspace_state,
+            workspace=self.workspace,
+            metainfo=self.metainfo,
+            metainfo_index=metainfo_index,
+            ep_rank=self.ep_rank,
+            health=self.ep_group_health,
+        )
         self._destroyed = False
         self._alltoall_watchdog: AlltoAllWatchdog | None = None
         if (alltoall_watchdog_timeout_s is None
                 and self.ep_group_health is not None):
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         if alltoall_watchdog_timeout_s is not None:
-            self._sync_watchdog_flag_generation()
-            self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
-                workspace=self.workspace,
-                metainfo=self.metainfo,
-                metainfo_index=self._METAINFO_INDEX,
-                ep_rank=self.ep_rank,
+            self._alltoall_watchdog = self._watchdog_coordinator.acquire_watchdog(
                 ep_size=self.ep_size,
                 timeout_s=alltoall_watchdog_timeout_s,
                 poll_interval_s=alltoall_watchdog_poll_interval_s,
-                health=self.ep_group_health,
                 on_timeout=alltoall_watchdog_on_timeout,
             )
 
@@ -265,73 +264,12 @@ class MoeAlltoAll:
         self._destroyed = True
         watchdog = getattr(self, "_alltoall_watchdog", None)
         if watchdog is not None:
-            watchdog.stop(timeout_s=1.0)
+            self._watchdog_coordinator.release_watchdog(watchdog)
             self._alltoall_watchdog = None
 
     def __del__(self) -> None:
         if not sys.is_finalizing():
             self.destroy()
-
-    def _read_current_flag_val(self) -> int:
-        flag_val_offset = self.metainfo[
-            self._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
-        flag_val = self.workspace[self.ep_rank,
-                                  flag_val_offset:flag_val_offset + 4].view(
-                                      torch.int32)
-        if flag_val.device.type != "cpu":
-            flag_val = flag_val.detach().cpu()
-        return int(flag_val.item())
-
-    def _sync_watchdog_flag_generation(self) -> None:
-        workspace_state = self._WORKSPACE
-        assert workspace_state is not None
-        lock = workspace_state["watchdog_flag_generation_lock"]
-        with lock:
-            workspace_state["watchdog_flag_generation"] = max(
-                int(workspace_state["watchdog_flag_generation"]),
-                self._read_current_flag_val(),
-            )
-
-    def _next_watchdog_flag_generation(self) -> int:
-        workspace_state = self._WORKSPACE
-        assert workspace_state is not None
-        lock = workspace_state["watchdog_flag_generation_lock"]
-        with lock:
-            workspace_state["watchdog_flag_generation"] = (
-                int(workspace_state["watchdog_flag_generation"]) + 1)
-            return int(workspace_state["watchdog_flag_generation"])
-
-    def _get_active_rank_mask_tensor(
-            self,
-            active_rank_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if active_rank_mask is not None:
-            return active_rank_mask
-        if self.ep_group_health is None:
-            return None
-        return torch.tensor(self.ep_group_health.get_mask_words(),
-                            dtype=torch.uint64,
-                            device="cpu")
-
-    def _active_mask_int(
-            self, active_rank_mask: Optional[torch.Tensor]) -> Optional[int]:
-        if active_rank_mask is not None:
-            mask_cpu = active_rank_mask.detach().cpu()
-            return sum(
-                int(word) << (64 * idx)
-                for idx, word in enumerate(mask_cpu.tolist()))
-        if self.ep_group_health is not None:
-            return self.ep_group_health.get_mask()
-        return None
-
-    def _watch_collective(self, phase: str,
-                          active_rank_mask: Optional[torch.Tensor]) -> None:
-        if self._alltoall_watchdog is None:
-            return
-        self._alltoall_watchdog.watch(
-            phase=phase,
-            expected_flag=self._next_watchdog_flag_generation(),
-            active_mask=self._active_mask_int(active_rank_mask),
-        )
 
     def dispatch(self,
                  token_selected_experts: torch.Tensor,
@@ -366,7 +304,8 @@ class MoeAlltoAll:
                 0
             ) == self.eplb_stats_num_experts, "eplb_local_stats size must match eplb_stats_num_experts"
 
-        active_rank_mask = self._get_active_rank_mask_tensor(active_rank_mask)
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
+            active_rank_mask)
         recv_tensors, combine_payload_offset, eplb_gathered_stats = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -380,7 +319,9 @@ class MoeAlltoAll:
             eplb_local_stats,
             active_rank_mask,
         )
-        self._watch_collective("dispatch", active_rank_mask)
+        self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
+                                                    "dispatch",
+                                                    active_rank_mask)
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
 
@@ -428,13 +369,15 @@ class MoeAlltoAll:
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
 
-        active_rank_mask = self._get_active_rank_mask_tensor(active_rank_mask)
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
+            active_rank_mask)
         output = torch.ops.trtllm.moe_a2a_combine(
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
             payload_in_workspace, use_low_precision_combine, active_rank_mask)
-        self._watch_collective("combine", active_rank_mask)
+        self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
+                                                    "combine", active_rank_mask)
 
         # Reset state for next round
         self.reset_state()

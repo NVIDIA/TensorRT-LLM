@@ -26,7 +26,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -38,6 +38,23 @@ from tensorrt_llm.logger import logger as tllm_logger
 DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S = 5.0
 DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S = 0.1
 UNKNOWN_COMPLETION_FLAG = -(2**63)
+_COMPLETION_FLAG_MASK = (1 << 32) - 1
+_COMPLETION_FLAG_HALF_RANGE = 1 << 31
+_WORKSPACE_WATCHDOG_STATE_KEY = "alltoall_watchdog_shared_state"
+_WORKSPACE_WATCHDOG_STATE_INIT_LOCK = threading.Lock()
+
+
+def _normalize_completion_flag(value: int) -> int:
+    return int(value) & _COMPLETION_FLAG_MASK
+
+
+def _completion_flag_reached(observed: int, expected: int) -> bool:
+    if observed == UNKNOWN_COMPLETION_FLAG:
+        return False
+    # Counter values are ordered modulo uint32. A queued watch cannot lag by
+    # half the counter space within the bounded watchdog timeout.
+    distance = (_normalize_completion_flag(observed) - expected) & _COMPLETION_FLAG_MASK
+    return distance < _COMPLETION_FLAG_HALF_RANGE
 
 
 class CompletionFlagReader(Protocol):
@@ -52,6 +69,9 @@ class EPGroupHealthLike(Protocol):
 
     def get_mask(self) -> int:
         """Return the active-rank bitmask."""
+
+    def get_mask_words(self) -> tuple[int, ...]:
+        """Return the active-rank bitmask split into uint64 words."""
 
     def mark_failed(self, rank: int) -> bool:
         """Mark ``rank`` failed and return whether state changed."""
@@ -80,6 +100,25 @@ class _CollectiveWatch:
     expected_flag: int
     active_mask: int
     start_s: float
+
+
+@dataclass(frozen=True)
+class _SharedWatchdogConfig:
+    ep_size: int
+    ep_rank: int
+    timeout_s: float
+    poll_interval_s: float
+    health: EPGroupHealthLike | None
+    on_timeout: Callable[[AlltoAllWatchdogTimeout], None] | None
+
+
+@dataclass
+class _WorkspaceWatchdogState:
+    lock: threading.Lock
+    generation: int = 0
+    watchdog: AlltoAllWatchdog | None = None
+    config: _SharedWatchdogConfig | None = None
+    ref_count: int = 0
 
 
 class _TorchCompletionFlagReader:
@@ -164,6 +203,168 @@ class _TorchCompletionFlagReader:
         if flags.device.type != "cpu":
             flags = flags.detach().cpu()
         return tuple(int(v) for v in flags.tolist())
+
+
+class AlltoAllWatchdogCoordinator:
+    """Shared watchdog plumbing for MoE AlltoAll frontends."""
+
+    def __init__(
+        self,
+        *,
+        workspace_state: MutableMapping[str, object],
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        metainfo_index: Mapping[str, int],
+        ep_rank: int,
+        health: EPGroupHealthLike | None = None,
+    ) -> None:
+        self._workspace_state = workspace_state
+        self._workspace = workspace
+        self._metainfo = metainfo
+        self._metainfo_index = metainfo_index
+        self._ep_rank = ep_rank
+        self._health = health
+
+    def _find_shared_state(self) -> _WorkspaceWatchdogState | None:
+        state = self._workspace_state.get(_WORKSPACE_WATCHDOG_STATE_KEY)
+        if state is None:
+            return None
+        if not isinstance(state, _WorkspaceWatchdogState):
+            raise TypeError("invalid shared AlltoAll watchdog workspace state")
+        return state
+
+    def _get_shared_state(self) -> _WorkspaceWatchdogState:
+        state = self._find_shared_state()
+        if state is not None:
+            return state
+        with _WORKSPACE_WATCHDOG_STATE_INIT_LOCK:
+            state = self._workspace_state.get(_WORKSPACE_WATCHDOG_STATE_KEY)
+            if state is None:
+                state = _WorkspaceWatchdogState(lock=threading.Lock())
+                self._workspace_state[_WORKSPACE_WATCHDOG_STATE_KEY] = state
+            if not isinstance(state, _WorkspaceWatchdogState):
+                raise TypeError("invalid shared AlltoAll watchdog workspace state")
+            return state
+
+    def read_current_flag_val(self) -> int:
+        flag_val_offset = int(self._metainfo[self._metainfo_index["FLAG_VAL_OFFSET_INDEX"]].item())
+        flag_val = self._workspace[self._ep_rank, flag_val_offset : flag_val_offset + 4].view(
+            torch.int32
+        )
+        if flag_val.device.type != "cpu":
+            flag_val = flag_val.detach().cpu()
+        return _normalize_completion_flag(int(flag_val.item()))
+
+    def active_rank_mask_tensor(self, active_rank_mask: torch.Tensor | None) -> torch.Tensor | None:
+        if active_rank_mask is not None:
+            return active_rank_mask
+        if self._health is None:
+            return None
+        return torch.tensor(self._health.get_mask_words(), dtype=torch.uint64, device="cpu")
+
+    def active_mask_int(self, active_rank_mask: torch.Tensor | None) -> int | None:
+        if active_rank_mask is not None:
+            mask_cpu = active_rank_mask.detach().cpu()
+            return sum(int(word) << (64 * idx) for idx, word in enumerate(mask_cpu.tolist()))
+        if self._health is not None:
+            return self._health.get_mask()
+        return None
+
+    def acquire_watchdog(
+        self,
+        *,
+        ep_size: int,
+        timeout_s: float,
+        poll_interval_s: float,
+        on_timeout: Callable[[AlltoAllWatchdogTimeout], None] | None = None,
+    ) -> AlltoAllWatchdog:
+        config = _SharedWatchdogConfig(
+            ep_size=int(ep_size),
+            ep_rank=self._ep_rank,
+            timeout_s=float(timeout_s),
+            poll_interval_s=float(poll_interval_s),
+            health=self._health,
+            on_timeout=on_timeout,
+        )
+        state = self._get_shared_state()
+        with state.lock:
+            if state.watchdog is None:
+                state.generation = self.read_current_flag_val()
+                state.watchdog = AlltoAllWatchdog.from_workspace(
+                    workspace=self._workspace,
+                    metainfo=self._metainfo,
+                    metainfo_index=self._metainfo_index,
+                    ep_rank=self._ep_rank,
+                    ep_size=ep_size,
+                    timeout_s=timeout_s,
+                    poll_interval_s=poll_interval_s,
+                    health=self._health,
+                    on_timeout=on_timeout,
+                )
+                state.config = config
+            elif not self._matching_config(state.config, config):
+                raise ValueError(
+                    "AlltoAll wrappers sharing a workspace must use the same "
+                    "watchdog configuration and EP health object"
+                )
+            state.ref_count += 1
+            watchdog = state.watchdog
+            assert watchdog is not None
+            return watchdog
+
+    @staticmethod
+    def _matching_config(
+        existing: _SharedWatchdogConfig | None,
+        requested: _SharedWatchdogConfig,
+    ) -> bool:
+        return (
+            existing is not None
+            and existing.ep_size == requested.ep_size
+            and existing.ep_rank == requested.ep_rank
+            and existing.timeout_s == requested.timeout_s
+            and existing.poll_interval_s == requested.poll_interval_s
+            and existing.health is requested.health
+            and existing.on_timeout is requested.on_timeout
+        )
+
+    def release_watchdog(self, watchdog: AlltoAllWatchdog) -> None:
+        state = self._get_shared_state()
+        watchdog_to_stop: AlltoAllWatchdog | None = None
+        with state.lock:
+            if state.watchdog is not watchdog or state.ref_count <= 0:
+                raise RuntimeError("attempted to release an unregistered AlltoAll watchdog")
+            state.ref_count -= 1
+            if state.ref_count == 0:
+                watchdog_to_stop = state.watchdog
+                state.watchdog = None
+                state.config = None
+        if watchdog_to_stop is not None:
+            watchdog_to_stop.stop()
+
+    def watch_collective(
+        self,
+        watchdog: AlltoAllWatchdog | None,
+        phase: str,
+        active_rank_mask: torch.Tensor | None,
+    ) -> None:
+        if watchdog is None:
+            state = self._find_shared_state()
+            if state is not None:
+                with state.lock:
+                    if state.watchdog is not None:
+                        state.generation = (state.generation + 1) & _COMPLETION_FLAG_MASK
+            return
+        active_mask = self.active_mask_int(active_rank_mask)
+        state = self._get_shared_state()
+        with state.lock:
+            if state.watchdog is not watchdog:
+                raise RuntimeError("AlltoAll watchdog is not registered for this workspace")
+            state.generation = (state.generation + 1) & _COMPLETION_FLAG_MASK
+            watchdog.watch(
+                phase=phase,
+                expected_flag=state.generation,
+                active_mask=active_mask,
+            )
 
 
 class AlltoAllWatchdog:
@@ -279,7 +480,7 @@ class AlltoAllWatchdog:
             self._queue.clear()
             self._cv.notify_all()
             thread = self._thread
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=timeout_s)
 
     def watch(
@@ -292,8 +493,10 @@ class AlltoAllWatchdog:
         """Queue a just-launched AlltoAll phase for watchdog polling."""
         if phase not in self.VALID_PHASES:
             raise ValueError(f"phase must be one of {sorted(self.VALID_PHASES)}, got {phase!r}")
-        if expected_flag < 0:
-            raise ValueError(f"expected_flag must be non-negative, got {expected_flag}")
+        if not 0 <= expected_flag <= _COMPLETION_FLAG_MASK:
+            raise ValueError(
+                f"expected_flag must be in [0, {_COMPLETION_FLAG_MASK}], got {expected_flag}"
+            )
         if active_mask is None:
             if self._health is not None:
                 active_mask = self._health.get_mask()
@@ -339,7 +542,7 @@ class AlltoAllWatchdog:
 
     def _phase_complete(self, watch: _CollectiveWatch, observed_flags: tuple[int, ...]) -> bool:
         return all(
-            observed_flags[rank] >= watch.expected_flag
+            _completion_flag_reached(observed_flags[rank], watch.expected_flag)
             for rank in self._active_ranks(watch.active_mask)
         )
 
@@ -349,7 +552,7 @@ class AlltoAllWatchdog:
         return tuple(
             rank
             for rank in self._active_ranks(watch.active_mask)
-            if observed_flags[rank] < watch.expected_flag
+            if not _completion_flag_reached(observed_flags[rank], watch.expected_flag)
         )
 
     def _handle_timeout(
@@ -362,8 +565,11 @@ class AlltoAllWatchdog:
         elapsed_s = time.monotonic() - watch.start_s
         missing_ranks = self._missing_ranks(watch, observed_flags)
         marked_failed: list[int] = []
-        has_known_flags = UNKNOWN_COMPLETION_FLAG not in observed_flags
-        if self._health is not None and (has_known_flags or not poll_timed_out):
+        if (
+            self._health is not None
+            and not poll_timed_out
+            and UNKNOWN_COMPLETION_FLAG not in observed_flags
+        ):
             for rank in missing_ranks:
                 if rank == self._ep_rank:
                     continue
@@ -405,6 +611,14 @@ class AlltoAllWatchdog:
         if self._on_timeout is not None:
             self._on_timeout(event)
 
+    def _stop_after_error(self, exc: Exception) -> None:
+        with self._cv:
+            self._last_error = exc
+            self._closed = True
+            self._stopping = True
+            self._queue.clear()
+            self._cv.notify_all()
+
     def _run(self) -> None:
         last_observed_flags = tuple(UNKNOWN_COMPLETION_FLAG for _ in range(self._ep_size))
         poll_timed_out = False
@@ -418,7 +632,8 @@ class AlltoAllWatchdog:
 
             try:
                 observed_flags = tuple(
-                    int(v) for v in self._completion_reader.read_completion_flags(watch.phase)
+                    _normalize_completion_flag(int(v))
+                    for v in self._completion_reader.read_completion_flags(watch.phase)
                 )
                 if len(observed_flags) != self._ep_size:
                     raise RuntimeError(
@@ -431,10 +646,7 @@ class AlltoAllWatchdog:
                 observed_flags = last_observed_flags
                 poll_timed_out = True
             except Exception as exc:  # noqa: BLE001 - keep watchdog failures visible.
-                with self._cv:
-                    self._last_error = exc
-                    self._queue.clear()
-                    self._cv.notify_all()
+                self._stop_after_error(exc)
                 tllm_logger.error("AlltoAll watchdog stopped after polling error: %s", exc)
                 return
 
@@ -448,7 +660,14 @@ class AlltoAllWatchdog:
                 continue
 
             if time.monotonic() - watch.start_s >= self._timeout_s:
-                self._handle_timeout(watch, observed_flags, poll_timed_out=poll_timed_out)
+                try:
+                    self._handle_timeout(watch, observed_flags, poll_timed_out=poll_timed_out)
+                except Exception as exc:  # noqa: BLE001 - keep watchdog failures visible.
+                    self._stop_after_error(exc)
+                    tllm_logger.error(
+                        "AlltoAll watchdog stopped after timeout handling error: %s", exc
+                    )
+                    return
                 with self._cv:
                     # The GPU stream is no longer trustworthy once a collective
                     # times out. Drop queued follow-on phases so they do not
