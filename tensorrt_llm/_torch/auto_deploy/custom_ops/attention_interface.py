@@ -1648,7 +1648,7 @@ class SequenceInfo:
         self,
         offset: torch.Tensor,
         active_args_override: Optional[Set[str]] = None,
-        no_prefill_offsets: bool = False,
+        ignore_prefill_offsets: bool = False,
     ) -> None:
         """Offset position and cache-related metadata for active arguments.
 
@@ -1657,11 +1657,10 @@ class SequenceInfo:
             active_args_override: Optional graph-input names for the next in-forward consumer. When
                 provided, host mirroring is limited to those active host args. The caller is
                 responsible for including every host argument the next consumer may read.
-            no_prefill_offsets: Whether the caller has guaranteed that prefill entries in ``offset``
-                are zero. This enables static-width mixed-batch position-id updates for overlap
-                scheduling without reading device ``seq_len``. The caller must also have prepared
-                MTP extend requests with exactly ``max_draft_len + 1`` tokens each and decode
-                requests with exactly one token each.
+            ignore_prefill_offsets: Whether prefill entries in ``offset`` can be ignored for
+                per-token position-id expansion because they are known to be zero. This enables
+                mixed-batch position-id updates without reading device ``seq_len`` when only
+                non-prefill offsets matter.
         """
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
@@ -1724,23 +1723,15 @@ class SequenceInfo:
 
         # --- position_ids (device) ---
         position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
-        # position_ids is per-token while offset is per-sequence; expand if needed
-        if self.is_generate_only:
-            offset_for_pos_ids = offset
-        elif self.is_extend_only:
-            _, num_extend, _ = self.batch_info.get_num_sequences()
-            _, num_extend_tokens, _ = self.batch_info.get_num_tokens()
-            tokens_per_seq = num_extend_tokens // num_extend
-            offset_for_pos_ids = offset[:num_extend].repeat_interleave(tokens_per_seq)
-        elif no_prefill_offsets:
-            num_prefill, num_extend, num_decode = self.batch_info.get_num_sequences()
-            num_prefill_tokens, num_extend_tokens, num_decode_tokens = (
-                self.batch_info.get_num_tokens()
-            )
-            tokens_per_extend = self.batch_info.get_max_draft_len() + 1
-
-            # The overlap prepare-inputs path packs prefill, then fixed-width MTP extend, then
-            # single-token decode. Use batch_info host scalars directly to avoid device seq_len.
+        # position_ids is per-token while offset is per-sequence.
+        num_prefill, num_extend, num_decode = self.batch_info.get_num_sequences()
+        num_prefill_tokens, num_extend_tokens, num_decode_tokens = self.batch_info.get_num_tokens()
+        if num_prefill > 0 and not ignore_prefill_offsets:
+            seq_len = self.get_arg("seq_len", truncate=True)
+            offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
+        else:
+            # Prefill offsets are ignored in this path, so start with zero offsets for every token
+            # and only fill the non-prefill token ranges. This avoids reading device seq_len.
             offset_for_pos_ids = torch.zeros_like(position_ids)
 
             extend_token_start = num_prefill_tokens
@@ -1753,16 +1744,14 @@ class SequenceInfo:
             decode_seq_start = extend_seq_end
             decode_seq_end = decode_seq_start + num_decode
 
-            offset_for_pos_ids[extend_token_start:extend_token_end] = offset[
-                extend_seq_start:extend_seq_end
-            ].repeat_interleave(tokens_per_extend)
+            if num_extend > 0:
+                tokens_per_extend = num_extend_tokens // num_extend
+                offset_for_pos_ids[extend_token_start:extend_token_end] = offset[
+                    extend_seq_start:extend_seq_end
+                ].repeat_interleave(tokens_per_extend)
             offset_for_pos_ids[decode_token_start:decode_token_end] = offset[
                 decode_seq_start:decode_seq_end
             ]
-        else:
-            # mixed prefill + (extend/decode). Need to use seq_len in the generic case. Causes host sync.
-            seq_len = self.get_arg("seq_len", truncate=True)
-            offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
 
         position_ids += offset_for_pos_ids
 
@@ -1814,7 +1803,7 @@ class SequenceInfo:
         # This adjustment accounts for requests that went through speculative verification in the
         # previous iteration. Prefill requests are still consuming context and are not in
         # speculative decoding mode yet, so there is no verification offset to apply to them.
-        self.offset_pos_and_cache_(increment, no_prefill_offsets=True)
+        self.offset_pos_and_cache_(increment, ignore_prefill_offsets=True)
 
     @nvtx_range("ad_switch_to_generate_")
     def switch_to_generate_(self, active_args_override: Optional[Set[str]] = None) -> None:

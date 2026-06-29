@@ -1104,6 +1104,46 @@ def test_sequence_info_set_capture_batch_max_draft_len_gt_0_builds_extend_only_b
     assert tuple(input_ids.shape) == (2, 4)
 
 
+def test_sequence_info_mixed_extend_decode_offset_uses_batch_info_lengths():
+    """Mixed extend/decode position-id offsets use static BatchInfo token counts."""
+    max_draft_len = 3
+    num_extend = 2
+    num_decode = 2
+    num_extend_tokens = num_extend * (1 + max_draft_len)
+    num_decode_tokens = num_decode
+
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=16,
+        tokens_per_block=32,
+    )
+    seq_info.nest_sequences(
+        input_ids=[1] * (num_extend_tokens + num_decode_tokens),
+        cu_seqlen=[0, 4, 8, 9, 10],
+        input_pos=[10, 20, 30, 40],
+        batch_info=[0, 0, num_extend, num_extend_tokens, num_decode, num_decode_tokens],
+        slot_idx=[0, 1, 2, 3],
+    )
+
+    position_ids_before = seq_info.get_arg("position_ids", truncate=True, unflatten=False).clone()
+
+    # This catches accidental fallback to tensor-valued repeat_interleave(seq_len).
+    seq_info.get_arg("seq_len", truncate=True).fill_(99)
+
+    seq_info.offset_pos_and_cache_(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+
+    position_ids_after = seq_info.get_arg("position_ids", truncate=True, unflatten=False)
+    expected = position_ids_before.clone()
+    expected[:4] += 1
+    expected[4:8] += 2
+    expected[8] += 3
+    expected[9] += 4
+
+    assert torch.equal(position_ids_after, expected)
+    assert seq_info.get_arg("input_pos", truncate=True).tolist() == [11, 22, 33, 44]
+
+
 def test_sequence_info_overlap_mixed_mtp_offset_does_not_need_device_seq_len():
     """Overlap MTP updates use the packed batch layout instead of device seq_len.
 
@@ -1146,9 +1186,8 @@ def test_sequence_info_overlap_mixed_mtp_offset_does_not_need_device_seq_len():
 
     position_ids_before = seq_info.get_arg("position_ids", truncate=True, unflatten=False).clone()
 
-    # If offset_with_new_lens_ falls back to tensor-valued repeat_interleave(seq_len), this
-    # corrupted device value gives the wrong output size. The static MTP path must not read it.
-    seq_info.copy_("seq_len", torch.tensor([99, 99, 99, 99], dtype=torch.int))
+    # This catches accidental fallback to tensor-valued repeat_interleave(seq_len).
+    seq_info.get_arg("seq_len", truncate=True).fill_(99)
 
     seq_info.offset_with_new_lens_(
         torch.tensor([extend_new_len, decode_new_len], dtype=torch.int32)
