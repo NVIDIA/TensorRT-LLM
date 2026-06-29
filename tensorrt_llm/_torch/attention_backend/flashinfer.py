@@ -143,6 +143,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+    host_request_types: torch.Tensor = field(init=False)
+    host_request_types_runtime: torch.Tensor = field(init=False)
 
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
@@ -703,6 +705,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
+        self.host_request_types = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.int,
+                                              pin_memory=prefer_pinned(),
+                                              device='cpu')
         self._batch_indices = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -1078,6 +1084,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+        num_seqs = self.num_contexts + self.num_generations
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:num_seqs].fill_(1)
+        self.host_request_types_runtime = self.host_request_types[:num_seqs]
 
         if self.multi_item_part_lens is not None:
             self._multi_item_params = self._process_multi_item_part_lens(
