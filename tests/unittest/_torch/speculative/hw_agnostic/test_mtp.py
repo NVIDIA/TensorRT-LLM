@@ -11,10 +11,15 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
+from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
+
+
+class _MTPPretrainedConfig:
+    num_nextn_predict_layers = 1
 
 
 def unittest_name_func(testcase_func, param_num, param):
@@ -23,6 +28,21 @@ def unittest_name_func(testcase_func, param_num, param):
         testcase_func.__name__,
         parameterized.to_safe_name(name),
     )
+
+
+def test_mtp_dynamic_tree_preserves_max_total_draft_tokens():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=6,
+        max_total_draft_tokens=15,
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=4,
+    )
+
+    update_spec_config_from_model_config(spec_config, _MTPPretrainedConfig())
+
+    assert spec_config.max_draft_len == 6
+    assert spec_config.max_total_draft_tokens == 15
+    assert spec_config.tokens_per_gen_step == 16
 
 
 class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
