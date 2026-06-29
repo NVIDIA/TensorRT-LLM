@@ -27,6 +27,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
     UNKNOWN_COMPLETION_FLAG,
     AlltoAllWatchdog,
+    AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
     CompletionFlagReadTimeout,
 )
@@ -121,6 +122,33 @@ def test_watchdog_completes_when_flags_advance_past_expected_generation() -> Non
 
     assert events == []
     assert health.all_active() is True
+
+
+def test_watchdog_handles_signed_uint32_generation_boundaries() -> None:
+    reader = FakeCompletionFlagReader(ep_size=2)
+    events: list[AlltoAllWatchdogTimeout] = []
+
+    with AlltoAllWatchdog(
+        ep_size=2,
+        ep_rank=0,
+        completion_reader=reader,
+        timeout_s=0.05,
+        poll_interval_s=0.005,
+        on_timeout=events.append,
+    ) as watchdog:
+        reader.set_flags("dispatch", [-(1 << 31), -(1 << 31)])
+        watchdog.watch(phase="dispatch", expected_flag=1 << 31)
+        assert watchdog.wait_until_idle(timeout_s=1.0)
+
+        reader.set_flags("dispatch", [-1, -1])
+        watchdog.watch(phase="dispatch", expected_flag=(1 << 32) - 1)
+        assert watchdog.wait_until_idle(timeout_s=1.0)
+
+        reader.set_flags("dispatch", [0, 0])
+        watchdog.watch(phase="dispatch", expected_flag=0)
+        assert watchdog.wait_until_idle(timeout_s=1.0)
+
+    assert events == []
 
 
 def test_watchdog_defaults_match_design_doc() -> None:
@@ -268,7 +296,7 @@ def test_watchdog_poll_timeout_without_snapshot_fails_closed() -> None:
     assert health.all_active() is True
 
 
-def test_watchdog_poll_timeout_with_prior_snapshot_marks_known_missing_rank() -> None:
+def test_watchdog_poll_timeout_with_prior_snapshot_does_not_mark_failed_rank() -> None:
     health = EPGroupHealth(3)
     events: list[AlltoAllWatchdogTimeout] = []
 
@@ -288,8 +316,33 @@ def test_watchdog_poll_timeout_with_prior_snapshot_marks_known_missing_rank() ->
     assert event.poll_timed_out is True
     assert event.observed_flags == (1, 0, 1)
     assert event.missing_ranks == (1,)
-    assert event.marked_failed_ranks == (1,)
-    assert health.get_failed_ranks() == frozenset({1})
+    assert event.marked_failed_ranks == ()
+    assert health.all_active() is True
+
+
+def test_watchdog_callback_error_stops_and_clears_queue() -> None:
+    health = EPGroupHealth(2)
+    reader = FakeCompletionFlagReader(ep_size=2)
+    reader.set_flags("dispatch", [1, 0])
+
+    def raise_from_callback(event: AlltoAllWatchdogTimeout) -> None:
+        raise RuntimeError(f"callback failed for {event.phase}")
+
+    with AlltoAllWatchdog(
+        ep_size=2,
+        ep_rank=0,
+        completion_reader=reader,
+        timeout_s=0.02,
+        poll_interval_s=0.005,
+        health=health,
+        on_timeout=raise_from_callback,
+    ) as watchdog:
+        watchdog.watch(phase="dispatch", expected_flag=1)
+        _wait_for(lambda: watchdog.last_error is not None)
+        assert watchdog.wait_until_idle(timeout_s=1.0)
+        assert isinstance(watchdog.last_error, RuntimeError)
+        with pytest.raises(RuntimeError, match="stopped AlltoAllWatchdog"):
+            watchdog.watch(phase="dispatch", expected_flag=2)
 
 
 def test_watchdog_preserves_fifo_order_and_clears_followups_after_timeout() -> None:
@@ -357,6 +410,125 @@ def test_watchdog_from_workspace_reads_phase_specific_offsets() -> None:
     assert events[0].missing_ranks == (0,)
     assert events[0].marked_failed_ranks == (0,)
     assert health.get_failed_ranks() == frozenset({0})
+
+
+def test_workspace_coordinators_share_fifo_watchdog() -> None:
+    ep_size = 3
+    ep_rank = 0
+    workspace_state: dict[str, object] = {}
+    workspace = torch.zeros((ep_size, 64), dtype=torch.uint8)
+    metainfo = torch.tensor([0, 4, 16], dtype=torch.int64)
+    metainfo_index = {
+        "FLAG_VAL_OFFSET_INDEX": 0,
+        "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+        "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+    }
+    workspace[ep_rank, 4:16].view(torch.int32).copy_(torch.tensor([1, 0, 1]))
+    health = EPGroupHealth(ep_size)
+    events: list[AlltoAllWatchdogTimeout] = []
+    on_timeout = events.append
+    coordinators = [
+        AlltoAllWatchdogCoordinator(
+            workspace_state=workspace_state,
+            workspace=workspace,
+            metainfo=metainfo,
+            metainfo_index=metainfo_index,
+            ep_rank=ep_rank,
+            health=health,
+        )
+        for _ in range(2)
+    ]
+    watchdogs = [
+        coordinator.acquire_watchdog(
+            ep_size=ep_size,
+            timeout_s=0.02,
+            poll_interval_s=0.005,
+            on_timeout=on_timeout,
+        )
+        for coordinator in coordinators
+    ]
+
+    try:
+        assert watchdogs[0] is watchdogs[1]
+        coordinators[0].watch_collective(watchdogs[0], "dispatch", None)
+        coordinators[1].watch_collective(watchdogs[1], "combine", None)
+        _wait_for(lambda: len(events) == 1)
+        assert watchdogs[0].wait_until_idle(timeout_s=1.0)
+        time.sleep(0.05)
+
+        assert len(events) == 1
+        assert events[0].phase == "dispatch"
+        assert events[0].missing_ranks == (1,)
+        assert health.get_failed_ranks() == frozenset({1})
+    finally:
+        for coordinator, watchdog in zip(coordinators, watchdogs):
+            coordinator.release_watchdog(watchdog)
+
+
+def test_workspace_coordinator_wraps_shared_generation() -> None:
+    workspace_state: dict[str, object] = {}
+    workspace = torch.zeros((1, 32), dtype=torch.uint8)
+    workspace[0, 0:4].view(torch.int32).fill_(-1)
+    metainfo = torch.tensor([0, 4, 8], dtype=torch.int64)
+    metainfo_index = {
+        "FLAG_VAL_OFFSET_INDEX": 0,
+        "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+        "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+    }
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state=workspace_state,
+        workspace=workspace,
+        metainfo=metainfo,
+        metainfo_index=metainfo_index,
+        ep_rank=0,
+    )
+    watchdog = coordinator.acquire_watchdog(
+        ep_size=1,
+        timeout_s=0.05,
+        poll_interval_s=0.005,
+    )
+
+    try:
+        coordinator.watch_collective(watchdog, "dispatch", None)
+        assert watchdog.wait_until_idle(timeout_s=1.0)
+    finally:
+        coordinator.release_watchdog(watchdog)
+
+
+def test_unmonitored_coordinator_advances_shared_generation() -> None:
+    workspace_state: dict[str, object] = {}
+    workspace = torch.zeros((2, 32), dtype=torch.uint8)
+    metainfo = torch.tensor([0, 4, 12], dtype=torch.int64)
+    metainfo_index = {
+        "FLAG_VAL_OFFSET_INDEX": 0,
+        "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+        "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+    }
+    coordinators = [
+        AlltoAllWatchdogCoordinator(
+            workspace_state=workspace_state,
+            workspace=workspace,
+            metainfo=metainfo,
+            metainfo_index=metainfo_index,
+            ep_rank=0,
+        )
+        for _ in range(2)
+    ]
+    events: list[AlltoAllWatchdogTimeout] = []
+    watchdog = coordinators[0].acquire_watchdog(
+        ep_size=2,
+        timeout_s=0.02,
+        poll_interval_s=0.005,
+        on_timeout=events.append,
+    )
+
+    try:
+        coordinators[1].watch_collective(None, "dispatch", None)
+        coordinators[0].watch_collective(watchdog, "dispatch", None)
+        _wait_for(lambda: len(events) == 1)
+        assert events[0].expected_flag == 2
+    finally:
+        coordinators[0].release_watchdog(watchdog)
 
 
 def test_watchdog_rejects_active_mask_without_local_rank() -> None:

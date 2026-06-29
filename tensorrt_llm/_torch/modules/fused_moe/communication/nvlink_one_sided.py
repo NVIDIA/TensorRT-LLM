@@ -25,7 +25,6 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
-import threading
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -35,7 +34,9 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
     AlltoAllWatchdog,
+    AlltoAllWatchdogCoordinator,
     AlltoAllWatchdogTimeout,
+    EPGroupHealthLike,
 )
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
@@ -158,11 +159,11 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-        ep_group_health=None,
+        ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
-    ):
+    ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
 
@@ -288,8 +289,6 @@ class NVLinkOneSided(Communication):
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
-                "watchdog_flag_generation": 0,
-                "watchdog_flag_generation_lock": threading.Lock(),
             }
             NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         else:
@@ -320,28 +319,27 @@ class NVLinkOneSided(Communication):
         self.workspace = workspace_state["workspace"]
         self.moe_a2a_metainfo = workspace_state["metainfo"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
-        if "watchdog_flag_generation_lock" not in workspace_state:
-            workspace_state["watchdog_flag_generation_lock"] = threading.Lock()
-            workspace_state["watchdog_flag_generation"] = self._read_current_flag_val()
         self.ep_group_health = ep_group_health
+        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
+            workspace_state=workspace_state,
+            workspace=self.workspace,
+            metainfo=self.moe_a2a_metainfo,
+            metainfo_index={
+                "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
+                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
+                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
+            },
+            ep_rank=self.ep_rank,
+            health=self.ep_group_health,
+        )
         self._alltoall_watchdog: AlltoAllWatchdog | None = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
         if alltoall_watchdog_timeout_s is not None:
-            self._sync_watchdog_flag_generation()
-            self._alltoall_watchdog = AlltoAllWatchdog.from_workspace(
-                workspace=self.workspace,
-                metainfo=self.moe_a2a_metainfo,
-                metainfo_index={
-                    "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
-                    "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
-                    "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
-                },
-                ep_rank=self.ep_rank,
+            self._alltoall_watchdog = self._watchdog_coordinator.acquire_watchdog(
                 ep_size=self.ep_size,
                 timeout_s=alltoall_watchdog_timeout_s,
                 poll_interval_s=alltoall_watchdog_poll_interval_s,
-                health=self.ep_group_health,
                 on_timeout=alltoall_watchdog_on_timeout,
             )
 
@@ -350,57 +348,6 @@ class NVLinkOneSided(Communication):
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
-
-    def _read_current_flag_val(self) -> int:
-        flag_val_offset = self.moe_a2a_metainfo[self.FLAG_VAL_OFFSET_INDEX].item()
-        flag_val = self.workspace[self.ep_rank, flag_val_offset : flag_val_offset + 4].view(
-            torch.int32
-        )
-        if flag_val.device.type != "cpu":
-            flag_val = flag_val.detach().cpu()
-        return int(flag_val.item())
-
-    def _sync_watchdog_flag_generation(self) -> None:
-        lock = self._workspace_state["watchdog_flag_generation_lock"]
-        with lock:
-            self._workspace_state["watchdog_flag_generation"] = max(
-                int(self._workspace_state["watchdog_flag_generation"]),
-                self._read_current_flag_val(),
-            )
-
-    def _next_watchdog_flag_generation(self) -> int:
-        lock = self._workspace_state["watchdog_flag_generation_lock"]
-        with lock:
-            self._workspace_state["watchdog_flag_generation"] = (
-                int(self._workspace_state["watchdog_flag_generation"]) + 1
-            )
-            return int(self._workspace_state["watchdog_flag_generation"])
-
-    def _get_active_rank_mask_tensor(
-        self, active_rank_mask: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        if active_rank_mask is not None:
-            return active_rank_mask
-        if self.ep_group_health is None:
-            return None
-        return torch.tensor(self.ep_group_health.get_mask_words(), dtype=torch.uint64, device="cpu")
-
-    def _active_mask_int(self, active_rank_mask: Optional[torch.Tensor]) -> Optional[int]:
-        if active_rank_mask is not None:
-            mask_cpu = active_rank_mask.detach().cpu()
-            return sum(int(word) << (64 * idx) for idx, word in enumerate(mask_cpu.tolist()))
-        if self.ep_group_health is not None:
-            return self.ep_group_health.get_mask()
-        return None
-
-    def _watch_collective(self, phase: str, active_rank_mask: Optional[torch.Tensor]) -> None:
-        if self._alltoall_watchdog is None:
-            return
-        self._alltoall_watchdog.watch(
-            phase=phase,
-            expected_flag=self._next_watchdog_flag_generation(),
-            active_mask=self._active_mask_int(active_rank_mask),
-        )
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -422,7 +369,7 @@ class NVLinkOneSided(Communication):
 
         self._destroyed = True
         if self._alltoall_watchdog is not None:
-            self._alltoall_watchdog.stop(timeout_s=1.0)
+            self._watchdog_coordinator.release_watchdog(self._alltoall_watchdog)
             self._alltoall_watchdog = None
         workspace_key = getattr(self, "_workspace_key", None)
         if workspace_key is None:
@@ -508,7 +455,9 @@ class NVLinkOneSided(Communication):
             assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
                 "eplb_local_stats size must match eplb_stats_num_experts"
             )
-        active_rank_mask = self._get_active_rank_mask_tensor(kwargs.get("active_rank_mask"))
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
+            kwargs.get("active_rank_mask")
+        )
 
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
@@ -525,7 +474,9 @@ class NVLinkOneSided(Communication):
                 active_rank_mask,
             )
         )
-        self._watch_collective("dispatch", active_rank_mask)
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "dispatch", active_rank_mask
+        )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
@@ -628,7 +579,9 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
-        active_rank_mask = self._get_active_rank_mask_tensor(kwargs.get("active_rank_mask"))
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
+            kwargs.get("active_rank_mask")
+        )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -643,7 +596,9 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             active_rank_mask,
         )
-        self._watch_collective("combine", active_rank_mask)
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "combine", active_rank_mask
+        )
 
         # Reset state for next round
         self.reset_state()
