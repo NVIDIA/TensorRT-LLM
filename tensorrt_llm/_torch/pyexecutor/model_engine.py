@@ -2568,9 +2568,14 @@ class PyTorchModelEngine(ModelEngine):
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
-            'num_ctx_requests': 0,
-            'num_ctx_tokens': 0,
-            'num_generation_tokens': num_generation_tokens
+            'num_ctx_requests':
+            0,
+            'num_ctx_tokens':
+            0,
+            'num_generation_tokens':
+            num_generation_tokens,
+            'cached_kv_tokens':
+            sum(num_cached_tokens_per_seq),
         })
 
         return lora_params
