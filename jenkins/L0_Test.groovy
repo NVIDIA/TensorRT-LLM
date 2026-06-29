@@ -2204,6 +2204,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
     def Boolean stageIsFailed = true
+    def Boolean hasTimeoutTest = false
     Throwable caughtError = null
     try {
         taskRunner()
@@ -2220,9 +2221,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             echo "Stage is interrupted, skip to upload test result."
         } else {
             // Generate timeout test result xml if there are terminated unexpectedly tests
-            hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+            hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName) as Boolean
             if (hasTimeoutTest) {
-                echo "There are terminated unexpectedly tests, stage is failed."
+                echo "There is a terminated unexpectedly test, stage is failed."
                 stageIsFailed = true
             }
             // Temporarily disable to reduce the log size
@@ -2291,6 +2292,13 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             pwd && ls -alh
             rm -rf ./*
         """
+
+        // If tests timed out but the stage itself did not throw (try block succeeded),
+        // we must explicitly fail here so Jenkins marks the stage red. Results and
+        // junit() have already been uploaded above before the workspace was cleaned.
+        if (hasTimeoutTest && caughtError == null) {
+            error("Stage failed: tests terminated unexpectedly")
+        }
 
         echo "Finished test stage execution."
     }
