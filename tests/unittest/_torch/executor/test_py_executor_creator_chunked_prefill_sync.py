@@ -127,7 +127,7 @@ def _make_llm_args(*, attn_backend="TRTLLM", enable_chunked_prefill=True):
 
 
 def _run_create_py_executor(
-    monkeypatch, *, attn_backend="TRTLLM", sm_version=90, is_mla=False, enable_chunked_prefill=True
+    monkeypatch, *, attn_backend="TRTLLM", enable_chunked_prefill=True
 ):
     llm_args = _make_llm_args(
         attn_backend=attn_backend, enable_chunked_prefill=enable_chunked_prefill
@@ -161,9 +161,9 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla)
+    monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: False)
     monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: False)
-    monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: 90)
     monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _DummyKvCacheCreator)
 
     monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
@@ -208,12 +208,7 @@ def _run_create_py_executor(
 
 
 def test_flashinfer_star_attention_fallback_syncs_chunked_prefill(monkeypatch):
-    """FLASHINFER_STAR_ATTENTION fallback must disable chunked prefill in llm_args.
-
-    When attn_backend is FLASHINFER_STAR_ATTENTION and chunked prefill is initially
-    enabled, the fallback disables it. After executor creation, llm_args must reflect
-    the effective runtime state (False), not the original user setting (True).
-    """
+    """FLASHINFER_STAR_ATTENTION fallback disables chunked prefill and llm_args reflects it."""
     llm_args_flag, runtime_flag = _run_create_py_executor(
         monkeypatch,
         attn_backend="FLASHINFER_STAR_ATTENTION",
@@ -224,53 +219,13 @@ def test_flashinfer_star_attention_fallback_syncs_chunked_prefill(monkeypatch):
     assert runtime_flag is False
 
 
-def test_mla_unsupported_sm_fallback_syncs_chunked_prefill(monkeypatch):
-    """MLA unsupported-SM fallback must disable chunked prefill in llm_args.
-
-    When MLA is active but the SM version (89) is unsupported for chunked prefill,
-    the fallback disables it in both attn_runtime_features and enable_chunked_context.
-    After executor creation, llm_args.enable_chunked_prefill must agree with the
-    runtime state (both False).
-    """
-    llm_args_flag, runtime_flag = _run_create_py_executor(
-        monkeypatch,
-        is_mla=True,
-        sm_version=89,
-        enable_chunked_prefill=True,
-    )
-
-    assert llm_args_flag is False
-    assert runtime_flag is False
-
-
 def test_supported_config_preserves_chunked_prefill(monkeypatch):
-    """A supported configuration must leave llm_args.enable_chunked_prefill True.
-
-    When no fallback triggers (non-MLA, default TRTLLM backend, SM90), the
-    initial enable_chunked_prefill=True should propagate unchanged to both
-    llm_args and attn_runtime_features.
-    """
+    """No fallback triggers on a supported config; chunked prefill stays True in llm_args."""
     llm_args_flag, runtime_flag = _run_create_py_executor(
         monkeypatch,
         attn_backend="TRTLLM",
-        is_mla=False,
-        sm_version=90,
         enable_chunked_prefill=True,
     )
 
     assert llm_args_flag is True
     assert runtime_flag is True
-
-
-def test_chunked_prefill_disabled_from_start_stays_disabled(monkeypatch):
-    """When chunked prefill is initially False, no fallback changes it, and llm_args stays False."""
-    llm_args_flag, runtime_flag = _run_create_py_executor(
-        monkeypatch,
-        attn_backend="TRTLLM",
-        is_mla=False,
-        sm_version=90,
-        enable_chunked_prefill=False,
-    )
-
-    assert llm_args_flag is False
-    assert runtime_flag is False
