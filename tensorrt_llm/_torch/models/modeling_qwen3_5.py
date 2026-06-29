@@ -1,9 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import re
 from types import SimpleNamespace
 from typing import Dict, List
 
 import torch
 from transformers import PretrainedConfig
+
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.quantization import QuantAlgo
 
 from ...inputs import (
     ContentFormat,
@@ -412,7 +430,106 @@ def _normalize_qwen35_exclude_modules(model_config):
     # but conv1d is not a proper linear module and should be excluded from quant
     normalized.add("*linear_attn.conv1d")
 
+    # TRT-LLM's LMHead always allocates an unquantized (bf16) weight, so a
+    # quantized lm_head (e.g. NVFP4 in some ModelOpt MIXED_PRECISION exports)
+    # must be excluded from quant; the weight mapper dequantizes it to bf16.
+    normalized.add("lm_head")
+
     qc.exclude_modules = sorted(normalized)
+
+
+def _normalize_qwen35_quant_config_dict(model_config):
+    """Normalize MIXED_PRECISION per-layer quant config keys from HF naming.
+
+    ModelOpt MIXED_PRECISION checkpoints key ``quant_config_dict`` by HF names
+    (``model.language_model.layers.N...``, ``mtp.layers.N...``), but
+    ``apply_layerwise_quant_config`` matches them against TRT-LLM module names
+    (``model.layers.N...``).  Without this translation the per-layer entries
+    never match, so quantized modules (MoE experts, shared_expert, attention,
+    linear_attn.out_proj) silently fall back to the MIXED_PRECISION global
+    config -> unquantized, and their quantized checkpoint weights fail to load.
+
+    On SM100/SM103, W4A16_NVFP4 routed experts AND dense MLP projections
+    (gate_proj/up_proj/down_proj) are promoted to NVFP4 so the CuteDSL/TRTLLM
+    GEMM path can consume the checkpoint's packed FP4 weights and static input
+    scales. Dense MLP keys are additionally re-pathed to the doubled
+    ``.mlp.mlp.`` form to match the ``_DenseMlpAdapter`` runtime module tree.
+    Other W4A16_NVFP4 modules retain their original algorithm.
+
+    Mutates ``quant_config_dict`` in place (model_config is frozen).
+
+    Split linear-attn in_proj projections (in_proj_qkv/in_proj_z or fully
+    split q/k/v/z) are fused into a single ``in_proj_qkvz`` Linear at runtime.
+    When the checkpoint quantizes every one of them per-tensor FP8, a single
+    FP8 entry is synthesized under the fused module name so the Linear is
+    built FP8; the weight mapper then requantizes the split weights onto one
+    shared scale (_requantize_linear_attn_fp8_qkvz).  Incomplete or non-FP8
+    sets get no fused entry, and the mapper dequantizes them to bf16 instead.
+    """
+    qcd = getattr(model_config, "quant_config_dict", None)
+    if not qcd:
+        return
+
+    n_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
+    convert_to_nvfp4 = get_sm_version() in (100, 103)
+
+    normalized = {}
+    in_proj_fp8 = {}
+    for name, cfg in qcd.items():
+        if name.startswith(_LANG_PREFIX):
+            name = "model." + name[len(_LANG_PREFIX) :]
+        if name.startswith("model.visual"):
+            continue
+        from_mtp = name.startswith("mtp.")
+        if from_mtp:
+            if n_hidden_layers is None:
+                continue
+            translated = _translate_mtp_pattern(name, n_hidden_layers)
+            if translated is None:
+                continue
+            name = translated
+        # Collect split linear-attn in_proj FP8 entries for fusion below.
+        # MTP-origin entries are excluded: the weight mapper requantizes by
+        # checkpoint prefix (mtp.layers.N), which never matches the translated
+        # model.layers.{offset+N} key, so a fused entry would build an FP8
+        # module whose weights load as bf16.
+        in_proj_match = re.search(r"^(.+\.linear_attn)\.in_proj_(qkv|q|k|v|z)$", name)
+        if in_proj_match and not from_mtp and cfg.quant_algo == QuantAlgo.FP8:
+            in_proj_fp8.setdefault(in_proj_match.group(1), {})[in_proj_match.group(2)] = cfg
+            continue
+        if (
+            convert_to_nvfp4
+            and name.endswith(".mlp.experts")
+            and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        ):
+            cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+        else:
+            # Dense MLP (gate_proj/up_proj/down_proj directly under ``.mlp``) is
+            # wrapped by ``_DenseMlpAdapter``, so the runtime module path has a
+            # doubled ``.mlp.mlp.`` segment
+            # (layer.mlp[adapter].mlp[GatedMLP].{gate_up_proj,down_proj}).
+            # Translate the per-layer key to that path so
+            # ``apply_layerwise_quant_config`` matches it; otherwise the dense
+            # MLP silently falls back to the global MIXED_PRECISION config and
+            # its quantized checkpoint weights fail to load. On SM100/SM103 also
+            # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
+            # consume the checkpoint's packed FP4 weights and static input scales.
+            dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
+            if dense_mlp_match and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
+                if convert_to_nvfp4:
+                    cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
+                proj = dense_mlp_match.group(1)
+                name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
+        normalized[name] = cfg
+
+    # Synthesize one FP8 entry per fused in_proj_qkvz whose split projections
+    # are all FP8; the weight mapper requantizes them onto a shared scale.
+    for prefix, projs in in_proj_fp8.items():
+        if set(projs) in ({"qkv", "z"}, {"q", "k", "v", "z"}):
+            normalized[f"{prefix}.in_proj_qkvz"] = next(iter(projs.values()))
+
+    qcd.clear()
+    qcd.update(normalized)
 
 
 @register_auto_model("Qwen3_5MoeForCausalLM")
@@ -439,6 +556,7 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
 
     def __init__(self, model_config):
         _normalize_qwen35_exclude_modules(model_config)
+        _normalize_qwen35_quant_config_dict(model_config)
         super().__init__(model_config)
 
 
@@ -454,6 +572,7 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
 
     def __init__(self, model_config):
         _normalize_qwen35_exclude_modules(model_config)
+        _normalize_qwen35_quant_config_dict(model_config)
         super().__init__(model_config)
 
 
