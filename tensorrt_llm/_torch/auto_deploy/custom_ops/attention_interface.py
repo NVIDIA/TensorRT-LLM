@@ -1645,10 +1645,7 @@ class SequenceInfo:
 
     @nvtx_range("ad_offset_pos_and_cache_")
     def offset_pos_and_cache_(
-        self,
-        offset: torch.Tensor,
-        active_args_override: Optional[Set[str]] = None,
-        ignore_prefill_offsets: bool = False,
+        self, offset: torch.Tensor, active_args_override: Optional[Set[str]] = None
     ) -> None:
         """Offset position and cache-related metadata for active arguments.
 
@@ -1657,10 +1654,6 @@ class SequenceInfo:
             active_args_override: Optional graph-input names for the next in-forward consumer. When
                 provided, host mirroring is limited to those active host args. The caller is
                 responsible for including every host argument the next consumer may read.
-            ignore_prefill_offsets: Whether prefill entries in ``offset`` can be ignored for
-                per-token position-id expansion because they are known to be zero. This enables
-                mixed-batch position-id updates without reading device ``seq_len`` when only
-                non-prefill offsets matter.
         """
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
@@ -1724,35 +1717,10 @@ class SequenceInfo:
         # --- position_ids (device) ---
         position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
         # position_ids is per-token while offset is per-sequence.
-        num_prefill, num_extend, num_decode = self.batch_info.get_num_sequences()
-        num_prefill_tokens, num_extend_tokens, num_decode_tokens = self.batch_info.get_num_tokens()
-        if num_prefill > 0 and not ignore_prefill_offsets:
-            seq_len = self.get_arg("seq_len", truncate=True)
-            offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
-        else:
-            # Prefill offsets are ignored in this path, so start with zero offsets for every token
-            # and only fill the non-prefill token ranges. This avoids reading device seq_len.
-            offset_for_pos_ids = torch.zeros_like(position_ids)
-
-            extend_token_start = num_prefill_tokens
-            extend_token_end = extend_token_start + num_extend_tokens
-            decode_token_start = extend_token_end
-            decode_token_end = decode_token_start + num_decode_tokens
-
-            extend_seq_start = num_prefill
-            extend_seq_end = extend_seq_start + num_extend
-            decode_seq_start = extend_seq_end
-            decode_seq_end = decode_seq_start + num_decode
-
-            if num_extend > 0:
-                tokens_per_extend = num_extend_tokens // num_extend
-                offset_for_pos_ids[extend_token_start:extend_token_end] = offset[
-                    extend_seq_start:extend_seq_end
-                ].repeat_interleave(tokens_per_extend)
-            offset_for_pos_ids[decode_token_start:decode_token_end] = offset[
-                decode_seq_start:decode_seq_end
-            ]
-
+        seq_len = self.get_arg("seq_len", truncate=True)
+        offset_for_pos_ids = torch.repeat_interleave(
+            offset, seq_len.to(torch.int64), output_size=position_ids.numel()
+        )
         position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
@@ -1800,10 +1768,7 @@ class SequenceInfo:
         increment[num_prefill : num_prefill + num_overlap] = (
             new_lens_ungathered[gather_slot_idx] - 1
         )
-        # This adjustment accounts for requests that went through speculative verification in the
-        # previous iteration. Prefill requests are still consuming context and are not in
-        # speculative decoding mode yet, so there is no verification offset to apply to them.
-        self.offset_pos_and_cache_(increment, ignore_prefill_offsets=True)
+        self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")
     def switch_to_generate_(self, active_args_override: Optional[Set[str]] = None) -> None:
