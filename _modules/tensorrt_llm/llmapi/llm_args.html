@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc19" />
+  <meta name="docsearch:version" content="1.3.0rc20" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -842,6 +842,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
@@ -1066,7 +1067,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_helper</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
                                       <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">_str_to_torch_dtype_dict</span><span class="p">,</span> <span class="n">mpi_rank</span><span class="p">,</span> <span class="n">prefer_pinned</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">_str_to_torch_dtype_dict</span><span class="p">,</span> <span class="n">is_sm_100f</span><span class="p">,</span> <span class="n">mpi_rank</span><span class="p">,</span>
+                      <span class="n">prefer_pinned</span><span class="p">)</span>
 
 <span class="c1"># yapf: disable</span>
 <span class="c1"># isort: off</span>
@@ -1489,6 +1491,77 @@ window.runMermaid = runMermaid;</script>
 <span class="p">]</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">MultimodalEncoderCudaGraphConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;CUDA graph capture for multimodal vision / audio encoders.</span>
+
+<span class="sd">    One graph is captured per `buckets` entry; replay falls back to eager when the live workload&#39;s</span>
+<span class="sd">    padded shape does not match any bucket.</span>
+
+<span class="sd">    NOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for</span>
+<span class="sd">    `buckets` corresponding to lesser compute.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">,</span> <span class="n">PositiveInt</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">&quot;Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair &quot;</span>
+         <span class="s2">&quot;captures one graph sized for up to `total_tokens` real encoder tokens across exactly &quot;</span>
+         <span class="s2">&quot;`num_contexts` real contexts.&quot;</span><span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">enable_padding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">&quot;Capture a padded variant of each bucket so partial buckets can replay. Padding works &quot;</span>
+         <span class="s2">&quot;only when the request has exactly the bucket&#39;s `num_contexts` real contexts and no &quot;</span>
+         <span class="s2">&quot;more than the bucket&#39;s `total_tokens` real encoder tokens. The runner appends one &quot;</span>
+         <span class="s2">&quot;dummy padding context and one reserved padding token internally, so bucket values &quot;</span>
+         <span class="s2">&quot;should describe only the real workload.&quot;</span><span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">warmup_steps</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Warmup iterations to run per bucket before capturing.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">enable_replay_stats</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">&quot;Log diagnostic details for encoder CUDA graph bucket hits and misses. &quot;</span>
+         <span class="s2">&quot;When enabled, each request&#39;s bucket decision is logged at INFO.&quot;</span><span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_normalize</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;MultimodalEncoderCudaGraphConfig&#39;</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">total_tokens</span><span class="p">,</span> <span class="n">num_contexts</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">buckets</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&lt;</span> <span class="n">num_contexts</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;`buckets` entries must have total_tokens &gt;= &quot;</span>
+                                 <span class="s2">&quot;num_contexts.&quot;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">buckets</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buckets</span><span class="p">))</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+
+<span class="c1"># TODO(TRTLLM-13352): migrate `TorchLlmArgs.mm_encoder_only` and</span>
+<span class="c1"># `TorchLlmArgs.video_pruning_rate` into this class in a follow-up change.</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">MultimodalConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Multimodal model configuration.&quot;&quot;&quot;</span>
+
+    <span class="n">encoder_cuda_graph</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">MultimodalEncoderCudaGraphConfig</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">&quot;CUDA graph capture for multimodal encoders, keyed by modality name. &quot;</span>
+         <span class="s2">&quot;This config is not applied automatically - each model must read &quot;</span>
+         <span class="s2">&quot;`model_config.multimodal_config.encoder_cuda_graph` and implement capture + replay &quot;</span>
+         <span class="s2">&quot;via `MultimodalEncoderCudaGraphRunner` (see &quot;</span>
+         <span class="s2">&quot;`tensorrt_llm/_torch/models/multimodal_encoder_graph.py`).&quot;</span><span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">GuidedDecodingConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 
     <span class="k">class</span><span class="w"> </span><span class="nc">GuidedDecodingBackend</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
@@ -1863,6 +1936,68 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DeepSeekV4SparseAttentionConfig</span><span class="p">(</span><span class="n">DeepSeekSparseAttentionConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for DeepSeek-V4 Sparse Attention.&quot;&quot;&quot;</span>
+
+    <span class="n">algorithm</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;deepseek_v4&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;deepseek_v4&quot;</span>
+    <span class="n">index_head_dim</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The dimension of the DeepSeek-V4 indexer heads.&quot;</span><span class="p">)</span>
+    <span class="n">skip_indexer_for_short_seqs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Whether to skip the MQA and Top-K in the indexer for short sequences.&quot;</span><span class="p">)</span>
+    <span class="n">compress_ratios</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">4</span><span class="p">],</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The compress ratios of each layer. DeepSeek-V4 uses 0 &quot;</span>
+        <span class="s2">&quot;for uncompressed/SWA-only layers; the LLM API config normalizes &quot;</span>
+        <span class="s2">&quot;0 to 1, while checkpoint-facing semantics remain unchanged.&quot;</span><span class="p">)</span>
+    <span class="n">window_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The sliding window size in tokens for SWA layers.&quot;</span><span class="p">)</span>
+    <span class="n">index_topk</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
+                                      <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The top-k for the indexer.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.validate_index_head_dim">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.validate_index_head_dim">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">&quot;index_head_dim&quot;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_index_head_dim</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">index_head_dim</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">index_head_dim</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;index_head_dim is required for DeepSeek-V4 sparse attention.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">index_head_dim</span></div>
+
+
+<div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.normalize_compress_ratios">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.normalize_compress_ratios">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s2">&quot;compress_ratios&quot;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">normalize_compress_ratios</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">compress_ratios</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">compress_ratios</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;compress_ratios must not be empty.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">ratio</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">ratio</span> <span class="ow">in</span> <span class="n">compress_ratios</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;compress_ratios must be non-negative.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">[</span><span class="mi">1</span> <span class="k">if</span> <span class="n">ratio</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="n">ratio</span> <span class="k">for</span> <span class="n">ratio</span> <span class="ow">in</span> <span class="n">compress_ratios</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.supports_backend">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.supports_backend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+
+
+<div class="viewcode-block" id="DeepSeekV4SparseAttentionConfig.needs_separate_short_long_cuda_graphs">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig.needs_separate_short_long_cuda_graphs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">needs_separate_short_long_cuda_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="c1"># DeepSeek-V4 does not support short/long CUDA graph separation.</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="SkipSoftmaxAttentionConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">BaseSparseAttentionConfig</span><span class="p">):</span>
@@ -2074,7 +2209,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for MoE.&quot;&quot;&quot;</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
         <span class="s2">&quot;AUTO&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span> <span class="s2">&quot;WIDEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span> <span class="s2">&quot;DEEPGEMM&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;DENSEGEMM&quot;</span><span class="p">,</span> <span class="s2">&quot;VANILLA&quot;</span><span class="p">,</span> <span class="s2">&quot;TRITON&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="s2">&quot;DENSEGEMM&quot;</span><span class="p">,</span> <span class="s2">&quot;VANILLA&quot;</span><span class="p">,</span> <span class="s2">&quot;TRITON&quot;</span><span class="p">,</span> <span class="s2">&quot;MARLIN&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
             <span class="n">default</span><span class="o">=</span><span class="s1">&#39;AUTO&#39;</span><span class="p">,</span>
             <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE backend to use. &quot;</span>
             <span class="s2">&quot;AUTO selects default backend based on model. It currently doesn</span><span class="se">\&#39;</span><span class="s2">t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.&quot;</span>
@@ -2105,7 +2240,7 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="n">Nvfp4Backend</span> <span class="o">=</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;cutlass&#39;</span><span class="p">,</span> <span class="s1">&#39;cublaslt&#39;</span><span class="p">,</span> <span class="s1">&#39;cutedsl&#39;</span><span class="p">,</span> <span class="s1">&#39;cuda_core&#39;</span><span class="p">]</span>
+<span class="n">Nvfp4Backend</span> <span class="o">=</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;cutlass&#39;</span><span class="p">,</span> <span class="s1">&#39;cublaslt&#39;</span><span class="p">,</span> <span class="s1">&#39;cutedsl&#39;</span><span class="p">,</span> <span class="s1">&#39;cuda_core&#39;</span><span class="p">,</span> <span class="s1">&#39;marlin&#39;</span><span class="p">]</span>
 
 <span class="c1"># Short aliases for built-in custom tokenizers.</span>
 <span class="c1"># Maps alias → full import path (module.ClassName).</span>
@@ -2702,8 +2837,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">num_eagle_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;The number of eagle layers. Will not be used in pytorch flow, just for compatibility with TRT flow.&quot;</span>
-    <span class="p">)</span>
+        <span class="s2">&quot;Deprecated TensorRT-only field with different semantics from draft model &quot;</span>
+        <span class="s2">&quot;layer count. Do not use on the PyTorch backend.&quot;</span><span class="p">)</span>
+    <span class="n">_num_draft_hidden_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="n">max_non_leaves_per_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of non-leaves in each layer.&quot;</span><span class="p">)</span>
     <span class="n">eagle3_one_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -4143,11 +4279,28 @@ window.runMermaid = runMermaid;</script>
     <span class="n">Union</span><span class="p">[</span>
         <span class="n">RocketSparseAttentionConfig</span><span class="p">,</span>
         <span class="n">DeepSeekSparseAttentionConfig</span><span class="p">,</span>
+        <span class="n">DeepSeekV4SparseAttentionConfig</span><span class="p">,</span>
         <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">,</span>
         <span class="n">MiniMaxM3SparseAttentionConfig</span><span class="p">,</span>
     <span class="p">],</span>
     <span class="n">Field</span><span class="p">(</span><span class="n">discriminator</span><span class="o">=</span><span class="s2">&quot;algorithm&quot;</span><span class="p">),</span>
 <span class="p">]</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">KvCacheCompressionConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Config for KV-cache compression: a compression manager runs a KV-reduction</span>
+<span class="sd">    algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.</span>
+
+<span class="sd">    Kept separate from SparseAttentionConfig by design -- compression changes</span>
+<span class="sd">    which KV is stored, not the attention computation. The manager is registered</span>
+<span class="sd">    as a resource manager in create_py_executor (_util.py), like the KV cache</span>
+<span class="sd">    manager itself. Concrete algorithms subclass this and add their parameters.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">algorithm</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Name of the KV-cache compression algorithm to run; selects which &quot;</span>
+        <span class="s2">&quot;compression manager is built. Concrete algorithm configs subclass this &quot;</span>
+        <span class="s2">&quot;and set the value.&quot;</span><span class="p">)</span>
 
 
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_AgentTreeConfig</span><span class="p">)</span>
@@ -4331,6 +4484,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to use the KV cache manager v2 (experimental).&quot;</span><span class="p">)</span>
+
+    <span class="n">kv_cache_event_hash_algo</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
+        <span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;v1_block_key&quot;</span><span class="p">,</span> <span class="s2">&quot;v2_sha256&quot;</span><span class="p">,</span> <span class="s2">&quot;v2_sha256_64&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+            <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+            <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+            <span class="n">description</span><span class="o">=</span>
+            <span class="s2">&quot;The block hash algorithm used by KV cache manager events. &quot;</span>
+            <span class="s2">&quot;&#39;auto&#39; uses the native hash for each KV cache manager. &quot;</span>
+            <span class="s2">&quot;Explicit V2 hash choices are ignored with a warning by the V1 &quot;</span>
+            <span class="s2">&quot;KV cache manager.&quot;</span><span class="p">)</span>
 
     <span class="n">max_util_for_resume</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mf">0.95</span><span class="p">,</span>
@@ -4797,6 +4960,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">sparse_attention_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SparseAttentionConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Sparse attention config.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="c1"># KV cache compression config (separate from sparse attention: changes which</span>
+    <span class="c1"># KV is stored, not the attention computation)</span>
+    <span class="n">kv_cache_compression_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">KvCacheCompressionConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;KV-cache compression config; None disables compression.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="c1"># Speculative decoding parameters</span>
@@ -5668,6 +5838,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">v</span></div>
 
 
+    <span class="n">multimodal_config</span><span class="p">:</span> <span class="n">MultimodalConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="n">MultimodalConfig</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Multimodal model configuration.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
     <span class="n">attention_dp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AttentionDpConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optimized load-balancing for the DP Attention scheduler.&quot;</span><span class="p">,</span>
@@ -6437,6 +6612,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_cute_dsl_bf16">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_cute_dsl_bf16</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_bmm</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_gemm</span><span class="p">)</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">pipeline_parallel_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">is_sm_100f</span><span class="p">()):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Automatically enabling CuTe DSL BF16 BMM and GEMM for &quot;</span>
+                        <span class="s2">&quot;SM100/SM103 PP.&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_bmm</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_gemm</span> <span class="o">=</span> <span class="kc">True</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_bmm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_gemm</span><span class="p">:</span>
             <span class="n">major</span><span class="p">,</span> <span class="n">minor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_capability</span><span class="p">()</span>
             <span class="n">sm</span> <span class="o">=</span> <span class="n">major</span> <span class="o">*</span> <span class="mi">10</span> <span class="o">+</span> <span class="n">minor</span>
@@ -6780,9 +6962,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 22, 2026.</p>
+  <p>Last updated on June 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
   
 </div></div>
       

@@ -16,10 +16,10 @@ The `devel` and `release` images are published to NGC and can be pulled directly
 
 ```bash
 # Pull the development image (for building from source)
-docker pull nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc19
+docker pull nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc20
 
 # Pull the release image (ready to run)
-docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19
+docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20
 ```
 
 Replace `x.y.z` with the desired version. Browse the available tags for [`devel`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags) and [`release`](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) on NGC.

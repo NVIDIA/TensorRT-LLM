@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc19';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc19" />
+  <meta name="docsearch:version" content="1.3.0rc20" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -842,6 +842,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
@@ -1066,6 +1067,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">W4A8_MXFP4_FP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A8_MXFP4_MXFP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A16_MXFP4</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="n">MXFP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NVFP4_AWQ</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NVFP4_ARC</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NO_QUANT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span></div>
@@ -1124,6 +1126,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">W4A8_MXFP4_FP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A8_MXFP4_MXFP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">W4A16_MXFP4</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
+    <span class="c1"># MXFP8 weights (e4m3 + UE8M0 1x32 block scales) with MXFP8 dynamic activations (W8A8).</span>
+    <span class="n">MXFP8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
 
     <span class="c1"># The smallest power-of-two that is not used by a flag. Do not call auto() after that line.</span>
     <span class="n">COUNT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
@@ -1221,6 +1225,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">has_w4a16_mxfp4</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">W4A16_MXFP4</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">has_mxfp8</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">MXFP8</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">has_mxfp4</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_FP8</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_MXFP8</span>
                          <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A16_MXFP4</span><span class="p">)</span>
@@ -1239,7 +1246,8 @@ window.runMermaid = runMermaid;</script>
                               <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_NVFP4_FP8</span>
                               <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_FP8</span>
                               <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A16_MXFP4</span>
-                              <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_MXFP8</span><span class="p">)</span>
+                              <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_MXFP4_MXFP8</span>
+                              <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">MXFP8</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">exclude_kv_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">has_quant</span>
 
@@ -1278,7 +1286,8 @@ window.runMermaid = runMermaid;</script>
                          <span class="n">use_w4a8_qserve</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_w4a8_mxfp4_fp8</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_w4a8_mxfp4_mxfp8</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                         <span class="n">use_w4a16_mxfp4</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                         <span class="n">use_w4a16_mxfp4</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                         <span class="n">use_mxfp8</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">raise_error</span><span class="p">():</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported combination of QuantMode args: &quot;</span>
@@ -1297,7 +1306,8 @@ window.runMermaid = runMermaid;</script>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_qserve</span><span class="si">=}</span><span class="s2">, &quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_mxfp4_fp8</span><span class="si">=}</span><span class="s2">, &quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_mxfp4_mxfp8</span><span class="si">=}</span><span class="s2">, &quot;</span>
-                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a16_mxfp4</span><span class="si">=}</span><span class="s2">&quot;</span><span class="p">)</span>
+                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a16_mxfp4</span><span class="si">=}</span><span class="s2">, &quot;</span>
+                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_mxfp8</span><span class="si">=}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="c1"># We must quantize weights when we quantize activations.</span>
         <span class="k">if</span> <span class="n">quantize_activations</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">quantize_weights</span><span class="p">:</span>
@@ -1363,6 +1373,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="n">use_w4a16_mxfp4</span><span class="p">:</span>
             <span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">W4A16_MXFP4</span>
+
+        <span class="k">if</span> <span class="n">use_mxfp8</span><span class="p">:</span>
+            <span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">MXFP8</span>
 
         <span class="k">return</span> <span class="n">mode</span>
 
@@ -1451,6 +1464,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_w4a8_mxfp4_mxfp8</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_MXFP4</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_w4a16_mxfp4</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">MXFP8</span><span class="p">:</span>
+            <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_mxfp8</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 
@@ -1491,6 +1506,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_w4a8_mxfp4_mxfp8</span><span class="p">(),</span>
             <span class="s1">&#39;enable_w4a16_mxfp4&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_w4a16_mxfp4</span><span class="p">(),</span>
+            <span class="s1">&#39;enable_mxfp8&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">has_mxfp8</span><span class="p">(),</span>
             <span class="s1">&#39;fp8_kv_cache&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">(),</span>
             <span class="s1">&#39;use_weight_only&#39;</span><span class="p">:</span>
@@ -1615,9 +1632,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 22, 2026.</p>
+  <p>Last updated on June 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a8c5955">a8c5955</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
   
 </div></div>
       
