@@ -825,10 +825,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            # bf16 acceptance is stable; fp8/nvfp4 have higher variance due to
-            # arithmetic rounding, so use a lower threshold for quantized models.
-            min_rate = 0.50 if model_id == "bf16" else 0.40
-            self.check_acceptance_rate(llm, min_acceptance_rate=min_rate)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.50)
 
         print_memory_usage("after evaluation")
 

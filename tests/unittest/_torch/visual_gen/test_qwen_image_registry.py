@@ -23,7 +23,41 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImageTransformer2DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig
+
+
+def _tiny_static_nvfp4_model() -> QwenImageTransformer2DModel:
+    """Build a CPU-sized static NVFP4 model with representative exclusions."""
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4,
+        group_size=16,
+        exclude_modules=[
+            "img_in",
+            "txt_in",
+            "proj_out",
+            "norm_out*",
+            "transformer_blocks.0*",
+        ],
+    )
+    model_config = DiffusionModelConfig(
+        quant_config=quant_config,
+        skip_create_weights_in_init=False,
+    )
+    return QwenImageTransformer2DModel(
+        model_config=model_config,
+        patch_size=1,
+        in_channels=16,
+        out_channels=16,
+        num_layers=2,
+        attention_head_dim=16,
+        num_attention_heads=1,
+        joint_attention_dim=16,
+        axes_dims_rope=(4, 6, 6),
+    )
 
 
 def test_qwen_image_pipeline_is_registered():
@@ -73,39 +107,63 @@ def test_static_quant_excludes_high_precision_layers():
     BF16 with no scales, so they must fall back to the unquantized Linear
     method while the rest stay NVFP4.
     """
-    from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
 
-    quant_config = QuantConfig(
-        quant_algo=QuantAlgo.NVFP4,
-        group_size=16,
-        exclude_modules=[
-            "img_in",
-            "txt_in",
-            "proj_out",
-            "norm_out*",
-            "transformer_blocks.0*",
-            "transformer_blocks.1.*",
-        ],
-    )
-    model_config = DiffusionModelConfig(
-        quant_config=quant_config,
-        skip_create_weights_in_init=True,
-    )
-    model = QwenImageTransformer2DModel(model_config=model_config, num_layers=4)
-    model._clear_quant_config_on_excluded_layers()
+    model = _tiny_static_nvfp4_model()
 
-    # Excluded -> quant_config cleared (unquantized Linear method).
+    # Excluded layers materialize directly in their unquantized layout.
     assert model.img_in.quant_config is None
     assert model.txt_in.quant_config is None
     assert model.proj_out.quant_config is None
     assert model.norm_out.linear.quant_config is None
     assert model.transformer_blocks[0].attn.to_q.quant_config is None
-    assert model.transformer_blocks[1].img_mlp.up_proj.quant_config is None
-    # Quantized blocks keep NVFP4.
-    keep = model.transformer_blocks[2].attn.to_q.quant_config
+    assert model.img_in._weights_created
+    assert model.img_in.weight.shape == (16, 16)
+    assert not hasattr(model.img_in, "weight_scale")
+
+    # Included layers materialize in the NVFP4 layout.
+    keep = model.transformer_blocks[1].attn.to_q.quant_config
     assert keep is not None and keep.quant_algo == QuantAlgo.NVFP4
-    assert model.transformer_blocks[3].img_mlp.down_proj.quant_config is not None
+    quantized = model.transformer_blocks[1].attn.to_q
+    assert quantized._weights_created
+    assert quantized.weight.shape == (16, 8)
+    assert hasattr(quantized, "weight_scale")
+
+
+def test_static_quant_load_allows_only_missing_derived_parameters(monkeypatch):
+    """Static loading ignores quant helpers but still requires real weights."""
+    model = _tiny_static_nvfp4_model()
+    expected = dict(model.named_parameters())
+    derived_param_names = ("alpha", "inv_input_scale", "kv_scales", "inv_kv_scales")
+    derived = {
+        name
+        for name in expected
+        if any(name.endswith(f".{param_name}") for param_name in derived_param_names)
+    }
+    for param_name in derived_param_names:
+        assert any(name.endswith(f".{param_name}") for name in derived)
+
+    checkpoint = {name: param.detach() for name, param in expected.items() if name not in derived}
+    monkeypatch.setattr(
+        DynamicLinearWeightLoader,
+        "get_linear_weights",
+        lambda self, module, full_name, weights: [],
+    )
+    monkeypatch.setattr(
+        DynamicLinearWeightLoader,
+        "filter_weights",
+        lambda self, prefix, weights: {},
+    )
+
+    model.load_weights(checkpoint)
+
+    real_weight = "transformer_blocks.1.attn.to_q.weight"
+    checkpoint_missing_weight = checkpoint.copy()
+    checkpoint_missing_weight.pop(real_weight)
+    with pytest.raises(RuntimeError) as exc_info:
+        model.load_weights(checkpoint_missing_weight)
+    assert real_weight in str(exc_info.value)
+    assert not any(name in str(exc_info.value) for name in derived)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

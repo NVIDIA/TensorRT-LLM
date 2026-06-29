@@ -1068,6 +1068,8 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
+    EXPECT_EQ(
+        cacheTransceiverConfig.getKvTransferPollIntervalMs(), cacheTransceiverConfig2.getKvTransferPollIntervalMs());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)

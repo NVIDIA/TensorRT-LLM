@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import itertools
 import math
 from typing import List, Optional, Tuple
@@ -323,10 +324,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
+    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
+        Sm100BlockScaledPersistentDenseGemmActFusionKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
-    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_swiglu_fusion import \
-        Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
     from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
@@ -851,7 +852,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         single kernel for shared experts. The weight tensor has N columns
         (gate + up interleaved), and the output has N/2 columns after SwiGLU.
         """
-        kernel_class = Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
+        kernel_class = Sm100BlockScaledPersistentDenseGemmActFusionKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
@@ -862,7 +863,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
         )
 
-        def __init__(self, output_dtype: torch.dtype, use_tvm_ffi: bool = True):
+        def __init__(self,
+                     output_dtype: torch.dtype,
+                     use_tvm_ffi: bool = True,
+                     activation_type: ActivationType = ActivationType.Swiglu):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -871,9 +875,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
             self.use_tvm_ffi = use_tvm_ffi
+            self.activation_type = activation_type
+            self.is_gated = is_gated_activation(activation_type)
 
         def unique_id(self):
-            return (self.output_dtype, self.use_tvm_ffi)
+            return (self.output_dtype, self.use_tvm_ffi, self.activation_type)
 
         def get_valid_tactics(
             self,
@@ -910,8 +916,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"(K%32={real_k%32}, expected 0). Skipping all tactics.")
                 return []
 
-            # SwiGLU output has N/2 columns — check alignment for C
-            n_out = n // 2
+            # Gated (SwiGLU) halves output N; non-gated (e.g. GELU) keeps full N.
+            n_out = n // 2 if self.is_gated else n
             if n_out % 8 != 0:
                 logger.debug(
                     f"CuteDSL SwiGLU: N_out={n_out} (N/2) does not meet 16-byte alignment "
@@ -1026,11 +1032,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     False,
                 ]
 
-            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
+            # Optional trailing per-N bias (non-gated GELU only). Default off.
+            bias_tensor = inputs[5] if len(inputs) > 5 else None
+            (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor,
+             alpha_tensor) = inputs[:5]
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
-            n_out = n // 2  # SwiGLU halves the N dimension
+            # Gated (SwiGLU) halves output N; non-gated (e.g. GELU) keeps full N.
+            n_out = n // 2 if self.is_gated else n
 
-            # Allocate output tensor with halved N dimension
+            # Bias is a per-N vector [n_out]; broadcast over M happens in the
+            # kernel via a stride-0 layout. Require contiguous N for that.
+            if bias_tensor is not None:
+                if bias_tensor.numel() != n_out:
+                    raise ValueError(
+                        f"CuteDSL GELU: bias must have {n_out} elements "
+                        f"(n_out), got {bias_tensor.numel()}")
+                bias_tensor = bias_tensor.contiguous()
+
+            # Allocate output tensor with the activation-adjusted N dimension
             c_tensor = torch.empty(*(m, n_out),
                                    dtype=self.output_dtype,
                                    device="cuda")
@@ -1061,6 +1080,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
             b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
+            # Resolve optional bias dtype (bf16/fp32 accepted; consumed in fp32).
+            has_bias = bias_tensor is not None
+            if has_bias:
+                if bias_tensor.dtype == torch.bfloat16:
+                    bias_cute_dtype = cutlass.BFloat16
+                elif bias_tensor.dtype == torch.float32:
+                    bias_cute_dtype = cutlass.Float32
+                else:
+                    raise ValueError(
+                        f"CuteDSL GELU: bias must be bf16 or fp32, "
+                        f"got {bias_tensor.dtype}")
+
             if not self.use_tvm_ffi:
                 a_ptr = self.make_cute_dsl_global_pointer(
                     a_tensor, cutlass.Float4E2M1FN, 32)
@@ -1072,6 +1103,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_sf_tensor, cutlass.Float8E4M3FN, 16)
                 c_ptr = self.make_cute_dsl_global_pointer(
                     c_tensor, cutlass.BFloat16, 16)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 torch_stream = torch.cuda.current_stream()
@@ -1083,8 +1116,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_sf_m = sf_m
             kernel_sf_n = sf_n
 
+            # Cache key includes bias presence + dtype so the bias-free and
+            # bias paths compile to distinct kernels (different host signature).
+            bias_key = bias_tensor.dtype if has_bias else None
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn,
-                         use_prefetch, self.use_tvm_ffi)
+                         use_prefetch, self.use_tvm_ffi, self.activation_type,
+                         bias_key)
             if cache_key not in self.__class__.kernel_cache:
                 if self.use_tvm_ffi:
                     a_ptr = self.make_cute_dsl_global_pointer(
@@ -1097,6 +1134,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_tensor, cutlass.Float8E4M3FN, 16)
                     c_ptr = self.make_cute_dsl_global_pointer(
                         c_tensor, cutlass.BFloat16, 16)
+                    bias_ptr = self.make_cute_dsl_global_pointer(
+                        bias_tensor, bias_cute_dtype, 4) if has_bias else None
                     alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
                     stream = cute.runtime.make_fake_stream(
                         use_tvm_ffi_env_stream=True)
@@ -1107,12 +1146,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn,
                     True,  # vectorized_f32
                     use_prefetch,
+                    activation_type=self.activation_type,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                compiled_gemm = cute.compile(
+                # bias_ptr is the trailing keyword of wrapper; omit it entirely
+                # when absent so the bias-free signature is unchanged.
+                compile_args = [
                     gemm.wrapper,
                     kernel_m,
                     kernel_n,
@@ -1130,9 +1172,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     False,  # swap_ab=False for SwiGLU
+                ]
+                compile_kwargs = dict(
                     options=f"--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
-                )
+                    if self.use_tvm_ffi else "--opt-level 2", )
+                if has_bias:
+                    compile_kwargs["bias_ptr"] = bias_ptr
+
+                compiled_gemm = cute.compile(*compile_args, **compile_kwargs)
 
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
@@ -1140,7 +1187,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Launch kernel
             if self.use_tvm_ffi:
-                compiled_gemm(
+                # bias data_ptr (when present) is the trailing dynamic arg,
+                # mirroring the bias_ptr appended at compile time.
+                tvm_args = [
                     kernel_m,
                     kernel_n,
                     real_k,
@@ -1153,9 +1202,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     b_sf_tensor.data_ptr(),
                     c_tensor.data_ptr(),
                     alpha_tensor,
-                )
+                ]
+                if has_bias:
+                    tvm_args.append(bias_tensor.data_ptr())
+                compiled_gemm(*tvm_args)
             else:
-                compiled_gemm(
+                # bias_ptr is the trailing runtime arg of the compiled wrapper
+                # (swap_ab/epilogue_op are constexprs baked in at compile time);
+                # omit it entirely when absent.
+                call_args = [
                     kernel_m,
                     kernel_n,
                     real_k,
@@ -1169,7 +1224,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_ptr,
                     alpha_cute_tensor,
                     stream,
-                )
+                ]
+                if has_bias:
+                    call_args.append(bias_ptr)
+                compiled_gemm(*call_args)
 
             return c_tensor
 
@@ -1243,6 +1301,100 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
+    class CuteDSLNVFP4GeluBlackwellRunner(CuteDSLNVFP4SwigluBlackwellRunner):
+        """Non-gated GELU(tanh) variant of the dense bf16-out runner.
+
+        Reuses the swiglu runner's forward/get_valid_tactics; only the fused
+        activation (GELU, non-gated -> output keeps full N) and the kernel
+        compile cache differ.
+        """
+        kernel_cache = dict()
+
+        def __init__(self, output_dtype: torch.dtype, use_tvm_ffi: bool = True):
+            super().__init__(output_dtype,
+                             use_tvm_ffi,
+                             activation_type=ActivationType.Gelu)
+
+        def unique_id(self):
+            return (self.output_dtype, self.use_tvm_ffi, 'gelu')
+
+    # a/b: fp4, scale: fp8, output: bf16, fused non-gated GELU(tanh)
+    @torch.library.custom_op("trtllm::cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_nvfp4_dense_gemm_gelu_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> torch.Tensor:
+        """CuteDSL NVFP4 dense GEMM + non-gated GELU(tanh) with bf16 output for Blackwell.
+
+        Non-gated counterpart of cute_dsl_nvfp4_dense_gemm_swiglu_blackwell:
+        the output keeps the full N dimension (no gate/up halving), and the
+        epilogue applies GELU(tanh) before writing bf16. Optionally adds a
+        per-N bias (``gelu_tanh(alpha * acc + bias)``).
+
+        Args:
+            input: Activation tensor [m, k] in FP4 format (packed in uint8)
+            weight: Weight tensor [n, k] in FP4 format (packed in uint8).
+                    n = intermediate_size.
+            input_scale: Activation scale factors
+            weight_scale: Weight scale factors
+            alpha: GEMM scaling factor
+            output_dtype: Output data type (must be bfloat16)
+            bias: Optional per-N bias vector [n] (bf16/fp32, NOT quantized),
+                broadcast over M and added before GELU. None (default) -> no bias.
+            use_tvm_ffi: Whether to use TVM-FFI for reduced host launch overhead.
+
+        Returns:
+            Output tensor [m, n] in bfloat16 after non-gated GELU(tanh).
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL NVFP4 GELU backend requires SM 100 (B200) or SM 103 (B300), "
+                f"but got SM {sm_version}.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLNVFP4GeluBlackwellRunner(output_dtype, use_tvm_ffi)
+        inputs = [input, weight, input_scale, weight_scale, alpha]
+        if bias is not None:
+            inputs.append(bias)
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+
+        output = runner(inputs, tactic=best_tactic)
+        return output
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ):
+        # [m, k]
+        shape = list(mat_a.shape)
+        # [n, k] -> non-gated GELU keeps the full N dimension
+        shape[-1] = mat_b.shape[-2]
+        # output is fixed as bf16
+        ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
+        return ret
+
     class CuteDSLNVFP4SwigluFP4OutBlackwellRunner(TunableRunner):
         """Runner for dense GEMM + SwiGLU fusion with FP4 output on Blackwell.
 
@@ -1250,7 +1402,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output with scale factors (SFC quantization), eliminating the bf16→fp4
         requantization between FC1 and FC2.
         """
-        kernel_class = Sm100BlockScaledPersistentDenseGemmSwigluFusionKernel
+        kernel_class = Sm100BlockScaledPersistentDenseGemmActFusionKernel
         kernel_cache = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
@@ -1261,9 +1413,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
         )
 
-        def __init__(self, use_tvm_ffi: bool = True):
+        def __init__(self,
+                     use_tvm_ffi: bool = True,
+                     activation_type: ActivationType = ActivationType.Swiglu):
             super().__init__()
             self.use_tvm_ffi = use_tvm_ffi
+            self.activation_type = activation_type
+            self.is_gated = is_gated_activation(activation_type)
 
         def unique_id(self):
             return (self.use_tvm_ffi, 'fp4out')
@@ -1283,8 +1439,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[Tuple]:
-            # Same tactic search as BF16 runner but with FP4 C dtype
-            a, b, a_sf, b_sf, alpha, global_sf = inputs
+            # Same tactic search as BF16 runner but with FP4 C dtype.
+            # inputs may carry an optional trailing bias (non-gated GELU); only
+            # the first 6 are needed for shape inference / tactic validity.
+            a, b, a_sf, b_sf, alpha, global_sf = inputs[:6]
             m, k, n = a.shape[0], a.shape[1] * 2, b.shape[0]
 
             # The fp4out kernel's SFC epilogue does not properly predicate
@@ -1334,6 +1492,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             Args:
                 inputs: [act_fp4, weight_fp4, act_sf, weight_sf, alpha, global_sf]
+                    or, for the non-gated GELU path with bias, an extra trailing
+                    [bias] (per-N vector, bf16/fp32, NOT quantized). Bias is only
+                    consumed by the non-gated path; swiglu callers pass 6 inputs.
                 tactic: (mma_tiler_mn, cluster_shape_mn, use_prefetch)
 
             Returns:
@@ -1350,9 +1511,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     False,
                 ]
 
-            a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor, global_sf_tensor = inputs
+            # Optional trailing per-N bias (non-gated GELU only). Default off.
+            bias_tensor = inputs[6] if len(inputs) > 6 else None
+            (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor,
+             global_sf_tensor) = inputs[:6]
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
-            n_out = n // 2  # SwiGLU halves the N dimension
+            # Gated (SwiGLU) halves output N; non-gated (e.g. GELU) keeps full N.
+            n_out = n // 2 if self.is_gated else n
+
+            # Bias is a per-N vector [n_out]; broadcast over M happens in the
+            # kernel via a stride-0 layout. Require contiguous N for that.
+            if bias_tensor is not None:
+                if bias_tensor.numel() != n_out:
+                    raise ValueError(
+                        f"CuteDSL GELU FP4Out: bias must have {n_out} elements "
+                        f"(n_out), got {bias_tensor.numel()}")
+                bias_tensor = bias_tensor.contiguous()
 
             # Pad m to CTA tile height to prevent OOB writes from
             # the kernel's epilogue on partial tiles.
@@ -1409,8 +1583,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_m = m
             kernel_n = n
 
+            # Resolve optional bias dtype (bf16/fp32 accepted; consumed in fp32).
+            has_bias = bias_tensor is not None
+            if has_bias:
+                if bias_tensor.dtype == torch.bfloat16:
+                    bias_cute_dtype = cutlass.BFloat16
+                elif bias_tensor.dtype == torch.float32:
+                    bias_cute_dtype = cutlass.Float32
+                else:
+                    raise ValueError(
+                        f"CuteDSL GELU FP4Out: bias must be bf16 or fp32, "
+                        f"got {bias_tensor.dtype}")
+
+            # Cache key includes bias presence + dtype so the bias-free and
+            # bias paths compile to distinct kernels (different host signature).
+            bias_key = bias_tensor.dtype if has_bias else None
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn,
-                         use_prefetch, self.use_tvm_ffi, 'fp4out')
+                         use_prefetch, self.use_tvm_ffi, 'fp4out', bias_key)
             if cache_key not in self.__class__.kernel_cache:
                 # Create pointers for compilation
                 a_ptr = self.make_cute_dsl_global_pointer(
@@ -1425,6 +1614,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_tensor, cutlass.Float4E2M1FN, 32)
                 sfc_ptr = self.make_cute_dsl_global_pointer(
                     c_sf_tensor, cutlass.Float8E4M3FN, 16)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
                 norm_const_cute_tensor = cute.runtime.from_dlpack(
                     global_sf_tensor)
@@ -1442,12 +1633,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn,
                     True,  # vectorized_f32
                     use_prefetch,
+                    activation_type=self.activation_type,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                compiled_gemm = cute.compile(
+                # bias_ptr is the trailing positional of wrapper_fp4out; omit it
+                # entirely when absent so the bias-free signature is unchanged.
+                compile_args = [
                     gemm.wrapper_fp4out,
                     kernel_m,
                     kernel_n,
@@ -1468,6 +1662,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     norm_const_cute_tensor,
                     max_active_clusters,
                     stream,
+                ]
+                if has_bias:
+                    compile_args.append(bias_ptr)
+
+                compiled_gemm = cute.compile(
+                    *compile_args,
                     options=f"--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
@@ -1478,7 +1678,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Launch kernel
             if self.use_tvm_ffi:
-                compiled_gemm(
+                # bias data_ptr (when present) is the trailing dynamic arg,
+                # mirroring the bias_ptr appended at compile time.
+                tvm_args = [
                     kernel_m,
                     kernel_n,
                     real_k,
@@ -1495,7 +1697,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_sf_tensor.data_ptr(),
                     alpha_tensor,
                     global_sf_tensor,
-                )
+                ]
+                if has_bias:
+                    tvm_args.append(bias_tensor.data_ptr())
+                compiled_gemm(*tvm_args)
             else:
                 a_ptr = self.make_cute_dsl_global_pointer(
                     a_tensor, cutlass.Float4E2M1FN, 32)
@@ -1509,6 +1714,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_tensor, cutlass.Float4E2M1FN, 32)
                 sfc_ptr = self.make_cute_dsl_global_pointer(
                     c_sf_tensor, cutlass.Float8E4M3FN, 16)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
                 norm_const_cute_tensor = cute.runtime.from_dlpack(
                     global_sf_tensor)
@@ -1516,7 +1723,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 torch_stream = torch.cuda.current_stream()
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
-                compiled_gemm(
+                # bias_ptr is the trailing positional of wrapper_fp4out (after
+                # stream); omit it entirely when absent.
+                call_args = [
                     kernel_m,
                     kernel_n,
                     real_k,
@@ -1534,7 +1743,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     alpha_cute_tensor,
                     norm_const_cute_tensor,
                     stream,
-                )
+                ]
+                if has_bias:
+                    call_args.append(bias_ptr)
+                compiled_gemm(*call_args)
 
             # Trim padded C output back to original m rows
             c_tensor = c_tensor[:m]
@@ -1612,9 +1824,113 @@ if IS_CUTLASS_DSL_AVAILABLE:
         global_sf: torch.Tensor,
         use_tvm_ffi: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = mat_a.shape[0]
         n = mat_b.shape[-2]
         n_out = n // 2
+        sf_vec_size = 16
+        # FP4 output packed: [m, n_out // 2]. Use new_empty with the input
+        # shape list so the SymInt for the token dim is preserved through the
+        # FX graph (matches the BF16 / nvfp4_gemm fake patterns; a positional
+        # torch.empty(m, ...) loses the SymInt link required by the piecewise
+        # CUDA graph optimizer).
+        fp4_shape = list(mat_a.shape)
+        fp4_shape[-1] = n_out // 2
+        fp4_output = mat_a.new_empty(fp4_shape)
+        # Scale factors: 1D
+        m = mat_a.shape[0]
+        sf_size = pad_up(m, 128) * pad_up(n_out // sf_vec_size, 4)
+        output_sf = input_scale.new_empty([sf_size])
+        return fp4_output, output_sf
+
+    class CuteDSLNVFP4GeluFP4OutBlackwellRunner(
+            CuteDSLNVFP4SwigluFP4OutBlackwellRunner):
+        """Non-gated GELU(tanh) variant of the dense FP4-out runner.
+
+        Reuses the swiglu runner's forward/get_valid_tactics; only the fused
+        activation (GELU, non-gated -> output keeps full N) and the kernel
+        compile cache differ.
+        """
+        kernel_cache = dict()
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__(use_tvm_ffi, activation_type=ActivationType.Gelu)
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, 'gelu_fp4out')
+
+    # a/b: fp4, scale: fp8, output: fp4 + sfc, fused non-gated GELU(tanh)
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+        mutates_args=(),
+        device_types="cuda")
+    def cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        global_sf: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CuteDSL NVFP4 dense GEMM + non-gated GELU(tanh) with FP4 output for Blackwell.
+
+        Non-gated counterpart of cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell:
+        the output keeps the full N dimension (no gate/up halving), and the
+        epilogue applies GELU(tanh) before FP4 quantization. Optionally adds a
+        per-N bias (``gelu_tanh(alpha * acc + bias)``).
+
+        Args:
+            input: Activation tensor [m, k] in FP4 format (packed)
+            weight: Weight tensor [n, k] in FP4 format (packed). n = intermediate_size.
+            input_scale: Activation scale factors
+            weight_scale: Weight scale factors
+            alpha: GEMM scaling factor
+            global_sf: Output scale (norm_const for SFC quantization)
+            bias: Optional per-N bias vector [n] (bf16/fp32, NOT quantized),
+                broadcast over M and added before GELU. None (default) -> no bias.
+            use_tvm_ffi: Whether to use TVM-FFI.
+
+        Returns:
+            Tuple of (fp4_output, output_sf):
+                fp4_output: [m, n//2] in FP4 packed format
+                output_sf: Scale factors for the output (1D)
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL NVFP4 GELU FP4Out requires SM 100 or SM 103, "
+                f"but got SM {sm_version}.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLNVFP4GeluFP4OutBlackwellRunner(use_tvm_ffi)
+        inputs = [input, weight, input_scale, weight_scale, alpha, global_sf]
+        if bias is not None:
+            inputs.append(bias)
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        global_sf: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # bias does not change output shape.
+        m = mat_a.shape[0]
+        n = mat_b.shape[-2]
+        n_out = n  # non-gated: output keeps full N
         sf_vec_size = 16
         # FP4 output packed: [m, n_out // 2]
         fp4_output = torch.empty(m,
@@ -5707,16 +6023,95 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLGvrTopKDecodeRunner:
         """Runner for the GVR Top-K cuTe DSL kernel (Blackwell SM100).
 
-        Owns the JIT compile cache keyed on
-        ``(dtype, top_k, next_n, tuning_knobs, compress_ratio)`` and an
-        auto-heuristic that resolves T (threads/block), V (vec-load width),
-        ``min_blocks_per_mp`` (ptxas ``__launch_bounds`` cap) and
-        ``enable_warp_parallel_reduce`` from input shape + dtype.
-
-        Production knobs (tuning parameters) are fixed: ``enable_unroll_4``
-        and ``enable_phase3_unroll`` always on, ``use_constant_hint`` off.
+        Owns the JIT cache and the (T, V, min_blocks_per_mp,
+        warp_parallel_reduce) heuristic. ``forward()`` dispatches three
+        paths from ``(counters, order_row)`` — see its docstring. All
+        share :meth:`_pick_tuning`; only the compiled kernel class and
+        launch signature differ.
         """
         kernel_cache: dict = {}
+
+        @staticmethod
+        def _pick_tuning(
+            torch_dtype: torch.dtype,
+            num_rows: int,
+            N_per_cta: int,
+            num_sms: int,
+            max_seq_len: Optional[int],
+            data_ptr: int,
+        ) -> dict:
+            """Pick T / V / min_blocks_per_mp tuning knobs shared by
+            single-CTA / sort and LB compile paths. Returned keys match
+            ``_compile`` / ``_compile_lb`` param names for ``**tuning``
+            spreading.
+            """
+            enable_unroll_4 = True
+            enable_phase3_unroll = True
+            use_constant_hint = False
+
+            # T=1024 needs 1 CTA/SM grid AND enough per-CTA vec work.
+            # Under graph capture, raise the half-prec bar so a small
+            # capture-N doesn't force T=1024 on small-N replays
+            # (~14-16% regression).
+            if max_seq_len is not None and torch_dtype != torch.float32:
+                n_thresh_t = 131072
+            else:
+                n_thresh_t = 65536
+            num_threads_per_block = (1024 if
+                                     (num_rows <= num_sms
+                                      and N_per_cta >= n_thresh_t) else 512)
+            # V=256-bit only helps fp32 at large N. Half-prec cvt
+            # doubles reg pressure (5-11% loss at K=512/1024). Caller
+            # must hand a contiguous (32B-aligned) tensor — torch.empty
+            # / row slices satisfy this; column / stride-padded layouts
+            # may not.
+            use_256bit_load = (torch_dtype == torch.float32
+                               and N_per_cta >= 16384)
+            if use_256bit_load:
+                assert data_ptr % 32 == 0, (
+                    f"use_256bit_load=True requires 32B-aligned "
+                    f"logits.data_ptr(), got {data_ptr} % 32 = "
+                    f"{data_ptr % 32}.")
+            # Warp-parallel reduce only pays at 32-warp (T=1024).
+            enable_warp_parallel_reduce = num_threads_per_block == 1024
+
+            # min_blocks_per_mp: reg-vs-occupancy 3-tier. Half-prec
+            # prefers extra CTA/SM (cvt-ILP fits in 40 regs); fp32
+            # wants mb=2 (4-LDG ILP needs ~70 regs).
+            vec_bits_host = 256 if use_256bit_load else 128
+            vec_w_host = vec_bits_host // (32 if torch_dtype == torch.float32
+                                           else 16)
+            n_vec_iters = max(1,
+                              N_per_cta // (num_threads_per_block * vec_w_host))
+            if torch_dtype == torch.float32:
+                if n_vec_iters < 4:
+                    min_blocks_per_mp = 0
+                elif num_rows <= num_sms:
+                    min_blocks_per_mp = 1
+                elif (num_sms * 2 < num_rows <= num_sms * 3
+                      and N_per_cta <= 32768):
+                    # mb=3 packs all CTAs in 1 wave; at N>=64K kernel
+                    # is bandwidth-bound and mb=2 wins instead.
+                    min_blocks_per_mp = 3
+                else:
+                    min_blocks_per_mp = 2
+            else:
+                if num_rows > num_sms:
+                    min_blocks_per_mp = 3
+                elif n_vec_iters < 4:
+                    min_blocks_per_mp = 0
+                else:
+                    min_blocks_per_mp = 1
+
+            return dict(
+                enable_unroll_4=enable_unroll_4,
+                enable_phase3_unroll=enable_phase3_unroll,
+                use_constant_hint=use_constant_hint,
+                num_threads_per_block=num_threads_per_block,
+                use_256bit_load=use_256bit_load,
+                enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+                min_blocks_per_mp=min_blocks_per_mp,
+            )
 
         @classmethod
         def _compile(
@@ -5734,19 +6129,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compress_ratio: int,
             return_output_values: bool,
             cluster_size: int,
-        ) -> None:
+            seqlen_sorted: bool,
+        ) -> tuple:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
-                   compress_ratio, return_output_values, cluster_size)
+                   compress_ratio, return_output_values, cluster_size,
+                   seqlen_sorted)
             if key in cls.kernel_cache:
-                return
+                return key
             n_rows = cute.sym_int()
             n_cols = cute.sym_int()
             n_batch = cute.sym_int()
-            # 256-bit vec loads require 32-byte aligned input addresses
-            # (PyTorch CUDA allocations are 256-byte aligned; Phase 2/3
-            # offsets are multiples of vec_w * elem_bytes = 32 bytes).
+            # 32B alignment required by 256-bit vec loads.
             in_align = 32 if use_256bit_load else 16
             input_fake = cute.runtime.make_fake_compact_tensor(
                 dtype, (n_rows, n_cols),
@@ -5758,10 +6153,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assumed_align=16)
             seq_lens_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (n_batch, ), stride_order=(0, ))
-            # When return_output_values=False the kernel skips all STG.value
-            # writes; pass None so cute.compile doesn't materialize a fake
-            # value-output placeholder (matches the optional-tensor pattern
-            # used by CuteDSLTopKDecodeMultiCTARunner above).
+            # None → kernel skips STG.value path (cute.compile won't
+            # materialize the fake either).
             out_values_fake = (cute.runtime.make_fake_compact_tensor(
                 dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16)
                                if return_output_values else None)
@@ -5769,6 +6162,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Int32, (n_rows, top_k),
                 stride_order=(1, 0),
                 assumed_align=16)
+            # seqlen_sorted=False → const_expr's the indirection out, no
+            # order_row read at runtime. True → request-level fake
+            # (shape n_batch, not n_rows).
+            order_row_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch, ), stride_order=(0, )) if seqlen_sorted else None)
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -5786,6 +6185,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 compress_ratio=compress_ratio,
                 return_output_values=return_output_values,
                 cluster_size=cluster_size,
+                seqlen_sorted=seqlen_sorted,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -5794,10 +6194,101 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seq_lens_fake,
                 out_values_fake,
                 out_indices_fake,
+                order_row_fake,
                 stream=fake_stream,
                 options="--enable-tvm-ffi",
             )
             logger.debug(f"[compile cute_dsl gvr_topk_decode] {key}")
+            return key
+
+        @classmethod
+        def _compile_lb(
+            cls,
+            dtype,
+            top_k: int,
+            next_n: int,
+            compress_ratio: int,
+            max_batch_size: int,
+            num_threads_per_block: int,
+            cluster_size: int,
+            enable_unroll_4: bool,
+            enable_phase3_unroll: bool,
+            use_constant_hint: bool,
+            min_blocks_per_mp: int,
+            use_256bit_load: bool,
+            enable_warp_parallel_reduce: bool,
+            return_output_values: bool,
+        ) -> tuple:
+            """JIT-compile the LB (hybrid multi-CTA + single-CTA) kernel.
+
+            ``num_rows`` / ``N`` are ``cute.sym_int()`` — one compiled
+            kernel covers all shapes within a tuning bucket. Grid is
+            sized by ``max_batch_size`` (which IS in the cache key).
+            """
+            key = ("lb", dtype, top_k, next_n, compress_ratio, max_batch_size,
+                   num_threads_per_block, cluster_size, enable_unroll_4,
+                   enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
+                   use_256bit_load, enable_warp_parallel_reduce,
+                   return_output_values)
+            if key in cls.kernel_cache:
+                return key
+            n_rows = cute.sym_int()
+            n_cols = cute.sym_int()
+            n_batch = cute.sym_int()
+            in_align = 32 if use_256bit_load else 16
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                dtype, (n_rows, n_cols),
+                stride_order=(1, 0),
+                assumed_align=in_align)
+            pre_idx_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_batch, top_k),
+                stride_order=(1, 0),
+                assumed_align=16)
+            seq_lens_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_batch, ), stride_order=(0, ))
+            out_values_fake = (cute.runtime.make_fake_compact_tensor(
+                dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16)
+                               if return_output_values else None)
+            out_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, top_k),
+                stride_order=(1, 0),
+                assumed_align=16)
+            order_row_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (max_batch_size, ), stride_order=(0, ))
+            counters_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (2, ), stride_order=(0, ))
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+            kernel = _GvrTopKLBKernel(
+                dtype=dtype,
+                top_k=top_k,
+                next_n=next_n,
+                num_threads=num_threads_per_block,
+                compress_ratio=compress_ratio,
+                return_output_values=return_output_values,
+                cluster_size=cluster_size,
+                max_batch_size=max_batch_size,
+                enable_unroll_4=enable_unroll_4,
+                enable_phase3_unroll=enable_phase3_unroll,
+                use_constant_hint=use_constant_hint,
+                min_blocks_per_mp=min_blocks_per_mp,
+                use_256bit_load=use_256bit_load,
+                enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+            )
+            cls.kernel_cache[key] = cute.compile(
+                kernel,
+                input_fake,
+                pre_idx_fake,
+                seq_lens_fake,
+                out_values_fake,
+                out_indices_fake,
+                order_row_fake,
+                counters_fake,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            logger.debug(f"[compile cute_dsl gvr_topk_lb_decode] {key}")
+            return key
 
         @classmethod
         def forward(
@@ -5811,169 +6302,150 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compress_ratio: int = 1,
             max_seq_len: Optional[int] = None,
             cluster_size: Optional[int] = None,
+            order_row: Optional[torch.Tensor] = None,
+            counters: Optional[torch.Tensor] = None,
+            max_batch_size: Optional[int] = None,
         ) -> None:
+            """Three paths, picked by ``(counters, order_row)``:
+
+            - (None, None)   single-CTA.
+            - (None, tensor) single-CTA + sort indirect; ``order_row`` is a
+              descending argsort of ``seq_lens`` (shape == seq_lens.shape).
+            - (tensor, tensor) LB; ``order_row`` is the long-first partition
+              from ``cute_dsl_gvr_topk_lb_prepare`` (shape == max_batch_size;
+              valid prefix in ``counters`` = [n_long, n_short]).
+
+            ``counters`` without ``order_row`` is rejected.
+            """
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
-            # Op-level hardcodes return_output_values=False — the DSA indexer
-            # pipeline only consumes indices, mirroring CUDA's
-            # ``indexer_topk_decode`` (which also doesn't expose value
-            # outputs). The compiled kernel skips all STG.value writes and
-            # accepts None for its value-output slot at launch time.
-            #
-            # The kernel keeps both ``return_output_values=True/False``
-            # branches to support enabling value writeback in the future
-            # if a downstream caller needs it.
+            # seq_lens is request-level, logits is row-level (next_n
+            # rows per request).
+            assert num_rows % next_n == 0 and seq_lens.shape[
+                0] == num_rows // next_n, (
+                    f"shape contract: seq_lens.shape[0] (={seq_lens.shape[0]}) "
+                    f"must equal logits.shape[0] / next_n "
+                    f"(={num_rows} / {next_n} = {num_rows // next_n})")
+            # DSA indexer only reads indices (mirrors CUDA
+            # indexer_topk_decode). Kernel keeps True/False branches.
             return_output_values = False
-            # max_seq_len: graph-safe hint. Eager mode: leave None and the
-            # heuristic adapts to actual N each call. Graph capture mode:
-            # caller passes peak runtime N so the captured kernel selects
-            # the large-N (T=1024, V=256) variant instead of the
-            # capture-time-small-N variant.
+            # Under graph capture, max_seq_len = peak runtime N so the
+            # heuristic picks the large-N variant.
             N_row = max_seq_len if max_seq_len is not None else logits.shape[1]
             num_sms = _get_num_sms()
 
-            # ---- cluster_size auto-dispatch (must run first) ----
-            # The cluster decision uses the FULL row length (cluster only
-            # pays for itself when the row is large enough to recoup the
-            # cluster sync + DSMEM gather overhead). Tuning on synth-data
-            # bundles (B200 SXM5, synth_comprehensive sweep 2026-06-10):
-            #   N < 64K              -> 1 (cluster sync unrecouped)
-            #   N >= 128K, BS <= 4   -> 8 (large N + tiny grid → 8-way
-            #                              parallel fits + wins up to 1.84x)
-            #   BS * 4 <= num_sms    -> 4 (single-wave for cs=4)
-            #   BS * 2 <= num_sms    -> 2 (single-wave for cs=2)
-            #   else                 -> 1 (multi-wave for any cs > 1 loses)
-            # Caller can pin a value (1..16); auto only when None.
-            if cluster_size is None:
-                if N_row < 65536:
-                    cluster_size = 1
-                elif num_rows <= 4 and N_row >= 131072:
-                    cluster_size = 8
-                elif num_rows * 4 <= num_sms:
-                    cluster_size = 4
-                elif num_rows * 2 <= num_sms:
-                    cluster_size = 2
-                else:
-                    cluster_size = 1
-
-            # Clamp to per-device hardware limit (per-GPC SM count). The
-            # kernel's __init__ validates against the absolute [1, 16] cap,
-            # but the actual launchable cluster size depends on GPC
-            # topology; pinning a value that exceeds it would fail at
-            # launch with a CUDA error. ``_query_max_cluster_size`` is
-            # lru_cache'd so the driver query runs once per process.
-            if cluster_size > 1:
+            # cluster_size policy:
+            #   LB: caller-pinned in {2,4,8}; baked into cache key →
+            #       reject (not clamp) on hw mismatch.
+            #   single-CTA / sort: auto-pick from (N, BS) when unset;
+            #       safe to clamp to hw cap.
+            lb_mode = counters is not None
+            if lb_mode:
+                assert order_row is not None, (
+                    "counters requires order_row (both come from "
+                    "trtllm::cute_dsl_gvr_topk_lb_prepare).")
+                assert max_batch_size is not None, (
+                    "max_batch_size is required in LB mode and must "
+                    "match the value used at LB prepare time.")
+                assert (order_row.dtype == torch.int32 and order_row.is_cuda
+                        and order_row.shape == (max_batch_size, )), (
+                            f"LB order_row must be int32, CUDA, shape "
+                            f"({max_batch_size},); got dtype={order_row.dtype} "
+                            f"shape={tuple(order_row.shape)}")
+                assert (counters.dtype == torch.int32 and counters.is_cuda
+                        and counters.shape == (2, )), (
+                            f"LB counters must be int32, CUDA, shape (2,); "
+                            f"got dtype={counters.dtype} "
+                            f"shape={tuple(counters.shape)}")
+                if cluster_size is None:
+                    cluster_size = 4  # GvrTopKLBKernel ctor default
+                assert cluster_size in (2, 4, 8), (
+                    f"LB cluster_size must be 2, 4, or 8; got {cluster_size}")
                 hw_max_cluster = _query_max_cluster_size()
                 if cluster_size > hw_max_cluster:
-                    logger.warning_once(
-                        f"cute_dsl_gvr_topk_decode: cluster_size={cluster_size} "
-                        f"exceeds device max ({hw_max_cluster}); clamping.",
-                        key="cute_dsl_gvr_topk_decode_cluster_clamp",
-                    )
-                    cluster_size = hw_max_cluster
+                    raise ValueError(
+                        f"LB cluster_size={cluster_size} exceeds device "
+                        f"max ({hw_max_cluster}); pin a smaller cs at LB "
+                        f"prepare, or use the single-CTA path.")
+            else:
+                if cluster_size is None:
+                    # B200 SXM5 synth-data tuning, 2026-06-10:
+                    #   N < 64K              -> 1 (sync unrecouped)
+                    #   N >= 128K, BS <= 4   -> 8 (tiny grid)
+                    #   BS * cs <= num_sms   -> cs (single-wave)
+                    #   else                 -> 1 (multi-wave loses)
+                    if N_row < 65536:
+                        cluster_size = 1
+                    elif num_rows <= 4 and N_row >= 131072:
+                        cluster_size = 8
+                    elif num_rows * 4 <= num_sms:
+                        cluster_size = 4
+                    elif num_rows * 2 <= num_sms:
+                        cluster_size = 2
+                    else:
+                        cluster_size = 1
+                if cluster_size > 1:
+                    hw_max_cluster = _query_max_cluster_size()
+                    if cluster_size > hw_max_cluster:
+                        logger.warning_once(
+                            f"cute_dsl_gvr_topk_decode: cluster_size="
+                            f"{cluster_size} exceeds device max "
+                            f"({hw_max_cluster}); clamping.",
+                            key="cute_dsl_gvr_topk_decode_cluster_clamp",
+                        )
+                        cluster_size = hw_max_cluster
 
-            # Per-CTA effective scan length. With cluster_size > 1 each
-            # CTA only scans ``N_row // cluster_size`` of the row, so
-            # T / V / min_blocks heuristics below compare against the
-            # per-CTA work rather than the full row.
+            # Cluster CTAs split the row, so heuristics target per-CTA work.
             N_per_cta = N_row // cluster_size
+            # tuning keys mirror _compile / _compile_lb param names; spread
+            # with **tuning at the call sites.
+            tuning = cls._pick_tuning(logits.dtype, num_rows, N_per_cta,
+                                      num_sms, max_seq_len, logits.data_ptr())
 
-            # Production tuning knobs (fixed across shapes).
-            enable_unroll_4 = True
-            enable_phase3_unroll = True
-            use_constant_hint = False
+            if lb_mode:
+                key = cls._compile_lb(
+                    cute_dtype,
+                    top_k,
+                    next_n,
+                    compress_ratio,
+                    max_batch_size=max_batch_size,
+                    cluster_size=cluster_size,
+                    return_output_values=return_output_values,
+                    **tuning,
+                )
+                cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
+                                      output_indices, order_row, counters)
+                return
 
-            # ---- T (num_threads_per_block) + V (use_256bit_load) ----
-            # T=1024 only when grid fits 1 CTA/SM and each thread has
-            # enough per-CTA vec-loop work (N_per_cta >= 65536). For
-            # half-prec under graph capture, raise the bar to 131072 so
-            # a small capture-N never forces T=1024 onto small-N replays
-            # (~14-16% regression).
-            if max_seq_len is not None and logits.dtype != torch.float32:
-                n_thresh_t = 131072
-            else:
-                n_thresh_t = 65536
-            num_threads_per_block = (1024 if
-                                     (num_rows <= num_sms
-                                      and N_per_cta >= n_thresh_t) else 512)
-            # V=256-bit only for fp32 above N=16K (per-CTA). Half-prec
-            # cvt-to-fp32 doubles fragment reg footprint and regresses
-            # 5-11% on K=512/1024. Caller contract: when this fires,
-            # ``logits.data_ptr()`` must be 32-byte aligned (satisfied by
-            # torch.empty() and row slices; column slices / stride-padded
-            # layouts may violate it).
-            use_256bit_load = (logits.dtype == torch.float32
-                               and N_per_cta >= 16384)
-            if use_256bit_load:
-                ptr = logits.data_ptr()
-                assert ptr % 32 == 0, (
-                    f"use_256bit_load=True requires 32B-aligned "
-                    f"logits.data_ptr(), got {ptr} % 32 = {ptr % 32}. "
-                    f"Pass a contiguous tensor (column slices / stride-"
-                    f"padded layouts violate alignment).")
-            # Warp-parallel reduce only pays off at 32-warp (T=1024); at
-            # 16-warp (T=512) it costs ~2pp on synth data.
-            enable_warp_parallel_reduce = num_threads_per_block == 1024
-
-            # ---- min_blocks_per_mp (ptxas __launch_bounds cap) ----
-            # Reg-vs-occupancy 3-tier heuristic. Tier-3 ordering differs
-            # by dtype: half-prec puts tier-3 first (cvt-ILP fits in 40
-            # regs, extra CTA/SM hides cvt latency); fp32 keeps tier-0
-            # first (4-LDG ILP wants ~70 regs, mb=2 cap=64 caps ILP).
-            vec_bits_host = 256 if use_256bit_load else 128
-            vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32
-                                           else 16)
-            n_vec_iters = max(1,
-                              N_per_cta // (num_threads_per_block * vec_w_host))
-            is_fp32 = logits.dtype == torch.float32
-            if is_fp32:
-                if n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                elif num_rows <= num_sms:
-                    min_blocks_per_mp = 1
-                elif (num_sms * 2 < num_rows <= num_sms * 3
-                      and N_per_cta <= 32768):
-                    # Wave-fit + latency-bound: mb=3 caps each CTA to fit
-                    # all num_rows CTAs in a single wave. At N>=65K the
-                    # kernel becomes bandwidth-bound and mb=2 wins.
-                    min_blocks_per_mp = 3
-                else:
-                    min_blocks_per_mp = 2
-            else:
-                if num_rows > num_sms:
-                    min_blocks_per_mp = 3
-                elif n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                else:
-                    min_blocks_per_mp = 1
-
-            cls._compile(
+            # seqlen_sorted=True compiles in order_row[req] * next_n + nn
+            # (longer rows first); False const_expr's it out.
+            seqlen_sorted = order_row is not None
+            if seqlen_sorted:
+                assert (
+                    order_row.dtype == torch.int32 and order_row.is_cuda
+                    and order_row.shape == seq_lens.shape
+                ), ("order_row must be int32, CUDA, shape == seq_lens.shape "
+                    f"(={tuple(seq_lens.shape)}); got dtype={order_row.dtype} "
+                    f"shape={tuple(order_row.shape)}")
+            key = cls._compile(
                 cute_dtype,
                 top_k,
                 next_n,
-                enable_unroll_4,
-                enable_phase3_unroll,
-                use_constant_hint,
-                min_blocks_per_mp,
-                use_256bit_load,
-                num_threads_per_block,
-                enable_warp_parallel_reduce,
-                compress_ratio,
-                return_output_values,
-                cluster_size,
+                compress_ratio=compress_ratio,
+                return_output_values=return_output_values,
+                cluster_size=cluster_size,
+                seqlen_sorted=seqlen_sorted,
+                **tuning,
             )
-            key = (cute_dtype, top_k, next_n, enable_unroll_4,
-                   enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
-                   use_256bit_load, num_threads_per_block,
-                   enable_warp_parallel_reduce, compress_ratio,
-                   return_output_values, cluster_size)
-            # TVM FFI: pass raw torch tensors directly, env stream picked
-            # up automatically (no from_dlpack, no stream argument).
-            # ``output_values=None`` matches the kernel's compile-time
-            # ``return_output_values=False`` constexpr — no writes for top-k values.
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
-                                  output_indices)
+                                  output_indices, order_row)
 
+    # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
+    # (device-side, graph-safe) into the LJF row-reorder branch when
+    # ``num_rows >= 2 * num_sms``. Physical meaning: wave-2 must fit a
+    # full SM-row's worth of CTAs so the sort has long-vs-short rows to
+    # swap. Below that threshold the win is noise / can regress a few
+    # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
@@ -5987,50 +6459,53 @@ if IS_CUTLASS_DSL_AVAILABLE:
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
         cluster_size: Optional[int] = None,
+        order_row: Optional[torch.Tensor] = None,
+        counters: Optional[torch.Tensor] = None,
+        max_batch_size: Optional[int] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
-        Writes per-row top-K indices into the caller-allocated
-        ``output_indices`` buffer (no return). Values are NOT written —
-        the kernel is compiled with ``return_output_values=False`` so the
-        STG.value path is skipped. Mirrors CUDA ``indexer_topk_decode``
-        which also only exposes indices to callers.
+        Writes per-row top-K indices into ``output_indices`` (indices
+        only, mirroring CUDA ``indexer_topk_decode``).
 
         Args:
             logits: ``[num_rows, max_seq_len]`` fp32 / bf16 / fp16.
-            pre_idx: ``[num_rows // next_n, top_k]`` int32. ``pre_idx[..., 0]``
-                must be the argmax index (indexer invariant).
-            seq_lens: ``[num_rows // next_n]`` int32. Effective seq length per group.
+            pre_idx: ``[num_rows // next_n, top_k]`` int32.
+                ``pre_idx[..., 0]`` must be the argmax index.
+            seq_lens: ``[num_rows // next_n]`` int32, request-level.
             output_indices: ``[num_rows, top_k]`` int32.
             top_k: K ∈ {512, 1024, 2048} — compile-time specialized.
-            next_n: Temporal stride (V3.2 ``preIdxOffset = (row % next_n) + 1``).
-            compress_ratio: KV-indexer compression factor (1 = DSv3.2, 4 = DSv4).
-            max_seq_len: Graph-safe hint for peak ``logits.shape[1]`` at replay.
-                Pass under CUDA graph capture so the heuristic picks the
-                large-N kernel; leave ``None`` in eager mode.
-            cluster_size: Thread-block cluster size for the GVR kernel
-                (1 = single-CTA per row; 2/4/8 = N CTAs cooperatively
-                processing one row via DSMEM + cluster sync). ``None``
-                (default) delegates to the wrapper's auto-dispatch heuristic
-                based on (N, BS); pass an explicit int to pin the choice.
+            next_n: Temporal stride (V3.2
+                ``preIdxOffset = (row % next_n) + 1``).
+            compress_ratio: 1 = DSv3.2, 4 = DSv4.
+            max_seq_len: Peak N at replay; pass under CUDA Graph capture
+                so the heuristic picks the large-N kernel.
+            cluster_size: 1 = single-CTA; 2/4/8 = N CTAs cooperate via
+                DSMEM. ``None`` → auto-pick from (N, BS) (single-CTA /
+                sort path) or 4 (LB path).
+            order_row: Request-level dispatch order (int32, CUDA).
+                Without ``counters``: descending argsort of ``seq_lens``
+                (shape == seq_lens.shape). With ``counters``: LB
+                long-first partition (shape == max_batch_size) from
+                :func:`cute_dsl_gvr_topk_lb_prepare`. ``None`` skips
+                the indirection.
+            counters: LB ``[n_long, n_short]`` from
+                :func:`cute_dsl_gvr_topk_lb_prepare`. Selects the LB
+                path and requires ``order_row`` + ``max_batch_size``.
+            max_batch_size: Required with ``counters``; ignored
+                otherwise. Power of 2 in ``[64, 1024]``, must match
+                the value passed to LB prepare.
         """
         if not is_sm_100f():
             raise ValueError(
                 f"CuteDSL: SM version {get_sm_version()} is not supported. "
                 f"CuteDSL GVR Top-K Decode only supports SM 100 family.")
-        # num_rows = batch_size * next_n contract; downstream sizing of
-        # pre_idx/seq_lens/output_indices derives batch_size from this.
-        # Caught here so the user sees a clear message instead of an OOB
-        # write or ZeroDivisionError deep inside the kernel.
         if logits.shape[0] % next_n != 0:
             raise ValueError(
                 f"logits.shape[0] (={logits.shape[0]}) must be divisible by "
-                f"next_n (={next_n}); the kernel derives batch_size as "
+                f"next_n (={next_n}); kernel derives batch_size as "
                 f"logits.shape[0] / next_n.")
-        # Key includes the shape + dtype signature so a NEW input shape
-        # gets its own one-shot log line; without the signature only the
-        # first shape would ever be logged, hiding follow-up shapes from
-        # production diagnostics.
+        # Log once per (dtype, shape) so each new shape gets a line.
         _log_sig = (
             f"{logits.dtype}|{tuple(logits.shape)}|"
             f"k={top_k}|nn={next_n}|cr={compress_ratio}|msl={max_seq_len}")
@@ -6054,6 +6529,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             compress_ratio=compress_ratio,
             max_seq_len=max_seq_len,
             cluster_size=cluster_size,
+            order_row=order_row,
+            counters=counters,
+            max_batch_size=max_batch_size,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -6067,8 +6545,142 @@ if IS_CUTLASS_DSL_AVAILABLE:
         compress_ratio: int = 1,
         max_seq_len: Optional[int] = None,
         cluster_size: Optional[int] = None,
+        order_row: Optional[torch.Tensor] = None,
+        counters: Optional[torch.Tensor] = None,
+        max_batch_size: Optional[int] = None,
     ) -> None:
         return None
+
+    # ---- GVR Top-K Load-Balance (hybrid multi-CTA + single-CTA) ----
+    # Two ops:
+    #   1. cute_dsl_gvr_topk_lb_prepare (once per decode step) — writes
+    #      (order_row, counters) by classifying seq_lens into long/short.
+    #   2. cute_dsl_gvr_topk_decode with counters set (once per layer) —
+    #      long rows ride a cluster (cs=2/4) via DSMEM; short rows go
+    #      single-CTA. Both branches share the grid for graph capture.
+    # (order_row, counters) are layer-invariant within a decode step.
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
+        GvrTopKLBKernel as _GvrTopKLBKernel
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
+        GvrTopKLBPrepareKernel as _GvrTopKLBPrepareKernel
+
+    # No Runner class for prepare: no tuning knobs, no cluster dispatch.
+    @functools.cache
+    def _compile_lb_prepare(
+        num_threads: int,
+        batch_size: int,
+        long_threshold: int,
+        compress_ratio: int,
+    ):
+        """JIT-compile the LB prepare kernel.
+
+        ``num_threads`` = block size = max_batch_size. ``batch_size``
+        must equal runtime ``seq_lens.shape[0]`` (TVM-FFI marshalling).
+        ``compress_ratio`` puts the classifier in scan-length space.
+        """
+        prep = _GvrTopKLBPrepareKernel(
+            long_threshold=long_threshold,
+            compress_ratio=compress_ratio,
+            num_threads=num_threads,
+        )
+        fake_seq = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                         (batch_size, ),
+                                                         stride_order=(0, ))
+        fake_order = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                           (num_threads, ),
+                                                           stride_order=(0, ))
+        fake_ctr = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2, ),
+                                                         stride_order=(0, ))
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            prep,
+            fake_seq,
+            fake_order,
+            fake_ctr,
+            cutlass.Int32(0),
+            stream=fake_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_gvr_topk_lb_prepare",
+        mutates_args=("order_row", "counters"),
+        device_types="cuda",
+    )
+    def cute_dsl_gvr_topk_lb_prepare(
+        seq_lens: torch.Tensor,
+        order_row: torch.Tensor,
+        counters: torch.Tensor,
+        max_batch_size: int,
+        long_threshold: int = 64 * 1024,
+        compress_ratio: int = 1,
+    ) -> None:
+        """LB partition prepare — run once per decode step; outputs
+        are layer-invariant and feed every per-layer decode call.
+
+        Writes:
+          ``order_row[max_batch_size]`` int32 — long group at
+              ``[0, n_long)``, short group at ``[n_long, n_long+n_short)``,
+              tail untouched (caller should pre-fill with -1).
+          ``counters[2]`` int32 — ``[n_long_req, n_short_req]``.
+
+        Args:
+            seq_lens: ``[batch_size]`` int32, UNCOMPRESSED tokens
+                (classifier divides by ``compress_ratio`` internally).
+            order_row: caller-allocated ``[max_batch_size]`` int32.
+                Fixed shape so CUDA Graph capture sees a single grid.
+            counters: caller-allocated ``[2]`` int32.
+            long_threshold: scan-length-space threshold (default 64K =
+                B200 cs=4 break-even ≈ 3.2us / row).
+            max_batch_size: power of 2 in [64, 1024]
+                (block_prefix_sum_kernel constraint).
+            compress_ratio: 1 = DSv3.2, 4 = DSv4.
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL GVR Top-K LB prepare only supports SM 100 family.")
+        # block_prefix_sum needs num_warps > 1 and pow2 →
+        # max_batch_size ∈ {64, 128, 256, 512, 1024}.
+        if not (64 <= max_batch_size <= 1024) or (max_batch_size &
+                                                  (max_batch_size - 1)) != 0:
+            raise ValueError(
+                f"max_batch_size must be a power of 2 in [64, 1024] "
+                f"(block_prefix_sum_kernel constraint); got {max_batch_size}")
+        batch_size = seq_lens.shape[0]
+        if batch_size > max_batch_size:
+            # Block is sized to max_batch_size (1 thread / request);
+            # requests with idx >= max_batch_size have no thread.
+            raise ValueError(
+                f"batch_size ({batch_size}) must be <= max_batch_size "
+                f"({max_batch_size}).")
+        assert (order_row.dtype == torch.int32 and order_row.is_cuda
+                and order_row.shape == (max_batch_size, )), (
+                    f"order_row must be int32, CUDA, shape "
+                    f"({max_batch_size},); got dtype={order_row.dtype} "
+                    f"shape={tuple(order_row.shape)}")
+        assert (counters.dtype == torch.int32 and counters.is_cuda
+                and counters.shape == (2, )), (
+                    f"counters must be int32, CUDA, shape (2,); got "
+                    f"dtype={counters.dtype} shape={tuple(counters.shape)}")
+        compiled = _compile_lb_prepare(max_batch_size, batch_size,
+                                       long_threshold, compress_ratio)
+        compiled(seq_lens, order_row, counters, cutlass.Int32(batch_size))
+
+    @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_lb_prepare")
+    def _(
+        seq_lens: torch.Tensor,
+        order_row: torch.Tensor,
+        counters: torch.Tensor,
+        max_batch_size: int,
+        long_threshold: int = 64 * 1024,
+        compress_ratio: int = 1,
+    ) -> None:
+        return None
+
+    # LB decode lives inside CuteDSLGvrTopKDecodeRunner — see
+    # ``_compile_lb`` and the ``counters is not None`` branch of
+    # ``forward`` (shares ``_pick_tuning`` with the single-CTA path).
 
     def warmup_cute_dsl_indexer_topk(
         dtype: torch.dtype,

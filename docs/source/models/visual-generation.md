@@ -48,14 +48,18 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.2** | Yes | Yes | Yes [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
+| **Qwen-Image** [^4] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 work both as VisualGen dynamic quantization from a BF16 checkpoint (no pre-quantized checkpoint required) and by loading a pre-quantized ModelOpt checkpoint (static scales, with the checkpoint's `quantization_config` `ignore` list keeping the embedders, output projection, and first/last transformer blocks in high precision). ModelOpt **NVFP4 SVDQuant** checkpoints (`quant_algo` `NVFP4_SVD`: an NVFP4 residual plus a per-input-channel `pre_quant_scale` and a rank-r BF16 LoRA correction) are also supported. 
+[^2]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
+
+[^3]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
+
+[^4]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 work both as VisualGen dynamic quantization from a BF16 checkpoint and by loading a pre-quantized ModelOpt checkpoint with static scales. For pre-quantized checkpoints, the checkpoint's `quantization_config` `ignore` list keeps the embedders, output projection, and first/last transformer blocks in high precision. ModelOpt **NVFP4 SVDQuant** checkpoints (`quant_algo` `NVFP4_SVD`: an NVFP4 residual plus a per-input-channel `pre_quant_scale` and a rank-r BF16 LoRA correction) are also supported.
 
 ## Quick Start
 
