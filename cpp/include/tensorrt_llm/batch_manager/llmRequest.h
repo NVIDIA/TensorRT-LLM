@@ -2247,7 +2247,10 @@ private:
 
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
-        mLastTokens = VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
+        // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
+        // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
+        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.beamWidth)
+                                          : VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
 
         // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};
