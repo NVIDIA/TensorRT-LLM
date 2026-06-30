@@ -29,7 +29,6 @@ import zipfile
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
 from torch._inductor.async_compile import shutdown_compile_workers
 
@@ -341,6 +340,17 @@ def _llm_models_root():
     from defs import conftest
 
     return conftest.llm_models_root()
+
+
+def _venv_check_call(*args, **kwargs):
+    # Deferred like _llm_models_root above: defs.common does `from tensorrt_llm import
+    # LLM`, which pulls in tensorrt_llm.bindings. Importing it at module load would
+    # crash the torch.multiprocessing.spawn child processes used by the multi-GPU LPIPS
+    # tests, which re-import this module before the worker fixes sys.path. Only the
+    # single-GPU example tests call this, and only in the parent process.
+    from defs.common import venv_check_call
+
+    return venv_check_call(*args, **kwargs)
 
 
 def _lpips_model_path(*parts):
@@ -1236,7 +1246,7 @@ def _run_vbench_and_report(
         "custom_input",
     ]
     cmd.extend(["--dimension"] + VBENCH_DIMENSIONS)
-    venv_check_call(llm_venv, cmd)
+    _venv_check_call(llm_venv, cmd)
 
     pattern = os.path.join(output_path, "*_eval_results.json")
     result_files = glob.glob(pattern)
@@ -1389,7 +1399,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
         os.symlink(model_src, model_dst, target_is_directory=True)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "quickstart_example.py")
-    venv_check_call(llm_venv, [script_path])
+    _venv_check_call(llm_venv, [script_path])
 
     output_path = os.path.join(llm_venv.get_working_directory(), "output.avi")
     assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"
@@ -1411,7 +1421,7 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
         os.symlink(model_src, model_dst, target_is_directory=True)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "api_walkthrough.py")
-    venv_check_call(llm_venv, [script_path])
+    _venv_check_call(llm_venv, [script_path])
 
     output_path = os.path.join(llm_venv.get_working_directory(), "api_walkthrough_output.avi")
     assert os.path.isfile(output_path), f"API walkthrough did not produce {output_path}"
@@ -1452,7 +1462,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1488,7 +1498,7 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1524,7 +1534,7 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1563,7 +1573,7 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1606,7 +1616,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1650,7 +1660,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1686,7 +1696,7 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
