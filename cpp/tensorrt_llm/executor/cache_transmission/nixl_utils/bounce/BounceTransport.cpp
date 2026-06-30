@@ -972,8 +972,16 @@ void BounceTransport::addPeer(std::string const& peer, std::string const& endpoi
 
 void BounceTransport::forgetPeer(std::string const& peer)
 {
-    // Queue; the actual reclaim runs on the IO thread (drainForgets) so the scheduler and the
-    // request table stay owned by a single thread. Safe to call from invalidateRemoteAgent.
+    // Drop the control-channel DEALER to this peer SYNCHRONOUSLY here (ControlChannel::removePeer is
+    // thread-safe). Doing it on the caller thread — rather than on the IO thread in drainForgets —
+    // gives a deterministic happens-before for any addPeer() the caller issues after forgetPeer()
+    // returns (e.g. re-establishing a peer that came back): the dealer is already gone, so that
+    // addPeer() rebuilds it instead of racing an async removePeer that would otherwise erase the
+    // freshly re-added dealer. A pending send to the now-removed peer is dropped (it is being
+    // invalidated), which degrades any in-flight request to a FAILURE — never corruption.
+    mCtx.channel->removePeer(peer);
+    // The scheduler / request-table reclaim still runs on the IO thread (drainForgets) so that state
+    // stays owned by a single thread. Safe to call from invalidateRemoteAgent.
     std::lock_guard<std::mutex> lk(mForgetMu);
     mForgetPeers.push_back(peer);
 }
@@ -993,10 +1001,8 @@ void BounceTransport::drainForgets()
     {
         mReceiver.forget(peer); // reclaim receiver-side credits/jobs of the gone peer
         mSender.forget(peer);   // fail in-flight sender requests to the gone peer
-        // Reclaim the per-peer control-channel DEALER/endpoint too (forget()s above may emit a final
-        // cancel WANT, so do this last). A later transfer to/from this peer re-establishes the dealer
-        // via addPeer() (our submit path) or the WANT self-bootstrap (the peer's onWant).
-        mCtx.channel->removePeer(peer);
+        // NOTE: the control-channel DEALER for this peer was already dropped synchronously in
+        // forgetPeer() (see there); we only reclaim scheduler/request state on this (IO) thread.
     }
 }
 
