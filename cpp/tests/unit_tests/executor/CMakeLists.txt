@@ -69,11 +69,15 @@ target_sources(gatherScatterKernelTest
 add_gtest(bounceArenaTest bounceArenaTest.cpp)
 target_sources(bounceArenaTest PRIVATE ${BOUNCE_DIR}/BounceArena.cpp)
 
-# zmq control-plane test — only when zmq/cppzmq are available (fetched under
-# ENABLE_UCX).
-if(ENABLE_UCX)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(ZMQ REQUIRED libzmq)
+# Bounce control-plane tests — gated on zmq availability (+ the fetched cppzmq
+# header), NOT UCX, mirroring the library (whose only extra dep beyond NIXL is
+# zmq, orthogonal to UCX). ZMQ_FOUND is set here for the whole file (the
+# real-NIXL e2e block below reuses it).
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(ZMQ libzmq)
+endif()
+if(ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
   add_gtest(zmqControlChannelTest zmqControlChannelTest.cpp)
   target_sources(
     zmqControlChannelTest PRIVATE ${BOUNCE_DIR}/ZmqControlChannel.cpp
@@ -176,8 +180,9 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
                                      ${NIXL_BUILD_LIBRARY})
 
     # Real-NIXL end-to-end loopback (needs both NIXL and zmq). Two real agents,
-    # real RDMA.
-    if(ENABLE_UCX)
+    # real RDMA. Gated on zmq (ZMQ_FOUND set above), not UCX; cppzmq is fetched
+    # here since NIXL is on.
+    if(ZMQ_FOUND)
       add_gtest(bounceNixlE2ETest bounceNixlE2ETest.cpp)
       target_sources(
         bounceNixlE2ETest
