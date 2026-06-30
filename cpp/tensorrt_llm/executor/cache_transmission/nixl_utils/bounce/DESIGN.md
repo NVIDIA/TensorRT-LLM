@@ -161,6 +161,33 @@ flowchart TD
     Find -.-> note4
 ```
 
+**直观理解(给新人)** —— `schedule()` 解决的问题:多个远端 sender 同时想往**同一块共享 arena** 写数据,如何
+**公平且有界**地把 arena 空间发出去。三个约束:
+
+1. **公平**:多个 flow **轮流**拿(round-robin),不让先到的 flow 独占。
+2. **单 flow 限速(窗口 W)**:每个 flow 同时最多 `W` 块 region 在飞(`held.size() < W`),多了要等 ACK 释放
+   —— 这就是流水线深度。
+3. **总量限速(arena)**:所有 flow 的在飞 region 共享一块 arena,装不下就先不发(背压,不报错)。
+
+把它想成**排队发号**:`ring` 是排队的 flow 列表,`cursor` 是"下一个轮到谁"的指针。每趟内层循环**只发一块**
+region —— 发给"轮到的、还想要(`pending` 非空)、窗口没满(`held < W`)、且 arena 此刻装得下队首 chunk"的那个
+flow,然后把 `cursor` 移到它**之后**、`break` 重新从头再发一块。于是发放顺序在各 flow 之间**交替**,而不是把一个
+flow 的窗口一次性灌满。外层循环一直发,直到**整整一圈都没发出任何一块**(全都 pending 空 / 窗口满 / 装不下)才停。
+
+**一个例子**(`W=2`,arena 此刻够放 4 块;flow A 有 3 个 chunk c1/c2/c3,flow B 有 2 个 d1/d2,起始 cursor→A):
+
+| 步 | cursor 指向 | 动作 | A.held | B.held |
+|---|---|---|---|---|
+| 1 | A | 发 `A/c1` | 1 | 0 |
+| 2 | B | 发 `B/d1` | 1 | 1 |
+| 3 | A | 发 `A/c2` | 2 | 1 |
+| 4 | B | 发 `B/d2` | 2 | 2 |
+| 5 | A | A 窗口满(2≥W)跳过;B 窗口满跳过 → 一圈无进展 → **停** | 2 | 2 |
+
+发放顺序 `A,B,A,B`(严格交替);A 的 `c3` 留在 `pending`,等 A 的某块 region 被 ACK 释放(`onScatterDone`→
+`schedule()`)后的**下一次** `schedule()` 才发出。每次 `schedule()` 返回的就是这一批新发的 GRANT,由 `sendGrants`
+按 flow key 拆出 peer 发回去。
+
 要点:
 
 - **两级限流**:per-flow 窗口 `W` 限单 flow 流水线深度;**arena 容量**限聚合并发(`alloc` 失败 ⇒ 背压,
