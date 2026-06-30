@@ -773,8 +773,9 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
-                indexer_k_dtype = DeepSeekV4SparseAttentionConfig.model_fields[
-                    'indexer_k_dtype'].default
+                default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
+                )
+                indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim

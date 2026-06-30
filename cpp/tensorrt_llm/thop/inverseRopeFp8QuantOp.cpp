@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
- *
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "tensorrt_llm/kernels/inverseRopeFp8QuantKernel.h"
