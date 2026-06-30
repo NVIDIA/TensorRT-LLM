@@ -15,9 +15,10 @@
 """Host-memory ``madvise`` helpers for releasing mmap-backed page cache.
 
 These utilities advise the OS to drop the physical pages backing read-only
-mmap regions (e.g. safetensors shards) so the resident file cache cannot grow
-unbounded during weight load on host-memory-constrained nodes. They only emit
-a kernel *hint*: the data is re-faulted on demand and is never corrupted.
+file-backed mmap regions (e.g. safetensors shards) so the resident file cache
+cannot grow unbounded during weight load on host-memory-constrained nodes.
+Callers must establish that a tensor is file-backed before using
+``advise_tensor_pageout``.
 """
 
 import ctypes
@@ -123,10 +124,10 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
     -----
     - Works only on Linux systems.
     - This call only gives a *hint* to the kernel: the OS may decide to ignore it.
-    - Safe to call on mmap-backed tensors (data will be reloaded on next access).
-    - If called on a malloc-based tensor (not mmap), madvise() simply does nothing
-      and returns 0 (success) because the virtual address range is anonymous memory.
-      It does NOT crash or corrupt data.
+    - Safe to call on file-backed mmap tensors (data will be reloaded on next
+      access).
+    - Do not call this on malloc-based tensors. ``MADV_DONTNEED`` may discard
+      anonymous pages, and later accesses can observe zero-filled memory.
     """
 
     if not tensor.device.type == "cpu":

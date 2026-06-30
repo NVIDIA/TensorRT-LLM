@@ -81,37 +81,11 @@ class ConsumableWeightsDict:
             The number of keys deleted.
 
         Thread-safe: uses a lock to prevent concurrent modification issues.
-
-        Memory note: for mmap-backed CPU tensors (e.g. safetensors views), `del`
-        alone drops the Python refcount but leaves the underlying file-backed
-        pages resident in the kernel page cache. On host-memory-constrained
-        platforms (e.g. Grace LPDDR shared by 4 ranks) this causes RSS to grow
-        unboundedly during weight loading. We therefore advise MADV_DONTNEED on
-        each tensor's mmap region before deletion to actively release page
-        cache. A `torch.cuda.synchronize()` is issued first to drain any
-        in-flight H2D copies that may still read from these pages.
         """
         with self._lock:
             keys_to_delete = [
                 k for k in self._weights.keys() if k.startswith(prefix + ".")
             ]
-            if keys_to_delete:
-                try:
-                    import torch
-
-                    from tensorrt_llm._torch.mmap_utils import \
-                        advise_tensor_pageout
-                    torch.cuda.synchronize()
-                    for k in keys_to_delete:
-                        t = self._weights[k]
-                        if isinstance(t,
-                                      torch.Tensor) and t.device.type == "cpu":
-                            try:
-                                advise_tensor_pageout(t, mode="dontneed")
-                            except (OSError, ValueError):
-                                pass
-                except ImportError:
-                    pass
             for key in keys_to_delete:
                 del self._weights[key]
             return len(keys_to_delete)
