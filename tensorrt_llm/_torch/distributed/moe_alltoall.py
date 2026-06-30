@@ -31,6 +31,7 @@ class _A2AState:
     local_num_tokens: int | None = None
     combine_payload_offset: int | None = None
     eplb_gathered_stats: torch.Tensor | None = None
+    active_rank_mask: torch.Tensor | None = None
 
 
 class MoeAlltoAll:
@@ -149,8 +150,8 @@ class MoeAlltoAll:
                 Note: The terminology is mapped to `num_experts` in this class and the kernels.
             num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
-            ep_group_health: Optional EPGroupHealth-compatible object. When present, its mask is passed to the
-                CUDA kernels and used by the watchdog.
+            ep_group_health: Optional read-only committed EP membership. When present, its mask is passed to the
+                CUDA kernels and defines the peers expected by the watchdog. Timeout detection never mutates it.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -289,7 +290,8 @@ class MoeAlltoAll:
             invalid_token_expert_id: If not None, set the token_selected_experts of the invalid tokens to this expert id. This is used to notify the MoE to skip these tokens for GroupGEMM.
             expert_id_payload_index: The index of token_selected_experts in the input_payloads. Must be provided if invalid_token_expert_id is not None.
             eplb_local_stats: (Optional) [num_experts] tensor containing local statistics for EPLB
-            active_rank_mask: Optional uint64 CPU tensor overriding ep_group_health for this dispatch.
+            active_rank_mask: Optional uint64 CPU tensor overriding committed membership for this dispatch. The
+                captured value is reused by combine.
 
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
@@ -329,6 +331,7 @@ class MoeAlltoAll:
         self._state.local_num_tokens = token_selected_experts.size(0)
         self._state.combine_payload_offset = combine_payload_offset
         self._state.eplb_gathered_stats = eplb_gathered_stats
+        self._state.active_rank_mask = active_rank_mask
         self._state.phase = "dispatched"
 
         if invalid_token_expert_id is not None:
@@ -361,7 +364,8 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
             payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink transfer (halves NVLink bandwidth usage, output precision is preserved).
-            active_rank_mask: Optional uint64 CPU tensor overriding ep_group_health for this combine.
+            active_rank_mask: Optional uint64 CPU tensor. If supplied, it must match the mask captured by dispatch
+                for this collective.
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
@@ -369,8 +373,8 @@ class MoeAlltoAll:
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
 
-        active_rank_mask = self._watchdog_coordinator.active_rank_mask_tensor(
-            active_rank_mask)
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
+            self._state.active_rank_mask, active_rank_mask)
         output = torch.ops.trtllm.moe_a2a_combine(
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,

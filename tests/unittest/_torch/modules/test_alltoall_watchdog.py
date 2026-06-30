@@ -180,7 +180,7 @@ def test_watchdog_stop_is_terminal() -> None:
 def test_wide_ep_ft_options_create_shared_health_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
+    monkeypatch.setenv("TLLM_FAULT_TOLERANCE_MODE", "1")
     model_config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(moe_ep_size=4),
@@ -197,8 +197,50 @@ def test_wide_ep_ft_options_create_shared_health_when_enabled(
     assert poll_again_s == poll_interval_s
 
 
-def test_watchdog_timeout_reports_and_marks_missing_remote_ranks() -> None:
+def test_wide_ep_ft_options_ignore_legacy_enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TLLM_FAULT_TOLERANCE_MODE", raising=False)
+    monkeypatch.setenv("TRTLLM_ENABLE_WIDE_EP_FT", "1")
+    model_config = SimpleNamespace(
+        extra_attrs={},
+        mapping=SimpleNamespace(moe_ep_size=4),
+    )
+
+    health, timeout_s, _ = get_wide_ep_ft_options(model_config)
+
+    assert health is None
+    assert timeout_s is None
+
+
+def test_watchdog_coordinator_reuses_dispatch_mask_for_combine() -> None:
     health = EPGroupHealth(4)
+    coordinator = AlltoAllWatchdogCoordinator(
+        workspace_state={},
+        workspace=torch.zeros((4, 1), dtype=torch.uint8),
+        metainfo=torch.zeros((1,), dtype=torch.int64),
+        metainfo_index={},
+        ep_rank=0,
+        health=health,
+    )
+    dispatch_mask = coordinator.active_rank_mask_tensor(None)
+    assert dispatch_mask is not None
+
+    # Simulate a higher-layer commit at an invalid mid-collective point. The
+    # local dispatch/combine pair must keep using its dispatch snapshot.
+    health.mark_failed(2)
+    combine_mask = coordinator.active_rank_mask_for_combine(dispatch_mask, None)
+
+    assert combine_mask is dispatch_mask
+    assert combine_mask.tolist() == [0b1111, 0]
+    with pytest.raises(ValueError, match="mask captured at dispatch"):
+        coordinator.active_rank_mask_for_combine(
+            dispatch_mask,
+            torch.tensor(health.get_mask_words(), dtype=torch.uint64),
+        )
+
+
+def test_watchdog_no_detected_failure_publication_to_committed_health() -> None:
+    health = EPGroupHealth(4)
+    committed_before = health.snapshot()
     reader = FakeCompletionFlagReader(ep_size=4)
     reader.set_flags("dispatch", [1, 0, 1, 0])
     events: list[AlltoAllWatchdogTimeout] = []
@@ -221,8 +263,8 @@ def test_watchdog_timeout_reports_and_marks_missing_remote_ranks() -> None:
     assert event.expected_flag == 1
     assert event.observed_flags == (1, 0, 1, 0)
     assert event.missing_ranks == (1, 3)
-    assert event.marked_failed_ranks == (1, 3)
-    assert health.get_failed_ranks() == frozenset({1, 3})
+    assert not hasattr(event, "marked_failed_ranks")
+    assert health.snapshot() == committed_before
 
 
 def test_watchdog_ignores_ranks_already_failed_in_health_mask() -> None:
@@ -248,7 +290,7 @@ def test_watchdog_ignores_ranks_already_failed_in_health_mask() -> None:
     assert health.get_failed_ranks() == frozenset({2})
 
 
-def test_watchdog_reports_local_missing_but_does_not_mark_local_failed() -> None:
+def test_watchdog_reports_local_missing_without_changing_committed_health() -> None:
     health = EPGroupHealth(4)
     reader = FakeCompletionFlagReader(ep_size=4)
     reader.set_flags("combine", [0, 2, 2, 2])
@@ -268,7 +310,6 @@ def test_watchdog_reports_local_missing_but_does_not_mark_local_failed() -> None
 
     event = events[0]
     assert event.missing_ranks == (0,)
-    assert event.marked_failed_ranks == ()
     assert health.get_failed_ranks() == frozenset()
 
 
@@ -292,7 +333,6 @@ def test_watchdog_poll_timeout_without_snapshot_fails_closed() -> None:
     assert event.poll_timed_out is True
     assert event.observed_flags == (UNKNOWN_COMPLETION_FLAG,) * 3
     assert event.missing_ranks == (0, 1, 2)
-    assert event.marked_failed_ranks == ()
     assert health.all_active() is True
 
 
@@ -316,7 +356,6 @@ def test_watchdog_poll_timeout_with_prior_snapshot_does_not_mark_failed_rank() -
     assert event.poll_timed_out is True
     assert event.observed_flags == (1, 0, 1)
     assert event.missing_ranks == (1,)
-    assert event.marked_failed_ranks == ()
     assert health.all_active() is True
 
 
@@ -370,7 +409,7 @@ def test_watchdog_preserves_fifo_order_and_clears_followups_after_timeout() -> N
     assert len(events) == 1
     assert events[0].phase == "dispatch"
     assert events[0].missing_ranks == (1,)
-    assert health.get_failed_ranks() == frozenset({1})
+    assert health.get_failed_ranks() == frozenset()
 
 
 def test_watchdog_from_workspace_reads_phase_specific_offsets() -> None:
@@ -408,8 +447,7 @@ def test_watchdog_from_workspace_reads_phase_specific_offsets() -> None:
 
     assert events[0].phase == "combine"
     assert events[0].missing_ranks == (0,)
-    assert events[0].marked_failed_ranks == (0,)
-    assert health.get_failed_ranks() == frozenset({0})
+    assert health.get_failed_ranks() == frozenset()
 
 
 def test_workspace_coordinators_share_fifo_watchdog() -> None:
@@ -459,7 +497,7 @@ def test_workspace_coordinators_share_fifo_watchdog() -> None:
         assert len(events) == 1
         assert events[0].phase == "dispatch"
         assert events[0].missing_ranks == (1,)
-        assert health.get_failed_ranks() == frozenset({1})
+        assert health.get_failed_ranks() == frozenset()
     finally:
         for coordinator, watchdog in zip(coordinators, watchdogs):
             coordinator.release_watchdog(watchdog)

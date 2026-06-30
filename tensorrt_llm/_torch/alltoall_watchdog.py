@@ -19,6 +19,12 @@ The NVLinkOneSided kernels signal each collective by writing the current
 silent-spin failure mode never writes its slot, so this watchdog polls the same
 table from a CPU thread and reports peers whose flags do not reach the expected
 generation before a bounded timeout.
+
+Timeouts are detection events, not committed membership changes.  The optional
+EP health object supplies the already-committed active peers to watch, and is
+read-only here.  Higher-layer recovery coordination consumes ``on_timeout``
+events and commits a new membership only after the data plane and expert
+placement are ready for the same generation.
 """
 
 from __future__ import annotations
@@ -65,16 +71,13 @@ class CompletionFlagReader(Protocol):
 
 
 class EPGroupHealthLike(Protocol):
-    """Subset of EPGroupHealth used by the watchdog."""
+    """Read-only committed EP membership used by AlltoAll frontends."""
 
     def get_mask(self) -> int:
         """Return the active-rank bitmask."""
 
     def get_mask_words(self) -> tuple[int, ...]:
         """Return the active-rank bitmask split into uint64 words."""
-
-    def mark_failed(self, rank: int) -> bool:
-        """Mark ``rank`` failed and return whether state changed."""
 
 
 class CompletionFlagReadTimeout(TimeoutError):
@@ -83,13 +86,17 @@ class CompletionFlagReadTimeout(TimeoutError):
 
 @dataclass(frozen=True)
 class AlltoAllWatchdogTimeout:
-    """Details emitted when an AlltoAll phase times out."""
+    """Detection details emitted when an AlltoAll phase times out.
+
+    ``missing_ranks`` contains suspects relative to the committed active mask
+    captured for this collective.  Receiving this event does not publish a new
+    active mask.
+    """
 
     phase: str
     expected_flag: int
     observed_flags: tuple[int, ...]
     missing_ranks: tuple[int, ...]
-    marked_failed_ranks: tuple[int, ...]
     elapsed_s: float
     poll_timed_out: bool = False
 
@@ -206,7 +213,11 @@ class _TorchCompletionFlagReader:
 
 
 class AlltoAllWatchdogCoordinator:
-    """Shared watchdog plumbing for MoE AlltoAll frontends."""
+    """Shared watchdog plumbing for MoE AlltoAll frontends.
+
+    ``health`` is the committed membership snapshot source.  This class reads
+    it when a dispatch starts but never publishes detected failures into it.
+    """
 
     def __init__(
         self,
@@ -256,11 +267,37 @@ class AlltoAllWatchdogCoordinator:
         return _normalize_completion_flag(int(flag_val.item()))
 
     def active_rank_mask_tensor(self, active_rank_mask: torch.Tensor | None) -> torch.Tensor | None:
+        """Capture a caller override or the current committed mask.
+
+        The returned tensor does not alias a caller-owned override, so it can
+        safely represent the mask used by one dispatch/combine pair.
+        """
         if active_rank_mask is not None:
-            return active_rank_mask
+            return active_rank_mask.detach().clone()
         if self._health is None:
             return None
         return torch.tensor(self._health.get_mask_words(), dtype=torch.uint64, device="cpu")
+
+    def active_rank_mask_for_combine(
+        self,
+        dispatch_active_rank_mask: torch.Tensor | None,
+        requested_active_rank_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Reuse the dispatch mask and reject a conflicting combine override.
+
+        This guarantees one local mask snapshot across a dispatch/combine pair.
+        Atomic membership across layers and iterations remains the recovery
+        coordinator's responsibility.
+        """
+        if requested_active_rank_mask is None:
+            return dispatch_active_rank_mask
+        requested_mask = self.active_rank_mask_tensor(requested_active_rank_mask)
+        assert requested_mask is not None
+        if dispatch_active_rank_mask is None or not torch.equal(
+            dispatch_active_rank_mask, requested_mask
+        ):
+            raise ValueError("active_rank_mask must match the mask captured at dispatch")
+        return dispatch_active_rank_mask
 
     def active_mask_int(self, active_rank_mask: torch.Tensor | None) -> int | None:
         if active_rank_mask is not None:
@@ -372,7 +409,8 @@ class AlltoAllWatchdog:
 
     The watchdog is intentionally opt-in.  Callers queue phases with
     :meth:`watch`; the thread polls them in FIFO order so a queued combine cannot
-    hide a still-spinning dispatch.
+    hide a still-spinning dispatch.  A timeout is reported through
+    ``on_timeout`` without mutating the committed EP membership.
     """
 
     VALID_PHASES = frozenset({"dispatch", "combine"})
@@ -564,24 +602,11 @@ class AlltoAllWatchdog:
     ) -> None:
         elapsed_s = time.monotonic() - watch.start_s
         missing_ranks = self._missing_ranks(watch, observed_flags)
-        marked_failed: list[int] = []
-        if (
-            self._health is not None
-            and not poll_timed_out
-            and UNKNOWN_COMPLETION_FLAG not in observed_flags
-        ):
-            for rank in missing_ranks:
-                if rank == self._ep_rank:
-                    continue
-                if self._health.mark_failed(rank):
-                    marked_failed.append(rank)
-
         event = AlltoAllWatchdogTimeout(
             phase=watch.phase,
             expected_flag=watch.expected_flag,
             observed_flags=observed_flags,
             missing_ranks=missing_ranks,
-            marked_failed_ranks=tuple(marked_failed),
             elapsed_s=elapsed_s,
             poll_timed_out=poll_timed_out,
         )
@@ -589,14 +614,13 @@ class AlltoAllWatchdog:
             tllm_logger.error(
                 "AlltoAll watchdog could not read completion flags on rank %d "
                 "during %s before timeout %.3fs; expected flag %d, active "
-                "ranks %s, observed flags %s, marked ranks %s",
+                "ranks %s, observed flags %s; reporting detection event only",
                 self._ep_rank,
                 watch.phase,
                 elapsed_s,
                 watch.expected_flag,
                 list(self._active_ranks(watch.active_mask)),
                 list(observed_flags),
-                list(marked_failed),
             )
         else:
             tllm_logger.warning(
