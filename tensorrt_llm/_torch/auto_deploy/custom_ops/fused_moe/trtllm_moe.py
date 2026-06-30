@@ -19,7 +19,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_tinygemm2_disabled
 from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
@@ -44,7 +44,8 @@ def _router_use_tinygemm(x2d: torch.Tensor, weight: torch.Tensor, bias) -> bool:
     # tinygemm2 only supports these SM archs (see thop/tinygemm2.cpp).
     _TINYGEMM_SM = (90, 100, 103)
     return (
-        bias is not None
+        not is_tinygemm2_disabled()  # off by default (TLLM_DISABLE_TINYGEMM2); falls back to F.linear
+        and bias is not None
         and get_sm_version() in _TINYGEMM_SM
         and x2d.shape[0] <= _MIN_LATENCY_TINYGEMM_NUM_TOKENS
         and x2d.dtype == torch.bfloat16

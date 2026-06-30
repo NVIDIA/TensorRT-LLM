@@ -590,6 +590,16 @@ def mpi_disabled() -> bool:
     return os.environ.get("TLLM_DISABLE_MPI") == "1"
 
 
+def is_tinygemm2_disabled() -> bool:
+    """True if the tinygemm2 kernel (gpt-oss small-M router GEMM) is disabled.
+
+    tinygemm2 is disabled by default; set ``TLLM_DISABLE_TINYGEMM2=0`` to re-enable
+    it. When disabled, every dispatch site falls back to its standard GEMM path
+    (cuBLAS / ``F.linear``), so there is no functional change beyond kernel choice.
+    """
+    return os.environ.get("TLLM_DISABLE_TINYGEMM2", "1") == "1"
+
+
 def mpi_rank():
     if mpi_disabled():
         try:

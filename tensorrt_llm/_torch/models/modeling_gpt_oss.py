@@ -6,7 +6,8 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
-from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
+from tensorrt_llm._utils import (get_hf_rope_theta, get_sm_version,
+                                 is_tinygemm2_disabled)
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -210,7 +211,9 @@ class MLPBlock(torch.nn.Module):
                             x: torch.Tensor,
                             lora_params: Optional[dict] = None) -> torch.Tensor:
         # Skip tinygemm2 optimization when LoRA is active (tinygemm2 doesn't support LoRA)
-        use_tinygemm = (get_sm_version() in [90, 100, 103]
+        # tinygemm2 is disabled by default (TLLM_DISABLE_TINYGEMM2); falls back to self.gate.
+        use_tinygemm = (not is_tinygemm2_disabled()
+                        and get_sm_version() in [90, 100, 103]
                         and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS
                         and (lora_params is None or not bool(lora_params)))
 
