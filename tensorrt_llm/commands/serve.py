@@ -341,6 +341,44 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
+def _diagnose_port_in_use(port: int) -> str:
+    """Describe which process currently holds the given port, best effort.
+
+    Returns a human-readable string for logs and error messages when a bind
+    fails with EADDRINUSE. Such bind failures are usually races: the port was
+    free at selection time, then taken before the rebind. They are not
+    reproducible, so capturing the holder at failure time is the best chance
+    to diagnose them.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return "psutil unavailable; cannot identify the process holding the port"
+
+    details = []
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port:
+                holder = ""
+                if conn.pid is not None:
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        holder = (f" pid={conn.pid} name={proc.name()} "
+                                  f"cmdline={' '.join(proc.cmdline())}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        holder = f" pid={conn.pid}"
+                details.append(
+                    f"{conn.laddr.ip}:{conn.laddr.port} status={conn.status}{holder}"
+                )
+    except (psutil.Error, OSError) as e:
+        return f"failed to inspect port holders: {e}"
+
+    if not details:
+        return ("no listening socket found for this port; it may have already "
+                "been released, indicating a transient race")
+    return "; ".join(details)
+
+
 def launch_server(
         host: str,
         port: int,
@@ -369,7 +407,12 @@ def launch_server(
             if port == 0:
                 port = s.getsockname()[1]
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind server socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
@@ -584,7 +627,12 @@ def launch_visual_gen_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind VisualGen server socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
 
         logger.info(f"Initializing VisualGen ({model})")
 
@@ -1352,13 +1400,20 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
+    logger.info(f"Reserving disaggregated server address "
+                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()})")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
         except OSError as e:
+            holder = _diagnose_port_in_use(disagg_cfg.port)
+            logger.error(
+                f"Failed to bind disaggregated server socket to "
+                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
+                f"{e}. Current port holder(s): {holder}")
             raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
-            )
+                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
+                f"Port holder(s): {holder}")
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
