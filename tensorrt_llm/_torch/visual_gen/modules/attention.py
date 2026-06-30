@@ -528,7 +528,7 @@ class Attention(nn.Module):
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # hidden_states may be a plain bf16 tensor or an Fp4QuantizedTensor from an upstream
+        # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
         # fused norm+quant kernel; downstream Linear accepts either.
         if not isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
